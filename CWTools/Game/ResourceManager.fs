@@ -205,6 +205,7 @@ type IResourceAPI<'T when 'T :> ComputedData> =
     abstract ForceRulesDataGenerate: unit -> unit
     abstract GetFileNames: FileNames
     abstract GetEntityByFilePath: string -> struct (Entity * Lazy<'T>) option
+    abstract ClearFileTexts: unit -> unit
 
 [<Sealed>]
 type ResourceManager<'T when 'T :> ComputedData>
@@ -838,6 +839,14 @@ type ResourceManager<'T when 'T :> ComputedData>
         | true, r -> Some r
         | _ -> None
 
+    let clearFileTexts () =
+        let keys = fileMap.Keys |> Seq.toArray
+        for key in keys do
+            match fileMap[key] with
+            | FileWithContentResource(s, r) when r.scope <> "embedded" && not (r.filepath.StartsWith("uri:")) ->
+                fileMap[key] <- FileWithContentResource(s, { r with filetext = "" })
+            | _ -> ()
+
     member _.ManualProcessResource = parseFileThenEntity >> snd
 
     member _.ManualProcess (filename: string) (filetext: string) =
@@ -860,4 +869,5 @@ type ResourceManager<'T when 'T :> ComputedData>
             member _.ForceRecompute() = forceRecompute ()
             member _.ForceRulesDataGenerate() = forceRulesData ()
             member _.GetFileNames = getFileNames
-            member _.GetEntityByFilePath path = getEntityByFilePath path }
+            member _.GetEntityByFilePath path = getEntityByFilePath path
+            member _.ClearFileTexts() = clearFileTexts () }
