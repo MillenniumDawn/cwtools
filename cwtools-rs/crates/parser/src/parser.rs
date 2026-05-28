@@ -120,7 +120,13 @@ impl<'a> Parser<'a> {
             self.advance();
             let mut s = String::new();
             while let Some(c) = self.peek() {
-                if c == '"' {
+                if c == '\\' {
+                    self.advance();
+                    if let Some(escaped) = self.advance() {
+                        s.push(escaped);
+                        continue;
+                    }
+                } else if c == '"' {
                     self.advance();
                     break;
                 }
@@ -175,7 +181,13 @@ impl<'a> Parser<'a> {
             self.advance();
             let mut s = String::new();
             while let Some(c) = self.peek() {
-                if c == '"' {
+                if c == '\\' {
+                    self.advance();
+                    if let Some(escaped) = self.advance() {
+                        s.push(escaped);
+                        continue;
+                    }
+                } else if c == '"' {
                     self.advance();
                     break;
                 }
@@ -455,8 +467,10 @@ fn is_value_char(c: char) -> bool {
         || c == ')'
 }
 
+/// Strip UTF-8 BOM if present, then parse.
 pub fn parse_string(input: &str, table: &StringTable) -> Result<ParsedFile, ParseError> {
-    let parser = Parser::new(input, table);
+    let stripped = input.strip_prefix('\u{FEFF}').unwrap_or(input);
+    let parser = Parser::new(stripped, table);
     parser.parse()
 }
 

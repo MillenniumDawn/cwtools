@@ -56,6 +56,30 @@ enum Commands {
     },
 }
 
+/// Decide whether to search a directory directly (as a leaf directory containing .txt files)
+/// or as a mod root with standard subfolders.
+fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
+    let known_script_folders = ["common", "events", "history", "interface", "decisions", "missions", "gfx"];
+    let dir_name = directory.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") {
+        // Search this directory directly
+        FileManagerConfig {
+            root: directory.to_path_buf(),
+            include_dirs: vec![".".into()],
+            ..Default::default()
+        }
+    } else {
+        // Treat as mod root with standard subfolders
+        FileManagerConfig {
+            root: directory.to_path_buf(),
+            ..Default::default()
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -79,10 +103,9 @@ fn main() {
             }
         }
         Commands::Discover { directory } => {
-            let config = FileManagerConfig {
-                root: directory.clone(),
-                ..Default::default()
-            };
+            // If the directory is a specific subfolder (has .txt files), search directly.
+            // Otherwise, treat it as a mod root and search standard subfolders.
+            let config = search_config_for(&directory);
             let mut manager = FileManager::new(config);
             match manager.discover_and_parse() {
                 Ok(files) => {
@@ -201,10 +224,7 @@ fn main() {
             println!("  Loaded {} types, {} enums", ruleset.types.len(), ruleset.enums.len());
 
             // Discover and parse files
-            let config = FileManagerConfig {
-                root: directory.clone(),
-                ..Default::default()
-            };
+            let config = search_config_for(&directory);
             let mut manager = FileManager::new(config);
             let files = manager.discover_and_parse().unwrap_or_else(|e| {
                 eprintln!("Error discovering files: {}", e);

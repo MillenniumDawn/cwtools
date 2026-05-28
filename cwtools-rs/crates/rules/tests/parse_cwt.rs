@@ -34,8 +34,10 @@ enums = {
     let parsed = parse_string(input, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed, &table);
 
-    assert_eq!(ruleset.aliases.len(), 0); // not yet extracting aliases
+    assert_eq!(ruleset.aliases.len(), 1); // alias[effect:create_starbase] extracted
+    assert_eq!(ruleset.root_rules.len(), 0); // no top-level type rules in this snippet
     assert_eq!(ruleset.types.len(), 1);
+    assert_eq!(ruleset.root_rules.is_empty(), true);
     assert_eq!(ruleset.types[0].name, "ship_size");
     assert_eq!(ruleset.types[0].path_options.paths, vec!["common/ship_sizes"]);
     assert_eq!(ruleset.types[0].subtypes.len(), 1);

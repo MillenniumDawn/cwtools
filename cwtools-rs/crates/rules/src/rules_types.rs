@@ -6,6 +6,7 @@ pub struct RuleSet {
     pub single_aliases: Vec<(String, NewRule)>,
     pub enums: Vec<EnumDefinition>,
     pub complex_enums: Vec<ComplexEnumDef>,
+    pub root_rules: Vec<RootRule>,
 }
 
 impl RuleSet {
@@ -16,6 +17,7 @@ impl RuleSet {
             single_aliases: Vec::new(),
             enums: Vec::new(),
             complex_enums: Vec::new(),
+            root_rules: Vec::new(),
         }
     }
 }

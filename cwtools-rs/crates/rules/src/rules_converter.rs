@@ -2,15 +2,51 @@ use crate::rules_types::*;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_string_table::string_table::StringTable;
 
+use cwtools_parser::ast::Comment;
+
+/// Extract comment text directly preceding a child in the AST.
+fn collect_comments_before_child(
+    all_children: &[Child],
+    idx: usize,
+    ast: &ParsedFile,
+    table: &StringTable,
+) -> Vec<String> {
+    let mut comments = Vec::new();
+    // Walk backwards from idx to collect adjacent comments
+    let mut i = idx;
+    while i > 0 {
+        i -= 1;
+        match &all_children[i] {
+            Child::Comment(cidx) => {
+                let c = &ast.arena.comments[*cidx as usize];
+                let text = c.text.trim();
+                if text.starts_with('#') {
+                    comments.push(text.to_string());
+                } else if text.starts_with("##") {
+                    comments.push(text.to_string());
+                } else {
+                    comments.push(text.to_string());
+                }
+            }
+            _ => break,
+        }
+    }
+    comments.reverse();
+    comments
+}
+
 /// Convert a parsed .cwt AST into a RuleSet.
 pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
     let mut ruleset = RuleSet::new();
 
-    for child in &ast.root_children {
+    for (idx, child) in ast.root_children.iter().enumerate() {
+        let comments = collect_comments_before_child(&ast.root_children, idx, ast, table,
+        );
+
         match child {
-            // Case 1: `types = { ... }` parsed as a Node (if key has no value)
-            Child::Node(idx) => {
-                let node = &ast.arena.nodes[*idx as usize];
+            // Case 1: `types = { ... }` parsed as a Node
+            Child::Node(nidx) => {
+                let node = &ast.arena.nodes[*nidx as usize];
                 let key = table.get_string(node.key.normal).unwrap_or_default();
                 match key.as_str() {
                     "types" => extract_types_from_children(&node.children, ast, table, &mut ruleset,
@@ -18,7 +54,10 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                     "enums" => extract_enums_from_children(
                         &node.children, ast, table, &mut ruleset,
                     ),
-                    _ => {}
+                    _ => {
+                        // Top-level type rule or alias
+                        process_root_node(key, node, ast, table, &comments, &mut ruleset);
+                    }
                 }
             }
             // Case 2: `types = { ... }` parsed as a Leaf with clause value
@@ -36,7 +75,10 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                             extract_enums_from_children(children, ast, table, &mut ruleset);
                         }
                     }
-                    _ => {}
+                    _ => {
+                        // Top-level alias or type rule
+                        process_root_leaf(key, leaf, ast, table, &comments, &mut ruleset);
+                    }
                 }
             }
             _ => {}
@@ -44,6 +86,231 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
     }
 
     ruleset
+}
+
+fn process_root_node(
+    key: String,
+    node: &cwtools_parser::ast::Node,
+    ast: &ParsedFile,
+    table: &StringTable,
+    comments: &[String],
+    ruleset: &mut RuleSet,
+) {
+    if key.starts_with("alias[") {
+        if let Some((alias_name, _rn)) = get_alias_settings(&key, "alias") {
+            let rule = node_to_noderule(node, ast, table, ruleset);
+            let opts = options_from_comments(comments);
+            ruleset
+                .aliases
+                .push((alias_name, (RuleType::NodeRule { left: NewField::SpecificField(key.clone()), rules: rule }, opts)));
+        }
+    } else if key.starts_with("single_alias[") {
+        if let Some(alias_name) = get_setting_from_string(&key, "single_alias") {
+            let rule = node_to_noderule(node, ast, table, ruleset);
+            let opts = options_from_comments(comments);
+            ruleset
+                .single_aliases
+                .push((alias_name, (RuleType::NodeRule { left: NewField::SpecificField(key.clone()), rules: rule }, opts)));
+        }
+    } else {
+        let rule = build_rule_from_node(node, ast, table, ruleset);
+        let opts = options_from_comments(comments);
+        ruleset.root_rules.push(RootRule::TypeRule(key, (rule, opts)));
+    }
+}
+
+fn process_root_leaf(
+    key: String,
+    leaf: &cwtools_parser::ast::Leaf,
+    ast: &ParsedFile,
+    table: &StringTable,
+    comments: &[String],
+    ruleset: &mut RuleSet,
+) {
+    if key.starts_with("alias[") {
+        if let Some((alias_name, _rn)) = get_alias_settings(&key, "alias") {
+            let rule = leaf_to_rule(leaf, ast, table, ruleset);
+            let opts = options_from_comments(comments);
+            ruleset
+                .aliases
+                .push((alias_name, (rule, opts)));
+        }
+    } else if key.starts_with("single_alias[") {
+        if let Some(alias_name) = get_setting_from_string(&key, "single_alias") {
+            let rule = leaf_to_rule(leaf, ast, table, ruleset);
+            let opts = options_from_comments(comments);
+            ruleset
+                .single_aliases
+                .push((alias_name, (rule, opts)));
+        }
+    } else {
+        let rule = leaf_to_rule(leaf, ast, table, ruleset);
+        let opts = options_from_comments(comments);
+        ruleset.root_rules.push(RootRule::TypeRule(key, (rule, opts)));
+    }
+}
+
+fn build_rule_from_node(
+    node: &cwtools_parser::ast::Node,
+    ast: &ParsedFile,
+    table: &StringTable,
+    ruleset: &mut RuleSet,
+) -> RuleType {
+    let inner = node_to_noderule(node, ast, table, ruleset);
+    RuleType::NodeRule {
+        left: NewField::SpecificField(
+            table.get_string(node.key.normal).unwrap_or_default(),
+        ),
+        rules: inner,
+    }
+}
+
+fn leaf_to_rule(
+    leaf: &cwtools_parser::ast::Leaf,
+    ast: &ParsedFile,
+    table: &StringTable,
+    ruleset: &mut RuleSet,
+) -> RuleType {
+    match &leaf.value {
+        Value::Clause(children) => {
+            let inner = children_to_rules(children, ast, table, ruleset);
+            RuleType::NodeRule {
+                left: NewField::SpecificField(
+                    table.get_string(leaf.key.normal).unwrap_or_default(),
+                ),
+                rules: inner,
+            }
+        }
+        _ => {
+            // scalar alias like alias[effect:set_name] = scalar
+            let left = NewField::SpecificField(
+                table.get_string(leaf.key.normal).unwrap_or_default(),
+            );
+            let right = process_right_field(
+                &value_to_string(&leaf.value, table),
+                table,
+            );
+            RuleType::LeafRule { left, right }
+        }
+    }
+}
+
+fn node_to_noderule(
+    node: &cwtools_parser::ast::Node,
+    ast: &ParsedFile,
+    table: &StringTable,
+    ruleset: &mut RuleSet,
+) -> Vec<NewRule> {
+    children_to_rules(&node.children, ast, table, ruleset,
+    )
+}
+
+fn children_to_rules(
+    children: &Vec<Child>,
+    ast: &ParsedFile,
+    table: &StringTable,
+    ruleset: &mut RuleSet,
+) -> Vec<NewRule> {
+    let mut rules = Vec::new();
+    for (idx, child) in children.iter().enumerate() {
+        let comments = collect_comments_before_child(children, idx, ast, table);
+        match child {
+            Child::Leaf(lidx) => {
+                let leaf = &ast.arena.leaves[*lidx as usize];
+                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+
+                if key.starts_with("subtype[") {
+                    if let Some(st_name) = extract_bracket_content(&key, "subtype") {
+                        let positive = !st_name.starts_with('!');
+                        let name = if positive {
+                            st_name
+                        } else {
+                            st_name[1..].to_string()
+                        };
+                        let inner = match &leaf.value {
+                            Value::Clause(children) => children_to_rules(children, ast, table, ruleset),
+                            _ => Vec::new(),
+                        };
+                        rules.push((
+                            RuleType::SubtypeRule {
+                                name,
+                                positive,
+                                rules: inner,
+                            },
+                            options_from_comments(&comments),
+                        ));
+                    }
+                    continue;
+                }
+
+                let opts = options_from_comments(&comments);
+                let rule = match &leaf.value {
+                    Value::Clause(_) => {
+                        let inner = match &leaf.value {
+                            Value::Clause(children) => {
+                                children_to_rules(children, ast, table, ruleset)
+                            }
+                            _ => Vec::new(),
+                        };
+                        RuleType::NodeRule {
+                            left: NewField::SpecificField(key),
+                            rules: inner,
+                        }
+                    }
+                    _ => {
+                        let right = process_right_field(
+                            &value_to_string(&leaf.value, table),
+                            table,
+                        );
+                        RuleType::LeafRule {
+                            left: NewField::SpecificField(key),
+                            right,
+                        }
+                    }
+                };
+                rules.push((rule, opts));
+            }
+            Child::Node(nidx) => {
+                let node = &ast.arena.nodes[*nidx as usize];
+                let key = table.get_string(node.key.normal).unwrap_or_default();
+
+                if key.starts_with("subtype[") {
+                    if let Some(st_name) = extract_bracket_content(&key, "subtype") {
+                        let positive = !st_name.starts_with('!');
+                        let name = if positive {
+                            st_name
+                        } else {
+                            st_name[1..].to_string()
+                        };
+                        let inner = children_to_rules(&node.children, ast, table, ruleset,
+                        );
+                        rules.push((
+                            RuleType::SubtypeRule {
+                                name,
+                                positive,
+                                rules: inner,
+                            },
+                            options_from_comments(&comments),
+                        ));
+                    }
+                    continue;
+                }
+
+                let opts = options_from_comments(&comments);
+                let inner = children_to_rules(&node.children, ast, table, ruleset,
+                );
+                rules.push((
+                    RuleType::NodeRule {
+                        left: NewField::SpecificField(key),
+                        rules: inner,
+                    },
+                    opts,
+                ));
+            }
+            _ => {}
+        }
+    }
+    rules
 }
 
 fn extract_types_from_children(
@@ -310,6 +577,75 @@ fn value_to_string(value: &Value, table: &StringTable) -> String {
 }
 
 /// Clean a path string: remove `game/` or `game\` prefix (matching F# behavior).
+/// Extract settings from bracket notation, e.g. `alias[effect:create_starbase]`.
+fn get_alias_settings(full: &str, prefix: &str) -> Option<(String, String)> {
+    let setting = get_setting_from_string(full, prefix)?;
+    let parts: Vec<&str> = setting.split(':').collect();
+    if parts.len() < 2 {
+        None
+    } else {
+        Some((parts[0].to_string(), parts[1..].join(":")))
+    }
+}
+
+fn get_setting_from_string(full: &str, key: &str) -> Option<String> {
+    let expected = format!("{}[", key);
+    if full.starts_with(&expected) && full.ends_with(']') {
+        Some(full[expected.len()..full.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+fn options_from_comments(comments: &[String]) -> Options {
+    let mut opts = Options::default();
+    for c in comments {
+        let trimmed = c.trim();
+        if trimmed.starts_with("## cardinality = ") {
+            if let Some(spec) = trimmed.strip_prefix("## cardinality = ") {
+                let spec = spec.trim();
+                // Parse min..max
+                if let Some((min_s, max_s)) = spec.split_once("..") {
+                    let min = min_s.trim().parse::<i32>().unwrap_or(0);
+                    let max = if max_s == "inf" {
+                        i32::MAX
+                    } else {
+                        max_s.trim().parse::<i32>().unwrap_or(1000)
+                    };
+                    opts.min = min;
+                    opts.max = max;
+                }
+            }
+        }
+        if trimmed.starts_with("## push_scope = ") {
+            if let Some(scope) = trimmed.strip_prefix("## push_scope = ") {
+                opts.push_scope = Some(scope.trim().to_string());
+            }
+        }
+        if trimmed.starts_with("## replace_scope") {
+            // Simplified: just note that replace_scope exists
+            // Full implementation would parse the scope clause
+        }
+        if trimmed.starts_with("## severity = ") {
+            if let Some(sev) = trimmed.strip_prefix("## severity = ") {
+                opts.severity = match sev.trim() {
+                    "error" => Some(Severity::Error),
+                    "warning" => Some(Severity::Warning),
+                    "info" => Some(Severity::Information),
+                    "information" => Some(Severity::Information),
+                    "hint" => Some(Severity::Hint),
+                    _ => None,
+                };
+            }
+        }
+        if trimmed.starts_with("###") {
+            // Description comment
+            opts.description = Some(trimmed[3..].trim().to_string());
+        }
+    }
+    opts
+}
+
 fn clean_path(path: &str) -> String {
     path.strip_prefix("game/")
         .or_else(|| path.strip_prefix("game\\"))
