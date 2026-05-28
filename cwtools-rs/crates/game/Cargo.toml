@@ -1,0 +1,11 @@
+[package]
+name = "cwtools_game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cwtools_string_table = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
