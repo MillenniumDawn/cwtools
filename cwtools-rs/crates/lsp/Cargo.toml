@@ -13,7 +13,7 @@ cwtools_parser = { workspace = true }
 cwtools_string_table = { workspace = true }
 cwtools_file_manager = { workspace = true }
 cwtools_rules = { workspace = true }
-cwtools_cache = { workspace = true }
+cwtools_validation = { workspace = true }
 tower-lsp = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

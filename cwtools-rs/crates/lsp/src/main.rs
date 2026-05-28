@@ -7,28 +7,36 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use serde_json::Value;
 
 use cwtools_parser::parser::parse_string;
+use cwtools_parser::ast::ParsedFile;
+use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
+use cwtools_validation::{validate_ast, ValidationError};
 
-/// Server state: parsed documents.
+/// Server state.
 struct DocumentState {
-    /// file URI -> parsed result
+    /// file URI -> parsed document
     documents: Mutex<HashMap<String, ParsedDoc>>,
+    /// loaded .cwt ruleset
+    ruleset: Mutex<Option<RuleSet>>,
     /// shared string table
     string_table: StringTable,
+    /// game language from init options
+    language: Mutex<String>,
 }
 
-#[derive(Debug)]
 struct ParsedDoc {
     version: i32,
     text: String,
-    // TODO: store parsed AST
+    ast: Option<ParsedFile>,
 }
 
 impl DocumentState {
     fn new() -> Self {
         Self {
             documents: Mutex::new(HashMap::new()),
+            ruleset: Mutex::new(None),
             string_table: StringTable::new(),
+            language: Mutex::new("paradox".to_string()),
         }
     }
 }
@@ -44,8 +52,14 @@ impl LanguageServer for Backend {
         &self,
         params: InitializeParams,
     ) -> Result<InitializeResult> {
-        // Log initialization options for debugging
+        // Store language from init options
         if let Some(opts) = &params.initialization_options {
+            if let Some(lang) = opts.get("language").and_then(|v| v.as_str()) {
+                *self.state.language.lock().unwrap() = lang.to_string();
+                self.client
+                    .log_message(MessageType::INFO, format!("language: {}", lang))
+                    .await;
+            }
             self.client
                 .log_message(MessageType::INFO, format!("init options: {:?}", opts))
                 .await;
@@ -98,16 +112,13 @@ impl LanguageServer for Backend {
     }
 
     // --- Text document sync ---
-    async fn did_open(&self, params: DidOpenTextDocumentParams,
-    ) {
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let text = params.text_document.text;
         let version = params.text_document.version;
 
-        // Parse the document
-        let diagnostics = self.parse_and_validate(&uri, &text).await;
+        let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
 
-        // Store in state
         {
             let mut docs = self.state.documents.lock().unwrap();
             docs.insert(
@@ -115,28 +126,25 @@ impl LanguageServer for Backend {
                 ParsedDoc {
                     version,
                     text: text.clone(),
+                    ast: parsed,
                 },
             );
         }
 
-        // Publish diagnostics
         self.client
             .publish_diagnostics(params.text_document.uri, diagnostics, Some(version))
             .await;
     }
 
-    async fn did_change(&self, params: DidChangeTextDocumentParams,
-    ) {
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
 
-        // With Full sync, we get the entire new document
         if let Some(change) = params.content_changes.into_iter().next() {
             let text = change.text;
 
-            let diagnostics = self.parse_and_validate(&uri, &text).await;
+            let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
 
-            // Update state
             {
                 let mut docs = self.state.documents.lock().unwrap();
                 docs.insert(
@@ -144,6 +152,7 @@ impl LanguageServer for Backend {
                     ParsedDoc {
                         version,
                         text: text.clone(),
+                        ast: parsed,
                     },
                 );
             }
@@ -154,68 +163,72 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_save(&self, params: DidSaveTextDocumentParams,
-    ) {
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
-        // Re-validate on save
-        if let Some(doc) = {
+        if let Some(text) = {
             let docs = self.state.documents.lock().unwrap();
             docs.get(&uri).map(|d| d.text.clone())
         } {
-            let diagnostics = self.parse_and_validate(&uri, &doc).await;
+            let (diagnostics, _) = self.parse_and_validate(&uri, &text).await;
             self.client
                 .publish_diagnostics(params.text_document.uri, diagnostics, None)
                 .await;
         }
     }
 
-    async fn did_close(&self, params: DidCloseTextDocumentParams,
-    ) {
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         {
             let mut docs = self.state.documents.lock().unwrap();
             docs.remove(&uri);
         }
-        // Clear diagnostics
         self.client
             .publish_diagnostics(params.text_document.uri, vec![], None)
             .await;
     }
 
     // --- Language features (stubs) ---
-    async fn hover(&self,
+    async fn hover(
+        &self,
         _params: HoverParams,
     ) -> Result<Option<Hover>> {
         Ok(None)
     }
 
-    async fn completion(&self,
+    async fn completion(
+        &self,
         _params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
         Ok(None)
     }
 
-    async fn goto_definition(&self,
+    async fn goto_definition(
+        &self,
         _params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
         Ok(None)
     }
 
-    async fn references(&self,
+    async fn references(
+        &self,
         _params: ReferenceParams,
     ) -> Result<Option<Vec<Location>>> {
         Ok(None)
     }
 
-    async fn execute_command(&self,
+    async fn execute_command(
+        &self,
         params: ExecuteCommandParams,
     ) -> Result<Option<Value>> {
         match params.command.as_str() {
             "getFileTypes" => {
-                // Return a simple mapping for now
-                let mut map = serde_json::Map::new();
-                map.insert("txt".to_string(), Value::String("script".to_string()));
-                Ok(Some(Value::Object(map)))
+                if let Some(uri_val) = params.arguments.first() {
+                    let uri = uri_val.as_str().unwrap_or("");
+                    let types = self.determine_file_types(uri).await;
+                    let arr: Vec<Value> = types.into_iter().map(Value::String).collect();
+                    return Ok(Some(Value::Array(arr)));
+                }
+                Ok(Some(Value::Array(vec![])))
             }
             _ => Ok(None),
         }
@@ -223,19 +236,27 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
-    /// Parse a document and return any syntax diagnostics.
-    async fn parse_and_validate(&self,
+    /// Parse and validate a single document.
+    async fn parse_and_validate(
+        &self,
         _uri: &str,
         text: &str,
-    ) -> Vec<Diagnostic> {
+    ) -> (Vec<Diagnostic>, Option<ParsedFile>) {
         let mut diagnostics = Vec::new();
 
         match parse_string(text, &self.state.string_table) {
-            Ok(_parsed) => {
-                // TODO: run rule validation and produce diagnostics
+            Ok(parsed) => {
+                // If we have rules loaded, run validation
+                let ruleset_guard = self.state.ruleset.lock().unwrap();
+                if let Some(ruleset) = ruleset_guard.as_ref() {
+                    let errors = validate_ast(&parsed, ruleset, &self.state.string_table);
+                    for err in errors {
+                        diagnostics.push(validation_error_to_diagnostic(&err));
+                    }
+                }
+                (diagnostics, Some(parsed))
             }
             Err(e) => {
-                // Convert parse error to diagnostic
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position::default(),
@@ -250,10 +271,62 @@ impl Backend {
                     tags: None,
                     data: None,
                 });
+                (diagnostics, None)
             }
         }
+    }
 
-        diagnostics
+    /// Determine file types for a given URI.
+    async fn determine_file_types(
+        &self, uri: &str) -> Vec<String> {
+        let path = uri.to_lowercase();
+        let mut types = Vec::new();
+
+        if path.contains("/events/") {
+            types.push("event".to_string());
+        }
+        if path.contains("/common/") {
+            types.push("script".to_string());
+        }
+        if path.contains("/common/scripted_effects") {
+            types.push("scripted_effect".to_string());
+        }
+        if path.contains("/common/scripted_triggers") {
+            types.push("scripted_trigger".to_string());
+        }
+        if path.ends_with(".txt") {
+            types.push("txt".to_string());
+        }
+
+        types
+    }
+}
+
+fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: err.line.saturating_sub(1),
+                character: err.col as u32,
+            },
+            end: Position {
+                line: err.line.saturating_sub(1),
+                character: err.col as u32 + 1,
+            },
+        },
+        severity: match err.severity {
+            cwtools_validation::ErrorSeverity::Error => Some(DiagnosticSeverity::ERROR),
+            cwtools_validation::ErrorSeverity::Warning => Some(DiagnosticSeverity::WARNING),
+            cwtools_validation::ErrorSeverity::Information => Some(DiagnosticSeverity::INFORMATION),
+            cwtools_validation::ErrorSeverity::Hint => Some(DiagnosticSeverity::HINT),
+        },
+        code: None,
+        code_description: None,
+        source: Some("cwtools".to_string()),
+        message: err.message.clone(),
+        related_information: None,
+        tags: None,
+        data: None,
     }
 }
 
