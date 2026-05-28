@@ -391,7 +391,7 @@ impl Backend {
                 // If we have rules loaded, run validation
                 let ruleset_guard = self.state.ruleset.lock().unwrap();
                 if let Some(ruleset) = ruleset_guard.as_ref() {
-                    let errors = validate_ast(&parsed, ruleset, &self.state.string_table);
+                    let errors = validate_ast(&parsed, ruleset, &self.state.string_table, uri);
                     for err in errors {
                         diagnostics.push(validation_error_to_diagnostic(&err));
                     }

@@ -1,7 +1,7 @@
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::{validate_ast, ErrorSeverity};
+use cwtools_validation::{validate_ast, ErrorSeverity, error_hash};
 
 #[test]
 fn test_validate_simple_type() {
@@ -34,7 +34,7 @@ ethos = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table);
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt");
     assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
 
     // Invalid file: wrong value type for int field
@@ -45,7 +45,7 @@ ethos = {
 }
 "#;
     let parsed_bad = parse_string(bad_script, &table).unwrap();
-    let errors = validate_ast(&parsed_bad, &ruleset, &table);
+    let errors = validate_ast(&parsed_bad, &ruleset, &table, "test.txt");
     assert!(
         !errors.is_empty(),
         "Expected validation error for wrong type"
@@ -81,10 +81,77 @@ ship_size = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table);
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt");
+    assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
+}
+
+#[test]
+fn test_error_hash() {
+    let error = cwtools_validation::ValidationError {
+        message: "Field 'cost' has value 'not_a_number', expected Int".to_string(),
+        severity: ErrorSeverity::Error,
+        line: 3,
+        col: 10,
+        file: "test.txt".to_string(),
+    };
+    let hash = error_hash(&error);
+    assert_eq!(hash, "error|test.txt|3|Field 'cost' has value 'not_a_number', expected Int");
+}
+
+#[test]
+fn test_type_key_filter_matching() {
+    let cwt = r#"
+types = {
+    type[event] = {
+        path = "game/events"
+        subtype[country_event] = {
+            type_key_field = is_triggered_only
+            is_triggered_only = bool
+            id = scalar
+        }
+        subtype[news_event] = {
+            type_key_field = major
+            major = bool
+            id = scalar
+        }
+    }
+}
+"#;
+
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+
+    // country_event has is_triggered_only - should match country_event subtype
+    let script = r#"
+event = {
+    is_triggered_only = yes
+    id = my_event
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt");
     assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
 
-    // TODO: cardinality enforcement needs more work - the rules currently
-    // count root-level children per type, not per subtype. This is a known
-    // limitation that requires scope tracking.
+    // news_event has major - should match news_event subtype
+    let script2 = r#"
+event = {
+    major = yes
+    id = news_event
+}
+"#;
+    let parsed2 = parse_string(script2, &table).unwrap();
+    let errors2 = validate_ast(&parsed2, &ruleset, &table, "test.txt");
+    assert!(errors2.is_empty(), "Expected no errors but got: {:?}", errors2);
+
+    // Generic event without subtype key - should not get subtype-specific errors
+    let script3 = r#"
+event = {
+    id = generic_event
+}
+"#;
+    let parsed3 = parse_string(script3, &table).unwrap();
+    let errors3 = validate_ast(&parsed3, &ruleset, &table, "test.txt");
+    // No subtype matches, so no subtype rules apply, no errors expected
+    assert!(errors3.is_empty(), "Expected no errors for generic event: {:?}", errors3);
 }
