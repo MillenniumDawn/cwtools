@@ -7,6 +7,7 @@ members = [
     "crates/rules",
     "crates/validation",
     "crates/game",
+    "crates/localization",
     "crates/lsp",
     "crates/cli",
 ]
@@ -26,6 +27,7 @@ cwtools_cache = { path = "crates/cache" }
 cwtools_rules = { path = "crates/rules" }
 cwtools_validation = { path = "crates/validation" }
 cwtools_game = { path = "crates/game" }
+cwtools_localization = { path = "crates/localization" }
 cwtools_lsp = { path = "crates/lsp" }
 cwtools_cli = { path = "crates/cli" }
 clap = { version = "4.5", features = ["derive"] }

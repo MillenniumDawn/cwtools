@@ -54,6 +54,11 @@ enum Commands {
         #[arg(long, short)]
         rules: PathBuf,
     },
+    /// Parse and validate localisation files (.yml)
+    Loc {
+        /// Directory containing localisation .yml files
+        directory: PathBuf,
+    },
 }
 
 /// Decide whether to search a directory directly (as a leaf directory containing .txt files)
@@ -256,6 +261,64 @@ fn main() {
             }
 
             println!("\nValidation complete: {} errors, {} warnings", total_errors, total_warnings);
+            if total_errors > 0 {
+                std::process::exit(1);
+            }
+        }
+        Commands::Loc { directory } => {
+            use cwtools_localization::service::LocService;
+            use cwtools_localization::validation::validate_loc_file;
+            use cwtools_localization::validation::build_key_union;
+
+            println!("Scanning localisation in {}", directory.display());
+            let service = LocService::from_folder(&directory);
+
+            // Collect all keys across all languages
+            let mut all_files = Vec::new();
+            for (_, result) in service.results() {
+                if let Ok(file) = result {
+                    all_files.push(file.clone());
+                }
+            }
+            let all_keys = build_key_union(&all_files);
+            println!("  Total unique keys: {}", all_keys.len());
+
+            let hardcoded: Vec<&str> = vec![
+                // Common hardcoded loc refs across games
+                "Player", "Root", "From", "Prev", "Capital", "Random", "This",
+                "Country", "Ruler", "GetName", "GetName2", "GetSpeciesName",
+                "GetSpeciesNamePlural", "GetSpeciesAdj", "GetTitle",
+                "Owner", "Controller", "GetGovernmentName", "GetClassName",
+                "GetAdj", "GetIcon", "GetRegnalName", "Date", "GetDate",
+            ];
+
+            let mut total_errors = 0;
+            let mut total_entries = 0;
+
+            for (path, result) in service.results() {
+                match result {
+                    Ok(file) => {
+                        let mut file_copy = file.clone();
+                        let errors = validate_loc_file(
+                            &mut file_copy, &all_keys, &hardcoded
+                        );
+                        total_entries += file.entries.len();
+                        if !errors.is_empty() {
+                            println!("\n  {} — {} errors:", path, errors.len());
+                            for err in &errors {
+                                println!("    [line {}] {}", err.line, err.message);
+                            }
+                            total_errors += errors.len();
+                        }
+                    }
+                    Err(e) => {
+                        println!("\n  {} — PARSE ERROR: {}", path, e);
+                        total_errors += 1;
+                    }
+                }
+            }
+
+            println!("\nLoc validation complete: {} entries, {} errors", total_entries, total_errors);
             if total_errors > 0 {
                 std::process::exit(1);
             }
