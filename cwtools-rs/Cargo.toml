@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/string_table",
+    "crates/parser",
+    "crates/file_manager",
+    "crates/cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/MillenniumDawn/cwtools"
+
+[workspace.dependencies]
+cwtools_string_table = { path = "crates/string_table" }
+cwtools_parser = { path = "crates/parser" }
+cwtools_file_manager = { path = "crates/file_manager" }
+cwtools_cli = { path = "crates/cli" }
+clap = { version = "4.5", features = ["derive"] }
+walkdir = "2.5"
+globset = "0.4"
+memmap2 = "0.9"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+bumpalo = "3.16"

@@ -1,0 +1,15 @@
+[package]
+name = "cwtools_file_manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cwtools_parser = { workspace = true }
+cwtools_string_table = { workspace = true }
+walkdir = { workspace = true }
+globset = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
