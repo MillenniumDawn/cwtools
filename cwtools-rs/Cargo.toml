@@ -3,6 +3,8 @@ members = [
     "crates/string_table",
     "crates/parser",
     "crates/file_manager",
+    "crates/cache",
+    "crates/rules",
     "crates/cli",
 ]
 resolver = "3"
@@ -17,6 +19,8 @@ repository = "https://github.com/MillenniumDawn/cwtools"
 cwtools_string_table = { path = "crates/string_table" }
 cwtools_parser = { path = "crates/parser" }
 cwtools_file_manager = { path = "crates/file_manager" }
+cwtools_cache = { path = "crates/cache" }
+cwtools_rules = { path = "crates/rules" }
 cwtools_cli = { path = "crates/cli" }
 clap = { version = "4.5", features = ["derive"] }
 walkdir = "2.5"
@@ -26,3 +30,6 @@ thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 bumpalo = "3.16"
+rkyv = { version = "0.8", features = ["std", "bytecheck"] }
+bytecheck = "0.8"
+zstd = "0.13"

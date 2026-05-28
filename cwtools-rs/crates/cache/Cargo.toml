@@ -1,22 +1,19 @@
 [package]
-name = "cwtools_cli"
+name = "cwtools_cache"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "cwtools"
-path = "src/main.rs"
-
 [dependencies]
 cwtools_parser = { workspace = true }
-cwtools_file_manager = { workspace = true }
-cwtools_cache = { workspace = true }
-cwtools_rules = { workspace = true }
 cwtools_string_table = { workspace = true }
-clap = { workspace = true }
+rkyv = { workspace = true }
+bytecheck = { workspace = true }
+zstd = { workspace = true }
+memmap2 = { workspace = true }
+thiserror = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3.10"
