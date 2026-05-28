@@ -1,0 +1,15 @@
+[package]
+name = "cwtools_validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cwtools_parser = { path = "../parser" }
+cwtools_rules = { path = "../rules" }
+cwtools_string_table = { path = "../string_table" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
