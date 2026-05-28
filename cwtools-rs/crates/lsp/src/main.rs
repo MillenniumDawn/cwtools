@@ -12,6 +12,9 @@ use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{validate_ast, ValidationError};
 
+mod position;
+mod symbols;
+
 /// Server state.
 struct DocumentState {
     /// file URI -> parsed document
@@ -22,6 +25,8 @@ struct DocumentState {
     string_table: StringTable,
     /// game language from init options
     language: Mutex<String>,
+    /// symbol index for goto-definition and references
+    symbol_index: Mutex<symbols::SymbolIndex>,
 }
 
 struct ParsedDoc {
@@ -37,6 +42,7 @@ impl DocumentState {
             ruleset: Mutex::new(None),
             string_table: StringTable::new(),
             language: Mutex::new("paradox".to_string()),
+            symbol_index: Mutex::new(symbols::SymbolIndex::new()),
         }
     }
 }
@@ -190,8 +196,40 @@ impl LanguageServer for Backend {
     // --- Language features (stubs) ---
     async fn hover(
         &self,
-        _params: HoverParams,
+        params: HoverParams,
     ) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri.to_string();
+        let pos = params.text_document_position_params.position;
+        
+        let docs = self.state.documents.lock().unwrap();
+        if let Some(doc) = docs.get(&uri) {
+            if let Some(ast) = &doc.ast {
+                let source_pos = cwtools_parser::ast::SourcePos {
+                    line: pos.line + 1,
+                    col: pos.character as u16,
+                };
+                if let Some(element) = position::find_at_position(ast, &source_pos, &self.state.string_table) {
+                    let contents = match element {
+                        position::AstElement::Node { key, .. } => {
+                            format!("**Node**: `{}`", key)
+                        }
+                        position::AstElement::Leaf { key, value, .. } => {
+                            format!("**Field**: `{} = {}`", key, value)
+                        }
+                        position::AstElement::LeafValue { value, .. } => {
+                            format!("**Value**: `{}`", value)
+                        }
+                    };
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: contents,
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+        }
         Ok(None)
     }
 
@@ -199,20 +237,117 @@ impl LanguageServer for Backend {
         &self,
         _params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
+        let ruleset = self.state.ruleset.lock().unwrap();
+        if let Some(rules) = ruleset.as_ref() {
+            let mut items = Vec::new();
+            for t in &rules.types {
+                items.push(CompletionItem {
+                    label: t.name.clone(),
+                    kind: Some(CompletionItemKind::STRUCT),
+                    detail: Some("Type definition".to_string()),
+                    ..Default::default()
+                });
+            }
+            for e in &rules.enums {
+                items.push(CompletionItem {
+                    label: e.key.clone(),
+                    kind: Some(CompletionItemKind::ENUM),
+                    detail: Some(format!("Enum ({} values)", e.values.len())),
+                    ..Default::default()
+                });
+            }
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
         Ok(None)
     }
 
     async fn goto_definition(
         &self,
-        _params: GotoDefinitionParams,
+        params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        let pos = params.text_document_position_params.position;
+        let uri = params.text_document_position_params.text_document.uri.to_string();
+        
+        let docs = self.state.documents.lock().unwrap();
+        if let Some(doc) = docs.get(&uri) {
+            if let Some(ast) = &doc.ast {
+                let source_pos = cwtools_parser::ast::SourcePos {
+                    line: pos.line + 1,
+                    col: pos.character as u16,
+                };
+                if let Some(element) = position::find_at_position(ast, &source_pos, &self.state.string_table) {
+                    let symbol = match &element {
+                        position::AstElement::Node { key, .. } => key.clone(),
+                        position::AstElement::Leaf { key, .. } => key.clone(),
+                        position::AstElement::LeafValue { value, .. } => value.clone(),
+                    };
+                    drop(docs); // release lock
+                    let index = self.state.symbol_index.lock().unwrap();
+                    if let Some(locs) = index.find_definitions(&symbol) {
+                        let locations: Vec<Location> = locs.iter().map(|l| Location {
+                            uri: l.uri.parse().unwrap_or_else(|_| params.text_document_position_params.text_document.uri.clone()),
+                            range: Range {
+                                start: Position { line: l.line.saturating_sub(1), character: l.col as u32 },
+                                end: Position { line: l.line.saturating_sub(1), character: (l.col + symbol.len() as u16) as u32 },
+                            },
+                        }).collect();
+                        if !locations.is_empty() {
+                            return Ok(Some(GotoDefinitionResponse::Array(locations)));
+                        }
+                    }
+                }
+            }
+        }
         Ok(None)
     }
 
     async fn references(
         &self,
-        _params: ReferenceParams,
+        params: ReferenceParams,
     ) -> Result<Option<Vec<Location>>> {
+        let pos = params.text_document_position.position;
+        let uri = params.text_document_position.text_document.uri.to_string();
+        
+        let docs = self.state.documents.lock().unwrap();
+        if let Some(doc) = docs.get(&uri) {
+            if let Some(ast) = &doc.ast {
+                let source_pos = cwtools_parser::ast::SourcePos {
+                    line: pos.line + 1,
+                    col: pos.character as u16,
+                };
+                if let Some(element) = position::find_at_position(ast, &source_pos, &self.state.string_table) {
+                    let symbol = match &element {
+                        position::AstElement::Node { key, .. } => key.clone(),
+                        position::AstElement::Leaf { key, .. } => key.clone(),
+                        position::AstElement::LeafValue { value, .. } => value.clone(),
+                    };
+                    drop(docs); // release lock
+                    let index = self.state.symbol_index.lock().unwrap();
+                    let mut all_locs = Vec::new();
+                    if let Some(defs) = index.find_definitions(&symbol) {
+                        all_locs.extend(defs.iter().map(|l| Location {
+                            uri: l.uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
+                            range: Range {
+                                start: Position { line: l.line.saturating_sub(1), character: l.col as u32 },
+                                end: Position { line: l.line.saturating_sub(1), character: (l.col + symbol.len() as u16) as u32 },
+                            },
+                        }));
+                    }
+                    if let Some(refs) = index.find_references(&symbol) {
+                        all_locs.extend(refs.iter().map(|l| Location {
+                            uri: l.uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
+                            range: Range {
+                                start: Position { line: l.line.saturating_sub(1), character: l.col as u32 },
+                                end: Position { line: l.line.saturating_sub(1), character: (l.col + symbol.len() as u16) as u32 },
+                            },
+                        }));
+                    }
+                    if !all_locs.is_empty() {
+                        return Ok(Some(all_locs));
+                    }
+                }
+            }
+        }
         Ok(None)
     }
 
@@ -239,13 +374,20 @@ impl Backend {
     /// Parse and validate a single document.
     async fn parse_and_validate(
         &self,
-        _uri: &str,
+        uri: &str,
         text: &str,
     ) -> (Vec<Diagnostic>, Option<ParsedFile>) {
         let mut diagnostics = Vec::new();
 
         match parse_string(text, &self.state.string_table) {
             Ok(parsed) => {
+                // Update symbol index
+                {
+                    let mut index = self.state.symbol_index.lock().unwrap();
+                    index.clear_document(uri);
+                    index.index_document(uri, &parsed, &self.state.string_table);
+                }
+
                 // If we have rules loaded, run validation
                 let ruleset_guard = self.state.ruleset.lock().unwrap();
                 if let Some(ruleset) = ruleset_guard.as_ref() {
