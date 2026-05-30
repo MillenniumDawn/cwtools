@@ -3,6 +3,8 @@ use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
 use cwtools_string_table::string_table::StringTable;
 use cwtools_rules::rules_types::RuleSet;
 
+pub mod inline_expansion;
+
 /// Computed data for a single file — mirrors F# `InfoService` batch folds.
 #[derive(Debug, Clone, Default)]
 pub struct FileInfo {
