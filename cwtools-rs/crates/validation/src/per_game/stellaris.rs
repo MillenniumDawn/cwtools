@@ -33,7 +33,7 @@ pub fn validate_stellaris(
                     }
                 }
             }
-            _ => {}
+            Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => {}
         }
     }
 }

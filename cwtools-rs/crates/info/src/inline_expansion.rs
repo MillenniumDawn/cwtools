@@ -164,6 +164,35 @@ fn clone_child(
             dst_arena.comments.push(new_comment);
             Child::Comment(new_idx)
         }
+        Child::LeafValue(idx) => {
+            // LeafValue is a string value without a key, just clone it
+            let lv = &src_arena.leaf_values[*idx as usize];
+            let new_text = clone_string_tokens(&lv.value, src_table, dst_table, params,
+            );
+            let new_lv = cwtools_parser::ast::LeafValue {
+                value: new_text,
+                pos: lv.pos,
+            };
+            let new_idx = dst_arena.leaf_values.len() as u32;
+            dst_arena.leaf_values.push(new_lv);
+            Child::LeafValue(new_idx)
+        }
+        Child::ValueClause(idx) => {
+            // ValueClause is a clause inside a value position, clone its children
+            let vc = &src_arena.value_clauses[*idx as usize];
+            let new_children: Vec<Child> = vc
+                .children
+                .iter()
+                .map(|c| clone_child(c, src_arena, src_table, dst_arena, dst_table, params))
+                .collect();
+            let new_vc = cwtools_parser::ast::ValueClause {
+                children: new_children,
+                pos: vc.pos,
+            };
+            let new_idx = dst_arena.value_clauses.len() as u32;
+            dst_arena.value_clauses.push(new_vc);
+            Child::ValueClause(new_idx)
+        }
     }
 }
 

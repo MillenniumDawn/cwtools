@@ -32,7 +32,7 @@ pub fn validate_eu4(
                     }
                 }
             }
-            _ => {}
+            Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => {}
         }
     }
 }
