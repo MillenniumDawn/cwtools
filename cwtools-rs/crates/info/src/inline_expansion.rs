@@ -167,10 +167,9 @@ fn clone_child(
         Child::LeafValue(idx) => {
             // LeafValue is a string value without a key, just clone it
             let lv = &src_arena.leaf_values[*idx as usize];
-            let new_text = clone_string_tokens(&lv.value, src_table, dst_table, params,
-            );
+            let new_value = clone_value(&lv.value, src_arena, src_table, dst_arena, dst_table, params);
             let new_lv = cwtools_parser::ast::LeafValue {
-                value: new_text,
+                value: new_value,
                 pos: lv.pos,
             };
             let new_idx = dst_arena.leaf_values.len() as u32;
@@ -185,7 +184,13 @@ fn clone_child(
                 .iter()
                 .map(|c| clone_child(c, src_arena, src_table, dst_arena, dst_table, params))
                 .collect();
+            let new_keys: Vec<StringTokens> = vc
+                .keys
+                .iter()
+                .map(|k| clone_string_tokens(k, src_table, dst_table, params))
+                .collect();
             let new_vc = cwtools_parser::ast::ValueClause {
+                keys: new_keys,
                 children: new_children,
                 pos: vc.pos,
             };
