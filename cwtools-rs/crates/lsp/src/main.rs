@@ -27,6 +27,8 @@ struct DocumentState {
     language: Mutex<String>,
     /// symbol index for goto-definition and references
     symbol_index: Mutex<symbols::SymbolIndex>,
+    /// computed info service for type/references/definitions
+    info_service: Mutex<cwtools_info::InfoService>,
 }
 
 struct ParsedDoc {
@@ -43,6 +45,7 @@ impl DocumentState {
             string_table: StringTable::new(),
             language: Mutex::new("paradox".to_string()),
             symbol_index: Mutex::new(symbols::SymbolIndex::new()),
+            info_service: Mutex::new(cwtools_info::InfoService::new()),
         }
     }
 }
@@ -237,9 +240,11 @@ impl LanguageServer for Backend {
         &self,
         _params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
+        let mut items = Vec::new();
+
+        // Type definitions and enums from ruleset
         let ruleset = self.state.ruleset.lock().unwrap();
         if let Some(rules) = ruleset.as_ref() {
-            let mut items = Vec::new();
             for t in &rules.types {
                 items.push(CompletionItem {
                     label: t.name.clone(),
@@ -256,9 +261,45 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 });
             }
-            return Ok(Some(CompletionResponse::Array(items)));
         }
-        Ok(None)
+        drop(ruleset);
+
+        // Defined variables from info service
+        let info = self.state.info_service.lock().unwrap();
+        for var in &info.all_variables {
+            items.push(CompletionItem {
+                label: var.clone(),
+                kind: Some(CompletionItemKind::CONSTANT),
+                detail: Some("Variable".to_string()),
+                ..Default::default()
+            });
+        }
+        // Saved event targets
+        for et in &info.all_event_targets {
+            items.push(CompletionItem {
+                label: format!("event_target:{}", et),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some("Event target".to_string()),
+                ..Default::default()
+            });
+        }
+        // Top-level keys from all files
+        for (uri, file_info) in &info.files {
+            for (key, _loc) in &file_info.top_level_keys {
+                items.push(CompletionItem {
+                    label: key.clone(),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    detail: Some(format!("Key in {}", uri)),
+                    ..Default::default()
+                });
+            }
+        }
+
+        if items.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(CompletionResponse::Array(items)))
+        }
     }
 
     async fn goto_definition(
@@ -282,13 +323,13 @@ impl LanguageServer for Backend {
                         position::AstElement::LeafValue { value, .. } => value.clone(),
                     };
                     drop(docs); // release lock
-                    let index = self.state.symbol_index.lock().unwrap();
-                    if let Some(locs) = index.find_definitions(&symbol) {
-                        let locations: Vec<Location> = locs.iter().map(|l| Location {
-                            uri: l.uri.parse().unwrap_or_else(|_| params.text_document_position_params.text_document.uri.clone()),
+                    let info = self.state.info_service.lock().unwrap();
+                    if let Some(defs) = info.find_definitions(&symbol) {
+                        let locations: Vec<Location> = defs.iter().map(|(file_uri, loc)| Location {
+                            uri: file_uri.parse().unwrap_or_else(|_| params.text_document_position_params.text_document.uri.clone()),
                             range: Range {
-                                start: Position { line: l.line.saturating_sub(1), character: l.col as u32 },
-                                end: Position { line: l.line.saturating_sub(1), character: (l.col + symbol.len() as u16) as u32 },
+                                start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
+                                end: Position { line: loc.line.saturating_sub(1), character: (loc.col + symbol.len() as u16) as u32 },
                             },
                         }).collect();
                         if !locations.is_empty() {
@@ -322,19 +363,32 @@ impl LanguageServer for Backend {
                         position::AstElement::LeafValue { value, .. } => value.clone(),
                     };
                     drop(docs); // release lock
-                    let index = self.state.symbol_index.lock().unwrap();
+                    let info = self.state.info_service.lock().unwrap();
                     let mut all_locs = Vec::new();
-                    if let Some(defs) = index.find_definitions(&symbol) {
-                        all_locs.extend(defs.iter().map(|l| Location {
-                            uri: l.uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
+                    // Definitions
+                    if let Some(defs) = info.find_definitions(&symbol) {
+                        all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
+                            uri: file_uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
                             range: Range {
-                                start: Position { line: l.line.saturating_sub(1), character: l.col as u32 },
-                                end: Position { line: l.line.saturating_sub(1), character: (l.col + symbol.len() as u16) as u32 },
+                                start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
+                                end: Position { line: loc.line.saturating_sub(1), character: (loc.col + symbol.len() as u16) as u32 },
                             },
                         }));
                     }
-                    if let Some(refs) = index.find_references(&symbol) {
-                        all_locs.extend(refs.iter().map(|l| Location {
+                    // References from other files
+                    if let Some(refs) = info.find_references(&symbol) {
+                        all_locs.extend(refs.iter().map(|(file_uri, loc)| Location {
+                            uri: file_uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
+                            range: Range {
+                                start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
+                                end: Position { line: loc.line.saturating_sub(1), character: (loc.col + symbol.len() as u16) as u32 },
+                            },
+                        }));
+                    }
+                    // Fallback: also include symbol index references from current document
+                    let index = self.state.symbol_index.lock().unwrap();
+                    if let Some(locs) = index.find_references(&symbol) {
+                        all_locs.extend(locs.iter().map(|l| Location {
                             uri: l.uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
                             range: Range {
                                 start: Position { line: l.line.saturating_sub(1), character: l.col as u32 },
@@ -386,6 +440,16 @@ impl Backend {
                     let mut index = self.state.symbol_index.lock().unwrap();
                     index.clear_document(uri);
                     index.index_document(uri, &parsed, &self.state.string_table);
+                }
+
+                // Update info service (for definitions/references/completion)
+                {
+                    let ruleset_guard = self.state.ruleset.lock().unwrap();
+                    let mut info = self.state.info_service.lock().unwrap();
+                    info.clear_file(uri);
+                    if let Some(ruleset) = ruleset_guard.as_ref() {
+                        info.index_file(uri, &parsed, &self.state.string_table, ruleset);
+                    }
                 }
 
                 // If we have rules loaded, run validation

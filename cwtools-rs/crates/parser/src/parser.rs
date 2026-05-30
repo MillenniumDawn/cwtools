@@ -504,4 +504,23 @@ mod tests {
         assert!(!result.root_children.is_empty());
         assert!(table.len() > 0);
     }
+
+    #[test]
+    fn parse_angle_bracket_value() {
+        let table = StringTable::new();
+        let result = parse_string("ethos = <ethos>", &table).unwrap();
+        assert_eq!(result.root_children.len(), 1);
+        if let Child::Leaf(idx) = &result.root_children[0] {
+            let leaf = &result.arena.leaves[*idx as usize];
+            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            assert_eq!(key, "ethos");
+            let val = match &leaf.value {
+                Value::String(t) | Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
+                _ => panic!("expected string value, got {:?}", leaf.value),
+            };
+            assert_eq!(val, "<ethos>");
+        } else {
+            panic!("expected leaf child");
+        }
+    }
 }
