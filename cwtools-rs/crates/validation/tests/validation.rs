@@ -34,7 +34,7 @@ ethos = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt");
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None);
     assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
 
     // Invalid file: wrong value type for int field
@@ -45,7 +45,7 @@ ethos = {
 }
 "#;
     let parsed_bad = parse_string(bad_script, &table).unwrap();
-    let errors = validate_ast(&parsed_bad, &ruleset, &table, "test.txt");
+    let errors = validate_ast(&parsed_bad, &ruleset, &table, "test.txt", None);
     assert!(
         !errors.is_empty(),
         "Expected validation error for wrong type"
@@ -81,7 +81,7 @@ ship_size = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt");
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None);
     assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
 }
 
@@ -130,7 +130,7 @@ event = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt");
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None);
     assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
 
     // news_event has major - should match news_event subtype
@@ -141,7 +141,7 @@ event = {
 }
 "#;
     let parsed2 = parse_string(script2, &table).unwrap();
-    let errors2 = validate_ast(&parsed2, &ruleset, &table, "test.txt");
+    let errors2 = validate_ast(&parsed2, &ruleset, &table, "test.txt", None);
     assert!(errors2.is_empty(), "Expected no errors but got: {:?}", errors2);
 
     // Generic event without subtype key - should not get subtype-specific errors
@@ -151,7 +151,7 @@ event = {
 }
 "#;
     let parsed3 = parse_string(script3, &table).unwrap();
-    let errors3 = validate_ast(&parsed3, &ruleset, &table, "test.txt");
+    let errors3 = validate_ast(&parsed3, &ruleset, &table, "test.txt", None);
     // No subtype matches, so no subtype rules apply, no errors expected
     assert!(errors3.is_empty(), "Expected no errors for generic event: {:?}", errors3);
 }

@@ -1,3 +1,5 @@
+use cwtools_game::scope_engine::{ScopeContext, ScopeId, ScopeResult};
+use cwtools_game::constants::Game;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
@@ -25,6 +27,7 @@ pub fn validate_ast(
     ruleset: &RuleSet,
     table: &StringTable,
     file_path: &str,
+    game: Option<Game>,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     let enum_map: HashMap<&str, &EnumDefinition> = ruleset
@@ -32,6 +35,9 @@ pub fn validate_ast(
         .iter()
         .map(|e| (e.key.as_str(), e))
         .collect();
+
+    // Create a default scope context if game is provided
+    let mut scope_context = game.map(|g| ScopeContext::new(g, ScopeId(100)));
 
     for child in &ast.root_children {
         let children_to_validate = match child {
@@ -56,7 +62,7 @@ pub fn validate_ast(
 
         if let Some((_type_key, type_def, children)) = children_to_validate {
             if type_def.subtypes.is_empty() {
-                validate_children(children, ast, &[], &enum_map, table, &mut errors, file_path);
+                validate_children(children, ast, &[], &enum_map, table, &mut errors, file_path, &mut scope_context);
             } else {
                 for subtype in &type_def.subtypes {
                     let should_apply = if let Some(ref filter_key) = subtype.type_key_field {
@@ -65,7 +71,17 @@ pub fn validate_ast(
                         true
                     };
                     if should_apply {
-                        validate_children(children, ast, &subtype.rules, &enum_map, table, &mut errors, file_path);
+                        // Apply subtype push_scope if present
+                        let saved = scope_context.as_ref().map(|ctx| ctx.save());
+                        if let Some(ref mut ctx) = scope_context {
+                            if let Some(ref push_scope) = subtype.push_scope {
+                                ctx.change_scope(push_scope);
+                            }
+                        }
+                        validate_children(children, ast, &subtype.rules, &enum_map, table, &mut errors, file_path, &mut scope_context);
+                        if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
+                            ctx.restore(saved);
+                        }
                     }
                 }
             }
@@ -100,6 +116,7 @@ fn validate_children(
     table: &StringTable,
     errors: &mut Vec<ValidationError>,
     file_path: &str,
+    scope_context: &mut Option<ScopeContext>,
 ) {
     let mut key_counts: HashMap<String, usize> = HashMap::new();
     for child in children {
@@ -124,9 +141,24 @@ fn validate_children(
                 let leaf = &ast.arena.leaves[*idx as usize];
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
                 let mut matched = false;
-                for (rule_type, _opts) in rules {
+                for (rule_type, opts) in rules {
                     if rule_matches_leaf_key(rule_type, &key) {
                         matched = true;
+                        // Check required_scopes before validating value
+                        if let Some(ctx) = scope_context {
+                            if let Some(current) = ctx.current() {
+                                let scope_name = format!("{:?}", current); // placeholder
+                                if !opts.required_scopes.is_empty() && !opts.required_scopes.iter().any(|s| scope_name.eq_ignore_ascii_case(s)) {
+                                    errors.push(ValidationError {
+                                        message: format!("Field '{}' requires scope {:?}, but current scope is {:?}", key, opts.required_scopes, current),
+                                        severity: ErrorSeverity::Warning,
+                                        line: leaf.pos.start.line,
+                                        col: leaf.pos.start.col,
+                                        file: file_path.to_string(),
+                                    });
+                                }
+                            }
+                        }
                         validate_leaf(leaf, rule_type, table, enum_map, errors, file_path);
                     }
                 }
@@ -144,13 +176,27 @@ fn validate_children(
                 let node = &ast.arena.nodes[*idx as usize];
                 let key = table.get_string(node.key.normal).unwrap_or_default();
                 let mut matched = false;
-                for (rule_type, _opts) in rules {
+                for (rule_type, opts) in rules {
                     if rule_matches_node_key(rule_type, &key) {
                         matched = true;
                         match rule_type {
                             RuleType::NodeRule { rules: inner_rules, .. } => {
-                                validate_children(&node.children, ast, inner_rules, enum_map, table, errors, file_path,
-                                );
+                                // Apply push_scope / replace_scopes before recursing
+                                let saved = scope_context.as_ref().map(|ctx| ctx.save());
+                                if let Some(ctx) = scope_context.as_mut() {
+                                    if let Some(ref push) = opts.push_scope {
+                                        ctx.change_scope(push);
+                                    }
+                                    if let Some(ref replace) = opts.replace_scopes {
+                                        // Apply replace_scopes: update root, this, from, prev
+                                        apply_replace_scopes(ctx, replace);
+                                    }
+                                }
+                                validate_children(&node.children, ast, inner_rules, enum_map, table, errors, file_path, scope_context);
+                                // Restore scope after recursing
+                                if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
+                                    ctx.restore(saved);
+                                }
                             }
                             _ => {}
                         }
@@ -187,6 +233,15 @@ fn validate_children(
                 });
             }
         }
+    }
+}
+
+fn apply_replace_scopes(_ctx: &mut ScopeContext, replace: &ReplaceScopes) {
+    // TODO: implement proper replace_scopes
+    // For now, just note that it was applied (placeholder)
+    if let Some(ref root) = replace.root {
+        // Would need to map scope name to ScopeId
+        let _ = root;
     }
 }
 

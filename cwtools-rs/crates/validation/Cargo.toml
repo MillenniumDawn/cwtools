@@ -8,6 +8,7 @@ license.workspace = true
 cwtools_parser = { path = "../parser" }
 cwtools_rules = { path = "../rules" }
 cwtools_string_table = { path = "../string_table" }
+cwtools_game = { path = "../game" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

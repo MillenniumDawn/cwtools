@@ -246,7 +246,7 @@ fn main() {
                     root_children: file.root_children,
                 };
                 let errors = validate_ast(
-                    &parser_file, &ruleset, &rules_table, file.path.to_str().unwrap_or(""),
+                    &parser_file, &ruleset, &rules_table, file.path.to_str().unwrap_or(""), Some(game_id),
                 );
                 let file_errors: Vec<_> = errors.iter().filter(|e| e.severity == cwtools_validation::ErrorSeverity::Error).collect();
                 let file_warnings: Vec<_> = errors.iter().filter(|e| e.severity == cwtools_validation::ErrorSeverity::Warning).collect();
