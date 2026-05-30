@@ -5,6 +5,8 @@ use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
 use std::collections::HashMap;
 
+pub mod per_game;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidationError {
     pub message: String,
@@ -87,6 +89,12 @@ pub fn validate_ast(
             }
         }
     }
+    // Run game-specific validators if game is provided
+    if let Some(g) = game {
+        let game_errors = per_game::run_game_validators(ast, ruleset, table, file_path, g);
+        errors.extend(game_errors);
+    }
+
     errors
 }
 
