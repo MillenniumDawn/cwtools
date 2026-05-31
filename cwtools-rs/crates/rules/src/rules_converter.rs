@@ -97,12 +97,13 @@ fn process_root_node(
     ruleset: &mut RuleSet,
 ) {
     if key.starts_with("alias[") {
-        if let Some((alias_name, _rn)) = get_alias_settings(&key, "alias") {
+        if let Some((category, alias_name)) = get_alias_settings(&key, "alias") {
+            let full_name = format!("{}:{}", category, alias_name);
             let rule = node_to_noderule(node, ast, table, ruleset);
             let opts = options_from_comments(comments);
             ruleset
                 .aliases
-                .push((alias_name, (RuleType::NodeRule { left: NewField::SpecificField(key.clone()), rules: rule }, opts)));
+                .push((full_name, (RuleType::NodeRule { left: NewField::AliasField(category), rules: rule }, opts)));
         }
     } else if key.starts_with("single_alias[") {
         if let Some(alias_name) = get_setting_from_string(&key, "single_alias") {
@@ -110,7 +111,7 @@ fn process_root_node(
             let opts = options_from_comments(comments);
             ruleset
                 .single_aliases
-                .push((alias_name, (RuleType::NodeRule { left: NewField::SpecificField(key.clone()), rules: rule }, opts)));
+                .push((alias_name.clone(), (RuleType::NodeRule { left: NewField::SingleAliasField(alias_name), rules: rule }, opts)));
         }
     } else {
         let rule = build_rule_from_node(node, ast, table, ruleset);
@@ -128,12 +129,13 @@ fn process_root_leaf(
     ruleset: &mut RuleSet,
 ) {
     if key.starts_with("alias[") {
-        if let Some((alias_name, _rn)) = get_alias_settings(&key, "alias") {
+        if let Some((category, alias_name)) = get_alias_settings(&key, "alias") {
+            let full_name = format!("{}:{}", category, alias_name);
             let rule = leaf_to_rule(leaf, ast, table, ruleset);
             let opts = options_from_comments(comments);
             ruleset
                 .aliases
-                .push((alias_name, (rule, opts)));
+                .push((full_name, (rule, opts)));
         }
     } else if key.starts_with("single_alias[") {
         if let Some(alias_name) = get_setting_from_string(&key, "single_alias") {
@@ -320,14 +322,35 @@ fn extract_types_from_children(
     ruleset: &mut RuleSet,
 ) {
     for tchild in children {
-        if let Child::Leaf(lidx) = tchild {
-            let leaf = &ast.arena.leaves[*lidx as usize];
-            let lkey = table.get_string(leaf.key.normal).unwrap_or_default();
-            if lkey.starts_with("type[") {
-                if let Some(typename) = extract_bracket_content(&lkey, "type") {
-                    let typedef = process_type_node(typename, leaf, ast, table, ruleset);
-                    ruleset.types.push(typedef);
-                }
+        let (key, is_leaf) = match tchild {
+            Child::Leaf(lidx) => {
+                let leaf = &ast.arena.leaves[*lidx as usize];
+                (table.get_string(leaf.key.normal).unwrap_or_default(), true)
+            }
+            Child::Node(nidx) => {
+                let node = &ast.arena.nodes[*nidx as usize];
+                (table.get_string(node.key.normal).unwrap_or_default(), false)
+            }
+            _ => continue,
+        };
+        if key.starts_with("type[") {
+            if let Some(typename) = extract_bracket_content(&key, "type") {
+                let typedef = if is_leaf {
+                    if let Child::Leaf(lidx) = tchild {
+                        process_type_node(typename, &ast.arena.leaves[*lidx as usize], ast, table, ruleset)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    if let Child::Node(nidx) = tchild {
+                        // Node-style type definition (no = before brace)
+                        let node = &ast.arena.nodes[*nidx as usize];
+                        process_type_node_from_node(typename, node, ast, table, ruleset)
+                    } else {
+                        continue;
+                    }
+                };
+                ruleset.types.push(typedef);
             }
         }
     }
@@ -340,16 +363,86 @@ fn extract_enums_from_children(
     ruleset: &mut RuleSet,
 ) {
     for echild in children {
-        if let Child::Leaf(lidx) = echild {
-            let leaf = &ast.arena.leaves[*lidx as usize];
-            let lkey = table.get_string(leaf.key.normal).unwrap_or_default();
-            if lkey.starts_with("enum[") {
-                if let Some(enum_name) = extract_bracket_content(&lkey, "enum") {
-                    let def = process_enum_node(enum_name, leaf, ast, table);
-                    ruleset.enums.push(def);
-                }
+        let (key, is_leaf) = match echild {
+            Child::Leaf(lidx) => {
+                let leaf = &ast.arena.leaves[*lidx as usize];
+                (table.get_string(leaf.key.normal).unwrap_or_default(), true)
+            }
+            Child::Node(nidx) => {
+                let node = &ast.arena.nodes[*nidx as usize];
+                (table.get_string(node.key.normal).unwrap_or_default(), false)
+            }
+            _ => continue,
+        };
+        if key.starts_with("enum[") {
+            if let Some(enum_name) = extract_bracket_content(&key, "enum") {
+                let def = if is_leaf {
+                    if let Child::Leaf(lidx) = echild {
+                        process_enum_node(enum_name, &ast.arena.leaves[*lidx as usize], ast, table)
+                    } else {
+                        continue;
+                    }
+                } else {
+                    if let Child::Node(nidx) = echild {
+                        process_enum_node_from_node(enum_name, &ast.arena.nodes[*nidx as usize], ast, table)
+                    } else {
+                        continue;
+                    }
+                };
+                ruleset.enums.push(def);
             }
         }
+    }
+}
+
+fn process_type_node_from_node(
+    name: String,
+    node: &cwtools_parser::ast::Node,
+    ast: &ParsedFile,
+    table: &StringTable,
+    ruleset: &mut RuleSet,
+) -> TypeDefinition {
+    // Node-style type definitions have children inside the node itself.
+    // We synthesize a Leaf with Value::Clause(children) and delegate.
+    let synthetic_leaf = cwtools_parser::ast::Leaf {
+        key: node.key,
+        value: Value::Clause(node.children.clone()),
+        op: cwtools_parser::ast::Operator::Equals,
+        pos: node.pos.clone(),
+    };
+    process_type_node(name, &synthetic_leaf, ast, table, ruleset)
+}
+
+fn process_enum_node_from_node(
+    name: String,
+    node: &cwtools_parser::ast::Node,
+    ast: &ParsedFile,
+    table: &StringTable,
+) -> EnumDefinition {
+    let mut values = Vec::new();
+    for child in &node.children {
+        match child {
+            Child::LeafValue(lvidx) => {
+                let lv = &ast.arena.leaf_values[*lvidx as usize];
+                let v = value_to_string(&lv.value, table);
+                if !v.is_empty() {
+                    values.push(v);
+                }
+            }
+            Child::Leaf(lidx) => {
+                let l = &ast.arena.leaves[*lidx as usize];
+                let v = table.get_string(l.key.normal).unwrap_or_default();
+                if !v.is_empty() {
+                    values.push(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    EnumDefinition {
+        key: name,
+        description: String::new(),
+        values,
     }
 }
 
@@ -422,6 +515,14 @@ fn process_type_node(
                             "unique" => {
                                 if leaf_value_string(l, table) == "yes" {
                                     def.unique = true;
+                                }
+                            }
+                            "skip_root_key" => {
+                                let v = leaf_value_string(l, table);
+                                if v == "any" {
+                                    def.skip_root_key.push(SkipRootKey::AnyKey);
+                                } else {
+                                    def.skip_root_key.push(SkipRootKey::SpecificKey(v));
                                 }
                             }
                             _ => {}
@@ -541,12 +642,22 @@ fn process_enum_node(
 
     if let Value::Clause(children) = &leaf.value {
         for child in children {
-            if let Child::LeafValue(lvidx) = child {
-                let lv = &ast.arena.leaf_values[*lvidx as usize];
-                let v = value_to_string(&lv.value, table);
-                if !v.is_empty() {
-                    values.push(v);
+            match child {
+                Child::LeafValue(lvidx) => {
+                    let lv = &ast.arena.leaf_values[*lvidx as usize];
+                    let v = value_to_string(&lv.value, table);
+                    if !v.is_empty() {
+                        values.push(v);
+                    }
                 }
+                Child::Leaf(lidx) => {
+                    let l = &ast.arena.leaves[*lidx as usize];
+                    let v = table.get_string(l.key.normal).unwrap_or_default();
+                    if !v.is_empty() {
+                        values.push(v);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -607,6 +718,7 @@ fn options_from_comments(comments: &[String]) -> Options {
                 // Parse min..max
                 if let Some((min_s, max_s)) = spec.split_once("..") {
                     let min = min_s.trim().parse::<i32>().unwrap_or(0);
+                    let max_s = max_s.trim();
                     let max = if max_s == "inf" {
                         i32::MAX
                     } else {
@@ -647,9 +759,9 @@ fn options_from_comments(comments: &[String]) -> Options {
 }
 
 fn clean_path(path: &str) -> String {
-    path.strip_prefix("game/")
-        .or_else(|| path.strip_prefix("game\\"))
-        .unwrap_or(path)
+    let normalized = path.replace('\\', "/");
+    normalized.strip_prefix("game/")
+        .unwrap_or(&normalized)
         .to_string()
 }
 

@@ -2,14 +2,6 @@ use crate::ast::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
 use std::str::Chars;
 
-#[derive(Debug, thiserror::Error)]
-pub enum ParseError {
-    #[error("{0}:{1}:{2}: {3}")]
-    Pos(String, u32, u16, String),
-    #[error("{0}")]
-    General(String),
-}
-
 #[allow(dead_code)]
 struct Parser<'a> {
     input: &'a str,
@@ -18,6 +10,7 @@ struct Parser<'a> {
     col: u16,
     table: &'a StringTable,
     arena: Arena,
+    errors: Vec<ParseError>,
 }
 
 impl<'a> Parser<'a> {
@@ -29,6 +22,7 @@ impl<'a> Parser<'a> {
             col: 0,
             table,
             arena: Arena::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -67,7 +61,8 @@ impl<'a> Parser<'a> {
     fn consume_comment(&mut self) -> Option<Comment> {
         if self.peek() == Some('#') {
             let start = self.pos();
-            self.advance(); // consume '#'
+            // Do NOT consume the '#'; keep it in the comment text so that
+            // directive comments like '## cardinality = ...' remain intact.
             let mut text = String::new();
             while let Some(c) = self.peek() {
                 if c == '\n' {
@@ -155,6 +150,8 @@ impl<'a> Parser<'a> {
                     || c == '^'
                     || c == '&'
                     || c == '|'
+                    || c == '('
+                    || c == ')'
                 {
                     s.push(c);
                     self.advance();
@@ -172,6 +169,13 @@ impl<'a> Parser<'a> {
 
     fn parse_value(&mut self) -> Option<Value> {
         self.skip_whitespace();
+        // Skip any comments that appear before the actual value (e.g. value on next line)
+        while let Some(comment) = self.consume_comment() {
+            let idx = self.arena.push_comment(comment);
+            // Comments inside a value are unusual; we drop them on the floor here
+            // because the AST doesn't have a place for comments inside Leaf values.
+            self.skip_whitespace();
+        }
 
         if self.peek() == Some('{') {
             return self.parse_clause();
@@ -184,7 +188,15 @@ impl<'a> Parser<'a> {
                 if c == '\\' {
                     self.advance();
                     if let Some(escaped) = self.advance() {
-                        s.push(escaped);
+                        let translated = match escaped {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            '\\' => '\\',
+                            '"' => '"',
+                            _ => escaped,
+                        };
+                        s.push(translated);
                         continue;
                     }
                 } else if c == '"' {
@@ -203,13 +215,28 @@ impl<'a> Parser<'a> {
         let ahead: String = self.chars.clone().take(64).collect();
         let trimmed = ahead.trim();
 
-        if trimmed.starts_with("rgb ") || trimmed.starts_with("RGB ") {
-            return self.parse_rgb();
+        // rgb / hsv detection: must be followed by whitespace, '=', or '{'
+        let is_rgb = trimmed.starts_with("rgb") || trimmed.starts_with("RGB");
+        let is_hsv = trimmed.starts_with("hsv") || trimmed.starts_with("HSV");
+        if is_rgb {
+            let after = trimmed.chars().skip(3).next();
+            if after == Some('3') {
+                // Could be rgb360 — check further
+            } else if after.map_or(true, |c| !c.is_alphanumeric()) {
+                return self.parse_rgb();
+            }
         }
-        if trimmed.starts_with("hsv ") || trimmed.starts_with("HSV ") {
-            return self.parse_hsv();
+        if is_hsv {
+            let after = trimmed.chars().skip(3).next();
+            if after == Some('3') {
+                // Could be hsv360
+            } else if after.map_or(true, |c| !c.is_alphanumeric()) {
+                return self.parse_hsv();
+            }
         }
         if trimmed.starts_with("yes") {
+            let saved = self.pos();
+            let saved_chars = self.chars.clone();
             for _ in 0..3 { self.advance(); }
             if let Some(c) = self.peek() {
                 if !is_value_char(c) {
@@ -220,8 +247,14 @@ impl<'a> Parser<'a> {
                 self.skip_whitespace();
                 return Some(Value::Bool(true));
             }
+            // Not a standalone "yes" — backtrack
+            self.chars = saved_chars;
+            self.line = saved.line;
+            self.col = saved.col;
         }
         if trimmed.starts_with("no") {
+            let saved = self.pos();
+            let saved_chars = self.chars.clone();
             for _ in 0..2 { self.advance(); }
             if let Some(c) = self.peek() {
                 if !is_value_char(c) {
@@ -232,6 +265,10 @@ impl<'a> Parser<'a> {
                 self.skip_whitespace();
                 return Some(Value::Bool(false));
             }
+            // Not a standalone "no" — backtrack
+            self.chars = saved_chars;
+            self.line = saved.line;
+            self.col = saved.col;
         }
         if trimmed.starts_with("@[") {
             return self.parse_metaprogramming();
@@ -315,10 +352,18 @@ impl<'a> Parser<'a> {
                 break;
             }
             if self.peek().is_none() {
+                // Unclosed brace — record error and break to avoid infinite loop
+                self.errors.push(ParseError::Pos(
+                    "".to_string(),
+                    self.pos().line,
+                    self.pos().col,
+                    "unclosed clause: expected '}' before end of file".to_string(),
+                ));
                 break;
             }
             self.parse_statement(&mut children);
         }
+
         Some(Value::Clause(children))
     }
 
@@ -331,7 +376,7 @@ impl<'a> Parser<'a> {
             return;
         }
 
-        // Try key=value first
+        // Try key=value (or key { ... } shorthand)
         let saved = self.pos();
         let saved_chars = self.chars.clone();
         if let Some(key) = self.parse_key() {
@@ -348,8 +393,41 @@ impl<'a> Parser<'a> {
                     out.push(Child::Leaf(idx));
                     return;
                 }
+                // key = EOF  — commit as error instead of backtracking
+                let end = self.pos();
+                let leaf = Leaf {
+                    key,
+                    value: Value::String(self.table.intern("")),
+                    op,
+                    pos: SourceRange { start: saved, end },
+                };
+                let idx = self.arena.push_leaf(leaf);
+                out.push(Child::Leaf(idx));
+                self.errors.push(ParseError::Pos(
+                    "".to_string(),
+                    saved.line,
+                    saved.col,
+                    format!("key '{}' has no value after '='", self.table.get_string(key.normal).unwrap_or_default()),
+                ));
+                return;
             }
-            // Not a key=value; restore and try leaf-value
+            // No operator — check for shorthand `key { ... }`
+            self.skip_whitespace();
+            if let Some('{') = self.peek() {
+                if let Some(value) = self.parse_clause() {
+                    let end = self.pos();
+                    let leaf = Leaf {
+                        key,
+                        value,
+                        op: Operator::Equals,
+                        pos: SourceRange { start: saved, end },
+                    };
+                    let idx = self.arena.push_leaf(leaf);
+                    out.push(Child::Leaf(idx));
+                    return;
+                }
+            }
+            // Not a key=value or shorthand; restore and try leaf-value
             self.chars = saved_chars;
             self.line = saved.line;
             self.col = saved.col;
@@ -364,14 +442,17 @@ impl<'a> Parser<'a> {
             };
             let idx = self.arena.push_leaf_value(lv);
             out.push(Child::LeafValue(idx));
+            return;
         }
+
+        // Nothing matched — consume one char to avoid infinite loop on malformed input
+        self.advance();
     }
 
     fn parse_rgb(&mut self) -> Option<Value> {
-        // Consume "rgb" or "RGB" and optional "360"
-        let _ = self.advance(); // r
-        let _ = self.advance(); // g
-        let _ = self.advance(); // b
+        // "rgb" is already peeked and matched in parse_value before this is called.
+        // Consume "rgb" or "RGB" and optional "360".
+        for _ in 0..3 { self.advance(); }
         self.skip_whitespace();
         if let Some('3') = self.peek() {
             let ahead: String = self.chars.clone().take(3).collect();
@@ -381,14 +462,17 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.skip_whitespace();
             }
+        }
+        // Support `rgb = { ... }` by skipping optional '='
+        if self.peek() == Some('=') {
+            self.advance();
+            self.skip_whitespace();
         }
         self.parse_clause()
     }
 
     fn parse_hsv(&mut self) -> Option<Value> {
-        let _ = self.advance(); // h
-        let _ = self.advance(); // s
-        let _ = self.advance(); // v
+        for _ in 0..3 { self.advance(); }
         self.skip_whitespace();
         if let Some('3') = self.peek() {
             let ahead: String = self.chars.clone().take(3).collect();
@@ -399,23 +483,46 @@ impl<'a> Parser<'a> {
                 self.skip_whitespace();
             }
         }
+        // Support `hsv = { ... }` by skipping optional '='
+        if self.peek() == Some('=') {
+            self.advance();
+            self.skip_whitespace();
+        }
         self.parse_clause()
     }
 
     fn parse_metaprogramming(&mut self) -> Option<Value> {
-        let mut s = String::new();
-        s.push('@');
+        // Must start with "@["
+        if self.peek() != Some('@') {
+            return None;
+        }
         self.advance(); // '@'
+        if self.peek() != Some('[') {
+            return None;
+        }
         self.advance(); // '['
-        s.push('[');
+
+        let mut s = String::new();
+        s.push_str("@[");
+        let mut found_close = false;
         while let Some(c) = self.peek() {
             if c == ']' {
                 s.push(c);
                 self.advance();
+                found_close = true;
                 break;
             }
             s.push(c);
             self.advance();
+        }
+        if !found_close {
+            self.errors.push(ParseError::Pos(
+                "".to_string(),
+                self.pos().line,
+                self.pos().col,
+                "unclosed metaprogramming bracket: expected ']'".to_string(),
+            ));
+            return None;
         }
         self.skip_whitespace();
         let tokens = self.table.intern(&s);
@@ -431,6 +538,7 @@ impl<'a> Parser<'a> {
         Ok(ParsedFile {
             arena: self.arena,
             root_children,
+            errors: self.errors,
         })
     }
 }
@@ -456,6 +564,7 @@ fn is_value_char(c: char) -> bool {
         || c == '>'
         || c == '?'
         || c == '$'
+        || c == '\\'
         || c == 'š'
         || c == 'Š'
         || c == '’'

@@ -1,5 +1,13 @@
 use cwtools_string_table::string_table::StringTokens;
 
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    #[error("{0}:{1}:{2}: {3}")]
+    Pos(String, u32, u16, String),
+    #[error("{0}")]
+    General(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operator {
     Equals,
@@ -155,4 +163,5 @@ impl Arena {
 pub struct ParsedFile {
     pub arena: Arena,
     pub root_children: Vec<Child>,
+    pub errors: Vec<ParseError>,
 }

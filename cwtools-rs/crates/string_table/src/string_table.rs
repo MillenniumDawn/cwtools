@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-/// A unique identifier for an interned string.  
+/// A unique identifier for an interned string.
 /// `NULL` (u32::MAX) is reserved and never assigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
@@ -11,9 +11,9 @@ impl StringId {
     pub const NULL: StringId = StringId(u32::MAX);
 }
 
-/// Mirrors the F# `StringTokens` struct.  
-/// `lower`  → ID of the lower‑cased canonical form.  
-/// `normal` → ID of the exact (case‑preserving) string.  
+/// Mirrors the F# `StringTokens` struct.
+/// `lower`  → ID of the lower‑cased canonical form.
+/// `normal` → ID of the exact (case‑preserving) string.
 /// `quoted` → whether the original was surrounded by `"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StringTokens {
@@ -22,7 +22,7 @@ pub struct StringTokens {
     pub quoted: bool,
 }
 
-/// Metadata computed once per canonical (lower‑cased) string.  
+/// Metadata computed once per canonical (lower‑cased) string.
 /// Used by the rules / scope engines to avoid re‑scanning strings.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StringMetadata {
@@ -58,7 +58,15 @@ struct Inner {
 ///   every normal variant.
 /// * `quoted` is tracked per‑normal variant.
 pub struct StringTable {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
+}
+
+impl Clone for StringTable {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl Default for StringTable {
@@ -72,18 +80,18 @@ impl StringTable {
         let mut id_to_string = Vec::with_capacity(1024);
         let mut id_to_metadata = Vec::with_capacity(1024);
         // Slot 0 = empty string (never returned by intern, but keeps the
-        // array 1‑based so that `StringId(0)` is safe to index).
+        // array 1-based so that `StringId(0)` is safe to index).
         id_to_string.push(String::new());
         id_to_metadata.push(StringMetadata::default());
 
         Self {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 lower_map: HashMap::new(),
                 exact_map: HashMap::new(),
                 id_to_string,
                 id_to_metadata,
                 next_id: 1,
-            }),
+            })),
         }
     }
 
@@ -233,5 +241,16 @@ mod tests {
         let meta = table.get_metadata(t.normal).unwrap();
         assert!(meta.starts_with_amp);
         assert!(meta.contains_pipe);
+    }
+
+    #[test]
+    fn shared_table() {
+        let table = StringTable::new();
+        let a = table.intern("hello");
+
+        let table2 = table.clone();
+        let b = table2.intern("hello");
+
+        assert_eq!(a, b);                     // shared table → same token
     }
 }

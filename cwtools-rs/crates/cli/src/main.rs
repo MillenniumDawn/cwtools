@@ -64,12 +64,35 @@ enum Commands {
 /// Decide whether to search a directory directly (as a leaf directory containing .txt files)
 /// or as a mod root with standard subfolders.
 fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
-    let known_script_folders = ["common", "events", "history", "interface", "decisions", "missions", "gfx"];
+    let known_script_folders = [
+        "common", "events", "history", "interface", "decisions", "missions", "gfx",
+        "static_modifiers", "buildings", "technologies", "ethics", "policies",
+        "ship_sizes", "pop_faction", "starbases_consolidated", "traits", "edicts",
+        "traditions", "ascension_perks", "governments", "country_types", "bypass",
+        "dlc_list", "subject_types", "casus_belli", "war_goals", "bombardment_stances",
+        "armies", "deposits", "planet_classes", "tile_blockers", "species_rights",
+        "observation_station_missions", "star_classes", "ambient_objects", "name_lists",
+        "notification_modifier", "component_tags", "event_chains", "personalities",
+        "global_ship_designs", "graphical_cultures", "species_archetypes", "resources",
+        "species_classes", "buildable_pops", "opinion_modifiers", "leader_class_enum",
+        "asteroid_belt", "solar_system_initializers", "fallen_empires",
+    ];
     let dir_name = directory.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
-    if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") {
+    // If this directory itself contains .txt files, search it directly.
+    let has_txt_files = std::fs::read_dir(directory).ok().map_or(false, |mut entries| {
+        entries.any(|e| {
+            if let Ok(entry) = e {
+                entry.path().extension().map_or(false, |ext| ext == "txt")
+            } else {
+                false
+            }
+        })
+    });
+
+    if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") || has_txt_files {
         // Search this directory directly
         FileManagerConfig {
             root: directory.to_path_buf(),
@@ -215,7 +238,7 @@ fn main() {
 
             println!("Validating {} files in {} against {}", game_id, directory.display(), rules.display());
 
-            // Parse rules
+            // Parse rules (shares its StringTable)
             let rules_str = std::fs::read_to_string(&rules).unwrap_or_else(|e| {
                 eprintln!("Error reading rules {}: {}", rules.display(), e);
                 std::process::exit(1);
@@ -228,9 +251,9 @@ fn main() {
             let ruleset = ast_to_ruleset(&rules_parsed, &rules_table);
             println!("  Loaded {} types, {} enums", ruleset.types.len(), ruleset.enums.len());
 
-            // Discover and parse files
+            // Discover and parse files using the SAME string table
             let config = search_config_for(&directory);
-            let mut manager = FileManager::new(config);
+            let mut manager = FileManager::with_string_table(config, rules_table.clone());
             let files = manager.discover_and_parse().unwrap_or_else(|e| {
                 eprintln!("Error discovering files: {}", e);
                 std::process::exit(1);
@@ -244,6 +267,7 @@ fn main() {
                 let parser_file = cwtools_parser::ast::ParsedFile {
                     arena: file.arena,
                     root_children: file.root_children,
+                    errors: vec![],
                 };
                 let errors = validate_ast(
                     &parser_file, &ruleset, &rules_table, file.path.to_str().unwrap_or(""), Some(game_id),

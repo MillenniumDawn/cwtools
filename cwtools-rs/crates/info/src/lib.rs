@@ -184,6 +184,27 @@ impl InfoService {
             Child::Leaf(idx) => {
                 let leaf = &arena.leaves[*idx as usize];
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
+
+                // Standard Paradox syntax `foo = { ... }` is parsed as Leaf with Clause value.
+                // Index it as a top-level key and, if applicable, as a type definition.
+                info.top_level_keys.push((
+                    key.clone(),
+                    SourceLocation {
+                        line: leaf.pos.start.line,
+                        col: leaf.pos.start.col,
+                    },
+                ));
+
+                if type_names.contains(&key) {
+                    info.type_definitions
+                        .entry(key.clone())
+                        .or_default()
+                        .push(SourceLocation {
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                        });
+                }
+
                 let value_str = leaf_value_string(&leaf.value, table);
 
                 // Defined variable: `@var = 5`

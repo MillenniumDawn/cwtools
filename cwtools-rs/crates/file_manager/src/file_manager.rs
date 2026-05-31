@@ -65,6 +65,13 @@ impl FileManager {
         }
     }
 
+    pub fn with_string_table(config: FileManagerConfig, table: StringTable) -> Self {
+        Self {
+            config,
+            string_table: table,
+        }
+    }
+
     /// Discover and parse all matching files under the configured root.
     pub fn discover_and_parse(&mut self) -> Result<Vec<ParsedFile>, FileError> {
         let mut files = Vec::new();
