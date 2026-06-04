@@ -25,6 +25,51 @@ pub enum ErrorSeverity {
     Hint,
 }
 
+/// Iterate grandchildren of a skip_root_key wrapper and validate each one uniformly.
+/// Both the Node-root and Leaf-root shapes delegate here so behaviour is identical.
+#[allow(clippy::too_many_arguments)]
+fn validate_wrapper_grandchildren(
+    grandchildren: &[Child],
+    type_def: &TypeDefinition,
+    ast: &ParsedFile,
+    inner_rules: &[(RuleType, Options)],
+    enum_map: &HashMap<&str, &EnumDefinition>,
+    table: &StringTable,
+    errors: &mut Vec<ValidationError>,
+    file_path: &str,
+    scope_context: &mut Option<ScopeContext>,
+    game: Option<Game>,
+    ruleset: &RuleSet,
+) {
+    for grandchild in grandchildren {
+        match grandchild {
+            Child::Node(gc_idx) => {
+                let gc_node = &ast.arena.nodes[*gc_idx as usize];
+                validate_with_type(type_def, gc_node.children.as_slice(), ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
+            }
+            Child::Leaf(gc_idx) => {
+                let gc_leaf = &ast.arena.leaves[*gc_idx as usize];
+                if let Value::Clause(gc_children) = &gc_leaf.value {
+                    validate_with_type(type_def, gc_children.as_slice(), ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                }
+                // Non-clause scalar leaf inside wrapper: leave as-is (no error)
+            }
+            Child::LeafValue(idx) => {
+                let lv = &ast.arena.leaf_values[*idx as usize];
+                let value = leaf_value_to_string(&lv.value, table);
+                errors.push(ValidationError {
+                    message: format!("Unexpected bare value '{}'", value),
+                    severity: ErrorSeverity::Warning,
+                    line: lv.pos.start.line,
+                    col: lv.pos.start.col,
+                    file: file_path.to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn validate_ast(
     ast: &ParsedFile,
     ruleset: &RuleSet,
@@ -89,59 +134,21 @@ pub fn validate_ast(
 
             // If skip_root_key = any (or heuristic matches), the root node is a WRAPPER — validate its children individually
             if should_skip_root_key(&root_key, type_def) || subtype_wrapper {
-                match child {
+                let grandchildren: &[Child] = match child {
                     Child::Node(node_idx) => {
-                        let node = &ast.arena.nodes[*node_idx as usize];
-                        for grandchild in &node.children {
-                            match grandchild {
-                                Child::Node(gc_idx) => {
-                                    let gc_node = &ast.arena.nodes[*gc_idx as usize];
-                                    let gc_key = table.get_string(gc_node.key.normal).unwrap_or_default();
-                                    validate_with_type(type_def, gc_node.children.as_slice(), ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
-                                }
-                                Child::Leaf(gc_idx) => {
-                                    let gc_leaf = &ast.arena.leaves[*gc_idx as usize];
-                                    if let Value::Clause(gc_children) = &gc_leaf.value {
-                                        validate_with_type(type_def, gc_children.as_slice(), ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
+                        &ast.arena.nodes[*node_idx as usize].children
                     }
                     Child::Leaf(leaf_idx) => {
                         let leaf = &ast.arena.leaves[*leaf_idx as usize];
-                        if let Value::Clause(children) = &leaf.value {
-                            for grandchild in children {
-                                match grandchild {
-                                    Child::Node(gc_idx) => {
-                                        let gc_node = &ast.arena.nodes[*gc_idx as usize];
-                                        validate_with_type(type_def, gc_node.children.as_slice(), ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
-                                    }
-                                    Child::Leaf(gc_idx) => {
-                                        let gc_leaf = &ast.arena.leaves[*gc_idx as usize];
-                                        if let Value::Clause(gc_children) = &gc_leaf.value {
-                                            validate_with_type(type_def, gc_children.as_slice(), ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
-                                        }
-                                    }
-            Child::LeafValue(idx) => {
-                let lv = &ast.arena.leaf_values[*idx as usize];
-                let value = leaf_value_to_string(&lv.value, table);
-                errors.push(ValidationError {
-                    message: format!("Unexpected bare value '{}'", value),
-                    severity: ErrorSeverity::Warning,
-                    line: lv.pos.start.line,
-                    col: lv.pos.start.col,
-                    file: file_path.to_string(),
-                });
-            }
-            _ => {}
-                                }
-                            }
+                        if let Value::Clause(ref ch) = leaf.value {
+                            ch.as_slice()
+                        } else {
+                            &[]
                         }
                     }
-                    _ => {}
-                }
+                    _ => &[],
+                };
+                validate_wrapper_grandchildren(grandchildren, type_def, ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
                 continue;
             }
 
@@ -274,6 +281,31 @@ fn find_rules_by_name<'a>(name: &str, ruleset: &'a RuleSet) -> &'a [(RuleType, O
     &[]
 }
 
+/// Returns true only when `needle` appears in `haystack` as a whole sequence of
+/// path segments (bounded by '/' or start/end on both sides). Both inputs must
+/// already be lowercased and use '/' separators (clean_path normalizes these).
+/// This prevents `events` from matching `.../my_events_backup/x.txt`.
+fn path_contains_segment(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let left_ok = abs == 0 || haystack.as_bytes().get(abs - 1) == Some(&b'/');
+        let right = abs + needle.len();
+        let right_ok = right == haystack.len() || haystack.as_bytes().get(right) == Some(&b'/');
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs + 1;
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// Find a type whose path_options match the given file path.
 /// Returns the MOST SPECIFIC match (longest path string) so that
 /// `common/ai_strategy_plans` wins over generic `common`.
@@ -285,18 +317,13 @@ fn find_type_by_path<'a>(file_path: &str, ruleset: &'a RuleSet) -> Option<&'a Ty
     for t in &ruleset.types {
         for p in &t.path_options.paths {
             let p_lower = p.to_lowercase();
-            if path_lower.contains(&p_lower) && p_lower.len() > best_len {
+            if path_contains_segment(&path_lower, &p_lower) && p_lower.len() > best_len {
                 best = Some(t);
                 best_len = p_lower.len();
             }
         }
     }
     best
-}
-
-fn find_matching_type<'a>(_key: &str, _ruleset: &'a RuleSet) -> Option<&'a TypeDefinition> {
-    // Kept for compatibility but no longer used directly
-    None
 }
 
 fn child_key_matches(child: &Child, ast: &ParsedFile, table: &StringTable, filter_key: &str) -> bool {
@@ -481,14 +508,16 @@ fn apply_replace_scopes(_ctx: &mut ScopeContext, replace: &ReplaceScopes) {
 
 fn rule_matches_leaf_key(rule_type: &RuleType, key: &str, ruleset: &RuleSet) -> bool {
     match rule_type {
-        RuleType::LeafRule { left, .. } => field_matches_key(left, key, ruleset),
+        // Cross-kind fallback: a NodeRule can also match a leaf key (e.g. alias blocks)
+        RuleType::LeafRule { left, .. } | RuleType::NodeRule { left, .. } => field_matches_key(left, key, ruleset),
         _ => false,
     }
 }
 
 fn rule_matches_node_key(rule_type: &RuleType, key: &str, ruleset: &RuleSet) -> bool {
     match rule_type {
-        RuleType::NodeRule { left, .. } => field_matches_key(left, key, ruleset),
+        // Cross-kind fallback: a LeafRule can also match a node key
+        RuleType::NodeRule { left, .. } | RuleType::LeafRule { left, .. } => field_matches_key(left, key, ruleset),
         _ => false,
     }
 }
@@ -500,6 +529,11 @@ fn field_matches_key(field: &NewField, key: &str, ruleset: &RuleSet) -> bool {
             // Check if this key matches any alias in the given category.
             // Aliases are stored as "category:name" in ruleset.aliases.
             let prefix = format!("{}:", category);
+            let has_any = ruleset.aliases.iter().any(|(name, _)| name.starts_with(&prefix));
+            if !has_any {
+                // Category entirely unloaded — be permissive to avoid false-positive floods.
+                return true;
+            }
             ruleset.aliases.iter().any(|(name, _)| {
                 name.starts_with(&prefix) && name.split(':').nth(1) == Some(key)
             })
@@ -559,7 +593,9 @@ fn field_matches_value(field: &NewField, value: &Value, table: &StringTable, enu
             let text = table.get_string(t.normal).unwrap_or_default();
             match enum_map.get(enum_name.as_str()) {
                 Some(enum_def) => enum_def.values.contains(&text),
-                None => false, // flag missing enum as invalid
+                // Unknown enums (complex enums, unloaded enums) can't be statically validated here.
+                // Accept them to avoid false positives.
+                None => true,
             }
         }
         (NewField::ScalarField, _) => true,

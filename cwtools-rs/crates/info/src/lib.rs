@@ -185,24 +185,27 @@ impl InfoService {
                 let leaf = &arena.leaves[*idx as usize];
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
 
-                // Standard Paradox syntax `foo = { ... }` is parsed as Leaf with Clause value.
-                // Index it as a top-level key and, if applicable, as a type definition.
-                info.top_level_keys.push((
-                    key.clone(),
-                    SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    },
-                ));
-
-                if type_names.contains(&key) {
-                    info.type_definitions
-                        .entry(key.clone())
-                        .or_default()
-                        .push(SourceLocation {
+                // Only index as a top-level key / type definition when the value is a clause
+                // (`foo = { ... }`). Scalar leaves like `x = 5` must not be indexed here or
+                // they pollute goto-definition with false hits.
+                if let Value::Clause(_) = &leaf.value {
+                    info.top_level_keys.push((
+                        key.clone(),
+                        SourceLocation {
                             line: leaf.pos.start.line,
                             col: leaf.pos.start.col,
-                        });
+                        },
+                    ));
+
+                    if type_names.contains(&key) {
+                        info.type_definitions
+                            .entry(key.clone())
+                            .or_default()
+                            .push(SourceLocation {
+                                line: leaf.pos.start.line,
+                                col: leaf.pos.start.col,
+                            });
+                    }
                 }
 
                 let value_str = leaf_value_string(&leaf.value, table);

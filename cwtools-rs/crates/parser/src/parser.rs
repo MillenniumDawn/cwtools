@@ -169,11 +169,9 @@ impl<'a> Parser<'a> {
 
     fn parse_value(&mut self) -> Option<Value> {
         self.skip_whitespace();
-        // Skip any comments that appear before the actual value (e.g. value on next line)
-        while let Some(comment) = self.consume_comment() {
-            let idx = self.arena.push_comment(comment);
-            // Comments inside a value are unusual; we drop them on the floor here
-            // because the AST doesn't have a place for comments inside Leaf values.
+        // Skip any comments that appear before the actual value (e.g. value on next line).
+        // The AST has no place for comments inside Leaf values, so just discard them.
+        while self.consume_comment().is_some() {
             self.skip_whitespace();
         }
 
@@ -215,23 +213,41 @@ impl<'a> Parser<'a> {
         let ahead: String = self.chars.clone().take(64).collect();
         let trimmed = ahead.trim();
 
-        // rgb / hsv detection: must be followed by whitespace, '=', or '{'
+        // rgb / hsv detection.
+        // Determine the candidate keyword ("rgb", "rgb360", "hsv", "hsv360") and
+        // only proceed when the char after the keyword is absent or non-alphanumeric,
+        // so that identifiers like `rgbx` or `rgb3foo` are excluded.
+        // We save state and restore it if parse_rgb/parse_hsv returns None, so a
+        // bare `rgb` token that isn't followed by `{` doesn't get consumed and lost.
         let is_rgb = trimmed.starts_with("rgb") || trimmed.starts_with("RGB");
         let is_hsv = trimmed.starts_with("hsv") || trimmed.starts_with("HSV");
         if is_rgb {
-            let after = trimmed.chars().skip(3).next();
-            if after == Some('3') {
-                // Could be rgb360 — check further
-            } else if after.map_or(true, |c| !c.is_alphanumeric()) {
-                return self.parse_rgb();
+            // Determine keyword length: "rgb360" (6) or "rgb" (3)
+            let kw_len = if trimmed[3..].starts_with("360") { 6 } else { 3 };
+            let after = trimmed.as_bytes().get(kw_len).map(|&b| b as char);
+            if after.map_or(true, |c| !c.is_alphanumeric()) {
+                let saved = self.pos();
+                let saved_chars = self.chars.clone();
+                if let Some(v) = self.parse_rgb() {
+                    return Some(v);
+                }
+                self.chars = saved_chars;
+                self.line = saved.line;
+                self.col = saved.col;
             }
         }
         if is_hsv {
-            let after = trimmed.chars().skip(3).next();
-            if after == Some('3') {
-                // Could be hsv360
-            } else if after.map_or(true, |c| !c.is_alphanumeric()) {
-                return self.parse_hsv();
+            let kw_len = if trimmed[3..].starts_with("360") { 6 } else { 3 };
+            let after = trimmed.as_bytes().get(kw_len).map(|&b| b as char);
+            if after.map_or(true, |c| !c.is_alphanumeric()) {
+                let saved = self.pos();
+                let saved_chars = self.chars.clone();
+                if let Some(v) = self.parse_hsv() {
+                    return Some(v);
+                }
+                self.chars = saved_chars;
+                self.line = saved.line;
+                self.col = saved.col;
             }
         }
         if trimmed.starts_with("yes") {

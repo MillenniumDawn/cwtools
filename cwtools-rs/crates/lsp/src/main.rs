@@ -7,7 +7,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use serde_json::Value;
 
 use cwtools_parser::parser::parse_string;
-use cwtools_parser::ast::ParsedFile;
+use cwtools_parser::ast::{ParsedFile, ParseError};
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{validate_ast, ValidationError};
@@ -79,7 +79,6 @@ impl LanguageServer for Backend {
             // Load .cwt rules from rulesCache if provided
             if let Some(cache) = opts.get("rulesCache").and_then(|v| v.as_str()) {
                 let mut combined_ruleset = RuleSet::new();
-                let mut loaded_count = 0;
 
                 fn collect_cwt_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
                     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -204,7 +203,14 @@ impl LanguageServer for Backend {
             .await;
 
         // --- Workspace-wide initial validation (mirrors F# server behavior) ---
-        self.validate_entire_workspace().await;
+        // Spawned onto a background task so `initialized` returns promptly and
+        // does not block LSP handshake on large workspaces.
+        let client = self.client.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let backend = Backend { client, state };
+            backend.validate_entire_workspace().await;
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -676,6 +682,47 @@ impl Backend {
 
         match parse_string(text, &self.state.string_table) {
             Ok(parsed) => {
+                // Surface any syntax errors recorded by the parser (unclosed braces, etc.)
+                for parse_err in &parsed.errors {
+                    let diag = match parse_err {
+                        ParseError::Pos(_file, line, col, msg) => Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line: line.saturating_sub(1),
+                                    character: *col as u32,
+                                },
+                                end: Position {
+                                    line: line.saturating_sub(1),
+                                    character: *col as u32 + 1,
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            code: None,
+                            code_description: None,
+                            source: Some("cwtools".to_string()),
+                            message: msg.clone(),
+                            related_information: None,
+                            tags: None,
+                            data: None,
+                        },
+                        ParseError::General(msg) => Diagnostic {
+                            range: Range {
+                                start: Position::default(),
+                                end: Position::default(),
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            code: None,
+                            code_description: None,
+                            source: Some("cwtools".to_string()),
+                            message: msg.clone(),
+                            related_information: None,
+                            tags: None,
+                            data: None,
+                        },
+                    };
+                    diagnostics.push(diag);
+                }
+
                 // Update symbol index
                 {
                     let mut index = self.state.symbol_index.lock().unwrap();
@@ -694,15 +741,6 @@ impl Backend {
                 }
 
                 // If we have rules loaded, run validation
-                let (ruleset_types, ruleset_enums, ruleset_aliases) = {
-                    let ruleset_guard = self.state.ruleset.lock().unwrap();
-                    if let Some(ruleset) = ruleset_guard.as_ref() {
-                        (ruleset.types.len(), ruleset.enums.len(), ruleset.aliases.len())
-                    } else {
-                        (0, 0, 0)
-                    }
-                };
-                
                 let (errors, log_msg) = {
                     let ruleset_guard = self.state.ruleset.lock().unwrap();
                     if let Some(ruleset) = ruleset_guard.as_ref() {

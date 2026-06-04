@@ -207,6 +207,23 @@ fn node_to_noderule(
     )
 }
 
+/// Convert a left-hand key string into the appropriate NewField.
+/// Handles CWT idioms like `alias_name[effect]`, `alias_match_left[effect]`,
+/// and `single_alias_right[X]` that need to produce AliasField / SingleAliasField
+/// rather than a bare SpecificField (which would never match a real modder key).
+fn key_string_to_left_field(key: &str) -> NewField {
+    if (key.starts_with("alias_name[") || key.starts_with("alias_match_left[")) && key.ends_with(']') {
+        let inner_start = key.find('[').unwrap() + 1;
+        let inner = &key[inner_start..key.len() - 1];
+        return NewField::AliasField(inner.to_string());
+    }
+    if key.starts_with("single_alias_right[") && key.ends_with(']') {
+        let inner = &key[19..key.len() - 1];
+        return NewField::SingleAliasField(inner.to_string());
+    }
+    NewField::SpecificField(key.to_string())
+}
+
 fn children_to_rules(
     children: &Vec<Child>,
     ast: &ParsedFile,
@@ -255,7 +272,7 @@ fn children_to_rules(
                             _ => Vec::new(),
                         };
                         RuleType::NodeRule {
-                            left: NewField::SpecificField(key),
+                            left: key_string_to_left_field(&key),
                             rules: inner,
                         }
                     }
@@ -265,7 +282,7 @@ fn children_to_rules(
                             table,
                         );
                         RuleType::LeafRule {
-                            left: NewField::SpecificField(key),
+                            left: key_string_to_left_field(&key),
                             right,
                         }
                     }
@@ -303,7 +320,7 @@ fn children_to_rules(
                 );
                 rules.push((
                     RuleType::NodeRule {
-                        left: NewField::SpecificField(key),
+                        left: key_string_to_left_field(&key),
                         rules: inner,
                     },
                     opts,
@@ -419,31 +436,15 @@ fn process_enum_node_from_node(
     ast: &ParsedFile,
     table: &StringTable,
 ) -> EnumDefinition {
-    let mut values = Vec::new();
-    for child in &node.children {
-        match child {
-            Child::LeafValue(lvidx) => {
-                let lv = &ast.arena.leaf_values[*lvidx as usize];
-                let v = value_to_string(&lv.value, table);
-                if !v.is_empty() {
-                    values.push(v);
-                }
-            }
-            Child::Leaf(lidx) => {
-                let l = &ast.arena.leaves[*lidx as usize];
-                let v = table.get_string(l.key.normal).unwrap_or_default();
-                if !v.is_empty() {
-                    values.push(v);
-                }
-            }
-            _ => {}
-        }
-    }
-    EnumDefinition {
-        key: name,
-        description: String::new(),
-        values,
-    }
+    // Delegate to process_enum_node via a synthetic Leaf with Clause value,
+    // the same technique used by process_type_node_from_node.
+    let synthetic_leaf = cwtools_parser::ast::Leaf {
+        key: node.key,
+        value: Value::Clause(node.children.clone()),
+        op: cwtools_parser::ast::Operator::Equals,
+        pos: node.pos.clone(),
+    };
+    process_enum_node(name, &synthetic_leaf, ast, table)
 }
 
 fn extract_bracket_content(full: &str, prefix: &str) -> Option<String> {
