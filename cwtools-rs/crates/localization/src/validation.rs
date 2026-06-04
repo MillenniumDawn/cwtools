@@ -54,8 +54,8 @@ pub fn validate_loc_file(
         for r in &entry.refs {
             let lowercase = r.to_lowercase();
             if all_keys.contains(&lowercase) {
-                // Defined – check for recursion
-                if *r == entry.key && !hardcoded.contains(&lowercase) {
+                // Defined – check for recursion (case-insensitive, matching F# checkRef)
+                if lowercase == entry.key.to_lowercase() && !hardcoded.contains(&lowercase) {
                     errors.push(LocValidationError {
                         line: entry.position.line,
                         message: format!(
@@ -119,15 +119,21 @@ fn is_known_event_target(cmd: &str, all_keys: &HashSet<String>) -> bool {
 
 /// Validate invalid characters.
 ///
-/// Returns `Some(error_range)` if invalid characters are found.
-/// Mirrors F# `validateInvalidChars`.
+/// If `entry.error_range` is set (populated by the parser when a char outside
+/// the `isLocValueChar` ranges was found), push a `CW-LocInvalidChars` error.
+/// Mirrors F# `validateInvalidChars` (LocalisationString.fs:124-127).
 pub fn validate_invalid_chars(
     entry: &LocEntry,
-    _errors: &mut Vec<LocValidationError>,
+    errors: &mut Vec<LocValidationError>,
 ) -> Option<()> {
-    if let Some(_range) = &entry.error_range {
-        // F# marks positions where `isLocValueChar` returned false as error_range
-        // We already computed error_range during parsing, so just report it.
+    if let Some(range) = &entry.error_range {
+        errors.push(LocValidationError {
+            line: range.line,
+            message: format!(
+                "CW-LocInvalidChars: key '{}' contains a character outside the allowed Unicode ranges (col {})",
+                entry.key, range.column
+            ),
+        });
         Some(())
     } else {
         None
@@ -279,5 +285,59 @@ mod tests {
         );
 
         assert!(errors.is_empty(), "hardcoded ref should not error");
+    }
+
+    #[test]
+    fn test_invalid_char_detected() {
+        // U+FFFE is outside all allowed ranges and should trigger CW-LocInvalidChars
+        let bad_char = '\u{FFFE}';
+        let text = format!("l_english:\n key1: \"Hello {}world\"\n", bad_char);
+        let mut file = parse_loc_text(&text, "test.yml").unwrap();
+
+        // error_range should be set by the parser
+        assert!(file.entries[0].error_range.is_some(),
+            "parser should have set error_range for out-of-range char");
+
+        let keys: HashSet<String> = HashSet::new();
+        let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
+
+        let inv_char_errors: Vec<_> = errors.iter()
+            .filter(|e| e.message.contains("LocInvalidChars"))
+            .collect();
+        assert!(!inv_char_errors.is_empty(), "expected CW-LocInvalidChars error, got: {:?}", errors);
+    }
+
+    #[test]
+    fn test_valid_chars_no_error() {
+        // Normal ASCII and Latin Extended chars should not trigger the check
+        let text = "l_english:\n key1: \"Hello world — café\"\n";
+        let mut file = parse_loc_text(text, "test.yml").unwrap();
+
+        assert!(file.entries[0].error_range.is_none(),
+            "valid chars should not set error_range");
+
+        let keys: HashSet<String> = HashSet::new();
+        let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
+        let inv_char_errors: Vec<_> = errors.iter()
+            .filter(|e| e.message.contains("LocInvalidChars"))
+            .collect();
+        assert!(inv_char_errors.is_empty(), "valid chars should not produce LocInvalidChars");
+    }
+
+    // ---- case-insensitive recursive ref check (fix 7) ---------------------
+
+    #[test]
+    fn test_recursive_ref_case_insensitive() {
+        // key "KEY1" references "$key1$" — different case, should still be recursive
+        let text = "l_english:\n KEY1: \"Hello $key1$\"\n";
+        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let mut keys = HashSet::new();
+        keys.insert("key1".to_string()); // stored lowercased in union
+        let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
+
+        let recursive: Vec<_> = errors.iter()
+            .filter(|e| e.message.contains("RecursiveLocRef"))
+            .collect();
+        assert!(!recursive.is_empty(), "case-insensitive self-ref should trigger RecursiveLocRef: {:?}", errors);
     }
 }

@@ -9,6 +9,7 @@ use serde_json::Value;
 use cwtools_parser::parser::parse_string;
 use cwtools_parser::ast::{ParsedFile, ParseError};
 use cwtools_rules::rules_types::RuleSet;
+use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{validate_ast, ValidationError};
 
@@ -78,77 +79,45 @@ impl LanguageServer for Backend {
 
             // Load .cwt rules from rulesCache if provided
             if let Some(cache) = opts.get("rulesCache").and_then(|v| v.as_str()) {
-                let mut combined_ruleset = RuleSet::new();
+                let cache_path = std::path::Path::new(cache);
+                let (combined_ruleset, parse_errors) =
+                    load_ruleset_from_dir(cache_path, &self.state.string_table);
 
-                fn collect_cwt_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                collect_cwt_files(&path, out);
-                            } else if path.extension().map(|e| e.eq_ignore_ascii_case("cwt")).unwrap_or(false) {
-                                out.push(path);
-                            }
-                        }
-                    }
-                }
-
-                let mut cwt_files = Vec::new();
-                collect_cwt_files(std::path::Path::new(cache), &mut cwt_files);
-
-                let mut loaded_count = 0;
-                let mut skipped_count = 0;
-                let mut parse_errors = Vec::new();
-
-                for path in &cwt_files {
-                    match std::fs::read_to_string(path) {
-                        Ok(content) => {
-                            match parse_string(&content, &self.state.string_table) {
-                                Ok(parsed) => {
-                                    let ruleset = cwtools_rules::rules_converter::ast_to_ruleset(&parsed, &self.state.string_table);
-                                    combined_ruleset.types.extend(ruleset.types);
-                                    combined_ruleset.aliases.extend(ruleset.aliases);
-                                    combined_ruleset.single_aliases.extend(ruleset.single_aliases);
-                                    combined_ruleset.enums.extend(ruleset.enums);
-                                    combined_ruleset.complex_enums.extend(ruleset.complex_enums);
-                                    combined_ruleset.root_rules.extend(ruleset.root_rules);
-                                    loaded_count += 1;
-                                }
-                                Err(e) => {
-                                    skipped_count += 1;
-                                    let err_msg = format!("CWT parse error in {}: {}", path.display(), e);
-                                    parse_errors.push(err_msg.clone());
-                                    self.client
-                                        .log_message(MessageType::WARNING, err_msg)
-                                        .await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            skipped_count += 1;
-                            let err_msg = format!("CWT read error for {}: {}", path.display(), e);
-                            parse_errors.push(err_msg.clone());
-                            self.client
-                                .log_message(MessageType::WARNING, err_msg)
-                                .await;
-                        }
-                    }
-                }
-
-                if loaded_count > 0 {
-                    *self.state.ruleset.lock().unwrap() = Some(combined_ruleset);
+                for err in &parse_errors {
                     self.client
-                        .log_message(MessageType::INFO, format!(
-                            "Loaded {} CWT rule files from {} ({} files found, {} skipped)",
-                            loaded_count, cache, cwt_files.len(), skipped_count
-                        ))
+                        .log_message(MessageType::WARNING, err.clone())
                         .await;
+                }
+
+                let loaded = !combined_ruleset.types.is_empty()
+                    || !combined_ruleset.enums.is_empty()
+                    || !combined_ruleset.aliases.is_empty()
+                    || !combined_ruleset.root_rules.is_empty();
+
+                if loaded {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "Loaded rules from {} ({} types, {} enums, {} aliases, {} errors)",
+                                cache,
+                                combined_ruleset.types.len(),
+                                combined_ruleset.enums.len(),
+                                combined_ruleset.aliases.len(),
+                                parse_errors.len(),
+                            ),
+                        )
+                        .await;
+                    *self.state.ruleset.lock().unwrap() = Some(combined_ruleset);
                 } else {
                     self.client
-                        .log_message(MessageType::WARNING, format!(
-                            "No .cwt files successfully loaded from {}. Found {} files, {} skipped. Errors: {:?}",
-                            cache, cwt_files.len(), skipped_count, parse_errors
-                        ))
+                        .log_message(
+                            MessageType::WARNING,
+                            format!(
+                                "No rules loaded from {}. Errors: {:?}",
+                                cache, parse_errors
+                            ),
+                        )
                         .await;
                 }
             }

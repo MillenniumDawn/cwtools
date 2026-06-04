@@ -103,12 +103,16 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
 }
 
 /// Parse a `$ref$` starting at `chars[start]`.
+///
+/// Mirrors F# `dollarColour`: the ref name ends at `|` or `$`.
+/// So `$MY_KEY|Y$` yields `Ref("MY_KEY")`.
 fn parse_ref(chars: &[char], start: usize) -> Option<(LocElement, usize)> {
     // chars[start] == '$'
     let mut i = start + 1;
     let content_start = i;
 
-    while i < chars.len() && chars[i] != '$' {
+    // Collect key chars up to '|', '$', or end
+    while i < chars.len() && chars[i] != '$' && chars[i] != '|' {
         i += 1;
     }
 
@@ -116,8 +120,22 @@ fn parse_ref(chars: &[char], start: usize) -> Option<(LocElement, usize)> {
         return None; // No closing '$'
     }
 
-    let content = chars[content_start..i].iter().collect::<String>();
-    Some((LocElement::Ref(content), i + 1))
+    let key = chars[content_start..i].iter().collect::<String>();
+
+    // Skip the colour suffix (|COLOR) if present, then consume the closing '$'
+    if chars[i] == '|' {
+        // skip everything up to and including the closing '$'
+        i += 1; // skip '|'
+        while i < chars.len() && chars[i] != '$' {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return None; // No closing '$' after colour suffix
+        }
+    }
+
+    // chars[i] == '$' — consume it
+    Some((LocElement::Ref(key), i + 1))
 }
 
 /// Parse a `[...]` block starting at `chars[start]`.
@@ -343,5 +361,28 @@ mod tests {
         let elems = parse_loc_elements("[?var_name]");
         assert_eq!(elems.len(), 1);
         assert_eq!(elems[0], LocElement::Command("?var_name".to_string()));
+    }
+
+    #[test]
+    fn test_ref_colour_suffix_stripped() {
+        // $MY_KEY|Y$ should yield Ref("MY_KEY"), not Ref("MY_KEY|Y")
+        let elems = parse_loc_elements("$MY_KEY|Y$");
+        assert_eq!(elems, vec![LocElement::Ref("MY_KEY".to_string())]);
+    }
+
+    #[test]
+    fn test_ref_no_colour_suffix() {
+        // Plain ref without colour suffix still works
+        let elems = parse_loc_elements("$MY_KEY$");
+        assert_eq!(elems, vec![LocElement::Ref("MY_KEY".to_string())]);
+    }
+
+    #[test]
+    fn test_ref_colour_in_mixed_string() {
+        // Colour-suffixed ref inside mixed text
+        let elems = parse_loc_elements("Hello $NAME|G$ world");
+        assert_eq!(elems[0], LocElement::Chars("Hello ".to_string()));
+        assert_eq!(elems[1], LocElement::Ref("NAME".to_string()));
+        assert_eq!(elems[2], LocElement::Chars(" world".to_string()));
     }
 }

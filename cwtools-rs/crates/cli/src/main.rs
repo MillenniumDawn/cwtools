@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
 use cwtools_parser::parser::parse_string;
+use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_rules::rules_converter::ast_to_ruleset;
+use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 use std::path::PathBuf;
 
@@ -15,9 +17,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Parse a single Paradox script file and print AST summary
+    /// Parse a single Paradox script file (or a directory of .cwt rule files) and print summary
     Parse {
-        /// Path to the file to parse
+        /// Path to a file or a directory of .cwt files
         file: PathBuf,
     },
     /// Discover and parse all files under a directory
@@ -37,9 +39,9 @@ enum Commands {
         /// Input cache file
         input: PathBuf,
     },
-    /// Parse a .cwt rules file and print summary
+    /// Parse a .cwt rules file or directory and print summary
     Rules {
-        /// Path to the .cwt file
+        /// Path to a .cwt file or a directory containing .cwt files
         file: PathBuf,
     },
     /// Validate a directory of game files against .cwt rules
@@ -50,7 +52,7 @@ enum Commands {
         /// Directory containing game files
         #[arg(long, short)]
         directory: PathBuf,
-        /// Path to the .cwt rules file
+        /// Path to a .cwt rules file OR a directory containing .cwt rule files
         #[arg(long, short)]
         rules: PathBuf,
     },
@@ -93,18 +95,37 @@ fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
     });
 
     if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") || has_txt_files {
-        // Search this directory directly
         FileManagerConfig {
             root: directory.to_path_buf(),
             include_dirs: vec![".".into()],
             ..Default::default()
         }
     } else {
-        // Treat as mod root with standard subfolders
         FileManagerConfig {
             root: directory.to_path_buf(),
             ..Default::default()
         }
+    }
+}
+
+/// Load a RuleSet from either a single `.cwt` file or a directory of `.cwt` files.
+fn load_rules(rules_path: &std::path::Path, table: &StringTable) -> RuleSet {
+    if rules_path.is_dir() {
+        let (ruleset, errors) = load_ruleset_from_dir(rules_path, table);
+        for err in &errors {
+            eprintln!("warn: {}", err);
+        }
+        ruleset
+    } else {
+        let rules_str = std::fs::read_to_string(rules_path).unwrap_or_else(|e| {
+            eprintln!("Error reading rules {}: {}", rules_path.display(), e);
+            std::process::exit(1);
+        });
+        let parsed = parse_string(&rules_str, table).unwrap_or_else(|e| {
+            eprintln!("Error parsing rules {}: {}", rules_path.display(), e);
+            std::process::exit(1);
+        });
+        ast_to_ruleset(&parsed, table)
     }
 }
 
@@ -113,26 +134,46 @@ fn main() {
 
     match cli.command {
         Commands::Parse { file } => {
-            let mut manager = FileManager::new(FileManagerConfig::default());
-            match manager.parse_single_file(&file) {
-                Ok(parsed) => {
-                    println!("Parsed: {}", file.display());
-                    println!("  Nodes:     {}", parsed.arena.nodes.len());
-                    println!("  Leaves:    {}", parsed.arena.leaves.len());
-                    println!("  Values:    {}", parsed.arena.leaf_values.len());
-                    println!("  Clauses:   {}", parsed.arena.value_clauses.len());
-                    println!("  Comments:  {}", parsed.arena.comments.len());
-                    println!("  Root children: {}", parsed.root_children.len());
+            if file.is_dir() {
+                // Treat as a directory of .cwt rule files
+                let table = StringTable::new();
+                let (ruleset, errors) = load_ruleset_from_dir(&file, &table);
+                for err in &errors {
+                    eprintln!("warn: {}", err);
                 }
-                Err(e) => {
-                    eprintln!("Error parsing {}: {}", file.display(), e);
-                    std::process::exit(1);
+                println!("Parsed rule directory: {}", file.display());
+                println!("  Types:         {}", ruleset.types.len());
+                for t in &ruleset.types {
+                    println!("    - {} (path: {:?}, subtypes: {})", t.name, t.path_options.paths, t.subtypes.len());
+                }
+                println!("  Enums:         {}", ruleset.enums.len());
+                for e in &ruleset.enums {
+                    println!("    - {} ({} values)", e.key, e.values.len());
+                }
+                println!("  Aliases:       {}", ruleset.aliases.len());
+                println!("  SingleAliases: {}", ruleset.single_aliases.len());
+                println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
+            } else {
+                let mut manager = FileManager::new(FileManagerConfig::default());
+                match manager.parse_single_file(&file) {
+                    Ok(parsed) => {
+                        println!("Parsed: {}", file.display());
+                        println!("  Logical path:  {}", parsed.logical_path);
+                        println!("  Nodes:         {}", parsed.arena.nodes.len());
+                        println!("  Leaves:        {}", parsed.arena.leaves.len());
+                        println!("  Values:        {}", parsed.arena.leaf_values.len());
+                        println!("  Clauses:       {}", parsed.arena.value_clauses.len());
+                        println!("  Comments:      {}", parsed.arena.comments.len());
+                        println!("  Root children: {}", parsed.root_children.len());
+                    }
+                    Err(e) => {
+                        eprintln!("Error parsing {}: {}", file.display(), e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }
         Commands::Discover { directory } => {
-            // If the directory is a specific subfolder (has .txt files), search directly.
-            // Otherwise, treat it as a mod root and search standard subfolders.
             let config = search_config_for(&directory);
             let mut manager = FileManager::new(config);
             match manager.discover_and_parse() {
@@ -140,7 +181,8 @@ fn main() {
                     println!("Discovered and parsed {} files in {}", files.len(), directory.display());
                     for f in files {
                         println!(
-                            "  {} — nodes: {}, leaves: {}",
+                            "  {} [{}] — nodes: {}, leaves: {}",
+                            f.logical_path,
                             f.path.display(),
                             f.arena.nodes.len(),
                             f.arena.leaves.len()
@@ -200,32 +242,25 @@ fn main() {
             }
         }
         Commands::Rules { file } => {
-            let input_str = std::fs::read_to_string(&file).unwrap_or_else(|e| {
-                eprintln!("Error reading {}: {}", file.display(), e);
-                std::process::exit(1);
-            });
             let table = StringTable::new();
-            match parse_string(&input_str, &table) {
-                Ok(parsed) => {
-                    let ruleset = ast_to_ruleset(&parsed, &table);
-                    println!("Parsed rules file: {}", file.display());
-                    println!("  Types:         {}", ruleset.types.len());
-                    for t in &ruleset.types {
-                        println!("    - {} (path: {:?}, subtypes: {})", t.name, t.path_options.paths, t.subtypes.len());
-                    }
-                    println!("  Enums:         {}", ruleset.enums.len());
-                    for e in &ruleset.enums {
-                        println!("    - {} ({} values)", e.key, e.values.len());
-                    }
-                    println!("  Aliases:       {}", ruleset.aliases.len());
-                    println!("  SingleAliases: {}", ruleset.single_aliases.len());
-                    println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
-                }
-                Err(e) => {
-                    eprintln!("Error parsing {}: {}", file.display(), e);
-                    std::process::exit(1);
-                }
+            let ruleset = load_rules(&file, &table);
+            let label = if file.is_dir() {
+                format!("rule directory: {}", file.display())
+            } else {
+                format!("rules file: {}", file.display())
+            };
+            println!("Parsed {}", label);
+            println!("  Types:         {}", ruleset.types.len());
+            for t in &ruleset.types {
+                println!("    - {} (path: {:?}, subtypes: {})", t.name, t.path_options.paths, t.subtypes.len());
             }
+            println!("  Enums:         {}", ruleset.enums.len());
+            for e in &ruleset.enums {
+                println!("    - {} ({} values)", e.key, e.values.len());
+            }
+            println!("  Aliases:       {}", ruleset.aliases.len());
+            println!("  SingleAliases: {}", ruleset.single_aliases.len());
+            println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
         }
         Commands::Validate { game, directory, rules } => {
             use cwtools_game::constants::Game;
@@ -236,20 +271,17 @@ fn main() {
                 std::process::exit(1);
             });
 
-            println!("Validating {} files in {} against {}", game_id, directory.display(), rules.display());
+            let rules_label = if rules.is_dir() {
+                format!("directory {}", rules.display())
+            } else {
+                format!("file {}", rules.display())
+            };
+            println!("Validating {} files in {} against rules {}", game_id, directory.display(), rules_label);
 
-            // Parse rules (shares its StringTable)
-            let rules_str = std::fs::read_to_string(&rules).unwrap_or_else(|e| {
-                eprintln!("Error reading rules {}: {}", rules.display(), e);
-                std::process::exit(1);
-            });
+            // Parse rules (shares its StringTable with game files)
             let rules_table = StringTable::new();
-            let rules_parsed = parse_string(&rules_str, &rules_table).unwrap_or_else(|e| {
-                eprintln!("Error parsing rules {}: {}", rules.display(), e);
-                std::process::exit(1);
-            });
-            let ruleset = ast_to_ruleset(&rules_parsed, &rules_table);
-            println!("  Loaded {} types, {} enums", ruleset.types.len(), ruleset.enums.len());
+            let ruleset = load_rules(&rules, &rules_table);
+            println!("  Loaded {} types, {} enums, {} aliases", ruleset.types.len(), ruleset.enums.len(), ruleset.aliases.len());
 
             // Discover and parse files using the SAME string table
             let config = search_config_for(&directory);
@@ -297,7 +329,6 @@ fn main() {
             println!("Scanning localisation in {}", directory.display());
             let service = LocService::from_folder(&directory);
 
-            // Collect all keys across all languages
             let mut all_files = Vec::new();
             for (_, result) in service.results() {
                 if let Ok(file) = result {
@@ -308,7 +339,6 @@ fn main() {
             println!("  Total unique keys: {}", all_keys.len());
 
             let hardcoded: Vec<&str> = vec![
-                // Common hardcoded loc refs across games
                 "Player", "Root", "From", "Prev", "Capital", "Random", "This",
                 "Country", "Ruler", "GetName", "GetName2", "GetSpeciesName",
                 "GetSpeciesNamePlural", "GetSpeciesAdj", "GetTitle",

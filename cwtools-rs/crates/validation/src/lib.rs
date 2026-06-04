@@ -111,14 +111,32 @@ pub fn validate_ast(
             _ => None,
         };
 
-        if let Some((type_key, type_def, children, inner_rules)) = exact_match {
+        if let Some((_type_key, type_def, children, inner_rules)) = exact_match {
+            // Only content-validate when the matched type actually has rules; a
+            // type[x] declared solely for instance indexing (path/name_field, no
+            // rule body) must not flag its instance fields as unexpected.
+            let has_content_rules = !inner_rules.is_empty()
+                || type_def.subtypes.iter().any(|st| !st.rules.is_empty());
+            if has_content_rules {
                 validate_with_type(type_def, children, ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
-            continue;
+                continue;
+            }
+            // matched by name but instance-only: fall through to path matching
         }
 
         // 2. Fallback: path-based matching
         if let Some(type_def) = path_type {
             let inner_rules = find_rules_by_name(&type_def.name, ruleset);
+
+            // A `type[x] = { path = ... name_field = ... }` with no associated rule
+            // body exists only to index instances of that type; its instances are
+            // not content-validated (matching F#). Skip when there is nothing to
+            // validate against, otherwise every field reads as "unexpected".
+            let has_content_rules = !inner_rules.is_empty()
+                || type_def.subtypes.iter().any(|st| !st.rules.is_empty());
+            if !has_content_rules {
+                continue;
+            }
 
             // Determine if the root node should be treated as a wrapper.
             // Official CWT rules use skip_root_key = any for this, but many
@@ -179,6 +197,13 @@ pub fn validate_ast(
 }
 
 /// Validate a set of children against a type's rules, handling subtypes.
+///
+/// Follows F# memoizeRules logic: collect the base rules (non-SubtypeRule entries from
+/// inner_rules) plus the rules of every matching subtype into a single merged list, then
+/// validate the children once against that union.  This means:
+///   - cardinality is counted over the merged rule set, not per-subtype in isolation
+///   - a field that exists in any matching subtype is not "unexpected"
+///   - SubtypeRule entries that don't match are silently skipped
 fn validate_with_type(
     type_def: &TypeDefinition,
     children: &[Child],
@@ -193,33 +218,115 @@ fn validate_with_type(
     ruleset: &RuleSet,
 ) {
     if type_def.subtypes.is_empty() {
+        let pre_count = errors.len();
         validate_children(children, ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
-    } else {
-        for subtype in &type_def.subtypes {
-            let should_apply = if let Some(ref filter_key) = subtype.type_key_field {
-                children.iter().any(|c| child_key_matches(c, ast, table, filter_key))
-            } else {
-                true
-            };
-            if should_apply {
-                // Look up the actual validation rules for this subtype from the root rule.
-                // The SubtypeRule in inner_rules carries the real parsed rules, whereas
-                // the type_def's SubTypeDefinition only stores metadata.
-                let subtype_rules = find_subtype_rules(subtype.name.as_str(), inner_rules)
-                    .unwrap_or(&subtype.rules);
-                
-                let saved = scope_context.as_ref().map(|ctx| ctx.save());
-                if let Some(ctx) = scope_context.as_mut() {
-                    if let Some(ref push_scope) = subtype.push_scope {
-                        ctx.change_scope(push_scope);
-                    }
-                }
-                validate_children(children, ast, subtype_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
-                if let (Some(saved), Some(ctx)) = (saved, scope_context.as_mut()) {
-                    ctx.restore(saved);
+        // Item 9: warning_only
+        if type_def.warning_only {
+            for err in errors[pre_count..].iter_mut() {
+                if err.severity == ErrorSeverity::Error {
+                    err.severity = ErrorSeverity::Warning;
                 }
             }
         }
+        return;
+    }
+
+    // Step 1: determine which subtypes match (F# testSubtype logic).
+    // A subtype matches when:
+    //   (a) type_key_field is None, OR the children contain a field whose key equals type_key_field
+    //   (b) starts_with is None, OR (no-op here; starts_with filters by the node's OWN key which
+    //       we don't have at this point — conservative: treat as matching)
+    // Mutual-exclusion via only_if_not is applied after the initial pass.
+    let mut matched_subtype_names: Vec<&str> = Vec::new();
+    for subtype in &type_def.subtypes {
+        let key_ok = subtype.type_key_field.as_ref()
+            .map(|fk| children.iter().any(|c| child_key_matches(c, ast, table, fk)))
+            .unwrap_or(true);
+        if key_ok {
+            matched_subtype_names.push(subtype.name.as_str());
+        }
+    }
+    // Apply only_if_not: remove a subtype if any of its only_if_not names are in the matched set.
+    let all_names_copy: Vec<&str> = matched_subtype_names.clone();
+    matched_subtype_names.retain(|name| {
+        let st = type_def.subtypes.iter().find(|s| s.name == *name).unwrap();
+        !st.only_if_not.iter().any(|excl| all_names_copy.contains(&excl.as_str()))
+    });
+
+    // Step 2: collect base rules (non-SubtypeRule entries) + matching SubtypeRule entries.
+    // This mirrors F# memoizeRules which expands SubtypeRule(key, shouldMatch, cfs) based on
+    // whether key is in the active subtypes list.
+    //
+    // Two sources of rules:
+    //   (A) inner_rules — from a separate `type_name = { ... }` TypeRule in the ruleset.
+    //       SubtypeRule entries inside it are expanded per the active subtype set.
+    //   (B) type_def.subtypes[i].rules — rules stored directly on SubTypeDefinition.
+    //       These are populated when the type is defined ONLY via `types = { type[x] = { subtype[y] = { ... } } }`
+    //       with no separate `x = { subtype[y] = { ... } }` rule block.
+    //
+    // If inner_rules has SubtypeRule entries, use path (A).  Otherwise fall back to (B).
+    let inner_has_subtype_rules = inner_rules.iter().any(|(rt, _)| matches!(rt, RuleType::SubtypeRule { .. }));
+
+    let mut merged: Vec<(RuleType, Options)> = Vec::new();
+    if inner_has_subtype_rules {
+        // Path A: expand SubtypeRule entries from inner_rules
+        for (rule_type, opts) in inner_rules {
+            match rule_type {
+                RuleType::SubtypeRule { name, positive, rules: st_rules } => {
+                    let is_active = matched_subtype_names.contains(&name.as_str());
+                    let should_include = if *positive { is_active } else { !is_active };
+                    if should_include {
+                        merged.extend(st_rules.iter().cloned());
+                    }
+                }
+                _ => {
+                    merged.push((rule_type.clone(), opts.clone()));
+                }
+            }
+        }
+    } else {
+        // Path B: pull rules directly from the matching SubTypeDefinition entries.
+        // Base (non-subtype) rules come from inner_rules as-is.
+        merged.extend(inner_rules.iter().cloned());
+        for subtype in &type_def.subtypes {
+            if matched_subtype_names.contains(&subtype.name.as_str()) {
+                merged.extend(subtype.rules.iter().cloned());
+            }
+        }
+    }
+
+    // Step 3: if no subtypes matched and there are no base rules, there's nothing to validate.
+    // This handles the case where a type is defined purely via subtypes: a script object that
+    // doesn't match any subtype discriminator is silently accepted.
+    if matched_subtype_names.is_empty() && merged.is_empty() {
+        return;
+    }
+
+    // Step 4: pick push_scope from the first matching subtype that has one.
+    let push_scope: Option<&str> = type_def.subtypes.iter()
+        .filter(|s| matched_subtype_names.contains(&s.name.as_str()))
+        .find_map(|s| s.push_scope.as_deref());
+
+    let saved = scope_context.as_ref().map(|ctx| ctx.save());
+    if let (Some(ps), Some(ctx)) = (push_scope, scope_context.as_mut()) {
+        ctx.change_scope(ps);
+    }
+
+    // Step 5: validate children once against the merged rule set.
+    let pre_count = errors.len();
+    validate_children(children, ast, &merged, enum_map, table, errors, file_path, scope_context, game, ruleset);
+
+    // Item 9: warning_only — downgrade all newly-added errors to warnings (F# RuleValidationService.fs:916).
+    if type_def.warning_only {
+        for err in errors[pre_count..].iter_mut() {
+            if err.severity == ErrorSeverity::Error {
+                err.severity = ErrorSeverity::Warning;
+            }
+        }
+    }
+
+    if let (Some(saved), Some(ctx)) = (saved, scope_context.as_mut()) {
+        ctx.restore(saved);
     }
 }
 
@@ -352,7 +459,15 @@ fn validate_children(
     game: Option<Game>,
     ruleset: &RuleSet,
 ) {
+    // Track occurrence counts for cardinality checking.
+    // Keyed children (Leaf/Node): key string -> count.
     let mut key_counts: HashMap<String, usize> = HashMap::new();
+    // Item 5: LeafValues — count per LeafValueRule index.
+    let mut leafvalue_counts: Vec<usize> = vec![0usize; rules.len()];
+    // Item 5: ValueClause — count per ValueClauseRule index.
+    let mut valueclause_counts: Vec<usize> = vec![0usize; rules.len()];
+
+    // First pass: count occurrences of all children kinds.
     for child in children {
         match child {
             Child::Leaf(idx) => {
@@ -365,10 +480,30 @@ fn validate_children(
                 let key = table.get_string(node.key.normal).unwrap_or_default();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
+            Child::LeafValue(lvidx) => {
+                let lv = &ast.arena.leaf_values[*lvidx as usize];
+                for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
+                    if let RuleType::LeafValueRule { right } = rule_type {
+                        if field_matches_value(right, &lv.value, table, enum_map) {
+                            leafvalue_counts[rule_idx] += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            Child::ValueClause(_) => {
+                for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
+                    if matches!(rule_type, RuleType::ValueClauseRule { .. }) {
+                        valueclause_counts[rule_idx] += 1;
+                        break;
+                    }
+                }
+            }
             _ => {}
         }
     }
 
+    // Second pass: validate each child.
     for child in children {
         match child {
             Child::Leaf(idx) => {
@@ -378,46 +513,104 @@ fn validate_children(
                 for (rule_type, opts) in rules {
                     if rule_matches_leaf_key(rule_type, &key, ruleset) {
                         matched = true;
-                        // Check required_scopes before validating value
-                        if let Some(ctx) = scope_context {
-                            if let Some(current) = ctx.current() {
-                                if let Some(g) = game {
-                                    if !opts.required_scopes.is_empty() && !scope_matches_required(current, g, &opts.required_scopes) {
-                                        errors.push(ValidationError {
-                                            message: format!("Field '{}' requires scope {:?}, but current scope is {:?}", key, opts.required_scopes, get_scope_name(current, g)),
-                                            severity: ErrorSeverity::Warning,
-                                            line: leaf.pos.start.line,
-                                            col: leaf.pos.start.col,
-                                            file: file_path.to_string(),
-                                        });
-                                    }
+                        // Item 8: required_scopes check for Leaf
+                        if let Some(current) = scope_context.as_ref().and_then(|ctx| ctx.current()) {
+                            if let Some(g) = game {
+                                if !opts.required_scopes.is_empty() && !scope_matches_required(current, g, &opts.required_scopes) {
+                                    errors.push(ValidationError {
+                                        message: format!(
+                                            "Field '{}' requires scope {:?}, but current scope is '{}'",
+                                            key, opts.required_scopes, get_scope_name(current, g)
+                                        ),
+                                        severity: ErrorSeverity::Warning,
+                                        line: leaf.pos.start.line,
+                                        col: leaf.pos.start.col,
+                                        file: file_path.to_string(),
+                                    });
                                 }
                             }
                         }
                         match rule_type {
-                            RuleType::LeafRule { .. } => {
-                                validate_leaf(leaf, rule_type, table, enum_map, errors, file_path);
-                            }
-                            RuleType::NodeRule { rules: inner_rules, .. } => {
-                                // A Leaf with a Clause value is effectively a Node — recurse into its children
-                                if let Value::Clause(children) = &leaf.value {
-                                    let saved = scope_context.as_ref().map(|ctx| ctx.save());
-                                    if let Some(ctx) = scope_context.as_mut() {
-                                        if let Some(ref push) = opts.push_scope {
-                                            ctx.change_scope(push);
-                                        }
-                                        if let Some(ref replace) = opts.replace_scopes {
-                                            apply_replace_scopes(ctx, replace);
+                            RuleType::LeafRule { left, .. } => {
+                                // Item 6: alias expansion — when the rule is AliasField(cat), look up
+                                // the specific `cat:key` alias and validate against its right side.
+                                if let NewField::AliasField(category) = left {
+                                    let alias_key = format!("{}:{}", category, key);
+                                    if let Some((_, alias_rule)) = ruleset.aliases.iter().find(|(n, _)| n == &alias_key) {
+                                        match alias_rule {
+                                            (RuleType::LeafRule { .. }, _) => {
+                                                validate_leaf(leaf, &alias_rule.0, table, enum_map, errors, file_path);
+                                            }
+                                            (RuleType::NodeRule { rules: alias_inner, .. }, alias_opts) => {
+                                                if let Value::Clause(clause_children) = &leaf.value {
+                                                    let saved = scope_context.as_ref().map(|ctx| ctx.save());
+                                                    if let Some(ctx) = scope_context.as_mut() {
+                                                        if let Some(ref push) = alias_opts.push_scope {
+                                                            ctx.change_scope(push);
+                                                        }
+                                                        if let Some(ref replace) = alias_opts.replace_scopes {
+                                                            apply_replace_scopes(ctx, replace, game);
+                                                        }
+                                                    }
+                                                    validate_children(clause_children, ast, alias_inner, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                                                    if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
+                                                        ctx.restore(saved);
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
                                         }
                                     }
-        validate_children(children, ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
-                                    if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
-                                        ctx.restore(saved);
+                                    // If alias category is unloaded (empty), accept silently.
+                                } else {
+                                    validate_leaf(leaf, rule_type, table, enum_map, errors, file_path);
+                                }
+                            }
+                            RuleType::NodeRule { left, rules: inner_rules, .. } => {
+                                // Item 6: alias expansion for NodeRule with AliasField left
+                                if let NewField::AliasField(category) = left {
+                                    let alias_key = format!("{}:{}", category, key);
+                                    if let Some((_, alias_rule)) = ruleset.aliases.iter().find(|(n, _)| n == &alias_key) {
+                                        if let (RuleType::NodeRule { rules: alias_inner, .. }, alias_opts) = alias_rule {
+                                            if let Value::Clause(clause_children) = &leaf.value {
+                                                let saved = scope_context.as_ref().map(|ctx| ctx.save());
+                                                if let Some(ctx) = scope_context.as_mut() {
+                                                    if let Some(ref push) = alias_opts.push_scope {
+                                                        ctx.change_scope(push);
+                                                    }
+                                                    if let Some(ref replace) = alias_opts.replace_scopes {
+                                                        apply_replace_scopes(ctx, replace, game);
+                                                    }
+                                                }
+                                                validate_children(clause_children, ast, alias_inner, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                                                if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
+                                                    ctx.restore(saved);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // A Leaf with a Clause value is effectively a Node — recurse into its children.
+                                    if let Value::Clause(clause_children) = &leaf.value {
+                                        let saved = scope_context.as_ref().map(|ctx| ctx.save());
+                                        if let Some(ctx) = scope_context.as_mut() {
+                                            if let Some(ref push) = opts.push_scope {
+                                                ctx.change_scope(push);
+                                            }
+                                            if let Some(ref replace) = opts.replace_scopes {
+                                                apply_replace_scopes(ctx, replace, game);
+                                            }
+                                        }
+                                        validate_children(clause_children, ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                                        if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
+                                            ctx.restore(saved);
+                                        }
                                     }
                                 }
                             }
                             _ => {}
                         }
+                        break; // first matching rule wins
                     }
                 }
                 if !matched {
@@ -437,30 +630,68 @@ fn validate_children(
                 for (rule_type, opts) in rules {
                     if rule_matches_node_key(rule_type, &key, ruleset) {
                         matched = true;
-                        match rule_type {
-                            RuleType::NodeRule { rules: inner_rules, .. } => {
-                                // Apply push_scope / replace_scopes before recursing
-                                let saved = scope_context.as_ref().map(|ctx| ctx.save());
-                                if let Some(ctx) = scope_context.as_mut() {
-                                    if let Some(ref push) = opts.push_scope {
-                                        ctx.change_scope(push);
-                                    }
-                                    if let Some(ref replace) = opts.replace_scopes {
-                                        // Apply replace_scopes: update root, this, from, prev
-                                        apply_replace_scopes(ctx, replace);
-                                    }
+                        // Item 8: required_scopes check for Node
+                        if let Some(current) = scope_context.as_ref().and_then(|ctx| ctx.current()) {
+                            if let Some(g) = game {
+                                if !opts.required_scopes.is_empty() && !scope_matches_required(current, g, &opts.required_scopes) {
+                                    errors.push(ValidationError {
+                                        message: format!(
+                                            "Block '{}' requires scope {:?}, but current scope is '{}'",
+                                            key, opts.required_scopes, get_scope_name(current, g)
+                                        ),
+                                        severity: ErrorSeverity::Warning,
+                                        line: node.pos.start.line,
+                                        col: node.pos.start.col,
+                                        file: file_path.to_string(),
+                                    });
                                 }
-                                validate_children(
-                                    &node.children, ast, inner_rules, enum_map, table, errors,
-                                    file_path, scope_context, game, ruleset,
-                                );
-                                // Restore scope after recursing
-                                if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
-                                    ctx.restore(saved);
+                            }
+                        }
+                        match rule_type {
+                            // Item 6: alias expansion for Node children
+                            RuleType::NodeRule { left, rules: inner_rules, .. } => {
+                                if let NewField::AliasField(category) = left {
+                                    let alias_key = format!("{}:{}", category, key);
+                                    if let Some((_, alias_rule)) = ruleset.aliases.iter().find(|(n, _)| n == &alias_key) {
+                                        if let (RuleType::NodeRule { rules: alias_inner, .. }, alias_opts) = alias_rule {
+                                            let saved = scope_context.as_ref().map(|ctx| ctx.save());
+                                            if let Some(ctx) = scope_context.as_mut() {
+                                                if let Some(ref push) = alias_opts.push_scope {
+                                                    ctx.change_scope(push);
+                                                }
+                                                if let Some(ref replace) = alias_opts.replace_scopes {
+                                                    apply_replace_scopes(ctx, replace, game);
+                                                }
+                                            }
+                                            validate_children(&node.children, ast, alias_inner, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                                            if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
+                                                ctx.restore(saved);
+                                            }
+                                        }
+                                    }
+                                    // If the alias is unloaded, accept silently.
+                                } else {
+                                    let saved = scope_context.as_ref().map(|ctx| ctx.save());
+                                    if let Some(ctx) = scope_context.as_mut() {
+                                        if let Some(ref push) = opts.push_scope {
+                                            ctx.change_scope(push);
+                                        }
+                                        if let Some(ref replace) = opts.replace_scopes {
+                                            apply_replace_scopes(ctx, replace, game);
+                                        }
+                                    }
+                                    validate_children(
+                                        &node.children, ast, inner_rules, enum_map, table, errors,
+                                        file_path, scope_context, game, ruleset,
+                                    );
+                                    if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
+                                        ctx.restore(saved);
+                                    }
                                 }
                             }
                             _ => {}
                         }
+                        break; // first matching rule wins
                     }
                 }
                 if !matched {
@@ -473,36 +704,128 @@ fn validate_children(
                     });
                 }
             }
+            // Item 5: LeafValue validation
+            Child::LeafValue(lvidx) => {
+                let lv = &ast.arena.leaf_values[*lvidx as usize];
+                let mut matched = false;
+                for (rule_type, _opts) in rules {
+                    if let RuleType::LeafValueRule { right } = rule_type {
+                        if field_matches_value(right, &lv.value, table, enum_map) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if !matched {
+                    let val_str = leaf_value_to_string(&lv.value, table);
+                    errors.push(ValidationError {
+                        message: format!("Unexpected bare value '{}'", val_str),
+                        severity: ErrorSeverity::Warning,
+                        line: lv.pos.start.line,
+                        col: lv.pos.start.col,
+                        file: file_path.to_string(),
+                    });
+                }
+            }
+            // Item 5: ValueClause validation
+            Child::ValueClause(vcidx) => {
+                let vc = &ast.arena.value_clauses[*vcidx as usize];
+                let mut matched = false;
+                for (rule_type, _opts) in rules {
+                    if let RuleType::ValueClauseRule { rules: vc_rules } = rule_type {
+                        matched = true;
+                        validate_children(&vc.children, ast, vc_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                        break;
+                    }
+                }
+                if !matched {
+                    errors.push(ValidationError {
+                        message: "Unexpected value clause '{...}'".to_string(),
+                        severity: ErrorSeverity::Warning,
+                        line: vc.pos.start.line,
+                        col: vc.pos.start.col,
+                        file: file_path.to_string(),
+                    });
+                }
+            }
             _ => {}
         }
     }
 
-    for (rule_type, opts) in rules {
-        if let Some(key) = get_rule_key(rule_type) {
-            let count = key_counts.get(&key).copied().unwrap_or(0) as i32;
-            let sev = opts.severity.as_ref().map(|s| severity_to_error(s.clone())).unwrap_or(ErrorSeverity::Error);
-            if count < opts.min {
-                errors.push(ValidationError {
-                    message: format!("Field '{}' appears {} time(s), expected at least {}", key, count, opts.min),
-                    severity: sev, line: 0, col: 0, file: file_path.to_string(),
-                });
+    // Cardinality enforcement
+    for (rule_idx, (rule_type, opts)) in rules.iter().enumerate() {
+        // Item 7: when strict_min=false, missing required fields are warnings not errors.
+        let missing_sev = if opts.strict_min {
+            opts.severity.as_ref().map(|s| severity_to_error(s.clone())).unwrap_or(ErrorSeverity::Error)
+        } else {
+            ErrorSeverity::Warning
+        };
+        let max_sev = opts.severity.as_ref().map(|s| severity_to_error(s.clone())).unwrap_or(ErrorSeverity::Error);
+
+        match rule_type {
+            RuleType::LeafRule { .. } | RuleType::NodeRule { .. } => {
+                if let Some(key) = get_rule_key(rule_type) {
+                    let count = key_counts.get(&key).copied().unwrap_or(0) as i32;
+                    if count < opts.min {
+                        errors.push(ValidationError {
+                            message: format!("Field '{}' appears {} time(s), expected at least {}", key, count, opts.min),
+                            severity: missing_sev, line: 0, col: 0, file: file_path.to_string(),
+                        });
+                    }
+                    if count > opts.max {
+                        errors.push(ValidationError {
+                            message: format!("Field '{}' appears {} time(s), expected at most {}", key, count, opts.max),
+                            severity: max_sev, line: 0, col: 0, file: file_path.to_string(),
+                        });
+                    }
+                }
             }
-            if count > opts.max {
-                errors.push(ValidationError {
-                    message: format!("Field '{}' appears {} time(s), expected at most {}", key, count, opts.max),
-                    severity: sev, line: 0, col: 0, file: file_path.to_string(),
-                });
+            // Item 5: LeafValueRule cardinality
+            RuleType::LeafValueRule { right } => {
+                let count = leafvalue_counts[rule_idx] as i32;
+                if count < opts.min {
+                    errors.push(ValidationError {
+                        message: format!("LeafValue {:?} appears {} time(s), expected at least {}", right, count, opts.min),
+                        severity: missing_sev, line: 0, col: 0, file: file_path.to_string(),
+                    });
+                }
+                if count > opts.max {
+                    errors.push(ValidationError {
+                        message: format!("LeafValue {:?} appears {} time(s), expected at most {}", right, count, opts.max),
+                        severity: max_sev, line: 0, col: 0, file: file_path.to_string(),
+                    });
+                }
             }
+            // Item 5: ValueClauseRule cardinality
+            RuleType::ValueClauseRule { .. } => {
+                let count = valueclause_counts[rule_idx] as i32;
+                if count < opts.min {
+                    errors.push(ValidationError {
+                        message: format!("ValueClause appears {} time(s), expected at least {}", count, opts.min),
+                        severity: missing_sev, line: 0, col: 0, file: file_path.to_string(),
+                    });
+                }
+                if count > opts.max {
+                    errors.push(ValidationError {
+                        message: format!("ValueClause appears {} time(s), expected at most {}", count, opts.max),
+                        severity: max_sev, line: 0, col: 0, file: file_path.to_string(),
+                    });
+                }
+            }
+            _ => {}
         }
     }
 }
 
-fn apply_replace_scopes(_ctx: &mut ScopeContext, replace: &ReplaceScopes) {
-    // TODO: implement proper replace_scopes
-    // For now, just note that it was applied (placeholder)
-    if let Some(ref root) = replace.root {
-        // Would need to map scope name to ScopeId
-        let _ = root;
+fn apply_replace_scopes(ctx: &mut ScopeContext, replace: &ReplaceScopes, game: Option<Game>) {
+    if let Some(g) = game {
+        ctx.apply_replace_scope(
+            replace.root.as_deref(),
+            replace.this.as_deref(),
+            &replace.froms,
+            &replace.prevs,
+            g,
+        );
     }
 }
 
@@ -583,25 +906,119 @@ fn validate_leaf(
     }
 }
 
+/// Check that a string has the YYYY.MM.DD shape for a CW date field.
+fn is_date_shape(s: &str) -> bool {
+    // Accept YYYY.MM.DD or YYYY.M.D — split by '.' and check 3 numeric parts
+    let parts: Vec<&str> = s.splitn(4, '.').collect();
+    parts.len() >= 3 && parts[0].parse::<i32>().is_ok()
+        && parts[1].parse::<u32>().is_ok()
+        && parts[2].parse::<u32>().is_ok()
+}
+
+/// Check that a string has the YYYY.MM.DD.HH shape for a CW datetime field.
+fn is_datetime_shape(s: &str) -> bool {
+    // Allow 3 or 4 dot-separated numeric parts
+    is_date_shape(s)
+}
+
 fn field_matches_value(field: &NewField, value: &Value, table: &StringTable, enum_map: &HashMap<&str, &EnumDefinition>) -> bool {
+    // Item 2: VALUE-VALIDATOR BYPASSES (F# FieldValidators.fs:82-83, 836-839).
+    // Before any type-specific checks, accept scripted variables (@...), localisation
+    // references ($$), and inline math ([...]).  These are valid CW script idioms that
+    // can legitimately appear in place of any typed value.
+    match value {
+        Value::String(t) | Value::QString(t) => {
+            let text = table.get_string(t.normal).unwrap_or_default();
+            if text.starts_with('@') || text.contains("$$") || text.starts_with('[') {
+                return true;
+            }
+        }
+        _ => {}
+    }
+
     match (field, value) {
+        // --- Boolean ---
         (NewField::ValueField(ValueType::Bool), Value::Bool(_)) => true,
-        (NewField::ValueField(ValueType::Int { min, max }), Value::Int(v)) => { let v_i = *v as i32; v_i >= *min && v_i <= *max }
+        (NewField::ValueField(ValueType::Bool), Value::String(t)) | (NewField::ValueField(ValueType::Bool), Value::QString(t)) => {
+            let v = table.get_string(t.normal).unwrap_or_default().to_lowercase();
+            v == "yes" || v == "no"
+        }
+
+        // --- Int with range enforcement (item 4) ---
+        (NewField::ValueField(ValueType::Int { min, max }), Value::Int(v)) => {
+            let v_i = *v as i32;
+            v_i >= *min && v_i <= *max
+        }
+        (NewField::ValueField(ValueType::Int { min, max }), Value::String(t)) | (NewField::ValueField(ValueType::Int { min, max }), Value::QString(t)) => {
+            let text = table.get_string(t.normal).unwrap_or_default();
+            if let Ok(v) = text.parse::<i32>() {
+                v >= *min && v <= *max
+            } else {
+                false
+            }
+        }
+
+        // --- Float with range enforcement (item 4) ---
         (NewField::ValueField(ValueType::Float { min, max }), Value::Float(v)) => { *v >= *min && *v <= *max }
+        (NewField::ValueField(ValueType::Float { min, max }), Value::String(t)) | (NewField::ValueField(ValueType::Float { min, max }), Value::QString(t)) => {
+            let text = table.get_string(t.normal).unwrap_or_default();
+            if let Ok(v) = text.parse::<f64>() {
+                v >= *min && v <= *max
+            } else {
+                false
+            }
+        }
+
+        // --- Enum ---
         (NewField::ValueField(ValueType::Enum(enum_name)), Value::String(t))
         | (NewField::ValueField(ValueType::Enum(enum_name)), Value::QString(t)) => {
             let text = table.get_string(t.normal).unwrap_or_default();
             match enum_map.get(enum_name.as_str()) {
                 Some(enum_def) => enum_def.values.contains(&text),
-                // Unknown enums (complex enums, unloaded enums) can't be statically validated here.
-                // Accept them to avoid false positives.
-                None => true,
+                None => true, // unknown/complex enums can't be validated statically
             }
         }
+
+        // --- Percent (item 3): value ends with '%' or is a number ---
+        (NewField::ValueField(ValueType::Percent), Value::String(t)) | (NewField::ValueField(ValueType::Percent), Value::QString(t)) => {
+            let text = table.get_string(t.normal).unwrap_or_default();
+            text.ends_with('%') || text.parse::<f64>().is_ok()
+        }
+        (NewField::ValueField(ValueType::Percent), Value::Float(_) | Value::Int(_)) => true,
+
+        // --- Date / DateTime (item 3): basic YYYY.MM.DD[.HH] shape ---
+        (NewField::ValueField(ValueType::Date), Value::String(t)) | (NewField::ValueField(ValueType::Date), Value::QString(t)) => {
+            is_date_shape(&table.get_string(t.normal).unwrap_or_default())
+        }
+        (NewField::ValueField(ValueType::DateTime), Value::String(t)) | (NewField::ValueField(ValueType::DateTime), Value::QString(t)) => {
+            is_datetime_shape(&table.get_string(t.normal).unwrap_or_default())
+        }
+
+        // --- Ck2Dna (item 3): exactly 32 hex chars (F# FieldValidators.fs:194-204) ---
+        (NewField::ValueField(ValueType::Ck2Dna), Value::String(t)) | (NewField::ValueField(ValueType::Ck2Dna), Value::QString(t)) => {
+            let text = table.get_string(t.normal).unwrap_or_default();
+            text.len() == 32 && text.chars().all(|c| c.is_ascii_hexdigit())
+        }
+
+        // --- Ck2DnaProperty (item 3): length 8 or 32, hex chars (F# FieldValidators.fs:205-211) ---
+        (NewField::ValueField(ValueType::Ck2DnaProperty), Value::String(t)) | (NewField::ValueField(ValueType::Ck2DnaProperty), Value::QString(t)) => {
+            let text = table.get_string(t.normal).unwrap_or_default();
+            (text.len() == 8 || text.len() == 32) && text.chars().all(|c| c.is_ascii_hexdigit())
+        }
+
+        // --- IrFamilyName / StlNameFormat (item 3): accept any string ---
+        (NewField::ValueField(ValueType::IrFamilyName), Value::String(_) | Value::QString(_)) => true,
+        (NewField::ValueField(ValueType::StlNameFormat(_)), Value::String(_) | Value::QString(_)) => true,
+
+        // --- Scalar: accept anything ---
         (NewField::ScalarField, _) => true,
+
+        // --- SpecificField: exact string match ---
         (NewField::SpecificField(s), Value::String(t)) | (NewField::SpecificField(s), Value::QString(t)) => {
             table.get_string(t.normal).unwrap_or_default() == *s
         }
+
+        // --- TypeField: accept string (cross-file existence is a separate pass) ---
         (NewField::TypeField(TypeType::Simple(type_name)), Value::String(t))
         | (NewField::TypeField(TypeType::Simple(type_name)), Value::QString(t)) => {
             validate_type_reference(&table.get_string(t.normal).unwrap_or_default(), type_name)
@@ -610,10 +1027,14 @@ fn field_matches_value(field: &NewField, value: &Value, table: &StringTable, enu
         | (NewField::TypeField(TypeType::Complex { name, .. }), Value::QString(t)) => {
             validate_type_reference(&table.get_string(t.normal).unwrap_or_default(), name)
         }
+
+        // --- ScopeField ---
         (NewField::ScopeField(_), Value::String(t)) | (NewField::ScopeField(_), Value::QString(t)) => {
             let text = table.get_string(t.normal).unwrap_or_default();
             text.starts_with("scope[") || ["root","this","from","prev","capital","random","trigger"].contains(&text.as_str())
         }
+
+        // --- VariableField with range enforcement (item 4) ---
         (NewField::VariableField { min, max, .. }, Value::Float(v)) => { *v >= *min && *v <= *max }
         (NewField::VariableField { min, max, .. }, Value::Int(v)) => { (*v as f64) >= *min && (*v as f64) <= *max }
         (NewField::VariableField { min, max, .. }, Value::String(t)) | (NewField::VariableField { min, max, .. }, Value::QString(t)) => {
@@ -621,32 +1042,55 @@ fn field_matches_value(field: &NewField, value: &Value, table: &StringTable, enu
             if let Ok(v) = text.parse::<f64>() {
                 v >= *min && v <= *max
             } else {
-                false
+                // non-numeric string: accept (could be a scripted variable not caught by bypass)
+                true
             }
         }
+
+        // --- LocalisationField / FilepathField ---
         (NewField::LocalisationField { .. }, Value::String(_) | Value::QString(_)) => true,
         (NewField::FilepathField { .. }, Value::String(_) | Value::QString(_)) => true,
-        (NewField::ValueField(ValueType::Bool), Value::String(t)) | (NewField::ValueField(ValueType::Bool), Value::QString(t)) => { let v = table.get_string(t.normal).unwrap_or_default().to_lowercase(); v == "yes" || v == "no" }
-        (NewField::ValueField(ValueType::Int { .. }), Value::String(t)) | (NewField::ValueField(ValueType::Int { .. }), Value::QString(t)) => { table.get_string(t.normal).unwrap_or_default().parse::<i32>().is_ok() }
-        (NewField::ValueField(ValueType::Float { .. }), Value::String(t)) | (NewField::ValueField(ValueType::Float { .. }), Value::QString(t)) => { table.get_string(t.normal).unwrap_or_default().parse::<f64>().is_ok() }
-        // AliasField and SingleAliasField on the right side accept clauses and strings
-        // TODO: implement deep validation against the alias / single_alias definition
+
+        // --- IconField (item 3): accept any string ---
+        (NewField::IconField(_), Value::String(_) | Value::QString(_)) => true,
+
+        // --- VariableGetField / VariableSetField (item 3): accept any string or numeric ---
+        (NewField::VariableGetField(_), _) => true,
+        (NewField::VariableSetField(_), _) => true,
+
+        // --- ValueScopeField / ValueScopeMarkerField (item 3): accept number, @var, or scope chain ---
+        (NewField::ValueScopeField { .. }, Value::Float(_) | Value::Int(_)) => true,
+        (NewField::ValueScopeField { .. }, Value::String(_) | Value::QString(_)) => true,
+        (NewField::ValueScopeMarkerField { .. }, Value::Float(_) | Value::Int(_)) => true,
+        (NewField::ValueScopeMarkerField { .. }, Value::String(_) | Value::QString(_)) => true,
+
+        // --- AliasValueKeysField (item 3): accept any string key ---
+        (NewField::AliasValueKeysField(_), Value::String(_) | Value::QString(_)) => true,
+
+        // --- AliasField / SingleAliasField: accept clause or string (deep validation TODO) ---
         (NewField::AliasField(_), Value::Clause(_)) => true,
         (NewField::AliasField(_), Value::String(_) | Value::QString(_)) => true,
         (NewField::SingleAliasField(_), Value::Clause(_)) => true,
         (NewField::SingleAliasField(_), Value::String(_) | Value::QString(_)) => true,
+
+        // --- MarkerField: accept anything (validated elsewhere) ---
+        (NewField::MarkerField(_), _) => true,
+
+        // --- IgnoreMarkerField / IgnoreField: always accept ---
+        (NewField::IgnoreMarkerField, _) => true,
+        (NewField::IgnoreField(_), _) => true,
+
         _ => false,
     }
 }
 
-fn validate_type_reference(text: &str, expected_type: &str) -> bool {
-    if text.is_empty() { return false; }
-    let clean = text.trim_start_matches('<').trim_end_matches('>');
-    if clean.contains('.') {
-        let parts: Vec<&str> = clean.split('.').collect();
-        if !parts.is_empty() && parts[0] == expected_type { return true; }
-    }
-    clean == expected_type || text == expected_type
+fn validate_type_reference(text: &str, _expected_type: &str) -> bool {
+    // A TypeField references an *instance* of the named type (e.g. a `node_type`
+    // rule is satisfied by `node_type_one`, a defined instance), not the literal
+    // type name. Verifying the instance actually exists needs a cross-file type
+    // index (built in the info crate); until that is wired in, accept any
+    // non-empty token rather than flag every valid reference as an error.
+    !text.is_empty()
 }
 
 fn leaf_value_to_string(value: &Value, table: &StringTable) -> String {

@@ -16,6 +16,133 @@
 use crate::commands::{key_to_language, Lang, LocEntry, LocFile, Position};
 use crate::loc_string::parse_loc_elements;
 
+// ---- UTF-8 BOM check -------------------------------------------------------
+
+/// UTF-8 byte-order mark bytes.
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// Diagnostic produced when a `.yml` loc file is missing the UTF-8 BOM.
+///
+/// Mirrors F# `STLLocalisationString.checkFileEncoding`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingBomDiagnostic {
+    /// The file name / stream name that failed the check.
+    pub file: String,
+}
+
+/// Check whether `bytes` starts with the UTF-8 BOM (0xEF 0xBB 0xBF).
+///
+/// Returns `Ok(())` when the BOM is present, `Err(MissingBomDiagnostic)`
+/// otherwise, so callers can emit the diagnostic without panicking.
+pub fn check_utf8_bom(bytes: &[u8], file: &str) -> Result<(), MissingBomDiagnostic> {
+    if bytes.len() >= 3 && bytes[..3] == UTF8_BOM {
+        Ok(())
+    } else {
+        Err(MissingBomDiagnostic { file: file.to_string() })
+    }
+}
+
+// ---- Language-header / filename diagnostics --------------------------------
+
+/// Diagnostic kind for YAML localisation filename / header issues.
+///
+/// Mirrors F# `STLLocalisationString.checkLocFileName` error codes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LangHeaderDiagnostic {
+    /// The file has no recognisable `l_xxx:` header (MissingLocFileLangHeader).
+    MissingLocFileLangHeader { file: String },
+    /// The filename carries no recognised language tag (MissingLocFileLang).
+    MissingLocFileLang { file: String },
+    /// The filename language tag and the header language tag disagree
+    /// (LocFileLangMismatch).
+    LocFileLangMismatch { file: String, filename_lang: Lang, header_lang: Lang },
+}
+
+/// Extract the language tag from a filename (stem only, without extension).
+///
+/// `"l_english"` is matched anywhere in the stem — e.g. a file named
+/// `events_l_english.yml` returns `Some(Lang::English)`.
+pub fn lang_from_filename(stem: &str) -> Option<Lang> {
+    let lower = stem.to_ascii_lowercase();
+    if lower.contains("l_english") { Some(Lang::English) }
+    else if lower.contains("l_french") { Some(Lang::French) }
+    else if lower.contains("l_german") { Some(Lang::German) }
+    else if lower.contains("l_spanish") { Some(Lang::Spanish) }
+    else if lower.contains("l_russian") { Some(Lang::Russian) }
+    else if lower.contains("l_polish") { Some(Lang::Polish) }
+    else if lower.contains("l_braz_por") { Some(Lang::BrazPor) }
+    else if lower.contains("l_simp_chinese") { Some(Lang::SimpChinese) }
+    else if lower.contains("l_japanese") { Some(Lang::Japanese) }
+    else if lower.contains("l_korean") { Some(Lang::Korean) }
+    else if lower.contains("l_turkish") { Some(Lang::Turkish) }
+    else if lower.contains("l_default") { Some(Lang::Default) }
+    else { None }
+}
+
+/// Validate the language header of a YAML loc file against the filename.
+///
+/// * If the file is `languages.yml`, skip all checks (special file).
+/// * If the header is `l_default`, treat as wildcard (OK for any filename).
+/// * If the header language is unrecognised → `MissingLocFileLangHeader`.
+/// * If the filename carries no language tag → `MissingLocFileLang`.
+/// * If header and filename disagree → `LocFileLangMismatch`.
+///
+/// `header_key` is the raw `l_xxx` token found in the file (without `:`).
+/// `file` is the path / name used for diagnostics.
+pub fn check_loc_file_lang(
+    file: &str,
+    header_key: &str,
+) -> Option<LangHeaderDiagnostic> {
+    // Derive the stem (basename without extension) from `file`
+    let stem = std::path::Path::new(file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file);
+
+    // Special-case: languages.yml is exempt from all checks
+    if stem.eq_ignore_ascii_case("languages") {
+        return None;
+    }
+
+    let header_lang = key_to_language(header_key);
+
+    // l_default in the header is always OK (mirrors F# `STLLang.Default` branch)
+    if header_key.eq_ignore_ascii_case("l_default") {
+        return None;
+    }
+
+    // Unrecognised header
+    let header_lang = match header_lang {
+        Some(l) => l,
+        None => {
+            return Some(LangHeaderDiagnostic::MissingLocFileLangHeader {
+                file: file.to_string(),
+            });
+        }
+    };
+
+    // Filename carries no language tag
+    let filename_lang = match lang_from_filename(stem) {
+        Some(l) => l,
+        None => {
+            return Some(LangHeaderDiagnostic::MissingLocFileLang {
+                file: file.to_string(),
+            });
+        }
+    };
+
+    // Mismatch
+    if filename_lang != header_lang {
+        return Some(LangHeaderDiagnostic::LocFileLangMismatch {
+            file: file.to_string(),
+            filename_lang,
+            header_lang,
+        });
+    }
+
+    None
+}
+
 /// Parse a single YAML localisation file from text.
 ///
 /// Returns `Err` if the language header is malformed.
@@ -97,6 +224,16 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
 
         let position = Position::new(name, i + 1, 1); // 1-based line numbers
 
+        // Check for chars outside the allowed loc-value Unicode ranges.
+        // Mirrors F# parser `desc` production which stops at the first
+        // char where `isLocValueChar` returns false, then records the
+        // position of that char as `errorRange`.
+        let error_range = find_invalid_loc_char(desc).map(|byte_off| {
+            // Work out which column the bad char is at (1-based)
+            let col = desc[..byte_off].chars().count() + 1;
+            Position::new(name, i + 1, col)
+        });
+
         // Lazy-parse loc elements (refs, commands, etc.)
         let elements = parse_loc_elements(desc);
         let refs: Vec<String> = elements
@@ -135,7 +272,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
             value: version,
             desc: desc.to_string(),
             position,
-            error_range: None, // populated later during validation
+            error_range, // set by isLocValueChar check above
             refs,
             commands,
             jomini_commands,
@@ -144,11 +281,78 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         i += 1;
     }
 
+    // Collect file-level diagnostics: header/filename lang validation
+    let mut file_diagnostics = Vec::new();
+    if let Some(diag) = check_loc_file_lang(name, language_key) {
+        let msg = match &diag {
+            LangHeaderDiagnostic::MissingLocFileLangHeader { file } => {
+                format!("CW-MissingLocFileLangHeader: '{}' has no recognised language header", file)
+            }
+            LangHeaderDiagnostic::MissingLocFileLang { file } => {
+                format!("CW-MissingLocFileLang: '{}' filename carries no language tag", file)
+            }
+            LangHeaderDiagnostic::LocFileLangMismatch { file, filename_lang, header_lang } => {
+                format!(
+                    "CW-LocFileLangMismatch: '{}' filename says '{}' but header says '{}'",
+                    file, filename_lang, header_lang
+                )
+            }
+        };
+        file_diagnostics.push(msg);
+    }
+
     Ok(LocFile {
         language_prefix: language_key.to_string(),
         lang,
         entries,
+        file_diagnostics,
     })
+}
+
+// ---- isLocValueChar --------------------------------------------------------
+
+/// Check whether a char falls within the allowed Unicode ranges for a loc value.
+///
+/// Mirrors F# `isLocValueChar` (YAMLLocalisationParser.fs:17-30).
+pub fn is_loc_value_char(c: char) -> bool {
+    let u = c as u32;
+    // ASCII letters
+    c.is_ascii_alphabetic()
+    // U+0020–U+007E  (printable ASCII)
+    || (u >= 0x0020 && u <= 0x007E)
+    // U+00A0–U+024F  (Latin Extended)
+    || (u >= 0x00A0 && u <= 0x024F)
+    // U+0401–U+045F  (Cyrillic)
+    || (u >= 0x0401 && u <= 0x045F)
+    // U+0490–U+0491  (Cyrillic supplement)
+    || (u >= 0x0490 && u <= 0x0491)
+    // U+1E00–U+1EFF  (Latin Extended Additional)
+    || (u >= 0x1E00 && u <= 0x1EFF)
+    // U+2013–U+2044  (General Punctuation subset)
+    || (u >= 0x2013 && u <= 0x2044)
+    // U+2460–U+24FF  (Enclosed Alphanumerics)
+    || (u >= 0x2460 && u <= 0x24FF)
+    // U+4E00–U+9FFF  (CJK Unified Ideographs)
+    || (u >= 0x4E00 && u <= 0x9FFF)
+    // U+3000–U+30FF  (CJK Symbols + Katakana/Hiragana)
+    || (u >= 0x3000 && u <= 0x30FF)
+    // U+FE30–U+FE4F  (CJK Compatibility Forms)
+    || (u >= 0xFE30 && u <= 0xFE4F)
+    // U+FF00–U+FFEF  (Halfwidth and Fullwidth Forms)
+    || (u >= 0xFF00 && u <= 0xFFEF)
+}
+
+/// Scan `desc` for the first character that fails `is_loc_value_char`.
+///
+/// Returns `Some(byte_offset)` at the position of the offending char,
+/// or `None` if all chars are valid.
+pub fn find_invalid_loc_char(desc: &str) -> Option<usize> {
+    for (offset, c) in desc.char_indices() {
+        if !is_loc_value_char(c) {
+            return Some(offset);
+        }
+    }
+    None
 }
 
 /// Quote / imbalanced-quote validation (mirrors F# `validateQuotes`).
@@ -327,6 +531,89 @@ mod tests {
     #[test]
     fn test_empty_file() {
         assert!(parse_loc_text("", "test.yml").is_err());
+    }
+
+    // ---- UTF-8 BOM tests ---------------------------------------------------
+
+    #[test]
+    fn test_bom_present() {
+        let bytes: &[u8] = &[0xEF, 0xBB, 0xBF, b'l', b'_'];
+        assert!(check_utf8_bom(bytes, "test.yml").is_ok());
+    }
+
+    #[test]
+    fn test_bom_missing() {
+        let bytes: &[u8] = b"l_english:\n";
+        let result = check_utf8_bom(bytes, "test.yml");
+        assert!(result.is_err());
+        let diag = result.unwrap_err();
+        assert_eq!(diag.file, "test.yml");
+    }
+
+    #[test]
+    fn test_bom_too_short() {
+        let bytes: &[u8] = &[0xEF, 0xBB];
+        assert!(check_utf8_bom(bytes, "short.yml").is_err());
+    }
+
+    #[test]
+    fn test_bom_wrong_bytes() {
+        // UTF-16 LE BOM — not a UTF-8 BOM
+        let bytes: &[u8] = &[0xFF, 0xFE, 0x00];
+        assert!(check_utf8_bom(bytes, "utf16.yml").is_err());
+    }
+
+    // ---- lang-header / filename diagnostics tests --------------------------
+
+    #[test]
+    fn test_lang_header_matching_filename() {
+        // events_l_english.yml with l_english: header — no diagnostic
+        let text = "l_english:\n key: \"value\"\n";
+        let file = parse_loc_text(text, "events_l_english.yml").unwrap();
+        assert!(file.file_diagnostics.is_empty(), "should have no diagnostics: {:?}", file.file_diagnostics);
+    }
+
+    #[test]
+    fn test_lang_header_mismatch() {
+        // events_l_english.yml but header says l_french:
+        let text = "l_french:\n key: \"value\"\n";
+        let file = parse_loc_text(text, "events_l_english.yml").unwrap();
+        assert_eq!(file.file_diagnostics.len(), 1);
+        assert!(file.file_diagnostics[0].contains("LocFileLangMismatch"), "{:?}", file.file_diagnostics);
+    }
+
+    #[test]
+    fn test_lang_header_missing_from_filename() {
+        // file with no lang tag in name, valid header
+        let text = "l_english:\n key: \"value\"\n";
+        let file = parse_loc_text(text, "events.yml").unwrap();
+        assert_eq!(file.file_diagnostics.len(), 1);
+        assert!(file.file_diagnostics[0].contains("MissingLocFileLang"), "{:?}", file.file_diagnostics);
+    }
+
+    #[test]
+    fn test_lang_header_unrecognised_header() {
+        // unrecognised header key
+        let text = "l_klingon:\n key: \"value\"\n";
+        let file = parse_loc_text(text, "events_l_english.yml").unwrap();
+        assert_eq!(file.file_diagnostics.len(), 1);
+        assert!(file.file_diagnostics[0].contains("MissingLocFileLangHeader"), "{:?}", file.file_diagnostics);
+    }
+
+    #[test]
+    fn test_lang_header_default_is_ok() {
+        // l_default header should always pass
+        let text = "l_default:\n key: \"value\"\n";
+        let file = parse_loc_text(text, "events_l_english.yml").unwrap();
+        assert!(file.file_diagnostics.is_empty(), "l_default should not produce diagnostics: {:?}", file.file_diagnostics);
+    }
+
+    #[test]
+    fn test_languages_yml_exempt() {
+        // languages.yml is special-cased
+        let text = "l_english:\n key: \"value\"\n";
+        let file = parse_loc_text(text, "languages.yml").unwrap();
+        assert!(file.file_diagnostics.is_empty(), "languages.yml should be exempt: {:?}", file.file_diagnostics);
     }
 
     #[test]

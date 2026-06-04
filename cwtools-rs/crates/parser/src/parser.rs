@@ -38,7 +38,8 @@ impl<'a> Parser<'a> {
         if c == '\n' {
             self.line += 1;
             self.col = 0;
-        } else {
+        } else if c != '\r' {
+            // '\r' is not counted toward column (CRLF line endings: \r\n is one newline).
             self.col += 1;
         }
         Some(c)
@@ -111,16 +112,27 @@ impl<'a> Parser<'a> {
 
     fn parse_key(&mut self) -> Option<StringTokens> {
         if self.peek() == Some('"') {
-            // Quoted key
+            // Quoted key — same escape rules as quoted values (F# SharedParsers.fs:183-186).
             self.advance();
             let mut s = String::new();
             while let Some(c) = self.peek() {
                 if c == '\\' {
-                    self.advance();
-                    if let Some(escaped) = self.advance() {
-                        s.push(escaped);
-                        continue;
+                    self.advance(); // consume '\'
+                    match self.peek() {
+                        Some('"') => {
+                            self.advance();
+                            s.push('"');
+                        }
+                        Some('\\') => {
+                            self.advance();
+                            s.push('\\');
+                        }
+                        _ => {
+                            // Keep literal backslash; next char picked up naturally.
+                            s.push('\\');
+                        }
                     }
+                    continue;
                 } else if c == '"' {
                     self.advance();
                     break;
@@ -184,19 +196,25 @@ impl<'a> Parser<'a> {
             let mut s = String::new();
             while let Some(c) = self.peek() {
                 if c == '\\' {
-                    self.advance();
-                    if let Some(escaped) = self.advance() {
-                        let translated = match escaped {
-                            'n' => '\n',
-                            't' => '\t',
-                            'r' => '\r',
-                            '\\' => '\\',
-                            '"' => '"',
-                            _ => escaped,
-                        };
-                        s.push(translated);
-                        continue;
+                    self.advance(); // consume '\'
+                    match self.peek() {
+                        Some('"') => {
+                            // \" -> " (unescape)
+                            self.advance();
+                            s.push('"');
+                        }
+                        Some('\\') => {
+                            // \\ -> \ (unescape)
+                            self.advance();
+                            s.push('\\');
+                        }
+                        _ => {
+                            // Any other \X: keep the backslash and let the loop
+                            // pick up the next char naturally (matches F# behaviour).
+                            s.push('\\');
+                        }
                     }
+                    continue;
                 } else if c == '"' {
                     self.advance();
                     break;
@@ -286,16 +304,37 @@ impl<'a> Parser<'a> {
             self.line = saved.line;
             self.col = saved.col;
         }
-        if trimmed.starts_with("@[") {
+        // F# metaprogramming prefix is "@\[" (at, backslash, open-bracket).
+        // SharedParsers.fs:244 uses pstring "@\\[" which is the 3-char literal @\[.
+        if trimmed.starts_with("@\\[") {
             return self.parse_metaprogramming();
         }
 
-        // Try integer then float
+        // Try integer then float.
+        //
+        // F# uses `attempt valueInt` then `attempt valueFloat` with backtracking.
+        // If parsing a numeric literal fails (e.g. "1444.11.11", "1e5", "0x1A"),
+        // FParsec backtracks to the start and valueStr consumes the whole token.
+        //
+        // We replicate this: save position, scan digits+optional-dot, then check
+        // that the NEXT char is NOT a value-char (i.e. the token ends here).  If
+        // it is still a value-char we must backtrack and let the fallback string
+        // path consume the entire token.
+        //
+        // Leading '+' is accepted by F#'s pint64/pfloat (issue #2).
+        let num_saved_chars = self.chars.clone();
+        let num_saved_pos = self.pos();
+
         let mut num_str = String::new();
         let mut had_dot = false;
-        if let Some('-') = self.peek() {
-            num_str.push('-');
-            self.advance();
+
+        match self.peek() {
+            Some('-') | Some('+') => {
+                let sign = self.peek().unwrap();
+                num_str.push(sign);
+                self.advance();
+            }
+            _ => {}
         }
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
@@ -309,30 +348,31 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        if !num_str.is_empty() && num_str != "-" {
+
+        // Only commit a numeric result when the token ends here (next char is not
+        // a value-char).  Otherwise backtrack so the whole token becomes a String.
+        let num_token_ends = match self.peek() {
+            None => true,
+            Some(c) => !is_value_char(c),
+        };
+
+        if num_token_ends && !num_str.is_empty() && num_str != "-" && num_str != "+" {
+            // Try int first (strips leading '+' via parse::<i64>)
             if let Ok(i) = num_str.parse::<i64>() {
-                if let Some(c) = self.peek() {
-                    if !is_value_char(c) {
-                        self.skip_whitespace();
-                        return Some(Value::Int(i));
-                    }
-                } else {
-                    self.skip_whitespace();
-                    return Some(Value::Int(i));
-                }
+                self.skip_whitespace();
+                return Some(Value::Int(i));
             }
             if let Ok(f) = num_str.parse::<f64>() {
-                if let Some(c) = self.peek() {
-                    if !is_value_char(c) {
-                        self.skip_whitespace();
-                        return Some(Value::Float(f));
-                    }
-                } else {
-                    self.skip_whitespace();
-                    return Some(Value::Float(f));
-                }
+                self.skip_whitespace();
+                return Some(Value::Float(f));
             }
         }
+
+        // Numeric parse didn't commit — backtrack fully so the string path gets the
+        // whole token (e.g. "1444.11.11", "1e5", "0x1A", lone "-").
+        self.chars = num_saved_chars;
+        self.line = num_saved_pos.line;
+        self.col = num_saved_pos.col;
 
         // Fallback: plain string
         let mut s = String::new();
@@ -508,18 +548,25 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_metaprogramming(&mut self) -> Option<Value> {
-        // Must start with "@["
+        // F# prefix is "@\[" (at, backslash, open-bracket) — SharedParsers.fs:244.
+        // metaprogrammingCharSnippet accepts everything except ']' and '\'.
+        // The closing char is ']' (consumed by `ch ']'`).
+        // Result token includes the prefix "@\[" and the closing ']'.
         if self.peek() != Some('@') {
             return None;
         }
         self.advance(); // '@'
+        if self.peek() != Some('\\') {
+            return None;
+        }
+        self.advance(); // '\'
         if self.peek() != Some('[') {
             return None;
         }
         self.advance(); // '['
 
         let mut s = String::new();
-        s.push_str("@[");
+        s.push_str("@\\[");
         let mut found_close = false;
         while let Some(c) = self.peek() {
             if c == ']' {
@@ -528,6 +575,7 @@ impl<'a> Parser<'a> {
                 found_close = true;
                 break;
             }
+            // F# metaprogrammingCharSnippet stops at '\' too — just collect content.
             s.push(c);
             self.advance();
         }
@@ -646,6 +694,214 @@ mod tests {
             assert_eq!(val, "<ethos>");
         } else {
             panic!("expected leaf child");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 1: Numeric token corruption — tokens like "1444.11.11" must not
+    // be split; the whole thing should become a String.
+    // -----------------------------------------------------------------------
+
+    fn value_of(result: &ParsedFile, _table: &StringTable, idx: usize) -> Value {
+        match &result.root_children[idx] {
+            Child::Leaf(i) => result.arena.leaves[*i as usize].value.clone(),
+            Child::LeafValue(i) => result.arena.leaf_values[*i as usize].value.clone(),
+            _ => panic!("unexpected child kind"),
+        }
+    }
+
+    #[test]
+    fn date_token_is_string() {
+        // "1444.11.11" must parse as one String, not be split at the first dot.
+        let table = StringTable::new();
+        let result = parse_string("start = 1444.11.11", &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::String(t) => {
+                assert_eq!(table.get_string(t.normal).unwrap_or_default(), "1444.11.11");
+            }
+            v => panic!("expected String, got {:?}", v),
+        }
+    }
+
+    #[test]
+    fn normal_float_parses() {
+        let table = StringTable::new();
+        let result = parse_string("x = 3.14", &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::Float(f) => assert!((f - 3.14).abs() < 1e-9),
+            v => panic!("expected Float, got {:?}", v),
+        }
+    }
+
+    #[test]
+    fn hex_like_token_is_string() {
+        // "0x1A" — after "0" the 'x' is a value-char so the whole thing is a String.
+        let table = StringTable::new();
+        let result = parse_string("x = 0x1A", &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::String(t) => {
+                assert_eq!(table.get_string(t.normal).unwrap_or_default(), "0x1A");
+            }
+            v => panic!("expected String, got {:?}", v),
+        }
+    }
+
+    #[test]
+    fn scientific_like_token_is_string() {
+        // "1e5" — after "1" the 'e' is a value-char so the whole token is a String.
+        let table = StringTable::new();
+        let result = parse_string("x = 1e5", &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::String(t) => {
+                assert_eq!(table.get_string(t.normal).unwrap_or_default(), "1e5");
+            }
+            v => panic!("expected String, got {:?}", v),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 2: Leading '+' — "+5" should parse as Int(5).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn leading_plus_parses_as_int() {
+        let table = StringTable::new();
+        let result = parse_string("x = +5", &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::Int(5) => {}
+            v => panic!("expected Int(5), got {:?}", v),
+        }
+    }
+
+    #[test]
+    fn leading_plus_float() {
+        let table = StringTable::new();
+        let result = parse_string("x = +3.14", &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::Float(f) => assert!((f - 3.14).abs() < 1e-9),
+            v => panic!("expected Float, got {:?}", v),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 3: Quoted-string escapes — only \" and \\ are unescaped.
+    // \n in source stays as backslash + 'n', not a newline char.
+    // Applies equally to quoted keys and quoted values.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn qstr_backslash_n_stays_literal() {
+        // Input: x = "hello\nworld"  — \n must NOT become newline
+        let table = StringTable::new();
+        let result = parse_string(r#"x = "hello\nworld""#, &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::QString(t) => {
+                let raw = table.get_string(t.normal).unwrap_or_default();
+                // The stored string is wrapped in quotes; strip them
+                let inner = raw.trim_matches('"');
+                assert!(
+                    !inner.contains('\n'),
+                    "\\n should stay as two chars, not a newline; got: {:?}",
+                    inner
+                );
+                assert!(inner.contains('\\'), "backslash should be preserved");
+            }
+            v => panic!("expected QString, got {:?}", v),
+        }
+    }
+
+    #[test]
+    fn qstr_escaped_quote_is_unescaped() {
+        // Input: x = "say \"hi\""  — \" becomes "
+        // Stored token is wrapped in outer quotes: "say "hi""
+        // Use strip_prefix/suffix to remove exactly the outermost quotes.
+        let table = StringTable::new();
+        let result = parse_string(r#"x = "say \"hi\"""#, &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::QString(t) => {
+                let raw = table.get_string(t.normal).unwrap_or_default();
+                let inner = raw
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(&raw);
+                assert_eq!(inner, r#"say "hi""#);
+            }
+            v => panic!("expected QString, got {:?}", v),
+        }
+    }
+
+    #[test]
+    fn qstr_double_backslash_collapses() {
+        // Input: x = "a\\b"  — \\ becomes single \
+        let table = StringTable::new();
+        let result = parse_string(r#"x = "a\\b""#, &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::QString(t) => {
+                let raw = table.get_string(t.normal).unwrap_or_default();
+                let inner = raw.trim_matches('"');
+                assert_eq!(inner, r"a\b");
+            }
+            v => panic!("expected QString, got {:?}", v),
+        }
+    }
+
+    #[test]
+    fn quoted_key_escape_rules_match_value() {
+        // "\"key\"" = value — the key's \" should unescape to just "key" without outer quotes
+        let table = StringTable::new();
+        let result = parse_string(r#""my\"key" = 1"#, &table).unwrap();
+        if let Child::Leaf(i) = &result.root_children[0] {
+            let leaf = &result.arena.leaves[*i as usize];
+            let key_raw = table.get_string(leaf.key.normal).unwrap_or_default();
+            // The key is stored as "my"key" (quoted form), inner part is my"key
+            assert!(key_raw.contains('"'), "key should contain unescaped quote");
+        } else {
+            panic!("expected leaf");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 4: CRLF column tracking — '\r' must not advance col.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn crlf_does_not_double_count_column() {
+        // Two identical assignments, one with CRLF line ending, one with LF.
+        // The column of the second key should be the same in both cases.
+        let table = StringTable::new();
+        let crlf = parse_string("a = 1\r\nb = 2", &table).unwrap();
+        let lf = parse_string("a = 1\nb = 2", &table).unwrap();
+        let col_crlf = match &crlf.root_children[1] {
+            Child::Leaf(i) => crlf.arena.leaves[*i as usize].pos.start.col,
+            _ => panic!(),
+        };
+        let col_lf = match &lf.root_children[1] {
+            Child::Leaf(i) => lf.arena.leaves[*i as usize].pos.start.col,
+            _ => panic!(),
+        };
+        assert_eq!(
+            col_crlf, col_lf,
+            "CRLF should not skew column (crlf={}, lf={})",
+            col_crlf, col_lf
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 5: Metaprogramming prefix is "@\[" (at, backslash, bracket).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metaprogramming_prefix() {
+        // "@\[expr]" should parse as a String containing "@\[expr]".
+        let table = StringTable::new();
+        let input = r"x = @\[expr]";
+        let result = parse_string(input, &table).unwrap();
+        match value_of(&result, &table, 0) {
+            Value::String(t) => {
+                let s = table.get_string(t.normal).unwrap_or_default();
+                assert_eq!(s, r"@\[expr]");
+            }
+            v => panic!("expected String, got {:?}", v),
         }
     }
 }

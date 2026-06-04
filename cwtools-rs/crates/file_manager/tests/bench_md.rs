@@ -22,6 +22,7 @@ fn bench_millennium_dawn_mod() {
             include_dirs: vec![".".into()],
             file_patterns: vec!["*.txt".into()],
             exclude_patterns: vec![],
+            ..Default::default()
         };
         let mut manager = cwtools_file_manager::file_manager::FileManager::new(config);
         match manager.discover_and_parse() {

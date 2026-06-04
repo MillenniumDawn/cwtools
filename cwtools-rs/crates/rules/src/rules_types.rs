@@ -7,6 +7,8 @@ pub struct RuleSet {
     pub enums: Vec<EnumDefinition>,
     pub complex_enums: Vec<ComplexEnumDef>,
     pub root_rules: Vec<RootRule>,
+    /// Parsed `values = { value[name] = { ... } }` blocks (item G).
+    pub values: Vec<(String, Vec<String>)>,
 }
 
 impl RuleSet {
@@ -18,6 +20,7 @@ impl RuleSet {
             enums: Vec::new(),
             complex_enums: Vec::new(),
             root_rules: Vec::new(),
+            values: Vec::new(),
         }
     }
 }
@@ -226,8 +229,27 @@ pub struct ComplexEnumDef {
     pub name: String,
     pub description: String,
     pub path_options: PathOptions,
-    pub name_tree: String, // placeholder: would be AST node
+    pub name_tree: ComplexEnumNameTree,
     pub start_from_root: bool,
+}
+
+/// Represents the `name = { ... }` subtree inside a complex_enum definition.
+/// This captures the key-path structure used to extract enum member names from files.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComplexEnumNameTree {
+    /// No name block was present.
+    Empty,
+    /// A list of leaf/node entries describing the name-extraction path.
+    Entries(Vec<ComplexEnumNameTreeEntry>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComplexEnumNameTreeEntry {
+    /// A leaf entry: the key under which the enum name lives.
+    /// `is_name` is true when the value is `enum_name`/`this`.
+    Leaf { key: String, is_name: bool },
+    /// A nested node entry: descend into `key` then recurse.
+    Node { key: String, children: ComplexEnumNameTree },
 }
 
 /// Root-level rule from a .cwt file.
