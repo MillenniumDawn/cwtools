@@ -9,6 +9,26 @@ pub struct RuleSet {
     pub root_rules: Vec<RootRule>,
     /// Parsed `values = { value[name] = { ... } }` blocks (item G).
     pub values: Vec<(String, Vec<String>)>,
+    /// Names from a top-level `modifiers = { name = category ... }` block. These
+    /// are the valid keys for `alias_name[modifier]` slots (modifier contexts).
+    pub modifiers: Vec<String>,
+    /// Lookup index over `aliases`, built by `reindex()`. Maps a full alias name
+    /// (`"cat:key"`) to the indices of every matching overload, so alias
+    /// resolution is O(1) instead of a linear scan over all aliases per key.
+    pub alias_exact: std::collections::HashMap<String, Vec<usize>>,
+    /// Per-category alias metadata (the `<type>` patterns and `scope_field`),
+    /// also built by `reindex()`.
+    pub alias_categories: std::collections::HashMap<String, AliasCategoryIndex>,
+}
+
+/// Per-category alias index entry (see `RuleSet::alias_categories`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AliasCategoryIndex {
+    /// Indices of aliases in this category whose name embeds a `<type>` pattern
+    /// (e.g. `trigger:<scripted_trigger>`, `modifier:production_speed_<building>_factor`).
+    pub type_pattern_idxs: Vec<usize>,
+    /// Index of this category's `scope_field` alias, if any.
+    pub scope_field_idx: Option<usize>,
 }
 
 impl RuleSet {
@@ -21,6 +41,29 @@ impl RuleSet {
             complex_enums: Vec::new(),
             root_rules: Vec::new(),
             values: Vec::new(),
+            modifiers: Vec::new(),
+            alias_exact: std::collections::HashMap::new(),
+            alias_categories: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Build the alias lookup indexes from `aliases`. Call once after all aliases
+    /// are loaded and post-processed (names/order are stable after that).
+    pub fn reindex(&mut self) {
+        self.alias_exact.clear();
+        self.alias_categories.clear();
+        for (i, (name, _)) in self.aliases.iter().enumerate() {
+            self.alias_exact.entry(name.clone()).or_default().push(i);
+            if let Some((cat, rest)) = name.split_once(':') {
+                let entry = self.alias_categories.entry(cat.to_string()).or_default();
+                if rest == "scope_field" {
+                    entry.scope_field_idx = Some(i);
+                } else if rest.contains('<') || rest.contains('[') {
+                    // A placeholder pattern: `<type>`, `<type.subtype>`,
+                    // `value[set]`, `enum[name]` embedded in the alias name.
+                    entry.type_pattern_idxs.push(i);
+                }
+            }
         }
     }
 }
@@ -65,6 +108,9 @@ pub struct SubTypeDefinition {
     pub localisation: Vec<TypeLocalisation>,
     pub only_if_not: Vec<String>,
     pub modifiers: Vec<TypeModifier>,
+    /// `## type_key_filter = X` (or `= { a b }`): the subtype is active when the
+    /// instance's own node key is one of these values.
+    pub type_key_filter: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

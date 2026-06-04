@@ -32,6 +32,7 @@ pub fn merge_ruleset(dst: &mut RuleSet, src: RuleSet) {
     dst.complex_enums.extend(src.complex_enums);
     dst.root_rules.extend(src.root_rules);
     dst.values.extend(src.values);
+    dst.modifiers.extend(src.modifiers);
 }
 
 /// Walk `dir` for `*.cwt` files, parse each with `table`, convert via
@@ -66,6 +67,9 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<S
     // Run the post-processing pipeline once all files have been merged so that
     // cross-file single_alias references are fully resolved.
     post_process(&mut combined);
+
+    // Build alias lookup indexes last — alias names/order are stable after this.
+    combined.reindex();
 
     (combined, errors)
 }

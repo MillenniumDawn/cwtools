@@ -184,6 +184,9 @@ impl Default for FileManagerConfig {
                 "bin".into(),
                 "obj".into(),
                 ".idea".into(),
+                ".vscode".into(),
+                // developer scratch area in many mods, not loaded by the game
+                "resources".into(),
             ],
             max_file_size: 2 * 1024 * 1024, // 2 MB
         }

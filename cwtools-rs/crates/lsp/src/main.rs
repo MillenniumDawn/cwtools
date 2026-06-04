@@ -12,12 +12,38 @@ use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{validate_ast, ValidationError};
+use cwtools_info::TypeIndex;
 use cwtools_info::{
     info_at_position, PositionElement, ReferenceHint,
 };
 
 mod position;
 mod symbols;
+
+/// Build the set of valid modifier names for `alias_name[modifier]` slots from the
+/// ruleset's `modifiers = { ... }` block. Templated entries like
+/// `production_speed_<building>_factor` / `<ideology>_drift` are expanded against
+/// the type index, one per instance. Mirrors the CLI so the extension and CLI
+/// agree on what counts as a modifier.
+fn build_modifier_keys(ruleset: &RuleSet, type_index: &TypeIndex) -> std::collections::HashSet<String> {
+    let mut mk = std::collections::HashSet::new();
+    for m in &ruleset.modifiers {
+        match (m.find('<'), m.find('>')) {
+            (Some(open), Some(close)) if open < close => {
+                let tn = &m[open + 1..close];
+                let pre = &m[..open];
+                let suf = &m[close + 1..];
+                for (_uri, inst) in type_index.instances(tn) {
+                    mk.insert(format!("{}{}{}", pre, inst.name, suf));
+                }
+            }
+            _ => {
+                mk.insert(m.clone());
+            }
+        }
+    }
+    mk
+}
 
 // ── Custom LSP notification types ─────────────────────────────────────────────
 
@@ -752,6 +778,14 @@ impl LanguageServer for Backend {
         &self,
         params: InitializeParams,
     ) -> Result<InitializeResult> {
+        // Distinctive banner so it's unmistakable in the Output panel WHICH server
+        // is running. If you don't see this line, you're on an old/F# binary.
+        self.client
+            .log_message(
+                MessageType::INFO,
+                "★ CWTools RUST LSP server — build: two-pass-index + modifier-keys (rust-2025-06b)",
+            )
+            .await;
         // Store language from init options
         if let Some(opts) = &params.initialization_options {
             if let Some(lang) = opts.get("language").and_then(|v| v.as_str()) {
@@ -1714,6 +1748,9 @@ impl Backend {
                         let skip = matches!(
                             name.as_str(),
                             ".git" | "node_modules" | "out" | "dist" | "target" | "bin" | "obj"
+                            // `resources/` is a developer scratch area in many mods,
+                            // not a path the game loads — don't validate it.
+                            | "resources" | ".vscode"
                         );
                         if !skip {
                             walk_dir(&path, extensions, out);
@@ -1744,47 +1781,51 @@ impl Backend {
             ))
             .await;
 
-        let mut total_errors = 0usize;
-        let mut total_files = 0usize;
+        // Pass 1: parse + index every file (types, scripted triggers/effects,
+        // modifiers) so cross-file references resolve before any file is
+        // validated. Keep the parsed ASTs so pass 2 doesn't re-parse.
+        self.send_loading_bar(true, "Indexing workspace…").await;
+        let mut parsed_docs: Vec<(String, String, ParsedFile)> = Vec::new();
         for file_path in &files_to_validate {
             let uri = format!("file://{}", file_path.display());
-            let text = match std::fs::read_to_string(file_path) {
-                Ok(t) => t,
-                Err(e) => {
-                    self.client
-                        .log_message(MessageType::WARNING, format!(
-                            "Could not read {}: {}",
-                            file_path.display(),
-                            e
-                        ))
-                        .await;
-                    continue;
+            if let Ok(text) = std::fs::read_to_string(file_path) {
+                if let Some(parsed) = self.index_document(&uri, &text).await {
+                    parsed_docs.push((uri, text, parsed));
                 }
-            };
+            }
+        }
 
-            let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
+        // Build the modifier-key set ONCE — it depends only on the ruleset and the
+        // now-complete type index, not on the file being validated.
+        let modifier_keys = {
+            let ruleset_guard = self.state.ruleset.lock().unwrap();
+            let info_guard = self.state.info_service.lock().unwrap();
+            match ruleset_guard.as_ref() {
+                Some(rs) => build_modifier_keys(rs, &info_guard.type_index),
+                None => std::collections::HashSet::new(),
+            }
+        };
+
+        // Pass 2: validate each stored AST against the complete index. No
+        // re-parsing and no per-file logging (that logging was ~2 LSP
+        // notifications per file — the main source of slowness).
+        self.send_loading_bar(true, "Validating workspace…").await;
+        let mut total_errors = 0usize;
+        let total_files = parsed_docs.len();
+        for (uri, text, parsed) in parsed_docs {
+            let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys);
             total_errors += diagnostics.iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
                 .count();
-            total_files += 1;
-
-            {
-                let mut docs = self.state.documents.lock().unwrap();
-                docs.insert(
-                    uri.clone(),
-                    ParsedDoc {
-                        version: 0,
-                        text: text.clone(),
-                        ast: parsed,
-                    },
-                );
-            }
 
             if let Ok(uri_obj) = Url::parse(&uri) {
                 self.client
                     .publish_diagnostics(uri_obj, diagnostics, None)
                     .await;
             }
+
+            let mut docs = self.state.documents.lock().unwrap();
+            docs.insert(uri, ParsedDoc { version: 0, text, ast: Some(parsed) });
         }
 
         self.client
@@ -1796,6 +1837,64 @@ impl Backend {
             .await;
 
         self.send_loading_bar(false, "").await;
+    }
+
+    /// Parse a file and add it to the symbol + info (type) indexes WITHOUT
+    /// validating. The first pass of a full-workspace scan calls this for every
+    /// file so cross-file references (scripted triggers/effects, type instances,
+    /// templated modifiers) resolve before ANY file is validated. Without this,
+    /// a file validated early can't see definitions that live in later files.
+    async fn index_document(&self, uri: &str, text: &str) -> Option<ParsedFile> {
+        let parsed = parse_string(text, &self.state.string_table).ok()?;
+        {
+            let mut index = self.state.symbol_index.lock().unwrap();
+            index.clear_document(uri);
+            index.index_document(uri, &parsed, &self.state.string_table);
+        }
+        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let logical_path = logical_path_from_uri(uri, &ws_uri);
+        let ruleset_guard = self.state.ruleset.lock().unwrap();
+        let mut info = self.state.info_service.lock().unwrap();
+        info.clear_file(uri);
+        if let Some(ruleset) = ruleset_guard.as_ref() {
+            info.index_file_with_path(uri, &parsed, &self.state.string_table, ruleset, &logical_path);
+        }
+        Some(parsed)
+    }
+
+    /// Validate an already-parsed document against the (already-built) workspace
+    /// index, using a precomputed modifier-key set. No parsing, no re-indexing,
+    /// no per-file logging — this is the hot path for a full-workspace scan.
+    fn validate_parsed(
+        &self,
+        uri: &str,
+        parsed: &ParsedFile,
+        modifier_keys: &std::collections::HashSet<String>,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics: Vec<Diagnostic> = parsed.errors.iter().map(parse_error_to_diagnostic).collect();
+        let ruleset_guard = self.state.ruleset.lock().unwrap();
+        if let Some(ruleset) = ruleset_guard.as_ref() {
+            let language = self.state.language.lock().unwrap().clone();
+            let game = cwtools_game::constants::Game::from_str(&language);
+            let info_guard = self.state.info_service.lock().unwrap();
+            let type_index = &info_guard.type_index;
+            let mut errs = validate_ast(parsed, ruleset, &self.state.string_table, uri, game, Some(type_index), Some(modifier_keys));
+            drop(info_guard);
+            const MAX_ERRORS: usize = 100;
+            let total = errs.len();
+            if total > MAX_ERRORS {
+                errs.truncate(MAX_ERRORS);
+                errs.push(cwtools_validation::ValidationError {
+                    message: format!("... {} additional errors truncated", total - MAX_ERRORS),
+                    severity: cwtools_validation::ErrorSeverity::Information,
+                    line: 0, col: 0, file: uri.to_string(), code: None,
+                });
+            }
+            for err in &errs {
+                diagnostics.push(validation_error_to_diagnostic(err));
+            }
+        }
+        diagnostics
     }
 
     /// Parse and validate a single document.
@@ -1883,7 +1982,8 @@ impl Backend {
                         // Pass the workspace TypeIndex for cross-file type reference checking.
                         let info_guard = self.state.info_service.lock().unwrap();
                         let type_index = &info_guard.type_index;
-                        let mut errs = validate_ast(&parsed, ruleset, &self.state.string_table, uri, game, Some(type_index), None);
+                        let modifier_keys = build_modifier_keys(ruleset, type_index);
+                        let mut errs = validate_ast(&parsed, ruleset, &self.state.string_table, uri, game, Some(type_index), Some(&modifier_keys));
                         drop(info_guard);
                         let elapsed = start.elapsed();
                         const MAX_ERRORS: usize = 100;
@@ -2108,6 +2208,27 @@ fn is_type_ref_leaf(
         }
     }
     false
+}
+
+fn parse_error_to_diagnostic(e: &ParseError) -> Diagnostic {
+    let (line, col, msg) = match e {
+        ParseError::Pos(_f, line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
+        ParseError::General(msg) => (0, 0, msg.clone()),
+    };
+    Diagnostic {
+        range: Range {
+            start: Position { line, character: col },
+            end: Position { line, character: col + 1 },
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: None,
+        code_description: None,
+        source: Some("cwtools".to_string()),
+        message: msg,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
 }
 
 fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnostic {

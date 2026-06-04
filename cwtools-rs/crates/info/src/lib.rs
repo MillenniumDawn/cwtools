@@ -54,11 +54,21 @@ impl TypeIndex {
     }
 
     /// Return true if `type_name` has a known instance called `instance`.
+    /// Paradox script identifiers are case-insensitive, so a reference like
+    /// `LBA_AI_BEHAVIOR` resolves to the `LBA_ai_behavior` definition.
     pub fn contains(&self, type_name: &str, instance: &str) -> bool {
         self.map
             .get(type_name)
-            .map(|v| v.iter().any(|(_, ti)| ti.name == instance))
+            .map(|v| v.iter().any(|(_, ti)| ti.name.eq_ignore_ascii_case(instance)))
             .unwrap_or(false)
+    }
+
+    /// Return true if `name` is a known instance of ANY type. Used to recognise
+    /// scope-opening keys: HOI4 from-data scope links (links.cwt) let an instance
+    /// of a referenced type (character, state, ideology, ...) open its own scope,
+    /// e.g. `LBA_some_character = { ... }`.
+    pub fn is_any_instance(&self, name: &str) -> bool {
+        self.map.values().any(|v| v.iter().any(|(_, ti)| ti.name == name))
     }
 
     /// All instances for a type (across all files).

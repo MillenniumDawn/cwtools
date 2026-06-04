@@ -219,3 +219,114 @@ event = {
     assert!(errs_no_idx.iter().all(|e| e.code.as_deref() != Some("CW500")),
         "Expected no CW500 without index, got: {:?}", errs_no_idx);
 }
+
+#[test]
+fn test_alias_overload_disjunction() {
+    // Regression: an aliased usage must be accepted if it matches ANY
+    // `alias[cat:key]` overload, not just the first one declared.
+    // Mirrors HOI4 `alias[trigger:original_tag]` (scope OR tag) and the ~40
+    // `alias[ai_strategy_rule:ai_strategy]` blocks keyed by `type`.
+    let cwt = r#"
+types = {
+    type[ai_strategy] = {
+        path = "game/common/ai_strategy"
+    }
+}
+
+ai_strategy = {
+    ## cardinality = 0..1
+    enable = {
+        alias_name[trigger] = alias_match_left[trigger]
+    }
+    alias_name[ai_strategy_rule] = alias_match_left[ai_strategy_rule]
+}
+
+alias[trigger:original_tag] = scope[country]
+alias[trigger:original_tag] = enum[country_tags]
+
+alias[ai_strategy_rule:ai_strategy] = {
+    type = enum[ai_role_strats]
+    id = scalar
+    value = int
+}
+alias[ai_strategy_rule:ai_strategy] = {
+    type = enum[building_strats]
+    id = scalar
+    target = int
+    value = int
+}
+
+enums = {
+    enum[country_tags] = { AFG TAL }
+    enum[ai_role_strats] = { role_ratio }
+    enum[building_strats] = { building_target }
+}
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+
+    // original_tag = AFG matches the 2nd trigger overload (enum[country_tags]).
+    // The ai_strategy block matches the 2nd rule overload (building_strats, which
+    // is the only one that allows `target`). Both fail against the FIRST overload.
+    let script = r#"
+my_strat = {
+    enable = {
+        original_tag = AFG
+    }
+    ai_strategy = {
+        type = building_target
+        id = foo
+        target = 5
+        value = 10
+    }
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errors = validate_ast(
+        &parsed, &ruleset, &table, "game/common/ai_strategy/test.txt",
+        Some(cwtools_game::constants::Game::Hoi4), None, None,
+    );
+    assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
+}
+
+#[test]
+fn test_enum_keyed_rule_matches_key() {
+    // Regression: a rule keyed by `enum[x] = value` must match keys that are
+    // members of enum x (HOI4 `research = { enum[tech_category] = float }`).
+    let cwt = r#"
+types = {
+    type[ai_strategy_plan] = {
+        path = "game/common/ai_strategy_plans"
+    }
+}
+
+ai_strategy_plan = {
+    ## cardinality = 0..1
+    research = {
+        enum[tech_category] = float
+    }
+}
+
+enums = {
+    enum[tech_category] = { CAT_inf }
+}
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+
+    let script = r#"
+my_plan = {
+    research = {
+        CAT_inf = 10.0
+    }
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errors = validate_ast(
+        &parsed, &ruleset, &table, "game/common/ai_strategy_plans/test.txt",
+        Some(cwtools_game::constants::Game::Hoi4), None, None,
+    );
+    assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
+}

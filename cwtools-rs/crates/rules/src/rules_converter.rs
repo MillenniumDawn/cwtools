@@ -2,9 +2,11 @@ use crate::rules_types::*;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_string_table::string_table::StringTable;
 
-// Float sentinel values matching F# RulesParserConstants
-const FLOAT_MAX: f64 = 1_000_000.0;
-const FLOAT_MIN: f64 = -1_000_000.0;
+// Float sentinel values matching F# RulesParserConstants (cwtools uses ±1e12 for
+// an unranged `float`; ±1e6 was far too narrow and flagged valid large values
+// like build costs and populations).
+const FLOAT_MAX: f64 = 1e12;
+const FLOAT_MIN: f64 = -1e12;
 const INT_MAX: i32 = 2_147_483_647;
 const INT_MIN: i32 = -2_147_483_648;
 
@@ -47,6 +49,7 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                     "types" => extract_types_from_children(&node.children, ast, table, &mut ruleset),
                     "enums" => extract_enums_from_children(&node.children, ast, table, &mut ruleset),
                     "values" => extract_values_from_children(&node.children, ast, table, &mut ruleset),
+                    "modifiers" => extract_modifier_names(&node.children, ast, table, &mut ruleset),
                     _ => {
                         process_root_node(key, node, ast, table, &comments, &mut ruleset);
                     }
@@ -71,6 +74,11 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                             extract_values_from_children(children, ast, table, &mut ruleset);
                         }
                     }
+                    "modifiers" => {
+                        if let Value::Clause(children) = &leaf.value {
+                            extract_modifier_names(children, ast, table, &mut ruleset);
+                        }
+                    }
                     _ => {
                         process_root_leaf(key, leaf, ast, table, &comments, &mut ruleset);
                     }
@@ -80,6 +88,7 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
         }
     }
 
+    ruleset.reindex();
     ruleset
 }
 
@@ -696,6 +705,26 @@ fn extract_enums_from_children(
 }
 
 /// Parse `values = { value[name] = { ... } }` top-level block (F# RulesParser.fs:1298-1321).
+/// Collect modifier names from a top-level `modifiers = { name = category ... }`
+/// block. Each entry's key is a valid modifier name (the value is its category).
+fn extract_modifier_names(
+    children: &Vec<Child>,
+    ast: &ParsedFile,
+    table: &StringTable,
+    ruleset: &mut RuleSet,
+) {
+    for child in children {
+        let name = match child {
+            Child::Leaf(lidx) => table.get_string(ast.arena.leaves[*lidx as usize].key.normal).unwrap_or_default(),
+            Child::Node(nidx) => table.get_string(ast.arena.nodes[*nidx as usize].key.normal).unwrap_or_default(),
+            _ => continue,
+        };
+        if !name.is_empty() {
+            ruleset.modifiers.push(name);
+        }
+    }
+}
+
 fn extract_values_from_children(
     children: &Vec<Child>,
     ast: &ParsedFile,
@@ -1216,7 +1245,12 @@ fn build_subtype(
     let abbreviation = extract_comment_value(comments, "abbreviation");
     let push_scope = extract_comment_value(comments, "push_scope");
     let starts_with = extract_comment_value(comments, "starts_with");
-    let mut type_key_field = extract_comment_value(comments, "type_key_filter");
+    // `## type_key_filter = X` discriminates on the instance's OWN node key — a
+    // different mechanism from `type_key_field` (which checks for a child field).
+    let type_key_filter = parse_type_key_filter_from_comments(comments)
+        .map(|(vals, _)| vals)
+        .unwrap_or_default();
+    let mut type_key_field: Option<String> = None;
     let only_if_not = parse_only_if_not_from_comments(comments);
 
     // Also recognise `type_key_field = <value>` placed as a direct leaf inside the
@@ -1252,6 +1286,7 @@ fn build_subtype(
         localisation: Vec::new(),
         only_if_not,
         modifiers: Vec::new(),
+        type_key_filter,
     }
 }
 
