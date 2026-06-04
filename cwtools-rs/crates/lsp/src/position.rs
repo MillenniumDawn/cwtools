@@ -1,4 +1,4 @@
-use cwtools_parser::ast::{Arena, Child, LeafValue, Node, ParsedFile, SourcePos, Value};
+use cwtools_parser::ast::{Arena, Child, ParsedFile, SourcePos, Value};
 use cwtools_string_table::string_table::StringTable;
 
 /// Find the AST node or leaf at a given position.

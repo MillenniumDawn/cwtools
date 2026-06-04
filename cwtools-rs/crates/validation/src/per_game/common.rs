@@ -1,6 +1,5 @@
-use crate::{ValidationError, ErrorSeverity};
-use cwtools_game::constants::Game;
-use cwtools_parser::ast::{Child, ParsedFile, Value};
+use crate::{ValidationError, ErrorSeverity, error_codes};
+use cwtools_parser::ast::{Child, ParsedFile};
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 use cwtools_string_table::string_table::StringTable;
 use std::collections::HashMap;
@@ -40,6 +39,7 @@ pub fn validate_common(
                         line: 0,
                         col: 0,
                         file: file_path.to_string(),
+                        code: Some(error_codes::CW501_DUPLICATE_TYPE.id.to_string()),
                     });
                 }
             }

@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
+use cwtools_info::{collect_type_instances, TypeIndex};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_rules::rules_converter::ast_to_ruleset;
@@ -292,6 +293,21 @@ fn main() {
             });
             println!("  Discovered {} files", files.len());
 
+            // Build cross-file TypeIndex from all discovered files (Item 2).
+            // Arena doesn't derive Clone, so we re-read each file to build the
+            // index, then use the already-parsed arenas for validation.
+            let mut type_index = TypeIndex::new();
+            for file in &files {
+                let text = match std::fs::read_to_string(&file.path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if let Ok(pf) = cwtools_parser::parser::parse_string(&text, &rules_table) {
+                    let instances = collect_type_instances(&ruleset, &pf, &file.logical_path, &rules_table);
+                    type_index.merge(file.path.to_str().unwrap_or(""), instances);
+                }
+            }
+
             // Validate each file
             let mut total_errors = 0;
             let mut total_warnings = 0;
@@ -302,7 +318,8 @@ fn main() {
                     errors: vec![],
                 };
                 let errors = validate_ast(
-                    &parser_file, &ruleset, &rules_table, file.path.to_str().unwrap_or(""), Some(game_id),
+                    &parser_file, &ruleset, &rules_table, file.path.to_str().unwrap_or(""),
+                    Some(game_id), Some(&type_index), None,
                 );
                 let file_errors: Vec<_> = errors.iter().filter(|e| e.severity == cwtools_validation::ErrorSeverity::Error).collect();
                 let file_warnings: Vec<_> = errors.iter().filter(|e| e.severity == cwtools_validation::ErrorSeverity::Warning).collect();
@@ -311,7 +328,8 @@ fn main() {
                 if !errors.is_empty() {
                     println!("\n  {}:", file.path.display());
                     for err in &errors {
-                        println!("    [{:?}] {} (line {})", err.severity, err.message, err.line);
+                        let code_part = err.code.as_deref().map(|c| format!("[{}] ", c)).unwrap_or_default();
+                        println!("    [{:?}] {}{} (line {})", err.severity, code_part, err.message, err.line);
                     }
                 }
             }

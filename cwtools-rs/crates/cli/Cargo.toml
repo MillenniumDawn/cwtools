@@ -16,6 +16,7 @@ cwtools_string_table = { workspace = true }
 cwtools_cache = { workspace = true }
 cwtools_rules = { workspace = true }
 cwtools_validation = { workspace = true }
+cwtools_info = { workspace = true }
 cwtools_game = { workspace = true }
 cwtools_localization = { workspace = true }
 clap = { workspace = true }

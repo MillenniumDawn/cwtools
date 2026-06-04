@@ -1,7 +1,9 @@
+use cwtools_info::{TypeIndex, TypeInstance, SourceLocation};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{validate_ast, ErrorSeverity, error_hash};
+use std::collections::HashMap;
 
 #[test]
 fn test_validate_simple_type() {
@@ -34,7 +36,7 @@ ethos = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None);
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
 
     // Invalid file: wrong value type for int field
@@ -45,7 +47,7 @@ ethos = {
 }
 "#;
     let parsed_bad = parse_string(bad_script, &table).unwrap();
-    let errors = validate_ast(&parsed_bad, &ruleset, &table, "test.txt", None);
+    let errors = validate_ast(&parsed_bad, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         !errors.is_empty(),
         "Expected validation error for wrong type"
@@ -81,7 +83,7 @@ ship_size = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None);
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
 }
 
@@ -93,6 +95,7 @@ fn test_error_hash() {
         line: 3,
         col: 10,
         file: "test.txt".to_string(),
+        code: None,
     };
     let hash = error_hash(&error);
     assert_eq!(hash, "error|test.txt|3|Field 'cost' has value 'not_a_number', expected Int");
@@ -130,7 +133,7 @@ event = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None);
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
 
     // news_event has major - should match news_event subtype
@@ -141,7 +144,7 @@ event = {
 }
 "#;
     let parsed2 = parse_string(script2, &table).unwrap();
-    let errors2 = validate_ast(&parsed2, &ruleset, &table, "test.txt", None);
+    let errors2 = validate_ast(&parsed2, &ruleset, &table, "test.txt", None, None, None);
     assert!(errors2.is_empty(), "Expected no errors but got: {:?}", errors2);
 
     // Generic event without subtype key - should not get subtype-specific errors
@@ -151,7 +154,68 @@ event = {
 }
 "#;
     let parsed3 = parse_string(script3, &table).unwrap();
-    let errors3 = validate_ast(&parsed3, &ruleset, &table, "test.txt", None);
+    let errors3 = validate_ast(&parsed3, &ruleset, &table, "test.txt", None, None, None);
     // No subtype matches, so no subtype rules apply, no errors expected
     assert!(errors3.is_empty(), "Expected no errors for generic event: {:?}", errors3);
+}
+
+#[test]
+fn test_type_index_checking() {
+    // Rules: simple type reference field
+    let cwt = r#"
+event = {
+    ## cardinality = 0..inf
+    requires_technology = <technology>
+}
+types = {
+    type[event] = {
+        path = "game/events"
+    }
+    type[technology] = {
+        path = "game/common/technology"
+    }
+}
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+
+    let script_valid = r#"
+event = {
+    requires_technology = my_tech_alpha
+}
+"#;
+    let script_bogus = r#"
+event = {
+    requires_technology = bogus_tech_xyz
+}
+"#;
+
+    // Build a TypeIndex with one known technology instance
+    let mut idx = TypeIndex::new();
+    let mut map = HashMap::new();
+    map.insert(
+        "technology".to_string(),
+        vec![TypeInstance {
+            name: "my_tech_alpha".to_string(),
+            location: SourceLocation { line: 1, col: 0 },
+        }],
+    );
+    idx.merge("file://tech.txt", map);
+
+    // Valid reference: no error
+    let parsed_v = parse_string(script_valid, &table).unwrap();
+    let errs_v = validate_ast(&parsed_v, &ruleset, &table, "game/events/test.txt", None, Some(&idx), None);
+    assert!(errs_v.is_empty(), "Expected no errors for valid ref, got: {:?}", errs_v);
+
+    // Bogus reference: should produce CW500
+    let parsed_b = parse_string(script_bogus, &table).unwrap();
+    let errs_b = validate_ast(&parsed_b, &ruleset, &table, "game/events/test.txt", None, Some(&idx), None);
+    let type_errs: Vec<_> = errs_b.iter().filter(|e| e.code.as_deref() == Some("CW500")).collect();
+    assert!(!type_errs.is_empty(), "Expected CW500 for bogus type ref, got: {:?}", errs_b);
+
+    // Without type_index: no type-ref errors even for bogus reference
+    let errs_no_idx = validate_ast(&parsed_b, &ruleset, &table, "game/events/test.txt", None, None, None);
+    assert!(errs_no_idx.iter().all(|e| e.code.as_deref() != Some("CW500")),
+        "Expected no CW500 without index, got: {:?}", errs_no_idx);
 }

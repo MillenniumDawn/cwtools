@@ -1,9 +1,8 @@
-use crate::{ValidationError, ErrorSeverity};
+use crate::{ValidationError};
 use cwtools_game::constants::Game;
-use cwtools_parser::ast::{Child, ParsedFile, Value};
-use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
+use cwtools_parser::ast::ParsedFile;
+use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
-use std::collections::HashMap;
 
 pub mod common;
 pub mod stellaris;

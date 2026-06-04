@@ -1,4 +1,4 @@
-use crate::{ValidationError, ErrorSeverity};
+use crate::{ValidationError, ErrorSeverity, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
@@ -62,6 +62,7 @@ fn validate_event(
             line: node.pos.start.line,
             col: node.pos.start.col,
             file: file_path.to_string(),
+            code: Some(error_codes::CW300_EVENT_EVERY_TICK.id.to_string()),
         });
     }
 
@@ -83,6 +84,7 @@ fn validate_event(
                 line: child_line(child, ast),
                 col: 0,
                 file: file_path.to_string(),
+                code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id.to_string()),
             });
         }
     }
@@ -112,6 +114,7 @@ fn validate_event_clause(
             line,
             col: 0,
             file: file_path.to_string(),
+            code: Some(error_codes::CW300_EVENT_EVERY_TICK.id.to_string()),
         });
     }
 }
@@ -191,4 +194,119 @@ fn child_is_bool(child: &Child, ast: &ParsedFile, table: &StringTable, expected:
         }
         _ => false,
     }
+}
+
+// ── Localisation validators (Item 6) ─────────────────────────────────────────
+//
+// Ported from CWTools/Validation/Stellaris/STLLocalisationValidation.fs
+// (checkKeyAndDesc).  These require a set of known localisation keys — if the
+// caller doesn't supply one, the checks are skipped entirely.
+
+/// Check that every named instance of `type_name` found in `ast` has both a
+/// `<instance_name>` loc key AND a `<instance_name>_desc` loc key present in
+/// `loc_keys`.  Mirrors F# `checkKeyAndDesc`.
+///
+/// The `name_getter` closure extracts the instance name from a node's children.
+/// If `loc_keys` is None the function is a no-op.
+pub fn check_key_and_desc(
+    ast: &ParsedFile,
+    table: &StringTable,
+    file_path: &str,
+    loc_keys: Option<&std::collections::HashSet<String>>,
+    node_key_filter: &[&str],
+    errors: &mut Vec<ValidationError>,
+) {
+    let loc_keys = match loc_keys {
+        Some(k) => k,
+        None => return,
+    };
+
+    for child in &ast.root_children {
+        match child {
+            Child::Node(idx) => {
+                let node = &ast.arena.nodes[*idx as usize];
+                let key = table.get_string(node.key.normal).unwrap_or_default();
+                if !node_key_filter.is_empty() && !node_key_filter.contains(&key.as_str()) {
+                    continue;
+                }
+                // The node key itself is the type instance name.
+                let instance_name = key.clone();
+                check_loc_key_pair(
+                    &instance_name,
+                    node.pos.start.line,
+                    loc_keys,
+                    file_path,
+                    errors,
+                );
+            }
+            Child::Leaf(idx) => {
+                let leaf = &ast.arena.leaves[*idx as usize];
+                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                if !node_key_filter.is_empty() && !node_key_filter.contains(&key.as_str()) {
+                    continue;
+                }
+                if let Value::Clause(_) = &leaf.value {
+                    check_loc_key_pair(
+                        &key,
+                        leaf.pos.start.line,
+                        loc_keys,
+                        file_path,
+                        errors,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_loc_key_pair(
+    name: &str,
+    line: u32,
+    loc_keys: &std::collections::HashSet<String>,
+    file_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !loc_keys.contains(name) {
+        errors.push(ValidationError {
+            message: format!("Missing localisation key '{}' for instance '{}'", name, name),
+            severity: ErrorSeverity::Warning,
+            line,
+            col: 0,
+            file: file_path.to_string(),
+            code: Some(error_codes::CW100_MISSING_LOCALISATION.id.to_string()),
+        });
+    }
+    let desc_key = format!("{}_desc", name);
+    if !loc_keys.contains(&desc_key) {
+        errors.push(ValidationError {
+            message: format!("Missing localisation key '{}' for instance '{}'", desc_key, name),
+            severity: ErrorSeverity::Warning,
+            line,
+            col: 0,
+            file: file_path.to_string(),
+            code: Some(error_codes::CW100_MISSING_LOCALISATION.id.to_string()),
+        });
+    }
+}
+
+/// Port of F# `valTechLocs`: validate that each technology node has its
+/// localisation keys.  Requires loc_keys; no-op if None.
+/// valPolicies follows the same pattern.
+///
+/// Note: Full `valTechLocs`/`valPolicies` porting depends on localisation-key
+/// plumbing not yet available at this call site.  The mechanism is in place;
+/// call `check_key_and_desc` with the appropriate `node_key_filter` from the
+/// CLI/LSP layer once loc keys are available.
+pub fn validate_stellaris_loc(
+    ast: &ParsedFile,
+    table: &StringTable,
+    file_path: &str,
+    loc_keys: Option<&std::collections::HashSet<String>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    // Technology localisation check
+    check_key_and_desc(ast, table, file_path, loc_keys, &["technology"], errors);
+    // Policy localisation check
+    check_key_and_desc(ast, table, file_path, loc_keys, &["policy"], errors);
 }

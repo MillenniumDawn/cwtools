@@ -282,7 +282,7 @@ fn rules_for_context<'a>(
 
     // Find a TypeRule whose corresponding TypeDef covers logical_path and
     // whose top-level key matches key_path[0].
-    let top_key = &key_path[0];
+    let _top_key = &key_path[0];
     for root_rule in &ruleset.root_rules {
         let (type_name, (rule_type, _)) = match root_rule {
             RootRule::TypeRule(n, r) => (n, r),
@@ -1452,7 +1452,11 @@ impl Backend {
                         let language = self.state.language.lock().unwrap().clone();
                         let game = cwtools_game::constants::Game::from_str(&language);
                         let start = std::time::Instant::now();
-                        let mut errs = validate_ast(&parsed, ruleset, &self.state.string_table, uri, game);
+                        // Pass the workspace TypeIndex for cross-file type reference checking.
+                        let info_guard = self.state.info_service.lock().unwrap();
+                        let type_index = &info_guard.type_index;
+                        let mut errs = validate_ast(&parsed, ruleset, &self.state.string_table, uri, game, Some(type_index), None);
+                        drop(info_guard);
                         let elapsed = start.elapsed();
                         const MAX_ERRORS: usize = 100;
                         let total = errs.len();
@@ -1464,6 +1468,7 @@ impl Backend {
                                 line: 0,
                                 col: 0,
                                 file: uri.to_string(),
+                                code: None,
                             });
                         }
                         let msg = format!(
@@ -1547,7 +1552,7 @@ fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnostic {
             cwtools_validation::ErrorSeverity::Information => Some(DiagnosticSeverity::INFORMATION),
             cwtools_validation::ErrorSeverity::Hint => Some(DiagnosticSeverity::HINT),
         },
-        code: None,
+        code: err.code.as_deref().map(|c| NumberOrString::String(c.to_string())),
         code_description: None,
         source: Some("cwtools".to_string()),
         message: err.message.clone(),

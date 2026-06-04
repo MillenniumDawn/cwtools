@@ -1,11 +1,11 @@
-use cwtools_game::scope_engine::{ScopeContext, ScopeId, ScopeResult};
+use cwtools_game::scope_engine::{ScopeContext, ScopeId};
 use cwtools_game::constants::Game;
-use cwtools_game::scope::{Scope};
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+pub mod error_codes;
 pub mod per_game;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +15,8 @@ pub struct ValidationError {
     pub line: u32,
     pub col: u16,
     pub file: String,
+    /// CW### error code, e.g. "CW201" for unexpected field.
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,17 +42,19 @@ fn validate_wrapper_grandchildren(
     scope_context: &mut Option<ScopeContext>,
     game: Option<Game>,
     ruleset: &RuleSet,
+    type_index: Option<&cwtools_info::TypeIndex>,
+    modifier_keys: Option<&HashSet<String>>,
 ) {
     for grandchild in grandchildren {
         match grandchild {
             Child::Node(gc_idx) => {
                 let gc_node = &ast.arena.nodes[*gc_idx as usize];
-                validate_with_type(type_def, gc_node.children.as_slice(), ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                validate_with_type(type_def, gc_node.children.as_slice(), ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset, type_index, modifier_keys);
             }
             Child::Leaf(gc_idx) => {
                 let gc_leaf = &ast.arena.leaves[*gc_idx as usize];
                 if let Value::Clause(gc_children) = &gc_leaf.value {
-                    validate_with_type(type_def, gc_children.as_slice(), ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                    validate_with_type(type_def, gc_children.as_slice(), ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset, type_index, modifier_keys);
                 }
                 // Non-clause scalar leaf inside wrapper: leave as-is (no error)
             }
@@ -63,6 +67,7 @@ fn validate_wrapper_grandchildren(
                     line: lv.pos.start.line,
                     col: lv.pos.start.col,
                     file: file_path.to_string(),
+                    code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
                 });
             }
             _ => {}
@@ -76,6 +81,8 @@ pub fn validate_ast(
     table: &StringTable,
     file_path: &str,
     game: Option<Game>,
+    type_index: Option<&cwtools_info::TypeIndex>,
+    modifier_keys: Option<&HashSet<String>>,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     let enum_map: HashMap<&str, &EnumDefinition> = ruleset
@@ -118,7 +125,7 @@ pub fn validate_ast(
             let has_content_rules = !inner_rules.is_empty()
                 || type_def.subtypes.iter().any(|st| !st.rules.is_empty());
             if has_content_rules {
-                validate_with_type(type_def, children, ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
+                validate_with_type(type_def, children, ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset, type_index, modifier_keys);
                 continue;
             }
             // matched by name but instance-only: fall through to path matching
@@ -166,7 +173,7 @@ pub fn validate_ast(
                     }
                     _ => &[],
                 };
-                validate_wrapper_grandchildren(grandchildren, type_def, ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
+                validate_wrapper_grandchildren(grandchildren, type_def, ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset, type_index, modifier_keys);
                 continue;
             }
 
@@ -174,12 +181,12 @@ pub fn validate_ast(
             match child {
                 Child::Node(node_idx) => {
                     let node = &ast.arena.nodes[*node_idx as usize];
-                    validate_with_type(type_def, node.children.as_slice(), ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
+                    validate_with_type(type_def, node.children.as_slice(), ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset, type_index, modifier_keys);
                 }
                 Child::Leaf(leaf_idx) => {
                     let leaf = &ast.arena.leaves[*leaf_idx as usize];
                     if let Value::Clause(children) = &leaf.value {
-                        validate_with_type(type_def, children.as_slice(), ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset);
+                        validate_with_type(type_def, children.as_slice(), ast, inner_rules, &enum_map, table, &mut errors, file_path, &mut scope_context, game, ruleset, type_index, modifier_keys);
                     }
                 }
                 _ => {}
@@ -216,10 +223,12 @@ fn validate_with_type(
     scope_context: &mut Option<ScopeContext>,
     game: Option<Game>,
     ruleset: &RuleSet,
+    type_index: Option<&cwtools_info::TypeIndex>,
+    modifier_keys: Option<&HashSet<String>>,
 ) {
     if type_def.subtypes.is_empty() {
         let pre_count = errors.len();
-        validate_children(children, ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
+        validate_children(children, ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset, type_index, modifier_keys);
         // Item 9: warning_only
         if type_def.warning_only {
             for err in errors[pre_count..].iter_mut() {
@@ -314,7 +323,7 @@ fn validate_with_type(
 
     // Step 5: validate children once against the merged rule set.
     let pre_count = errors.len();
-    validate_children(children, ast, &merged, enum_map, table, errors, file_path, scope_context, game, ruleset);
+    validate_children(children, ast, &merged, enum_map, table, errors, file_path, scope_context, game, ruleset, type_index, modifier_keys);
 
     // Item 9: warning_only — downgrade all newly-added errors to warnings (F# RuleValidationService.fs:916).
     if type_def.warning_only {
@@ -330,18 +339,6 @@ fn validate_with_type(
     }
 }
 
-/// Look up the validation rules for a named subtype from a set of inner rules.
-/// Returns the rules slice from the matching SubtypeRule, or None if not found.
-fn find_subtype_rules<'a>(name: &str, inner_rules: &'a [(RuleType, Options)]) -> Option<&'a [(RuleType, Options)]> {
-    for (rule_type, _opts) in inner_rules {
-        if let RuleType::SubtypeRule { name: rule_name, rules, .. } = rule_type {
-            if rule_name == name {
-                return Some(rules.as_slice());
-            }
-        }
-    }
-    None
-}
 
 /// Check if this type says its root key should be skipped (children are the real entries).
 fn should_skip_root_key(_key: &str, type_def: &TypeDefinition) -> bool {
@@ -458,6 +455,8 @@ fn validate_children(
     scope_context: &mut Option<ScopeContext>,
     game: Option<Game>,
     ruleset: &RuleSet,
+    type_index: Option<&cwtools_info::TypeIndex>,
+    modifier_keys: Option<&HashSet<String>>,
 ) {
     // Track occurrence counts for cardinality checking.
     // Keyed children (Leaf/Node): key string -> count.
@@ -526,6 +525,7 @@ fn validate_children(
                                         line: leaf.pos.start.line,
                                         col: leaf.pos.start.col,
                                         file: file_path.to_string(),
+                                        code: Some(error_codes::CW400_UNKNOWN_SCOPE.id.to_string()),
                                     });
                                 }
                             }
@@ -539,7 +539,7 @@ fn validate_children(
                                     if let Some((_, alias_rule)) = ruleset.aliases.iter().find(|(n, _)| n == &alias_key) {
                                         match alias_rule {
                                             (RuleType::LeafRule { .. }, _) => {
-                                                validate_leaf(leaf, &alias_rule.0, table, enum_map, errors, file_path);
+                                                validate_leaf(leaf, &alias_rule.0, table, enum_map, errors, file_path, type_index);
                                             }
                                             (RuleType::NodeRule { rules: alias_inner, .. }, alias_opts) => {
                                                 if let Value::Clause(clause_children) = &leaf.value {
@@ -552,7 +552,7 @@ fn validate_children(
                                                             apply_replace_scopes(ctx, replace, game);
                                                         }
                                                     }
-                                                    validate_children(clause_children, ast, alias_inner, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                                                    validate_children(clause_children, ast, alias_inner, enum_map, table, errors, file_path, scope_context, game, ruleset, type_index, modifier_keys);
                                                     if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
                                                         ctx.restore(saved);
                                                     }
@@ -563,7 +563,7 @@ fn validate_children(
                                     }
                                     // If alias category is unloaded (empty), accept silently.
                                 } else {
-                                    validate_leaf(leaf, rule_type, table, enum_map, errors, file_path);
+                                    validate_leaf(leaf, rule_type, table, enum_map, errors, file_path, type_index);
                                 }
                             }
                             RuleType::NodeRule { left, rules: inner_rules, .. } => {
@@ -582,7 +582,7 @@ fn validate_children(
                                                         apply_replace_scopes(ctx, replace, game);
                                                     }
                                                 }
-                                                validate_children(clause_children, ast, alias_inner, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                                                validate_children(clause_children, ast, alias_inner, enum_map, table, errors, file_path, scope_context, game, ruleset, type_index, modifier_keys);
                                                 if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
                                                     ctx.restore(saved);
                                                 }
@@ -601,7 +601,7 @@ fn validate_children(
                                                 apply_replace_scopes(ctx, replace, game);
                                             }
                                         }
-                                        validate_children(clause_children, ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                                        validate_children(clause_children, ast, inner_rules, enum_map, table, errors, file_path, scope_context, game, ruleset, type_index, modifier_keys);
                                         if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
                                             ctx.restore(saved);
                                         }
@@ -614,13 +614,19 @@ fn validate_children(
                     }
                 }
                 if !matched {
-                    errors.push(ValidationError {
-                        message: format!("Unexpected field '{}'", key),
-                        severity: ErrorSeverity::Error,
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                        file: file_path.to_string(),
-                    });
+                    // Item 5: dynamic modifier keys — if provided and this key is a
+                    // known modifier, accept silently (modifier context mechanism).
+                    let is_modifier = modifier_keys.map(|mk| mk.contains(&key)).unwrap_or(false);
+                    if !is_modifier {
+                        errors.push(ValidationError {
+                            message: format!("Unexpected field '{}'", key),
+                            severity: ErrorSeverity::Error,
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                            file: file_path.to_string(),
+                            code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
+                        });
+                    }
                 }
             }
             Child::Node(idx) => {
@@ -643,6 +649,7 @@ fn validate_children(
                                         line: node.pos.start.line,
                                         col: node.pos.start.col,
                                         file: file_path.to_string(),
+                                        code: Some(error_codes::CW400_UNKNOWN_SCOPE.id.to_string()),
                                     });
                                 }
                             }
@@ -663,7 +670,7 @@ fn validate_children(
                                                     apply_replace_scopes(ctx, replace, game);
                                                 }
                                             }
-                                            validate_children(&node.children, ast, alias_inner, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                                            validate_children(&node.children, ast, alias_inner, enum_map, table, errors, file_path, scope_context, game, ruleset, type_index, modifier_keys);
                                             if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
                                                 ctx.restore(saved);
                                             }
@@ -682,7 +689,7 @@ fn validate_children(
                                     }
                                     validate_children(
                                         &node.children, ast, inner_rules, enum_map, table, errors,
-                                        file_path, scope_context, game, ruleset,
+                                        file_path, scope_context, game, ruleset, type_index, modifier_keys,
                                     );
                                     if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
                                         ctx.restore(saved);
@@ -695,13 +702,18 @@ fn validate_children(
                     }
                 }
                 if !matched {
-                    errors.push(ValidationError {
-                        message: format!("Unexpected block '{}'", key),
-                        severity: ErrorSeverity::Error,
-                        line: node.pos.start.line,
-                        col: node.pos.start.col,
-                        file: file_path.to_string(),
-                    });
+                    // Item 5: dynamic modifier keys — accept known modifier block keys silently.
+                    let is_modifier = modifier_keys.map(|mk| mk.contains(&key)).unwrap_or(false);
+                    if !is_modifier {
+                        errors.push(ValidationError {
+                            message: format!("Unexpected block '{}'", key),
+                            severity: ErrorSeverity::Error,
+                            line: node.pos.start.line,
+                            col: node.pos.start.col,
+                            file: file_path.to_string(),
+                            code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
+                        });
+                    }
                 }
             }
             // Item 5: LeafValue validation
@@ -724,6 +736,7 @@ fn validate_children(
                         line: lv.pos.start.line,
                         col: lv.pos.start.col,
                         file: file_path.to_string(),
+                        code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
                     });
                 }
             }
@@ -734,7 +747,7 @@ fn validate_children(
                 for (rule_type, _opts) in rules {
                     if let RuleType::ValueClauseRule { rules: vc_rules } = rule_type {
                         matched = true;
-                        validate_children(&vc.children, ast, vc_rules, enum_map, table, errors, file_path, scope_context, game, ruleset);
+                        validate_children(&vc.children, ast, vc_rules, enum_map, table, errors, file_path, scope_context, game, ruleset, type_index, modifier_keys);
                         break;
                     }
                 }
@@ -745,6 +758,7 @@ fn validate_children(
                         line: vc.pos.start.line,
                         col: vc.pos.start.col,
                         file: file_path.to_string(),
+                        code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
                     });
                 }
             }
@@ -770,12 +784,14 @@ fn validate_children(
                         errors.push(ValidationError {
                             message: format!("Field '{}' appears {} time(s), expected at least {}", key, count, opts.min),
                             severity: missing_sev, line: 0, col: 0, file: file_path.to_string(),
+                            code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
                         });
                     }
                     if count > opts.max {
                         errors.push(ValidationError {
                             message: format!("Field '{}' appears {} time(s), expected at most {}", key, count, opts.max),
                             severity: max_sev, line: 0, col: 0, file: file_path.to_string(),
+                            code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
                         });
                     }
                 }
@@ -787,12 +803,14 @@ fn validate_children(
                     errors.push(ValidationError {
                         message: format!("LeafValue {:?} appears {} time(s), expected at least {}", right, count, opts.min),
                         severity: missing_sev, line: 0, col: 0, file: file_path.to_string(),
+                        code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
                     });
                 }
                 if count > opts.max {
                     errors.push(ValidationError {
                         message: format!("LeafValue {:?} appears {} time(s), expected at most {}", right, count, opts.max),
                         severity: max_sev, line: 0, col: 0, file: file_path.to_string(),
+                        code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
                     });
                 }
             }
@@ -803,12 +821,14 @@ fn validate_children(
                     errors.push(ValidationError {
                         message: format!("ValueClause appears {} time(s), expected at least {}", count, opts.min),
                         severity: missing_sev, line: 0, col: 0, file: file_path.to_string(),
+                        code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
                     });
                 }
                 if count > opts.max {
                     errors.push(ValidationError {
                         message: format!("ValueClause appears {} time(s), expected at most {}", count, opts.max),
                         severity: max_sev, line: 0, col: 0, file: file_path.to_string(),
+                        code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
                     });
                 }
             }
@@ -891,8 +911,52 @@ fn validate_leaf(
     enum_map: &HashMap<&str, &EnumDefinition>,
     errors: &mut Vec<ValidationError>,
     file_path: &str,
+    type_index: Option<&cwtools_info::TypeIndex>,
 ) {
     if let RuleType::LeafRule { right, .. } = rule_type {
+        // TypeField: check type_index when available (Item 1).
+        if let NewField::TypeField(type_type) = right {
+            let value_str = leaf_value_to_string(&leaf.value, table);
+            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            let type_name = match type_type {
+                TypeType::Simple(n) => n.as_str(),
+                TypeType::Complex { name, .. } => name.as_str(),
+            };
+            // Strip prefix/suffix for Complex TypeField before lookup.
+            let lookup_value = match type_type {
+                TypeType::Complex { prefix, suffix, .. } => {
+                    let mut v = value_str.as_str();
+                    if !prefix.is_empty() {
+                        v = v.strip_prefix(prefix.as_str()).unwrap_or(v);
+                    }
+                    if !suffix.is_empty() {
+                        v = v.strip_suffix(suffix.as_str()).unwrap_or(v);
+                    }
+                    v.to_string()
+                }
+                _ => value_str.clone(),
+            };
+            if let Some(idx) = type_index {
+                // Only flag if we have at least one known instance for this type.
+                // If zero instances, vanilla data probably isn't loaded — accept.
+                if !idx.instances(type_name).is_empty() && !idx.contains(type_name, &lookup_value) {
+                    errors.push(ValidationError {
+                        message: format!(
+                            "Field '{}' references '{}' which is not a known instance of type '{}'",
+                            key, lookup_value, type_name
+                        ),
+                        severity: ErrorSeverity::Error,
+                        line: leaf.pos.start.line,
+                        col: leaf.pos.start.col,
+                        file: file_path.to_string(),
+                        code: Some(error_codes::CW500_TYPE_NOT_FOUND.id.to_string()),
+                    });
+                }
+            }
+            // TypeField is otherwise accepted (non-empty check done by field_matches_value).
+            return;
+        }
+
         if !field_matches_value(right, &leaf.value, table, enum_map) {
             let expected = field_to_description(right);
             let actual = leaf_value_to_string(&leaf.value, table);
@@ -901,6 +965,7 @@ fn validate_leaf(
                 message: format!("Field '{}' has value '{}', expected {}", key, actual, expected),
                 severity: ErrorSeverity::Error,
                 line: leaf.pos.start.line, col: leaf.pos.start.col, file: file_path.to_string(),
+                code: Some(error_codes::CW202_INVALID_VALUE.id.to_string()),
             });
         }
     }
