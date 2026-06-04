@@ -1,3 +1,4 @@
+use crate::post_process::post_process;
 use crate::rules_converter::ast_to_ruleset;
 use crate::rules_types::RuleSet;
 use cwtools_parser::parser::parse_string;
@@ -61,6 +62,10 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<S
             }
         }
     }
+
+    // Run the post-processing pipeline once all files have been merged so that
+    // cross-file single_alias references are fully resolved.
+    post_process(&mut combined);
 
     (combined, errors)
 }
