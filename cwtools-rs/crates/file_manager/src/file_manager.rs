@@ -4,6 +4,82 @@ use cwtools_string_table::string_table::StringTable;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+// ── Encoding helper ───────────────────────────────────────────────────────────
+
+/// Windows-1252 → Unicode mapping for the 0x80-0x9F range (the gap not covered
+/// by ISO-8859-1).  Index 0 = byte 0x80, index 31 = byte 0x9F.
+///
+/// Source: https://encoding.spec.whatwg.org/index-windows-1252.txt
+const CP1252_HIGH: [char; 32] = [
+    '\u{20AC}', // 0x80 €
+    '\u{FFFD}', // 0x81 (undefined → replacement char)
+    '\u{201A}', // 0x82 ‚
+    '\u{0192}', // 0x83 ƒ
+    '\u{201E}', // 0x84 „
+    '\u{2026}', // 0x85 …
+    '\u{2020}', // 0x86 †
+    '\u{2021}', // 0x87 ‡
+    '\u{02C6}', // 0x88 ˆ
+    '\u{2030}', // 0x89 ‰
+    '\u{0160}', // 0x8A Š
+    '\u{2039}', // 0x8B ‹
+    '\u{0152}', // 0x8C Œ
+    '\u{FFFD}', // 0x8D (undefined)
+    '\u{017D}', // 0x8E Ž
+    '\u{FFFD}', // 0x8F (undefined)
+    '\u{FFFD}', // 0x90 (undefined)
+    '\u{2018}', // 0x91 '
+    '\u{2019}', // 0x92 '
+    '\u{201C}', // 0x93 "
+    '\u{201D}', // 0x94 "
+    '\u{2022}', // 0x95 •
+    '\u{2013}', // 0x96 –
+    '\u{2014}', // 0x97 —
+    '\u{02DC}', // 0x98 ˜
+    '\u{2122}', // 0x99 ™
+    '\u{0161}', // 0x9A š
+    '\u{203A}', // 0x9B ›
+    '\u{0153}', // 0x9C œ
+    '\u{FFFD}', // 0x9D (undefined)
+    '\u{017E}', // 0x9E ž
+    '\u{0178}', // 0x9F Ÿ
+];
+
+/// Decode a single byte as Windows-1252.
+#[inline]
+fn cp1252_byte(b: u8) -> char {
+    if b < 0x80 {
+        b as char
+    } else if b <= 0x9F {
+        CP1252_HIGH[(b - 0x80) as usize]
+    } else {
+        // 0xA0-0xFF: identical to Latin-1 / Unicode
+        b as char
+    }
+}
+
+/// Read a file as text: try UTF-8 first, fall back to Windows-1252.
+///
+/// Pre-Jomini games (CK2, EU4, VIC2, HOI4 old mods) often encode files in
+/// Windows-1252.  Blindly using `read_to_string` fails on any accented byte
+/// outside ASCII (e.g. `é` = 0xE9).  This helper avoids that breakage.
+pub fn read_text(path: &Path) -> Result<String, FileError> {
+    let bytes = std::fs::read(path)?;
+    // Fast path: valid UTF-8 (includes pure ASCII)
+    if let Ok(s) = std::str::from_utf8(&bytes) {
+        return Ok(s.to_owned());
+    }
+    // Strip UTF-8 BOM if present (still try to decode as CP-1252 below if the
+    // rest is not valid UTF-8, but this never happens in practice).
+    let bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &bytes[3..]
+    } else {
+        &bytes
+    };
+    // Decode as Windows-1252
+    Ok(bytes.iter().map(|&b| cp1252_byte(b)).collect())
+}
+
 /// How the file should be treated during discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileKind {
@@ -229,8 +305,8 @@ impl FileManager {
             // Compute logical path relative to root
             let logical_path = compute_logical_path(&path, &self.config.root);
 
-            // Parse file
-            let content = std::fs::read_to_string(&path)?;
+            // Parse file (UTF-8 with CP-1252 fallback)
+            let content = read_text(&path)?;
             match parse_string(&content, &self.string_table) {
                 Ok(parsed) => {
                     out.push(ParsedFile {
@@ -250,7 +326,7 @@ impl FileManager {
     }
 
     pub fn parse_single_file(&mut self, path: &Path) -> Result<ParsedFile, FileError> {
-        let content = std::fs::read_to_string(path)?;
+        let content = read_text(path)?;
         let logical_path = compute_logical_path(path, &self.config.root);
         match parse_string(&content, &self.string_table) {
             Ok(parsed) => Ok(ParsedFile {
@@ -296,7 +372,7 @@ pub fn compute_logical_path(path: &Path, root: &Path) -> String {
 /// Mirrors F# FileManager.fs:91-125: extracts `name`, `path`, and
 /// `replace_path` entries.
 pub fn parse_mod_descriptor(path: &Path) -> Result<ModDescriptor, FileError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_text(path)?;
     let mut name = String::new();
     let mut mod_path = None;
     let mut replace_paths = Vec::new();
@@ -323,6 +399,166 @@ pub fn parse_mod_descriptor(path: &Path) -> Result<ModDescriptor, FileError> {
         path: mod_path,
         replace_paths,
     })
+}
+
+// ── Multi-mod expansion ───────────────────────────────────────────────────────
+
+/// A resolved mod entry: its descriptor plus the on-disk root directory.
+#[derive(Debug, Clone)]
+pub struct ResolvedMod {
+    pub descriptor: ModDescriptor,
+    /// Absolute path to the mod root directory.
+    pub root: PathBuf,
+}
+
+/// Scan a `MultipleMod` workspace directory for `.mod` descriptors and resolve
+/// each to a concrete mod root.
+///
+/// Mirrors F# FileManager.fs:64-90: reads every `*.mod` file inside the
+/// `mod/` (or `mods/`) subfolder, parses it, and returns a `ResolvedMod` for
+/// each descriptor whose `path` resolves to an existing directory.
+///
+/// `workspace` must be the directory that `classify_directory` returned
+/// `MultipleMod` for.
+pub fn expand_multiple_mods(workspace: &Path) -> Vec<ResolvedMod> {
+    let mut out = Vec::new();
+
+    for mod_folder_name in &["mod", "mods"] {
+        let mod_folder = workspace.join(mod_folder_name);
+        if !mod_folder.is_dir() {
+            continue;
+        }
+
+        let entries = match std::fs::read_dir(&mod_folder) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e.eq_ignore_ascii_case("mod")).unwrap_or(false) {
+                match parse_mod_descriptor(&path) {
+                    Ok(desc) => {
+                        if let Some(mod_path) = &desc.path {
+                            // `path` can be relative (to the workspace) or absolute
+                            let root = if std::path::Path::new(mod_path).is_absolute() {
+                                PathBuf::from(mod_path)
+                            } else {
+                                workspace.join(mod_path)
+                            };
+                            if root.is_dir() {
+                                out.push(ResolvedMod { descriptor: desc, root });
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    // Sort by name for deterministic ordering
+    out.sort_by(|a, b| a.descriptor.name.cmp(&b.descriptor.name));
+    out
+}
+
+/// Discover files across multiple mods, honouring `replace_path`.
+///
+/// Mirrors F# FileManager.fs:91-147:
+/// * Mods are layered: later mods in `mods` take priority over earlier ones
+///   (typically the caller orders them from lowest to highest priority).
+/// * A mod's `replace_path` entries suppress *all* files whose logical path
+///   starts with that prefix that were contributed by lower-priority sources
+///   (including vanilla).
+///
+/// Returns `(mod_root, files_from_that_root)` pairs so callers know the origin.
+pub fn discover_files_multi_mod(
+    vanilla_root: Option<&Path>,
+    mods: &[ResolvedMod],
+    include_dirs: &[String],
+) -> Vec<(PathBuf, String)> {
+    // Collect (logical_path, absolute_path, source_priority) triples.
+    // Higher priority index wins.
+    use std::collections::HashMap;
+
+    let mut best: HashMap<String, (PathBuf, usize)> = HashMap::new();
+
+    // Build ordered list: vanilla is priority 0, mods are 1..=n
+    let mut sources: Vec<(usize, &Path, &[String])> = Vec::new();
+
+    if let Some(v) = vanilla_root {
+        sources.push((0, v, include_dirs));
+    }
+    for (i, m) in mods.iter().enumerate() {
+        sources.push((i + 1, &m.root, include_dirs));
+    }
+
+    // Collect candidate files from all sources
+    for (priority, root, dirs) in &sources {
+        for include_dir in *dirs {
+            let dir = if *include_dir == "." {
+                root.to_path_buf()
+            } else {
+                root.join(include_dir)
+            };
+            if !dir.is_dir() {
+                continue;
+            }
+            collect_files_recursive(&dir, root, *priority, &mut best);
+        }
+    }
+
+    // Apply replace_path suppression: for each mod (in priority order, highest
+    // first), any file whose logical path starts with a replace_path prefix and
+    // originates from a *lower* priority source is removed.
+    for (i, m) in mods.iter().enumerate().rev() {
+        let mod_priority = i + 1;
+        for rp in &m.descriptor.replace_paths {
+            let prefix = rp.trim_matches('/').to_string();
+            best.retain(|logical, (_path, file_prio)| {
+                // If the file's logical path is under this replace_path and
+                // comes from a lower-priority source → suppress it.
+                let under_prefix = logical == &prefix
+                    || logical.starts_with(&format!("{}/", prefix));
+                if under_prefix && *file_prio < mod_priority {
+                    return false;
+                }
+                true
+            });
+        }
+    }
+
+    let mut result: Vec<(PathBuf, String)> = best
+        .into_iter()
+        .map(|(logical, (abs_path, _prio))| (abs_path, logical))
+        .collect();
+    result.sort_by(|a, b| a.1.cmp(&b.1));
+    result
+}
+
+fn collect_files_recursive(
+    dir: &Path,
+    root: &Path,
+    priority: usize,
+    out: &mut std::collections::HashMap<String, (PathBuf, usize)>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(&path, root, priority, out);
+        } else {
+            let logical = compute_logical_path(&path, root);
+            // Higher priority wins
+            let entry = out.entry(logical).or_insert((path.clone(), priority));
+            if priority > entry.1 {
+                *entry = (path, priority);
+            }
+        }
+    }
 }
 
 /// Classify a directory following F# FileManager.fs:80-147.
@@ -470,5 +706,110 @@ mod tests {
         let root = PathBuf::from("/other");
         let path = PathBuf::from("/mnt/mod/foo.txt");
         assert_eq!(compute_logical_path(&path, &root), "foo.txt");
+    }
+
+    // ── CP-1252 / encoding tests ──────────────────────────────────────────────
+
+    #[test]
+    fn cp1252_e_acute_0xe9() {
+        // 0xE9 in CP-1252 is U+00E9 (é), same as Latin-1 for bytes >= 0xA0
+        assert_eq!(cp1252_byte(0xE9), 'é');
+    }
+
+    #[test]
+    fn cp1252_euro_sign_0x80() {
+        // 0x80 in CP-1252 is the Euro sign U+20AC — NOT U+0080
+        assert_eq!(cp1252_byte(0x80), '€');
+    }
+
+    #[test]
+    fn cp1252_ascii_passthrough() {
+        assert_eq!(cp1252_byte(b'A'), 'A');
+        assert_eq!(cp1252_byte(b'\n'), '\n');
+    }
+
+    #[test]
+    fn read_text_cp1252_bytes_via_tmpfile() {
+        use std::io::Write as _;
+
+        // Build a sequence: "caf" + 0xE9 (é in CP-1252) + "\n"
+        let bytes: &[u8] = b"caf\xE9\n";
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(bytes).expect("write");
+
+        let text = read_text(tmp.path()).expect("read_text");
+        assert_eq!(text, "caf\u{E9}\n", "0xE9 should decode as é (U+00E9)");
+    }
+
+    // ── multi-mod expand / replace_path tests ─────────────────────────────────
+
+    #[test]
+    fn multi_mod_replace_path_suppresses_vanilla() {
+        use std::fs;
+        use std::collections::HashMap;
+
+        // Create a tiny temp filesystem:
+        //   workspace/
+        //     vanilla/common/foo.txt
+        //     moda/common/foo.txt      (replaces common/)
+        //     modb/events/bar.txt
+        let workspace = tempfile::TempDir::new().expect("tmpdir");
+        let wsp = workspace.path();
+
+        let vanilla = wsp.join("vanilla");
+        fs::create_dir_all(vanilla.join("common")).unwrap();
+        fs::write(vanilla.join("common/foo.txt"), "vanilla").unwrap();
+
+        let moda_root = wsp.join("moda");
+        fs::create_dir_all(moda_root.join("common")).unwrap();
+        fs::write(moda_root.join("common/foo.txt"), "moda").unwrap();
+
+        let modb_root = wsp.join("modb");
+        fs::create_dir_all(modb_root.join("events")).unwrap();
+        fs::write(modb_root.join("events/bar.txt"), "modb").unwrap();
+
+        let mods = vec![
+            ResolvedMod {
+                descriptor: ModDescriptor {
+                    name: "ModA".into(),
+                    path: Some(moda_root.to_str().unwrap().to_string()),
+                    replace_paths: vec!["common".into()],
+                },
+                root: moda_root.clone(),
+            },
+            ResolvedMod {
+                descriptor: ModDescriptor {
+                    name: "ModB".into(),
+                    path: Some(modb_root.to_str().unwrap().to_string()),
+                    replace_paths: vec![],
+                },
+                root: modb_root.clone(),
+            },
+        ];
+
+        let include_dirs = vec!["common".to_string(), "events".to_string()];
+        let files = discover_files_multi_mod(Some(&vanilla), &mods, &include_dirs);
+
+        // Build logical_path → content map
+        let by_logical: HashMap<String, String> = files
+            .iter()
+            .map(|(abs, logical)| {
+                let content = fs::read_to_string(abs).unwrap_or_default();
+                (logical.clone(), content)
+            })
+            .collect();
+
+        // Vanilla's common/foo.txt should be suppressed by ModA's replace_path
+        assert_eq!(
+            by_logical.get("common/foo.txt").map(|s| s.as_str()),
+            Some("moda"),
+            "ModA's common/foo.txt should win; vanilla suppressed by replace_path"
+        );
+
+        // ModB's events/bar.txt should be present
+        assert!(
+            by_logical.contains_key("events/bar.txt"),
+            "ModB events/bar.txt should be present"
+        );
     }
 }

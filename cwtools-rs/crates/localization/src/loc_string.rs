@@ -13,8 +13,6 @@
 //! Mirrors F# `LocalisationString.fs` and handles both the original Paradox
 //! syntax (`[GetName]`) and the newer Jomini syntax.
 
-use std::collections::HashMap;
-
 /// Parsed element inside a loc string.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocElement {

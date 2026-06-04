@@ -5,8 +5,9 @@
 //!
 //! Mirrors F# `LocalisationManager.fs`.
 
-use crate::commands::{key_to_language, Lang, LocApi, LocEntry, LocFile};
+use crate::commands::{Lang, LocApi, LocEntry, LocFile};
 use crate::yaml_parser::parse_loc_text;
+use cwtools_file_manager::read_text;
 use std::collections::HashMap;
 
 /// A multi-file localization service for a single game.
@@ -85,7 +86,7 @@ fn walk_folder(folder: &std::path::Path) -> Vec<(String, String)> {
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
             if ext == "yml" || ext == "csv" {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let text = read_text(&path).unwrap_or_default();
                 files.push((path.to_string_lossy().to_string(), text));
             }
         }

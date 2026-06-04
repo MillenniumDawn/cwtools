@@ -8,8 +8,8 @@
 //!
 //! Mirrors F# `LocalisationString.fs`.
 
-use crate::commands::{Lang, LocEntry, LocFile};
-use std::collections::{HashMap, HashSet};
+use crate::commands::{LocEntry, LocFile};
+use std::collections::HashSet;
 
 /// Validation error for a loc entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -203,7 +203,6 @@ pub fn build_key_union(files: &[LocFile]) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Lang, Position};
     use crate::yaml_parser::parse_loc_text;
 
     #[test]
