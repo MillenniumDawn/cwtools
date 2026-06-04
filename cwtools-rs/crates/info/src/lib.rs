@@ -45,7 +45,7 @@ pub struct TypeInstance {
 #[derive(Debug, Default)]
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
-    map: HashMap<String, Vec<(String, TypeInstance)>>,
+    pub map: HashMap<String, Vec<(String, TypeInstance)>>,
 }
 
 impl TypeIndex {

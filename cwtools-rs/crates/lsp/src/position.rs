@@ -17,9 +17,9 @@ pub fn find_at_position(
 
 #[derive(Debug, Clone)]
 pub enum AstElement {
-    Node { key: String, idx: u32 },
-    Leaf { key: String, value: String, idx: u32 },
-    LeafValue { value: String, idx: u32 },
+    Node { key: String, #[allow(dead_code)] idx: u32 },
+    Leaf { key: String, value: String, #[allow(dead_code)] idx: u32 },
+    LeafValue { value: String, #[allow(dead_code)] idx: u32 },
 }
 
 fn find_in_child(

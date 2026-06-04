@@ -6,9 +6,9 @@ use cwtools_string_table::string_table::StringTable;
 /// For each symbol name, stores (uri, line) pairs where it's defined or referenced.
 pub struct SymbolIndex {
     /// Symbol name → list of definition locations (uri, line)
-    definitions: HashMap<String, Vec<(SymbolLocation)>>,
+    definitions: HashMap<String, Vec<SymbolLocation>>,
     /// Symbol name → list of reference locations (uri, line)
-    references: HashMap<String, Vec<(SymbolLocation)>>,
+    references: HashMap<String, Vec<SymbolLocation>>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +109,7 @@ impl SymbolIndex {
             && !key.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn find_definitions(&self,
         name: &str,
     ) -> Option<&Vec<SymbolLocation>> {

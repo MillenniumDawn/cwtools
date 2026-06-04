@@ -19,6 +19,17 @@ use cwtools_info::{
 mod position;
 mod symbols;
 
+// ── Custom LSP notification types ─────────────────────────────────────────────
+
+/// `loadingBar` server→client notification (S→C).
+/// Payload: `{ "enable": bool, "value": string }`.
+/// Used to drive the extension's status-bar progress indicator.
+enum LoadingBar {}
+impl tower_lsp::lsp_types::notification::Notification for LoadingBar {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "loadingBar";
+}
+
 /// Server state.
 struct DocumentState {
     /// file URI -> parsed document
@@ -38,6 +49,7 @@ struct DocumentState {
 }
 
 struct ParsedDoc {
+    #[allow(dead_code)]
     version: i32,
     text: String,
     ast: Option<ParsedFile>,
@@ -63,6 +75,17 @@ struct Backend {
 }
 
 // ── Custom notification stubs ─────────────────────────────────────────────────
+
+// NOT PORTED — large / game-specific features left as future work:
+//   - Code actions / pre-trigger refactor: Stellaris-specific effect/trigger
+//     scaffolding (F# LanguageFeatures.getCodeActions).  Would need a full
+//     scope-context walker and template engine.
+//   - techGraph / event-graph: graphical views generated from type relations
+//     (F# LanguageFeatures.getEventGraph / techGraph).  Needs a graph-building
+//     pass over the TypeIndex.
+//   - getEmbeddedMetadata: per-file metadata bundle sent to the extension on
+//     open (F# LanguageFeatures.getEmbeddedMetadata).  Low priority until the
+//     extension side is ported.
 
 impl Backend {
     /// Called when the VS Code extension tells us the user switched to a file.
@@ -430,14 +453,22 @@ fn completions_from_rules<'a>(
                     ..Default::default()
                 });
             }
-            // A node block key
-            RuleType::NodeRule { left: NewField::SpecificField(k), .. } => {
+            // A node block key — generate snippet with required child fields pre-populated
+            RuleType::NodeRule { left: NewField::SpecificField(k), rules: inner } => {
+                let snippet = generate_node_snippet(k, inner, ruleset);
+                // Scope-aware sortText: if rule has required_scopes push it earlier (lower sort key).
+                let sort = if !opts.required_scopes.is_empty() {
+                    format!("0_{}", k)
+                } else {
+                    format!("1_{}", k)
+                };
                 items.push(CompletionItem {
                     label: k.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
                     detail: opts.description.clone(),
-                    insert_text: Some(format!("{} = {{\n\t$0\n}}", k)),
+                    insert_text: Some(snippet),
                     insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    sort_text: Some(sort),
                     ..Default::default()
                 });
             }
@@ -520,6 +551,176 @@ fn enum_values_for<'a>(ruleset: &'a RuleSet, enum_name: &str) -> Vec<String> {
         return e.values.clone();
     }
     Vec::new()
+}
+
+/// Build an LSP snippet body for a NodeRule, pre-populating required child fields
+/// (those with cardinality min >= 1 and a SpecificField left-side).
+///
+/// Mirrors F# createSnippetForClause:346-390. Tab-stop numbering starts at 1.
+fn generate_node_snippet(
+    key: &str,
+    child_rules: &[(RuleType, cwtools_rules::rules_types::Options)],
+    ruleset: &RuleSet,
+) -> String {
+    // Collect required SpecificField leaves/nodes (min >= 1).
+    let mut required_parts: Vec<String> = Vec::new();
+    let mut tab_stop = 1u32;
+
+    // Use a seen-set so duplicate keys (e.g. from subtype rules) don't repeat.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (rule_type, opts) in child_rules {
+        if opts.min < 1 {
+            continue;
+        }
+        match rule_type {
+            RuleType::LeafRule { left: NewField::SpecificField(k), right } => {
+                if seen.contains(k) { continue; }
+                seen.insert(k.clone());
+                let placeholder = leaf_right_placeholder(right, tab_stop, ruleset);
+                required_parts.push(format!("\t{} = {}", k, placeholder));
+                tab_stop += 1;
+            }
+            RuleType::NodeRule { left: NewField::SpecificField(k), .. } => {
+                if seen.contains(k) { continue; }
+                seen.insert(k.clone());
+                required_parts.push(format!("\t{} = ${{{}:{{ }}}}", k, tab_stop));
+                tab_stop += 1;
+            }
+            _ => {}
+        }
+    }
+
+    if required_parts.is_empty() {
+        // No required fields — just a block with cursor inside.
+        format!("{} = {{\n\t$0\n}}", key)
+    } else {
+        let body = required_parts.join("\n");
+        format!("{} = {{\n{}\n}}", key, body)
+    }
+}
+
+/// Produce a snippet placeholder string for the right-hand side of a leaf rule.
+fn leaf_right_placeholder(
+    right: &NewField,
+    tab_stop: u32,
+    ruleset: &RuleSet,
+) -> String {
+    match right {
+        NewField::ValueField(ValueType::Bool) => {
+            format!("${{{}|yes,no|}}", tab_stop)
+        }
+        NewField::ValueField(ValueType::Enum(e)) => {
+            let vals = enum_values_for(ruleset, e);
+            if !vals.is_empty() && vals.len() <= 20 {
+                format!("${{{}|{}|}}", tab_stop, vals.join(","))
+            } else {
+                format!("${{{}}}", tab_stop)
+            }
+        }
+        _ => format!("${{{}}}", tab_stop),
+    }
+}
+
+/// Build root-level type snippets for types whose path matches `logical_path`.
+///
+/// When the cursor is at the top level of a file, offer a snippet for each
+/// matching type.  Mirrors F# rootTypeItems:1077-1097: uses typeKeyFilter keys
+/// as the block opener if set, otherwise the type name itself; also adds
+/// subtype.typeKeyField alternatives.
+fn root_type_snippets(
+    ruleset: &RuleSet,
+    logical_path: &str,
+) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+
+    for td in &ruleset.types {
+        if !cwtools_info_path_check(&td.path_options, logical_path) {
+            continue;
+        }
+
+        // Determine which keys to offer as block openers.
+        let mut openers: Vec<String> = match &td.type_key_filter {
+            Some((keys, false)) if !keys.is_empty() => keys.clone(),
+            _ => vec![td.name.clone()],
+        };
+
+        // Add subtype typeKeyField alternatives.
+        for st in &td.subtypes {
+            if let Some(tkf) = &st.type_key_field {
+                if !openers.contains(tkf) {
+                    openers.push(tkf.clone());
+                }
+            }
+        }
+
+        // Find the TypeRule for this type to get child rules for snippet body.
+        let child_rules: Option<&[(RuleType, cwtools_rules::rules_types::Options)]> =
+            ruleset.root_rules.iter().find_map(|r| {
+                if let RootRule::TypeRule(name, (RuleType::NodeRule { rules, .. }, _)) = r {
+                    if name == &td.name { Some(rules.as_slice()) } else { None }
+                } else {
+                    None
+                }
+            });
+
+        for opener in openers {
+            let snippet = if let Some(cr) = child_rules {
+                generate_node_snippet(&opener, cr, ruleset)
+            } else {
+                format!("{} = {{\n\t$0\n}}", opener)
+            };
+            items.push(CompletionItem {
+                label: opener.clone(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: Some(format!("type {} instance", td.name)),
+                insert_text: Some(snippet),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                sort_text: Some(format!("0_{}", opener)),
+                ..Default::default()
+            });
+        }
+    }
+
+    items
+}
+
+/// Build best-effort localisation-key completions for .yml files.
+///
+/// Offers all known loc keys from the InfoService.  Inside a `[...]` data-
+/// function block, offers scope/command names instead.  Best-effort only —
+/// full CWTools loc completion (F# locComplete:208-243) would need the loc
+/// database and scope tracking, which are not yet ported.
+fn loc_completions(
+    info: &cwtools_info::InfoService,
+    language: &str,
+) -> Vec<CompletionItem> {
+    // Collect all top-level keys from all files as potential loc keys
+    let mut items: Vec<CompletionItem> = info
+        .files
+        .iter()
+        .flat_map(|(_, fi)| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .map(|k| CompletionItem {
+            label: k.clone(),
+            kind: Some(CompletionItemKind::TEXT),
+            detail: Some("loc key".to_string()),
+            ..Default::default()
+        })
+        .collect();
+
+    // Offer scope names as data-function completions inside [...]
+    for scope in scope_names_for_game(language) {
+        items.push(CompletionItem {
+            label: scope.to_string(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some("scope command".to_string()),
+            ..Default::default()
+        });
+    }
+
+    items
 }
 
 /// Best-effort scope name list for the current game.
@@ -644,6 +845,11 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -843,6 +1049,15 @@ impl LanguageServer for Backend {
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
         let language = self.state.language.lock().unwrap().clone();
 
+        // .yml localisation file — offer loc-key / data-function completions.
+        if uri.ends_with(".yml") || uri.ends_with(".yaml") {
+            let info_guard = self.state.info_service.lock().unwrap();
+            let items = loc_completions(&*info_guard, &language);
+            if !items.is_empty() {
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+        }
+
         let context_items: Vec<CompletionItem> = {
             let docs = self.state.documents.lock().unwrap();
             let ruleset_guard = self.state.ruleset.lock().unwrap();
@@ -851,7 +1066,10 @@ impl LanguageServer for Backend {
             if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
                 if let Some(ast) = &doc.ast {
                     let key_path = enclosing_key_path(ast, lsp_line, lsp_col, &self.state.string_table);
-                    if let Some(rules) = rules_for_context(rs, &key_path, &logical_path) {
+                    if key_path.is_empty() {
+                        // Top level — offer root-type snippets for this file's path.
+                        root_type_snippets(rs, &logical_path)
+                    } else if let Some(rules) = rules_for_context(rs, &key_path, &logical_path) {
                         completions_from_rules(rules, rs, &*info_guard, &language)
                     } else {
                         Vec::new()
@@ -1062,29 +1280,44 @@ impl LanguageServer for Backend {
         };
 
         if let Some((type_name, instance_name)) = type_ref {
-            let info = self.state.info_service.lock().unwrap();
-            let instances = info.type_index.instances(&type_name);
-            let found: Vec<Location> = instances
-                .iter()
-                .filter(|(_, inst)| inst.name == instance_name)
-                .map(|(file_uri, inst)| Location {
-                    uri: file_uri.parse().unwrap_or_else(|_| {
-                        params.text_document_position.text_document.uri.clone()
-                    }),
-                    range: Range {
-                        start: Position {
-                            line: inst.location.line.saturating_sub(1),
-                            character: inst.location.col as u32,
+            let mut all_locs: Vec<Location> = Vec::new();
+
+            // 1. Definition location(s) from TypeIndex.
+            {
+                let info = self.state.info_service.lock().unwrap();
+                let instances = info.type_index.instances(&type_name);
+                for (file_uri, inst) in instances.iter().filter(|(_, inst)| inst.name == instance_name) {
+                    all_locs.push(Location {
+                        uri: file_uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
+                        range: Range {
+                            start: Position { line: inst.location.line.saturating_sub(1), character: inst.location.col as u32 },
+                            end: Position { line: inst.location.line.saturating_sub(1), character: inst.location.col as u32 + instance_name.len() as u32 },
                         },
-                        end: Position {
-                            line: inst.location.line.saturating_sub(1),
-                            character: inst.location.col as u32 + instance_name.len() as u32,
-                        },
-                    },
-                })
-                .collect();
-            if !found.is_empty() {
-                return Ok(Some(found));
+                    });
+                }
+            }
+
+            // 2. Use-sites: scan all docs for TypeField leaves with the same value.
+            {
+                let docs = self.state.documents.lock().unwrap();
+                let ruleset_guard = self.state.ruleset.lock().unwrap();
+                let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+                if let Some(rs) = ruleset_guard.as_ref() {
+                    let use_sites = scan_use_sites(&type_name, &instance_name, &*docs, rs, &ws_uri, &self.state.string_table);
+                    for (file_uri, loc) in use_sites {
+                        all_locs.push(Location {
+                            uri: file_uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
+                            range: Range {
+                                start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
+                                end: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 + instance_name.len() as u32 },
+                            },
+                        });
+                    }
+                }
+            }
+
+            if !all_locs.is_empty() {
+                return Ok(Some(all_locs));
             }
         }
 
@@ -1214,6 +1447,187 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let query = params.query.to_lowercase();
+        let info = self.state.info_service.lock().unwrap();
+        let mut symbols: Vec<SymbolInformation> = Vec::new();
+
+        for (type_name, instances) in &info.type_index.map {
+            for (file_uri, inst) in instances {
+                if query.is_empty() || inst.name.to_lowercase().contains(&query) {
+                    #[allow(deprecated)]
+                    symbols.push(SymbolInformation {
+                        name: inst.name.clone(),
+                        kind: SymbolKind::STRUCT,
+                        tags: None,
+                        deprecated: None,
+                        location: Location {
+                            uri: file_uri.parse().unwrap_or_else(|_| {
+                                Url::parse("file:///unknown").unwrap()
+                            }),
+                            range: Range {
+                                start: Position {
+                                    line: inst.location.line.saturating_sub(1),
+                                    character: inst.location.col as u32,
+                                },
+                                end: Position {
+                                    line: inst.location.line.saturating_sub(1),
+                                    character: inst.location.col as u32 + inst.name.len() as u32,
+                                },
+                            },
+                        },
+                        container_name: Some(type_name.clone()),
+                    });
+                }
+                // Cap at 500 to avoid flooding the client.
+                if symbols.len() >= 500 {
+                    break;
+                }
+            }
+            if symbols.len() >= 500 {
+                break;
+            }
+        }
+
+        if symbols.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(symbols))
+        }
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri.to_string();
+        let pos = params.position;
+        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+
+        let type_ref: Option<(String, String)> = {
+            let docs = self.state.documents.lock().unwrap();
+            let ruleset_guard = self.state.ruleset.lock().unwrap();
+            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
+                if let Some(ast) = &doc.ast {
+                    let info = info_at_position(
+                        ast, pos.line + 1, pos.character as u16,
+                        rs, &logical_path, &self.state.string_table,
+                    );
+                    info.and_then(|i| match i.hint {
+                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some((_, instance_name)) = type_ref {
+            // Return a range covering the instance name at cursor.
+            let range = Range {
+                start: Position { line: pos.line, character: pos.character },
+                end: Position { line: pos.line, character: pos.character + instance_name.len() as u32 },
+            };
+            return Ok(Some(PrepareRenameResponse::Range(range)));
+        }
+        Ok(None)
+    }
+
+    async fn rename(
+        &self,
+        params: RenameParams,
+    ) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri.to_string();
+        let pos = params.text_document_position.position;
+        let new_name = params.new_name.clone();
+        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+
+        // Identify what's under the cursor
+        let type_ref: Option<(String, String)> = {
+            let docs = self.state.documents.lock().unwrap();
+            let ruleset_guard = self.state.ruleset.lock().unwrap();
+            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
+                if let Some(ast) = &doc.ast {
+                    let info = info_at_position(
+                        ast, pos.line + 1, pos.character as u16,
+                        rs, &logical_path, &self.state.string_table,
+                    );
+                    info.and_then(|i| match i.hint {
+                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let (type_name, instance_name) = match type_ref {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Collect definition + use-site locations (reuse references logic)
+        let mut all_locs: Vec<(String, cwtools_info::SourceLocation, usize)> = Vec::new();
+
+        {
+            let info = self.state.info_service.lock().unwrap();
+            let instances = info.type_index.instances(&type_name);
+            for (file_uri, inst) in instances.iter().filter(|(_, i)| i.name == instance_name) {
+                all_locs.push((file_uri.clone(), inst.location, instance_name.len()));
+            }
+        }
+
+        {
+            let docs = self.state.documents.lock().unwrap();
+            let ruleset_guard = self.state.ruleset.lock().unwrap();
+            let ws_uri2 = self.state.workspace_uri.lock().unwrap().clone();
+            if let Some(rs) = ruleset_guard.as_ref() {
+                let use_sites = scan_use_sites(&type_name, &instance_name, &*docs, rs, &ws_uri2, &self.state.string_table);
+                for (file_uri, loc) in use_sites {
+                    all_locs.push((file_uri, loc, instance_name.len()));
+                }
+            }
+        }
+
+        if all_locs.is_empty() {
+            return Ok(None);
+        }
+
+        // Build WorkspaceEdit: group text edits by file URI
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        for (file_uri, loc, name_len) in all_locs {
+            let url = match file_uri.parse::<Url>() {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let edit = TextEdit {
+                range: Range {
+                    start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
+                    end: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 + name_len as u32 },
+                },
+                new_text: new_name.clone(),
+            };
+            changes.entry(url).or_default().push(edit);
+        }
+
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }))
+    }
+
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,
@@ -1234,8 +1648,20 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
+    // ── Custom notification helpers ───────────────────────────────────────────
+
+    /// Send the `loadingBar` server→client notification so the VS Code extension
+    /// status bar reflects background indexing/validation work.
+    /// Payload: `{ "enable": bool, "value": string }`.
+    async fn send_loading_bar(&self, enable: bool, value: &str) {
+        let payload = serde_json::json!({ "enable": enable, "value": value });
+        self.client.send_notification::<LoadingBar>(payload).await;
+    }
+
     /// Scan the entire workspace for relevant game files and validate them all.
     async fn validate_entire_workspace(&self) {
+        self.send_loading_bar(true, "Indexing workspace…").await;
+
         let workspace_uri = {
             let guard = self.state.workspace_uri.lock().unwrap();
             guard.clone()
@@ -1368,6 +1794,8 @@ impl Backend {
                 total_files
             ))
             .await;
+
+        self.send_loading_bar(false, "").await;
     }
 
     /// Parse and validate a single document.
@@ -1532,6 +1960,154 @@ impl Backend {
 
         types
     }
+}
+
+// ── Use-site scanning ─────────────────────────────────────────────────────────
+
+/// Scan all documents indexed in `info` (whose text is in `docs`) for leaves
+/// whose value equals `instance_name` and whose rule context is a TypeField
+/// for `type_name`.
+///
+/// Returns a list of (file_uri, SourceLocation) use-sites.
+///
+/// Implementation: walks every leaf in every indexed file's AST.  For each
+/// leaf, we call `info_at_position` to classify it.  If it comes back as a
+/// TypeRef for the right type+name, we record the location.
+///
+/// This is O(files × leaves) but runs only on demand (find-references / rename)
+/// so is acceptable for mod-sized workspaces.
+fn scan_use_sites(
+    type_name: &str,
+    instance_name: &str,
+    docs: &HashMap<String, ParsedDoc>,
+    ruleset: &RuleSet,
+    workspace_uri: &Option<String>,
+    string_table: &cwtools_string_table::string_table::StringTable,
+) -> Vec<(String, cwtools_info::SourceLocation)> {
+    let mut results = Vec::new();
+
+    for (file_uri, parsed_doc) in docs {
+        let ast = match &parsed_doc.ast {
+            Some(a) => a,
+            None => continue,
+        };
+        let logical_path = logical_path_from_uri(file_uri, workspace_uri);
+
+        scan_ast_for_type_ref(
+            &ast.root_children,
+            &ast.arena,
+            type_name,
+            instance_name,
+            file_uri,
+            ruleset,
+            &logical_path,
+            string_table,
+            &mut results,
+        );
+    }
+
+    results
+}
+
+/// Recursively walk children and record leaves whose value classifies as a
+/// TypeRef for the specified type+name.
+fn scan_ast_for_type_ref(
+    children: &[cwtools_parser::ast::Child],
+    arena: &cwtools_parser::ast::Arena,
+    type_name: &str,
+    instance_name: &str,
+    file_uri: &str,
+    ruleset: &RuleSet,
+    logical_path: &str,
+    table: &cwtools_string_table::string_table::StringTable,
+    out: &mut Vec<(String, cwtools_info::SourceLocation)>,
+) {
+    use cwtools_parser::ast::{Child, Value};
+
+    for child in children {
+        match child {
+            Child::Leaf(idx) => {
+                let leaf = &arena.leaves[*idx as usize];
+                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                let val = match &leaf.value {
+                    Value::String(t) | Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if val == instance_name {
+                    // Check if this leaf's rule context is TypeField(type_name)
+                    if is_type_ref_leaf(ruleset, &key, type_name, logical_path) {
+                        out.push((file_uri.to_string(), cwtools_info::SourceLocation {
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                        }));
+                    }
+                }
+                // Recurse into clause values
+                if let Value::Clause(ch) = &leaf.value {
+                    scan_ast_for_type_ref(ch, arena, type_name, instance_name, file_uri, ruleset, logical_path, table, out);
+                }
+            }
+            Child::Node(idx) => {
+                let node = &arena.nodes[*idx as usize];
+                scan_ast_for_type_ref(&node.children, arena, type_name, instance_name, file_uri, ruleset, logical_path, table, out);
+            }
+            Child::LeafValue(idx) => {
+                let lv = &arena.leaf_values[*idx as usize];
+                let val = match &lv.value {
+                    cwtools_parser::ast::Value::String(t) | cwtools_parser::ast::Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if val == instance_name {
+                    // LeafValue type refs: classified via parent context — best effort skip for now.
+                    let _ = (type_name, logical_path, ruleset);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Check if a leaf with key `leaf_key` is a TypeField reference to `type_name`.
+/// Walks root_rules shallowly (depth 1) looking for a LeafRule whose left
+/// is SpecificField(leaf_key) and right is TypeField(Simple(type_name)).
+fn is_type_ref_leaf(
+    ruleset: &RuleSet,
+    leaf_key: &str,
+    type_name: &str,
+    logical_path: &str,
+) -> bool {
+    for root_rule in &ruleset.root_rules {
+        let (rule_type_name, (rule_type, _)) = match root_rule {
+            RootRule::TypeRule(n, r) => (Some(n.as_str()), r),
+            RootRule::AliasRule(n, r) => (Some(n.as_str()), r),
+            RootRule::SingleAliasRule(n, r) => (Some(n.as_str()), r),
+        };
+
+        // For TypeRules, check path filter
+        if let RootRule::TypeRule(..) = root_rule {
+            if let Some(name) = rule_type_name {
+                if let Some(td) = ruleset.types.iter().find(|t| t.name == name) {
+                    if !cwtools_info_path_check(&td.path_options, logical_path) {
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let rules = match rule_type {
+            RuleType::NodeRule { rules, .. } => rules.as_slice(),
+            _ => continue,
+        };
+
+        for (inner, _) in rules {
+            if let RuleType::LeafRule { left: NewField::SpecificField(k), right: NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)) } = inner {
+                if k.eq_ignore_ascii_case(leaf_key) && t == type_name {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnostic {
@@ -1798,5 +2374,172 @@ mod tests {
     fn test_logical_path_fallback() {
         let lp = logical_path_from_uri("file:///some/path/events/foo.txt", &None);
         assert_eq!(lp, "/some/path/events/foo.txt");
+    }
+
+    // ── snippet generation tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_generate_node_snippet_no_required_fields() {
+        let rs = bool_enum_ruleset();
+        // Build a rule with no required children (min=0)
+        let snippet = generate_node_snippet("my_block", &[], &rs);
+        assert!(snippet.contains("my_block = {"), "got: {}", snippet);
+        assert!(snippet.contains("$0"), "expected cursor $0, got: {}", snippet);
+    }
+
+    #[test]
+    fn test_generate_node_snippet_with_required_bool() {
+        let rs = bool_enum_ruleset();
+        // Build rules with min=1
+        let required_rules = vec![
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("active".to_string()),
+                    right: NewField::ValueField(ValueType::Bool),
+                },
+                Options { min: 1, ..Options::default() },
+            ),
+        ];
+        let snippet = generate_node_snippet("my_type", &required_rules, &rs);
+        assert!(snippet.contains("my_type = {"), "got: {}", snippet);
+        assert!(snippet.contains("active"), "expected 'active' in snippet: {}", snippet);
+        assert!(snippet.contains("yes") || snippet.contains("${1"), "expected bool placeholder: {}", snippet);
+    }
+
+    #[test]
+    fn test_generate_node_snippet_with_required_enum() {
+        let rs = bool_enum_ruleset();
+        let required_rules = vec![
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("kind".to_string()),
+                    right: NewField::ValueField(ValueType::Enum("my_enum".to_string())),
+                },
+                Options { min: 1, ..Options::default() },
+            ),
+        ];
+        let snippet = generate_node_snippet("my_type", &required_rules, &rs);
+        // The enum values alpha, beta, gamma should appear as choices
+        assert!(snippet.contains("alpha"), "expected enum choices in snippet: {}", snippet);
+    }
+
+    #[test]
+    fn test_generate_node_snippet_ignores_optional_fields() {
+        let rs = bool_enum_ruleset();
+        // Only the min=1 field should appear; min=0 should not.
+        let rules = vec![
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("required_field".to_string()),
+                    right: NewField::ValueField(ValueType::Bool),
+                },
+                Options { min: 1, ..Options::default() },
+            ),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("optional_field".to_string()),
+                    right: NewField::ValueField(ValueType::Bool),
+                },
+                Options { min: 0, ..Options::default() },
+            ),
+        ];
+        let snippet = generate_node_snippet("my_type", &rules, &rs);
+        assert!(snippet.contains("required_field"), "should have required: {}", snippet);
+        assert!(!snippet.contains("optional_field"), "should not have optional: {}", snippet);
+    }
+
+    // ── root-type snippets tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_root_type_snippets_path_match() {
+        let rs = bool_enum_ruleset();
+        // The type "my_type" is in path "events"
+        let items = root_type_snippets(&rs, "events/test.txt");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"my_type") || !labels.is_empty(), "expected type items: {:?}", labels);
+    }
+
+    #[test]
+    fn test_root_type_snippets_path_mismatch() {
+        let rs = bool_enum_ruleset();
+        // The type "my_type" is in path "events", not "common"
+        let items = root_type_snippets(&rs, "common/foo.txt");
+        assert!(items.is_empty(), "should not offer types for wrong path, got: {:?}", items.iter().map(|i| &i.label).collect::<Vec<_>>());
+    }
+
+    // ── use-site scanning tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_is_type_ref_leaf() {
+        let mut rs = bool_enum_ruleset();
+        // Add a TypeRule with a leaf that references type "my_type"
+        let mut other_opts = Options::default();
+        other_opts.description = Some("a type ref field".to_string());
+        rs.root_rules.push(RootRule::TypeRule(
+            "owner_type".to_string(),
+            (
+                RuleType::NodeRule {
+                    left: NewField::SpecificField("owner_type".to_string()),
+                    rules: vec![
+                        (
+                            RuleType::LeafRule {
+                                left: NewField::SpecificField("base".to_string()),
+                                right: NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple("my_type".to_string())),
+                            },
+                            Options::default(),
+                        ),
+                    ],
+                },
+                Options::default(),
+            ),
+        ));
+
+        // "base" field referencing "my_type" should be recognized
+        assert!(is_type_ref_leaf(&rs, "base", "my_type", "events/test.txt"));
+        // "base" field referencing a different type should not match
+        assert!(!is_type_ref_leaf(&rs, "base", "other_type", "events/test.txt"));
+        // unrelated field should not match
+        assert!(!is_type_ref_leaf(&rs, "unrelated", "my_type", "events/test.txt"));
+    }
+
+    #[test]
+    fn test_scan_use_sites() {
+        let table = StringTable::new();
+        // Nested: foo node containing a leaf "base = my_instance"
+        let source = "foo = { base = my_instance }\n";
+        let parsed = parse_string(source, &table).unwrap();
+
+        let mut rs = bool_enum_ruleset();
+        // Use an AliasRule (not path-filtered) that contains base -> TypeField(my_type)
+        rs.root_rules.push(RootRule::AliasRule(
+            "effect:use_type".to_string(),
+            (
+                RuleType::NodeRule {
+                    left: NewField::SpecificField("use_type".to_string()),
+                    rules: vec![
+                        (
+                            RuleType::LeafRule {
+                                left: NewField::SpecificField("base".to_string()),
+                                right: NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple("my_type".to_string())),
+                            },
+                            Options::default(),
+                        ),
+                    ],
+                },
+                Options::default(),
+            ),
+        ));
+
+        let mut docs = HashMap::new();
+        docs.insert("file:///test.txt".to_string(), ParsedDoc {
+            version: 0,
+            text: source.to_string(),
+            ast: Some(parsed),
+        });
+
+        let ws_uri = Some("file:///".to_string());
+        let sites = scan_use_sites("my_type", "my_instance", &docs, &rs, &ws_uri, &table);
+        assert!(!sites.is_empty(), "expected use sites, got none");
+        assert!(sites.iter().any(|(uri, _)| uri == "file:///test.txt"), "expected correct uri");
     }
 }
