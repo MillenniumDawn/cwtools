@@ -19,7 +19,7 @@ fn index_game_dir(dir: &Path, ruleset: &RuleSet, table: &StringTable) -> TypeInd
     let mut mgr = FileManager::with_string_table(config, table.clone());
     match mgr.discover_and_parse() {
         Ok(files) => {
-            println!("  Indexing {} base-game files from {}", files.len(), dir.display());
+            eprintln!("  Indexing {} base-game files from {}", files.len(), dir.display());
             for file in &files {
                 if let Ok(text) = std::fs::read_to_string(&file.path)
                     && let Ok(pf) = parse_string(&text, table)
@@ -99,6 +99,20 @@ enum Commands {
         /// `--vanilla`; can be combined with it.
         #[arg(long)]
         vanilla_cache: Option<PathBuf>,
+        /// Report format: cli (default, grouped text), csv, or json.
+        #[arg(long, default_value = "cli")]
+        report_type: String,
+        /// Write the report to this file instead of stdout.
+        #[arg(long)]
+        output_file: Option<PathBuf>,
+        /// Suppress diagnostics whose hash is listed in this file (one hash per
+        /// line). Lets you baseline known/accepted diagnostics and see only new ones.
+        #[arg(long)]
+        ignore_hashes: Option<PathBuf>,
+        /// Write the surviving diagnostics' hashes (one per line) to this file, to
+        /// use later with --ignore-hashes.
+        #[arg(long)]
+        output_hashes: Option<PathBuf>,
     },
     /// Pre-generate a vanilla type index from a base-game install, for use with
     /// `validate --vanilla-cache`. Parses and indexes the install once so later
@@ -170,6 +184,47 @@ fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
             ..Default::default()
         }
     }
+}
+
+/// Stable FNV-1a-64 hex digest of a diagnostic, for baseline/ignore matching.
+/// Stable across runs and machines (unlike std's DefaultHasher seed).
+fn diag_hash(file: &str, code: &str, message: &str, line: u32) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in file.bytes().chain(b"|".iter().copied())
+        .chain(code.bytes()).chain(b"|".iter().copied())
+        .chain(message.bytes()).chain(b"|".iter().copied())
+        .chain(line.to_string().bytes())
+    {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", h)
+}
+
+/// Escape a field for CSV output.
+fn csv_escape(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Minimal JSON string escape.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Load a RuleSet from either a single `.cwt` file or a directory of `.cwt` files.
@@ -400,7 +455,7 @@ fn main() {
             println!("  SingleAliases: {}", ruleset.single_aliases.len());
             println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
         }
-        Commands::Validate { game, directory, rules, vanilla, vanilla_cache } => {
+        Commands::Validate { game, directory, rules, vanilla, vanilla_cache, report_type, output_file, ignore_hashes, output_hashes } => {
             use cwtools_game::constants::Game;
             use cwtools_validation::validate_ast;
 
@@ -414,12 +469,12 @@ fn main() {
             } else {
                 format!("file {}", rules.display())
             };
-            println!("Validating {} files in {} against rules {}", game_id, directory.display(), rules_label);
+            eprintln!("Validating {} files in {} against rules {}", game_id, directory.display(), rules_label);
 
             // Parse rules (shares its StringTable with game files)
             let rules_table = StringTable::new();
             let ruleset = load_rules(&rules, &rules_table);
-            println!("  Loaded {} types, {} enums, {} aliases", ruleset.types.len(), ruleset.enums.len(), ruleset.aliases.len());
+            eprintln!("  Loaded {} types, {} enums, {} aliases", ruleset.types.len(), ruleset.enums.len(), ruleset.aliases.len());
 
             // Discover and parse files using the SAME string table
             let config = search_config_for(&directory);
@@ -428,7 +483,7 @@ fn main() {
                 eprintln!("Error discovering files: {}", e);
                 std::process::exit(1);
             });
-            println!("  Discovered {} files", files.len());
+            eprintln!("  Discovered {} files", files.len());
 
             // Build cross-file TypeIndex from all discovered files (Item 2).
             // Arena doesn't derive Clone, so we re-read each file to build the
@@ -470,7 +525,7 @@ fn main() {
                         }
                         let total: usize = per_type.values().map(|v| v.len()).sum();
                         type_index.merge("<vanilla-cache>", per_type);
-                        println!("  Loaded {} base-game instances from cache {}", total, cache_path.display());
+                        eprintln!("  Loaded {} base-game instances from cache {}", total, cache_path.display());
                     }
                     Err(e) => eprintln!("  warn: could not load vanilla cache {}: {}", cache_path.display(), e),
                 }
@@ -498,33 +553,89 @@ fn main() {
                 }
             }
 
-            // Validate each file
-            let mut total_errors = 0;
-            let mut total_warnings = 0;
+            // Load the ignore-hash baseline, if given.
+            let ignored: std::collections::HashSet<String> = ignore_hashes.as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+                .unwrap_or_default();
+
+            // Validate each file, collecting all (file, error, hash) diagnostics.
+            struct Diag { file: String, severity: cwtools_validation::ErrorSeverity, code: String, message: String, line: u32, hash: String }
+            let mut diags: Vec<Diag> = Vec::new();
             for file in files {
+                let file_str = file.path.to_str().unwrap_or("").to_string();
                 let parser_file = cwtools_parser::ast::ParsedFile {
                     arena: file.arena,
                     root_children: file.root_children,
                     errors: vec![],
                 };
                 let errors = validate_ast(
-                    &parser_file, &ruleset, &rules_table, file.path.to_str().unwrap_or(""),
+                    &parser_file, &ruleset, &rules_table, &file_str,
                     Some(game_id), Some(&type_index), Some(&modifier_keys),
                 );
-                let file_errors: Vec<_> = errors.iter().filter(|e| e.severity == cwtools_validation::ErrorSeverity::Error).collect();
-                let file_warnings: Vec<_> = errors.iter().filter(|e| e.severity == cwtools_validation::ErrorSeverity::Warning).collect();
-                total_errors += file_errors.len();
-                total_warnings += file_warnings.len();
-                if !errors.is_empty() {
-                    println!("\n  {}:", file.path.display());
-                    for err in &errors {
-                        let code_part = err.code.as_deref().map(|c| format!("[{}] ", c)).unwrap_or_default();
-                        println!("    [{:?}] {}{} (line {})", err.severity, code_part, err.message, err.line);
-                    }
+                for err in errors {
+                    let code = err.code.clone().unwrap_or_default();
+                    let hash = diag_hash(&file_str, &code, &err.message, err.line);
+                    if ignored.contains(&hash) { continue; }
+                    diags.push(Diag { file: file_str.clone(), severity: err.severity, code, message: err.message, line: err.line, hash });
                 }
             }
 
-            println!("\nValidation complete: {} errors, {} warnings", total_errors, total_warnings);
+            let total_errors = diags.iter().filter(|d| d.severity == cwtools_validation::ErrorSeverity::Error).count();
+            let total_warnings = diags.iter().filter(|d| d.severity == cwtools_validation::ErrorSeverity::Warning).count();
+
+            // Render the report in the requested format.
+            let mut out = String::new();
+            match report_type.as_str() {
+                "csv" => {
+                    out.push_str("file,line,severity,code,message,hash\n");
+                    for d in &diags {
+                        out.push_str(&format!("{},{},{:?},{},{},{}\n",
+                            csv_escape(&d.file), d.line, d.severity, csv_escape(&d.code), csv_escape(&d.message), d.hash));
+                    }
+                }
+                "json" => {
+                    out.push_str("[\n");
+                    for (i, d) in diags.iter().enumerate() {
+                        out.push_str(&format!(
+                            "  {{\"file\":\"{}\",\"line\":{},\"severity\":\"{:?}\",\"code\":\"{}\",\"message\":\"{}\",\"hash\":\"{}\"}}{}\n",
+                            json_escape(&d.file), d.line, d.severity, json_escape(&d.code), json_escape(&d.message), d.hash,
+                            if i + 1 < diags.len() { "," } else { "" }));
+                    }
+                    out.push_str("]\n");
+                }
+                _ => {
+                    // cli: grouped by file
+                    let mut current = "";
+                    for d in &diags {
+                        if d.file != current {
+                            out.push_str(&format!("\n  {}:\n", d.file));
+                            current = &d.file;
+                        }
+                        let code_part = if d.code.is_empty() { String::new() } else { format!("[{}] ", d.code) };
+                        out.push_str(&format!("    [{:?}] {}{} (line {})\n", d.severity, code_part, d.message, d.line));
+                    }
+                    out.push_str(&format!("\nValidation complete: {} errors, {} warnings\n", total_errors, total_warnings));
+                }
+            }
+
+            match &output_file {
+                Some(p) => {
+                    if let Err(e) = std::fs::write(p, &out) { eprintln!("Error writing report {}: {}", p.display(), e); }
+                    else { println!("Wrote {} report ({} errors, {} warnings) to {}", report_type, total_errors, total_warnings, p.display()); }
+                }
+                None => print!("{}", out),
+            }
+
+            // Write the surviving hashes for use as a future baseline.
+            if let Some(p) = &output_hashes {
+                let mut hashes: Vec<&str> = diags.iter().map(|d| d.hash.as_str()).collect();
+                hashes.sort_unstable();
+                hashes.dedup();
+                if let Err(e) = std::fs::write(p, hashes.join("\n")) { eprintln!("Error writing hashes {}: {}", p.display(), e); }
+                else { println!("Wrote {} diagnostic hashes to {}", hashes.len(), p.display()); }
+            }
+
             if total_errors > 0 {
                 std::process::exit(1);
             }
