@@ -641,6 +641,7 @@ fn is_value_char(c: char) -> bool {
 }
 
 /// Strip UTF-8 BOM if present, then parse.
+#[tracing::instrument(skip_all)]
 pub fn parse_string(input: &str, table: &StringTable) -> Result<ParsedFile, ParseError> {
     let stripped = input.strip_prefix('\u{FEFF}').unwrap_or(input);
     let parser = Parser::new(stripped, table);

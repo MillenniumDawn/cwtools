@@ -77,6 +77,7 @@ fn validate_wrapper_grandchildren(
     }
 }
 
+#[tracing::instrument(skip_all)]
 pub fn validate_ast(
     ast: &ParsedFile,
     ruleset: &RuleSet,

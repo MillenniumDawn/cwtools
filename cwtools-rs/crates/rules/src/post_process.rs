@@ -8,6 +8,7 @@
 use crate::rules_types::*;
 
 /// Run all four post-processing passes over `ruleset` in the same order as F#.
+#[tracing::instrument(skip_all)]
 pub fn post_process(ruleset: &mut RuleSet) {
     replace_value_marker_fields(ruleset);
     replace_single_aliases(ruleset);

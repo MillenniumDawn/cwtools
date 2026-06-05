@@ -285,6 +285,7 @@ fn collect_skip_root_child(
 ///
 /// Returns a map from type name → list of instances found in this file.
 /// Mirrors `getTypesFromDefinitions` / `infoServiceSkipRoot` from the F# codebase.
+#[tracing::instrument(skip_all)]
 pub fn collect_type_instances(
     ruleset: &RuleSet,
     file: &ParsedFile,

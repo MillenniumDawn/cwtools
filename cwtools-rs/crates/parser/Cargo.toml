@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+tracing = { workspace = true }
 cwtools_string_table = { workspace = true }
 thiserror = { workspace = true }
 

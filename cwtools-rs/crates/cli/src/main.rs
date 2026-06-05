@@ -313,7 +313,23 @@ fn run_fsharp_engine(command: &Commands) -> ! {
     }
 }
 
+/// Initialize tracing only when RUST_LOG is set, so the default run stays quiet.
+/// Profile a run with e.g. `RUST_LOG=info cwtools validate ...` and add
+/// `#[tracing::instrument]` to any hot path you want timed. See PROFILING.md.
+fn tracing_init() {
+    if std::env::var("RUST_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_target(true)
+            // Emit span close events so instrumented hot paths report their
+            // busy/idle time — that's the profiling signal.
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .try_init();
+    }
+}
+
 fn main() {
+    tracing_init();
     let cli = Cli::parse();
 
     match cli.engine.as_str() {

@@ -39,6 +39,7 @@ memmap2 = "0.9"
 thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bumpalo = "3.16"
 rkyv = { version = "0.8", features = ["std", "bytecheck"] }
 bytecheck = "0.8"
