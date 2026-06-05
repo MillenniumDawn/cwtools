@@ -56,6 +56,15 @@ impl tower_lsp::lsp_types::notification::Notification for LoadingBar {
     const METHOD: &'static str = "loadingBar";
 }
 
+/// `updateFileList` server→client notification (S→C).
+/// Payload: `{ "fileList": [{ "scope": string, "uri": string, "logicalpath": string }] }`.
+/// Used to populate the extension's file explorer tree view.
+enum UpdateFileList {}
+impl tower_lsp::lsp_types::notification::Notification for UpdateFileList {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "updateFileList";
+}
+
 /// Server state.
 struct DocumentState {
     /// file URI -> parsed document
@@ -1717,6 +1726,14 @@ impl Backend {
         self.client.send_notification::<LoadingBar>(payload).await;
     }
 
+    /// Send the `updateFileList` server→client notification so the VS Code
+    /// extension file explorer populates.
+    /// Payload: `{ "fileList": [{ "scope": string, "uri": string, "logicalpath": string }] }`.
+    async fn send_update_file_list(&self, file_list: Vec<serde_json::Value>) {
+        let payload = serde_json::json!({ "fileList": file_list });
+        self.client.send_notification::<UpdateFileList>(payload).await;
+    }
+
     /// Scan the entire workspace for relevant game files and validate them all.
     async fn validate_entire_workspace(&self) {
         self.send_loading_bar(true, "Indexing workspace…").await;
@@ -1795,12 +1812,12 @@ impl Backend {
         // modifiers) so cross-file references resolve before any file is
         // validated. Keep the parsed ASTs so pass 2 doesn't re-parse.
         self.send_loading_bar(true, "Indexing workspace…").await;
-        let mut parsed_docs: Vec<(String, String, ParsedFile)> = Vec::new();
+        let mut parsed_docs: Vec<(String, std::path::PathBuf, String, ParsedFile)> = Vec::new();
         for file_path in &files_to_validate {
             let uri = format!("file://{}", file_path.display());
             if let Ok(text) = std::fs::read_to_string(file_path) {
                 if let Some(parsed) = self.index_document(&uri, &text).await {
-                    parsed_docs.push((uri, text, parsed));
+                    parsed_docs.push((uri, file_path.clone(), text, parsed));
                 }
             }
         }
@@ -1834,7 +1851,7 @@ impl Backend {
         self.send_loading_bar(true, "Validating workspace…").await;
         let mut total_errors = 0usize;
         let total_files = parsed_docs.len();
-        for (uri, text, parsed) in parsed_docs {
+        for (uri, _file_path, text, parsed) in parsed_docs {
             let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys);
             total_errors += diagnostics.iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -1857,6 +1874,23 @@ impl Backend {
                 total_files
             ))
             .await;
+
+        // Build and send the file list for the extension's file explorer.
+        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let file_list: Vec<serde_json::Value> = files_to_validate
+            .iter()
+            .map(|file_path| {
+                let uri = format!("file://{}", file_path.display());
+                let logical_path = logical_path_from_uri(&uri, &ws_uri);
+                let scope = logical_path.split('/').next().unwrap_or("unknown").to_string();
+                serde_json::json!({
+                    "scope": scope,
+                    "uri": uri,
+                    "logicalpath": logical_path
+                })
+            })
+            .collect();
+        self.send_update_file_list(file_list).await;
 
         self.send_loading_bar(false, "").await;
     }
