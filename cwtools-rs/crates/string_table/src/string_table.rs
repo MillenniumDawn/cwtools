@@ -138,10 +138,10 @@ impl StringTable {
         let metadata = compute_metadata(&lower_key);
 
         inner.id_to_string.reserve_exact(2);
-        inner.id_to_string.push(s.to_string());      // normal_id
-        inner.id_to_string.push(lower_key.clone());  // lower_id
-        inner.id_to_metadata.push(metadata);         // normal_id
-        inner.id_to_metadata.push(metadata);           // lower_id
+        inner.id_to_string.push(s.to_string()); // normal_id
+        inner.id_to_string.push(lower_key.clone()); // lower_id
+        inner.id_to_metadata.push(metadata); // normal_id
+        inner.id_to_metadata.push(metadata); // lower_id
 
         let lower_token = StringTokens {
             lower: StringId(lower_id),
@@ -216,9 +216,9 @@ mod tests {
         let b = table.intern("HELLO");
         let c = table.intern("hello");
 
-        assert_eq!(a, c);                     // same exact string → same token
-        assert_eq!(a.lower, b.lower);         // same lower key → same lower ID
-        assert_ne!(a.normal, b.normal);       // different exact strings → different normal IDs
+        assert_eq!(a, c); // same exact string → same token
+        assert_eq!(a.lower, b.lower); // same lower key → same lower ID
+        assert_ne!(a.normal, b.normal); // different exact strings → different normal IDs
 
         assert_eq!(table.get_string(a.normal), Some("hello".to_string()));
         assert_eq!(table.get_string(b.normal), Some("HELLO".to_string()));
@@ -251,6 +251,6 @@ mod tests {
         let table2 = table.clone();
         let b = table2.intern("hello");
 
-        assert_eq!(a, b);                     // shared table → same token
+        assert_eq!(a, b); // shared table → same token
     }
 }

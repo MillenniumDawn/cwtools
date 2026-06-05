@@ -1,4 +1,4 @@
-use crate::{ValidationError, ErrorSeverity, error_codes};
+use crate::{ErrorSeverity, ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
@@ -47,13 +47,26 @@ fn validate_event(
     file_path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    let has_mtth = node.children.iter().any(|c| child_key_eq(c, ast, table, "mean_time_to_happen"));
-    let has_trig = node.children.iter().any(|c| child_key_eq(c, ast, table, "is_triggered_only"));
-    let has_once = node.children.iter().any(|c| child_key_eq(c, ast, table, "fire_only_once"));
-    let has_base = node.children.iter().any(|c| child_key_eq(c, ast, table, "base"));
-    let has_always_no = node.children.iter().any(|c| {
-        child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table)
-    });
+    let has_mtth = node
+        .children
+        .iter()
+        .any(|c| child_key_eq(c, ast, table, "mean_time_to_happen"));
+    let has_trig = node
+        .children
+        .iter()
+        .any(|c| child_key_eq(c, ast, table, "is_triggered_only"));
+    let has_once = node
+        .children
+        .iter()
+        .any(|c| child_key_eq(c, ast, table, "fire_only_once"));
+    let has_base = node
+        .children
+        .iter()
+        .any(|c| child_key_eq(c, ast, table, "base"));
+    let has_always_no = node
+        .children
+        .iter()
+        .any(|c| child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table));
 
     if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
         errors.push(ValidationError {
@@ -68,18 +81,30 @@ fn validate_event(
 
     // Check pre-triggers: must be in event's direct children, not inside trigger block
     let pre_triggers = [
-        "has_owner", "is_homeworld", "original_owner", "is_ai",
-        "has_ground_combat", "is_capital", "is_occupied_flag",
+        "has_owner",
+        "is_homeworld",
+        "original_owner",
+        "is_ai",
+        "has_ground_combat",
+        "is_capital",
+        "is_occupied_flag",
     ];
     for child in &node.children {
         let key = match child {
-            Child::Leaf(idx) => table.get_string(ast.arena.leaves[*idx as usize].key.normal).unwrap_or_default(),
-            Child::Node(idx) => table.get_string(ast.arena.nodes[*idx as usize].key.normal).unwrap_or_default(),
+            Child::Leaf(idx) => table
+                .get_string(ast.arena.leaves[*idx as usize].key.normal)
+                .unwrap_or_default(),
+            Child::Node(idx) => table
+                .get_string(ast.arena.nodes[*idx as usize].key.normal)
+                .unwrap_or_default(),
             _ => continue,
         };
         if pre_triggers.contains(&key.as_str()) {
             errors.push(ValidationError {
-                message: format!("Pre-trigger '{}' should be inside a 'trigger' block, not at event root", key),
+                message: format!(
+                    "Pre-trigger '{}' should be inside a 'trigger' block, not at event root",
+                    key
+                ),
                 severity: ErrorSeverity::Warning,
                 line: child_line(child, ast),
                 col: 0,
@@ -97,13 +122,19 @@ fn validate_event_clause(
     file_path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    let has_mtth = children.iter().any(|c| child_key_eq(c, ast, table, "mean_time_to_happen"));
-    let has_trig = children.iter().any(|c| child_key_eq(c, ast, table, "is_triggered_only"));
-    let has_once = children.iter().any(|c| child_key_eq(c, ast, table, "fire_only_once"));
+    let has_mtth = children
+        .iter()
+        .any(|c| child_key_eq(c, ast, table, "mean_time_to_happen"));
+    let has_trig = children
+        .iter()
+        .any(|c| child_key_eq(c, ast, table, "is_triggered_only"));
+    let has_once = children
+        .iter()
+        .any(|c| child_key_eq(c, ast, table, "fire_only_once"));
     let has_base = children.iter().any(|c| child_key_eq(c, ast, table, "base"));
-    let has_always_no = children.iter().any(|c| {
-        child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table)
-    });
+    let has_always_no = children
+        .iter()
+        .any(|c| child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table));
 
     if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
         // Find the event leaf's position
@@ -186,7 +217,10 @@ fn child_is_bool(child: &Child, ast: &ParsedFile, table: &StringTable, expected:
             match &leaf.value {
                 Value::Bool(b) => *b == expected,
                 Value::String(t) | Value::QString(t) => {
-                    let text = table.get_string(t.normal).unwrap_or_default().to_lowercase();
+                    let text = table
+                        .get_string(t.normal)
+                        .unwrap_or_default()
+                        .to_lowercase();
                     (expected && text == "yes") || (!expected && text == "no")
                 }
                 _ => false,
@@ -246,13 +280,7 @@ pub fn check_key_and_desc(
                     continue;
                 }
                 if let Value::Clause(_) = &leaf.value {
-                    check_loc_key_pair(
-                        &key,
-                        leaf.pos.start.line,
-                        loc_keys,
-                        file_path,
-                        errors,
-                    );
+                    check_loc_key_pair(&key, leaf.pos.start.line, loc_keys, file_path, errors);
                 }
             }
             _ => {}
@@ -269,7 +297,10 @@ fn check_loc_key_pair(
 ) {
     if !loc_keys.contains(name) {
         errors.push(ValidationError {
-            message: format!("Missing localisation key '{}' for instance '{}'", name, name),
+            message: format!(
+                "Missing localisation key '{}' for instance '{}'",
+                name, name
+            ),
             severity: ErrorSeverity::Warning,
             line,
             col: 0,
@@ -280,7 +311,10 @@ fn check_loc_key_pair(
     let desc_key = format!("{}_desc", name);
     if !loc_keys.contains(&desc_key) {
         errors.push(ValidationError {
-            message: format!("Missing localisation key '{}' for instance '{}'", desc_key, name),
+            message: format!(
+                "Missing localisation key '{}' for instance '{}'",
+                desc_key, name
+            ),
             severity: ErrorSeverity::Warning,
             line,
             col: 0,

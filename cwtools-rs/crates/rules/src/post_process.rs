@@ -117,17 +117,32 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)], change
     for mut rule in original {
         match &rule.0 {
             // LeafRule whose right-hand side is a SingleAliasField
-            RuleType::LeafRule { left: _, right: NewField::SingleAliasField(name) } => {
+            RuleType::LeafRule {
+                left: _,
+                right: NewField::SingleAliasField(name),
+            } => {
                 let name = name.clone();
                 let opts = rule.1.clone();
                 if let Some(resolved) = lookup_single_alias(&name, map) {
                     *changed = true;
                     match resolved.0 {
                         RuleType::LeafRule { right: ar, .. } => {
-                            rules.push((RuleType::LeafRule { left: extract_leaf_left(&rule.0), right: ar }, opts));
+                            rules.push((
+                                RuleType::LeafRule {
+                                    left: extract_leaf_left(&rule.0),
+                                    right: ar,
+                                },
+                                opts,
+                            ));
                         }
                         RuleType::NodeRule { rules: ar, .. } => {
-                            rules.push((RuleType::NodeRule { left: extract_leaf_left(&rule.0), rules: ar }, opts));
+                            rules.push((
+                                RuleType::NodeRule {
+                                    left: extract_leaf_left(&rule.0),
+                                    rules: ar,
+                                },
+                                opts,
+                            ));
                         }
                         other => {
                             // Fallback: keep original
@@ -140,7 +155,9 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)], change
                 }
             }
             // LeafValueRule whose right is a SingleAliasClauseField
-            RuleType::LeafValueRule { right: NewField::SingleAliasClauseField(_, name) } => {
+            RuleType::LeafValueRule {
+                right: NewField::SingleAliasClauseField(_, name),
+            } => {
                 let name = name.clone();
                 let opts = rule.1.clone();
                 if let Some(resolved) = lookup_single_alias(&name, map) {
@@ -244,37 +261,88 @@ fn expand_colour_in_list(rules: &mut Vec<NewRule>) {
 fn expand_colour_rule(mut rule: NewRule) -> Vec<NewRule> {
     match &rule.0 {
         // LeafRule(l, MarkerField(ColourField)) -> NodeRule(l, [LeafValue(Float(-256..256)) @ 3..3])
-        RuleType::LeafRule { right: NewField::MarkerField(Marker::ColourField), .. } => {
+        RuleType::LeafRule {
+            right: NewField::MarkerField(Marker::ColourField),
+            ..
+        } => {
             let left = extract_leaf_left(&rule.0);
             let opts = rule.1.clone();
             let inner_rule = (
                 RuleType::LeafValueRule {
-                    right: NewField::ValueField(ValueType::Float { min: -256.0, max: 256.0 }),
+                    right: NewField::ValueField(ValueType::Float {
+                        min: -256.0,
+                        max: 256.0,
+                    }),
                 },
-                Options { min: 3, max: 3, strict_min: true, leafvalue: true, ..Options::default() },
+                Options {
+                    min: 3,
+                    max: 3,
+                    strict_min: true,
+                    leafvalue: true,
+                    ..Options::default()
+                },
             );
-            vec![(RuleType::NodeRule { left, rules: vec![inner_rule] }, opts)]
+            vec![(
+                RuleType::NodeRule {
+                    left,
+                    rules: vec![inner_rule],
+                },
+                opts,
+            )]
         }
         // LeafRule(l, MarkerField(IrCountryTag)) -> two parallel LeafRules
-        RuleType::LeafRule { right: NewField::MarkerField(Marker::IrCountryTag), .. } => {
+        RuleType::LeafRule {
+            right: NewField::MarkerField(Marker::IrCountryTag),
+            ..
+        } => {
             let left = extract_leaf_left(&rule.0);
             let opts = rule.1.clone();
             vec![
-                (RuleType::LeafRule { left: left.clone(), right: NewField::ValueField(ValueType::Enum("country_tags".to_string())) }, opts.clone()),
-                (RuleType::LeafRule { left, right: NewField::VariableGetField("dynamic_country_tag".to_string()) }, opts),
+                (
+                    RuleType::LeafRule {
+                        left: left.clone(),
+                        right: NewField::ValueField(ValueType::Enum("country_tags".to_string())),
+                    },
+                    opts.clone(),
+                ),
+                (
+                    RuleType::LeafRule {
+                        left,
+                        right: NewField::VariableGetField("dynamic_country_tag".to_string()),
+                    },
+                    opts,
+                ),
             ]
         }
         // LeafRule(MarkerField(IrCountryTag), r) -> two parallel LeafRules
-        RuleType::LeafRule { left: NewField::MarkerField(Marker::IrCountryTag), .. } => {
+        RuleType::LeafRule {
+            left: NewField::MarkerField(Marker::IrCountryTag),
+            ..
+        } => {
             let right = extract_leaf_right(&rule.0);
             let opts = rule.1.clone();
             vec![
-                (RuleType::LeafRule { left: NewField::ValueField(ValueType::Enum("country_tags".to_string())), right: right.clone() }, opts.clone()),
-                (RuleType::LeafRule { left: NewField::VariableGetField("dynamic_country_tag".to_string()), right }, opts),
+                (
+                    RuleType::LeafRule {
+                        left: NewField::ValueField(ValueType::Enum("country_tags".to_string())),
+                        right: right.clone(),
+                    },
+                    opts.clone(),
+                ),
+                (
+                    RuleType::LeafRule {
+                        left: NewField::VariableGetField("dynamic_country_tag".to_string()),
+                        right,
+                    },
+                    opts,
+                ),
             ]
         }
         // NodeRule(MarkerField(IrCountryTag), r) -> two parallel NodeRules
-        RuleType::NodeRule { left: NewField::MarkerField(Marker::IrCountryTag), .. } => {
+        RuleType::NodeRule {
+            left: NewField::MarkerField(Marker::IrCountryTag),
+            ..
+        } => {
             if let RuleType::NodeRule { rules, .. } = rule.0 {
                 let opts = rule.1.clone();
                 let mut rules_a = rules.clone();
@@ -282,15 +350,29 @@ fn expand_colour_rule(mut rule: NewRule) -> Vec<NewRule> {
                 let mut rules_b = rules;
                 expand_colour_in_list(&mut rules_b);
                 vec![
-                    (RuleType::NodeRule { left: NewField::ValueField(ValueType::Enum("country_tags".to_string())), rules: rules_a }, opts.clone()),
-                    (RuleType::NodeRule { left: NewField::VariableGetField("dynamic_country_tag".to_string()), rules: rules_b }, opts),
+                    (
+                        RuleType::NodeRule {
+                            left: NewField::ValueField(ValueType::Enum("country_tags".to_string())),
+                            rules: rules_a,
+                        },
+                        opts.clone(),
+                    ),
+                    (
+                        RuleType::NodeRule {
+                            left: NewField::VariableGetField("dynamic_country_tag".to_string()),
+                            rules: rules_b,
+                        },
+                        opts,
+                    ),
                 ]
             } else {
                 vec![rule]
             }
         }
         // Recurse into nested containers
-        RuleType::NodeRule { .. } | RuleType::ValueClauseRule { .. } | RuleType::SubtypeRule { .. } => {
+        RuleType::NodeRule { .. }
+        | RuleType::ValueClauseRule { .. }
+        | RuleType::SubtypeRule { .. } => {
             expand_colour_in_rule(&mut rule);
             vec![rule]
         }
@@ -359,7 +441,11 @@ fn rewrite_vsm_in_list(rules: &mut Vec<NewRule>) {
 
 fn rewrite_vsm_field(field: &mut NewField) {
     if let NewField::ValueScopeMarkerField { is_int, min, max } = field {
-        *field = NewField::ValueScopeField { is_int: *is_int, min: *min, max: *max };
+        *field = NewField::ValueScopeField {
+            is_int: *is_int,
+            min: *min,
+            max: *max,
+        };
     }
 }
 
@@ -396,6 +482,7 @@ fn expand_ignore_in_rule(rule: &mut NewRule) {
 }
 
 fn expand_ignore_in_list(rules: &mut Vec<NewRule>) {
+<<<<<<< Updated upstream
     for rule in rules.iter_mut() {
         if matches!(rule.0, RuleType::LeafRule { right: NewField::IgnoreMarkerField, .. }) {
             let left = extract_leaf_left(&rule.0);
@@ -407,6 +494,33 @@ fn expand_ignore_in_list(rules: &mut Vec<NewRule>) {
                     expand_ignore_in_rule(rule);
                 }
                 _ => {}
+=======
+    let original = std::mem::take(rules);
+    for mut rule in original {
+        match &rule.0 {
+            RuleType::LeafRule {
+                right: NewField::IgnoreMarkerField,
+                ..
+            } => {
+                let left = extract_leaf_left(&rule.0);
+                let opts = rule.1.clone();
+                rules.push((
+                    RuleType::NodeRule {
+                        left: NewField::IgnoreField(Box::new(left)),
+                        rules: vec![],
+                    },
+                    opts,
+                ));
+            }
+            RuleType::NodeRule { .. }
+            | RuleType::ValueClauseRule { .. }
+            | RuleType::SubtypeRule { .. } => {
+                expand_ignore_in_rule(&mut rule);
+                rules.push(rule);
+            }
+            _ => {
+                rules.push(rule);
+>>>>>>> Stashed changes
             }
         }
     }
@@ -480,13 +594,22 @@ alias[effect:node_test] = {
 }
 "#;
         let rs = parse_and_post(input);
-        let (_, (rule, _)) = rs.aliases.iter().find(|(n, _)| n == "effect:node_test").unwrap();
+        let (_, (rule, _)) = rs
+            .aliases
+            .iter()
+            .find(|(n, _)| n == "effect:node_test")
+            .unwrap();
         if let RuleType::NodeRule { rules, .. } = rule {
             let (inner_rule, _) = &rules[0];
             // Should have been promoted to a NodeRule whose rules contain inner_key=scalar
             match inner_rule {
-                RuleType::NodeRule { rules: inner_rules, .. } => {
-                    assert!(!inner_rules.is_empty(), "inlined node alias should have inner rules");
+                RuleType::NodeRule {
+                    rules: inner_rules, ..
+                } => {
+                    assert!(
+                        !inner_rules.is_empty(),
+                        "inlined node alias should have inner rules"
+                    );
                 }
                 other => panic!("expected NodeRule after node-alias inline, got {:?}", other),
             }
@@ -536,15 +659,28 @@ alias[effect:colour_test] = {
 }
 "#;
         let rs = parse_and_post(input);
-        let (_, (rule, _)) = rs.aliases.iter().find(|(n, _)| n == "effect:colour_test").unwrap();
+        let (_, (rule, _)) = rs
+            .aliases
+            .iter()
+            .find(|(n, _)| n == "effect:colour_test")
+            .unwrap();
         if let RuleType::NodeRule { rules, .. } = rule {
             let (inner, _) = &rules[0];
             match inner {
-                RuleType::NodeRule { rules: colour_inner, .. } => {
-                    assert_eq!(colour_inner.len(), 1, "colour NodeRule should have 1 LeafValue child");
+                RuleType::NodeRule {
+                    rules: colour_inner,
+                    ..
+                } => {
+                    assert_eq!(
+                        colour_inner.len(),
+                        1,
+                        "colour NodeRule should have 1 LeafValue child"
+                    );
                     let (lv, lv_opts) = &colour_inner[0];
                     match lv {
-                        RuleType::LeafValueRule { right: NewField::ValueField(ValueType::Float { min, max }) } => {
+                        RuleType::LeafValueRule {
+                            right: NewField::ValueField(ValueType::Float { min, max }),
+                        } => {
                             assert_eq!(*min, -256.0, "colour float min");
                             assert_eq!(*max, 256.0, "colour float max");
                         }
@@ -553,7 +689,10 @@ alias[effect:colour_test] = {
                     assert_eq!(lv_opts.min, 3);
                     assert_eq!(lv_opts.max, 3);
                 }
-                other => panic!("expected NodeRule from colour_field expansion, got {:?}", other),
+                other => panic!(
+                    "expected NodeRule from colour_field expansion, got {:?}",
+                    other
+                ),
             }
         } else {
             panic!("expected outer NodeRule");
@@ -573,7 +712,11 @@ alias[trigger:val_test] = {
 }
 "#;
         let rs = parse_and_post(input);
-        let (_, (rule, _)) = rs.aliases.iter().find(|(n, _)| n == "trigger:val_test").unwrap();
+        let (_, (rule, _)) = rs
+            .aliases
+            .iter()
+            .find(|(n, _)| n == "trigger:val_test")
+            .unwrap();
         if let RuleType::NodeRule { rules, .. } = rule {
             let (inner, _) = &rules[0];
             match inner {
@@ -604,13 +747,26 @@ alias[effect:ignore_test] = {
 }
 "#;
         let rs = parse_and_post(input);
-        let (_, (rule, _)) = rs.aliases.iter().find(|(n, _)| n == "effect:ignore_test").unwrap();
+        let (_, (rule, _)) = rs
+            .aliases
+            .iter()
+            .find(|(n, _)| n == "effect:ignore_test")
+            .unwrap();
         if let RuleType::NodeRule { rules, .. } = rule {
             let (inner, _) = &rules[0];
             match inner {
-                RuleType::NodeRule { left: NewField::IgnoreField(boxed), rules: inner_rules } => {
-                    assert!(matches!(boxed.as_ref(), NewField::SpecificField(_)), "IgnoreField should wrap the original key field");
-                    assert!(inner_rules.is_empty(), "IgnoreField NodeRule should have no children");
+                RuleType::NodeRule {
+                    left: NewField::IgnoreField(boxed),
+                    rules: inner_rules,
+                } => {
+                    assert!(
+                        matches!(boxed.as_ref(), NewField::SpecificField(_)),
+                        "IgnoreField should wrap the original key field"
+                    );
+                    assert!(
+                        inner_rules.is_empty(),
+                        "IgnoreField NodeRule should have no children"
+                    );
                 }
                 other => panic!("expected NodeRule(IgnoreField(..), []), got {:?}", other),
             }

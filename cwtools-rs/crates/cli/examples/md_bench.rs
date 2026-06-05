@@ -41,8 +41,16 @@ fn main() {
     }
 
     let elapsed = start.elapsed();
-    println!("\n  BENCH: {} files, {} leaves in {:.3}s", total_files, total_leaves, elapsed.as_secs_f64());
-    println!("  Holding {} batch objects in memory for RSS measurement...", all_files.len());
+    println!(
+        "\n  BENCH: {} files, {} leaves in {:.3}s",
+        total_files,
+        total_leaves,
+        elapsed.as_secs_f64()
+    );
+    println!(
+        "  Holding {} batch objects in memory for RSS measurement...",
+        all_files.len()
+    );
     std::thread::sleep(std::time::Duration::from_secs(10));
     println!("  Done. Held in memory.");
 }

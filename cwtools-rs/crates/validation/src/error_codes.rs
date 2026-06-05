@@ -148,7 +148,12 @@ pub const CW502_UNUSED_TYPE: ErrorCode = ErrorCode {
 };
 
 /// Generate a hash from error code + location + parameters.
-pub fn error_code_hash(code: &ErrorCode, file: &str, line: u32, params: &[impl AsRef<str>]) -> String {
+pub fn error_code_hash(
+    code: &ErrorCode,
+    file: &str,
+    line: u32,
+    params: &[impl AsRef<str>],
+) -> String {
     let sev = match code.severity {
         ErrorSeverity::Error => "error",
         ErrorSeverity::Warning => "warning",

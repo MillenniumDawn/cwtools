@@ -41,6 +41,15 @@ fn bench_millennium_dawn_mod() {
 
     let elapsed = start.elapsed();
     let leaves_sec = total_leaves as f64 / elapsed.as_secs_f64();
-    println!("\n  BENCH: {} files, {} leaves in {:.3}s", total_files, total_leaves, elapsed.as_secs_f64());
-    println!("  Throughput: {:.0} leaves/s ({:.1}K leaves/s)", leaves_sec, leaves_sec / 1000.0);
+    println!(
+        "\n  BENCH: {} files, {} leaves in {:.3}s",
+        total_files,
+        total_leaves,
+        elapsed.as_secs_f64()
+    );
+    println!(
+        "  Throughput: {:.0} leaves/s ({:.1}K leaves/s)",
+        leaves_sec,
+        leaves_sec / 1000.0
+    );
 }

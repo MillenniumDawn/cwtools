@@ -1,5 +1,8 @@
 use crate::cache_format::*;
-use cwtools_parser::ast::{Arena, Child, Comment, Leaf, LeafValue, Node, Operator, SourcePos, SourceRange, Value, ValueClause};
+use cwtools_parser::ast::{
+    Arena, Child, Comment, Leaf, LeafValue, Node, Operator, SourcePos, SourceRange, Value,
+    ValueClause,
+};
 use cwtools_string_table::string_table::StringTable;
 
 /// Convert an arena AST (with StringTable IDs) into a self-contained CachedFile.
@@ -10,19 +13,36 @@ pub fn arena_to_cached(
 ) -> CachedFile {
     CachedFile {
         root_children: children_to_cached(root_children),
-        nodes: arena.nodes.iter().map(|n| node_to_cached(n, string_table)).collect(),
-        leaves: arena.leaves.iter().map(|l| leaf_to_cached(l, string_table)).collect(),
-        leaf_values: arena.leaf_values.iter().map(|lv| leaf_value_to_cached(lv, string_table)).collect(),
-        value_clauses: arena.value_clauses.iter().map(|vc| value_clause_to_cached(vc, string_table)).collect(),
-        comments: arena.comments.iter().map(|c| comment_to_cached(c)).collect(),
+        nodes: arena
+            .nodes
+            .iter()
+            .map(|n| node_to_cached(n, string_table))
+            .collect(),
+        leaves: arena
+            .leaves
+            .iter()
+            .map(|l| leaf_to_cached(l, string_table))
+            .collect(),
+        leaf_values: arena
+            .leaf_values
+            .iter()
+            .map(|lv| leaf_value_to_cached(lv, string_table))
+            .collect(),
+        value_clauses: arena
+            .value_clauses
+            .iter()
+            .map(|vc| value_clause_to_cached(vc, string_table))
+            .collect(),
+        comments: arena
+            .comments
+            .iter()
+            .map(|c| comment_to_cached(c))
+            .collect(),
     }
 }
 
 /// Convert a CachedFile back into an arena AST, re-interning strings.
-pub fn cached_to_arena(
-    cached: &CachedFile,
-    string_table: &StringTable,
-) -> (Arena, Vec<Child>) {
+pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Arena, Vec<Child>) {
     let mut arena = Arena::new();
 
     for n in &cached.nodes {
@@ -52,11 +72,17 @@ pub fn cached_to_arena(
 
 // ---- helpers ----
 
-fn string_token_to_str(token: &cwtools_string_table::string_table::StringTokens, table: &StringTable) -> String {
+fn string_token_to_str(
+    token: &cwtools_string_table::string_table::StringTokens,
+    table: &StringTable,
+) -> String {
     table.get_string(token.normal).unwrap_or_default()
 }
 
-fn str_to_string_token(s: &str, table: &StringTable) -> cwtools_string_table::string_table::StringTokens {
+fn str_to_string_token(
+    s: &str,
+    table: &StringTable,
+) -> cwtools_string_table::string_table::StringTokens {
     table.intern(s)
 }
 
@@ -66,19 +92,28 @@ fn range_to_cached(r: &SourceRange) -> (u32, u16, u32, u16) {
 
 fn cached_to_range(start_line: u32, start_col: u16, end_line: u32, end_col: u16) -> SourceRange {
     SourceRange {
-        start: SourcePos { line: start_line, col: start_col },
-        end: SourcePos { line: end_line, col: end_col },
+        start: SourcePos {
+            line: start_line,
+            col: start_col,
+        },
+        end: SourcePos {
+            line: end_line,
+            col: end_col,
+        },
     }
 }
 
 fn children_to_cached(children: &[Child]) -> Vec<CachedChild> {
-    children.iter().map(|c| match c {
-        Child::Node(i) => CachedChild::Node(*i),
-        Child::Leaf(i) => CachedChild::Leaf(*i),
-        Child::LeafValue(i) => CachedChild::LeafValue(*i),
-        Child::ValueClause(i) => CachedChild::ValueClause(*i),
-        Child::Comment(i) => CachedChild::Comment(*i),
-    }).collect()
+    children
+        .iter()
+        .map(|c| match c {
+            Child::Node(i) => CachedChild::Node(*i),
+            Child::Leaf(i) => CachedChild::Leaf(*i),
+            Child::LeafValue(i) => CachedChild::LeafValue(*i),
+            Child::ValueClause(i) => CachedChild::ValueClause(*i),
+            Child::Comment(i) => CachedChild::Comment(*i),
+        })
+        .collect()
 }
 
 fn children_from_cached(
@@ -86,13 +121,16 @@ fn children_from_cached(
     _table: &StringTable,
     _arena: &mut Arena,
 ) -> Vec<Child> {
-    children.iter().map(|c| match c {
-        CachedChild::Node(i) => Child::Node(*i),
-        CachedChild::Leaf(i) => Child::Leaf(*i),
-        CachedChild::LeafValue(i) => Child::LeafValue(*i),
-        CachedChild::ValueClause(i) => Child::ValueClause(*i),
-        CachedChild::Comment(i) => Child::Comment(*i),
-    }).collect()
+    children
+        .iter()
+        .map(|c| match c {
+            CachedChild::Node(i) => Child::Node(*i),
+            CachedChild::Leaf(i) => Child::Leaf(*i),
+            CachedChild::LeafValue(i) => Child::LeafValue(*i),
+            CachedChild::ValueClause(i) => Child::ValueClause(*i),
+            CachedChild::Comment(i) => Child::Comment(*i),
+        })
+        .collect()
 }
 
 fn node_to_cached(n: &Node, table: &StringTable) -> CachedNode {
@@ -100,7 +138,10 @@ fn node_to_cached(n: &Node, table: &StringTable) -> CachedNode {
     CachedNode {
         key: string_token_to_str(&n.key, table),
         key_prefix: n.key_prefix.as_ref().map(|t| string_token_to_str(t, table)),
-        value_prefix: n.value_prefix.as_ref().map(|t| string_token_to_str(t, table)),
+        value_prefix: n
+            .value_prefix
+            .as_ref()
+            .map(|t| string_token_to_str(t, table)),
         children: children_to_cached(&n.children),
         start_line: sl,
         start_col: sc,
@@ -113,7 +154,10 @@ fn cached_node_to_node(n: &CachedNode, table: &StringTable) -> Node {
     Node {
         key: str_to_string_token(&n.key, table),
         key_prefix: n.key_prefix.as_ref().map(|s| str_to_string_token(s, table)),
-        value_prefix: n.value_prefix.as_ref().map(|s| str_to_string_token(s, table)),
+        value_prefix: n
+            .value_prefix
+            .as_ref()
+            .map(|s| str_to_string_token(s, table)),
         children: children_from_cached(&n.children, table, &mut Arena::new()),
         pos: cached_to_range(n.start_line, n.start_col, n.end_line, n.end_col),
     }
@@ -162,7 +206,11 @@ fn cached_leaf_value_to_leaf_value(lv: &CachedLeafValue, table: &StringTable) ->
 fn value_clause_to_cached(vc: &ValueClause, table: &StringTable) -> CachedValueClause {
     let (sl, sc, el, ec) = range_to_cached(&vc.pos);
     CachedValueClause {
-        keys: vc.keys.iter().map(|k| string_token_to_str(k, table)).collect(),
+        keys: vc
+            .keys
+            .iter()
+            .map(|k| string_token_to_str(k, table))
+            .collect(),
         children: children_to_cached(&vc.children),
         start_line: sl,
         start_col: sc,
@@ -173,7 +221,11 @@ fn value_clause_to_cached(vc: &ValueClause, table: &StringTable) -> CachedValueC
 
 fn cached_value_clause_to_value_clause(vc: &CachedValueClause, table: &StringTable) -> ValueClause {
     ValueClause {
-        keys: vc.keys.iter().map(|k| str_to_string_token(k, table)).collect(),
+        keys: vc
+            .keys
+            .iter()
+            .map(|k| str_to_string_token(k, table))
+            .collect(),
         children: children_from_cached(&vc.children, table, &mut Arena::new()),
         pos: cached_to_range(vc.start_line, vc.start_col, vc.end_line, vc.end_col),
     }
@@ -215,7 +267,9 @@ fn cached_value_to_value(v: &CachedValue, table: &StringTable) -> Value {
         CachedValue::Float(f) => Value::Float(*f),
         CachedValue::Int(i) => Value::Int(*i),
         CachedValue::Bool(b) => Value::Bool(*b),
-        CachedValue::Clause(children) => Value::Clause(children_from_cached(children, table, &mut Arena::new())),
+        CachedValue::Clause(children) => {
+            Value::Clause(children_from_cached(children, table, &mut Arena::new()))
+        }
     }
 }
 

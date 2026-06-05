@@ -82,7 +82,15 @@ pub fn expand_inline_script(
     target_table: &mut StringTable,
     target_arena: &mut Arena,
 ) -> Result<Option<Vec<Child>>, String> {
-    expand_inline_inner(leaf, arena, table, registry, target_table, target_arena, &mut Vec::new())
+    expand_inline_inner(
+        leaf,
+        arena,
+        table,
+        registry,
+        target_table,
+        target_arena,
+        &mut Vec::new(),
+    )
 }
 
 // ── Internal recursive expander ───────────────────────────────────────────────
@@ -187,16 +195,12 @@ fn clone_and_expand_children(
         match child {
             Child::Leaf(idx) => {
                 let src_leaf = &src_arena.leaves[*idx as usize];
-                let key = src_table.get_string(src_leaf.key.normal).unwrap_or_default();
+                let key = src_table
+                    .get_string(src_leaf.key.normal)
+                    .unwrap_or_default();
                 if key == "inline_script" {
                     let exp = expand_inline_inner(
-                        src_leaf,
-                        src_arena,
-                        src_table,
-                        registry,
-                        dst_table,
-                        dst_arena,
-                        call_stack,
+                        src_leaf, src_arena, src_table, registry, dst_table, dst_arena, call_stack,
                     );
                     match exp {
                         Ok(Some(expanded_children)) => {
@@ -212,8 +216,14 @@ fn clone_and_expand_children(
                 // Normal leaf clone
                 let new_key = clone_tokens(&src_leaf.key, src_table, dst_table, params);
                 let new_value = clone_value_r(
-                    &src_leaf.value, src_arena, src_table, dst_arena, dst_table, params,
-                    registry, call_stack,
+                    &src_leaf.value,
+                    src_arena,
+                    src_table,
+                    dst_arena,
+                    dst_table,
+                    params,
+                    registry,
+                    call_stack,
                 )?;
                 let new_leaf = Leaf {
                     key: new_key,
@@ -227,8 +237,7 @@ fn clone_and_expand_children(
             }
             other => {
                 out.push(clone_and_expand_child_r(
-                    other, src_arena, src_table, dst_arena, dst_table, params, registry,
-                    call_stack,
+                    other, src_arena, src_table, dst_arena, dst_table, params, registry, call_stack,
                 )?);
             }
         }
@@ -253,8 +262,14 @@ fn clone_and_expand_child_r(
             let src_leaf = &src_arena.leaves[*idx as usize];
             let new_key = clone_tokens(&src_leaf.key, src_table, dst_table, params);
             let new_value = clone_value_r(
-                &src_leaf.value, src_arena, src_table, dst_arena, dst_table, params,
-                registry, call_stack,
+                &src_leaf.value,
+                src_arena,
+                src_table,
+                dst_arena,
+                dst_table,
+                params,
+                registry,
+                call_stack,
             )?;
             let new_leaf = Leaf {
                 key: new_key,
@@ -270,8 +285,14 @@ fn clone_and_expand_child_r(
             let node = &src_arena.nodes[*idx as usize];
             let new_key = clone_tokens(&node.key, src_table, dst_table, params);
             let new_children = clone_and_expand_children(
-                &node.children, src_arena, src_table, dst_arena, dst_table, params,
-                registry, call_stack,
+                &node.children,
+                src_arena,
+                src_table,
+                dst_arena,
+                dst_table,
+                params,
+                registry,
+                call_stack,
             )?;
             let new_node = Node {
                 key: new_key,
@@ -297,8 +318,7 @@ fn clone_and_expand_child_r(
         Child::LeafValue(idx) => {
             let lv = &src_arena.leaf_values[*idx as usize];
             let new_value = clone_value_r(
-                &lv.value, src_arena, src_table, dst_arena, dst_table, params, registry,
-                call_stack,
+                &lv.value, src_arena, src_table, dst_arena, dst_table, params, registry, call_stack,
             )?;
             let new_lv = cwtools_parser::ast::LeafValue {
                 value: new_value,
@@ -311,8 +331,14 @@ fn clone_and_expand_child_r(
         Child::ValueClause(idx) => {
             let vc = &src_arena.value_clauses[*idx as usize];
             let new_children = clone_and_expand_children(
-                &vc.children, src_arena, src_table, dst_arena, dst_table, params,
-                registry, call_stack,
+                &vc.children,
+                src_arena,
+                src_table,
+                dst_arena,
+                dst_table,
+                params,
+                registry,
+                call_stack,
             )?;
             let new_keys: Vec<StringTokens> = vc
                 .keys
@@ -357,8 +383,7 @@ fn clone_value_r(
         Value::Bool(b) => Ok(Value::Bool(*b)),
         Value::Clause(children) => {
             let new_children = clone_and_expand_children(
-                children, src_arena, src_table, dst_arena, dst_table, params, registry,
-                call_stack,
+                children, src_arena, src_table, dst_arena, dst_table, params, registry, call_stack,
             )?;
             Ok(Value::Clause(new_children))
         }
@@ -424,9 +449,7 @@ fn substitute_params(text: &str, params: &HashMap<String, String>) -> String {
 
 fn leaf_value_str(value: &Value, table: &StringTable) -> String {
     match value {
-        Value::String(t) | Value::QString(t) => {
-            table.get_string(t.normal).unwrap_or_default()
-        }
+        Value::String(t) | Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
         Value::Float(f) => f.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Bool(b) => b.to_string(),

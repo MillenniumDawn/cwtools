@@ -1,12 +1,12 @@
-use crate::{ValidationError};
+use crate::ValidationError;
 use cwtools_game::constants::Game;
 use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 
 pub mod common;
-pub mod stellaris;
 pub mod eu4;
+pub mod stellaris;
 
 /// Run game-specific validators after generic rule validation.
 pub fn run_game_validators(

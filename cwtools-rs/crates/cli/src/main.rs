@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand};
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
-use cwtools_info::{collect_type_instances, TypeIndex};
+use cwtools_info::{TypeIndex, collect_type_instances};
 use cwtools_parser::parser::parse_string;
-use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::RuleSet;
+use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use std::path::{Path, PathBuf};
 
@@ -142,22 +142,63 @@ enum Commands {
 /// or as a mod root with standard subfolders.
 fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
     let known_script_folders = [
-        "common", "events", "history", "interface", "decisions", "missions", "gfx",
-        "static_modifiers", "buildings", "technologies", "ethics", "policies",
-        "ship_sizes", "pop_faction", "starbases_consolidated", "traits", "edicts",
-        "traditions", "ascension_perks", "governments", "country_types", "bypass",
-        "dlc_list", "subject_types", "casus_belli", "war_goals", "bombardment_stances",
-        "armies", "deposits", "planet_classes", "tile_blockers", "species_rights",
-        "observation_station_missions", "star_classes", "ambient_objects", "name_lists",
-        "notification_modifier", "component_tags", "event_chains", "personalities",
-        "global_ship_designs", "graphical_cultures", "species_archetypes", "resources",
-        "species_classes", "buildable_pops", "opinion_modifiers", "leader_class_enum",
-        "asteroid_belt", "solar_system_initializers", "fallen_empires",
+        "common",
+        "events",
+        "history",
+        "interface",
+        "decisions",
+        "missions",
+        "gfx",
+        "sound",
+        "music",
+        "static_modifiers",
+        "buildings",
+        "technologies",
+        "ethics",
+        "policies",
+        "ship_sizes",
+        "pop_faction",
+        "starbases_consolidated",
+        "traits",
+        "edicts",
+        "traditions",
+        "ascension_perks",
+        "governments",
+        "country_types",
+        "bypass",
+        "dlc_list",
+        "subject_types",
+        "casus_belli",
+        "war_goals",
+        "bombardment_stances",
+        "armies",
+        "deposits",
+        "planet_classes",
+        "tile_blockers",
+        "species_rights",
+        "observation_station_missions",
+        "star_classes",
+        "ambient_objects",
+        "name_lists",
+        "notification_modifier",
+        "component_tags",
+        "event_chains",
+        "personalities",
+        "global_ship_designs",
+        "graphical_cultures",
+        "species_archetypes",
+        "resources",
+        "species_classes",
+        "buildable_pops",
+        "opinion_modifiers",
+        "leader_class_enum",
+        "asteroid_belt",
+        "solar_system_initializers",
+        "fallen_empires",
     ];
-    let dir_name = directory.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let dir_name = directory.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
+<<<<<<< Updated upstream
     // If this directory itself contains script files, search it directly.
     let script_exts = ["txt", "gui", "gfx", "sfx", "asset", "map"];
     let has_script_files = std::fs::read_dir(directory).ok().is_some_and(|mut entries| {
@@ -173,6 +214,28 @@ fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
     });
 
     if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") || has_script_files {
+=======
+    // If this directory itself contains script files (.txt/.gui/.gfx/.asset), search it directly.
+    let script_extensions = ["txt", "gui", "gfx", "asset"];
+    let has_script_files = std::fs::read_dir(directory).is_ok_and(|mut entries| {
+        entries.any(|e| {
+            e.is_ok_and(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| script_extensions.iter().any(|&se| ext == se))
+            })
+        })
+    });
+
+    if known_script_folders.contains(&dir_name)
+        || dir_name.ends_with(".txt")
+        || dir_name.ends_with(".gui")
+        || dir_name.ends_with(".gfx")
+        || dir_name.ends_with(".asset")
+        || has_script_files
+    {
+>>>>>>> Stashed changes
         FileManagerConfig {
             root: directory.to_path_buf(),
             include_dirs: vec![".".into()],
@@ -256,7 +319,10 @@ fn locate_fsharp_cli() -> Option<PathBuf> {
         if pb.is_file() {
             return Some(pb);
         }
-        eprintln!("warn: CWTOOLS_FSHARP_CLI is set but not a file: {}", pb.display());
+        eprintln!(
+            "warn: CWTOOLS_FSHARP_CLI is set but not a file: {}",
+            pb.display()
+        );
     }
     for c in [
         "../artifacts/bin/CWToolsCLI/release/CWToolsCLI.dll",
@@ -275,7 +341,12 @@ fn locate_fsharp_cli() -> Option<PathBuf> {
 /// `validate` subcommand is supported; everything else is rust-only.
 fn run_fsharp_engine(command: &Commands) -> ! {
     match command {
-        Commands::Validate { game, directory, rules, .. } => {
+        Commands::Validate {
+            game,
+            directory,
+            rules,
+            ..
+        } => {
             let dll = locate_fsharp_cli().unwrap_or_else(|| {
                 eprintln!(
                     "F# engine: CWToolsCLI.dll not found. Set CWTOOLS_FSHARP_CLI to its path, \
@@ -298,7 +369,9 @@ fn run_fsharp_engine(command: &Commands) -> ! {
             match status {
                 Ok(s) => std::process::exit(s.code().unwrap_or(1)),
                 Err(e) => {
-                    eprintln!("F# engine: failed to launch `dotnet`: {e}. Is the .NET runtime installed and on PATH?");
+                    eprintln!(
+                        "F# engine: failed to launch `dotnet`: {e}. Is the .NET runtime installed and on PATH?"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -353,7 +426,12 @@ fn main() {
                 println!("Parsed rule directory: {}", file.display());
                 println!("  Types:         {}", ruleset.types.len());
                 for t in &ruleset.types {
-                    println!("    - {} (path: {:?}, subtypes: {})", t.name, t.path_options.paths, t.subtypes.len());
+                    println!(
+                        "    - {} (path: {:?}, subtypes: {})",
+                        t.name,
+                        t.path_options.paths,
+                        t.subtypes.len()
+                    );
                 }
                 println!("  Enums:         {}", ruleset.enums.len());
                 for e in &ruleset.enums {
@@ -387,7 +465,11 @@ fn main() {
             let mut manager = FileManager::new(config);
             match manager.discover_and_parse() {
                 Ok(files) => {
-                    println!("Discovered and parsed {} files in {}", files.len(), directory.display());
+                    println!(
+                        "Discovered and parsed {} files in {}",
+                        files.len(),
+                        directory.display()
+                    );
                     for f in files {
                         println!(
                             "  {} [{}] — nodes: {}, leaves: {}",
@@ -413,7 +495,9 @@ fn main() {
             match parse_string(&input_str, &table) {
                 Ok(parsed) => {
                     let cached = cwtools_cache::convert::arena_to_cached(
-                        &parsed.arena, &parsed.root_children, &table,
+                        &parsed.arena,
+                        &parsed.root_children,
+                        &table,
                     );
                     match cwtools_cache::io::serialize_to_file(&cached, &output) {
                         Ok(_) => {
@@ -431,25 +515,23 @@ fn main() {
                 }
             }
         }
-        Commands::Deserialize { input } => {
-            match cwtools_cache::io::deserialize_from_file(&input) {
-                Ok(loaded) => {
-                    let table = StringTable::new();
-                    let (arena, root) = cwtools_cache::convert::cached_to_arena(&loaded, &table);
-                    println!("Deserialized from {}", input.display());
-                    println!("  Nodes:    {}", arena.nodes.len());
-                    println!("  Leaves:   {}", arena.leaves.len());
-                    println!("  Values:   {}", arena.leaf_values.len());
-                    println!("  Clauses:  {}", arena.value_clauses.len());
-                    println!("  Comments: {}", arena.comments.len());
-                    println!("  Root children: {}", root.len());
-                }
-                Err(e) => {
-                    eprintln!("Error deserializing {}: {}", input.display(), e);
-                    std::process::exit(1);
-                }
+        Commands::Deserialize { input } => match cwtools_cache::io::deserialize_from_file(&input) {
+            Ok(loaded) => {
+                let table = StringTable::new();
+                let (arena, root) = cwtools_cache::convert::cached_to_arena(&loaded, &table);
+                println!("Deserialized from {}", input.display());
+                println!("  Nodes:    {}", arena.nodes.len());
+                println!("  Leaves:   {}", arena.leaves.len());
+                println!("  Values:   {}", arena.leaf_values.len());
+                println!("  Clauses:  {}", arena.value_clauses.len());
+                println!("  Comments: {}", arena.comments.len());
+                println!("  Root children: {}", root.len());
             }
-        }
+            Err(e) => {
+                eprintln!("Error deserializing {}: {}", input.display(), e);
+                std::process::exit(1);
+            }
+        },
         Commands::Rules { file } => {
             let table = StringTable::new();
             let ruleset = load_rules(&file, &table);
@@ -461,7 +543,12 @@ fn main() {
             println!("Parsed {}", label);
             println!("  Types:         {}", ruleset.types.len());
             for t in &ruleset.types {
-                println!("    - {} (path: {:?}, subtypes: {})", t.name, t.path_options.paths, t.subtypes.len());
+                println!(
+                    "    - {} (path: {:?}, subtypes: {})",
+                    t.name,
+                    t.path_options.paths,
+                    t.subtypes.len()
+                );
             }
             println!("  Enums:         {}", ruleset.enums.len());
             for e in &ruleset.enums {
@@ -471,7 +558,16 @@ fn main() {
             println!("  SingleAliases: {}", ruleset.single_aliases.len());
             println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
         }
+<<<<<<< Updated upstream
         Commands::Validate { game, directory, rules, vanilla, vanilla_cache, report_type, output_file, ignore_hashes, output_hashes } => {
+=======
+        Commands::Validate {
+            game,
+            directory,
+            rules,
+            vanilla,
+        } => {
+>>>>>>> Stashed changes
             use cwtools_game::constants::Game;
             use cwtools_validation::validate_ast;
 
@@ -485,12 +581,30 @@ fn main() {
             } else {
                 format!("file {}", rules.display())
             };
+<<<<<<< Updated upstream
             eprintln!("Validating {} files in {} against rules {}", game_id, directory.display(), rules_label);
+=======
+            println!(
+                "Validating {} files in {} against rules {}",
+                game_id,
+                directory.display(),
+                rules_label
+            );
+>>>>>>> Stashed changes
 
             // Parse rules (shares its StringTable with game files)
             let rules_table = StringTable::new();
             let ruleset = load_rules(&rules, &rules_table);
+<<<<<<< Updated upstream
             eprintln!("  Loaded {} types, {} enums, {} aliases", ruleset.types.len(), ruleset.enums.len(), ruleset.aliases.len());
+=======
+            println!(
+                "  Loaded {} types, {} enums, {} aliases",
+                ruleset.types.len(),
+                ruleset.enums.len(),
+                ruleset.aliases.len()
+            );
+>>>>>>> Stashed changes
 
             // Discover and parse files using the SAME string table
             let config = search_config_for(&directory);
@@ -511,7 +625,8 @@ fn main() {
                     Err(_) => continue,
                 };
                 if let Ok(pf) = cwtools_parser::parser::parse_string(&text, &rules_table) {
-                    let instances = collect_type_instances(&ruleset, &pf, &file.logical_path, &rules_table);
+                    let instances =
+                        collect_type_instances(&ruleset, &pf, &file.logical_path, &rules_table);
                     type_index.merge(file.path.to_str().unwrap_or(""), instances);
                 }
             }
@@ -521,6 +636,7 @@ fn main() {
             // ship_names, focuses, … without "not a known instance" errors) but are
             // never validated themselves.
             if let Some(vanilla_dir) = &vanilla {
+<<<<<<< Updated upstream
                 let vanilla_index = index_game_dir(vanilla_dir, &ruleset, &rules_table);
                 for (type_name, entries) in vanilla_index.map {
                     let per_type = std::collections::HashMap::from([(
@@ -538,12 +654,48 @@ fn main() {
                     Ok((cache_game, per_type)) => {
                         if cache_game != game {
                             eprintln!("  warn: vanilla cache was built for game '{}', validating '{}'", cache_game, game);
+=======
+                let vanilla_config = search_config_for(vanilla_dir);
+                let mut vanilla_mgr =
+                    FileManager::with_string_table(vanilla_config, rules_table.clone());
+                match vanilla_mgr.discover_and_parse() {
+                    Ok(vanilla_files) => {
+                        println!(
+                            "  Indexing {} base-game files from {}",
+                            vanilla_files.len(),
+                            vanilla_dir.display()
+                        );
+                        for file in &vanilla_files {
+                            let text = match std::fs::read_to_string(&file.path) {
+                                Ok(t) => t,
+                                Err(_) => continue,
+                            };
+                            if let Ok(pf) =
+                                cwtools_parser::parser::parse_string(&text, &rules_table)
+                            {
+                                let instances = collect_type_instances(
+                                    &ruleset,
+                                    &pf,
+                                    &file.logical_path,
+                                    &rules_table,
+                                );
+                                type_index.merge(file.path.to_str().unwrap_or(""), instances);
+                            }
+>>>>>>> Stashed changes
                         }
                         let total: usize = per_type.values().map(|v| v.len()).sum();
                         type_index.merge("<vanilla-cache>", per_type);
                         eprintln!("  Loaded {} base-game instances from cache {}", total, cache_path.display());
                     }
+<<<<<<< Updated upstream
                     Err(e) => eprintln!("  warn: could not load vanilla cache {}: {}", cache_path.display(), e),
+=======
+                    Err(e) => eprintln!(
+                        "  warn: could not read base-game dir {}: {}",
+                        vanilla_dir.display(),
+                        e
+                    ),
+>>>>>>> Stashed changes
                 }
             }
 
@@ -552,7 +704,8 @@ fn main() {
             // entries like `production_speed_<building>_factor` /
             // `local_resources_<resource>_factor` / `<ideology>_drift` are
             // expanded against the type index, one per instance.
-            let mut modifier_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut modifier_keys: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for m in &ruleset.modifiers {
                 match (m.find('<'), m.find('>')) {
                     (Some(open), Some(close)) if open < close => {
@@ -586,6 +739,7 @@ fn main() {
                     errors: vec![],
                 };
                 let errors = validate_ast(
+<<<<<<< Updated upstream
                     &parser_file, &ruleset, &rules_table, &file_str,
                     Some(game_id), Some(&type_index), Some(&modifier_keys),
                 );
@@ -652,6 +806,46 @@ fn main() {
                 else { println!("Wrote {} diagnostic hashes to {}", hashes.len(), p.display()); }
             }
 
+=======
+                    &parser_file,
+                    &ruleset,
+                    &rules_table,
+                    file.path.to_str().unwrap_or(""),
+                    Some(game_id),
+                    Some(&type_index),
+                    Some(&modifier_keys),
+                );
+                let file_errors: Vec<_> = errors
+                    .iter()
+                    .filter(|e| e.severity == cwtools_validation::ErrorSeverity::Error)
+                    .collect();
+                let file_warnings: Vec<_> = errors
+                    .iter()
+                    .filter(|e| e.severity == cwtools_validation::ErrorSeverity::Warning)
+                    .collect();
+                total_errors += file_errors.len();
+                total_warnings += file_warnings.len();
+                if !errors.is_empty() {
+                    println!("\n  {}:", file.path.display());
+                    for err in &errors {
+                        let code_part = err
+                            .code
+                            .as_deref()
+                            .map(|c| format!("[{}] ", c))
+                            .unwrap_or_default();
+                        println!(
+                            "    [{:?}] {}{} (line {})",
+                            err.severity, code_part, err.message, err.line
+                        );
+                    }
+                }
+            }
+
+            println!(
+                "\nValidation complete: {} errors, {} warnings",
+                total_errors, total_warnings
+            );
+>>>>>>> Stashed changes
             if total_errors > 0 {
                 std::process::exit(1);
             }
@@ -679,8 +873,8 @@ fn main() {
         }
         Commands::Loc { directory } => {
             use cwtools_localization::service::LocService;
-            use cwtools_localization::validation::validate_loc_file;
             use cwtools_localization::validation::build_key_union;
+            use cwtools_localization::validation::validate_loc_file;
 
             println!("Scanning localisation in {}", directory.display());
             let service = LocService::from_folder(&directory);
@@ -695,11 +889,30 @@ fn main() {
             println!("  Total unique keys: {}", all_keys.len());
 
             let hardcoded: Vec<&str> = vec![
-                "Player", "Root", "From", "Prev", "Capital", "Random", "This",
-                "Country", "Ruler", "GetName", "GetName2", "GetSpeciesName",
-                "GetSpeciesNamePlural", "GetSpeciesAdj", "GetTitle",
-                "Owner", "Controller", "GetGovernmentName", "GetClassName",
-                "GetAdj", "GetIcon", "GetRegnalName", "Date", "GetDate",
+                "Player",
+                "Root",
+                "From",
+                "Prev",
+                "Capital",
+                "Random",
+                "This",
+                "Country",
+                "Ruler",
+                "GetName",
+                "GetName2",
+                "GetSpeciesName",
+                "GetSpeciesNamePlural",
+                "GetSpeciesAdj",
+                "GetTitle",
+                "Owner",
+                "Controller",
+                "GetGovernmentName",
+                "GetClassName",
+                "GetAdj",
+                "GetIcon",
+                "GetRegnalName",
+                "Date",
+                "GetDate",
             ];
 
             let mut total_errors = 0;
@@ -709,9 +922,7 @@ fn main() {
                 match result {
                     Ok(file) => {
                         let mut file_copy = file.clone();
-                        let errors = validate_loc_file(
-                            &mut file_copy, &all_keys, &hardcoded
-                        );
+                        let errors = validate_loc_file(&mut file_copy, &all_keys, &hardcoded);
                         total_entries += file.entries.len();
                         if !errors.is_empty() {
                             println!("\n  {} — {} errors:", path, errors.len());
@@ -728,7 +939,10 @@ fn main() {
                 }
             }
 
-            println!("\nLoc validation complete: {} entries, {} errors", total_entries, total_errors);
+            println!(
+                "\nLoc validation complete: {} entries, {} errors",
+                total_entries, total_errors
+            );
             if total_errors > 0 {
                 std::process::exit(1);
             }

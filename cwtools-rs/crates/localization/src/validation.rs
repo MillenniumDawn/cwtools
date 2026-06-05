@@ -46,7 +46,10 @@ pub fn validate_loc_file(
         if !validate_quotes(entry) {
             errors.push(LocValidationError {
                 line: entry.position.line,
-                message: format!("CW-LocMissingQuote: key '{}' has unbalanced quotes", entry.key),
+                message: format!(
+                    "CW-LocMissingQuote: key '{}' has unbalanced quotes",
+                    entry.key
+                ),
             });
         }
 
@@ -74,9 +77,7 @@ pub fn validate_loc_file(
 
                 if has_lower
                     && !hardcoded.contains(&lowercase)
-                    && !(first_space.is_some()
-                        && last_space.is_some()
-                        && first_space != last_space)
+                    && !(first_space.is_some() && last_space.is_some() && first_space != last_space)
                 {
                     errors.push(LocValidationError {
                         line: entry.position.line,
@@ -210,11 +211,7 @@ mod tests {
         let text = "l_english:\n key1: \"Hello $undefined_key$\"\n";
         let mut file = parse_loc_text(text, "test.yml").unwrap();
         let keys: HashSet<String> = HashSet::new();
-        let errors = validate_loc_file(
-            &mut file,
-            &keys,
-            &Vec::<String>::new(),
-        );
+        let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
 
         assert_eq!(errors.len(), 1);
         assert_eq!(
@@ -229,16 +226,10 @@ mod tests {
         let mut file = parse_loc_text(text, "test.yml").unwrap();
         let mut keys = HashSet::new();
         keys.insert("key1".to_string());
-        let errors = validate_loc_file(
-            &mut file,
-            &keys,
-            &Vec::<String>::new(),
-        );
+        let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
 
         assert_eq!(errors.len(), 1);
-        assert!(errors[0]
-            .message
-            .contains("RecursiveLocRef"));
+        assert!(errors[0].message.contains("RecursiveLocRef"));
     }
 
     #[test]
@@ -247,11 +238,7 @@ mod tests {
         let mut file = parse_loc_text(text, "test.yml").unwrap();
         let mut keys = HashSet::new();
         keys.insert("key2".to_string());
-        let errors = validate_loc_file(
-            &mut file,
-            &keys,
-            &Vec::<String>::new(),
-        );
+        let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
 
         assert!(errors.is_empty(), "valid ref should not error");
     }
@@ -262,11 +249,7 @@ mod tests {
         let mut file = parse_loc_text(text, "test.yml").unwrap();
         let keys: HashSet<String> = HashSet::new();
 
-        let errors = validate_loc_file(
-            &mut file,
-            &keys,
-            &Vec::<String>::new(),
-        );
+        let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
 
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("ReplaceMe"));
@@ -277,11 +260,7 @@ mod tests {
         let text = "l_english:\n key1: \"Hello $Player$\"\n";
         let mut file = parse_loc_text(text, "test.yml").unwrap();
         let keys: HashSet<String> = HashSet::new();
-        let errors = validate_loc_file(
-            &mut file,
-            &keys,
-            &vec!["Player"],
-        );
+        let errors = validate_loc_file(&mut file, &keys, &vec!["Player"]);
 
         assert!(errors.is_empty(), "hardcoded ref should not error");
     }
@@ -294,16 +273,23 @@ mod tests {
         let mut file = parse_loc_text(&text, "test.yml").unwrap();
 
         // error_range should be set by the parser
-        assert!(file.entries[0].error_range.is_some(),
-            "parser should have set error_range for out-of-range char");
+        assert!(
+            file.entries[0].error_range.is_some(),
+            "parser should have set error_range for out-of-range char"
+        );
 
         let keys: HashSet<String> = HashSet::new();
         let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
 
-        let inv_char_errors: Vec<_> = errors.iter()
+        let inv_char_errors: Vec<_> = errors
+            .iter()
             .filter(|e| e.message.contains("LocInvalidChars"))
             .collect();
-        assert!(!inv_char_errors.is_empty(), "expected CW-LocInvalidChars error, got: {:?}", errors);
+        assert!(
+            !inv_char_errors.is_empty(),
+            "expected CW-LocInvalidChars error, got: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -312,15 +298,21 @@ mod tests {
         let text = "l_english:\n key1: \"Hello world — café\"\n";
         let mut file = parse_loc_text(text, "test.yml").unwrap();
 
-        assert!(file.entries[0].error_range.is_none(),
-            "valid chars should not set error_range");
+        assert!(
+            file.entries[0].error_range.is_none(),
+            "valid chars should not set error_range"
+        );
 
         let keys: HashSet<String> = HashSet::new();
         let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
-        let inv_char_errors: Vec<_> = errors.iter()
+        let inv_char_errors: Vec<_> = errors
+            .iter()
             .filter(|e| e.message.contains("LocInvalidChars"))
             .collect();
-        assert!(inv_char_errors.is_empty(), "valid chars should not produce LocInvalidChars");
+        assert!(
+            inv_char_errors.is_empty(),
+            "valid chars should not produce LocInvalidChars"
+        );
     }
 
     // ---- case-insensitive recursive ref check (fix 7) ---------------------
@@ -334,9 +326,14 @@ mod tests {
         keys.insert("key1".to_string()); // stored lowercased in union
         let errors = validate_loc_file(&mut file, &keys, &Vec::<String>::new());
 
-        let recursive: Vec<_> = errors.iter()
+        let recursive: Vec<_> = errors
+            .iter()
             .filter(|e| e.message.contains("RecursiveLocRef"))
             .collect();
-        assert!(!recursive.is_empty(), "case-insensitive self-ref should trigger RecursiveLocRef: {:?}", errors);
+        assert!(
+            !recursive.is_empty(),
+            "case-insensitive self-ref should trigger RecursiveLocRef: {:?}",
+            errors
+        );
     }
 }

@@ -75,10 +75,17 @@ values = {
     assert_eq!(ruleset.complex_enums.len(), 1);
     assert_eq!(ruleset.complex_enums[0].name, "my_complex");
     assert!(ruleset.complex_enums[0].start_from_root);
-    assert!(matches!(ruleset.complex_enums[0].name_tree, ComplexEnumNameTree::Entries(_)));
+    assert!(matches!(
+        ruleset.complex_enums[0].name_tree,
+        ComplexEnumNameTree::Entries(_)
+    ));
 
     // F: enum description from ###
-    let pe = ruleset.enums.iter().find(|e| e.key == "power_types").unwrap();
+    let pe = ruleset
+        .enums
+        .iter()
+        .find(|e| e.key == "power_types")
+        .unwrap();
     assert_eq!(pe.description, "Power Type enum");
 
     // C: type metadata
@@ -102,7 +109,10 @@ values = {
             // count: int_value_field
             let (count_rule, _) = &rules[1];
             if let RuleType::LeafRule { right, .. } = count_rule {
-                assert!(matches!(right, NewField::ValueScopeMarkerField { is_int: true, .. }));
+                assert!(matches!(
+                    right,
+                    NewField::ValueScopeMarkerField { is_int: true, .. }
+                ));
             }
 
             // pct: ##cardinality= (no space) + percentage_field
@@ -117,7 +127,13 @@ values = {
             // filepath[gfx,dds]
             let (fp_rule, _) = &rules[5];
             if let RuleType::LeafRule { right, .. } = fp_rule {
-                assert!(matches!(right, NewField::FilepathField { prefix: Some(_), extension: Some(_) }));
+                assert!(matches!(
+                    right,
+                    NewField::FilepathField {
+                        prefix: Some(_),
+                        extension: Some(_)
+                    }
+                ));
             }
 
             // scope[country]
@@ -129,13 +145,27 @@ values = {
             // variable_field
             let (vf_rule, _) = &rules[7];
             if let RuleType::LeafRule { right, .. } = vf_rule {
-                assert!(matches!(right, NewField::VariableField { is_int: false, is_32bit: false, .. }));
+                assert!(matches!(
+                    right,
+                    NewField::VariableField {
+                        is_int: false,
+                        is_32bit: false,
+                        ..
+                    }
+                ));
             }
 
             // int_variable_field
             let (ivf_rule, _) = &rules[8];
             if let RuleType::LeafRule { right, .. } = ivf_rule {
-                assert!(matches!(right, NewField::VariableField { is_int: true, is_32bit: false, .. }));
+                assert!(matches!(
+                    right,
+                    NewField::VariableField {
+                        is_int: true,
+                        is_32bit: false,
+                        ..
+                    }
+                ));
             }
         }
     }

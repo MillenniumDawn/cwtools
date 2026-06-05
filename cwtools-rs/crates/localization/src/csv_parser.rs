@@ -17,12 +17,12 @@ use crate::commands::{Lang, LocEntry, Position};
 /// Index 0 is the key; indices 1–4 are languages in this order.
 /// Matches F# `CSVLocRow`:  Code, English, French, German, Spanish.
 pub const CK2_COLUMN_LANGS: &[Option<Lang>] = &[
-    None,                  // col 0: key
-    Some(Lang::English),   // col 1
-    Some(Lang::French),    // col 2
-    Some(Lang::German),    // col 3
-    None,                  // col 4: empty column (CK2/VIC2 schema gap)
-    Some(Lang::Spanish),   // col 5
+    None,                // col 0: key
+    Some(Lang::English), // col 1
+    Some(Lang::French),  // col 2
+    Some(Lang::German),  // col 3
+    None,                // col 4: empty column (CK2/VIC2 schema gap)
+    Some(Lang::Spanish), // col 5
 ];
 
 /// Parse a CSV localisation file and return per-language entries.
@@ -67,11 +67,7 @@ pub fn parse_csv_loc_per_lang(
         for (col_idx, maybe_lang) in column_langs.iter().enumerate().skip(1) {
             let Some(lang) = *maybe_lang else { continue };
 
-            let desc = parts
-                .get(col_idx)
-                .copied()
-                .unwrap_or("")
-                .to_string();
+            let desc = parts.get(col_idx).copied().unwrap_or("").to_string();
 
             let position = Position::new(name, line_num + 1, 1);
 

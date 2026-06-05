@@ -81,10 +81,7 @@ fn walk_folder(folder: &std::path::Path) -> Vec<(String, String)> {
         if path.is_dir() {
             files.extend(walk_folder(&path));
         } else {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext == "yml" || ext == "csv" {
                 let text = read_text(&path).unwrap_or_default();
                 files.push((path.to_string_lossy().to_string(), text));

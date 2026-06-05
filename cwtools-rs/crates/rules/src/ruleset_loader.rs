@@ -89,10 +89,14 @@ mod tests {
         let links = parse_string("links = { character = { from_data = yes } }", &table).unwrap();
         let mut a = ast_to_ruleset(&links, &table);
 
-        let other = parse_string("types = { type[evt] = { path = \"game/events\" } }", &table).unwrap();
+        let other =
+            parse_string("types = { type[evt] = { path = \"game/events\" } }", &table).unwrap();
         let b = ast_to_ruleset(&other, &table);
 
         merge_ruleset(&mut a, b);
-        assert!(a.scope_links.contains("character"), "scope_links lost during merge");
+        assert!(
+            a.scope_links.contains("character"),
+            "scope_links lost during merge"
+        );
     }
 }

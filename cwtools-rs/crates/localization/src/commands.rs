@@ -81,40 +81,84 @@ pub enum Game {
 pub fn languages_for_game(game: Game) -> &'static [Lang] {
     match game {
         Game::Stellaris => &[
-            Lang::English, Lang::French, Lang::German, Lang::Spanish,
-            Lang::Russian, Lang::Polish, Lang::BrazPor, Lang::SimpChinese,
-            Lang::Japanese, Lang::Korean, Lang::Default,
+            Lang::English,
+            Lang::French,
+            Lang::German,
+            Lang::Spanish,
+            Lang::Russian,
+            Lang::Polish,
+            Lang::BrazPor,
+            Lang::SimpChinese,
+            Lang::Japanese,
+            Lang::Korean,
+            Lang::Default,
         ],
         Game::HOI4 => &[
-            Lang::English, Lang::French, Lang::German, Lang::Spanish,
-            Lang::Russian, Lang::Polish, Lang::BrazPor, Lang::SimpChinese,
+            Lang::English,
+            Lang::French,
+            Lang::German,
+            Lang::Spanish,
+            Lang::Russian,
+            Lang::Polish,
+            Lang::BrazPor,
+            Lang::SimpChinese,
             Lang::Japanese,
         ],
-        Game::EU4 => &[
-            Lang::English, Lang::French, Lang::German, Lang::Spanish,
-        ],
+        Game::EU4 => &[Lang::English, Lang::French, Lang::German, Lang::Spanish],
         Game::CK3 => &[
-            Lang::English, Lang::French, Lang::German, Lang::Spanish,
-            Lang::SimpChinese, Lang::Russian, Lang::Korean,
+            Lang::English,
+            Lang::French,
+            Lang::German,
+            Lang::Spanish,
+            Lang::SimpChinese,
+            Lang::Russian,
+            Lang::Korean,
         ],
         Game::VIC3 | Game::EU5 => &[
-            Lang::English, Lang::French, Lang::German, Lang::Spanish,
-            Lang::SimpChinese, Lang::Russian, Lang::Korean, Lang::Japanese,
-            Lang::BrazPor, Lang::Polish, Lang::Turkish,
+            Lang::English,
+            Lang::French,
+            Lang::German,
+            Lang::Spanish,
+            Lang::SimpChinese,
+            Lang::Russian,
+            Lang::Korean,
+            Lang::Japanese,
+            Lang::BrazPor,
+            Lang::Polish,
+            Lang::Turkish,
         ],
         Game::IR => &[
-            Lang::English, Lang::French, Lang::German, Lang::Spanish,
-            Lang::SimpChinese, Lang::Russian,
+            Lang::English,
+            Lang::French,
+            Lang::German,
+            Lang::Spanish,
+            Lang::SimpChinese,
+            Lang::Russian,
         ],
         Game::Custom => &[
-            Lang::English, Lang::French, Lang::German, Lang::Spanish,
-            Lang::SimpChinese, Lang::Russian, Lang::Polish, Lang::BrazPor,
+            Lang::English,
+            Lang::French,
+            Lang::German,
+            Lang::Spanish,
+            Lang::SimpChinese,
+            Lang::Russian,
+            Lang::Polish,
+            Lang::BrazPor,
             Lang::Default,
         ],
         Game::Generic => &[
-            Lang::English, Lang::French, Lang::German, Lang::Spanish,
-            Lang::Russian, Lang::Polish, Lang::BrazPor, Lang::SimpChinese,
-            Lang::Japanese, Lang::Korean, Lang::Turkish, Lang::Default,
+            Lang::English,
+            Lang::French,
+            Lang::German,
+            Lang::Spanish,
+            Lang::Russian,
+            Lang::Polish,
+            Lang::BrazPor,
+            Lang::SimpChinese,
+            Lang::Japanese,
+            Lang::Korean,
+            Lang::Turkish,
+            Lang::Default,
         ],
     }
 }
@@ -242,8 +286,14 @@ mod tests {
     #[test]
     fn test_key_to_language_for_game_stellaris() {
         // Stellaris supports l_korean and l_default
-        assert_eq!(key_to_language_for_game(Game::Stellaris, "l_korean"), Some(Lang::Korean));
-        assert_eq!(key_to_language_for_game(Game::Stellaris, "l_default"), Some(Lang::Default));
+        assert_eq!(
+            key_to_language_for_game(Game::Stellaris, "l_korean"),
+            Some(Lang::Korean)
+        );
+        assert_eq!(
+            key_to_language_for_game(Game::Stellaris, "l_default"),
+            Some(Lang::Default)
+        );
         // Turkish is NOT in Stellaris set
         assert_eq!(key_to_language_for_game(Game::Stellaris, "l_turkish"), None);
     }
@@ -251,27 +301,42 @@ mod tests {
     #[test]
     fn test_key_to_language_for_game_eu4() {
         // EU4 only has English, French, German, Spanish
-        assert_eq!(key_to_language_for_game(Game::EU4, "l_english"), Some(Lang::English));
+        assert_eq!(
+            key_to_language_for_game(Game::EU4, "l_english"),
+            Some(Lang::English)
+        );
         assert_eq!(key_to_language_for_game(Game::EU4, "l_russian"), None);
         assert_eq!(key_to_language_for_game(Game::EU4, "l_default"), None);
     }
 
     #[test]
     fn test_key_to_language_for_game_hoi4() {
-        assert_eq!(key_to_language_for_game(Game::HOI4, "l_japanese"), Some(Lang::Japanese));
+        assert_eq!(
+            key_to_language_for_game(Game::HOI4, "l_japanese"),
+            Some(Lang::Japanese)
+        );
         // HOI4 does not have Korean
         assert_eq!(key_to_language_for_game(Game::HOI4, "l_korean"), None);
     }
 
     #[test]
     fn test_key_to_language_for_game_custom_has_default() {
-        assert_eq!(key_to_language_for_game(Game::Custom, "l_default"), Some(Lang::Default));
+        assert_eq!(
+            key_to_language_for_game(Game::Custom, "l_default"),
+            Some(Lang::Default)
+        );
     }
 
     #[test]
     fn test_generic_accepts_all() {
-        assert_eq!(key_to_language_for_game(Game::Generic, "l_turkish"), Some(Lang::Turkish));
-        assert_eq!(key_to_language_for_game(Game::Generic, "l_default"), Some(Lang::Default));
+        assert_eq!(
+            key_to_language_for_game(Game::Generic, "l_turkish"),
+            Some(Lang::Turkish)
+        );
+        assert_eq!(
+            key_to_language_for_game(Game::Generic, "l_default"),
+            Some(Lang::Default)
+        );
     }
 
     #[test]

@@ -67,7 +67,15 @@ impl RuleSet {
         self.alias_exact.clear();
         self.alias_categories.clear();
         for (i, (name, _)) in self.aliases.iter().enumerate() {
+            // Store under the original name AND the all-lowercase variant so
+            // that game-file keys like `instantTextboxType` (mixed case) match
+            // rule alias keys like `instantTextBoxType` (camelCase). Paradox
+            // script keys are case-insensitive; aliases are no different.
             self.alias_exact.entry(name.clone()).or_default().push(i);
+            let lower = name.to_ascii_lowercase();
+            if lower != *name {
+                self.alias_exact.entry(lower).or_default().push(i);
+            }
             if let Some((cat, rest)) = name.split_once(':') {
                 let entry = self.alias_categories.entry(cat.to_string()).or_default();
                 if rest == "scope_field" {
@@ -188,11 +196,25 @@ pub type NewRule = (RuleType, Options);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuleType {
-    NodeRule { left: NewField, rules: Vec<NewRule> },
-    LeafRule { left: NewField, right: NewField },
-    LeafValueRule { right: NewField },
-    ValueClauseRule { rules: Vec<NewRule> },
-    SubtypeRule { name: String, positive: bool, rules: Vec<NewRule> },
+    NodeRule {
+        left: NewField,
+        rules: Vec<NewRule>,
+    },
+    LeafRule {
+        left: NewField,
+        right: NewField,
+    },
+    LeafValueRule {
+        right: NewField,
+    },
+    ValueClauseRule {
+        rules: Vec<NewRule>,
+    },
+    SubtypeRule {
+        name: String,
+        positive: bool,
+        rules: Vec<NewRule>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,8 +224,14 @@ pub enum NewField {
     ScalarField,
     TypeField(TypeType),
     ScopeField(Vec<String>),
-    LocalisationField { synced: bool, is_inline: bool },
-    FilepathField { prefix: Option<String>, extension: Option<String> },
+    LocalisationField {
+        synced: bool,
+        is_inline: bool,
+    },
+    FilepathField {
+        prefix: Option<String>,
+        extension: Option<String>,
+    },
     IconField(String),
     AliasValueKeysField(String),
     AliasField(String),
@@ -212,9 +240,22 @@ pub enum NewField {
     SubtypeField(String, bool, Vec<NewRule>),
     VariableSetField(String),
     VariableGetField(String),
-    VariableField { is_int: bool, is_32bit: bool, min: f64, max: f64 },
-    ValueScopeMarkerField { is_int: bool, min: f64, max: f64 },
-    ValueScopeField { is_int: bool, min: f64, max: f64 },
+    VariableField {
+        is_int: bool,
+        is_32bit: bool,
+        min: f64,
+        max: f64,
+    },
+    ValueScopeMarkerField {
+        is_int: bool,
+        min: f64,
+        max: f64,
+    },
+    ValueScopeField {
+        is_int: bool,
+        min: f64,
+        max: f64,
+    },
     MarkerField(Marker),
     JominiGuiField,
     IgnoreMarkerField,
@@ -239,7 +280,11 @@ pub enum ValueType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeType {
     Simple(String),
-    Complex { prefix: String, name: String, suffix: String },
+    Complex {
+        prefix: String,
+        name: String,
+        suffix: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -329,7 +374,10 @@ pub enum ComplexEnumNameTreeEntry {
     /// `is_name` is true when the value is `enum_name`/`this`.
     Leaf { key: String, is_name: bool },
     /// A nested node entry: descend into `key` then recurse.
-    Node { key: String, children: ComplexEnumNameTree },
+    Node {
+        key: String,
+        children: ComplexEnumNameTree,
+    },
 }
 
 /// Root-level rule from a .cwt file.

@@ -241,7 +241,11 @@ impl<'a> Parser<'a> {
         let is_hsv = trimmed.starts_with("hsv") || trimmed.starts_with("HSV");
         if is_rgb {
             // Determine keyword length: "rgb360" (6) or "rgb" (3)
-            let kw_len = if trimmed[3..].starts_with("360") { 6 } else { 3 };
+            let kw_len = if trimmed[3..].starts_with("360") {
+                6
+            } else {
+                3
+            };
             let after = trimmed.as_bytes().get(kw_len).map(|&b| b as char);
             if after.map_or(true, |c| !c.is_alphanumeric()) {
                 let saved = self.pos();
@@ -255,7 +259,11 @@ impl<'a> Parser<'a> {
             }
         }
         if is_hsv {
-            let kw_len = if trimmed[3..].starts_with("360") { 6 } else { 3 };
+            let kw_len = if trimmed[3..].starts_with("360") {
+                6
+            } else {
+                3
+            };
             let after = trimmed.as_bytes().get(kw_len).map(|&b| b as char);
             if after.map_or(true, |c| !c.is_alphanumeric()) {
                 let saved = self.pos();
@@ -271,7 +279,9 @@ impl<'a> Parser<'a> {
         if trimmed.starts_with("yes") {
             let saved = self.pos();
             let saved_chars = self.chars.clone();
-            for _ in 0..3 { self.advance(); }
+            for _ in 0..3 {
+                self.advance();
+            }
             if let Some(c) = self.peek() {
                 if !is_value_char(c) {
                     self.skip_whitespace();
@@ -289,7 +299,9 @@ impl<'a> Parser<'a> {
         if trimmed.starts_with("no") {
             let saved = self.pos();
             let saved_chars = self.chars.clone();
-            for _ in 0..2 { self.advance(); }
+            for _ in 0..2 {
+                self.advance();
+            }
             if let Some(c) = self.peek() {
                 if !is_value_char(c) {
                     self.skip_whitespace();
@@ -463,7 +475,10 @@ impl<'a> Parser<'a> {
                     "".to_string(),
                     saved.line,
                     saved.col,
-                    format!("key '{}' has no value after '='", self.table.get_string(key.normal).unwrap_or_default()),
+                    format!(
+                        "key '{}' has no value after '='",
+                        self.table.get_string(key.normal).unwrap_or_default()
+                    ),
                 ));
                 return;
             }
@@ -508,7 +523,9 @@ impl<'a> Parser<'a> {
     fn parse_rgb(&mut self) -> Option<Value> {
         // "rgb" is already peeked and matched in parse_value before this is called.
         // Consume "rgb" or "RGB" and optional "360".
-        for _ in 0..3 { self.advance(); }
+        for _ in 0..3 {
+            self.advance();
+        }
         self.skip_whitespace();
         if let Some('3') = self.peek() {
             let ahead: String = self.chars.clone().take(3).collect();
@@ -528,7 +545,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_hsv(&mut self) -> Option<Value> {
-        for _ in 0..3 { self.advance(); }
+        for _ in 0..3 {
+            self.advance();
+        }
         self.skip_whitespace();
         if let Some('3') = self.peek() {
             let ahead: String = self.chars.clone().take(3).collect();
@@ -689,7 +708,9 @@ mod tests {
             let key = table.get_string(leaf.key.normal).unwrap_or_default();
             assert_eq!(key, "ethos");
             let val = match &leaf.value {
-                Value::String(t) | Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
+                Value::String(t) | Value::QString(t) => {
+                    table.get_string(t.normal).unwrap_or_default()
+                }
                 _ => panic!("expected string value, got {:?}", leaf.value),
             };
             assert_eq!(val, "<ethos>");

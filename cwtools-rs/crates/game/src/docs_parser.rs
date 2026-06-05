@@ -222,7 +222,12 @@ fn find_header(text: &str, header: &str) -> Option<usize> {
     let hdr_lower = header.to_ascii_lowercase();
     let pos = lower.find(&hdr_lower)?;
     // Advance past the header line
-    Some(text[pos..].find('\n').map(|nl| pos + nl + 1).unwrap_or(pos + header.len()))
+    Some(
+        text[pos..]
+            .find('\n')
+            .map(|nl| pos + nl + 1)
+            .unwrap_or(pos + header.len()),
+    )
 }
 
 fn parse_jomini_block(block: &str, default_kind: DocKind) -> Option<DocEntry> {
@@ -253,11 +258,7 @@ fn parse_jomini_block(block: &str, default_kind: DocKind) -> Option<DocEntry> {
     } else {
         // Name only, no description
         let name = name_line;
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return None;
         }
         (name, "")
@@ -292,7 +293,13 @@ fn parse_jomini_block(block: &str, default_kind: DocKind) -> Option<DocEntry> {
     let kind = if default_kind == DocKind::Trigger {
         if traits
             .as_deref()
-            .map(|t| t.contains("<=") || t.contains(">=") || t.contains(", =,") || t.contains("< ") || t.contains("> "))
+            .map(|t| {
+                t.contains("<=")
+                    || t.contains(">=")
+                    || t.contains(", =,")
+                    || t.contains("< ")
+                    || t.contains("> ")
+            })
             .unwrap_or(false)
         {
             DocKind::ValueTrigger
@@ -413,11 +420,7 @@ pub fn parse_setup_log(text: &str) -> Vec<ActualModifier> {
         // Format: `[timestamp][source]: Static Modifier #N tag = TAG name = …`
         if let Some(tag_pos) = line.find("tag = ") {
             let rest = &line[tag_pos + 6..];
-            let tag: String = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
+            let tag: String = rest.split_whitespace().next().unwrap_or("").to_string();
             if !tag.is_empty() {
                 result.push(ActualModifier {
                     tag,
@@ -518,7 +521,12 @@ fn parse_types_block(text: &str) -> Vec<(String, Vec<(String, String)>)> {
 
     while pos < bytes.len() {
         // Skip whitespace
-        while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t' || bytes[pos] == b'\r' || bytes[pos] == b'\n') {
+        while pos < bytes.len()
+            && (bytes[pos] == b' '
+                || bytes[pos] == b'\t'
+                || bytes[pos] == b'\r'
+                || bytes[pos] == b'\n')
+        {
             pos += 1;
         }
         if pos >= bytes.len() {
@@ -526,7 +534,8 @@ fn parse_types_block(text: &str) -> Vec<(String, Vec<(String, String)>)> {
         }
         // Read identifier up to `= {` or `={`
         let name_start = pos;
-        while pos < bytes.len() && bytes[pos] != b'=' && bytes[pos] != b'\n' && bytes[pos] != b'\r' {
+        while pos < bytes.len() && bytes[pos] != b'=' && bytes[pos] != b'\n' && bytes[pos] != b'\r'
+        {
             pos += 1;
         }
         let name = std::str::from_utf8(&bytes[name_start..pos])
@@ -656,7 +665,11 @@ mod tests {
         let ptax = triggers.iter().find(|e| e.name() == "province_tax_income");
         assert!(ptax.is_some(), "expected province_tax_income trigger");
         if let Some(e) = ptax {
-            assert_eq!(e.kind, DocKind::ValueTrigger, "province_tax_income should be ValueTrigger");
+            assert_eq!(
+                e.kind,
+                DocKind::ValueTrigger,
+                "province_tax_income should be ValueTrigger"
+            );
         }
     }
 
@@ -816,7 +829,10 @@ Types = {
 "#;
         let dump = parse_data_type_dump(text);
         assert_eq!(dump.promotes.len(), 2);
-        assert_eq!(dump.promotes[0], ("Character".to_string(), "Character".to_string()));
+        assert_eq!(
+            dump.promotes[0],
+            ("Character".to_string(), "Character".to_string())
+        );
         assert_eq!(dump.functions.len(), 1);
         assert_eq!(dump.types.len(), 1);
         assert_eq!(dump.types[0].0, "Character");
@@ -849,7 +865,10 @@ Types = {
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].name(), "set_local_variable");
         // "none" → empty scope vec
-        assert!(effects[0].scopes().is_empty(), "expected empty scopes for 'none'");
+        assert!(
+            effects[0].scopes().is_empty(),
+            "expected empty scopes for 'none'"
+        );
     }
 
     // Path-based existence test so CI can skip gracefully

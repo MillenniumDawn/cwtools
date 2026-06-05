@@ -100,7 +100,7 @@ pub fn classify_extension(path: &Path) -> FileKind {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "txt" | "gui" | "gfx" => FileKind::Script,
+        "txt" | "gui" | "gfx" | "asset" => FileKind::Script,
         "yml" | "yaml" | "csv" => FileKind::Localisation,
         _ => FileKind::Resource,
     }
@@ -171,7 +171,16 @@ impl Default for FileManagerConfig {
                 "interface".into(),
                 "decisions".into(),
                 "missions".into(),
+                "sound".into(),
+                "music".into(),
             ],
+            file_patterns: vec![
+                "*.txt".into(),
+                "*.gui".into(),
+                "*.gfx".into(),
+                "*.asset".into(),
+            ],
+<<<<<<< Updated upstream
             file_patterns: vec![
                 "*.txt".into(),
                 "*.gui".into(),
@@ -180,6 +189,8 @@ impl Default for FileManagerConfig {
                 "*.asset".into(),
                 "*.map".into(),
             ],
+=======
+>>>>>>> Stashed changes
             exclude_patterns: vec![],
             exclude_dirs: vec![
                 ".git".into(),
@@ -245,21 +256,14 @@ impl FileManager {
     fn walk_dir(&mut self, dir: &Path, out: &mut Vec<ParsedFile>) -> Result<(), FileError> {
         let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect();
         // Sort for deterministic ordering
-        entries.sort_by_key(|e| {
-            e.as_ref()
-                .map(|e| e.file_name())
-                .unwrap_or_default()
-        });
+        entries.sort_by_key(|e| e.as_ref().map(|e| e.file_name()).unwrap_or_default());
 
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
 
             if path.is_dir() {
-                let dir_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if self
                     .config
                     .exclude_dirs
@@ -446,7 +450,11 @@ pub fn expand_multiple_mods(workspace: &Path) -> Vec<ResolvedMod> {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e.eq_ignore_ascii_case("mod")).unwrap_or(false) {
+            if path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("mod"))
+                .unwrap_or(false)
+            {
                 match parse_mod_descriptor(&path) {
                     Ok(desc) => {
                         if let Some(mod_path) = &desc.path {
@@ -457,7 +465,10 @@ pub fn expand_multiple_mods(workspace: &Path) -> Vec<ResolvedMod> {
                                 workspace.join(mod_path)
                             };
                             if root.is_dir() {
-                                out.push(ResolvedMod { descriptor: desc, root });
+                                out.push(ResolvedMod {
+                                    descriptor: desc,
+                                    root,
+                                });
                             }
                         }
                     }
@@ -528,8 +539,8 @@ pub fn discover_files_multi_mod(
             best.retain(|logical, (_path, file_prio)| {
                 // If the file's logical path is under this replace_path and
                 // comes from a lower-priority source → suppress it.
-                let under_prefix = logical == &prefix
-                    || logical.starts_with(&format!("{}/", prefix));
+                let under_prefix =
+                    logical == &prefix || logical.starts_with(&format!("{}/", prefix));
                 if under_prefix && *file_prio < mod_priority {
                     return false;
                 }
@@ -698,8 +709,16 @@ mod tests {
     fn classify_ext() {
         assert_eq!(classify_extension(Path::new("foo.txt")), FileKind::Script);
         assert_eq!(classify_extension(Path::new("foo.gui")), FileKind::Script);
-        assert_eq!(classify_extension(Path::new("foo.yml")), FileKind::Localisation);
-        assert_eq!(classify_extension(Path::new("foo.csv")), FileKind::Localisation);
+        assert_eq!(classify_extension(Path::new("foo.gfx")), FileKind::Script);
+        assert_eq!(classify_extension(Path::new("foo.asset")), FileKind::Script);
+        assert_eq!(
+            classify_extension(Path::new("foo.yml")),
+            FileKind::Localisation
+        );
+        assert_eq!(
+            classify_extension(Path::new("foo.csv")),
+            FileKind::Localisation
+        );
         assert_eq!(classify_extension(Path::new("foo.dds")), FileKind::Resource);
         assert_eq!(classify_extension(Path::new("foo.png")), FileKind::Resource);
     }
@@ -755,8 +774,8 @@ mod tests {
 
     #[test]
     fn multi_mod_replace_path_suppresses_vanilla() {
-        use std::fs;
         use std::collections::HashMap;
+        use std::fs;
 
         // Create a tiny temp filesystem:
         //   workspace/

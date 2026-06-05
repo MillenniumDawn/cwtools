@@ -1,4 +1,4 @@
-use crate::{ValidationError, ErrorSeverity, error_codes};
+use crate::{ErrorSeverity, ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile};
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 use cwtools_string_table::string_table::StringTable;
@@ -34,7 +34,10 @@ pub fn validate_common(
                 let count = type_counts.get(&key).copied().unwrap_or(0);
                 if count > 1 {
                     errors.push(ValidationError {
-                        message: format!("Type '{}' appears {} times in file (unique violation)", key, count),
+                        message: format!(
+                            "Type '{}' appears {} times in file (unique violation)",
+                            key, count
+                        ),
                         severity: ErrorSeverity::Warning,
                         line: 0,
                         col: 0,

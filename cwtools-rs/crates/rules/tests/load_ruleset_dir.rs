@@ -10,9 +10,8 @@ use std::path::Path;
 /// exist (e.g. on CI without the submodule).
 #[test]
 fn load_ir_config_dir() {
-    let config_dir = Path::new(
-        "/mnt/Linux/github-projects/cwtools/CWToolsDocs/testconfig/cwtools-ir-config",
-    );
+    let config_dir =
+        Path::new("/mnt/Linux/github-projects/cwtools/CWToolsDocs/testconfig/cwtools-ir-config");
 
     if !config_dir.exists() {
         eprintln!("ir-config not found at {:?}, skipping test", config_dir);

@@ -16,8 +16,7 @@ nested = {
 "#;
     let table = StringTable::new();
     let parsed = parse_string(input, &table).unwrap();
-    let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table,
-    );
+    let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     // Serialize to temp file
     let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
@@ -48,9 +47,7 @@ fn roundtrip_real_file() {
     let input = std::fs::read_to_string(path).unwrap();
     let table = StringTable::new();
     let parsed = parse_string(&input, &table).unwrap();
-    let cached = convert::arena_to_cached(
-        &parsed.arena, &parsed.root_children, &table,
-    );
+    let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
     io::serialize_to_file(&cached, tmp.path()).unwrap();
@@ -93,9 +90,8 @@ fn roundtrip_all_performancetest_files() {
     let mut total_leaves = 0;
 
     for parsed in files {
-        let cached = convert::arena_to_cached(
-            &parsed.arena, &parsed.root_children, &manager.string_table,
-        );
+        let cached =
+            convert::arena_to_cached(&parsed.arena, &parsed.root_children, &manager.string_table);
 
         let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
         io::serialize_to_file(&cached, tmp.path()).unwrap();
@@ -106,34 +102,53 @@ fn roundtrip_all_performancetest_files() {
 
         // Verify counts match
         assert_eq!(
-            arena2.nodes.len(), parsed.arena.nodes.len(),
-            "Node count mismatch for {}", parsed.path.display()
+            arena2.nodes.len(),
+            parsed.arena.nodes.len(),
+            "Node count mismatch for {}",
+            parsed.path.display()
         );
         assert_eq!(
-            arena2.leaves.len(), parsed.arena.leaves.len(),
-            "Leaf count mismatch for {}", parsed.path.display()
+            arena2.leaves.len(),
+            parsed.arena.leaves.len(),
+            "Leaf count mismatch for {}",
+            parsed.path.display()
         );
         assert_eq!(
-            arena2.leaf_values.len(), parsed.arena.leaf_values.len(),
-            "LeafValue count mismatch for {}", parsed.path.display()
+            arena2.leaf_values.len(),
+            parsed.arena.leaf_values.len(),
+            "LeafValue count mismatch for {}",
+            parsed.path.display()
         );
         assert_eq!(
-            arena2.value_clauses.len(), parsed.arena.value_clauses.len(),
-            "ValueClause count mismatch for {}", parsed.path.display()
+            arena2.value_clauses.len(),
+            parsed.arena.value_clauses.len(),
+            "ValueClause count mismatch for {}",
+            parsed.path.display()
         );
         assert_eq!(
-            arena2.comments.len(), parsed.arena.comments.len(),
-            "Comment count mismatch for {}", parsed.path.display()
+            arena2.comments.len(),
+            parsed.arena.comments.len(),
+            "Comment count mismatch for {}",
+            parsed.path.display()
         );
         assert_eq!(
-            root2.len(), parsed.root_children.len(),
-            "Root children count mismatch for {}", parsed.path.display()
+            root2.len(),
+            parsed.root_children.len(),
+            "Root children count mismatch for {}",
+            parsed.path.display()
         );
 
         total_files += 1;
         total_leaves += parsed.arena.leaves.len();
     }
 
-    println!("Round-trip verified for {} files, {} total leaves", total_files, total_leaves);
-    assert!(total_files >= 60, "Expected at least 60 files, got {}", total_files);
+    println!(
+        "Round-trip verified for {} files, {} total leaves",
+        total_files, total_leaves
+    );
+    assert!(
+        total_files >= 60,
+        "Expected at least 60 files, got {}",
+        total_files
+    );
 }

@@ -249,19 +249,13 @@ impl ScopeContext {
             }
         }
         if !froms.is_empty() {
-            self.from = froms
-                .iter()
-                .filter_map(|n| resolve(n))
-                .collect();
+            self.from = froms.iter().filter_map(|n| resolve(n)).collect();
         }
         if !prevs.is_empty() {
             // Replace the bottom of the scope stack with the prev chain.
             // Keep the current scope on top.
             let current = self.scopes.last().copied().unwrap_or(self.root);
-            let mut new_scopes: Vec<ScopeId> = prevs
-                .iter()
-                .filter_map(|n| resolve(n))
-                .collect();
+            let mut new_scopes: Vec<ScopeId> = prevs.iter().filter_map(|n| resolve(n)).collect();
             new_scopes.push(current);
             self.scopes = new_scopes;
         }
@@ -348,13 +342,19 @@ impl ScopeContext {
             "this" | "self" => {
                 let cur = self.scopes.last().copied().unwrap_or(self.root);
                 self.scopes.push(cur);
-                return ScopeResult::NewScope { scope: cur, ignore_keys: vec![] };
+                return ScopeResult::NewScope {
+                    scope: cur,
+                    ignore_keys: vec![],
+                };
             }
             // ── root ─────────────────────────────────────────────────────
             "root" => {
                 let r = self.root;
                 self.scopes.push(r);
-                return ScopeResult::NewScope { scope: r, ignore_keys: vec![] };
+                return ScopeResult::NewScope {
+                    scope: r,
+                    ignore_keys: vec![],
+                };
             }
             // ── prev chain ───────────────────────────────────────────────
             "prev" => {
@@ -404,11 +404,13 @@ impl ScopeContext {
                 return self.apply_from(4);
             }
             // ── logical/boolean keywords (pass-through) ──────────────────
-            "and" | "or" | "not" | "nor" | "nand" | "if" | "else" | "else_if"
-            | "hidden_effect" | "hidden_trigger" | "limit"
-            | "trigger_if" | "trigger_else" | "trigger_else_if" => {
+            "and" | "or" | "not" | "nor" | "nand" | "if" | "else" | "else_if" | "hidden_effect"
+            | "hidden_trigger" | "limit" | "trigger_if" | "trigger_else" | "trigger_else_if" => {
                 let cur = self.scopes.last().copied().unwrap_or(self.root);
-                return ScopeResult::NewScope { scope: cur, ignore_keys: vec![] };
+                return ScopeResult::NewScope {
+                    scope: cur,
+                    ignore_keys: vec![],
+                };
             }
             _ => {}
         }
@@ -456,13 +458,19 @@ impl ScopeContext {
         let new_scopes = Self::pop_n(&self.scopes, hops);
         let scope = new_scopes.last().copied().unwrap_or(self.root);
         self.scopes = new_scopes;
-        ScopeResult::NewScope { scope, ignore_keys: vec![] }
+        ScopeResult::NewScope {
+            scope,
+            ignore_keys: vec![],
+        }
     }
 
     fn apply_from(&mut self, i: usize) -> ScopeResult {
         let scope = self.get_from(i);
         self.scopes.push(scope);
-        ScopeResult::NewScope { scope, ignore_keys: vec![] }
+        ScopeResult::NewScope {
+            scope,
+            ignore_keys: vec![],
+        }
     }
 }
 
@@ -517,45 +525,116 @@ fn load_hoi4_links(links: &mut HashMap<String, ScopeLink>) {
 
     let entries: &[(&[&str], &[u32], u32)] = &[
         // ── Global iterators (any → target) ─────────────────────────────
-        (&["every_country", "random_country", "any_country", "country"],
-            &[], COUNTRY),
-        (&["every_state", "random_state", "any_state", "state"],
-            &[], STATE),
-        (&["every_unit_leader", "random_unit_leader", "any_unit_leader", "unit_leader"],
-            &[], UNIT_LEADER),
-        (&["every_air_unit", "random_air_unit", "any_air_unit"],
-            &[], AIR),
+        (
+            &["every_country", "random_country", "any_country", "country"],
+            &[],
+            COUNTRY,
+        ),
+        (
+            &["every_state", "random_state", "any_state", "state"],
+            &[],
+            STATE,
+        ),
+        (
+            &[
+                "every_unit_leader",
+                "random_unit_leader",
+                "any_unit_leader",
+                "unit_leader",
+            ],
+            &[],
+            UNIT_LEADER,
+        ),
+        (
+            &["every_air_unit", "random_air_unit", "any_air_unit"],
+            &[],
+            AIR,
+        ),
         // ── Iterators scoped to Country ──────────────────────────────────
-        (&["every_owned_state", "random_owned_state", "any_owned_state"],
-            &[COUNTRY], STATE),
-        (&["every_controlled_state", "random_controlled_state", "any_controlled_state"],
-            &[COUNTRY], STATE),
-        (&["every_subject_country", "random_subject_country", "any_subject_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_other_country", "random_other_country", "any_other_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_neighbor_country", "random_neighbor_country", "any_neighbor_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_ally", "random_ally", "any_ally"],
-            &[COUNTRY], COUNTRY),
-        (&["every_enemy_country", "random_enemy_country", "any_enemy_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_army_leader", "random_army_leader", "any_army_leader"],
-            &[COUNTRY], UNIT_LEADER),
-        (&["every_navy_leader", "random_navy_leader", "any_navy_leader"],
-            &[COUNTRY], UNIT_LEADER),
+        (
+            &["every_owned_state", "random_owned_state", "any_owned_state"],
+            &[COUNTRY],
+            STATE,
+        ),
+        (
+            &[
+                "every_controlled_state",
+                "random_controlled_state",
+                "any_controlled_state",
+            ],
+            &[COUNTRY],
+            STATE,
+        ),
+        (
+            &[
+                "every_subject_country",
+                "random_subject_country",
+                "any_subject_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_other_country",
+                "random_other_country",
+                "any_other_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_neighbor_country",
+                "random_neighbor_country",
+                "any_neighbor_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &["every_ally", "random_ally", "any_ally"],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_enemy_country",
+                "random_enemy_country",
+                "any_enemy_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &["every_army_leader", "random_army_leader", "any_army_leader"],
+            &[COUNTRY],
+            UNIT_LEADER,
+        ),
+        (
+            &["every_navy_leader", "random_navy_leader", "any_navy_leader"],
+            &[COUNTRY],
+            UNIT_LEADER,
+        ),
         // ── Iterators scoped to State ────────────────────────────────────
-        (&["every_neighbor_state", "random_neighbor_state", "any_neighbor_state"],
-            &[STATE], STATE),
+        (
+            &[
+                "every_neighbor_state",
+                "random_neighbor_state",
+                "any_neighbor_state",
+            ],
+            &[STATE],
+            STATE,
+        ),
         // ── Country named links ──────────────────────────────────────────
-        (&["capital_scope"],                        &[COUNTRY], STATE),
-        (&["overlord"],                             &[COUNTRY], COUNTRY),
-        (&["faction_leader"],                       &[COUNTRY], COUNTRY),
+        (&["capital_scope"], &[COUNTRY], STATE),
+        (&["overlord"], &[COUNTRY], COUNTRY),
+        (&["faction_leader"], &[COUNTRY], COUNTRY),
         // ── State named links ────────────────────────────────────────────
-        (&["controller"],                           &[STATE], COUNTRY),
-        (&["owner"],                                &[STATE], COUNTRY),
+        (&["controller"], &[STATE], COUNTRY),
+        (&["owner"], &[STATE], COUNTRY),
         // ── Unit leader named links ──────────────────────────────────────
-        (&["unit_leader_scope"],                    &[COUNTRY], UNIT_LEADER),
+        (&["unit_leader_scope"], &[COUNTRY], UNIT_LEADER),
     ];
 
     for (aliases, valid, target) in entries {
@@ -597,113 +676,326 @@ fn load_stellaris_links(links: &mut HashMap<String, ScopeLink>) {
 
     let entries: &[(&[&str], &[u32], u32)] = &[
         // ── Global iterators ─────────────────────────────────────────────
-        (&["every_country", "random_country", "any_country", "country"],
-            &[], COUNTRY),
-        (&["every_planet", "random_planet", "any_planet", "planet"],
-            &[], PLANET),
-        (&["every_ship", "random_ship", "any_ship", "ship"],
-            &[], SHIP),
-        (&["every_fleet", "random_fleet", "any_fleet", "fleet"],
-            &[], FLEET),
-        (&["every_pop", "random_pop", "any_pop", "pop"],
-            &[], POP),
-        (&["every_army", "random_army", "any_army", "army"],
-            &[], ARMY),
-        (&["every_system", "random_system", "any_system",
-           "galactic_object", "system", "galacticobject"],
-            &[], SYSTEM),
-        (&["every_leader", "random_leader", "any_leader", "leader"],
-            &[], LEADER),
-        (&["every_species", "random_species", "any_species", "species"],
-            &[], SPECIES),
-        (&["every_pop_faction", "random_pop_faction", "any_pop_faction", "pop_faction"],
-            &[], POP_FACTION),
-        (&["every_megastructure", "random_megastructure", "any_megastructure", "megastructure"],
-            &[], MEGASTRUCTURE),
-        (&["every_deposit", "random_deposit", "any_deposit", "deposit"],
-            &[], DEPOSIT),
-        (&["every_war", "random_war", "any_war", "war"],
-            &[], WAR),
-        (&["every_federation", "random_federation", "any_federation", "federation"],
-            &[], FEDERATION),
-        (&["every_archaeological_site", "random_archaeological_site", "any_archaeological_site"],
-            &[], ARCHAEOLOGICAL_SITE),
-        (&["every_ambient_object", "random_ambient_object", "any_ambient_object"],
-            &[], AMBIENT_OBJECT),
+        (
+            &["every_country", "random_country", "any_country", "country"],
+            &[],
+            COUNTRY,
+        ),
+        (
+            &["every_planet", "random_planet", "any_planet", "planet"],
+            &[],
+            PLANET,
+        ),
+        (
+            &["every_ship", "random_ship", "any_ship", "ship"],
+            &[],
+            SHIP,
+        ),
+        (
+            &["every_fleet", "random_fleet", "any_fleet", "fleet"],
+            &[],
+            FLEET,
+        ),
+        (&["every_pop", "random_pop", "any_pop", "pop"], &[], POP),
+        (
+            &["every_army", "random_army", "any_army", "army"],
+            &[],
+            ARMY,
+        ),
+        (
+            &[
+                "every_system",
+                "random_system",
+                "any_system",
+                "galactic_object",
+                "system",
+                "galacticobject",
+            ],
+            &[],
+            SYSTEM,
+        ),
+        (
+            &["every_leader", "random_leader", "any_leader", "leader"],
+            &[],
+            LEADER,
+        ),
+        (
+            &["every_species", "random_species", "any_species", "species"],
+            &[],
+            SPECIES,
+        ),
+        (
+            &[
+                "every_pop_faction",
+                "random_pop_faction",
+                "any_pop_faction",
+                "pop_faction",
+            ],
+            &[],
+            POP_FACTION,
+        ),
+        (
+            &[
+                "every_megastructure",
+                "random_megastructure",
+                "any_megastructure",
+                "megastructure",
+            ],
+            &[],
+            MEGASTRUCTURE,
+        ),
+        (
+            &["every_deposit", "random_deposit", "any_deposit", "deposit"],
+            &[],
+            DEPOSIT,
+        ),
+        (&["every_war", "random_war", "any_war", "war"], &[], WAR),
+        (
+            &[
+                "every_federation",
+                "random_federation",
+                "any_federation",
+                "federation",
+            ],
+            &[],
+            FEDERATION,
+        ),
+        (
+            &[
+                "every_archaeological_site",
+                "random_archaeological_site",
+                "any_archaeological_site",
+            ],
+            &[],
+            ARCHAEOLOGICAL_SITE,
+        ),
+        (
+            &[
+                "every_ambient_object",
+                "random_ambient_object",
+                "any_ambient_object",
+            ],
+            &[],
+            AMBIENT_OBJECT,
+        ),
         // ── Country-scoped iterators ─────────────────────────────────────
-        (&["every_owned_planet", "random_owned_planet", "any_owned_planet"],
-            &[COUNTRY], PLANET),
-        (&["every_controlled_planet", "random_controlled_planet", "any_controlled_planet"],
-            &[COUNTRY], PLANET),
-        (&["every_subject", "random_subject", "any_subject"],
-            &[COUNTRY], COUNTRY),
-        (&["every_playable_country", "random_playable_country", "any_playable_country"],
-            &[], COUNTRY),
-        (&["every_owned_ship", "random_owned_ship", "any_owned_ship"],
-            &[COUNTRY, FLEET], SHIP),
-        (&["every_owned_fleet", "random_owned_fleet", "any_owned_fleet"],
-            &[COUNTRY], FLEET),
-        (&["every_owned_leader", "random_owned_leader", "any_owned_leader"],
-            &[COUNTRY], LEADER),
-        (&["every_owned_species", "random_owned_species", "any_owned_species"],
-            &[COUNTRY], SPECIES),
-        (&["every_owned_pop", "random_owned_pop", "any_owned_pop"],
-            &[COUNTRY, PLANET, SECTOR], POP),
-        (&["every_owned_starbase", "random_owned_starbase", "any_owned_starbase"],
-            &[COUNTRY], STARBASE),
-        (&["every_neighbor_country", "random_neighbor_country", "any_neighbor_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_sector", "random_sector", "any_sector"],
-            &[COUNTRY], SECTOR),
+        (
+            &[
+                "every_owned_planet",
+                "random_owned_planet",
+                "any_owned_planet",
+            ],
+            &[COUNTRY],
+            PLANET,
+        ),
+        (
+            &[
+                "every_controlled_planet",
+                "random_controlled_planet",
+                "any_controlled_planet",
+            ],
+            &[COUNTRY],
+            PLANET,
+        ),
+        (
+            &["every_subject", "random_subject", "any_subject"],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_playable_country",
+                "random_playable_country",
+                "any_playable_country",
+            ],
+            &[],
+            COUNTRY,
+        ),
+        (
+            &["every_owned_ship", "random_owned_ship", "any_owned_ship"],
+            &[COUNTRY, FLEET],
+            SHIP,
+        ),
+        (
+            &["every_owned_fleet", "random_owned_fleet", "any_owned_fleet"],
+            &[COUNTRY],
+            FLEET,
+        ),
+        (
+            &[
+                "every_owned_leader",
+                "random_owned_leader",
+                "any_owned_leader",
+            ],
+            &[COUNTRY],
+            LEADER,
+        ),
+        (
+            &[
+                "every_owned_species",
+                "random_owned_species",
+                "any_owned_species",
+            ],
+            &[COUNTRY],
+            SPECIES,
+        ),
+        (
+            &["every_owned_pop", "random_owned_pop", "any_owned_pop"],
+            &[COUNTRY, PLANET, SECTOR],
+            POP,
+        ),
+        (
+            &[
+                "every_owned_starbase",
+                "random_owned_starbase",
+                "any_owned_starbase",
+            ],
+            &[COUNTRY],
+            STARBASE,
+        ),
+        (
+            &[
+                "every_neighbor_country",
+                "random_neighbor_country",
+                "any_neighbor_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &["every_sector", "random_sector", "any_sector"],
+            &[COUNTRY],
+            SECTOR,
+        ),
         // ── System-scoped iterators ──────────────────────────────────────
-        (&["every_system_planet", "random_system_planet", "any_system_planet"],
-            &[SYSTEM], PLANET),
-        (&["every_system_fleet", "random_system_fleet", "any_system_fleet"],
-            &[SYSTEM], FLEET),
-        (&["every_fleet_in_system", "random_fleet_in_system", "any_fleet_in_system"],
-            &[SYSTEM], FLEET),
-        (&["every_system_ambient_object", "random_system_ambient_object"],
-            &[SYSTEM], AMBIENT_OBJECT),
-        (&["every_system_deposit", "random_system_deposit", "any_system_deposit"],
-            &[SYSTEM], DEPOSIT),
-        (&["every_system_archaeological_site"],
-            &[SYSTEM], ARCHAEOLOGICAL_SITE),
+        (
+            &[
+                "every_system_planet",
+                "random_system_planet",
+                "any_system_planet",
+            ],
+            &[SYSTEM],
+            PLANET,
+        ),
+        (
+            &[
+                "every_system_fleet",
+                "random_system_fleet",
+                "any_system_fleet",
+            ],
+            &[SYSTEM],
+            FLEET,
+        ),
+        (
+            &[
+                "every_fleet_in_system",
+                "random_fleet_in_system",
+                "any_fleet_in_system",
+            ],
+            &[SYSTEM],
+            FLEET,
+        ),
+        (
+            &[
+                "every_system_ambient_object",
+                "random_system_ambient_object",
+            ],
+            &[SYSTEM],
+            AMBIENT_OBJECT,
+        ),
+        (
+            &[
+                "every_system_deposit",
+                "random_system_deposit",
+                "any_system_deposit",
+            ],
+            &[SYSTEM],
+            DEPOSIT,
+        ),
+        (
+            &["every_system_archaeological_site"],
+            &[SYSTEM],
+            ARCHAEOLOGICAL_SITE,
+        ),
         // ── Planet-scoped iterators ──────────────────────────────────────
-        (&["every_planet_pop", "random_planet_pop", "any_planet_pop"],
-            &[PLANET], POP),
-        (&["every_planet_army", "random_planet_army", "any_planet_army"],
-            &[PLANET], ARMY),
-        (&["every_planet_deposit", "random_planet_deposit", "any_planet_deposit"],
-            &[PLANET], DEPOSIT),
+        (
+            &["every_planet_pop", "random_planet_pop", "any_planet_pop"],
+            &[PLANET],
+            POP,
+        ),
+        (
+            &["every_planet_army", "random_planet_army", "any_planet_army"],
+            &[PLANET],
+            ARMY,
+        ),
+        (
+            &[
+                "every_planet_deposit",
+                "random_planet_deposit",
+                "any_planet_deposit",
+            ],
+            &[PLANET],
+            DEPOSIT,
+        ),
         // ── Sector-scoped iterators ──────────────────────────────────────
-        (&["every_sector_system", "random_sector_system", "any_sector_system"],
-            &[SECTOR], SYSTEM),
-        (&["every_sector_planet", "random_sector_planet", "any_sector_planet"],
-            &[SECTOR], PLANET),
+        (
+            &[
+                "every_sector_system",
+                "random_sector_system",
+                "any_sector_system",
+            ],
+            &[SECTOR],
+            SYSTEM,
+        ),
+        (
+            &[
+                "every_sector_planet",
+                "random_sector_planet",
+                "any_sector_planet",
+            ],
+            &[SECTOR],
+            PLANET,
+        ),
         // ── Country named links ──────────────────────────────────────────
-        (&["overlord"],                                     &[COUNTRY], COUNTRY),
-        (&["federation_leader"],                            &[COUNTRY, FEDERATION], COUNTRY),
-        (&["capital"],                                      &[COUNTRY], PLANET),
-        (&["capital_scope"],                                &[COUNTRY], PLANET),
-        (&["capital_star"],                                 &[COUNTRY], SYSTEM),
-        (&["starbase"],                                     &[SYSTEM], STARBASE),
+        (&["overlord"], &[COUNTRY], COUNTRY),
+        (&["federation_leader"], &[COUNTRY, FEDERATION], COUNTRY),
+        (&["capital"], &[COUNTRY], PLANET),
+        (&["capital_scope"], &[COUNTRY], PLANET),
+        (&["capital_star"], &[COUNTRY], SYSTEM),
+        (&["starbase"], &[SYSTEM], STARBASE),
         // ── Planet/system links ──────────────────────────────────────────
-        (&["star"],                                         &[PLANET], STAR),
-        (&["solar_system"],
-            &[PLANET, SHIP, FLEET, STARBASE, ARMY, POP], SYSTEM),
-        (&["sector"],                                       &[PLANET, SYSTEM], SECTOR),
-        (&["owner"],
-            &[PLANET, SHIP, FLEET, ARMY, POP, POP_FACTION, STARBASE,
-              MEGASTRUCTURE, DEPOSIT, LEADER],              COUNTRY),
-        (&["controller"],                                   &[PLANET], COUNTRY),
+        (&["star"], &[PLANET], STAR),
+        (
+            &["solar_system"],
+            &[PLANET, SHIP, FLEET, STARBASE, ARMY, POP],
+            SYSTEM,
+        ),
+        (&["sector"], &[PLANET, SYSTEM], SECTOR),
+        (
+            &["owner"],
+            &[
+                PLANET,
+                SHIP,
+                FLEET,
+                ARMY,
+                POP,
+                POP_FACTION,
+                STARBASE,
+                MEGASTRUCTURE,
+                DEPOSIT,
+                LEADER,
+            ],
+            COUNTRY,
+        ),
+        (&["controller"], &[PLANET], COUNTRY),
         // ── Ship/fleet links ─────────────────────────────────────────────
-        (&["fleet"],                                        &[SHIP], FLEET),
-        (&["leader"],                                       &[SHIP, FLEET, COUNTRY, ARMY], LEADER),
-        (&["design"],                                       &[SHIP], DESIGN),
+        (&["fleet"], &[SHIP], FLEET),
+        (&["leader"], &[SHIP, FLEET, COUNTRY, ARMY], LEADER),
+        (&["design"], &[SHIP], DESIGN),
         // ── Species links ────────────────────────────────────────────────
-        (&["species"],                                      &[POP, LEADER], SPECIES),
+        (&["species"], &[POP, LEADER], SPECIES),
         // ── Pop-faction link ─────────────────────────────────────────────
-        (&["pop_faction"],                                  &[POP], POP_FACTION),
+        (&["pop_faction"], &[POP], POP_FACTION),
     ];
 
     for (aliases, valid, target) in entries {
@@ -735,52 +1027,139 @@ fn load_eu4_links(links: &mut HashMap<String, ScopeLink>) {
 
     let entries: &[(&[&str], &[u32], u32)] = &[
         // ── Global iterators ─────────────────────────────────────────────
-        (&["every_country", "random_country", "any_country", "country"],
-            &[], COUNTRY),
-        (&["every_province", "random_province", "any_province", "province"],
-            &[], PROVINCE),
-        (&["every_subject_country", "random_subject_country", "any_subject_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_neighbor_country", "random_neighbor_country", "any_neighbor_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_ally", "random_ally", "any_ally"],
-            &[COUNTRY], COUNTRY),
-        (&["every_enemy_country", "random_enemy_country", "any_enemy_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_core_province", "random_core_province", "any_core_province"],
-            &[COUNTRY], PROVINCE),
-        (&["every_owned_province", "random_owned_province", "any_owned_province"],
-            &[COUNTRY], PROVINCE),
-        (&["every_controlled_province", "random_controlled_province", "any_controlled_province"],
-            &[COUNTRY], PROVINCE),
-        (&["every_province_in_state", "random_province_in_state", "any_province_in_state"],
-            &[PROVINCE], PROVINCE),
-        (&["every_neighbor_province", "random_neighbor_province", "any_neighbor_province"],
-            &[PROVINCE], PROVINCE),
+        (
+            &["every_country", "random_country", "any_country", "country"],
+            &[],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_province",
+                "random_province",
+                "any_province",
+                "province",
+            ],
+            &[],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_subject_country",
+                "random_subject_country",
+                "any_subject_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_neighbor_country",
+                "random_neighbor_country",
+                "any_neighbor_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &["every_ally", "random_ally", "any_ally"],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_enemy_country",
+                "random_enemy_country",
+                "any_enemy_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_core_province",
+                "random_core_province",
+                "any_core_province",
+            ],
+            &[COUNTRY],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_owned_province",
+                "random_owned_province",
+                "any_owned_province",
+            ],
+            &[COUNTRY],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_controlled_province",
+                "random_controlled_province",
+                "any_controlled_province",
+            ],
+            &[COUNTRY],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_province_in_state",
+                "random_province_in_state",
+                "any_province_in_state",
+            ],
+            &[PROVINCE],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_neighbor_province",
+                "random_neighbor_province",
+                "any_neighbor_province",
+            ],
+            &[PROVINCE],
+            PROVINCE,
+        ),
         // ── Country named links ──────────────────────────────────────────
         // From EU4Scopes.fs scopedEffects: "owner" Province→Country
-        (&["owner"],                                &[PROVINCE, TRADE_NODE], COUNTRY),
-        (&["controller"],                           &[PROVINCE], COUNTRY),
-        (&["capital", "capital_scope"],             &[COUNTRY], PROVINCE),
-        (&["overlord"],                             &[COUNTRY], COUNTRY),
-        (&["emperor"],                              &[], COUNTRY),
-        (&["trade_node", "tradenode"],              &[], TRADE_NODE),
-        (&["monarch"],                              &[COUNTRY], MONARCH),
-        (&["heir"],                                 &[COUNTRY], HEIR),
-        (&["consort"],                              &[COUNTRY], CONSORT),
-        (&["unit"],                                 &[], UNIT),
+        (&["owner"], &[PROVINCE, TRADE_NODE], COUNTRY),
+        (&["controller"], &[PROVINCE], COUNTRY),
+        (&["capital", "capital_scope"], &[COUNTRY], PROVINCE),
+        (&["overlord"], &[COUNTRY], COUNTRY),
+        (&["emperor"], &[], COUNTRY),
+        (&["trade_node", "tradenode"], &[], TRADE_NODE),
+        (&["monarch"], &[COUNTRY], MONARCH),
+        (&["heir"], &[COUNTRY], HEIR),
+        (&["consort"], &[COUNTRY], CONSORT),
+        (&["unit"], &[], UNIT),
         // ── Rebel faction iterators ──────────────────────────────────────
-        (&["every_rebel_faction", "random_rebel_faction", "any_rebel_faction"],
-            &[COUNTRY, PROVINCE], REBEL_FACTION),
+        (
+            &[
+                "every_rebel_faction",
+                "random_rebel_faction",
+                "any_rebel_faction",
+            ],
+            &[COUNTRY, PROVINCE],
+            REBEL_FACTION,
+        ),
         // ── Advisor iterators ────────────────────────────────────────────
-        (&["every_advisor", "random_advisor", "any_advisor"],
-            &[COUNTRY], ADVISOR),
+        (
+            &["every_advisor", "random_advisor", "any_advisor"],
+            &[COUNTRY],
+            ADVISOR,
+        ),
         // ── Religion / Culture iterators ─────────────────────────────────
-        (&["every_known_country", "random_known_country", "any_known_country"],
-            &[COUNTRY], COUNTRY),
+        (
+            &[
+                "every_known_country",
+                "random_known_country",
+                "any_known_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
         // ── Province stubs ───────────────────────────────────────────────
-        (&["religion"],                             &[PROVINCE, COUNTRY], RELIGION),
-        (&["culture"],                              &[PROVINCE, COUNTRY], CULTURE),
+        (&["religion"], &[PROVINCE, COUNTRY], RELIGION),
+        (&["culture"], &[PROVINCE, COUNTRY], CULTURE),
     ];
 
     for (aliases, valid, target) in entries {
@@ -812,85 +1191,183 @@ fn load_ck2_links(links: &mut HashMap<String, ScopeLink>) {
 
     let entries: &[(&[&str], &[u32], u32)] = &[
         // ── Global iterators ─────────────────────────────────────────────
-        (&["every_character", "random_character", "any_character", "character"],
-            &[], CHARACTER),
-        (&["every_province", "random_province", "any_province", "province"],
-            &[], PROVINCE),
-        (&["every_playable_ruler", "random_playable_ruler", "any_playable_ruler"],
-            &[], CHARACTER),
+        (
+            &[
+                "every_character",
+                "random_character",
+                "any_character",
+                "character",
+            ],
+            &[],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_province",
+                "random_province",
+                "any_province",
+                "province",
+            ],
+            &[],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_playable_ruler",
+                "random_playable_ruler",
+                "any_playable_ruler",
+            ],
+            &[],
+            CHARACTER,
+        ),
         // ── Character iterators ──────────────────────────────────────────
-        (&["every_vassal", "random_vassal", "any_vassal"],
-            &[CHARACTER], CHARACTER),
-        (&["every_ward", "random_ward", "any_ward"],
-            &[CHARACTER], CHARACTER),
-        (&["every_child", "random_child", "any_child"],
-            &[CHARACTER], CHARACTER),
-        (&["every_sibling", "random_sibling", "any_sibling"],
-            &[CHARACTER], CHARACTER),
-        (&["every_spouse", "random_spouse", "any_spouse"],
-            &[CHARACTER], CHARACTER),
-        (&["every_courtier", "random_courtier", "any_courtier"],
-            &[CHARACTER], CHARACTER),
-        (&["every_realm_character", "random_realm_character", "any_realm_character"],
-            &[CHARACTER], CHARACTER),
-        (&["every_realm_province", "random_realm_province", "any_realm_province"],
-            &[CHARACTER], PROVINCE),
-        (&["every_demesne_province", "random_demesne_province", "any_demesne_province"],
-            &[CHARACTER], PROVINCE),
-        (&["every_demesne_title", "random_demesne_title", "any_demesne_title"],
-            &[CHARACTER], TITLE),
-        (&["every_realm_title", "random_realm_title", "any_realm_title"],
-            &[CHARACTER], TITLE),
-        (&["every_claim", "random_claim", "any_claim"],
-            &[CHARACTER], TITLE),
-        (&["every_heir_title", "random_heir_title"],
-            &[CHARACTER], TITLE),
-        (&["every_artifact", "random_artifact", "any_artifact"],
-            &[CHARACTER], ARTIFACT),
+        (
+            &["every_vassal", "random_vassal", "any_vassal"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_ward", "random_ward", "any_ward"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_child", "random_child", "any_child"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_sibling", "random_sibling", "any_sibling"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_spouse", "random_spouse", "any_spouse"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_courtier", "random_courtier", "any_courtier"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_realm_character",
+                "random_realm_character",
+                "any_realm_character",
+            ],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_realm_province",
+                "random_realm_province",
+                "any_realm_province",
+            ],
+            &[CHARACTER],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_demesne_province",
+                "random_demesne_province",
+                "any_demesne_province",
+            ],
+            &[CHARACTER],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_demesne_title",
+                "random_demesne_title",
+                "any_demesne_title",
+            ],
+            &[CHARACTER],
+            TITLE,
+        ),
+        (
+            &["every_realm_title", "random_realm_title", "any_realm_title"],
+            &[CHARACTER],
+            TITLE,
+        ),
+        (
+            &["every_claim", "random_claim", "any_claim"],
+            &[CHARACTER],
+            TITLE,
+        ),
+        (
+            &["every_heir_title", "random_heir_title"],
+            &[CHARACTER],
+            TITLE,
+        ),
+        (
+            &["every_artifact", "random_artifact", "any_artifact"],
+            &[CHARACTER],
+            ARTIFACT,
+        ),
         // ── Province iterators ───────────────────────────────────────────
-        (&["every_neighbor_province", "random_neighbor_province", "any_neighbor_province"],
-            &[PROVINCE], PROVINCE),
-        (&["every_de_jure_vassal", "random_de_jure_vassal"],
-            &[TITLE], CHARACTER),
+        (
+            &[
+                "every_neighbor_province",
+                "random_neighbor_province",
+                "any_neighbor_province",
+            ],
+            &[PROVINCE],
+            PROVINCE,
+        ),
+        (
+            &["every_de_jure_vassal", "random_de_jure_vassal"],
+            &[TITLE],
+            CHARACTER,
+        ),
         // ── Character named links (from CK2Scopes.fs scopedEffects) ──────
-        (&["primary_title"],                &[CHARACTER], TITLE),
-        (&["mother"],                       &[CHARACTER], CHARACTER),
-        (&["mother_even_if_dead"],          &[CHARACTER], CHARACTER),
-        (&["father"],                       &[CHARACTER], CHARACTER),
-        (&["father_even_if_dead"],          &[CHARACTER], CHARACTER),
-        (&["killer"],                       &[CHARACTER], CHARACTER),
-        (&["liege"],                        &[CHARACTER], CHARACTER),
-        (&["liege_before_war"],             &[CHARACTER], CHARACTER),
-        (&["top_liege"],                    &[CHARACTER], CHARACTER),
-        (&["employer"],                     &[CHARACTER], CHARACTER),
-        (&["host"],                         &[CHARACTER], CHARACTER),
-        (&["spouse"],                       &[CHARACTER], CHARACTER),
-        (&["guardian"],                     &[CHARACTER], CHARACTER),
-        (&["betrothed"],                    &[CHARACTER], CHARACTER),
-        (&["regent"],                       &[CHARACTER], CHARACTER),
+        (&["primary_title"], &[CHARACTER], TITLE),
+        (&["mother"], &[CHARACTER], CHARACTER),
+        (&["mother_even_if_dead"], &[CHARACTER], CHARACTER),
+        (&["father"], &[CHARACTER], CHARACTER),
+        (&["father_even_if_dead"], &[CHARACTER], CHARACTER),
+        (&["killer"], &[CHARACTER], CHARACTER),
+        (&["liege"], &[CHARACTER], CHARACTER),
+        (&["liege_before_war"], &[CHARACTER], CHARACTER),
+        (&["top_liege"], &[CHARACTER], CHARACTER),
+        (&["employer"], &[CHARACTER], CHARACTER),
+        (&["host"], &[CHARACTER], CHARACTER),
+        (&["spouse"], &[CHARACTER], CHARACTER),
+        (&["guardian"], &[CHARACTER], CHARACTER),
+        (&["betrothed"], &[CHARACTER], CHARACTER),
+        (&["regent"], &[CHARACTER], CHARACTER),
         // ── Province links ───────────────────────────────────────────────
         // From CK2Scopes.fs: capital_scope Character/Title → Province
-        (&["capital_scope"],                &[CHARACTER, TITLE], PROVINCE),
+        (&["capital_scope"], &[CHARACTER, TITLE], PROVINCE),
         // Province → Character (owner)
-        (&["owner"],                        &[PROVINCE], CHARACTER),
-        (&["location"],                     &[CHARACTER, UNIT], PROVINCE),
-        (&["realm_capital"],                &[CHARACTER], PROVINCE),
+        (&["owner"], &[PROVINCE], CHARACTER),
+        (&["location"], &[CHARACTER, UNIT], PROVINCE),
+        (&["realm_capital"], &[CHARACTER], PROVINCE),
         // ── Title links ──────────────────────────────────────────────────
-        (&["holder_scope"],                 &[TITLE], CHARACTER),
-        (&["de_jure_liege_title"],          &[TITLE], TITLE),
-        (&["de_facto_liege"],               &[TITLE], TITLE),
-        (&["independent_ruler"],            &[TITLE], CHARACTER),
+        (&["holder_scope"], &[TITLE], CHARACTER),
+        (&["de_jure_liege_title"], &[TITLE], TITLE),
+        (&["de_facto_liege"], &[TITLE], TITLE),
+        (&["independent_ruler"], &[TITLE], CHARACTER),
         // ── War links ────────────────────────────────────────────────────
-        (&["war"],                          &[CHARACTER], WAR),
-        (&["attacker"],                     &[WAR], CHARACTER),
-        (&["defender"],                     &[WAR], CHARACTER),
+        (&["war"], &[CHARACTER], WAR),
+        (&["attacker"], &[WAR], CHARACTER),
+        (&["defender"], &[WAR], CHARACTER),
         // ── Religion / culture links ─────────────────────────────────────
-        (&["religion"],                     &[CHARACTER, PROVINCE], RELIGION),
-        (&["culture"],                      &[CHARACTER, PROVINCE], CULTURE),
+        (&["religion"], &[CHARACTER, PROVINCE], RELIGION),
+        (&["culture"], &[CHARACTER, PROVINCE], CULTURE),
         // ── Offmap / society stubs ───────────────────────────────────────
-        (&["offmap_ruler"],                 &[OFFMAP], CHARACTER),
-        (&["any_society_member", "every_society_member", "random_society_member"],
-            &[SOCIETY], CHARACTER),
+        (&["offmap_ruler"], &[OFFMAP], CHARACTER),
+        (
+            &[
+                "any_society_member",
+                "every_society_member",
+                "random_society_member",
+            ],
+            &[SOCIETY],
+            CHARACTER,
+        ),
     ];
 
     for (aliases, valid, target) in entries {
@@ -923,74 +1400,170 @@ fn load_ck3_links(links: &mut HashMap<String, ScopeLink>) {
 
     let entries: &[(&[&str], &[u32], u32)] = &[
         // ── Global iterators ─────────────────────────────────────────────
-        (&["every_character", "random_character", "any_character", "character"],
-            &[], CHARACTER),
-        (&["every_province", "random_province", "any_province", "province"],
-            &[], PROVINCE),
-        (&["every_ruler", "random_ruler", "any_ruler"],
-            &[], CHARACTER),
+        (
+            &[
+                "every_character",
+                "random_character",
+                "any_character",
+                "character",
+            ],
+            &[],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_province",
+                "random_province",
+                "any_province",
+                "province",
+            ],
+            &[],
+            PROVINCE,
+        ),
+        (
+            &["every_ruler", "random_ruler", "any_ruler"],
+            &[],
+            CHARACTER,
+        ),
         // ── Character iterators ──────────────────────────────────────────
-        (&["every_vassal", "random_vassal", "any_vassal"],
-            &[CHARACTER], CHARACTER),
-        (&["every_direct_vassal_character", "random_direct_vassal_character"],
-            &[CHARACTER], CHARACTER),
-        (&["every_child", "random_child", "any_child"],
-            &[CHARACTER], CHARACTER),
-        (&["every_sibling", "random_sibling", "any_sibling"],
-            &[CHARACTER], CHARACTER),
-        (&["every_spouse", "random_spouse", "any_spouse"],
-            &[CHARACTER], CHARACTER),
-        (&["every_courtier", "random_courtier", "any_courtier"],
-            &[CHARACTER], CHARACTER),
-        (&["every_close_family_member", "random_close_family_member", "any_close_family_member"],
-            &[CHARACTER], CHARACTER),
-        (&["every_extended_family_member", "random_extended_family_member"],
-            &[CHARACTER], CHARACTER),
-        (&["every_realm_province", "random_realm_province", "any_realm_province"],
-            &[CHARACTER], PROVINCE),
-        (&["every_held_title", "random_held_title", "any_held_title"],
-            &[CHARACTER], PROVINCE),
-        (&["every_claim", "random_claim", "any_claim"],
-            &[CHARACTER], PROVINCE),
+        (
+            &["every_vassal", "random_vassal", "any_vassal"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_direct_vassal_character",
+                "random_direct_vassal_character",
+            ],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_child", "random_child", "any_child"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_sibling", "random_sibling", "any_sibling"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_spouse", "random_spouse", "any_spouse"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_courtier", "random_courtier", "any_courtier"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_close_family_member",
+                "random_close_family_member",
+                "any_close_family_member",
+            ],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_extended_family_member",
+                "random_extended_family_member",
+            ],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_realm_province",
+                "random_realm_province",
+                "any_realm_province",
+            ],
+            &[CHARACTER],
+            PROVINCE,
+        ),
+        (
+            &["every_held_title", "random_held_title", "any_held_title"],
+            &[CHARACTER],
+            PROVINCE,
+        ),
+        (
+            &["every_claim", "random_claim", "any_claim"],
+            &[CHARACTER],
+            PROVINCE,
+        ),
         // ── Province iterators ───────────────────────────────────────────
-        (&["every_neighbor_province", "random_neighbor_province", "any_neighbor_province"],
-            &[PROVINCE], PROVINCE),
-        (&["every_county_province", "random_county_province"],
-            &[PROVINCE], PROVINCE),
+        (
+            &[
+                "every_neighbor_province",
+                "random_neighbor_province",
+                "any_neighbor_province",
+            ],
+            &[PROVINCE],
+            PROVINCE,
+        ),
+        (
+            &["every_county_province", "random_county_province"],
+            &[PROVINCE],
+            PROVINCE,
+        ),
         // ── Character named links (CK3 equivalents of CK2 scopedEffects) ─
-        (&["liege"],                            &[CHARACTER], CHARACTER),
-        (&["top_liege"],                        &[CHARACTER], CHARACTER),
-        (&["father"],                           &[CHARACTER], CHARACTER),
-        (&["mother"],                           &[CHARACTER], CHARACTER),
-        (&["spouse"],                           &[CHARACTER], CHARACTER),
-        (&["betrothed"],                        &[CHARACTER], CHARACTER),
-        (&["guardian"],                         &[CHARACTER], CHARACTER),
-        (&["employer"],                         &[CHARACTER], CHARACTER),
-        (&["host"],                             &[CHARACTER], CHARACTER),
+        (&["liege"], &[CHARACTER], CHARACTER),
+        (&["top_liege"], &[CHARACTER], CHARACTER),
+        (&["father"], &[CHARACTER], CHARACTER),
+        (&["mother"], &[CHARACTER], CHARACTER),
+        (&["spouse"], &[CHARACTER], CHARACTER),
+        (&["betrothed"], &[CHARACTER], CHARACTER),
+        (&["guardian"], &[CHARACTER], CHARACTER),
+        (&["employer"], &[CHARACTER], CHARACTER),
+        (&["host"], &[CHARACTER], CHARACTER),
         // ── Province/character links ─────────────────────────────────────
-        (&["capital_province"],                 &[CHARACTER], PROVINCE),
-        (&["holder"],                           &[PROVINCE], CHARACTER),
-        (&["owner", "controller"],              &[PROVINCE], CHARACTER),
-        (&["location"],                         &[CHARACTER], PROVINCE),
+        (&["capital_province"], &[CHARACTER], PROVINCE),
+        (&["holder"], &[PROVINCE], CHARACTER),
+        (&["owner", "controller"], &[PROVINCE], CHARACTER),
+        (&["location"], &[CHARACTER], PROVINCE),
         // ── Family ───────────────────────────────────────────────────────
-        (&["family"],                           &[CHARACTER], FAMILY),
-        (&["every_family_member", "random_family_member", "any_family_member"],
-            &[FAMILY], CHARACTER),
+        (&["family"], &[CHARACTER], FAMILY),
+        (
+            &[
+                "every_family_member",
+                "random_family_member",
+                "any_family_member",
+            ],
+            &[FAMILY],
+            CHARACTER,
+        ),
         // ── Governorship/state ───────────────────────────────────────────
-        (&["governor"],                         &[GOVERNORSHIP, STATE], CHARACTER),
-        (&["every_governorship", "random_governorship", "any_governorship"],
-            &[CHARACTER], GOVERNORSHIP),
+        (&["governor"], &[GOVERNORSHIP, STATE], CHARACTER),
+        (
+            &[
+                "every_governorship",
+                "random_governorship",
+                "any_governorship",
+            ],
+            &[CHARACTER],
+            GOVERNORSHIP,
+        ),
         // ── Religion/culture stubs ────────────────────────────────────────
-        (&["religion"],                         &[CHARACTER, PROVINCE], RELIGION),
-        (&["culture"],                          &[CHARACTER, PROVINCE], CULTURE),
-        (&["culture_group"],                    &[CULTURE], CULTURE_GROUP),
+        (&["religion"], &[CHARACTER, PROVINCE], RELIGION),
+        (&["culture"], &[CHARACTER, PROVINCE], CULTURE),
+        (&["culture_group"], &[CULTURE], CULTURE_GROUP),
         // ── Combat ───────────────────────────────────────────────────────
-        (&["every_combat_side", "random_combat_side", "any_combat_side"],
-            &[COMBAT], CHARACTER),
-        (&["commander"],                        &[UNIT], CHARACTER),
+        (
+            &["every_combat_side", "random_combat_side", "any_combat_side"],
+            &[COMBAT],
+            CHARACTER,
+        ),
+        (&["commander"], &[UNIT], CHARACTER),
         // ── Pop iterators ─────────────────────────────────────────────────
-        (&["every_pop", "random_pop", "any_pop"],
-            &[PROVINCE, STATE], POP),
+        (
+            &["every_pop", "random_pop", "any_pop"],
+            &[PROVINCE, STATE],
+            POP,
+        ),
     ];
 
     for (aliases, valid, target) in entries {
@@ -1017,45 +1590,94 @@ fn load_vic2_links(links: &mut HashMap<String, ScopeLink>) {
 
     let entries: &[(&[&str], &[u32], u32)] = &[
         // ── Global iterators ─────────────────────────────────────────────
-        (&["every_country", "random_country", "any_country", "country"],
-            &[], COUNTRY),
-        (&["every_province", "random_province", "any_province", "province"],
-            &[], PROVINCE),
+        (
+            &["every_country", "random_country", "any_country", "country"],
+            &[],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_province",
+                "random_province",
+                "any_province",
+                "province",
+            ],
+            &[],
+            PROVINCE,
+        ),
         // ── Country-scoped iterators ─────────────────────────────────────
-        (&["every_owned_province", "random_owned_province", "any_owned_province"],
-            &[COUNTRY], PROVINCE),
-        (&["every_core_province", "random_core_province", "any_core_province"],
-            &[COUNTRY], PROVINCE),
-        (&["every_controlled_province", "random_controlled_province"],
-            &[COUNTRY], PROVINCE),
-        (&["every_state", "random_state", "any_state"],
-            &[COUNTRY], STATE),
-        (&["every_neighbor_country", "random_neighbor_country", "any_neighbor_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_sphere_member", "random_sphere_member"],
-            &[COUNTRY], COUNTRY),
-        (&["every_vassal", "random_vassal", "any_vassal"],
-            &[COUNTRY], COUNTRY),
-        (&["every_pop", "random_pop", "any_pop"],
-            &[COUNTRY, PROVINCE], POP),
-        (&["every_party", "random_party"],
-            &[COUNTRY], PARTY),
+        (
+            &[
+                "every_owned_province",
+                "random_owned_province",
+                "any_owned_province",
+            ],
+            &[COUNTRY],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_core_province",
+                "random_core_province",
+                "any_core_province",
+            ],
+            &[COUNTRY],
+            PROVINCE,
+        ),
+        (
+            &["every_controlled_province", "random_controlled_province"],
+            &[COUNTRY],
+            PROVINCE,
+        ),
+        (
+            &["every_state", "random_state", "any_state"],
+            &[COUNTRY],
+            STATE,
+        ),
+        (
+            &[
+                "every_neighbor_country",
+                "random_neighbor_country",
+                "any_neighbor_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &["every_sphere_member", "random_sphere_member"],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &["every_vassal", "random_vassal", "any_vassal"],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &["every_pop", "random_pop", "any_pop"],
+            &[COUNTRY, PROVINCE],
+            POP,
+        ),
+        (&["every_party", "random_party"], &[COUNTRY], PARTY),
         // ── Province-scoped iterators ────────────────────────────────────
-        (&["every_neighbor_province", "random_neighbor_province"],
-            &[PROVINCE], PROVINCE),
+        (
+            &["every_neighbor_province", "random_neighbor_province"],
+            &[PROVINCE],
+            PROVINCE,
+        ),
         // ── Named links ──────────────────────────────────────────────────
-        (&["owner"],                                &[PROVINCE], COUNTRY),
-        (&["controller"],                           &[PROVINCE], COUNTRY),
-        (&["capital"],                              &[COUNTRY], PROVINCE),
-        (&["overlord"],                             &[COUNTRY], COUNTRY),
-        (&["sphere_owner"],                         &[COUNTRY], COUNTRY),
-        (&["union"],                                &[COUNTRY], COUNTRY),
-        (&["ruling_party"],                         &[COUNTRY], PARTY),
-        (&["primary_culture"],                      &[COUNTRY], CULTURE),
-        (&["national_focus"],                       &[COUNTRY], PROVINCE),
-        (&["religion"],                             &[COUNTRY, PROVINCE, POP], RELIGION),
-        (&["culture"],                              &[COUNTRY, PROVINCE, POP], CULTURE),
-        (&["location"],                             &[CHARACTER, UNIT], PROVINCE),
+        (&["owner"], &[PROVINCE], COUNTRY),
+        (&["controller"], &[PROVINCE], COUNTRY),
+        (&["capital"], &[COUNTRY], PROVINCE),
+        (&["overlord"], &[COUNTRY], COUNTRY),
+        (&["sphere_owner"], &[COUNTRY], COUNTRY),
+        (&["union"], &[COUNTRY], COUNTRY),
+        (&["ruling_party"], &[COUNTRY], PARTY),
+        (&["primary_culture"], &[COUNTRY], CULTURE),
+        (&["national_focus"], &[COUNTRY], PROVINCE),
+        (&["religion"], &[COUNTRY, PROVINCE, POP], RELIGION),
+        (&["culture"], &[COUNTRY, PROVINCE, POP], CULTURE),
+        (&["location"], &[CHARACTER, UNIT], PROVINCE),
     ];
 
     for (aliases, valid, target) in entries {
@@ -1086,77 +1708,177 @@ fn load_ir_links(links: &mut HashMap<String, ScopeLink>) {
 
     let entries: &[(&[&str], &[u32], u32)] = &[
         // ── Global iterators ─────────────────────────────────────────────
-        (&["every_country", "random_country", "any_country", "country"],
-            &[], COUNTRY),
-        (&["every_province", "random_province", "any_province", "province"],
-            &[], PROVINCE),
-        (&["every_character", "random_character", "any_character", "character"],
-            &[], CHARACTER),
-        (&["every_ownable_province", "random_ownable_province", "any_ownable_province"],
-            &[], PROVINCE),
+        (
+            &["every_country", "random_country", "any_country", "country"],
+            &[],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_province",
+                "random_province",
+                "any_province",
+                "province",
+            ],
+            &[],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_character",
+                "random_character",
+                "any_character",
+                "character",
+            ],
+            &[],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_ownable_province",
+                "random_ownable_province",
+                "any_ownable_province",
+            ],
+            &[],
+            PROVINCE,
+        ),
         // ── Country-scoped iterators (from IR effects.log / CWT rules) ───
-        (&["every_owned_province", "random_owned_province", "any_owned_province"],
-            &[COUNTRY], PROVINCE),
-        (&["every_allied_country", "random_allied_country", "any_allied_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_subject", "random_subject", "any_subject"],
-            &[COUNTRY], COUNTRY),
-        (&["every_neighbor_country", "random_neighbour_country",
-           "any_neighbor_country", "random_neighbor_country"],
-            &[COUNTRY], COUNTRY),
-        (&["every_army", "random_army", "any_army"],
-            &[COUNTRY], UNIT),
-        (&["every_navy", "random_navy", "any_navy"],
-            &[COUNTRY], UNIT),
-        (&["every_country_state", "random_country_state", "any_country_state"],
-            &[COUNTRY], STATE),
-        (&["every_governor_state", "random_governor_state"],
-            &[CHARACTER], STATE),
-        (&["every_successor", "random_successor"],
-            &[COUNTRY], CHARACTER),
+        (
+            &[
+                "every_owned_province",
+                "random_owned_province",
+                "any_owned_province",
+            ],
+            &[COUNTRY],
+            PROVINCE,
+        ),
+        (
+            &[
+                "every_allied_country",
+                "random_allied_country",
+                "any_allied_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &["every_subject", "random_subject", "any_subject"],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (
+            &[
+                "every_neighbor_country",
+                "random_neighbour_country",
+                "any_neighbor_country",
+                "random_neighbor_country",
+            ],
+            &[COUNTRY],
+            COUNTRY,
+        ),
+        (&["every_army", "random_army", "any_army"], &[COUNTRY], UNIT),
+        (&["every_navy", "random_navy", "any_navy"], &[COUNTRY], UNIT),
+        (
+            &[
+                "every_country_state",
+                "random_country_state",
+                "any_country_state",
+            ],
+            &[COUNTRY],
+            STATE,
+        ),
+        (
+            &["every_governor_state", "random_governor_state"],
+            &[CHARACTER],
+            STATE,
+        ),
+        (
+            &["every_successor", "random_successor"],
+            &[COUNTRY],
+            CHARACTER,
+        ),
         // ── Province-scoped iterators ────────────────────────────────────
-        (&["every_neighbor_province", "random_neighbor_province", "any_neighbor_province"],
-            &[PROVINCE], PROVINCE),
+        (
+            &[
+                "every_neighbor_province",
+                "random_neighbor_province",
+                "any_neighbor_province",
+            ],
+            &[PROVINCE],
+            PROVINCE,
+        ),
         // ── Character-scoped iterators ───────────────────────────────────
-        (&["every_child", "random_child", "any_child"],
-            &[CHARACTER], CHARACTER),
-        (&["every_friend", "random_friend", "any_friend", "ordered_friend"],
-            &[CHARACTER], CHARACTER),
-        (&["every_support_as_heir", "any_support_as_heir"],
-            &[CHARACTER], CHARACTER),
+        (
+            &["every_child", "random_child", "any_child"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &[
+                "every_friend",
+                "random_friend",
+                "any_friend",
+                "ordered_friend",
+            ],
+            &[CHARACTER],
+            CHARACTER,
+        ),
+        (
+            &["every_support_as_heir", "any_support_as_heir"],
+            &[CHARACTER],
+            CHARACTER,
+        ),
         // ── Region/area iterators ────────────────────────────────────────
-        (&["every_area", "random_area", "any_area"],
-            &[], STATE),
-        (&["every_region", "random_region", "any_region"],
-            &[], REGION),
-        (&["every_region_state", "random_region_state"],
-            &[REGION], STATE),
-        (&["every_area_province", "random_area_province"],
-            &[STATE], PROVINCE),
+        (&["every_area", "random_area", "any_area"], &[], STATE),
+        (
+            &["every_region", "random_region", "any_region"],
+            &[],
+            REGION,
+        ),
+        (
+            &["every_region_state", "random_region_state"],
+            &[REGION],
+            STATE,
+        ),
+        (
+            &["every_area_province", "random_area_province"],
+            &[STATE],
+            PROVINCE,
+        ),
         // ── Named links (from IRScopes.fs active entries) ─────────────────
-        (&["owner"],                                &[PROVINCE], COUNTRY),
-        (&["controller"],                           &[PROVINCE], COUNTRY),
-        (&["capital"],                              &[COUNTRY], PROVINCE),
-        (&["liege"],                                &[CHARACTER], CHARACTER),
-        (&["employer"],                             &[CHARACTER], CHARACTER),
-        (&["spouse"],                               &[CHARACTER], CHARACTER),
-        (&["father"],                               &[CHARACTER], CHARACTER),
-        (&["mother"],                               &[CHARACTER], CHARACTER),
-        (&["top_liege"],                            &[CHARACTER], CHARACTER),
-        (&["family"],                               &[CHARACTER], FAMILY),
-        (&["location"],                             &[CHARACTER, UNIT, SUBUNIT], PROVINCE),
-        (&["overlord"],                             &[COUNTRY], COUNTRY),
+        (&["owner"], &[PROVINCE], COUNTRY),
+        (&["controller"], &[PROVINCE], COUNTRY),
+        (&["capital"], &[COUNTRY], PROVINCE),
+        (&["liege"], &[CHARACTER], CHARACTER),
+        (&["employer"], &[CHARACTER], CHARACTER),
+        (&["spouse"], &[CHARACTER], CHARACTER),
+        (&["father"], &[CHARACTER], CHARACTER),
+        (&["mother"], &[CHARACTER], CHARACTER),
+        (&["top_liege"], &[CHARACTER], CHARACTER),
+        (&["family"], &[CHARACTER], FAMILY),
+        (&["location"], &[CHARACTER, UNIT, SUBUNIT], PROVINCE),
+        (&["overlord"], &[COUNTRY], COUNTRY),
         // ── Governor/party/pop ────────────────────────────────────────────
-        (&["governor"],                             &[GOVERNORSHIP, STATE], CHARACTER),
-        (&["governorship"],                         &[CHARACTER], GOVERNORSHIP),
-        (&["ruling_party"],                         &[COUNTRY], PARTY),
-        (&["every_pop", "random_pop", "any_pop"],
-            &[PROVINCE, COUNTRY, STATE], POP),
-        (&["every_family_member", "random_family_member", "any_family_member"],
-            &[FAMILY], CHARACTER),
+        (&["governor"], &[GOVERNORSHIP, STATE], CHARACTER),
+        (&["governorship"], &[CHARACTER], GOVERNORSHIP),
+        (&["ruling_party"], &[COUNTRY], PARTY),
+        (
+            &["every_pop", "random_pop", "any_pop"],
+            &[PROVINCE, COUNTRY, STATE],
+            POP,
+        ),
+        (
+            &[
+                "every_family_member",
+                "random_family_member",
+                "any_family_member",
+            ],
+            &[FAMILY],
+            CHARACTER,
+        ),
         // ── Religion/culture stubs ────────────────────────────────────────
-        (&["religion"],                             &[CHARACTER, PROVINCE, COUNTRY], RELIGION),
-        (&["culture"],                              &[CHARACTER, PROVINCE, COUNTRY], CULTURE),
+        (&["religion"], &[CHARACTER, PROVINCE, COUNTRY], RELIGION),
+        (&["culture"], &[CHARACTER, PROVINCE, COUNTRY], CULTURE),
     ];
 
     for (aliases, valid, target) in entries {
@@ -1213,7 +1935,13 @@ mod tests {
         let mut ctx = stl_ctx();
         ctx.push_scope(ScopeId(203)); // now: [200, 203]
         let res = ctx.change_scope("prev");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(200), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(200),
+                ignore_keys: vec![]
+            }
+        );
         // Stack after PREV: [200, 200] (hopped back to 200)
         assert_eq!(ctx.current(), Some(ScopeId(200)));
     }
@@ -1224,7 +1952,13 @@ mod tests {
         ctx.push_scope(ScopeId(203)); // [200, 203]
         ctx.push_scope(ScopeId(202)); // [200, 203, 202]
         let res = ctx.change_scope("prevprev");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(200), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(200),
+                ignore_keys: vec![]
+            }
+        );
     }
 
     #[test]
@@ -1234,7 +1968,13 @@ mod tests {
         ctx.push_scope(ScopeId(202));
         ctx.push_scope(ScopeId(204));
         let res = ctx.change_scope("prevprevprev");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(200), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(200),
+                ignore_keys: vec![]
+            }
+        );
     }
 
     #[test]
@@ -1245,7 +1985,13 @@ mod tests {
         ctx.push_scope(ScopeId(204));
         ctx.push_scope(ScopeId(205));
         let res = ctx.change_scope("prevprevprevprev");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(200), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(200),
+                ignore_keys: vec![]
+            }
+        );
     }
 
     // ── FROM chain tests ──────────────────────────────────────────────────────
@@ -1255,7 +2001,13 @@ mod tests {
         let mut ctx = stl_ctx();
         ctx.from.push(ScopeId(203)); // FROM = Planet
         let res = ctx.change_scope("from");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(203), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(203),
+                ignore_keys: vec![]
+            }
+        );
     }
 
     #[test]
@@ -1264,7 +2016,13 @@ mod tests {
         ctx.from.push(ScopeId(203));
         ctx.from.push(ScopeId(202)); // FROMFROM = System
         let res = ctx.change_scope("fromfrom");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(202), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(202),
+                ignore_keys: vec![]
+            }
+        );
     }
 
     #[test]
@@ -1274,7 +2032,13 @@ mod tests {
         ctx.from.push(ScopeId(202));
         ctx.from.push(ScopeId(204)); // FROMFROMFROM = Ship
         let res = ctx.change_scope("fromfromfrom");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(204), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(204),
+                ignore_keys: vec![]
+            }
+        );
     }
 
     #[test]
@@ -1285,7 +2049,13 @@ mod tests {
         ctx.from.push(ScopeId(204));
         ctx.from.push(ScopeId(205)); // FROMFROMFROMFROM = Fleet
         let res = ctx.change_scope("fromfromfromfrom");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(205), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(205),
+                ignore_keys: vec![]
+            }
+        );
     }
 
     #[test]
@@ -1293,7 +2063,13 @@ mod tests {
         let mut ctx = stl_ctx();
         // No FROM set — should fall back to SCOPE_ANY
         let res = ctx.change_scope("from");
-        assert_eq!(res, ScopeResult::NewScope { scope: SCOPE_ANY, ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: SCOPE_ANY,
+                ignore_keys: vec![]
+            }
+        );
     }
 
     // ── Dotted key tests ──────────────────────────────────────────────────────
@@ -1304,8 +2080,16 @@ mod tests {
         let mut ctx = ScopeContext::new(Game::Eu4, ScopeId(301)); // start in Province
         let res = ctx.change_scope("owner.capital");
         // Should succeed (NewScope at Province level)
-        assert!(matches!(res, ScopeResult::NewScope { scope: ScopeId(301), .. }
-                           | ScopeResult::NewScope { scope: ScopeId(0), .. }));
+        assert!(matches!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(301),
+                ..
+            } | ScopeResult::NewScope {
+                scope: ScopeId(0),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1345,7 +2129,13 @@ mod tests {
         // hidden:owner in EU4 Province should resolve like plain owner
         let mut ctx = ScopeContext::new(Game::Eu4, ScopeId(301));
         let res = ctx.change_scope("hidden:owner");
-        assert!(matches!(res, ScopeResult::NewScope { scope: ScopeId(300), .. }));
+        assert!(matches!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(300),
+                ..
+            }
+        ));
     }
 
     // ── Meta scope tests ──────────────────────────────────────────────────────
@@ -1355,7 +2145,13 @@ mod tests {
         let mut ctx = stl_ctx();
         ctx.push_scope(ScopeId(203));
         let res = ctx.change_scope("root");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(200), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(200),
+                ignore_keys: vec![]
+            }
+        );
     }
 
     #[test]
@@ -1363,7 +2159,13 @@ mod tests {
         let mut ctx = stl_ctx();
         ctx.push_scope(ScopeId(203));
         let res = ctx.change_scope("this");
-        assert_eq!(res, ScopeResult::NewScope { scope: ScopeId(203), ignore_keys: vec![] });
+        assert_eq!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(203),
+                ignore_keys: vec![]
+            }
+        );
     }
 
     // ── Save / restore tests ──────────────────────────────────────────────────
@@ -1386,7 +2188,13 @@ mod tests {
     fn hoi4_state_owner() {
         let mut ctx = ScopeContext::new(Game::Hoi4, ScopeId(101)); // State
         let res = ctx.change_scope("owner");
-        assert!(matches!(res, ScopeResult::NewScope { scope: ScopeId(100), .. }));
+        assert!(matches!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(100),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1394,13 +2202,25 @@ mod tests {
         // Start in Planet scope
         let mut ctx = ScopeContext::new(Game::Stellaris, ScopeId(203));
         let res = ctx.change_scope("owner");
-        assert!(matches!(res, ScopeResult::NewScope { scope: ScopeId(200), .. }));
+        assert!(matches!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(200),
+                ..
+            }
+        ));
     }
 
     #[test]
     fn eu4_province_owner_gives_country() {
         let mut ctx = ScopeContext::new(Game::Eu4, ScopeId(301));
         let res = ctx.change_scope("owner");
-        assert!(matches!(res, ScopeResult::NewScope { scope: ScopeId(300), .. }));
+        assert!(matches!(
+            res,
+            ScopeResult::NewScope {
+                scope: ScopeId(300),
+                ..
+            }
+        ));
     }
 }

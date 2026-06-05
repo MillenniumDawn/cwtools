@@ -12,18 +12,18 @@ pub use csv_parser::*;
 // (legacy parallel types).  Export loc_string variants under explicit names
 // to avoid ambiguous glob re-exports.
 pub use loc_string::{
-    parse_loc_elements, JominiCommand as LocJominiCommand, JominiParam as LocJominiParam,
-    LocElement,
+    JominiCommand as LocJominiCommand, JominiParam as LocJominiParam, LocElement,
+    parse_loc_elements,
 };
-pub use scope_validation::{validate_loc_commands, LocCommandDiagnostic, LocScopeData};
+pub use scope_validation::{LocCommandDiagnostic, LocScopeData, validate_loc_commands};
 pub use service::*;
 // validation and yaml_parser both define validate_quotes / validate_replace_me;
 // export explicitly.
 pub use validation::{
-    build_key_union, validate_invalid_chars, validate_loc_file, LocValidationError,
+    LocValidationError, build_key_union, validate_invalid_chars, validate_loc_file,
 };
 pub use yaml_parser::{
-    check_loc_file_lang, check_utf8_bom, find_invalid_loc_char, is_loc_value_char,
-    lang_from_filename, parse_loc_text, validate_quotes, validate_replace_me, LangHeaderDiagnostic,
-    MissingBomDiagnostic,
+    LangHeaderDiagnostic, MissingBomDiagnostic, check_loc_file_lang, check_utf8_bom,
+    find_invalid_loc_char, is_loc_value_char, lang_from_filename, parse_loc_text, validate_quotes,
+    validate_replace_me,
 };

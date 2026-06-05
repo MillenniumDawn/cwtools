@@ -54,9 +54,9 @@ ship_name = {
 "#;
     let parsed = parse_string(script, &table).unwrap();
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
-    let enum_card_fp = errors.iter().any(|e| {
-        e.message.contains("Enum(\"ship_units\")") && e.message.contains("appears 0")
-    });
+    let enum_card_fp = errors
+        .iter()
+        .any(|e| e.message.contains("Enum(\"ship_units\")") && e.message.contains("appears 0"));
     assert!(
         !enum_card_fp,
         "false positive: enum[ship_units] reported 0 despite members present. Errors: {:?}",

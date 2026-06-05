@@ -6,8 +6,8 @@
 //! entries don't produce false positives.
 
 use crate::commands::{Game, JominiCommand, LocEntry};
-use cwtools_game::scope_engine::{ScopeContext, ScopeId, ScopeResult, SCOPE_ANY};
 use cwtools_game::constants::Game as EngineGame;
+use cwtools_game::scope_engine::{SCOPE_ANY, ScopeContext, ScopeId, ScopeResult};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -170,7 +170,11 @@ fn validate_command_string(
                 // Value-only trigger in the middle: chain cannot continue.
                 // Treat as terminal (lenient — F# would error but we accept).
             }
-            ScopeResult::WrongScope { command, current, expected } => {
+            ScopeResult::WrongScope {
+                command,
+                current,
+                expected,
+            } => {
                 diags.push(LocCommandDiagnostic::WrongScope {
                     command: format!("{} (in {})", command, cmd),
                     current_scope: current.0,
@@ -229,7 +233,11 @@ fn validate_jomini_chain(
     let mut ctx = ScopeContext::new(engine_game, initial_scope);
     let result = ctx.change_scope(seg);
     match result {
-        ScopeResult::WrongScope { command, current, expected } => {
+        ScopeResult::WrongScope {
+            command,
+            current,
+            expected,
+        } => {
             diags.push(LocCommandDiagnostic::WrongScope {
                 command,
                 current_scope: current.0,
@@ -406,7 +414,10 @@ mod tests {
         }]);
         let data = hoi4_data();
         let diags = validate_loc_commands(&entry, ScopeId(100), &data);
-        assert!(diags.is_empty(), "Jomini GetName should be accepted as terminal");
+        assert!(
+            diags.is_empty(),
+            "Jomini GetName should be accepted as terminal"
+        );
     }
 
     // ── Jomini wrong-scope link produces diagnostic ───────────────────────────

@@ -201,9 +201,13 @@ fn parse_jomini(input: &str) -> Result<Vec<JominiCommand>, String> {
     Ok(commands)
 }
 
+<<<<<<< Updated upstream
 fn parse_jomini_params(
     chars: &mut std::iter::Peekable<std::str::Chars>,
 ) -> Result<Vec<JominiParam>, String> {
+=======
+fn parse_jomini_params(chars: &[char], i: &mut usize) -> Result<Vec<JominiParam>, String> {
+>>>>>>> Stashed changes
     let mut params = Vec::new();
     let mut current = String::new();
 
@@ -231,7 +235,9 @@ fn parse_jomini_params(
 fn parse_jomini_param(s: &str) -> Result<JominiParam, String> {
     let trimmed = s.trim();
     if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-        Ok(JominiParam::Literal(trimmed[1..trimmed.len() - 1].to_string()))
+        Ok(JominiParam::Literal(
+            trimmed[1..trimmed.len() - 1].to_string(),
+        ))
     } else if trimmed.contains('.') {
         let commands = parse_jomini(trimmed)?;
         Ok(JominiParam::Commands(commands))
@@ -316,7 +322,10 @@ mod tests {
     fn test_event_target() {
         let elems = parse_loc_elements("[event_target:foo]");
         assert_eq!(elems.len(), 1);
-        assert_eq!(elems[0], LocElement::Command("event_target:foo".to_string()));
+        assert_eq!(
+            elems[0],
+            LocElement::Command("event_target:foo".to_string())
+        );
     }
 
     #[test]

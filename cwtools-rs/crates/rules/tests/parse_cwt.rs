@@ -39,13 +39,19 @@ enums = {
     assert_eq!(ruleset.types.len(), 1);
     assert_eq!(ruleset.root_rules.is_empty(), true);
     assert_eq!(ruleset.types[0].name, "ship_size");
-    assert_eq!(ruleset.types[0].path_options.paths, vec!["common/ship_sizes"]);
+    assert_eq!(
+        ruleset.types[0].path_options.paths,
+        vec!["common/ship_sizes"]
+    );
     assert_eq!(ruleset.types[0].subtypes.len(), 1);
     assert_eq!(ruleset.types[0].subtypes[0].name, "starbase");
 
     assert_eq!(ruleset.enums.len(), 1);
     assert_eq!(ruleset.enums[0].key, "shipsize_class");
-    assert_eq!(ruleset.enums[0].values, vec!["shipclass_military", "shipclass_starbase"]);
+    assert_eq!(
+        ruleset.enums[0].values,
+        vec!["shipclass_military", "shipclass_starbase"]
+    );
 }
 
 #[test]

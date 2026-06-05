@@ -13,7 +13,7 @@
 //! * `key: "this is "also" valid"` → desc = `"this is "also" valid"`
 //! * `key: "a" #comment` → desc = `"a" #comment`
 
-use crate::commands::{key_to_language, Lang, LocEntry, LocFile, Position};
+use crate::commands::{Lang, LocEntry, LocFile, Position, key_to_language};
 use crate::loc_string::parse_loc_elements;
 
 // ---- UTF-8 BOM check -------------------------------------------------------
@@ -38,7 +38,9 @@ pub fn check_utf8_bom(bytes: &[u8], file: &str) -> Result<(), MissingBomDiagnost
     if bytes.len() >= 3 && bytes[..3] == UTF8_BOM {
         Ok(())
     } else {
-        Err(MissingBomDiagnostic { file: file.to_string() })
+        Err(MissingBomDiagnostic {
+            file: file.to_string(),
+        })
     }
 }
 
@@ -55,7 +57,11 @@ pub enum LangHeaderDiagnostic {
     MissingLocFileLang { file: String },
     /// The filename language tag and the header language tag disagree
     /// (LocFileLangMismatch).
-    LocFileLangMismatch { file: String, filename_lang: Lang, header_lang: Lang },
+    LocFileLangMismatch {
+        file: String,
+        filename_lang: Lang,
+        header_lang: Lang,
+    },
 }
 
 /// Extract the language tag from a filename (stem only, without extension).
@@ -64,19 +70,33 @@ pub enum LangHeaderDiagnostic {
 /// `events_l_english.yml` returns `Some(Lang::English)`.
 pub fn lang_from_filename(stem: &str) -> Option<Lang> {
     let lower = stem.to_ascii_lowercase();
-    if lower.contains("l_english") { Some(Lang::English) }
-    else if lower.contains("l_french") { Some(Lang::French) }
-    else if lower.contains("l_german") { Some(Lang::German) }
-    else if lower.contains("l_spanish") { Some(Lang::Spanish) }
-    else if lower.contains("l_russian") { Some(Lang::Russian) }
-    else if lower.contains("l_polish") { Some(Lang::Polish) }
-    else if lower.contains("l_braz_por") { Some(Lang::BrazPor) }
-    else if lower.contains("l_simp_chinese") { Some(Lang::SimpChinese) }
-    else if lower.contains("l_japanese") { Some(Lang::Japanese) }
-    else if lower.contains("l_korean") { Some(Lang::Korean) }
-    else if lower.contains("l_turkish") { Some(Lang::Turkish) }
-    else if lower.contains("l_default") { Some(Lang::Default) }
-    else { None }
+    if lower.contains("l_english") {
+        Some(Lang::English)
+    } else if lower.contains("l_french") {
+        Some(Lang::French)
+    } else if lower.contains("l_german") {
+        Some(Lang::German)
+    } else if lower.contains("l_spanish") {
+        Some(Lang::Spanish)
+    } else if lower.contains("l_russian") {
+        Some(Lang::Russian)
+    } else if lower.contains("l_polish") {
+        Some(Lang::Polish)
+    } else if lower.contains("l_braz_por") {
+        Some(Lang::BrazPor)
+    } else if lower.contains("l_simp_chinese") {
+        Some(Lang::SimpChinese)
+    } else if lower.contains("l_japanese") {
+        Some(Lang::Japanese)
+    } else if lower.contains("l_korean") {
+        Some(Lang::Korean)
+    } else if lower.contains("l_turkish") {
+        Some(Lang::Turkish)
+    } else if lower.contains("l_default") {
+        Some(Lang::Default)
+    } else {
+        None
+    }
 }
 
 /// Validate the language header of a YAML loc file against the filename.
@@ -89,10 +109,7 @@ pub fn lang_from_filename(stem: &str) -> Option<Lang> {
 ///
 /// `header_key` is the raw `l_xxx` token found in the file (without `:`).
 /// `file` is the path / name used for diagnostics.
-pub fn check_loc_file_lang(
-    file: &str,
-    header_key: &str,
-) -> Option<LangHeaderDiagnostic> {
+pub fn check_loc_file_lang(file: &str, header_key: &str) -> Option<LangHeaderDiagnostic> {
     // Derive the stem (basename without extension) from `file`
     let stem = std::path::Path::new(file)
         .file_stem()
@@ -202,16 +219,18 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         let mut remainder = &trimmed[colon_pos + 1..];
 
         // optional version number (digits right after colon with no space)
-        let version = if !remainder.is_empty()
-            && remainder.starts_with(|c: char| c.is_ascii_digit())
-        {
-            let digit_str: String = remainder.chars().take_while(|c| c.is_ascii_digit()).collect();
-            let v = digit_str.parse::<u32>().ok();
-            remainder = &remainder[digit_str.len()..];
-            v
-        } else {
-            None
-        };
+        let version =
+            if !remainder.is_empty() && remainder.starts_with(|c: char| c.is_ascii_digit()) {
+                let digit_str: String = remainder
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                let v = digit_str.parse::<u32>().ok();
+                remainder = &remainder[digit_str.len()..];
+                v
+            } else {
+                None
+            };
 
         // strip one leading space (the convention after `:`)
         // but keep everything else including # comments,
@@ -253,15 +272,25 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         let jomini_commands: Vec<crate::commands::JominiCommand> = elements
             .iter()
             .filter_map(|e| match e {
-                crate::loc_string::LocElement::JominiCommand(cmds) => {
-                    Some(cmds.iter().map(|c| crate::commands::JominiCommand {
-                        key: c.key.clone(),
-                        params: c.params.iter().map(|p| match p {
-                            crate::loc_string::JominiParam::Literal(s) => crate::commands::JominiParam::Literal(s.clone()),
-                            crate::loc_string::JominiParam::Commands(_) => crate::commands::JominiParam::Literal("nested".to_string()),
-                        }).collect(),
-                    }).collect::<Vec<_>>())
-                }
+                crate::loc_string::LocElement::JominiCommand(cmds) => Some(
+                    cmds.iter()
+                        .map(|c| crate::commands::JominiCommand {
+                            key: c.key.clone(),
+                            params: c
+                                .params
+                                .iter()
+                                .map(|p| match p {
+                                    crate::loc_string::JominiParam::Literal(s) => {
+                                        crate::commands::JominiParam::Literal(s.clone())
+                                    }
+                                    crate::loc_string::JominiParam::Commands(_) => {
+                                        crate::commands::JominiParam::Literal("nested".to_string())
+                                    }
+                                })
+                                .collect(),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 _ => None,
             })
             .flatten()
@@ -286,12 +315,22 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     if let Some(diag) = check_loc_file_lang(name, language_key) {
         let msg = match &diag {
             LangHeaderDiagnostic::MissingLocFileLangHeader { file } => {
-                format!("CW-MissingLocFileLangHeader: '{}' has no recognised language header", file)
+                format!(
+                    "CW-MissingLocFileLangHeader: '{}' has no recognised language header",
+                    file
+                )
             }
             LangHeaderDiagnostic::MissingLocFileLang { file } => {
-                format!("CW-MissingLocFileLang: '{}' filename carries no language tag", file)
+                format!(
+                    "CW-MissingLocFileLang: '{}' filename carries no language tag",
+                    file
+                )
             }
-            LangHeaderDiagnostic::LocFileLangMismatch { file, filename_lang, header_lang } => {
+            LangHeaderDiagnostic::LocFileLangMismatch {
+                file,
+                filename_lang,
+                header_lang,
+            } => {
                 format!(
                     "CW-LocFileLangMismatch: '{}' filename says '{}' but header says '{}'",
                     file, filename_lang, header_lang
@@ -367,9 +406,7 @@ pub fn validate_quotes(entry: &mut LocEntry) -> bool {
 
     // 2.  Find first '#' after that last quote
     let first_hash_after_quote = last_quote
-        .and_then(|q| {
-            trimmed[q..].find('#').map(|h| q + h)
-        })
+        .and_then(|q| trimmed[q..].find('#').map(|h| q + h))
         .or_else(|| {
             // no last quote → look for first '#' overall
             trimmed.find('#')
@@ -377,12 +414,8 @@ pub fn validate_quotes(entry: &mut LocEntry) -> bool {
 
     // 3.  Truncate at the first '#' after last quote (if any)
     let mut effective = match (first_hash_after_quote, last_quote) {
-        (Some(h), Some(q)) if h > q => {
-            &trimmed[..h]
-        }
-        _ => {
-            trimmed
-        }
+        (Some(h), Some(q)) if h > q => &trimmed[..h],
+        _ => trimmed,
     };
 
     // Edge: HOI4 allows quoted text like:
@@ -472,10 +505,16 @@ mod tests {
         assert_eq!(file.entries[7].desc, "this is invalid loc");
 
         assert_eq!(file.entries[8].key, "loc_key9");
-        assert_eq!(file.entries[8].desc, "\"this is valid loc\" but with invalid stuff outside");
+        assert_eq!(
+            file.entries[8].desc,
+            "\"this is valid loc\" but with invalid stuff outside"
+        );
 
         assert_eq!(file.entries[9].key, "loc_key10");
-        assert_eq!(file.entries[9].desc, "\"this is valid loc\" #but with comment");
+        assert_eq!(
+            file.entries[9].desc,
+            "\"this is valid loc\" #but with comment"
+        );
     }
 
     #[test]
@@ -570,7 +609,11 @@ mod tests {
         // events_l_english.yml with l_english: header — no diagnostic
         let text = "l_english:\n key: \"value\"\n";
         let file = parse_loc_text(text, "events_l_english.yml").unwrap();
-        assert!(file.file_diagnostics.is_empty(), "should have no diagnostics: {:?}", file.file_diagnostics);
+        assert!(
+            file.file_diagnostics.is_empty(),
+            "should have no diagnostics: {:?}",
+            file.file_diagnostics
+        );
     }
 
     #[test]
@@ -579,7 +622,11 @@ mod tests {
         let text = "l_french:\n key: \"value\"\n";
         let file = parse_loc_text(text, "events_l_english.yml").unwrap();
         assert_eq!(file.file_diagnostics.len(), 1);
-        assert!(file.file_diagnostics[0].contains("LocFileLangMismatch"), "{:?}", file.file_diagnostics);
+        assert!(
+            file.file_diagnostics[0].contains("LocFileLangMismatch"),
+            "{:?}",
+            file.file_diagnostics
+        );
     }
 
     #[test]
@@ -588,7 +635,11 @@ mod tests {
         let text = "l_english:\n key: \"value\"\n";
         let file = parse_loc_text(text, "events.yml").unwrap();
         assert_eq!(file.file_diagnostics.len(), 1);
-        assert!(file.file_diagnostics[0].contains("MissingLocFileLang"), "{:?}", file.file_diagnostics);
+        assert!(
+            file.file_diagnostics[0].contains("MissingLocFileLang"),
+            "{:?}",
+            file.file_diagnostics
+        );
     }
 
     #[test]
@@ -597,7 +648,11 @@ mod tests {
         let text = "l_klingon:\n key: \"value\"\n";
         let file = parse_loc_text(text, "events_l_english.yml").unwrap();
         assert_eq!(file.file_diagnostics.len(), 1);
-        assert!(file.file_diagnostics[0].contains("MissingLocFileLangHeader"), "{:?}", file.file_diagnostics);
+        assert!(
+            file.file_diagnostics[0].contains("MissingLocFileLangHeader"),
+            "{:?}",
+            file.file_diagnostics
+        );
     }
 
     #[test]
@@ -605,7 +660,11 @@ mod tests {
         // l_default header should always pass
         let text = "l_default:\n key: \"value\"\n";
         let file = parse_loc_text(text, "events_l_english.yml").unwrap();
-        assert!(file.file_diagnostics.is_empty(), "l_default should not produce diagnostics: {:?}", file.file_diagnostics);
+        assert!(
+            file.file_diagnostics.is_empty(),
+            "l_default should not produce diagnostics: {:?}",
+            file.file_diagnostics
+        );
     }
 
     #[test]
@@ -613,7 +672,11 @@ mod tests {
         // languages.yml is special-cased
         let text = "l_english:\n key: \"value\"\n";
         let file = parse_loc_text(text, "languages.yml").unwrap();
-        assert!(file.file_diagnostics.is_empty(), "languages.yml should be exempt: {:?}", file.file_diagnostics);
+        assert!(
+            file.file_diagnostics.is_empty(),
+            "languages.yml should be exempt: {:?}",
+            file.file_diagnostics
+        );
     }
 
     #[test]

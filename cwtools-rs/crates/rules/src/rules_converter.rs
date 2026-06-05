@@ -46,9 +46,15 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                 let node = &ast.arena.nodes[*nidx as usize];
                 let key = table.get_string(node.key.normal).unwrap_or_default();
                 match key.as_str() {
-                    "types" => extract_types_from_children(&node.children, ast, table, &mut ruleset),
-                    "enums" => extract_enums_from_children(&node.children, ast, table, &mut ruleset),
-                    "values" => extract_values_from_children(&node.children, ast, table, &mut ruleset),
+                    "types" => {
+                        extract_types_from_children(&node.children, ast, table, &mut ruleset)
+                    }
+                    "enums" => {
+                        extract_enums_from_children(&node.children, ast, table, &mut ruleset)
+                    }
+                    "values" => {
+                        extract_values_from_children(&node.children, ast, table, &mut ruleset)
+                    }
                     "modifiers" => extract_modifier_names(&node.children, ast, table, &mut ruleset),
                     "links" => extract_link_names(&node.children, ast, table, &mut ruleset),
                     _ => {
@@ -111,22 +117,38 @@ fn process_root_node(
             let full_name = format!("{}:{}", category, _alias_name);
             let rule = node_to_noderule(node, ast, table, ruleset);
             let opts = options_from_comments(comments, false);
-            ruleset
-                .aliases
-                .push((full_name, (RuleType::NodeRule { left: NewField::AliasField(category), rules: rule }, opts)));
+            ruleset.aliases.push((
+                full_name,
+                (
+                    RuleType::NodeRule {
+                        left: NewField::AliasField(category),
+                        rules: rule,
+                    },
+                    opts,
+                ),
+            ));
         }
     } else if key.starts_with("single_alias[") {
         if let Some(alias_name) = get_setting_from_string(&key, "single_alias") {
             let rule = node_to_noderule(node, ast, table, ruleset);
             let opts = options_from_comments(comments, false);
-            ruleset
-                .single_aliases
-                .push((alias_name.clone(), (RuleType::NodeRule { left: NewField::SingleAliasField(alias_name), rules: rule }, opts)));
+            ruleset.single_aliases.push((
+                alias_name.clone(),
+                (
+                    RuleType::NodeRule {
+                        left: NewField::SingleAliasField(alias_name),
+                        rules: rule,
+                    },
+                    opts,
+                ),
+            ));
         }
     } else {
         let rule = build_rule_from_node(node, ast, table, ruleset);
         let opts = options_from_comments(comments, false);
-        ruleset.root_rules.push(RootRule::TypeRule(key, (rule, opts)));
+        ruleset
+            .root_rules
+            .push(RootRule::TypeRule(key, (rule, opts)));
     }
 }
 
@@ -143,22 +165,20 @@ fn process_root_leaf(
             let full_name = format!("{}:{}", category, _alias_name);
             let rule = leaf_to_rule(leaf, ast, table, ruleset);
             let opts = options_from_comments(comments, leaf_is_eqeq(leaf));
-            ruleset
-                .aliases
-                .push((full_name, (rule, opts)));
+            ruleset.aliases.push((full_name, (rule, opts)));
         }
     } else if key.starts_with("single_alias[") {
         if let Some(alias_name) = get_setting_from_string(&key, "single_alias") {
             let rule = leaf_to_rule(leaf, ast, table, ruleset);
             let opts = options_from_comments(comments, leaf_is_eqeq(leaf));
-            ruleset
-                .single_aliases
-                .push((alias_name, (rule, opts)));
+            ruleset.single_aliases.push((alias_name, (rule, opts)));
         }
     } else {
         let rule = leaf_to_rule(leaf, ast, table, ruleset);
         let opts = options_from_comments(comments, leaf_is_eqeq(leaf));
-        ruleset.root_rules.push(RootRule::TypeRule(key, (rule, opts)));
+        ruleset
+            .root_rules
+            .push(RootRule::TypeRule(key, (rule, opts)));
     }
 }
 
@@ -174,9 +194,7 @@ fn build_rule_from_node(
 ) -> RuleType {
     let inner = node_to_noderule(node, ast, table, ruleset);
     RuleType::NodeRule {
-        left: NewField::SpecificField(
-            table.get_string(node.key.normal).unwrap_or_default(),
-        ),
+        left: NewField::SpecificField(table.get_string(node.key.normal).unwrap_or_default()),
         rules: inner,
     }
 }
@@ -223,22 +241,92 @@ fn field_from_string(s: &str) -> NewField {
     match trimmed {
         "scalar" => return NewField::ScalarField,
         "bool" => return NewField::ValueField(ValueType::Bool),
-        "int" => return NewField::ValueField(ValueType::Int { min: INT_MIN, max: INT_MAX }),
-        "float" => return NewField::ValueField(ValueType::Float { min: FLOAT_MIN, max: FLOAT_MAX }),
+        "int" => {
+            return NewField::ValueField(ValueType::Int {
+                min: INT_MIN,
+                max: INT_MAX,
+            });
+        }
+        "float" => {
+            return NewField::ValueField(ValueType::Float {
+                min: FLOAT_MIN,
+                max: FLOAT_MAX,
+            });
+        }
         "percentage_field" => return NewField::ValueField(ValueType::Percent),
-        "localisation" => return NewField::LocalisationField { synced: false, is_inline: false },
-        "localisation_synced" => return NewField::LocalisationField { synced: true, is_inline: false },
-        "localisation_inline" => return NewField::LocalisationField { synced: false, is_inline: true },
-        "filepath" => return NewField::FilepathField { prefix: None, extension: None },
+        "localisation" => {
+            return NewField::LocalisationField {
+                synced: false,
+                is_inline: false,
+            };
+        }
+        "localisation_synced" => {
+            return NewField::LocalisationField {
+                synced: true,
+                is_inline: false,
+            };
+        }
+        "localisation_inline" => {
+            return NewField::LocalisationField {
+                synced: false,
+                is_inline: true,
+            };
+        }
+        "filepath" => {
+            return NewField::FilepathField {
+                prefix: None,
+                extension: None,
+            };
+        }
         "date_field" => return NewField::ValueField(ValueType::Date),
         "datetime_field" => return NewField::ValueField(ValueType::DateTime),
         "scope_field" => return NewField::ScopeField(vec!["any".to_string()]),
-        "variable_field" => return NewField::VariableField { is_int: false, is_32bit: false, min: FLOAT_MIN, max: FLOAT_MAX },
-        "int_variable_field" => return NewField::VariableField { is_int: true, is_32bit: false, min: INT_MIN as f64, max: INT_MAX as f64 },
-        "variable_field_32" => return NewField::VariableField { is_int: false, is_32bit: true, min: FLOAT_MIN, max: FLOAT_MAX },
-        "int_variable_field_32" => return NewField::VariableField { is_int: true, is_32bit: true, min: INT_MIN as f64, max: INT_MAX as f64 },
-        "value_field" => return NewField::ValueScopeMarkerField { is_int: false, min: FLOAT_MIN, max: FLOAT_MAX },
-        "int_value_field" => return NewField::ValueScopeMarkerField { is_int: true, min: INT_MIN as f64, max: INT_MAX as f64 },
+        "variable_field" => {
+            return NewField::VariableField {
+                is_int: false,
+                is_32bit: false,
+                min: FLOAT_MIN,
+                max: FLOAT_MAX,
+            };
+        }
+        "int_variable_field" => {
+            return NewField::VariableField {
+                is_int: true,
+                is_32bit: false,
+                min: INT_MIN as f64,
+                max: INT_MAX as f64,
+            };
+        }
+        "variable_field_32" => {
+            return NewField::VariableField {
+                is_int: false,
+                is_32bit: true,
+                min: FLOAT_MIN,
+                max: FLOAT_MAX,
+            };
+        }
+        "int_variable_field_32" => {
+            return NewField::VariableField {
+                is_int: true,
+                is_32bit: true,
+                min: INT_MIN as f64,
+                max: INT_MAX as f64,
+            };
+        }
+        "value_field" => {
+            return NewField::ValueScopeMarkerField {
+                is_int: false,
+                min: FLOAT_MIN,
+                max: FLOAT_MAX,
+            };
+        }
+        "int_value_field" => {
+            return NewField::ValueScopeMarkerField {
+                is_int: true,
+                min: INT_MIN as f64,
+                max: INT_MAX as f64,
+            };
+        }
         "portrait_dna_field" => return NewField::ValueField(ValueType::Ck2Dna),
         "portrait_properties_field" => return NewField::ValueField(ValueType::Ck2DnaProperty),
         // Legacy aliases from earlier implementation
@@ -248,7 +336,9 @@ fn field_from_string(s: &str) -> NewField {
         "ir_country_tag_field" => return NewField::MarkerField(Marker::IrCountryTag),
         "colour_field" | "color_field" => return NewField::MarkerField(Marker::ColourField),
         "ignore_field" => return NewField::IgnoreMarkerField,
-        "stellaris_name_format" => return NewField::ValueField(ValueType::StlNameFormat(String::new())),
+        "stellaris_name_format" => {
+            return NewField::ValueField(ValueType::StlNameFormat(String::new()));
+        }
         "percent_field" => return NewField::ValueField(ValueType::Percent),
         _ => {}
     }
@@ -260,9 +350,15 @@ fn field_from_string(s: &str) -> NewField {
             let mut parts = inner.splitn(2, ',');
             let folder = parts.next().unwrap_or("").to_string();
             let ext = parts.next().unwrap_or("").to_string();
-            NewField::FilepathField { prefix: Some(folder), extension: Some(ext) }
+            NewField::FilepathField {
+                prefix: Some(folder),
+                extension: Some(ext),
+            }
         } else {
-            NewField::FilepathField { prefix: Some(inner.to_string()), extension: None }
+            NewField::FilepathField {
+                prefix: Some(inner.to_string()),
+                extension: None,
+            }
         };
     }
 
@@ -276,7 +372,10 @@ fn field_from_string(s: &str) -> NewField {
                 return NewField::ValueField(ValueType::Int { min: mn, max: mx });
             }
         }
-        return NewField::ValueField(ValueType::Int { min: INT_MIN, max: INT_MAX });
+        return NewField::ValueField(ValueType::Int {
+            min: INT_MIN,
+            max: INT_MAX,
+        });
     }
 
     // float[min..max] with inf/-inf sentinels
@@ -289,7 +388,10 @@ fn field_from_string(s: &str) -> NewField {
                 return NewField::ValueField(ValueType::Float { min: mn, max: mx });
             }
         }
-        return NewField::ValueField(ValueType::Float { min: FLOAT_MIN, max: FLOAT_MAX });
+        return NewField::ValueField(ValueType::Float {
+            min: FLOAT_MIN,
+            max: FLOAT_MAX,
+        });
     }
 
     // enum[x]
@@ -342,7 +444,9 @@ fn field_from_string(s: &str) -> NewField {
     }
 
     // alias_name[x] / alias_match_left[x] -> AliasField
-    if (trimmed.starts_with("alias_name[") || trimmed.starts_with("alias_match_left[")) && trimmed.ends_with(']') {
+    if (trimmed.starts_with("alias_name[") || trimmed.starts_with("alias_match_left["))
+        && trimmed.ends_with(']')
+    {
         let inner_start = trimmed.find('[').unwrap() + 1;
         let alias = &trimmed[inner_start..trimmed.len() - 1];
         return NewField::AliasField(alias.to_string());
@@ -364,42 +468,70 @@ fn field_from_string(s: &str) -> NewField {
     if trimmed.starts_with("variable_field[") && trimmed.ends_with(']') {
         let inner = &trimmed[15..trimmed.len() - 1];
         let (mn, mx) = parse_float_range(inner, FLOAT_MIN, FLOAT_MAX);
-        return NewField::VariableField { is_int: false, is_32bit: false, min: mn, max: mx };
+        return NewField::VariableField {
+            is_int: false,
+            is_32bit: false,
+            min: mn,
+            max: mx,
+        };
     }
 
     // int_variable_field[min..max]
     if trimmed.starts_with("int_variable_field[") && trimmed.ends_with(']') {
         let inner = &trimmed[19..trimmed.len() - 1];
         let (mn, mx) = parse_int_range_as_float(inner, INT_MIN as f64, INT_MAX as f64);
-        return NewField::VariableField { is_int: true, is_32bit: false, min: mn, max: mx };
+        return NewField::VariableField {
+            is_int: true,
+            is_32bit: false,
+            min: mn,
+            max: mx,
+        };
     }
 
     // variable_field_32[min..max]
     if trimmed.starts_with("variable_field_32[") && trimmed.ends_with(']') {
         let inner = &trimmed[18..trimmed.len() - 1];
         let (mn, mx) = parse_float_range(inner, FLOAT_MIN, FLOAT_MAX);
-        return NewField::VariableField { is_int: false, is_32bit: true, min: mn, max: mx };
+        return NewField::VariableField {
+            is_int: false,
+            is_32bit: true,
+            min: mn,
+            max: mx,
+        };
     }
 
     // int_variable_field_32[min..max]
     if trimmed.starts_with("int_variable_field_32[") && trimmed.ends_with(']') {
         let inner = &trimmed[22..trimmed.len() - 1];
         let (mn, mx) = parse_int_range_as_float(inner, INT_MIN as f64, INT_MAX as f64);
-        return NewField::VariableField { is_int: true, is_32bit: true, min: mn, max: mx };
+        return NewField::VariableField {
+            is_int: true,
+            is_32bit: true,
+            min: mn,
+            max: mx,
+        };
     }
 
     // value_field[min..max]
     if trimmed.starts_with("value_field[") && trimmed.ends_with(']') {
         let inner = &trimmed[12..trimmed.len() - 1];
         let (mn, mx) = parse_float_range(inner, FLOAT_MIN, FLOAT_MAX);
-        return NewField::ValueScopeMarkerField { is_int: false, min: mn, max: mx };
+        return NewField::ValueScopeMarkerField {
+            is_int: false,
+            min: mn,
+            max: mx,
+        };
     }
 
     // int_value_field[min..max]
     if trimmed.starts_with("int_value_field[") && trimmed.ends_with(']') {
         let inner = &trimmed[16..trimmed.len() - 1];
         let (mn, mx) = parse_int_range_as_float(inner, INT_MIN as f64, INT_MAX as f64);
-        return NewField::ValueScopeMarkerField { is_int: true, min: mn, max: mx };
+        return NewField::ValueScopeMarkerField {
+            is_int: true,
+            min: mn,
+            max: mx,
+        };
     }
 
     // stellaris_name_format[x]
@@ -428,7 +560,11 @@ fn field_from_string(s: &str) -> NewField {
                 let prefix = s[..pi].to_string();
                 let name = s[pi + 1..si].to_string();
                 let suffix = s[si + 1..].to_string();
-                return NewField::TypeField(TypeType::Complex { prefix, name, suffix });
+                return NewField::TypeField(TypeType::Complex {
+                    prefix,
+                    name,
+                    suffix,
+                });
             }
         }
     }
@@ -465,8 +601,12 @@ fn parse_float_range(inner: &str, default_min: f64, default_max: f64) -> (f64, f
 
 fn parse_int_range_as_float(inner: &str, default_min: f64, default_max: f64) -> (f64, f64) {
     if let Some((min_s, max_s)) = inner.split_once("..") {
-        let mn = parse_int_sentinel(min_s.trim()).map(|v| v as f64).unwrap_or(default_min);
-        let mx = parse_int_sentinel(max_s.trim()).map(|v| v as f64).unwrap_or(default_max);
+        let mn = parse_int_sentinel(min_s.trim())
+            .map(|v| v as f64)
+            .unwrap_or(default_min);
+        let mx = parse_int_sentinel(max_s.trim())
+            .map(|v| v as f64)
+            .unwrap_or(default_max);
         (mn, mx)
     } else {
         (default_min, default_max)
@@ -501,8 +641,17 @@ fn children_to_rules(
                             _ => Vec::new(),
                         };
                         rules.push((
+<<<<<<< Updated upstream
                             RuleType::SubtypeRule { name, positive, rules: inner },
                             options_from_comments(comments, false),
+=======
+                            RuleType::SubtypeRule {
+                                name,
+                                positive,
+                                rules: inner,
+                            },
+                            options_from_comments(&comments, false),
+>>>>>>> Stashed changes
                         ));
                     }
                     continue;
@@ -550,8 +699,17 @@ fn children_to_rules(
                         };
                         let inner = children_to_rules(&node.children, ast, table, ruleset);
                         rules.push((
+<<<<<<< Updated upstream
                             RuleType::SubtypeRule { name, positive, rules: inner },
                             options_from_comments(comments, false),
+=======
+                            RuleType::SubtypeRule {
+                                name,
+                                positive,
+                                rules: inner,
+                            },
+                            options_from_comments(&comments, false),
+>>>>>>> Stashed changes
                         ));
                     }
                     continue;
@@ -604,23 +762,55 @@ fn build_colour_rules(colour_spec: &str) -> Vec<NewRule> {
     };
     match inner {
         "rgb" => vec![(
-            RuleType::LeafValueRule { right: NewField::ValueField(ValueType::Int { min: 0, max: 255 }) },
-            Options { min: 3, max: 4, strict_min: true, leafvalue: true, ..Options::default() },
+            RuleType::LeafValueRule {
+                right: NewField::ValueField(ValueType::Int { min: 0, max: 255 }),
+            },
+            Options {
+                min: 3,
+                max: 4,
+                strict_min: true,
+                leafvalue: true,
+                ..Options::default()
+            },
         )],
         "hsv" => vec![(
-            RuleType::LeafValueRule { right: NewField::ValueField(ValueType::Float { min: 0.0, max: 2.0 }) },
-            Options { min: 3, max: 4, strict_min: true, leafvalue: true, ..Options::default() },
+            RuleType::LeafValueRule {
+                right: NewField::ValueField(ValueType::Float { min: 0.0, max: 2.0 }),
+            },
+            Options {
+                min: 3,
+                max: 4,
+                strict_min: true,
+                leafvalue: true,
+                ..Options::default()
+            },
         )],
         _ => {
             // Unknown colour format — emit both
             vec![
                 (
-                    RuleType::LeafValueRule { right: NewField::ValueField(ValueType::Int { min: 0, max: 255 }) },
-                    Options { min: 3, max: 4, strict_min: true, leafvalue: true, ..Options::default() },
+                    RuleType::LeafValueRule {
+                        right: NewField::ValueField(ValueType::Int { min: 0, max: 255 }),
+                    },
+                    Options {
+                        min: 3,
+                        max: 4,
+                        strict_min: true,
+                        leafvalue: true,
+                        ..Options::default()
+                    },
                 ),
                 (
-                    RuleType::LeafValueRule { right: NewField::ValueField(ValueType::Float { min: 0.0, max: 2.0 }) },
-                    Options { min: 3, max: 4, strict_min: true, leafvalue: true, ..Options::default() },
+                    RuleType::LeafValueRule {
+                        right: NewField::ValueField(ValueType::Float { min: 0.0, max: 2.0 }),
+                    },
+                    Options {
+                        min: 3,
+                        max: 4,
+                        strict_min: true,
+                        leafvalue: true,
+                        ..Options::default()
+                    },
                 ),
             ]
         }
@@ -651,7 +841,18 @@ fn extract_types_from_children(
             if let Some(typename) = extract_bracket_content(&key, "type") {
                 let typedef = if is_leaf {
                     if let Child::Leaf(lidx) = tchild {
+<<<<<<< Updated upstream
                         process_type_node(typename, &ast.arena.leaves[*lidx as usize], ast, table, ruleset, comments)
+=======
+                        process_type_node(
+                            typename,
+                            &ast.arena.leaves[*lidx as usize],
+                            ast,
+                            table,
+                            ruleset,
+                            &comments,
+                        )
+>>>>>>> Stashed changes
                     } else {
                         continue;
                     }
@@ -693,13 +894,33 @@ fn extract_enums_from_children(
             if let Some(enum_name) = extract_bracket_content(&key, "enum") {
                 let def = if is_leaf {
                     if let Child::Leaf(lidx) = echild {
+<<<<<<< Updated upstream
                         process_enum_node(enum_name, &ast.arena.leaves[*lidx as usize], ast, table, comments)
+=======
+                        process_enum_node(
+                            enum_name,
+                            &ast.arena.leaves[*lidx as usize],
+                            ast,
+                            table,
+                            &comments,
+                        )
+>>>>>>> Stashed changes
                     } else {
                         continue;
                     }
                 } else {
                     if let Child::Node(nidx) = echild {
+<<<<<<< Updated upstream
                         process_enum_node_from_node(enum_name, &ast.arena.nodes[*nidx as usize], ast, table, comments)
+=======
+                        process_enum_node_from_node(
+                            enum_name,
+                            &ast.arena.nodes[*nidx as usize],
+                            ast,
+                            table,
+                            &comments,
+                        )
+>>>>>>> Stashed changes
                     } else {
                         continue;
                     }
@@ -718,7 +939,13 @@ fn extract_enums_from_children(
                     let leaf = &ast.arena.leaves[*lidx as usize];
                     if let Value::Clause(ch) = &leaf.value {
                         // Synthesize a node-like view from the clause children
+<<<<<<< Updated upstream
                         let def = process_complex_enum_from_children(enum_name, ch, ast, table, comments);
+=======
+                        let def = process_complex_enum_from_children(
+                            enum_name, ch, ast, table, &comments,
+                        );
+>>>>>>> Stashed changes
                         ruleset.complex_enums.push(def);
                     }
                 }
@@ -738,8 +965,12 @@ fn extract_modifier_names(
 ) {
     for child in children {
         let name = match child {
-            Child::Leaf(lidx) => table.get_string(ast.arena.leaves[*lidx as usize].key.normal).unwrap_or_default(),
-            Child::Node(nidx) => table.get_string(ast.arena.nodes[*nidx as usize].key.normal).unwrap_or_default(),
+            Child::Leaf(lidx) => table
+                .get_string(ast.arena.leaves[*lidx as usize].key.normal)
+                .unwrap_or_default(),
+            Child::Node(nidx) => table
+                .get_string(ast.arena.nodes[*nidx as usize].key.normal)
+                .unwrap_or_default(),
             _ => continue,
         };
         if !name.is_empty() {
@@ -760,8 +991,12 @@ fn extract_link_names(
 ) {
     for child in children {
         let name = match child {
-            Child::Leaf(lidx) => table.get_string(ast.arena.leaves[*lidx as usize].key.normal).unwrap_or_default(),
-            Child::Node(nidx) => table.get_string(ast.arena.nodes[*nidx as usize].key.normal).unwrap_or_default(),
+            Child::Leaf(lidx) => table
+                .get_string(ast.arena.leaves[*lidx as usize].key.normal)
+                .unwrap_or_default(),
+            Child::Node(nidx) => table
+                .get_string(ast.arena.nodes[*nidx as usize].key.normal)
+                .unwrap_or_default(),
             _ => continue,
         };
         if !name.is_empty() {
@@ -792,7 +1027,11 @@ fn extract_values_from_children(
             if let Some(value_name) = extract_bracket_content(&key, "value") {
                 let vals = if is_leaf {
                     if let Child::Leaf(lidx) = vchild {
-                        collect_leaf_values_from_clause(&ast.arena.leaves[*lidx as usize].value, ast, table)
+                        collect_leaf_values_from_clause(
+                            &ast.arena.leaves[*lidx as usize].value,
+                            ast,
+                            table,
+                        )
                     } else {
                         Vec::new()
                     }
@@ -810,7 +1049,11 @@ fn extract_values_from_children(
     }
 }
 
-fn collect_leaf_values_from_clause(value: &Value, ast: &ParsedFile, table: &StringTable) -> Vec<String> {
+fn collect_leaf_values_from_clause(
+    value: &Value,
+    ast: &ParsedFile,
+    table: &StringTable,
+) -> Vec<String> {
     if let Value::Clause(ch) = value {
         collect_leaf_values_from_children(ch, ast, table)
     } else {
@@ -818,7 +1061,11 @@ fn collect_leaf_values_from_clause(value: &Value, ast: &ParsedFile, table: &Stri
     }
 }
 
-fn collect_leaf_values_from_children(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<String> {
+fn collect_leaf_values_from_children(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+) -> Vec<String> {
     let mut out = Vec::new();
     for child in children {
         match child {
@@ -934,7 +1181,18 @@ fn process_type_node(
                     let k = table.get_string(l.key.normal).unwrap_or_default();
                     if k.starts_with("subtype[") {
                         if let Some(st_name) = extract_bracket_content(&k, "subtype") {
+<<<<<<< Updated upstream
                             let st = process_subtype_node_from_leaf(st_name, l, ast, table, ruleset, child_comments);
+=======
+                            let st = process_subtype_node_from_leaf(
+                                st_name,
+                                l,
+                                ast,
+                                table,
+                                ruleset,
+                                &child_comments,
+                            );
+>>>>>>> Stashed changes
                             def.subtypes.push(st);
                         }
                     } else if k == "localisation" || k == "modifiers" {
@@ -1006,12 +1264,17 @@ fn process_type_node(
                                         for existing in def.skip_root_key.drain(..) {
                                             match existing {
                                                 SkipRootKey::SpecificKey(k) => all_keys.push(k),
-                                                SkipRootKey::MultipleKeys(mut ks, _) => all_keys.append(&mut ks),
+                                                SkipRootKey::MultipleKeys(mut ks, _) => {
+                                                    all_keys.append(&mut ks)
+                                                }
                                                 SkipRootKey::AnyKey => {}
                                             }
                                         }
                                         all_keys.push(v);
-                                        def.skip_root_key.push(SkipRootKey::MultipleKeys(all_keys, should_match));
+                                        def.skip_root_key.push(SkipRootKey::MultipleKeys(
+                                            all_keys,
+                                            should_match,
+                                        ));
                                     }
                                 }
                             }
@@ -1024,7 +1287,18 @@ fn process_type_node(
                     let nk = table.get_string(n.key.normal).unwrap_or_default();
                     if nk.starts_with("subtype[") {
                         if let Some(st_name) = extract_bracket_content(&nk, "subtype") {
+<<<<<<< Updated upstream
                             let st = process_subtype_node(st_name, n, ast, table, ruleset, child_comments);
+=======
+                            let st = process_subtype_node(
+                                st_name,
+                                n,
+                                ast,
+                                table,
+                                ruleset,
+                                &child_comments,
+                            );
+>>>>>>> Stashed changes
                             def.subtypes.push(st);
                         }
                     } else if nk == "localisation" {
@@ -1048,7 +1322,8 @@ fn process_type_node(
                             }
                         }
                         if !block_keys.is_empty() {
-                            def.skip_root_key.push(SkipRootKey::MultipleKeys(block_keys, true));
+                            def.skip_root_key
+                                .push(SkipRootKey::MultipleKeys(block_keys, true));
                         }
                     }
                 }
@@ -1070,7 +1345,8 @@ fn process_type_node(
                     SkipRootKey::AnyKey => {}
                 }
             }
-            def.skip_root_key.push(SkipRootKey::MultipleKeys(all_keys, should_match));
+            def.skip_root_key
+                .push(SkipRootKey::MultipleKeys(all_keys, should_match));
         }
 
         // Parse localisation block
@@ -1116,7 +1392,11 @@ fn parse_type_key_filter_from_comments(comments: &[String]) -> Option<(Vec<Strin
         };
         let values = if rhs.starts_with('{') && rhs.ends_with('}') {
             let inner = rhs.trim_matches(|c| c == '{' || c == '}');
-            inner.split_whitespace().filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+            inner
+                .split_whitespace()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
         } else {
             vec![rhs]
         };
@@ -1132,7 +1412,11 @@ fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
             let rhs = c[idx + 1..].trim().to_string();
             if rhs.starts_with('{') && rhs.ends_with('}') {
                 let inner = rhs.trim_matches(|c| c == '{' || c == '}');
-                return inner.split_whitespace().filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+                return inner
+                    .split_whitespace()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
             } else {
                 return vec![rhs];
             }
@@ -1141,7 +1425,11 @@ fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
     Vec::new()
 }
 
-fn parse_localisation_block(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<TypeLocalisation> {
+fn parse_localisation_block(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+) -> Vec<TypeLocalisation> {
     let mut out = Vec::new();
     let precomputed = precompute_comments(children, ast, table);
     for (cidx, child) in children.iter().enumerate() {
@@ -1190,7 +1478,11 @@ fn parse_localisation_block(children: &[Child], ast: &ParsedFile, table: &String
     out
 }
 
-fn parse_subtype_localisation(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<(String, Vec<TypeLocalisation>)> {
+fn parse_subtype_localisation(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+) -> Vec<(String, Vec<TypeLocalisation>)> {
     let mut out = Vec::new();
     for child in children {
         if let Child::Node(nidx) = child {
@@ -1207,7 +1499,11 @@ fn parse_subtype_localisation(children: &[Child], ast: &ParsedFile, table: &Stri
     out
 }
 
-fn parse_modifiers_block(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<TypeModifier> {
+fn parse_modifiers_block(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+) -> Vec<TypeModifier> {
     let mut out = Vec::new();
     let precomputed = precompute_comments(children, ast, table);
     for (cidx, child) in children.iter().enumerate() {
@@ -1220,16 +1516,29 @@ fn parse_modifiers_block(children: &[Child], ast: &ParsedFile, table: &StringTab
             }
             let value = value_to_string(&l.value, table);
             let explicit = child_comments.iter().any(|s| s.contains("explicit"));
-            let documentation = child_comments.iter()
+            let documentation = child_comments
+                .iter()
                 .find(|s| s.starts_with("##"))
                 .map(|s| s.trim_start_matches('#').trim().to_string());
 
             let modifier = if let Some(dollar_idx) = value.find('$') {
                 let prefix = value[..dollar_idx].to_string();
                 let suffix = value[dollar_idx + 1..].to_string();
-                TypeModifier { prefix, suffix, category: key, documentation, explicit }
+                TypeModifier {
+                    prefix,
+                    suffix,
+                    category: key,
+                    documentation,
+                    explicit,
+                }
             } else {
-                TypeModifier { prefix: String::new(), suffix: String::new(), category: key, documentation, explicit }
+                TypeModifier {
+                    prefix: String::new(),
+                    suffix: String::new(),
+                    category: key,
+                    documentation,
+                    explicit,
+                }
             };
             out.push(modifier);
         }
@@ -1237,7 +1546,11 @@ fn parse_modifiers_block(children: &[Child], ast: &ParsedFile, table: &StringTab
     out
 }
 
-fn parse_subtype_modifiers(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<(String, Vec<TypeModifier>)> {
+fn parse_subtype_modifiers(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+) -> Vec<(String, Vec<TypeModifier>)> {
     let mut out = Vec::new();
     for child in children {
         if let Child::Node(nidx) = child {
@@ -1306,20 +1619,24 @@ fn build_subtype(
     // subtype body (the inline alternative to a ## type_key_filter = ... comment).
     // Strip it out of the children before building rules so it doesn't become a
     // spurious required field.
-    let filtered_children: Vec<Child> = children.iter().filter(|child| {
-        if let Child::Leaf(lidx) = child {
-            let leaf = &ast.arena.leaves[*lidx as usize];
-            let k = table.get_string(leaf.key.normal).unwrap_or_default();
-            if k == "type_key_field" {
-                // Extract its value as the type_key_field discriminator and skip it.
-                if type_key_field.is_none() {
-                    type_key_field = Some(value_to_string(&leaf.value, table));
+    let filtered_children: Vec<Child> = children
+        .iter()
+        .filter(|child| {
+            if let Child::Leaf(lidx) = child {
+                let leaf = &ast.arena.leaves[*lidx as usize];
+                let k = table.get_string(leaf.key.normal).unwrap_or_default();
+                if k == "type_key_field" {
+                    // Extract its value as the type_key_field discriminator and skip it.
+                    if type_key_field.is_none() {
+                        type_key_field = Some(value_to_string(&leaf.value, table));
+                    }
+                    return false;
                 }
-                return false;
             }
-        }
-        true
-    }).cloned().collect();
+            true
+        })
+        .cloned()
+        .collect();
 
     // Convert children using full children_to_rules for proper typing
     let rules = children_to_rules(&filtered_children, ast, table, ruleset);
@@ -1340,7 +1657,8 @@ fn build_subtype(
 }
 
 fn extract_comment_value(comments: &[String], key: &str) -> Option<String> {
-    comments.iter()
+    comments
+        .iter()
         .find(|s| s.contains(key) && s.contains('='))
         .and_then(|s| s.find('=').map(|i| s[i + 1..].trim().to_string()))
         .filter(|s| !s.is_empty())
@@ -1352,7 +1670,11 @@ fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {
             let rhs = c[idx + 1..].trim().to_string();
             if rhs.starts_with('{') && rhs.ends_with('}') {
                 let inner = rhs.trim_matches(|c| c == '{' || c == '}');
-                return inner.split_whitespace().filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+                return inner
+                    .split_whitespace()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
             } else {
                 return vec![rhs];
             }
@@ -1393,17 +1715,21 @@ fn process_enum_node(
     }
 
     // Description from ### or ## comments
-    let description = extract_description_from_comments(comments)
-        .unwrap_or_else(|| name.clone());
+    let description = extract_description_from_comments(comments).unwrap_or_else(|| name.clone());
 
-    EnumDefinition { key: name, description, values }
+    EnumDefinition {
+        key: name,
+        description,
+        values,
+    }
 }
 
 /// Extract description from ### comments (## are options).
 fn extract_description_from_comments(comments: &[String]) -> Option<String> {
     // F# collects all comments starting with ## and joins them
     // but ### is just ## with an extra # (all start with ##)
-    let desc_lines: Vec<String> = comments.iter()
+    let desc_lines: Vec<String> = comments
+        .iter()
         .filter(|s| s.starts_with("##"))
         .map(|s| s.trim_matches('#').trim().to_string())
         .collect();
@@ -1453,10 +1779,22 @@ fn process_complex_enum_from_children(
                 let v = leaf_value_string(l, table);
                 match k.as_str() {
                     "path" => paths.push(clean_path(&v)),
-                    "path_strict" => { if v == "yes" { path_strict = true; } }
-                    "path_file" => { path_file = Some(v); }
-                    "path_extension" => { path_extension = Some(v); }
-                    "start_from_root" => { if v == "yes" { start_from_root = true; } }
+                    "path_strict" => {
+                        if v == "yes" {
+                            path_strict = true;
+                        }
+                    }
+                    "path_file" => {
+                        path_file = Some(v);
+                    }
+                    "path_extension" => {
+                        path_extension = Some(v);
+                    }
+                    "start_from_root" => {
+                        if v == "yes" {
+                            start_from_root = true;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1471,20 +1809,32 @@ fn process_complex_enum_from_children(
         }
     }
 
-    let description = extract_description_from_comments(comments)
-        .unwrap_or_else(|| name.clone());
+    let description = extract_description_from_comments(comments).unwrap_or_else(|| name.clone());
 
     ComplexEnumDef {
         name,
         description,
+<<<<<<< Updated upstream
         path_options: PathOptions { paths, path_strict, path_file, path_extension, paths_lower: Vec::new() },
+=======
+        path_options: PathOptions {
+            paths,
+            path_strict,
+            path_file,
+            path_extension,
+        },
+>>>>>>> Stashed changes
         name_tree: name_tree.unwrap_or(ComplexEnumNameTree::Empty),
         start_from_root,
     }
 }
 
 /// Build a ComplexEnumNameTree from the `name = { ... }` block children.
-fn build_name_tree(children: &[Child], ast: &ParsedFile, table: &StringTable) -> ComplexEnumNameTree {
+fn build_name_tree(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+) -> ComplexEnumNameTree {
     let mut entries = Vec::new();
     for child in children {
         match child {
@@ -1494,13 +1844,22 @@ fn build_name_tree(children: &[Child], ast: &ParsedFile, table: &StringTable) ->
                 // Leaf with Clause value = nested node in CWT
                 if let Value::Clause(sub_ch) = &l.value {
                     let sub = build_name_tree(sub_ch, ast, table);
-                    entries.push(ComplexEnumNameTreeEntry::Node { key: k, children: sub });
+                    entries.push(ComplexEnumNameTreeEntry::Node {
+                        key: k,
+                        children: sub,
+                    });
                 } else {
                     let v = leaf_value_string(l, table);
                     if v == "enum_name" || v == "this" {
-                        entries.push(ComplexEnumNameTreeEntry::Leaf { key: k, is_name: true });
+                        entries.push(ComplexEnumNameTreeEntry::Leaf {
+                            key: k,
+                            is_name: true,
+                        });
                     } else {
-                        entries.push(ComplexEnumNameTreeEntry::Leaf { key: k, is_name: false });
+                        entries.push(ComplexEnumNameTreeEntry::Leaf {
+                            key: k,
+                            is_name: false,
+                        });
                     }
                 }
             }
@@ -1508,7 +1867,10 @@ fn build_name_tree(children: &[Child], ast: &ParsedFile, table: &StringTable) ->
                 let n = &ast.arena.nodes[*nidx as usize];
                 let nk = table.get_string(n.key.normal).unwrap_or_default();
                 let sub = build_name_tree(&n.children, ast, table);
-                entries.push(ComplexEnumNameTreeEntry::Node { key: nk, children: sub });
+                entries.push(ComplexEnumNameTreeEntry::Node {
+                    key: nk,
+                    children: sub,
+                });
             }
             _ => {}
         }
@@ -1559,37 +1921,43 @@ fn get_setting_from_string(full: &str, key: &str) -> Option<String> {
 /// CRITICAL: when NO cardinality comment is present, use min=1, max=1, strict_min=true (F# default).
 fn options_from_comments(comments: &[String], is_comparison: bool) -> Options {
     // Cardinality: match by Contains("cardinality") (handles both ## and ##cardinality= forms)
-    let (min, max, strict_min) = if let Some(c) = comments.iter().find(|s| s.contains("cardinality")) {
-        // Extract everything after the '='
-        if let Some(eq_idx) = c.find('=') {
-            let spec = c[eq_idx + 1..].trim();
-            if let Some((min_s, max_s)) = spec.split_once("..") {
-                let min_s = min_s.trim();
-                // Handle ~ prefix for strict_min=false
-                let (min_s, strict) = if min_s.starts_with('~') {
-                    (&min_s[1..], false)
+    let (min, max, strict_min) =
+        if let Some(c) = comments.iter().find(|s| s.contains("cardinality")) {
+            // Extract everything after the '='
+            if let Some(eq_idx) = c.find('=') {
+                let spec = c[eq_idx + 1..].trim();
+                if let Some((min_s, max_s)) = spec.split_once("..") {
+                    let min_s = min_s.trim();
+                    // Handle ~ prefix for strict_min=false
+                    let (min_s, strict) = if min_s.starts_with('~') {
+                        (&min_s[1..], false)
+                    } else {
+                        (min_s, true)
+                    };
+                    let min = min_s.parse::<i32>().unwrap_or(1);
+                    let max = if max_s.trim() == "inf" {
+                        i32::MAX
+                    } else {
+                        max_s.trim().parse::<i32>().unwrap_or(1)
+                    };
+                    (min, max, strict)
                 } else {
-                    (min_s, true)
-                };
-                let min = min_s.parse::<i32>().unwrap_or(1);
-                let max = if max_s.trim() == "inf" { i32::MAX } else { max_s.trim().parse::<i32>().unwrap_or(1) };
-                (min, max, strict)
+                    (1, 1, true)
+                }
             } else {
                 (1, 1, true)
             }
         } else {
+            // No cardinality comment -> F# default: 1..1, strict
             (1, 1, true)
-        }
-    } else {
-        // No cardinality comment -> F# default: 1..1, strict
-        (1, 1, true)
-    };
+        };
 
     // Description: all ## lines joined
     let description = extract_description_from_comments(comments);
 
     // push_scope: match by Contains("push_scope")
-    let push_scope = comments.iter()
+    let push_scope = comments
+        .iter()
         .find(|s| s.contains("push_scope"))
         .and_then(|s| s.find('=').map(|i| s[i + 1..].trim().to_string()))
         .filter(|s| !s.is_empty());
@@ -1598,7 +1966,8 @@ fn options_from_comments(comments: &[String], is_comparison: bool) -> Options {
     let replace_scopes = parse_replace_scopes_from_comments(comments);
 
     // severity
-    let severity = comments.iter()
+    let severity = comments
+        .iter()
         .find(|s| s.contains("severity"))
         .and_then(|s| s.find('=').map(|i| s[i + 1..].trim().to_string()))
         .and_then(|sev| match sev.as_str() {
@@ -1613,16 +1982,23 @@ fn options_from_comments(comments: &[String], is_comparison: bool) -> Options {
     let required_scopes = parse_required_scopes(comments);
 
     // reference_details
-    let reference_details = if let Some(c) = comments.iter().find(|s| s.contains("outgoingReferenceLabel")) {
+    let reference_details = if let Some(c) = comments
+        .iter()
+        .find(|s| s.contains("outgoingReferenceLabel"))
+    {
         c.find('=').map(|i| (true, c[i + 1..].trim().to_string()))
-    } else if let Some(c) = comments.iter().find(|s| s.contains("incomingReferenceLabel")) {
+    } else if let Some(c) = comments
+        .iter()
+        .find(|s| s.contains("incomingReferenceLabel"))
+    {
         c.find('=').map(|i| (false, c[i + 1..].trim().to_string()))
     } else {
         None
     };
 
     // error_if_only_match
-    let error_if_only_match = comments.iter()
+    let error_if_only_match = comments
+        .iter()
         .find(|s| s.contains("error_if_only_match"))
         .and_then(|s| s.find('=').map(|i| s[i + 1..].trim().to_string()))
         .filter(|s| !s.is_empty());
@@ -1680,14 +2056,56 @@ fn parse_replace_scopes_from_comments(comments: &[String]) -> Option<ReplaceScop
             match tokens[ti] {
                 "this" => this = Some(tokens[ti + 2].to_string()),
                 "root" => root = Some(tokens[ti + 2].to_string()),
-                "from" => { if froms.is_empty() { froms.push(tokens[ti + 2].to_string()); } else { froms[0] = tokens[ti + 2].to_string(); } }
-                "fromfrom" => { while froms.len() < 2 { froms.push(String::new()); } froms[1] = tokens[ti + 2].to_string(); }
-                "fromfromfrom" => { while froms.len() < 3 { froms.push(String::new()); } froms[2] = tokens[ti + 2].to_string(); }
-                "fromfromfromfrom" => { while froms.len() < 4 { froms.push(String::new()); } froms[3] = tokens[ti + 2].to_string(); }
-                "prev" => { if prevs.is_empty() { prevs.push(tokens[ti + 2].to_string()); } else { prevs[0] = tokens[ti + 2].to_string(); } }
-                "prevprev" => { while prevs.len() < 2 { prevs.push(String::new()); } prevs[1] = tokens[ti + 2].to_string(); }
-                "prevprevprev" => { while prevs.len() < 3 { prevs.push(String::new()); } prevs[2] = tokens[ti + 2].to_string(); }
-                "prevprevprevprev" => { while prevs.len() < 4 { prevs.push(String::new()); } prevs[3] = tokens[ti + 2].to_string(); }
+                "from" => {
+                    if froms.is_empty() {
+                        froms.push(tokens[ti + 2].to_string());
+                    } else {
+                        froms[0] = tokens[ti + 2].to_string();
+                    }
+                }
+                "fromfrom" => {
+                    while froms.len() < 2 {
+                        froms.push(String::new());
+                    }
+                    froms[1] = tokens[ti + 2].to_string();
+                }
+                "fromfromfrom" => {
+                    while froms.len() < 3 {
+                        froms.push(String::new());
+                    }
+                    froms[2] = tokens[ti + 2].to_string();
+                }
+                "fromfromfromfrom" => {
+                    while froms.len() < 4 {
+                        froms.push(String::new());
+                    }
+                    froms[3] = tokens[ti + 2].to_string();
+                }
+                "prev" => {
+                    if prevs.is_empty() {
+                        prevs.push(tokens[ti + 2].to_string());
+                    } else {
+                        prevs[0] = tokens[ti + 2].to_string();
+                    }
+                }
+                "prevprev" => {
+                    while prevs.len() < 2 {
+                        prevs.push(String::new());
+                    }
+                    prevs[1] = tokens[ti + 2].to_string();
+                }
+                "prevprevprev" => {
+                    while prevs.len() < 3 {
+                        prevs.push(String::new());
+                    }
+                    prevs[2] = tokens[ti + 2].to_string();
+                }
+                "prevprevprevprev" => {
+                    while prevs.len() < 4 {
+                        prevs.push(String::new());
+                    }
+                    prevs[3] = tokens[ti + 2].to_string();
+                }
                 _ => {}
             }
             ti += 3;
@@ -1700,17 +2118,28 @@ fn parse_replace_scopes_from_comments(comments: &[String]) -> Option<ReplaceScop
         return None;
     }
 
-    Some(ReplaceScopes { root, this, froms, prevs })
+    Some(ReplaceScopes {
+        root,
+        this,
+        froms,
+        prevs,
+    })
 }
 
 fn parse_required_scopes(comments: &[String]) -> Vec<String> {
     // Match F#: looks for "# scope =" (single #, starts_with "# scope =")
-    if let Some(c) = comments.iter().find(|s| s.starts_with("# scope =") || s.starts_with("#scope =") || s.starts_with("# scope=")) {
+    if let Some(c) = comments.iter().find(|s| {
+        s.starts_with("# scope =") || s.starts_with("#scope =") || s.starts_with("# scope=")
+    }) {
         let eq_idx = c.find('=').unwrap_or(0);
         let rhs = c[eq_idx + 1..].trim();
         if rhs.starts_with('{') && rhs.ends_with('}') {
             let inner = &rhs[1..rhs.len() - 1];
-            return inner.split_whitespace().filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+            return inner
+                .split_whitespace()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
         } else {
             return vec![rhs.to_string()];
         }
@@ -1720,7 +2149,8 @@ fn parse_required_scopes(comments: &[String]) -> Vec<String> {
 
 fn clean_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
-    normalized.strip_prefix("game/")
+    normalized
+        .strip_prefix("game/")
         .unwrap_or(&normalized)
         .to_string()
 }

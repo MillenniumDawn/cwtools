@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
 use cwtools_string_table::string_table::StringTable;
+use std::collections::HashMap;
 
 /// Index of symbols across all loaded documents.
 /// For each symbol name, stores (uri, line) pairs where it's defined or referenced.
@@ -27,24 +27,13 @@ impl SymbolIndex {
     }
 
     /// Index a parsed document.
-    pub fn index_document(
-        &mut self,
-        uri: &str,
-        ast: &ParsedFile,
-        table: &StringTable,
-    ) {
+    pub fn index_document(&mut self, uri: &str, ast: &ParsedFile, table: &StringTable) {
         for child in &ast.root_children {
             self.index_child(uri, child, &ast.arena, table);
         }
     }
 
-    fn index_child(
-        &mut self,
-        uri: &str,
-        child: &Child,
-        arena: &Arena,
-        table: &StringTable,
-    ) {
+    fn index_child(&mut self, uri: &str, child: &Child, arena: &Arena, table: &StringTable) {
         match child {
             Child::Node(idx) => {
                 let node = &arena.nodes[*idx as usize];
@@ -84,14 +73,13 @@ impl SymbolIndex {
                     let value = table.get_string(t.normal).unwrap_or_default();
                     if value.starts_with('<') && value.ends_with('>') {
                         let inner = &value[1..value.len() - 1];
-                        self.references
-                            .entry(inner.to_string())
-                            .or_default()
-                            .push(SymbolLocation {
+                        self.references.entry(inner.to_string()).or_default().push(
+                            SymbolLocation {
                                 uri: uri.to_string(),
                                 line: leaf.pos.start.line,
                                 col: leaf.pos.start.col,
-                            });
+                            },
+                        );
                     }
                 }
             }
@@ -110,21 +98,15 @@ impl SymbolIndex {
     }
 
     #[allow(dead_code)]
-    pub fn find_definitions(&self,
-        name: &str,
-    ) -> Option<&Vec<SymbolLocation>> {
+    pub fn find_definitions(&self, name: &str) -> Option<&Vec<SymbolLocation>> {
         self.definitions.get(name)
     }
 
-    pub fn find_references(&self,
-        name: &str,
-    ) -> Option<&Vec<SymbolLocation>> {
+    pub fn find_references(&self, name: &str) -> Option<&Vec<SymbolLocation>> {
         self.references.get(name)
     }
 
-    pub fn clear_document(&mut self,
-        uri: &str,
-    ) {
+    pub fn clear_document(&mut self, uri: &str) {
         for locs in self.definitions.values_mut() {
             locs.retain(|l| l.uri != uri);
         }

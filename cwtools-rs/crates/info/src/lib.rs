@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
 use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
-use cwtools_string_table::string_table::StringTable;
 use cwtools_rules::rules_types::{
     NewField, PathOptions, RuleSet, RuleType, SkipRootKey, TypeDefinition,
 };
+use cwtools_string_table::string_table::StringTable;
+use std::collections::{HashMap, HashSet};
 
 pub mod inline_expansion;
 pub mod vanilla_cache;
@@ -69,7 +69,10 @@ impl TypeIndex {
     pub fn contains(&self, type_name: &str, instance: &str) -> bool {
         self.map
             .get(type_name)
-            .map(|v| v.iter().any(|(_, ti)| ti.name.eq_ignore_ascii_case(instance)))
+            .map(|v| {
+                v.iter()
+                    .any(|(_, ti)| ti.name.eq_ignore_ascii_case(instance))
+            })
             .unwrap_or(false)
     }
 
@@ -83,10 +86,7 @@ impl TypeIndex {
 
     /// All instances for a type (across all files).
     pub fn instances(&self, type_name: &str) -> &[(String, TypeInstance)] {
-        self.map
-            .get(type_name)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.map.get(type_name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Merge per-file results into the index.
@@ -258,7 +258,12 @@ fn collect_skip_root_child(
         Child::Node(ni) => {
             let node = &arena.nodes[*ni as usize];
             let k = table.get_string(node.key.normal).unwrap_or_default();
-            (k, node.children.as_slice(), node.pos.start.line, node.pos.start.col)
+            (
+                k,
+                node.children.as_slice(),
+                node.pos.start.line,
+                node.pos.start.col,
+            )
         }
         Child::Leaf(li) => {
             let leaf = &arena.leaves[*li as usize];
@@ -275,7 +280,9 @@ fn collect_skip_root_child(
         [] => {
             // We are at the instance node.
             if type_key_filter_matches(td, &key) && starts_with_matches(td, &key) {
-                if let Some(name) = instance_name_from_children(td, &key, clause_children, arena, table) {
+                if let Some(name) =
+                    instance_name_from_children(td, &key, clause_children, arena, table)
+                {
                     out.push(TypeInstance {
                         name,
                         location: SourceLocation {
@@ -409,14 +416,16 @@ fn collect_vars_recursive(
 
                 // @var = value  (classic at-prefix variable)
                 if key.starts_with('@') {
-                    out.entry("@".to_string()).or_default().push(DefinedVariable {
-                        name: key.clone(),
-                        namespace: None,
-                        location: SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        },
-                    });
+                    out.entry("@".to_string())
+                        .or_default()
+                        .push(DefinedVariable {
+                            name: key.clone(),
+                            namespace: None,
+                            location: SourceLocation {
+                                line: leaf.pos.start.line,
+                                col: leaf.pos.start.col,
+                            },
+                        });
                 }
 
                 // Recurse into clause values
@@ -468,7 +477,9 @@ pub fn collect_defined_variables_from_rules(
         }
         // Find the TypeRule for this typedef in root_rules
         for root_rule in &ruleset.root_rules {
-            if let cwtools_rules::rules_types::RootRule::TypeRule(name, (rule_type, _opts)) = root_rule {
+            if let cwtools_rules::rules_types::RootRule::TypeRule(name, (rule_type, _opts)) =
+                root_rule
+            {
                 if name != &td.name {
                     continue;
                 }
@@ -505,14 +516,16 @@ fn collect_at_vars(
                 let leaf = &arena.leaves[*idx as usize];
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
                 if key.starts_with('@') {
-                    out.entry("@".to_string()).or_default().push(DefinedVariable {
-                        name: key.clone(),
-                        namespace: None,
-                        location: SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        },
-                    });
+                    out.entry("@".to_string())
+                        .or_default()
+                        .push(DefinedVariable {
+                            name: key.clone(),
+                            namespace: None,
+                            location: SourceLocation {
+                                line: leaf.pos.start.line,
+                                col: leaf.pos.start.col,
+                            },
+                        });
                 }
                 if let Value::Clause(ch) = &leaf.value {
                     collect_at_vars(ch, arena, table, out);
@@ -531,7 +544,10 @@ fn scan_node_for_varset(
     node_idx: usize,
     arena: &Arena,
     table: &StringTable,
-    rules: &[(cwtools_rules::rules_types::RuleType, cwtools_rules::rules_types::Options)],
+    rules: &[(
+        cwtools_rules::rules_types::RuleType,
+        cwtools_rules::rules_types::Options,
+    )],
     out: &mut HashMap<String, Vec<DefinedVariable>>,
 ) {
     let node = &arena.nodes[node_idx];
@@ -781,7 +797,10 @@ pub fn info_at_position(
     )
 }
 
-fn pos_in_range(pos: &cwtools_parser::ast::SourcePos, range: &cwtools_parser::ast::SourceRange) -> bool {
+fn pos_in_range(
+    pos: &cwtools_parser::ast::SourcePos,
+    range: &cwtools_parser::ast::SourceRange,
+) -> bool {
     let start = &range.start;
     let end = &range.end;
     if pos.line < start.line || pos.line > end.line {
@@ -811,7 +830,12 @@ fn find_pos_in_children(
                 if pos_in_range(target, &node.pos) {
                     // Try children first (deeper match wins)
                     if let Some(inner) = find_pos_in_children(
-                        &node.children, arena, target, table, ruleset, logical_path,
+                        &node.children,
+                        arena,
+                        target,
+                        table,
+                        ruleset,
+                        logical_path,
                     ) {
                         return Some(inner);
                     }
@@ -834,14 +858,13 @@ fn find_pos_in_children(
                     let value = leaf_value_string(&leaf.value, table);
                     // If value is a clause, try to recurse into it
                     if let Value::Clause(ch) = &leaf.value {
-                        if let Some(inner) = find_pos_in_children(
-                            ch, arena, target, table, ruleset, logical_path,
-                        ) {
+                        if let Some(inner) =
+                            find_pos_in_children(ch, arena, target, table, ruleset, logical_path)
+                        {
                             return Some(inner);
                         }
                     }
-                    let hint =
-                        classify_leaf_value(&key, &value, ruleset, logical_path, table);
+                    let hint = classify_leaf_value(&key, &value, ruleset, logical_path, table);
                     return Some(PositionInfo {
                         location: SourceLocation {
                             line: leaf.pos.start.line,
@@ -864,7 +887,9 @@ fn find_pos_in_children(
                             line: lv.pos.start.line,
                             col: lv.pos.start.col,
                         },
-                        element: PositionElement::LeafValue { value: value.clone() },
+                        element: PositionElement::LeafValue {
+                            value: value.clone(),
+                        },
                         hint: ReferenceHint::Unknown,
                     });
                 }
@@ -1233,13 +1258,12 @@ impl InfoService {
                     ));
 
                     if type_names.contains(&key) {
-                        info.type_definitions
-                            .entry(key.clone())
-                            .or_default()
-                            .push(SourceLocation {
+                        info.type_definitions.entry(key.clone()).or_default().push(
+                            SourceLocation {
                                 line: leaf.pos.start.line,
                                 col: leaf.pos.start.col,
-                            });
+                            },
+                        );
                     }
                 }
 
@@ -1296,13 +1320,11 @@ impl InfoService {
                     if let Value::Clause(children) = &leaf.value {
                         for c in children {
                             if let Child::Leaf(script_idx) = c {
-                                let script_leaf =
-                                    &arena.leaves[*script_idx as usize];
+                                let script_leaf = &arena.leaves[*script_idx as usize];
                                 let script_key =
                                     table.get_string(script_leaf.key.normal).unwrap_or_default();
                                 if script_key == "script" {
-                                    let script_name =
-                                        leaf_value_string(&script_leaf.value, table);
+                                    let script_name = leaf_value_string(&script_leaf.value, table);
                                     if !script_name.is_empty() {
                                         info.inline_scripts.insert(
                                             script_name,
@@ -1386,7 +1408,13 @@ mod tests {
         let mut info = FileInfo::default();
         let type_names = HashSet::new();
         for child in &parsed.root_children {
-            InfoService::index_child_heuristic(child, &parsed.arena, &table, &type_names, &mut info);
+            InfoService::index_child_heuristic(
+                child,
+                &parsed.arena,
+                &table,
+                &type_names,
+                &mut info,
+            );
         }
         (info, table)
     }
@@ -1449,8 +1477,7 @@ mod tests {
         let td = empty_type_def("ethoses", vec!["common/ethics"]);
         let rs = make_ruleset_with_type(td);
 
-        let result =
-            collect_type_instances(&rs, &parsed, "events/my_events.txt", &table);
+        let result = collect_type_instances(&rs, &parsed, "events/my_events.txt", &table);
         assert!(result.get("ethoses").map_or(true, |v| v.is_empty()));
     }
 
@@ -1465,15 +1492,15 @@ mod tests {
         td.skip_root_key = vec![SkipRootKey::AnyKey];
         let rs = make_ruleset_with_type(td);
 
-        let result = collect_type_instances(
-            &rs,
-            &parsed,
-            "common/technologies/00_techs.txt",
-            &table,
-        );
+        let result =
+            collect_type_instances(&rs, &parsed, "common/technologies/00_techs.txt", &table);
         let instances = result.get("technology").expect("should find technology");
         let names: Vec<&str> = instances.iter().map(|i| i.name.as_str()).collect();
-        assert!(names.contains(&"my_tech"), "expected my_tech in {:?}", names);
+        assert!(
+            names.contains(&"my_tech"),
+            "expected my_tech in {:?}",
+            names
+        );
         assert!(
             names.contains(&"another_tech"),
             "expected another_tech in {:?}",
@@ -1635,7 +1662,11 @@ effect = {
         let targets = collect_saved_event_targets(&parsed, &table);
 
         let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"my_target"), "missing my_target: {:?}", names);
+        assert!(
+            names.contains(&"my_target"),
+            "missing my_target: {:?}",
+            names
+        );
         assert!(
             names.contains(&"global_target"),
             "missing global_target: {:?}",
