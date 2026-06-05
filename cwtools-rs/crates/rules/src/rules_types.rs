@@ -24,6 +24,12 @@ pub struct RuleSet {
     /// Per-category alias metadata (the `<type>` patterns and `scope_field`),
     /// also built by `reindex()`.
     pub alias_categories: std::collections::HashMap<String, AliasCategoryIndex>,
+    /// Lookup index over `types`, built by `reindex()`. Maps a type name to its
+    /// index in `types`, so name lookups are O(1) instead of a linear scan.
+    pub type_by_name: std::collections::HashMap<String, usize>,
+    /// Lookup index over `enums`, built by `reindex()`. Maps an enum key to its
+    /// index in `enums` for O(1) lookups.
+    pub enum_by_name: std::collections::HashMap<String, usize>,
 }
 
 /// Per-category alias index entry (see `RuleSet::alias_categories`).
@@ -50,6 +56,8 @@ impl RuleSet {
             scope_links: std::collections::HashSet::new(),
             alias_exact: std::collections::HashMap::new(),
             alias_categories: std::collections::HashMap::new(),
+            type_by_name: std::collections::HashMap::new(),
+            enum_by_name: std::collections::HashMap::new(),
         }
     }
 
@@ -80,6 +88,14 @@ impl RuleSet {
             ce.path_options.paths_lower = ce.path_options.paths.iter().map(|p| {
                 p.replace('\\', "/").trim_matches('/').to_lowercase()
             }).collect();
+        }
+        self.type_by_name.clear();
+        for (i, td) in self.types.iter().enumerate() {
+            self.type_by_name.insert(td.name.clone(), i);
+        }
+        self.enum_by_name.clear();
+        for (i, e) in self.enums.iter().enumerate() {
+            self.enum_by_name.insert(e.key.clone(), i);
         }
     }
 }

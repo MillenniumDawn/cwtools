@@ -48,5 +48,5 @@ pub fn validate_common(
 }
 
 fn find_matching_type<'a>(key: &str, ruleset: &'a RuleSet) -> Option<&'a TypeDefinition> {
-    ruleset.types.iter().find(|t| t.name == key)
+    ruleset.type_by_name.get(key).map(|&i| &ruleset.types[i])
 }

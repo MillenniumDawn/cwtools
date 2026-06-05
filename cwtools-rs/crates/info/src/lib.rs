@@ -120,7 +120,7 @@ impl TypeIndex {
     }
 }
 
-// ── Path matching (mirrors F# CheckPathDir) ──────────────────────────────────
+// ── Path matching ─────────────────────────────────────────────────────────────
 
 /// Returns true when `logical_path` (e.g. `"events/my_events.txt"`) is covered
 /// by `path_options`.  Mirrors `FieldValidatorsHelper.CheckPathDir` which splits
@@ -175,7 +175,7 @@ fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
     false
 }
 
-// ── skip_root_key helper (mirrors F# skiprootkey) ────────────────────────────
+// ── skip_root_key helper ─────────────────────────────────────────────────────
 
 fn skip_root_key_matches(srk: &SkipRootKey, key: &str) -> bool {
     match srk {
@@ -300,7 +300,7 @@ fn collect_skip_root_child(
 /// Collect all type instances defined in `file` for the given `logical_path`.
 ///
 /// Returns a map from type name → list of instances found in this file.
-/// Mirrors `getTypesFromDefinitions` / `infoServiceSkipRoot` from the F# codebase.
+/// Collect type instances from AST nodes, applying skip_root_key navigation.
 #[tracing::instrument(skip_all)]
 pub fn collect_type_instances(
     ruleset: &RuleSet,
@@ -860,8 +860,8 @@ fn classify_leaf_value(
 
         // Only try path-matching type rules
         if let cwtools_rules::rules_types::RootRule::TypeRule(..) = root_rule {
-            let td = ruleset.types.iter().find(|t| &t.name == name);
-            if let Some(td) = td {
+            if let Some(&idx) = ruleset.type_by_name.get(name) {
+                let td = &ruleset.types[idx];
                 if !check_path_dir(&td.path_options, logical_path) {
                     continue;
                 }
@@ -916,7 +916,7 @@ fn classify_leaf_value(
 // Existing FileInfo / InfoService (preserved, extended)
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Computed data for a single file — mirrors F# `InfoService` batch folds.
+/// Computed data for a single file.
 #[derive(Debug, Clone, Default)]
 pub struct FileInfo {
     /// Type instances from rule-driven indexing.

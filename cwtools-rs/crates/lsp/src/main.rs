@@ -115,13 +115,8 @@ struct Backend {
 
 // ── Custom notification stubs ─────────────────────────────────────────────────
 
-// NOT PORTED — large / game-specific features left as future work:
-//   - Code actions / pre-trigger refactor: Stellaris-specific effect/trigger
-//     scaffolding (F# LanguageFeatures.getCodeActions).  Would need a full
-//     scope-context walker and template engine.
-//   - techGraph / event-graph: graphical views generated from type relations
-//     (F# LanguageFeatures.getEventGraph / techGraph).  Needs a graph-building
-//     pass over the TypeIndex.
+// NOT PORTED — code-actions, pre-trigger refactor, techGraph / event-graph.
+// See the F# LanguageFeatures.fs module if these are needed later.
 //   - getEmbeddedMetadata: per-file metadata bundle sent to the extension on
 //     open (F# LanguageFeatures.getEmbeddedMetadata).  Low priority until the
 //     extension side is ported.
@@ -350,8 +345,8 @@ fn rules_for_context<'a>(
             RootRule::TypeRule(n, r) => (n, r),
             _ => continue,
         };
-        let type_def = ruleset.types.iter().find(|t| &t.name == type_name);
-        if let Some(td) = type_def {
+        if let Some(&idx) = ruleset.type_by_name.get(type_name) {
+            let td = &ruleset.types[idx];
             // Check path
             if !cwtools_info_path_check(&td.path_options, logical_path) {
                 continue;
@@ -441,6 +436,11 @@ fn cwtools_info_path_check(opts: &cwtools_rules::rules_types::PathOptions, logic
         }
     }
     false
+}
+
+/// Parse a string into an LSP Url, falling back to a clone of `fallback` on error.
+fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
+    uri_str.as_ref().parse().unwrap_or_else(|_| fallback.clone())
 }
 
 /// Build context-aware completion items from the child rules at the cursor's
@@ -586,8 +586,8 @@ fn completions_from_rules<'a>(
 }
 
 fn enum_values_for<'a>(ruleset: &'a RuleSet, enum_name: &str) -> Vec<String> {
-    if let Some(e) = ruleset.enums.iter().find(|e| e.key == enum_name) {
-        return e.values.clone();
+    if let Some(&idx) = ruleset.enum_by_name.get(enum_name) {
+        return ruleset.enums[idx].values.clone();
     }
     Vec::new()
 }
@@ -1255,9 +1255,7 @@ impl LanguageServer for Backend {
                 .iter()
                 .filter(|(_, inst)| inst.name == instance_name)
                 .map(|(file_uri, inst)| Location {
-                    uri: file_uri.parse().unwrap_or_else(|_| {
-                        params.text_document_position_params.text_document.uri.clone()
-                    }),
+                    uri: parse_uri(file_uri, &params.text_document_position_params.text_document.uri),
                     range: Range {
                         start: Position {
                             line: inst.location.line.saturating_sub(1),
@@ -1293,7 +1291,7 @@ impl LanguageServer for Backend {
                     let info = self.state.info_service.lock().unwrap();
                     if let Some(defs) = info.find_definitions(&symbol) {
                         let locations: Vec<Location> = defs.iter().map(|(file_uri, loc)| Location {
-                            uri: file_uri.parse().unwrap_or_else(|_| params.text_document_position_params.text_document.uri.clone()),
+                            uri: parse_uri(file_uri, &params.text_document_position_params.text_document.uri),
                             range: Range {
                                 start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
                                 end: Position { line: loc.line.saturating_sub(1), character: (loc.col + symbol.len() as u16) as u32 },
@@ -1374,7 +1372,7 @@ impl LanguageServer for Backend {
                     let use_sites = scan_use_sites(&type_name, &instance_name, &*docs, rs, &ws_uri, &self.state.string_table);
                     for (file_uri, loc) in use_sites {
                         all_locs.push(Location {
-                            uri: file_uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
+                            uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
                             range: Range {
                                 start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
                                 end: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 + instance_name.len() as u32 },
@@ -1408,7 +1406,7 @@ impl LanguageServer for Backend {
                     let mut all_locs = Vec::new();
                     if let Some(defs) = info.find_definitions(&symbol) {
                         all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
-                            uri: file_uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
+                            uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
                             range: Range {
                                 start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
                                 end: Position { line: loc.line.saturating_sub(1), character: (loc.col + symbol.len() as u16) as u32 },
@@ -1417,7 +1415,7 @@ impl LanguageServer for Backend {
                     }
                     if let Some(refs) = info.find_references(&symbol) {
                         all_locs.extend(refs.iter().map(|(file_uri, loc)| Location {
-                            uri: file_uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
+                            uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
                             range: Range {
                                 start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
                                 end: Position { line: loc.line.saturating_sub(1), character: (loc.col + symbol.len() as u16) as u32 },
@@ -2242,7 +2240,8 @@ fn is_type_ref_leaf(
         // For TypeRules, check path filter
         if let RootRule::TypeRule(..) = root_rule {
             if let Some(name) = rule_type_name {
-                if let Some(td) = ruleset.types.iter().find(|t| t.name == name) {
+                if let Some(&idx) = ruleset.type_by_name.get(name) {
+                    let td = &ruleset.types[idx];
                     if !cwtools_info_path_check(&td.path_options, logical_path) {
                         continue;
                     }
@@ -2416,6 +2415,7 @@ mod tests {
             ),
         ));
 
+        rs.reindex();
         rs
     }
 

@@ -1,30 +1,9 @@
 //! Scope-aware localisation command validation.
 //!
-//! Mirrors F# `ChangeLocScope.fs` + per-game `*LocalisationScopes.fs`.
-//!
-//! # Overview
-//!
-//! Localisation strings like `[THIS.Owner.GetName]` or `[Root.capital.GetName]`
-//! embed a command chain.  Each segment either:
-//!
-//! * Changes scope (e.g. `Owner`, `capital`, `THIS`, `Root`, `PREV`, `FROM`)
-//! * Terminates in a "getter" command that returns text (e.g. `GetName`)
-//!
-//! This module validates such chains by folding through the game's
-//! `ScopeContext`.  It emits:
-//!
-//! * `LocCommandWrongScope` when a link is used from an incompatible scope.
-//! * `LocCommandChainEndsInScope` when the chain finishes without reaching a
-//!   terminal getter.
-//!
-//! Special prefixes (`event_target:`, `parameter:`, `?`, `scope:`) are always
-//! accepted without scope checking.
-//!
-//! # Per-game terminal commands (partial)
-//!
-//! A complete table would require the full F# game rules data.  This module
-//! covers the universally-useful getters.  Unknown commands are accepted
-//! (lenient) so that missing entries don't produce false positives.
+//! Validates chains like `[THIS.Owner.GetName]` by folding through the game's
+//! `ScopeContext`.  Emits `LocCommandWrongScope` or `LocCommandChainEndsInScope`
+//! when a chain is invalid.  Unknown commands are accepted leniently so missing
+//! entries don't produce false positives.
 
 use crate::commands::{Game, JominiCommand, LocEntry};
 use cwtools_game::scope_engine::{ScopeContext, ScopeId, ScopeResult, SCOPE_ANY};

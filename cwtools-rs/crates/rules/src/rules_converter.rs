@@ -2,9 +2,7 @@ use crate::rules_types::*;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_string_table::string_table::StringTable;
 
-// Float sentinel values matching F# RulesParserConstants (cwtools uses ±1e12 for
-// an unranged `float`; ±1e6 was far too narrow and flagged valid large values
-// like build costs and populations).
+// ±1e12 sentinel for unranged float; 1e6 was too narrow (build costs, populations).
 const FLOAT_MAX: f64 = 1e12;
 const FLOAT_MIN: f64 = -1e12;
 const INT_MAX: i32 = 2_147_483_647;
@@ -864,12 +862,12 @@ fn process_enum_node_from_node(
 }
 
 fn extract_bracket_content(full: &str, prefix: &str) -> Option<String> {
-    let expected = format!("{}[", prefix);
-    if full.starts_with(&expected) && full.ends_with(']') {
-        Some(full[expected.len()..full.len() - 1].to_string())
-    } else {
-        None
+    if let Some(body) = full.strip_prefix(prefix) {
+        if let Some(inner) = body.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            return Some(inner.to_string());
+        }
     }
+    None
 }
 
 fn process_type_node(
@@ -1387,10 +1385,7 @@ fn process_enum_node(
     EnumDefinition { key: name, description, values }
 }
 
-/// Parse description from comments, matching F# behavior:
-/// - `###` prefix lines are descriptions (trim the `###`)
-/// - `##` prefix lines are options, NOT descriptions unless there's no `###`
-/// F# RulesParser.fs:303-307 filters by `StartsWith "##"` and trims `#` chars.
+/// Extract description from ### comments (## are options).
 fn extract_description_from_comments(comments: &[String]) -> Option<String> {
     // F# collects all comments starting with ## and joins them
     // but ### is just ## with an extra # (all start with ##)

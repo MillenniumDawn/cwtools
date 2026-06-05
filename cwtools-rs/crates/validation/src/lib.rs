@@ -167,7 +167,7 @@ pub fn validate_ast(
 
             // A `type[x] = { path = ... name_field = ... }` with no associated rule
             // body exists only to index instances of that type; its instances are
-            // not content-validated (matching F#). Skip when there is nothing to
+            // not content-validated. Skip when there is nothing to
             // validate against, otherwise every field reads as "unexpected".
             let has_content_rules = !inner_rules.is_empty()
                 || type_def.subtypes.iter().any(|st| !st.rules.is_empty());
@@ -208,7 +208,7 @@ pub fn validate_ast(
             }
 
             // The type declares skip_root_key(s) but this root matches none of them:
-            // the type does not apply to this root (F# `skiprootkey` gate). Skip it
+            // the type does not apply to this root (skip_root_key gate). Skip it
             // rather than validating the root directly — otherwise an unrelated file
             // sharing the path (e.g. `leader_skills` under common/unit_leader, where
             // the only type is `unit_leader_trait` with skip_root_key = leader_traits)
@@ -245,9 +245,9 @@ pub fn validate_ast(
 
 /// Validate a set of children against a type's rules, handling subtypes.
 ///
-/// Follows F# memoizeRules logic: collect the base rules (non-SubtypeRule entries from
-/// inner_rules) plus the rules of every matching subtype into a single merged list, then
-/// validate the children once against that union.  This means:
+/// Collect the base rules (non-SubtypeRule entries) plus the rules of every matching
+/// subtype into a single merged list, then validate the children once against that union.
+/// This means:
 ///   - cardinality is counted over the merged rule set, not per-subtype in isolation
 ///   - a field that exists in any matching subtype is not "unexpected"
 ///   - SubtypeRule entries that don't match are silently skipped
@@ -281,7 +281,7 @@ fn validate_with_type(
         return;
     }
 
-    // Step 1: determine which subtypes match (F# testSubtype logic).
+    // Step 1: determine which subtypes match.
     // A subtype matches when:
     //   (a) type_key_field is None, OR the children contain a field whose key equals type_key_field
     //   (b) starts_with is None, OR (no-op here; starts_with filters by the node's OWN key which
@@ -301,8 +301,8 @@ fn validate_with_type(
     });
 
     // Step 2: collect base rules (non-SubtypeRule entries) + matching SubtypeRule entries.
-    // This mirrors F# memoizeRules which expands SubtypeRule(key, shouldMatch, cfs) based on
-    // whether key is in the active subtypes list.
+    // Expand SubtypeRule(key, shouldMatch, cfs) based on whether key is in the
+    // active subtypes list.
     //
     // Two sources of rules:
     //   (A) inner_rules — from a separate `type_name = { ... }` TypeRule in the ruleset.
@@ -389,7 +389,7 @@ fn should_skip_root_key(_key: &str, type_def: &TypeDefinition) -> bool {
 
 /// Look up both the TypeDefinition and the actual validation rules for a given type name.
 fn find_type_and_rules<'a>(name: &str, ruleset: &'a RuleSet) -> Option<(&'a TypeDefinition, &'a [(RuleType, Options)])> {
-    let type_def = ruleset.types.iter().find(|t| t.name == name)?;
+    let type_def = ruleset.type_by_name.get(name).map(|&i| &ruleset.types[i])?;
     let rules = find_rules_by_name(name, ruleset);
     Some((type_def, rules))
 }
@@ -469,7 +469,7 @@ fn find_type_by_path<'a>(file_path: &str, ruleset: &'a RuleSet) -> Option<&'a Ty
         }
         // path_extension restricts the type to files with a given extension
         // (e.g. sound types require `.asset`, so a `.txt` combat-sounds file must
-        // NOT match them). F# treats the extension as a hard filter.
+        // NOT match them). Treat the extension as a hard filter.
         if let Some(ext) = &t.path_options.path_extension {
             let ext = ext.to_lowercase();
             let ext = ext.strip_prefix('.').unwrap_or(&ext);
@@ -498,19 +498,16 @@ fn find_type_by_path<'a>(file_path: &str, ruleset: &'a RuleSet) -> Option<&'a Ty
     best
 }
 
-/// Test a subtype's rules against an entity's children, following F#
-/// `testSubtype` / `applyClauseField` with `enforceCardinality = false`.
+/// Test whether a subtype's rules are satisfied by an entity's children.
 ///
 /// A subtype is active unless one of its rules is violated:
 ///   - a required rule (min >= 1) whose key is absent (or under-count),
 ///   - a key present more than its max,
 ///   - a PRESENT field whose value doesn't match the rule.
-/// Fields the rules don't mention are ignored (no "unexpected" check here), so a
-/// subtype whose rules are all optional (`## cardinality = 0..1`) and absent
-/// matches vacuously — exactly how F# unions optional subtypes. The real
-/// discriminators are the un-annotated rules (default `1..1`, required) and any
-/// present field whose value contradicts a rule (e.g. `is_archetype = no` is
-/// contradicted by a present `is_archetype = yes`).
+/// Fields the rules don't mention are ignored, so a subtype whose rules are
+/// all optional (`## cardinality = 0..1`) and absent matches vacuously.
+/// The real discriminators are the un-annotated rules (default `1..1`, required)
+/// and any present field whose value contradicts a rule.
 fn subtype_rules_match(
     rules: &[(RuleType, Options)],
     children: &[Child],
@@ -520,7 +517,7 @@ fn subtype_rules_match(
     type_index: Option<&cwtools_info::TypeIndex>,
 ) -> bool {
     // A subtype with discriminators must be *positively activated* by the entity:
-    // F# matches a subtype when its rules apply cleanly, but a subtype whose
+    // A subtype matches when its rules apply cleanly, but one whose
     // discriminators are all optional (`0..1`) and absent would otherwise match
     // every entity and wrongly impose its required body fields. So we additionally
     // require some discriminator to be actively met. A present field that fails a
@@ -530,7 +527,7 @@ fn subtype_rules_match(
     // Discriminators are grouped by key. Several rules can share a key as a
     // disjunction — both same-kind (`trait_type = assignable_trait` / `trait_type =
     // assignable_terrain_trait`) and cross-kind (`type = enum[air_units]` as a leaf
-    // OR `type = { enum[air_units] }` as a block). F# counts cardinality by key
+    // OR `type = { enum[air_units] }` as a block). Cardinality is counted by key
     // across leaves AND nodes, and a present field is a contradiction only when it
     // matches NONE of the key's rules. So we collect both leaf and node rules under
     // one key and evaluate them together.
@@ -651,7 +648,7 @@ fn is_default_satisfied_literal(right: &NewField) -> bool {
     matches!(right, NewField::SpecificField(v) if v == "no" || v == "false" || v == "0")
 }
 
-/// Decide whether a subtype is active for an entity (F# `testSubtype`).
+/// Decide whether a subtype is active for an entity.
 ///
 /// - `## type_key_filter`: active iff the instance's own node key is in the list.
 /// - Explicit `type_key_field`: active iff the entity has a child with that key.
@@ -1008,8 +1005,7 @@ fn validate_children(
                 } else {
                     // Count toward EVERY matching LeafValueRule, not just the
                     // first. Alternative leafvalue rules in one block are counted
-                    // independently in F# (RuleValidationService.checkCardinality
-                    // is a per-rule `Seq.sumBy`). Breaking on the first match lets
+                    // independently (checkCardinality is a per-rule sum). Breaking on the first match lets
                     // a permissive earlier alternative (e.g. a `<type>` TypeField,
                     // which accepts any token) starve a later `enum[...]` rule,
                     // producing a spurious "appears 0 time(s)" cardinality error.
@@ -1188,7 +1184,7 @@ fn validate_children(
 
     for (rule_idx, (rule_type, opts)) in rules.iter().enumerate() {
         // Both under- and over-count default to a WARNING (config cardinalities are
-        // often stricter than the game, and F# emits cardinality-max as a Warning);
+        // often stricter than the game, and cardinality-max is emitted as a Warning);
         // an explicit `## severity` still wins.
         let card_sev = opts.severity.as_ref()
             .map(|s| severity_to_error(s.clone()))
@@ -1379,8 +1375,10 @@ fn alias_pattern_matches(
             let base = name.split('.').next().unwrap_or(name);
             type_index.map(|idx| idx.contains(base, middle)).unwrap_or(false)
         }
-        "enum" => match ruleset.enums.iter().find(|e| e.key == name) {
-            Some(def) if !def.values.is_empty() => def.values.iter().any(|v| v == middle),
+        "enum" => match ruleset.enum_by_name.get(name) {
+            Some(&idx) if !ruleset.enums[idx].values.is_empty() => {
+                ruleset.enums[idx].values.iter().any(|v| v == middle)
+            }
             _ => true, // enum absent/empty (game-derived) — permissive
         },
         "value" => match ruleset.values.iter().find(|(n, _)| n == name) {
@@ -1443,8 +1441,8 @@ fn field_matches_key(field: &NewField, key: &str, ruleset: &RuleSet, type_index:
         // If the enum isn't loaded (complex/game-derived enums), be permissive
         // rather than flag every key as unexpected.
         NewField::ValueField(ValueType::Enum(enum_name)) => {
-            match ruleset.enums.iter().find(|e| &e.key == enum_name) {
-                Some(def) => def.values.iter().any(|v| v == key),
+            match ruleset.enum_by_name.get(enum_name.as_str()) {
+                Some(&idx) => ruleset.enums[idx].values.iter().any(|v| v == key),
                 None => true,
             }
         }

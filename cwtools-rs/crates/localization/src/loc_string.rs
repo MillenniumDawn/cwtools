@@ -10,8 +10,8 @@
 //! * `[?variable]`                 – event_target / saved variable reference
 //! * `[event_target:foo]`          – named event target reference
 //!
-//! Mirrors F# `LocalisationString.fs` and handles both the original Paradox
-//! syntax (`[GetName]`) and the newer Jomini syntax.
+//! Handles both the original Paradox syntax (`[GetName]`) and the newer
+//! Jomini syntax.
 
 /// Parsed element inside a loc string.
 #[derive(Debug, Clone, PartialEq)]

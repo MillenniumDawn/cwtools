@@ -28,13 +28,12 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
     // First expand any single_alias refs inside single_alias bodies themselves
     // (up to 10 rounds, same as F#).
     for _ in 0..10 {
-        let before: Vec<_> = ruleset.single_aliases.clone();
-        // Build snapshot of current map to avoid borrow issues
         let map: Vec<(String, NewRule)> = ruleset.single_aliases.clone();
+        let mut changed = false;
         for (_, rule) in ruleset.single_aliases.iter_mut() {
-            inline_single_alias_rule(rule, &map);
+            inline_single_alias_rule(rule, &map, &mut changed);
         }
-        if ruleset.single_aliases == before {
+        if !changed {
             break;
         }
     }
@@ -43,22 +42,22 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
     let map: Vec<(String, NewRule)> = ruleset.single_aliases.clone();
     for root in ruleset.root_rules.iter_mut() {
         match root {
-            RootRule::TypeRule(_, rule) => inline_single_alias_rule(rule, &map),
-            RootRule::AliasRule(_, rule) => inline_single_alias_rule(rule, &map),
-            RootRule::SingleAliasRule(_, rule) => inline_single_alias_rule(rule, &map),
+            RootRule::TypeRule(_, rule) => inline_single_alias_rule(rule, &map, &mut true),
+            RootRule::AliasRule(_, rule) => inline_single_alias_rule(rule, &map, &mut true),
+            RootRule::SingleAliasRule(_, rule) => inline_single_alias_rule(rule, &map, &mut true),
         }
     }
     for (_, rule) in ruleset.aliases.iter_mut() {
-        inline_single_alias_rule(rule, &map);
+        inline_single_alias_rule(rule, &map, &mut true);
     }
     for (_, rule) in ruleset.single_aliases.iter_mut() {
-        inline_single_alias_rule(rule, &map);
+        inline_single_alias_rule(rule, &map, &mut true);
     }
 }
 
 /// Recursively walk `rule` and replace any `SingleAliasField` / `SingleAliasClauseField`
-/// references with the body from `map`.
-fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)]) {
+/// references with the body from `map`. Sets `changed` to true if any rewrite occurs.
+fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)], changed: &mut bool) {
     // A body that is *itself* a single_alias reference, e.g.
     // `alias[effect:every_country] = single_alias_right[every_effect_clause]`.
     // Resolve it in place so the alias body becomes the referenced rules and is
@@ -73,6 +72,7 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)]) {
                 RuleType::NodeRule { rules: ar, .. } => rule.0 = RuleType::NodeRule { left, rules: ar },
                 _ => {}
             }
+            *changed = true;
         }
         return;
     }
@@ -82,18 +82,19 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)]) {
             if let RuleType::NodeRule { rules: ar, .. } = resolved.0 {
                 rule.0 = RuleType::ValueClauseRule { rules: ar };
             }
+            *changed = true;
         }
         return;
     }
     match &mut rule.0 {
         RuleType::NodeRule { rules, .. } => {
-            inline_rules_list(rules, map);
+            inline_rules_list(rules, map, changed);
         }
         RuleType::ValueClauseRule { rules } => {
-            inline_rules_list(rules, map);
+            inline_rules_list(rules, map, changed);
         }
         RuleType::SubtypeRule { rules, .. } => {
-            inline_rules_list(rules, map);
+            inline_rules_list(rules, map, changed);
         }
         _ => {}
     }
@@ -101,7 +102,17 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)]) {
 
 /// Walk a `Vec<NewRule>` in place, replacing SingleAliasField entries by
 /// substituting the resolved body and recursing into nested rules.
-fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)]) {
+fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)], changed: &mut bool) {
+    let needs_rewrite = rules.iter().any(|r| matches!(r.0,
+        RuleType::LeafRule { right: NewField::SingleAliasField(..), .. } |
+        RuleType::LeafValueRule { right: NewField::SingleAliasClauseField(..), .. }
+    ));
+    if !needs_rewrite {
+        for rule in rules.iter_mut() {
+            inline_single_alias_rule(rule, map, changed);
+        }
+        return;
+    }
     let original = std::mem::take(rules);
     for mut rule in original {
         match &rule.0 {
@@ -110,6 +121,7 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)]) {
                 let name = name.clone();
                 let opts = rule.1.clone();
                 if let Some(resolved) = lookup_single_alias(&name, map) {
+                    *changed = true;
                     match resolved.0 {
                         RuleType::LeafRule { right: ar, .. } => {
                             rules.push((RuleType::LeafRule { left: extract_leaf_left(&rule.0), right: ar }, opts));
@@ -132,6 +144,7 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)]) {
                 let name = name.clone();
                 let opts = rule.1.clone();
                 if let Some(resolved) = lookup_single_alias(&name, map) {
+                    *changed = true;
                     match resolved.0 {
                         RuleType::NodeRule { rules: ar, .. } => {
                             rules.push((RuleType::ValueClauseRule { rules: ar }, opts));
@@ -146,15 +159,15 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)]) {
             }
             // Recurse into nested rule containers
             RuleType::NodeRule { .. } => {
-                inline_single_alias_rule(&mut rule, map);
+                inline_single_alias_rule(&mut rule, map, changed);
                 rules.push(rule);
             }
             RuleType::ValueClauseRule { .. } => {
-                inline_single_alias_rule(&mut rule, map);
+                inline_single_alias_rule(&mut rule, map, changed);
                 rules.push(rule);
             }
             RuleType::SubtypeRule { .. } => {
-                inline_single_alias_rule(&mut rule, map);
+                inline_single_alias_rule(&mut rule, map, changed);
                 rules.push(rule);
             }
             _ => {
