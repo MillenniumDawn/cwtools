@@ -2388,6 +2388,7 @@ mod tests {
                 path_strict: false,
                 path_file: None,
                 path_extension: None,
+                paths_lower: Vec::new(),
             },
             subtypes: Vec::new(),
             type_key_filter: None,

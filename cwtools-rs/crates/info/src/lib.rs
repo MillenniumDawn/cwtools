@@ -139,16 +139,32 @@ fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
     };
     let dir_lower = dir.to_lowercase();
 
-    for p in &opts.paths {
-        let pat = p.replace('\\', "/");
-        let pat = pat.trim_matches('/');
-        let pat_lower = pat.to_lowercase();
+    if opts.paths_lower.is_empty() && !opts.paths.is_empty() {
+        // Fallback for PathOptions built without reindex() (e.g. tests).
+        for p in &opts.paths {
+            let pat = p.replace('\\', "/");
+            let pat = pat.trim_matches('/');
+            let pat_lower = pat.to_lowercase();
+            if opts.path_strict {
+                if dir_lower == pat_lower {
+                    return true;
+                }
+            } else if dir_lower.starts_with(&pat_lower) {
+                let after = &dir_lower[pat_lower.len()..];
+                if after.is_empty() || after.starts_with('/') {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
+    for pat_lower in &opts.paths_lower {
         if opts.path_strict {
-            if dir_lower == pat_lower {
+            if dir_lower == *pat_lower {
                 return true;
             }
-        } else if dir_lower.starts_with(&pat_lower) {
+        } else if dir_lower.starts_with(pat_lower) {
             // Ensure we match at a directory boundary, not in the middle of a name.
             let after = &dir_lower[pat_lower.len()..];
             if after.is_empty() || after.starts_with('/') {
@@ -1259,6 +1275,7 @@ mod tests {
                 path_strict: false,
                 path_file: None,
                 path_extension: None,
+                paths_lower: Vec::new(),
             },
             subtypes: Vec::new(),
             type_key_filter: None,

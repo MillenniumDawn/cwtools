@@ -10,36 +10,38 @@ const FLOAT_MIN: f64 = -1e12;
 const INT_MAX: i32 = 2_147_483_647;
 const INT_MIN: i32 = -2_147_483_648;
 
-/// Extract comment text directly preceding a child in the AST.
-fn collect_comments_before_child(
-    all_children: &[Child],
-    idx: usize,
+/// Precompute comment text directly preceding every child in a single O(N) pass.
+/// `result[i]` is the list of comments before child `i` (may be empty).
+fn precompute_comments(
+    children: &[Child],
     ast: &ParsedFile,
     _table: &StringTable,
-) -> Vec<String> {
-    let mut comments = Vec::new();
-    let mut i = idx;
-    while i > 0 {
-        i -= 1;
-        match &all_children[i] {
+) -> Vec<Vec<String>> {
+    let mut result = vec![Vec::new(); children.len()];
+    let mut pending: Vec<String> = Vec::new();
+    for (i, child) in children.iter().enumerate() {
+        match child {
             Child::Comment(cidx) => {
                 let c = &ast.arena.comments[*cidx as usize];
-                let text = c.text.trim().to_string();
-                comments.push(text);
+                pending.push(c.text.trim().to_string());
             }
-            _ => break,
+            _ => {
+                if !pending.is_empty() {
+                    result[i] = std::mem::take(&mut pending);
+                }
+            }
         }
     }
-    comments.reverse();
-    comments
+    result
 }
 
 /// Convert a parsed .cwt AST into a RuleSet.
 pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
     let mut ruleset = RuleSet::new();
 
+    let precomputed = precompute_comments(&ast.root_children, ast, table);
     for (idx, child) in ast.root_children.iter().enumerate() {
-        let comments = collect_comments_before_child(&ast.root_children, idx, ast, table);
+        let comments = &precomputed[idx];
 
         match child {
             Child::Node(nidx) => {
@@ -52,7 +54,7 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                     "modifiers" => extract_modifier_names(&node.children, ast, table, &mut ruleset),
                     "links" => extract_link_names(&node.children, ast, table, &mut ruleset),
                     _ => {
-                        process_root_node(key, node, ast, table, &comments, &mut ruleset);
+                        process_root_node(key, node, ast, table, comments, &mut ruleset);
                     }
                 }
             }
@@ -86,7 +88,7 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                         }
                     }
                     _ => {
-                        process_root_leaf(key, leaf, ast, table, &comments, &mut ruleset);
+                        process_root_leaf(key, leaf, ast, table, comments, &mut ruleset);
                     }
                 }
             }
@@ -480,8 +482,9 @@ fn children_to_rules(
     ruleset: &mut RuleSet,
 ) -> Vec<NewRule> {
     let mut rules = Vec::new();
+    let precomputed = precompute_comments(children, ast, table);
     for (idx, child) in children.iter().enumerate() {
-        let comments = collect_comments_before_child(children, idx, ast, table);
+        let comments = &precomputed[idx];
         match child {
             Child::Leaf(lidx) => {
                 let leaf = &ast.arena.leaves[*lidx as usize];
@@ -501,14 +504,14 @@ fn children_to_rules(
                         };
                         rules.push((
                             RuleType::SubtypeRule { name, positive, rules: inner },
-                            options_from_comments(&comments, false),
+                            options_from_comments(comments, false),
                         ));
                     }
                     continue;
                 }
 
                 let is_eqeq = leaf.op == cwtools_parser::ast::Operator::EqualEqual;
-                let opts = options_from_comments(&comments, is_eqeq);
+                let opts = options_from_comments(comments, is_eqeq);
                 let rule = match &leaf.value {
                     Value::Clause(ch) => {
                         let inner = children_to_rules(ch, ast, table, ruleset);
@@ -550,13 +553,13 @@ fn children_to_rules(
                         let inner = children_to_rules(&node.children, ast, table, ruleset);
                         rules.push((
                             RuleType::SubtypeRule { name, positive, rules: inner },
-                            options_from_comments(&comments, false),
+                            options_from_comments(comments, false),
                         ));
                     }
                     continue;
                 }
 
-                let opts = options_from_comments(&comments, false);
+                let opts = options_from_comments(comments, false);
                 let inner = children_to_rules(&node.children, ast, table, ruleset);
                 rules.push((
                     RuleType::NodeRule {
@@ -570,7 +573,7 @@ fn children_to_rules(
                 let lv = &ast.arena.leaf_values[*lvidx as usize];
                 let val_str = value_to_string(&lv.value, table);
                 let field = field_from_string(&val_str);
-                let mut opts = options_from_comments(&comments, false);
+                let mut opts = options_from_comments(comments, false);
                 opts.leafvalue = true;
                 rules.push((RuleType::LeafValueRule { right: field }, opts));
             }
@@ -618,8 +621,9 @@ fn extract_types_from_children(
     table: &StringTable,
     ruleset: &mut RuleSet,
 ) {
+    let precomputed = precompute_comments(children, ast, table);
     for (idx, tchild) in children.iter().enumerate() {
-        let comments = collect_comments_before_child(children, idx, ast, table);
+        let comments = &precomputed[idx];
         let (key, is_leaf) = match tchild {
             Child::Leaf(lidx) => {
                 let leaf = &ast.arena.leaves[*lidx as usize];
@@ -635,14 +639,14 @@ fn extract_types_from_children(
             if let Some(typename) = extract_bracket_content(&key, "type") {
                 let typedef = if is_leaf {
                     if let Child::Leaf(lidx) = tchild {
-                        process_type_node(typename, &ast.arena.leaves[*lidx as usize], ast, table, ruleset, &comments)
+                        process_type_node(typename, &ast.arena.leaves[*lidx as usize], ast, table, ruleset, comments)
                     } else {
                         continue;
                     }
                 } else {
                     if let Child::Node(nidx) = tchild {
                         let node = &ast.arena.nodes[*nidx as usize];
-                        process_type_node_from_node(typename, node, ast, table, ruleset, &comments)
+                        process_type_node_from_node(typename, node, ast, table, ruleset, comments)
                     } else {
                         continue;
                     }
@@ -659,8 +663,9 @@ fn extract_enums_from_children(
     table: &StringTable,
     ruleset: &mut RuleSet,
 ) {
+    let precomputed = precompute_comments(children, ast, table);
     for (idx, echild) in children.iter().enumerate() {
-        let comments = collect_comments_before_child(children, idx, ast, table);
+        let comments = &precomputed[idx];
         let (key, is_leaf) = match echild {
             Child::Leaf(lidx) => {
                 let leaf = &ast.arena.leaves[*lidx as usize];
@@ -676,13 +681,13 @@ fn extract_enums_from_children(
             if let Some(enum_name) = extract_bracket_content(&key, "enum") {
                 let def = if is_leaf {
                     if let Child::Leaf(lidx) = echild {
-                        process_enum_node(enum_name, &ast.arena.leaves[*lidx as usize], ast, table, &comments)
+                        process_enum_node(enum_name, &ast.arena.leaves[*lidx as usize], ast, table, comments)
                     } else {
                         continue;
                     }
                 } else {
                     if let Child::Node(nidx) = echild {
-                        process_enum_node_from_node(enum_name, &ast.arena.nodes[*nidx as usize], ast, table, &comments)
+                        process_enum_node_from_node(enum_name, &ast.arena.nodes[*nidx as usize], ast, table, comments)
                     } else {
                         continue;
                     }
@@ -694,14 +699,14 @@ fn extract_enums_from_children(
                 if !is_leaf {
                     if let Child::Node(nidx) = echild {
                         let node = &ast.arena.nodes[*nidx as usize];
-                        let def = process_complex_enum_node(enum_name, node, ast, table, &comments);
+                        let def = process_complex_enum_node(enum_name, node, ast, table, comments);
                         ruleset.complex_enums.push(def);
                     }
                 } else if let Child::Leaf(lidx) = echild {
                     let leaf = &ast.arena.leaves[*lidx as usize];
                     if let Value::Clause(ch) = &leaf.value {
                         // Synthesize a node-like view from the clause children
-                        let def = process_complex_enum_from_children(enum_name, ch, ast, table, &comments);
+                        let def = process_complex_enum_from_children(enum_name, ch, ast, table, comments);
                         ruleset.complex_enums.push(def);
                     }
                 }
@@ -883,6 +888,7 @@ fn process_type_node(
             path_strict: false,
             path_file: None,
             path_extension: None,
+            paths_lower: Vec::new(),
         },
         subtypes: Vec::new(),
         type_key_filter: None,
@@ -907,15 +913,16 @@ fn process_type_node(
         let mut localisation_children: Option<Vec<Child>> = None;
         let mut modifiers_children: Option<Vec<Child>> = None;
 
+        let precomputed = precompute_comments(children, ast, table);
         for (cidx, child) in children.iter().enumerate() {
-            let child_comments = collect_comments_before_child(children, cidx, ast, table);
+            let child_comments = &precomputed[cidx];
             match child {
                 Child::Leaf(lidx) => {
                     let l = &ast.arena.leaves[*lidx as usize];
                     let k = table.get_string(l.key.normal).unwrap_or_default();
                     if k.starts_with("subtype[") {
                         if let Some(st_name) = extract_bracket_content(&k, "subtype") {
-                            let st = process_subtype_node_from_leaf(st_name, l, ast, table, ruleset, &child_comments);
+                            let st = process_subtype_node_from_leaf(st_name, l, ast, table, ruleset, child_comments);
                             def.subtypes.push(st);
                         }
                     } else if k == "localisation" || k == "modifiers" {
@@ -1005,7 +1012,7 @@ fn process_type_node(
                     let nk = table.get_string(n.key.normal).unwrap_or_default();
                     if nk.starts_with("subtype[") {
                         if let Some(st_name) = extract_bracket_content(&nk, "subtype") {
-                            let st = process_subtype_node(st_name, n, ast, table, ruleset, &child_comments);
+                            let st = process_subtype_node(st_name, n, ast, table, ruleset, child_comments);
                             def.subtypes.push(st);
                         }
                     } else if nk == "localisation" {
@@ -1124,8 +1131,9 @@ fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
 
 fn parse_localisation_block(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<TypeLocalisation> {
     let mut out = Vec::new();
+    let precomputed = precompute_comments(children, ast, table);
     for (cidx, child) in children.iter().enumerate() {
-        let child_comments = collect_comments_before_child(children, cidx, ast, table);
+        let child_comments = &precomputed[cidx];
         if let Child::Leaf(lidx) = child {
             let l = &ast.arena.leaves[*lidx as usize];
             let key = table.get_string(l.key.normal).unwrap_or_default();
@@ -1137,7 +1145,7 @@ fn parse_localisation_block(children: &[Child], ast: &ParsedFile, table: &String
             let required = child_comments.iter().any(|s| s.contains("required"));
             let optional = child_comments.iter().any(|s| s.contains("optional"));
             let primary = child_comments.iter().any(|s| s.contains("primary"));
-            let replace_scopes = parse_replace_scopes_from_comments(&child_comments);
+            let replace_scopes = parse_replace_scopes_from_comments(child_comments);
 
             let loc = if let Some(dollar_idx) = value.find('$') {
                 let prefix = value[..dollar_idx].to_string();
@@ -1189,8 +1197,9 @@ fn parse_subtype_localisation(children: &[Child], ast: &ParsedFile, table: &Stri
 
 fn parse_modifiers_block(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<TypeModifier> {
     let mut out = Vec::new();
+    let precomputed = precompute_comments(children, ast, table);
     for (cidx, child) in children.iter().enumerate() {
-        let child_comments = collect_comments_before_child(children, cidx, ast, table);
+        let child_comments = &precomputed[cidx];
         if let Child::Leaf(lidx) = child {
             let l = &ast.arena.leaves[*lidx as usize];
             let key = table.get_string(l.key.normal).unwrap_or_default();
@@ -1459,7 +1468,7 @@ fn process_complex_enum_from_children(
     ComplexEnumDef {
         name,
         description,
-        path_options: PathOptions { paths, path_strict, path_file, path_extension },
+        path_options: PathOptions { paths, path_strict, path_file, path_extension, paths_lower: Vec::new() },
         name_tree: name_tree.unwrap_or(ComplexEnumNameTree::Empty),
         start_from_root,
     }

@@ -71,6 +71,16 @@ impl RuleSet {
                 }
             }
         }
+        for td in &mut self.types {
+            td.path_options.paths_lower = td.path_options.paths.iter().map(|p| {
+                p.replace('\\', "/").trim_matches('/').to_lowercase()
+            }).collect();
+        }
+        for ce in &mut self.complex_enums {
+            ce.path_options.paths_lower = ce.path_options.paths.iter().map(|p| {
+                p.replace('\\', "/").trim_matches('/').to_lowercase()
+            }).collect();
+        }
     }
 }
 
@@ -100,6 +110,8 @@ pub struct PathOptions {
     pub path_strict: bool,
     pub path_file: Option<String>,
     pub path_extension: Option<String>,
+    /// Pre-computed lowercased path patterns, built by `RuleSet::reindex()`.
+    pub paths_lower: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
