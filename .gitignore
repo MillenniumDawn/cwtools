@@ -6,6 +6,10 @@ project.lock.json
 
 # Visual Studio Code
 .vscode
+.vscode_ext_*.ts
+
+# AI assistant temp files
+.opencode/
 
 # User-specific files
 *.suo

@@ -1,0 +1,20 @@
+[package]
+name = "cwtools_cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cwtools_parser = { workspace = true }
+cwtools_string_table = { workspace = true }
+rkyv = { workspace = true }
+bytecheck = { workspace = true }
+zstd = { workspace = true }
+memmap2 = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+cwtools_file_manager = { workspace = true }
