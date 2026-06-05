@@ -71,7 +71,15 @@ objectTypes = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table, "gfx/entities/test.gfx", None, None, None);
+    let errors = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "gfx/entities/test.gfx",
+        None,
+        None,
+        None,
+    );
     assert!(
         errors.is_empty(),
         "expected no diagnostics, got: {:?}",
@@ -100,7 +108,15 @@ objectTypes = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &ruleset, &table, "gfx/entities/test.gfx", None, None, None);
+    let errors = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "gfx/entities/test.gfx",
+        None,
+        None,
+        None,
+    );
     let msgs: Vec<&String> = errors.iter().map(|e| &e.message).collect();
     assert!(
         msgs.iter().any(|m| m.contains("totally_bogus_mesh_field")),
@@ -108,7 +124,8 @@ objectTypes = {
         msgs
     );
     assert!(
-        msgs.iter().any(|m| m.contains("totally_bogus_particle_field")),
+        msgs.iter()
+            .any(|m| m.contains("totally_bogus_particle_field")),
         "expected the bogus pdxparticle field to be flagged, got: {:?}",
         msgs
     );

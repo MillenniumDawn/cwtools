@@ -1649,11 +1649,13 @@ fn process_enum_node(
 
 /// Extract description from ### comments (## are options).
 fn extract_description_from_comments(comments: &[String]) -> Option<String> {
-    // F# collects all comments starting with ## and joins them
-    // but ### is just ## with an extra # (all start with ##)
+    // Only `###` lines are documentation. `##` lines are rule options
+    // (cardinality, scope, severity, ...) and must NOT leak into the hover
+    // tooltip. This intentionally diverges from F# (RulesParser.fs collects
+    // every `##` line), which polluted every tooltip with option text.
     let desc_lines: Vec<String> = comments
         .iter()
-        .filter(|s| s.starts_with("##"))
+        .filter(|s| s.starts_with("###"))
         .map(|s| s.trim_matches('#').trim().to_string())
         .collect();
     match desc_lines.len() {
@@ -2077,4 +2079,49 @@ fn leaf_value_string(leaf: &cwtools_parser::ast::Leaf, table: &StringTable) -> S
 #[allow(dead_code)]
 fn process_right_field(value: &str, _table: &StringTable) -> NewField {
     field_from_string(value)
+}
+
+#[cfg(test)]
+mod description_tests {
+    use super::extract_description_from_comments;
+
+    #[test]
+    fn only_triple_hash_is_documentation() {
+        // `## cardinality`/`## scope` are options and must not appear in the
+        // hover tooltip; only `###` lines are documentation.
+        let comments = vec![
+            "### Numeric index of an ai_area (see common/ai_areas), not a name.".to_string(),
+            "## cardinality = 0..1".to_string(),
+            "## scope = country".to_string(),
+        ];
+        let desc = extract_description_from_comments(&comments).unwrap();
+        assert_eq!(
+            desc,
+            "Numeric index of an ai_area (see common/ai_areas), not a name."
+        );
+        assert!(!desc.contains("cardinality"));
+        assert!(!desc.contains("scope"));
+    }
+
+    #[test]
+    fn multiple_doc_lines_join() {
+        let comments = vec![
+            "### First line.".to_string(),
+            "## cardinality = 0..1".to_string(),
+            "### Second line.".to_string(),
+        ];
+        assert_eq!(
+            extract_description_from_comments(&comments).unwrap(),
+            "First line.\nSecond line."
+        );
+    }
+
+    #[test]
+    fn no_doc_lines_yields_none() {
+        let comments = vec![
+            "## cardinality = 0..1".to_string(),
+            "# plain note".to_string(),
+        ];
+        assert!(extract_description_from_comments(&comments).is_none());
+    }
 }
