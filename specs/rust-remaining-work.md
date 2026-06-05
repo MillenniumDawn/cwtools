@@ -47,41 +47,24 @@ at 13,336 errors / 37,996 warnings):
 
 ## 3. Remaining items, by value
 
-### Lower value for HOI4 (consider dropping)
+### Dropped / deferred (decided 2026-06-04)
 
-**Icon/filepath existence checks.** `IconField`/`FilepathField` accept any string
-(`validation/src/lib.rs` ~1871-1874). F# checks the file exists. But the HOI4
-config uses `IconField` in ~0 rules and `FilepathField` in 2, and the icon
-validation that matters (`icon = <sprite>`) already works via TypeField. Disk
-checks need the file-set threaded into `validate_ast` for ~2 rules and risk
-false positives on vanilla/missing assets. Recommend dropping unless a non-HOI4
-game needs it.
+**Icon/filepath existence checks** — dropped. HOI4 config uses these in ~0/2
+rules; disk checks risk false positives on vanilla assets. Revisit for non-HOI4
+games only.
 
-**Strict variable/value-scope validation.** `variable_get`/`variable_set`
-(`lib.rs` ~1877) and `value_scope_field` (~1880) blanket-accept. F# matches
-against known var defs. Adding this is pure noise-add for low HOI4 value. The one
-contained, safe sub-part is the `var:`/`variable:` scope prefix in
-`game/src/scope_engine.rs` (~291) — but verify MD actually uses bare `var:` in
-scope position first; if scope errors are ~0 today it's zero value.
+**Strict variable/value-scope validation** — dropped for HOI4. Pure noise for
+MD; zero value unless `var:` scope errors actually appear.
 
-**Mod overwrite tracking.** `file_manager` doesn't track which mod's file wins
-across layers (F# `FileManager.fs:91-147`). Real for layered submods, but the
-user tests a single mod (MD), so it's unexercised today. Defer.
+**Mod overwrite tracking** — deferred. Only relevant for layered submods; MD is
+a single mod.
 
-**Embedded docs/setup.log loading.** Wire `game/src/docs_parser.rs` + a
-`--vanilla-dir`-style log source so effect/trigger/modifier DBs come from a real
-install. Largely superseded by the vanilla cache for the CW500 case; revisit only
-if undocumented effects/modifiers surface.
+**Embedded docs/setup.log loading** — deferred. Superseded by the vanilla cache
+for the CW500 case.
 
-### Delicate (high regression risk)
-
-**Reduce clicksound/subtype CW203 noise (~36K).** `subtype[spriteType]` requires
-`clicksound` (comment-less field -> defaults to 1..1) where F# never flags it (F#
-emits ~37,838 CW240 on the same sprites instead). Fixing means changing
-subtype-required-field semantics, which risks regressing the cardinality work
-just landed. Magnitude already tracks F#, so not urgent. If attempted: heavy
-F#-diff gating, and back off on any regression. Root cause not yet pinned (F#
-appears not to enforce comment-less subtype fields the way Rust does).
+**clicksound/subtype CW203 noise** — deferred. Root cause not pinned; fixing
+subtype-required-field semantics risks regressing cardinality work. Revisit only
+with heavy F#-diff gating.
 
 ### Perf + cosmetics
 
@@ -89,14 +72,13 @@ These are "no behavior change" and must be verified by identical diagnostics on
 MD plus a green `cargo test --workspace`. The tracing profiler already landed;
 the rest:
 
-- **rules/info perf:** H4 per-file summary, H6 hoist `replace_single_aliases`
+- **rules/info perf:** H6 hoist `replace_single_aliases`
   clone, H7 in-place `iter_mut` in the inline/colour/ignore passes, H9
   `precompute_comments` (kills an O(N^2) scan in `rules_converter`), H10
   precomputed lowercased path patterns, M14 `type_by_name` index in `reindex()`.
-  Note: H3 and M6 already landed.
-- **LSP perf:** H1 `spawn_blocking`/`yield_now` in `validate_entire_workspace`,
-  H2 `parking_lot` + single-lock-per-handler, H5 `type_by_name` for
-  `scan_use_sites`, H8 cache `modifier_keys` instead of per-file rebuild.
+  Note: H3, M6, H4 already landed.
+- **LSP perf:** H5 `type_by_name` for `scan_use_sites`.
+  Note: H1 (yield_now), H2 (parking_lot Mutex), H8 (cached modifier_keys) landed.
 - **Idiomatic:** the medium/low cleanups across `rules_converter`, `info/lib.rs`,
   `loc_string.rs`, `lsp/main.rs`, plus merging `position::find_at_position` with
   `info::find_pos_in_children` (watch the `<` vs `<=` end-column divergence).
@@ -121,14 +103,10 @@ graph panel and Stellaris pre-trigger code-actions are large and low HOI4 value.
 
 ## 4. Suggested order
 
-1. The contained safe wins if wanted: `var:` scope prefix (verify usage first),
-   LSP progress notifications.
-2. PR3 then PR2 perf, if the LSP responsiveness is worth the regression risk
-   (gate each with identical-diagnostics on MD).
-3. PR4, PR1 cosmetics.
-4. Drop or defer: icon/filepath, strict variable validation, mod overwrite,
-   embedded docs, graph/code-actions — unless a concrete need appears.
-5. clicksound noise only with a careful, gated attempt.
+1. Remaining rules/info perf (H6, H7, H9, H10, M14) — gate each with identical
+   diagnostics on MD.
+2. Idiomatic cleanups and comment cleanup — low regression risk, do last.
+3. LSP graph/code-actions — only if a concrete editor need appears.
 
 ## 5. This is the only spec
 

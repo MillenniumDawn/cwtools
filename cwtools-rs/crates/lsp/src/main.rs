@@ -1,5 +1,6 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -25,8 +26,8 @@ mod symbols;
 /// `production_speed_<building>_factor` / `<ideology>_drift` are expanded against
 /// the type index, one per instance. Mirrors the CLI so the extension and CLI
 /// agree on what counts as a modifier.
-fn build_modifier_keys(ruleset: &RuleSet, type_index: &TypeIndex) -> std::collections::HashSet<String> {
-    let mut mk = std::collections::HashSet::new();
+fn build_modifier_keys(ruleset: &RuleSet, type_index: &TypeIndex) -> HashSet<String> {
+    let mut mk = HashSet::new();
     for m in &ruleset.modifiers {
         match (m.find('<'), m.find('>')) {
             (Some(open), Some(close)) if open < close => {
@@ -84,6 +85,9 @@ struct DocumentState {
     /// pre-generated base-game type instances (from a vanilla cache), merged
     /// into the workspace index so the editor resolves base-game references.
     vanilla_index: Mutex<Option<HashMap<String, Vec<cwtools_info::TypeInstance>>>>,
+    /// cached modifier-key set; rebuilt after ruleset load and after each full
+    /// workspace scan when the type index is complete.
+    modifier_keys: parking_lot::RwLock<HashSet<String>>,
 }
 
 struct ParsedDoc {
@@ -104,6 +108,7 @@ impl DocumentState {
             info_service: Mutex::new(cwtools_info::InfoService::new()),
             workspace_uri: Mutex::new(None),
             vanilla_index: Mutex::new(None),
+            modifier_keys: parking_lot::RwLock::new(HashSet::new()),
         }
     }
 }
@@ -802,7 +807,7 @@ impl LanguageServer for Backend {
         // Store language from init options
         if let Some(opts) = &params.initialization_options {
             if let Some(lang) = opts.get("language").and_then(|v| v.as_str()) {
-                *self.state.language.lock().unwrap() = lang.to_string();
+                *self.state.language.lock() = lang.to_string();
                 self.client
                     .log_message(MessageType::INFO, format!("language: {}", lang))
                     .await;
@@ -819,7 +824,7 @@ impl LanguageServer for Backend {
                 match cwtools_info::vanilla_cache::load(std::path::Path::new(vc)) {
                     Ok((game, per_type)) => {
                         let total: usize = per_type.values().map(|v| v.len()).sum();
-                        *self.state.vanilla_index.lock().unwrap() = Some(per_type);
+                        *self.state.vanilla_index.lock() = Some(per_type);
                         self.client
                             .log_message(MessageType::INFO, format!("Loaded {} base-game instances from vanilla cache {} (game {})", total, vc, game))
                             .await;
@@ -863,7 +868,11 @@ impl LanguageServer for Backend {
                             ),
                         )
                         .await;
-                    *self.state.ruleset.lock().unwrap() = Some(combined_ruleset);
+                    *self.state.ruleset.lock() = Some(combined_ruleset);
+                    // Rebuild modifier_keys now that the ruleset is loaded.
+                    // The type index is empty at this point; it will be rebuilt
+                    // again after validate_entire_workspace with the full index.
+                    self.rebuild_modifier_keys();
                 } else {
                     self.client
                         .log_message(
@@ -881,7 +890,7 @@ impl LanguageServer for Backend {
         // Store workspace URI if provided
         if let Some(folders) = &params.workspace_folders {
             if let Some(first) = folders.first() {
-                *self.state.workspace_uri.lock().unwrap() = Some(first.uri.to_string());
+                *self.state.workspace_uri.lock() = Some(first.uri.to_string());
             }
         }
 
@@ -955,7 +964,7 @@ impl LanguageServer for Backend {
         let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
 
         {
-            let mut docs = self.state.documents.lock().unwrap();
+            let mut docs = self.state.documents.lock();
             docs.insert(
                 uri.clone(),
                 ParsedDoc {
@@ -981,7 +990,7 @@ impl LanguageServer for Backend {
             let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
 
             {
-                let mut docs = self.state.documents.lock().unwrap();
+                let mut docs = self.state.documents.lock();
                 docs.insert(
                     uri.clone(),
                     ParsedDoc {
@@ -1001,7 +1010,7 @@ impl LanguageServer for Backend {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         if let Some(text) = {
-            let docs = self.state.documents.lock().unwrap();
+            let docs = self.state.documents.lock();
             docs.get(&uri).map(|d| d.text.clone())
         } {
             let (diagnostics, _) = self.parse_and_validate(&uri, &text).await;
@@ -1014,7 +1023,7 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         {
-            let mut docs = self.state.documents.lock().unwrap();
+            let mut docs = self.state.documents.lock();
             docs.remove(&uri);
         }
         self.client
@@ -1031,16 +1040,16 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri.to_string();
         let pos = params.text_document_position_params.position;
 
-        let docs = self.state.documents.lock().unwrap();
+        let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri) {
             if let Some(ast) = &doc.ast {
                 let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
                 let lsp_col = pos.character as u16;
 
-                let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+                let ws_uri = self.state.workspace_uri.lock().clone();
                 let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-                let ruleset_guard = self.state.ruleset.lock().unwrap();
+                let ruleset_guard = self.state.ruleset.lock();
                 let pos_info = if let Some(rs) = ruleset_guard.as_ref() {
                     info_at_position(ast, lsp_line, lsp_col, rs, &logical_path, &self.state.string_table)
                 } else {
@@ -1050,7 +1059,7 @@ impl LanguageServer for Backend {
                 drop(ruleset_guard);
 
                 if let Some(info) = pos_info {
-                    let ruleset_guard2 = self.state.ruleset.lock().unwrap();
+                    let ruleset_guard2 = self.state.ruleset.lock();
                     let md = build_hover_markdown(
                         &info.element,
                         &info.hint,
@@ -1113,13 +1122,13 @@ impl LanguageServer for Backend {
         //  - ScopeField values are a static per-game list; full dynamic scope
         //    resolution is not implemented.
         //  - Deeply nested nodes inside aliases or subtypes may not match.
-        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
-        let language = self.state.language.lock().unwrap().clone();
+        let language = self.state.language.lock().clone();
 
         // .yml localisation file — offer loc-key / data-function completions.
         if uri.ends_with(".yml") || uri.ends_with(".yaml") {
-            let info_guard = self.state.info_service.lock().unwrap();
+            let info_guard = self.state.info_service.lock();
             let items = loc_completions(&*info_guard, &language);
             if !items.is_empty() {
                 return Ok(Some(CompletionResponse::Array(items)));
@@ -1127,9 +1136,9 @@ impl LanguageServer for Backend {
         }
 
         let context_items: Vec<CompletionItem> = {
-            let docs = self.state.documents.lock().unwrap();
-            let ruleset_guard = self.state.ruleset.lock().unwrap();
-            let info_guard = self.state.info_service.lock().unwrap();
+            let docs = self.state.documents.lock();
+            let ruleset_guard = self.state.ruleset.lock();
+            let info_guard = self.state.info_service.lock();
 
             if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
                 if let Some(ast) = &doc.ast {
@@ -1158,7 +1167,7 @@ impl LanguageServer for Backend {
         // matching produced nothing (no rules loaded, unrecognised path, etc.)
         let mut items = Vec::new();
 
-        let ruleset = self.state.ruleset.lock().unwrap();
+        let ruleset = self.state.ruleset.lock();
         if let Some(rules) = ruleset.as_ref() {
             for t in &rules.types {
                 items.push(CompletionItem {
@@ -1179,7 +1188,7 @@ impl LanguageServer for Backend {
         }
         drop(ruleset);
 
-        let info = self.state.info_service.lock().unwrap();
+        let info = self.state.info_service.lock();
         for var in &info.all_variables {
             items.push(CompletionItem {
                 label: var.clone(),
@@ -1221,14 +1230,14 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position_params.position;
         let uri = params.text_document_position_params.text_document.uri.to_string();
 
-        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         // First try the rule-aware lookup via info_at_position so we get a
         // TypeRef hint and can look up the actual definition location.
         let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock().unwrap();
-            let ruleset_guard = self.state.ruleset.lock().unwrap();
+            let docs = self.state.documents.lock();
+            let ruleset_guard = self.state.ruleset.lock();
             if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
                 if let Some(ast) = &doc.ast {
                     let info = info_at_position(
@@ -1249,7 +1258,7 @@ impl LanguageServer for Backend {
 
         if let Some((type_name, instance_name)) = type_ref {
             // Look up in the TypeIndex
-            let info = self.state.info_service.lock().unwrap();
+            let info = self.state.info_service.lock();
             let instances = info.type_index.instances(&type_name);
             let found: Vec<Location> = instances
                 .iter()
@@ -1274,7 +1283,7 @@ impl LanguageServer for Backend {
         }
 
         // Fallback: heuristic symbol-based lookup
-        let docs = self.state.documents.lock().unwrap();
+        let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri) {
             if let Some(ast) = &doc.ast {
                 let source_pos = cwtools_parser::ast::SourcePos {
@@ -1288,7 +1297,7 @@ impl LanguageServer for Backend {
                         position::AstElement::LeafValue { value, .. } => value.clone(),
                     };
                     drop(docs);
-                    let info = self.state.info_service.lock().unwrap();
+                    let info = self.state.info_service.lock();
                     if let Some(defs) = info.find_definitions(&symbol) {
                         let locations: Vec<Location> = defs.iter().map(|(file_uri, loc)| Location {
                             uri: parse_uri(file_uri, &params.text_document_position_params.text_document.uri),
@@ -1314,7 +1323,7 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position.position;
         let uri = params.text_document_position.text_document.uri.to_string();
 
-        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         // Try rule-aware: identify a TypeRef at cursor then scan type_index for
@@ -1325,8 +1334,8 @@ impl LanguageServer for Backend {
         // workspace would require an additional references index that is not yet
         // built.  Full cross-file reference tracking is left as future work.
         let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock().unwrap();
-            let ruleset_guard = self.state.ruleset.lock().unwrap();
+            let docs = self.state.documents.lock();
+            let ruleset_guard = self.state.ruleset.lock();
             if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
                 if let Some(ast) = &doc.ast {
                     let info = info_at_position(
@@ -1350,7 +1359,7 @@ impl LanguageServer for Backend {
 
             // 1. Definition location(s) from TypeIndex.
             {
-                let info = self.state.info_service.lock().unwrap();
+                let info = self.state.info_service.lock();
                 let instances = info.type_index.instances(&type_name);
                 for (file_uri, inst) in instances.iter().filter(|(_, inst)| inst.name == instance_name) {
                     all_locs.push(Location {
@@ -1365,9 +1374,9 @@ impl LanguageServer for Backend {
 
             // 2. Use-sites: scan all docs for TypeField leaves with the same value.
             {
-                let docs = self.state.documents.lock().unwrap();
-                let ruleset_guard = self.state.ruleset.lock().unwrap();
-                let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+                let docs = self.state.documents.lock();
+                let ruleset_guard = self.state.ruleset.lock();
+                let ws_uri = self.state.workspace_uri.lock().clone();
                 if let Some(rs) = ruleset_guard.as_ref() {
                     let use_sites = scan_use_sites(&type_name, &instance_name, &*docs, rs, &ws_uri, &self.state.string_table);
                     for (file_uri, loc) in use_sites {
@@ -1388,7 +1397,7 @@ impl LanguageServer for Backend {
         }
 
         // Fallback: heuristic-based approach
-        let docs = self.state.documents.lock().unwrap();
+        let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri) {
             if let Some(ast) = &doc.ast {
                 let source_pos = cwtools_parser::ast::SourcePos {
@@ -1402,7 +1411,7 @@ impl LanguageServer for Backend {
                         position::AstElement::LeafValue { value, .. } => value.clone(),
                     };
                     drop(docs);
-                    let info = self.state.info_service.lock().unwrap();
+                    let info = self.state.info_service.lock();
                     let mut all_locs = Vec::new();
                     if let Some(defs) = info.find_definitions(&symbol) {
                         all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
@@ -1422,7 +1431,7 @@ impl LanguageServer for Backend {
                             },
                         }));
                     }
-                    let index = self.state.symbol_index.lock().unwrap();
+                    let index = self.state.symbol_index.lock();
                     if let Some(locs) = index.find_references(&symbol) {
                         all_locs.extend(locs.iter().map(|l| Location {
                             uri: l.uri.parse().unwrap_or_else(|_| params.text_document_position.text_document.uri.clone()),
@@ -1446,7 +1455,7 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri.to_string();
-        let info = self.state.info_service.lock().unwrap();
+        let info = self.state.info_service.lock();
 
         let file_info = match info.files.get(&uri) {
             Some(f) => f,
@@ -1518,7 +1527,7 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
-        let info = self.state.info_service.lock().unwrap();
+        let info = self.state.info_service.lock();
         let mut symbols: Vec<SymbolInformation> = Vec::new();
 
         for (type_name, instances) in &info.type_index.map {
@@ -1571,12 +1580,12 @@ impl LanguageServer for Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri.to_string();
         let pos = params.position;
-        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock().unwrap();
-            let ruleset_guard = self.state.ruleset.lock().unwrap();
+            let docs = self.state.documents.lock();
+            let ruleset_guard = self.state.ruleset.lock();
             if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
                 if let Some(ast) = &doc.ast {
                     let info = info_at_position(
@@ -1613,13 +1622,13 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
         let new_name = params.new_name.clone();
-        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         // Identify what's under the cursor
         let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock().unwrap();
-            let ruleset_guard = self.state.ruleset.lock().unwrap();
+            let docs = self.state.documents.lock();
+            let ruleset_guard = self.state.ruleset.lock();
             if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
                 if let Some(ast) = &doc.ast {
                     let info = info_at_position(
@@ -1647,7 +1656,7 @@ impl LanguageServer for Backend {
         let mut all_locs: Vec<(String, cwtools_info::SourceLocation, usize)> = Vec::new();
 
         {
-            let info = self.state.info_service.lock().unwrap();
+            let info = self.state.info_service.lock();
             let instances = info.type_index.instances(&type_name);
             for (file_uri, inst) in instances.iter().filter(|(_, i)| i.name == instance_name) {
                 all_locs.push((file_uri.clone(), inst.location, instance_name.len()));
@@ -1655,9 +1664,9 @@ impl LanguageServer for Backend {
         }
 
         {
-            let docs = self.state.documents.lock().unwrap();
-            let ruleset_guard = self.state.ruleset.lock().unwrap();
-            let ws_uri2 = self.state.workspace_uri.lock().unwrap().clone();
+            let docs = self.state.documents.lock();
+            let ruleset_guard = self.state.ruleset.lock();
+            let ws_uri2 = self.state.workspace_uri.lock().clone();
             if let Some(rs) = ruleset_guard.as_ref() {
                 let use_sites = scan_use_sites(&type_name, &instance_name, &*docs, rs, &ws_uri2, &self.state.string_table);
                 for (file_uri, loc) in use_sites {
@@ -1737,7 +1746,7 @@ impl Backend {
         self.send_loading_bar(true, "Indexing workspace…").await;
 
         let workspace_uri = {
-            let guard = self.state.workspace_uri.lock().unwrap();
+            let guard = self.state.workspace_uri.lock();
             guard.clone()
         };
 
@@ -1811,12 +1820,17 @@ impl Backend {
         // validated. Keep the parsed ASTs so pass 2 doesn't re-parse.
         self.send_loading_bar(true, "Indexing workspace…").await;
         let mut parsed_docs: Vec<(String, std::path::PathBuf, String, ParsedFile)> = Vec::new();
-        for file_path in &files_to_validate {
+        for (i, file_path) in files_to_validate.iter().enumerate() {
             let uri = format!("file://{}", file_path.display());
             if let Ok(text) = std::fs::read_to_string(file_path) {
                 if let Some(parsed) = self.index_document(&uri, &text).await {
                     parsed_docs.push((uri, file_path.clone(), text, parsed));
                 }
+            }
+            // Yield every 50 files so LSP requests (hover, completion) can
+            // interleave with the workspace scan.
+            if i % 50 == 49 {
+                tokio::task::yield_now().await;
             }
         }
 
@@ -1824,24 +1838,18 @@ impl Backend {
         // references resolve. Re-merge each pass after dropping the prior copy
         // to avoid unbounded growth on re-validation.
         {
-            let vanilla_guard = self.state.vanilla_index.lock().unwrap();
+            let vanilla_guard = self.state.vanilla_index.lock();
             if let Some(per_type) = vanilla_guard.as_ref() {
-                let mut info_guard = self.state.info_service.lock().unwrap();
+                let mut info_guard = self.state.info_service.lock();
                 info_guard.type_index.remove_file("<vanilla-cache>");
                 info_guard.type_index.merge("<vanilla-cache>", per_type.clone());
             }
         }
 
-        // Build the modifier-key set ONCE — it depends only on the ruleset and the
-        // now-complete type index, not on the file being validated.
-        let modifier_keys = {
-            let ruleset_guard = self.state.ruleset.lock().unwrap();
-            let info_guard = self.state.info_service.lock().unwrap();
-            match ruleset_guard.as_ref() {
-                Some(rs) => build_modifier_keys(rs, &info_guard.type_index),
-                None => std::collections::HashSet::new(),
-            }
-        };
+        // Rebuild the cached modifier-key set now that the type index is
+        // complete (templated modifiers like production_speed_<building>_factor
+        // expand against the full instance list).
+        self.rebuild_modifier_keys();
 
         // Pass 2: validate each stored AST against the complete index. No
         // re-parsing and no per-file logging (that logging was ~2 LSP
@@ -1849,8 +1857,11 @@ impl Backend {
         self.send_loading_bar(true, "Validating workspace…").await;
         let mut total_errors = 0usize;
         let total_files = parsed_docs.len();
-        for (uri, _file_path, text, parsed) in parsed_docs {
-            let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys);
+        // Snapshot modifier_keys once before the loop; the set doesn't change
+        // during validation and we can't hold the guard across await points.
+        let modifier_keys_snap: HashSet<String> = self.state.modifier_keys.read().clone();
+        for (i, (uri, _file_path, text, parsed)) in parsed_docs.into_iter().enumerate() {
+            let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys_snap);
             total_errors += diagnostics.iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
                 .count();
@@ -1861,8 +1872,13 @@ impl Backend {
                     .await;
             }
 
-            let mut docs = self.state.documents.lock().unwrap();
-            docs.insert(uri, ParsedDoc { version: 0, text, ast: Some(parsed) });
+            {
+                let mut docs = self.state.documents.lock();
+                docs.insert(uri, ParsedDoc { version: 0, text, ast: Some(parsed) });
+            }
+            if i % 50 == 49 {
+                tokio::task::yield_now().await;
+            }
         }
 
         self.client
@@ -1874,7 +1890,7 @@ impl Backend {
             .await;
 
         // Build and send the file list for the extension's file explorer.
-        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let ws_uri = self.state.workspace_uri.lock().clone();
         let file_list: Vec<serde_json::Value> = files_to_validate
             .iter()
             .map(|file_path| {
@@ -1901,14 +1917,14 @@ impl Backend {
     async fn index_document(&self, uri: &str, text: &str) -> Option<ParsedFile> {
         let parsed = parse_string(text, &self.state.string_table).ok()?;
         {
-            let mut index = self.state.symbol_index.lock().unwrap();
+            let mut index = self.state.symbol_index.lock();
             index.clear_document(uri);
             index.index_document(uri, &parsed, &self.state.string_table);
         }
-        let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+        let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(uri, &ws_uri);
-        let ruleset_guard = self.state.ruleset.lock().unwrap();
-        let mut info = self.state.info_service.lock().unwrap();
+        let ruleset_guard = self.state.ruleset.lock();
+        let mut info = self.state.info_service.lock();
         info.clear_file(uri);
         if let Some(ruleset) = ruleset_guard.as_ref() {
             info.index_file_with_path(uri, &parsed, &self.state.string_table, ruleset, &logical_path);
@@ -1926,11 +1942,11 @@ impl Backend {
         modifier_keys: &std::collections::HashSet<String>,
     ) -> Vec<Diagnostic> {
         let mut diagnostics: Vec<Diagnostic> = parsed.errors.iter().map(parse_error_to_diagnostic).collect();
-        let ruleset_guard = self.state.ruleset.lock().unwrap();
+        let ruleset_guard = self.state.ruleset.lock();
         if let Some(ruleset) = ruleset_guard.as_ref() {
-            let language = self.state.language.lock().unwrap().clone();
+            let language = self.state.language.lock().clone();
             let game = cwtools_game::constants::Game::from_str(&language);
-            let info_guard = self.state.info_service.lock().unwrap();
+            let info_guard = self.state.info_service.lock();
             let type_index = &info_guard.type_index;
             let mut errs = validate_ast(parsed, ruleset, &self.state.string_table, uri, game, Some(type_index), Some(modifier_keys));
             drop(info_guard);
@@ -2007,19 +2023,19 @@ impl Backend {
 
                 // Update symbol index
                 {
-                    let mut index = self.state.symbol_index.lock().unwrap();
+                    let mut index = self.state.symbol_index.lock();
                     index.clear_document(uri);
                     index.index_document(uri, &parsed, &self.state.string_table);
                 }
 
                 // Derive logical path for type-instance indexing
-                let ws_uri = self.state.workspace_uri.lock().unwrap().clone();
+                let ws_uri = self.state.workspace_uri.lock().clone();
                 let logical_path = logical_path_from_uri(uri, &ws_uri);
 
                 // Update info service
                 {
-                    let ruleset_guard = self.state.ruleset.lock().unwrap();
-                    let mut info = self.state.info_service.lock().unwrap();
+                    let ruleset_guard = self.state.ruleset.lock();
+                    let mut info = self.state.info_service.lock();
                     info.clear_file(uri);
                     if let Some(ruleset) = ruleset_guard.as_ref() {
                         info.index_file_with_path(uri, &parsed, &self.state.string_table, ruleset, &logical_path);
@@ -2028,16 +2044,17 @@ impl Backend {
 
                 // Validation
                 let (errors, log_msg) = {
-                    let ruleset_guard = self.state.ruleset.lock().unwrap();
+                    let ruleset_guard = self.state.ruleset.lock();
                     if let Some(ruleset) = ruleset_guard.as_ref() {
-                        let language = self.state.language.lock().unwrap().clone();
+                        let language = self.state.language.lock().clone();
                         let game = cwtools_game::constants::Game::from_str(&language);
                         let start = std::time::Instant::now();
                         // Pass the workspace TypeIndex for cross-file type reference checking.
-                        let info_guard = self.state.info_service.lock().unwrap();
+                        let info_guard = self.state.info_service.lock();
                         let type_index = &info_guard.type_index;
-                        let modifier_keys = build_modifier_keys(ruleset, type_index);
-                        let mut errs = validate_ast(&parsed, ruleset, &self.state.string_table, uri, game, Some(type_index), Some(&modifier_keys));
+                        let modifier_keys = self.state.modifier_keys.read();
+                        let mut errs = validate_ast(&parsed, ruleset, &self.state.string_table, uri, game, Some(type_index), Some(&*modifier_keys));
+                        drop(modifier_keys);
                         drop(info_guard);
                         let elapsed = start.elapsed();
                         const MAX_ERRORS: usize = 100;
@@ -2090,6 +2107,17 @@ impl Backend {
                 (diagnostics, None)
             }
         }
+    }
+
+    /// Rebuild the cached modifier-key set from the current ruleset and type index.
+    fn rebuild_modifier_keys(&self) {
+        let ruleset_guard = self.state.ruleset.lock();
+        let info_guard = self.state.info_service.lock();
+        let keys = match ruleset_guard.as_ref() {
+            Some(rs) => build_modifier_keys(rs, &info_guard.type_index),
+            None => HashSet::new(),
+        };
+        *self.state.modifier_keys.write() = keys;
     }
 
     async fn determine_file_types(&self, uri: &str) -> Vec<String> {

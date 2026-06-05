@@ -443,16 +443,23 @@ fn collect_vars_recursive(
 /// Collect variables using full rule-tree walking.
 /// For each leaf where the rule field is `VariableSetField(ns)`, record the
 /// variable name under namespace `ns`.
+///
+/// When `at_vars` is `Some`, those entries are used as the "@" namespace
+/// instead of re-scanning the AST for `@`-prefix leaves (avoids a redundant
+/// walk when the caller already collected them via the heuristic pass).
 pub fn collect_defined_variables_from_rules(
     ruleset: &RuleSet,
     file: &ParsedFile,
     logical_path: &str,
     table: &StringTable,
+    at_vars: Option<Vec<DefinedVariable>>,
 ) -> HashMap<String, Vec<DefinedVariable>> {
     let mut result: HashMap<String, Vec<DefinedVariable>> = HashMap::new();
 
-    // First grab @-prefix vars (always valid regardless of rules)
-    collect_at_vars(&file.root_children, &file.arena, table, &mut result);
+    match at_vars {
+        Some(vars) if !vars.is_empty() => { result.insert("@".to_string(), vars); }
+        _ => { collect_at_vars(&file.root_children, &file.arena, table, &mut result); }
+    }
 
     // Walk type instances (path-filtered) and scan their rules for VariableSetField
     for td in &ruleset.types {
@@ -1006,9 +1013,15 @@ impl InfoService {
         info.type_instances = instances;
 
         // ── Rule-driven: defined variables ────────────────────────────────────
+        // Convert the @-vars already collected by index_child_heuristic into
+        // DefinedVariable form so collect_defined_variables_from_rules can skip
+        // re-scanning the AST for them.
+        let at_vars: Vec<DefinedVariable> = info.defined_variables.iter().map(|(name, loc)| {
+            DefinedVariable { name: name.clone(), namespace: None, location: *loc }
+        }).collect();
         info.defined_variables_ns =
-            collect_defined_variables_from_rules(ruleset, ast, logical_path, table);
-        // Flatten into legacy map
+            collect_defined_variables_from_rules(ruleset, ast, logical_path, table, Some(at_vars));
+        // Flatten non-@-var entries back into the legacy map for compat.
         for vars in info.defined_variables_ns.values() {
             for v in vars {
                 if v.name.starts_with('@') {
@@ -1017,8 +1030,8 @@ impl InfoService {
             }
         }
 
-        // ── Saved event targets with position ─────────────────────────────────
-        info.saved_event_targets_detailed = collect_saved_event_targets(ast, table);
+        // saved_event_targets_detailed is populated by index_child_heuristic
+        // (it detects save_event_target_as / save_global_event_target_as).
         info.saved_event_targets = info
             .saved_event_targets_detailed
             .iter()
@@ -1207,6 +1220,19 @@ impl InfoService {
                     let target = key.strip_prefix("event_target:").unwrap_or("");
                     if !target.is_empty() {
                         info.saved_event_targets.insert(target.to_string());
+                    }
+                }
+
+                if key == "save_event_target_as" || key == "save_global_event_target_as" {
+                    if !value_str.is_empty() {
+                        info.saved_event_targets_detailed.push(SavedEventTarget {
+                            name: value_str.clone(),
+                            location: SourceLocation {
+                                line: leaf.pos.start.line,
+                                col: leaf.pos.start.col,
+                            },
+                            is_global: key == "save_global_event_target_as",
+                        });
                     }
                 }
 
