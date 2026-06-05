@@ -1522,6 +1522,18 @@ fn validate_alias_usage(
             overloads.push(&ruleset.aliases[i].1);
         }
     }
+    // Case-insensitive retry: usages like `IF`, `Country_event` resolve to the
+    // lowercase alias (config alias names are lowercase). Mirrors the fallback in
+    // field_matches_key, which matches the key so the body must validate too.
+    let lower = key.to_ascii_lowercase();
+    if overloads.is_empty()
+        && lower != key
+        && let Some(idxs) = ruleset.alias_exact.get(&format!("{}:{}", category, lower))
+    {
+        for &i in idxs {
+            overloads.push(&ruleset.aliases[i].1);
+        }
+    }
     if let Some(cat) = ruleset.alias_categories.get(category) {
         for &idx in &cat.type_pattern_idxs {
             let (name, rule) = &ruleset.aliases[idx];

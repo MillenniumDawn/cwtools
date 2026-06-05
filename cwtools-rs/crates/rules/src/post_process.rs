@@ -58,8 +58,33 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
 /// Recursively walk `rule` and replace any `SingleAliasField` / `SingleAliasClauseField`
 /// references with the body from `map`.
 fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)]) {
-    let (rt, _opts) = rule;
-    match rt {
+    // A body that is *itself* a single_alias reference, e.g.
+    // `alias[effect:every_country] = single_alias_right[every_effect_clause]`.
+    // Resolve it in place so the alias body becomes the referenced rules and is
+    // deep-validated like an inline body, instead of staying an opaque
+    // SingleAliasField that validates permissively.
+    if let RuleType::LeafRule { right: NewField::SingleAliasField(name), .. } = &rule.0 {
+        let name = name.clone();
+        if let Some(resolved) = lookup_single_alias(&name, map) {
+            let left = extract_leaf_left(&rule.0);
+            match resolved.0 {
+                RuleType::LeafRule { right: ar, .. } => rule.0 = RuleType::LeafRule { left, right: ar },
+                RuleType::NodeRule { rules: ar, .. } => rule.0 = RuleType::NodeRule { left, rules: ar },
+                _ => {}
+            }
+        }
+        return;
+    }
+    if let RuleType::LeafValueRule { right: NewField::SingleAliasClauseField(_, name) } = &rule.0 {
+        let name = name.clone();
+        if let Some(resolved) = lookup_single_alias(&name, map) {
+            if let RuleType::NodeRule { rules: ar, .. } = resolved.0 {
+                rule.0 = RuleType::ValueClauseRule { rules: ar };
+            }
+        }
+        return;
+    }
+    match &mut rule.0 {
         RuleType::NodeRule { rules, .. } => {
             inline_rules_list(rules, map);
         }
@@ -69,8 +94,6 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)]) {
         RuleType::SubtypeRule { rules, .. } => {
             inline_rules_list(rules, map);
         }
-        // LeafRule / LeafValueRule are handled by the caller via the
-        // expand_single_alias_in_list helper below.
         _ => {}
     }
 }
@@ -447,6 +470,34 @@ alias[effect:node_test] = {
             }
         } else {
             panic!("expected outer NodeRule");
+        }
+    }
+
+    #[test]
+    fn test_single_alias_inline_whole_body() {
+        // An alias whose ENTIRE body is a single_alias_right reference, e.g.
+        // `alias[effect:every_country] = single_alias_right[every_effect_clause]`.
+        // Must inline to the referenced node's rules so the body deep-validates
+        // (otherwise every_*/random_* scope-effect bodies validate permissively).
+        let input = r#"
+single_alias[every_clause] = {
+    ## cardinality = 0..1
+    limit = scalar
+}
+
+alias[effect:every_country] = single_alias_right[every_clause]
+"#;
+        let rs = parse_and_post(input);
+        let (_, (rule, _)) = rs.aliases.iter().find(|(n, _)| n == "effect:every_country").unwrap();
+        match rule {
+            RuleType::NodeRule { rules, .. } => {
+                assert!(
+                    rules.iter().any(|(rt, _)| matches!(rt,
+                        RuleType::LeafRule { left: NewField::SpecificField(s), .. } if s == "limit")),
+                    "expected 'limit' rule from inlined every_clause, got {:?}", rules
+                );
+            }
+            other => panic!("expected NodeRule after whole-body single_alias inline, got {:?}", other),
         }
     }
 
