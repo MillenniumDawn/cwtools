@@ -7,8 +7,9 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
 use cwtools_info::TypeIndex;
-use cwtools_info::{element_at_position, info_at_position, PositionElement, ReferenceHint};
+use cwtools_info::{collect_type_instances, element_at_position, info_at_position, PositionElement, ReferenceHint, TypeInstance};
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType, ValueType};
@@ -41,6 +42,81 @@ fn build_modifier_keys(ruleset: &RuleSet, type_index: &TypeIndex) -> HashSet<Str
         }
     }
     mk
+}
+
+/// Index a base-game ("vanilla") install into per-type instances, ready to merge
+/// into the workspace TypeIndex. Mirrors the CLI's `index_game_dir` / `--vanilla`:
+/// for a game root, `FileManagerConfig::default()` already covers the standard
+/// layout (common/, gfx/, events/, …). The discovered ASTs are used directly (no
+/// re-parse) because vanilla files are only indexed, never validated.
+fn index_vanilla_dir(
+    dir: &std::path::Path,
+    ruleset: &RuleSet,
+    table: &StringTable,
+) -> HashMap<String, Vec<TypeInstance>> {
+    let config = FileManagerConfig {
+        root: dir.to_path_buf(),
+        ..Default::default()
+    };
+    let mut mgr = FileManager::with_string_table(config, table.clone());
+    let mut index = TypeIndex::new();
+    if let Ok(files) = mgr.discover_and_parse() {
+        for file in files {
+            let path = file.path.clone();
+            let logical = file.logical_path.clone();
+            let pf = ParsedFile {
+                arena: file.arena,
+                root_children: file.root_children,
+                errors: vec![],
+            };
+            let instances = collect_type_instances(ruleset, &pf, &logical, table);
+            index.merge(path.to_str().unwrap_or(""), instances);
+        }
+    }
+    // Drop the per-instance file_uri; the merge slot only needs the instances.
+    index
+        .map
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().map(|(_, inst)| inst).collect()))
+        .collect()
+}
+
+/// Best-effort discovery of a base-game install for `game`, checking the usual
+/// Steam library locations across platforms. Returns the first existing dir.
+/// Used as a fallback when the client passes neither `vanilla` nor `vanillaCache`.
+fn discover_vanilla_dir(game: &str) -> Option<std::path::PathBuf> {
+    // Map our game id to the Steam "common" install folder name.
+    let folder = match game {
+        "hoi4" => "Hearts of Iron IV",
+        "stellaris" => "Stellaris",
+        "eu4" => "Europa Universalis IV",
+        "ck2" => "Crusader Kings II",
+        "ck3" => "Crusader Kings III",
+        "vic2" => "Victoria 2",
+        "vic3" => "Victoria 3",
+        "ir" => "ImperatorRome",
+        _ => return None,
+    };
+
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    // Steam library roots to probe (Linux, macOS, Windows).
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(h) = &home {
+        roots.push(h.join(".steam/steam/steamapps/common"));
+        roots.push(h.join(".local/share/Steam/steamapps/common"));
+        roots.push(h.join("Library/Application Support/Steam/steamapps/common"));
+    }
+    roots.push(std::path::PathBuf::from(
+        "C:/Program Files (x86)/Steam/steamapps/common",
+    ));
+    roots.push(std::path::PathBuf::from(
+        "C:/Program Files/Steam/steamapps/common",
+    ));
+
+    roots
+        .into_iter()
+        .map(|r| r.join(folder))
+        .find(|p| p.is_dir())
 }
 
 // ── Custom LSP notification types ─────────────────────────────────────────────
@@ -79,9 +155,13 @@ struct DocumentState {
     info_service: Mutex<cwtools_info::InfoService>,
     /// workspace folder URI captured from initialize params
     workspace_uri: Mutex<Option<String>>,
-    /// pre-generated base-game type instances (from a vanilla cache), merged
-    /// into the workspace index so the editor resolves base-game references.
+    /// pre-generated base-game type instances (from a vanilla cache OR a live
+    /// index of `vanilla_dir`), merged into the workspace index so the editor
+    /// resolves base-game references.
     vanilla_index: Mutex<Option<HashMap<String, Vec<cwtools_info::TypeInstance>>>>,
+    /// base-game install dir (from the `vanilla` init option, or auto-discovered).
+    /// Indexed lazily into `vanilla_index` on the first full-workspace scan.
+    vanilla_dir: Mutex<Option<std::path::PathBuf>>,
     /// cached modifier-key set; rebuilt after ruleset load and after each full
     /// workspace scan when the type index is complete.
     modifier_keys: parking_lot::RwLock<HashSet<String>>,
@@ -105,6 +185,7 @@ impl DocumentState {
             info_service: Mutex::new(cwtools_info::InfoService::new()),
             workspace_uri: Mutex::new(None),
             vanilla_index: Mutex::new(None),
+            vanilla_dir: Mutex::new(None),
             modifier_keys: parking_lot::RwLock::new(HashSet::new()),
         }
     }
@@ -888,6 +969,23 @@ impl LanguageServer for Backend {
                             .log_message(MessageType::WARNING, format!("Could not load vanilla cache {}: {}", vc, e))
                             .await;
                     }
+                }
+            }
+
+            // A raw base-game install dir (like the CLI's `--vanilla`). Stored
+            // here and indexed lazily on the first full-workspace scan, so the
+            // editor resolves base-game references without a pre-built cache.
+            if let Some(vd) = opts.get("vanilla").and_then(|v| v.as_str()) {
+                let p = std::path::PathBuf::from(vd);
+                if p.is_dir() {
+                    *self.state.vanilla_dir.lock() = Some(p);
+                    self.client
+                        .log_message(MessageType::INFO, format!("Base-game dir set: {}", vd))
+                        .await;
+                } else {
+                    self.client
+                        .log_message(MessageType::WARNING, format!("`vanilla` dir does not exist: {}", vd))
+                        .await;
                 }
             }
 
@@ -1960,6 +2058,10 @@ impl Backend {
             }
         }
 
+        // Build the base-game index from a `vanilla` dir (or auto-discovery) if
+        // we have one and haven't indexed it yet. Populates `vanilla_index`.
+        self.ensure_vanilla_index().await;
+
         // Merge the pre-generated vanilla index (if loaded) so base-game
         // references resolve. Re-merge each pass after dropping the prior copy
         // to avoid unbounded growth on re-validation.
@@ -2276,6 +2378,65 @@ impl Backend {
             None => HashSet::new(),
         };
         *self.state.modifier_keys.write() = keys;
+    }
+
+    /// Lazily index the base-game install into `vanilla_index` (once). Resolves
+    /// the dir from the `vanilla` init option, falling back to auto-discovery by
+    /// game. No-op if already indexed, if no dir is found, or if the ruleset
+    /// isn't loaded yet (we need it to know which type each definition is).
+    async fn ensure_vanilla_index(&self) {
+        // Already have a vanilla index (from a cache or a prior build)? Done.
+        if self.state.vanilla_index.lock().is_some() {
+            return;
+        }
+        // Resolve the install dir: explicit `vanilla` option, else auto-discover.
+        let dir = {
+            let explicit = self.state.vanilla_dir.lock().clone();
+            explicit.or_else(|| {
+                let game = self.state.language.lock().clone();
+                discover_vanilla_dir(&game)
+            })
+        };
+        let dir = match dir {
+            Some(d) if d.is_dir() => d,
+            _ => return,
+        };
+        // We need the ruleset to map definitions to their types. Clone it out so
+        // the lock guard isn't held across the awaits below (parking_lot guards
+        // aren't Send, and this runs inside a spawned task).
+        let ruleset_opt = self.state.ruleset.lock().clone();
+        let ruleset = match ruleset_opt {
+            Some(rs) => rs,
+            None => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        "Base-game dir set but no rules loaded yet; skipping vanilla index.",
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        self.send_loading_bar(true, "Indexing base game…").await;
+        self.client
+            .log_message(MessageType::INFO, format!("Indexing base game at {} …", dir.display()))
+            .await;
+
+        // Indexing parses thousands of files; run it off the async executor.
+        let table = self.state.string_table.clone();
+        let per_type = tokio::task::spawn_blocking(move || index_vanilla_dir(&dir, &ruleset, &table))
+            .await
+            .unwrap_or_default();
+
+        let total: usize = per_type.values().map(|v| v.len()).sum();
+        *self.state.vanilla_index.lock() = Some(per_type);
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Indexed {} base-game instances.", total),
+            )
+            .await;
     }
 
     async fn determine_file_types(&self, uri: &str) -> Vec<String> {
@@ -3009,5 +3170,62 @@ mod tests {
             sites.iter().any(|(uri, _)| uri == "file:///test.txt"),
             "expected correct uri"
         );
+    }
+
+    // ── vanilla indexing tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_discover_vanilla_dir_unknown_game_is_none() {
+        assert!(discover_vanilla_dir("not_a_real_game").is_none());
+        assert!(discover_vanilla_dir("").is_none());
+    }
+
+    #[test]
+    fn test_index_vanilla_dir_collects_instances() {
+        // A type[foo] whose instances live under common/foos; the node key is the
+        // instance name (no name_field). Mirrors how a base-game type is indexed.
+        let mut rs = RuleSet::new();
+        rs.types.push(TypeDefinition {
+            name: "foo".to_string(),
+            name_field: None,
+            path_options: PathOptions {
+                paths: vec!["common/foos".to_string()],
+                path_strict: false,
+                path_file: None,
+                path_extension: None,
+                paths_lower: Vec::new(),
+            },
+            subtypes: Vec::new(),
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: false,
+            localisation: Vec::new(),
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        });
+        rs.reindex();
+
+        // Lay out a tiny "game install" in a temp dir.
+        let root = std::env::temp_dir().join("cwtools_lsp_vanilla_test");
+        let foos = root.join("common").join("foos");
+        std::fs::create_dir_all(&foos).unwrap();
+        std::fs::write(foos.join("a.txt"), "foo_one = { }\nfoo_two = { }\n").unwrap();
+
+        let table = StringTable::new();
+        let per_type = index_vanilla_dir(&root, &rs, &table);
+
+        let names: Vec<&str> = per_type
+            .get("foo")
+            .map(|v| v.iter().map(|i| i.name.as_str()).collect())
+            .unwrap_or_default();
+        assert!(names.contains(&"foo_one"), "got: {:?}", names);
+        assert!(names.contains(&"foo_two"), "got: {:?}", names);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

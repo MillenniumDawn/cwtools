@@ -89,6 +89,28 @@ The server needs to:
 
 ---
 
+## Base-game ("vanilla") references
+
+A mod references base-game content (sprites, particles, sound effects, equipment, focuses, …) that
+isn't defined in the mod. Without the base game indexed, every such reference is a false `CW500`
+"not a known instance" (on Millennium Dawn that's ~21K of them). The server resolves these the same
+way the CLI's `--vanilla` / `--vanilla-cache` flags do. Three ways to supply it, in priority order:
+
+1. `initializationOptions.vanillaCache` — path to a pre-built index (see the CLI `cache-vanilla`
+   command). Fastest; no parsing at startup.
+2. `initializationOptions.vanilla` — path to the base-game install dir (e.g. the Steam
+   `…/common/Hearts of Iron IV` folder). The server indexes it lazily on the first full-workspace
+   scan (shown on the loading bar). Equivalent to the CLI `--vanilla`.
+3. **Auto-discovery** — if neither is passed, the server probes the usual Steam library locations for
+   the current game (from the `language` init option) and indexes the install if found. So HOI4 at a
+   standard Steam path works out of the box with no extension change.
+
+The indexed base-game instances are merged into the workspace TypeIndex for reference resolution
+only; vanilla files are never validated (they carry known base-game errors). The extension can pass
+`vanilla`/`vanillaCache` explicitly to override auto-discovery or for non-standard install paths.
+
+---
+
 ## 3. Exact Code Changes
 
 ### In `cwtools-rs/crates/lsp/src/main.rs` (Rust server)

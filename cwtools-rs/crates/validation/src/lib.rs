@@ -33,6 +33,7 @@ pub enum ErrorSeverity {
 fn validate_wrapper_grandchildren(
     grandchildren: &[Child],
     type_def: &TypeDefinition,
+    wrapper_root_key: &str,
     ast: &ParsedFile,
     inner_rules: &[(RuleType, Options)],
     enum_map: &HashMap<&str, &EnumDefinition>,
@@ -46,49 +47,25 @@ fn validate_wrapper_grandchildren(
     modifier_keys: Option<&HashSet<String>>,
 ) {
     for grandchild in grandchildren {
-        match grandchild {
+        // Pull the grandchild's key and body uniformly for Node and Leaf-clause.
+        let (gc_key, gc_children): (String, &[Child]) = match grandchild {
             Child::Node(gc_idx) => {
                 let gc_node = &ast.arena.nodes[*gc_idx as usize];
-                let gc_key = table.get_string(gc_node.key.normal).unwrap_or_default();
-                validate_with_type(
-                    type_def,
+                (
+                    table.get_string(gc_node.key.normal).unwrap_or_default(),
                     gc_node.children.as_slice(),
-                    ast,
-                    inner_rules,
-                    enum_map,
-                    table,
-                    errors,
-                    file_path,
-                    scope_context,
-                    game,
-                    ruleset,
-                    type_index,
-                    modifier_keys,
-                    Some(&gc_key),
-                );
+                )
             }
             Child::Leaf(gc_idx) => {
                 let gc_leaf = &ast.arena.leaves[*gc_idx as usize];
-                if let Value::Clause(gc_children) = &gc_leaf.value {
-                    let gc_key = table.get_string(gc_leaf.key.normal).unwrap_or_default();
-                    validate_with_type(
-                        type_def,
+                match &gc_leaf.value {
+                    Value::Clause(gc_children) => (
+                        table.get_string(gc_leaf.key.normal).unwrap_or_default(),
                         gc_children.as_slice(),
-                        ast,
-                        inner_rules,
-                        enum_map,
-                        table,
-                        errors,
-                        file_path,
-                        scope_context,
-                        game,
-                        ruleset,
-                        type_index,
-                        modifier_keys,
-                        Some(&gc_key),
-                    );
+                    ),
+                    // Non-clause scalar leaf inside wrapper: leave as-is (no error).
+                    _ => continue,
                 }
-                // Non-clause scalar leaf inside wrapper: leave as-is (no error)
             }
             Child::LeafValue(idx) => {
                 let lv = &ast.arena.leaf_values[*idx as usize];
@@ -101,9 +78,48 @@ fn validate_wrapper_grandchildren(
                     file: file_path.to_string(),
                     code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
                 });
+                continue;
             }
-            _ => {}
-        }
+            _ => continue,
+        };
+
+        // A wrapper like `objectTypes` can hold instances of several types
+        // (pdxmesh, pdxparticle, entity, …) that share a path; pick the type that
+        // `## type_key_filter` assigns to THIS grandchild's key rather than
+        // validating every grandchild against whichever type won the path lookup.
+        let (gc_type_def, gc_rules) =
+            match find_grandchild_type(file_path, wrapper_root_key, &gc_key, ruleset) {
+                Some(t) => {
+                    let r = find_rules_by_name(&t.name, ruleset);
+                    let has_content =
+                        !r.is_empty() || t.subtypes.iter().any(|st| !st.rules.is_empty());
+                    // Resolved to an index-only type (no rule body): its fields
+                    // are not content-validated, so don't flag them.
+                    if !has_content {
+                        continue;
+                    }
+                    (t, r)
+                }
+                // No better match: keep the type the wrapper was resolved to.
+                None => (type_def, inner_rules),
+            };
+
+        validate_with_type(
+            gc_type_def,
+            gc_children,
+            ast,
+            gc_rules,
+            enum_map,
+            table,
+            errors,
+            file_path,
+            scope_context,
+            game,
+            ruleset,
+            type_index,
+            modifier_keys,
+            Some(&gc_key),
+        );
     }
 }
 
@@ -199,6 +215,7 @@ pub fn validate_ast(
                     validate_wrapper_grandchildren(
                         children,
                         type_def,
+                        &type_key,
                         ast,
                         inner_rules,
                         &enum_map,
@@ -285,6 +302,7 @@ pub fn validate_ast(
                 validate_wrapper_grandchildren(
                     grandchildren,
                     type_def,
+                    &child_root_key,
                     ast,
                     inner_rules,
                     &enum_map,
@@ -405,6 +423,7 @@ fn validate_with_type(
             ruleset,
             type_index,
             modifier_keys,
+            (0, 0),
         );
         // Item 9: warning_only
         if type_def.warning_only {
@@ -532,6 +551,7 @@ fn validate_with_type(
         ruleset,
         type_index,
         modifier_keys,
+        (0, 0),
     );
 
     // Item 9: warning_only — downgrade all newly-added errors to warnings (F# RuleValidationService.fs:916).
@@ -666,6 +686,24 @@ fn find_type_by_path_and_key<'a>(
                 continue;
             }
         }
+        // `## type_key_filter` gates a NON-wrapper type to nodes whose own key
+        // satisfies the filter: a top-level `animation = { ... }` node is only an
+        // instance of `type[model_animation] { type_key_filter = animation }`, not
+        // of `type[light]` that merely shares the path. A matching filter also
+        // earns a bonus so the filtered type beats an unfiltered one on the same
+        // path. (For skip_root_key wrappers the filter applies to GRANDCHILDREN,
+        // handled in validate_wrapper_grandchildren, so it is not gated here.)
+        let tkf_bonus = match (root_key, t.skip_root_key.is_empty(), &t.type_key_filter) {
+            (Some(rk), true, Some((keys, negate))) => {
+                let hit = keys.iter().any(|k| k.eq_ignore_ascii_case(rk));
+                if hit != *negate {
+                    5_000
+                } else {
+                    continue; // filter excludes this key: the type does not apply
+                }
+            }
+            _ => 0,
+        };
         for p in &t.path_options.paths {
             let p_lower = p.to_lowercase();
             // path_strict: the file must be DIRECTLY in this directory (so
@@ -691,6 +729,7 @@ fn find_type_by_path_and_key<'a>(
             };
             let weight = p_lower.len()
                 + skip_key_bonus
+                + tkf_bonus
                 + if t.path_options.path_file.is_some() {
                     1000
                 } else {
@@ -703,6 +742,74 @@ fn find_type_by_path_and_key<'a>(
         }
     }
     best
+}
+
+/// True if `t`'s `path_options` select `file_path`. Mirrors the per-path test in
+/// [`find_type_by_path_and_key`] without the scoring, for use when several types
+/// share a path.
+fn type_path_matches(file_path: &str, t: &TypeDefinition) -> bool {
+    let path_lower = file_path.to_lowercase();
+    let basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
+    let dir = path_lower
+        .strip_suffix(basename)
+        .unwrap_or(&path_lower)
+        .trim_end_matches('/');
+    if let Some(pf) = &t.path_options.path_file {
+        if basename != pf.to_lowercase() {
+            return false;
+        }
+    }
+    if let Some(ext) = &t.path_options.path_extension {
+        let ext = ext.to_lowercase();
+        let ext = ext.strip_prefix('.').unwrap_or(&ext);
+        if !basename.rsplit('.').next().is_some_and(|e| e == ext) {
+            return false;
+        }
+    }
+    t.path_options.paths.iter().any(|p| {
+        let p_lower = p.to_lowercase();
+        if t.path_options.path_strict {
+            dir == p_lower || dir.ends_with(&format!("/{}", p_lower))
+        } else {
+            path_contains_segment(dir, &p_lower)
+        }
+    })
+}
+
+/// Resolve which type a `skip_root_key` wrapper's grandchild belongs to, by the
+/// grandchild's own key. Several types can share a path AND `skip_root_key`
+/// (e.g. `pdxmesh`, `pdxparticle`, `entity` all sit under `objectTypes` in `.gfx`
+/// files); `## type_key_filter` is what disambiguates them. Prefer a candidate
+/// whose filter selects `gc_key`; otherwise fall back to a wrapper type that has
+/// no filter. Returns `None` when nothing fits, in which case the caller keeps
+/// the type that won the path lookup (so single-type wrappers are unaffected).
+fn find_grandchild_type<'a>(
+    file_path: &str,
+    wrapper_root_key: &str,
+    gc_key: &str,
+    ruleset: &'a RuleSet,
+) -> Option<&'a TypeDefinition> {
+    let mut generic: Option<&TypeDefinition> = None;
+    for t in &ruleset.types {
+        if !should_skip_root_key(wrapper_root_key, t) || !type_path_matches(file_path, t) {
+            continue;
+        }
+        match &t.type_key_filter {
+            Some((keys, negative)) => {
+                let in_list = keys.iter().any(|k| k.eq_ignore_ascii_case(gc_key));
+                // `negative` = `## type_key_filter <> ...` (exclude); otherwise include.
+                if in_list != *negative {
+                    return Some(t);
+                }
+            }
+            None => {
+                if generic.is_none() {
+                    generic = Some(t);
+                }
+            }
+        }
+    }
+    generic
 }
 
 /// Test whether a subtype's rules are satisfied by an entity's children.
@@ -1115,6 +1222,7 @@ fn validate_leaf_against_rule(
                     ruleset,
                     type_index,
                     modifier_keys,
+                    (leaf.pos.start.line, leaf.pos.start.col),
                 );
                 if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
                     ctx.restore(saved);
@@ -1214,6 +1322,7 @@ fn validate_node_against_rule(
                 ruleset,
                 type_index,
                 modifier_keys,
+                (node.pos.start.line, node.pos.start.col),
             );
             if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
                 ctx.restore(saved);
@@ -1323,6 +1432,10 @@ fn validate_children(
     ruleset: &RuleSet,
     type_index: Option<&cwtools_info::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
+    // Position of the block that owns `children` (its opening `key = {`). Used to
+    // anchor cardinality diagnostics when the block is empty — so a missing
+    // required field reports on the block's line, not at the file root (0,0).
+    block_pos: (u32, u16),
 ) {
     // Nested subtype blocks (a `subtype[x] = {...}` not at the entity root) carry
     // their fields inside SubtypeRule entries that the candidate matcher below
@@ -1523,6 +1636,7 @@ fn validate_children(
                                 ruleset,
                                 type_index,
                                 modifier_keys,
+                                (lv.pos.start.line, lv.pos.start.col),
                             );
                             break;
                         }
@@ -1580,6 +1694,7 @@ fn validate_children(
                             ruleset,
                             type_index,
                             modifier_keys,
+                            (vc.pos.start.line, vc.pos.start.col),
                         );
                         break;
                     }
@@ -1602,7 +1717,7 @@ fn validate_children(
     // Cardinality enforcement. Report at the block's own location (its first
     // child) rather than line 0 — a missing required field belongs to THIS
     // entity (e.g. the specific decision), not the top of the file.
-    let (block_line, block_col) = children.iter().find_map(|c| child_start_pos(c, ast)).unwrap_or((0, 0));
+    let (block_line, block_col) = children.iter().find_map(|c| child_start_pos(c, ast)).unwrap_or(block_pos);
 
     // Aggregate keyed-rule cardinality per (lowercased) key. Duplicate keys are
     // overloads/alternatives (e.g. two `clicksound =` rules in one subtype), so
@@ -2117,6 +2232,7 @@ fn validate_alias_usage(
                         ruleset,
                         type_index,
                         modifier_keys,
+                        leaf.map(|l| (l.pos.start.line, l.pos.start.col)).unwrap_or((0, 0)),
                     );
                     if let (Some(saved), Some(ctx)) = (saved, scope_context.as_mut()) {
                         ctx.restore(saved);
@@ -2491,7 +2607,9 @@ fn field_matches_value(
         // --- AliasValueKeysField (item 3): accept any string key ---
         (NewField::AliasValueKeysField(_), Value::String(_) | Value::QString(_)) => true,
 
-        // --- AliasField / SingleAliasField: accept clause or string (deep validation TODO) ---
+        // --- AliasField / SingleAliasField: shape check only (accept clause or
+        // string). Deep validation of alias bodies happens in validate_alias_usage,
+        // not here — this path is the secondary value-matching fallback. ---
         (NewField::AliasField(_), Value::Clause(_)) => true,
         (NewField::AliasField(_), Value::String(_) | Value::QString(_)) => true,
         (NewField::SingleAliasField(_), Value::Clause(_)) => true,

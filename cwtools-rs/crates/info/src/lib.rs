@@ -122,10 +122,37 @@ impl TypeIndex {
 
 // ── Path matching ─────────────────────────────────────────────────────────────
 
+/// True if `pat` occurs in `dir` as a whole path segment (or run of segments),
+/// e.g. `gfx/models` is contained in `dlc/dlc022/gfx/models/units`. Mirrors the
+/// validation side (`find_type_by_path_and_key` → `path_contains_segment`) so a
+/// file is INDEXED by the same type that VALIDATES it. A bare `starts_with` would
+/// miss base-game content nested under `dlc/<id>/…`, leaving its instances
+/// unindexed while the referencing files still validate (false CW500s).
+fn dir_contains_segment(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let left_ok = abs == 0 || haystack.as_bytes().get(abs - 1) == Some(&b'/');
+        let right = abs + needle.len();
+        let right_ok = right == haystack.len() || haystack.as_bytes().get(right) == Some(&b'/');
+        if left_ok && right_ok {
+            return true;
+        }
+        start = abs + 1;
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// Returns true when `logical_path` (e.g. `"events/my_events.txt"`) is covered
-/// by `path_options`.  Mirrors `FieldValidatorsHelper.CheckPathDir` which splits
-/// the path into directory + filename and checks whether the directory starts
-/// with (or equals, if `path_strict`) the pattern.
+/// by `path_options`. The directory must equal the pattern when `path_strict`,
+/// else contain it as a path segment (so base-game content nested under
+/// `dlc/<id>/…` is indexed by the same type that validates it).
 fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
     if opts.paths.is_empty() {
         return true;
@@ -149,11 +176,8 @@ fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
                 if dir_lower == pat_lower {
                     return true;
                 }
-            } else if dir_lower.starts_with(&pat_lower) {
-                let after = &dir_lower[pat_lower.len()..];
-                if after.is_empty() || after.starts_with('/') {
-                    return true;
-                }
+            } else if dir_contains_segment(&dir_lower, &pat_lower) {
+                return true;
             }
         }
         return false;
@@ -164,12 +188,8 @@ fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
             if dir_lower == *pat_lower {
                 return true;
             }
-        } else if dir_lower.starts_with(pat_lower) {
-            // Ensure we match at a directory boundary, not in the middle of a name.
-            let after = &dir_lower[pat_lower.len()..];
-            if after.is_empty() || after.starts_with('/') {
-                return true;
-            }
+        } else if dir_contains_segment(&dir_lower, pat_lower) {
+            return true;
         }
     }
     false
