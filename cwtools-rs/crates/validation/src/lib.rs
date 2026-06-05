@@ -323,7 +323,14 @@ fn validate_with_type(
                     let is_active = matched_subtype_names.contains(&name.as_str());
                     let should_include = if *positive { is_active } else { !is_active };
                     if should_include {
-                        merged.extend(st_rules.iter().cloned());
+                        // F# never enforces min cardinality for subtype-specific rules:
+                        // checkCardinality is called on the parent array of SubtypeRule
+                        // entries, which all hit the wildcard case.  Mirror that by
+                        // zeroing min so subtype fields are validated when present but
+                        // never required when absent.
+                        merged.extend(st_rules.iter().map(|(rt, o)| {
+                            let mut o2 = o.clone(); o2.min = 0; (rt.clone(), o2)
+                        }));
                     }
                 }
                 _ => {
@@ -337,7 +344,10 @@ fn validate_with_type(
         merged.extend(inner_rules.iter().cloned());
         for subtype in &type_def.subtypes {
             if matched_subtype_names.contains(&subtype.name.as_str()) {
-                merged.extend(subtype.rules.iter().cloned());
+                // Same min=0 treatment as Path A.
+                merged.extend(subtype.rules.iter().map(|(rt, o)| {
+                    let mut o2 = o.clone(); o2.min = 0; (rt.clone(), o2)
+                }));
             }
         }
     }

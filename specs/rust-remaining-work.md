@@ -62,16 +62,11 @@ a single mod.
 **Embedded docs/setup.log loading** — deferred. Superseded by the vanilla cache
 for the CW500 case.
 
-**clicksound/subtype CW203 noise** — deferred. Root cause not pinned; fixing
-subtype-required-field semantics risks regressing cardinality work. Revisit only
-with heavy F#-diff gating.
-
-### Remaining: clicksound/subtype CW203 noise (validation, delicate)
-
-**Reduce clicksound/subtype CW203 noise (~36K).** `subtype[spriteType]` requires
-`clicksound` (comment-less field defaults to 1..1) where F# never flags it.
-Root cause not yet pinned. Attempt only with heavy F#-diff gating; back off on
-any regression.
+**clicksound/subtype CW203 noise** — FIXED. F# never enforces min cardinality
+for rules inside subtype blocks; `checkCardinality` is called on the parent
+`SubtypeRule` entries which hit the wildcard case. Fix: set `min=0` when merging
+subtype rules into the flat list (both Path A and Path B in `validate_with_type`).
+Result: 36,826 fewer warnings (38,111 → 1,285) on MD, zero error regression.
 
 ### All perf/idiomatic/cosmetic items — DONE
 
@@ -92,8 +87,12 @@ The `lsp/main.rs` NOT-PORTED comment points at F# `LanguageFeatures.fs`.
 
 ## 4. What's left
 
-1. clicksound/CW203 noise — only with a careful, gated attempt.
-2. LSP graph/code-actions — only if a concrete editor need appears.
+1. **MD_ribbons.txt ribbon/colors CW203 (818 warnings)** — pre-existing, not subtype noise.
+   `colors = { {float float float float} }` value-clause children are flagged CW201
+   "Unexpected value clause" and CW203 "LeafValue SpecificField("") appears 0 times".
+   Root cause: `ValueClauseRule` inside a `NodeRule` not being matched in child dispatch,
+   plus empty-string SpecificField appearing in cardinality output. Investigate separately.
+2. **LSP graph/code-actions** — only if a concrete editor need appears.
 3. Delete this file once both are resolved or permanently dropped.
 
 ## 5. This is the only spec
