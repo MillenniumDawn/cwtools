@@ -641,17 +641,8 @@ fn children_to_rules(
                             _ => Vec::new(),
                         };
                         rules.push((
-<<<<<<< Updated upstream
                             RuleType::SubtypeRule { name, positive, rules: inner },
                             options_from_comments(comments, false),
-=======
-                            RuleType::SubtypeRule {
-                                name,
-                                positive,
-                                rules: inner,
-                            },
-                            options_from_comments(&comments, false),
->>>>>>> Stashed changes
                         ));
                     }
                     continue;
@@ -699,17 +690,8 @@ fn children_to_rules(
                         };
                         let inner = children_to_rules(&node.children, ast, table, ruleset);
                         rules.push((
-<<<<<<< Updated upstream
                             RuleType::SubtypeRule { name, positive, rules: inner },
                             options_from_comments(comments, false),
-=======
-                            RuleType::SubtypeRule {
-                                name,
-                                positive,
-                                rules: inner,
-                            },
-                            options_from_comments(&comments, false),
->>>>>>> Stashed changes
                         ));
                     }
                     continue;
@@ -841,18 +823,7 @@ fn extract_types_from_children(
             if let Some(typename) = extract_bracket_content(&key, "type") {
                 let typedef = if is_leaf {
                     if let Child::Leaf(lidx) = tchild {
-<<<<<<< Updated upstream
                         process_type_node(typename, &ast.arena.leaves[*lidx as usize], ast, table, ruleset, comments)
-=======
-                        process_type_node(
-                            typename,
-                            &ast.arena.leaves[*lidx as usize],
-                            ast,
-                            table,
-                            ruleset,
-                            &comments,
-                        )
->>>>>>> Stashed changes
                     } else {
                         continue;
                     }
@@ -894,33 +865,13 @@ fn extract_enums_from_children(
             if let Some(enum_name) = extract_bracket_content(&key, "enum") {
                 let def = if is_leaf {
                     if let Child::Leaf(lidx) = echild {
-<<<<<<< Updated upstream
                         process_enum_node(enum_name, &ast.arena.leaves[*lidx as usize], ast, table, comments)
-=======
-                        process_enum_node(
-                            enum_name,
-                            &ast.arena.leaves[*lidx as usize],
-                            ast,
-                            table,
-                            &comments,
-                        )
->>>>>>> Stashed changes
                     } else {
                         continue;
                     }
                 } else {
                     if let Child::Node(nidx) = echild {
-<<<<<<< Updated upstream
                         process_enum_node_from_node(enum_name, &ast.arena.nodes[*nidx as usize], ast, table, comments)
-=======
-                        process_enum_node_from_node(
-                            enum_name,
-                            &ast.arena.nodes[*nidx as usize],
-                            ast,
-                            table,
-                            &comments,
-                        )
->>>>>>> Stashed changes
                     } else {
                         continue;
                     }
@@ -939,13 +890,7 @@ fn extract_enums_from_children(
                     let leaf = &ast.arena.leaves[*lidx as usize];
                     if let Value::Clause(ch) = &leaf.value {
                         // Synthesize a node-like view from the clause children
-<<<<<<< Updated upstream
                         let def = process_complex_enum_from_children(enum_name, ch, ast, table, comments);
-=======
-                        let def = process_complex_enum_from_children(
-                            enum_name, ch, ast, table, &comments,
-                        );
->>>>>>> Stashed changes
                         ruleset.complex_enums.push(def);
                     }
                 }
@@ -1181,18 +1126,7 @@ fn process_type_node(
                     let k = table.get_string(l.key.normal).unwrap_or_default();
                     if k.starts_with("subtype[") {
                         if let Some(st_name) = extract_bracket_content(&k, "subtype") {
-<<<<<<< Updated upstream
                             let st = process_subtype_node_from_leaf(st_name, l, ast, table, ruleset, child_comments);
-=======
-                            let st = process_subtype_node_from_leaf(
-                                st_name,
-                                l,
-                                ast,
-                                table,
-                                ruleset,
-                                &child_comments,
-                            );
->>>>>>> Stashed changes
                             def.subtypes.push(st);
                         }
                     } else if k == "localisation" || k == "modifiers" {
@@ -1287,18 +1221,7 @@ fn process_type_node(
                     let nk = table.get_string(n.key.normal).unwrap_or_default();
                     if nk.starts_with("subtype[") {
                         if let Some(st_name) = extract_bracket_content(&nk, "subtype") {
-<<<<<<< Updated upstream
                             let st = process_subtype_node(st_name, n, ast, table, ruleset, child_comments);
-=======
-                            let st = process_subtype_node(
-                                st_name,
-                                n,
-                                ast,
-                                table,
-                                ruleset,
-                                &child_comments,
-                            );
->>>>>>> Stashed changes
                             def.subtypes.push(st);
                         }
                     } else if nk == "localisation" {
@@ -1814,16 +1737,7 @@ fn process_complex_enum_from_children(
     ComplexEnumDef {
         name,
         description,
-<<<<<<< Updated upstream
         path_options: PathOptions { paths, path_strict, path_file, path_extension, paths_lower: Vec::new() },
-=======
-        path_options: PathOptions {
-            paths,
-            path_strict,
-            path_file,
-            path_extension,
-        },
->>>>>>> Stashed changes
         name_tree: name_tree.unwrap_or(ComplexEnumNameTree::Empty),
         start_from_root,
     }

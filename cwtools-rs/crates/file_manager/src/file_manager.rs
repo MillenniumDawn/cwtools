@@ -178,19 +178,10 @@ impl Default for FileManagerConfig {
                 "*.txt".into(),
                 "*.gui".into(),
                 "*.gfx".into(),
-                "*.asset".into(),
-            ],
-<<<<<<< Updated upstream
-            file_patterns: vec![
-                "*.txt".into(),
-                "*.gui".into(),
-                "*.gfx".into(),
                 "*.sfx".into(),
                 "*.asset".into(),
                 "*.map".into(),
             ],
-=======
->>>>>>> Stashed changes
             exclude_patterns: vec![],
             exclude_dirs: vec![
                 ".git".into(),

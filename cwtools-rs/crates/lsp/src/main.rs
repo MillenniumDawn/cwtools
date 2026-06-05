@@ -8,21 +8,13 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use cwtools_info::TypeIndex;
-use cwtools_info::{PositionElement, ReferenceHint, info_at_position};
+use cwtools_info::{element_at_position, info_at_position, PositionElement, ReferenceHint};
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType, ValueType};
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
-<<<<<<< Updated upstream
 use cwtools_validation::{validate_ast, ValidationError};
-use cwtools_info::TypeIndex;
-use cwtools_info::{
-    element_at_position, info_at_position, PositionElement, ReferenceHint,
-};
-=======
-use cwtools_validation::{ValidationError, validate_ast};
->>>>>>> Stashed changes
 
 mod symbols;
 
@@ -31,16 +23,8 @@ mod symbols;
 /// `production_speed_<building>_factor` / `<ideology>_drift` are expanded against
 /// the type index, one per instance. Mirrors the CLI so the extension and CLI
 /// agree on what counts as a modifier.
-<<<<<<< Updated upstream
 fn build_modifier_keys(ruleset: &RuleSet, type_index: &TypeIndex) -> HashSet<String> {
     let mut mk = HashSet::new();
-=======
-fn build_modifier_keys(
-    ruleset: &RuleSet,
-    type_index: &TypeIndex,
-) -> std::collections::HashSet<String> {
-    let mut mk = std::collections::HashSet::new();
->>>>>>> Stashed changes
     for m in &ruleset.modifiers {
         match (m.find('<'), m.find('>')) {
             (Some(open), Some(close)) if open < close => {
@@ -1134,18 +1118,12 @@ impl LanguageServer for Backend {
                 drop(ruleset_guard);
 
                 if let Some(info) = pos_info {
-<<<<<<< Updated upstream
                     let ruleset_guard2 = self.state.ruleset.lock();
                     let md = build_hover_markdown(
                         &info.element,
                         &info.hint,
                         ruleset_guard2.as_ref(),
                     );
-=======
-                    let ruleset_guard2 = self.state.ruleset.lock().unwrap();
-                    let md =
-                        build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
->>>>>>> Stashed changes
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
                             kind: MarkupKind::Markdown,
@@ -1155,19 +1133,8 @@ impl LanguageServer for Backend {
                     }));
                 }
 
-<<<<<<< Updated upstream
                 // Fallback: no-rule position finder
                 if let Some(element) = element_at_position(ast, pos.line + 1, pos.character as u16, &self.state.string_table) {
-=======
-                // Fallback: use the simpler position finder (no rule context)
-                let source_pos = cwtools_parser::ast::SourcePos {
-                    line: pos.line + 1,
-                    col: pos.character as u16,
-                };
-                if let Some(element) =
-                    position::find_at_position(ast, &source_pos, &self.state.string_table)
-                {
->>>>>>> Stashed changes
                     let contents = match element {
                         PositionElement::Node { key } => {
                             format!("**Node**: `{}`", key)
@@ -1358,17 +1325,7 @@ impl LanguageServer for Backend {
                 .iter()
                 .filter(|(_, inst)| inst.name == instance_name)
                 .map(|(file_uri, inst)| Location {
-<<<<<<< Updated upstream
                     uri: parse_uri(file_uri, &params.text_document_position_params.text_document.uri),
-=======
-                    uri: file_uri.parse().unwrap_or_else(|_| {
-                        params
-                            .text_document_position_params
-                            .text_document
-                            .uri
-                            .clone()
-                    }),
->>>>>>> Stashed changes
                     range: Range {
                         start: Position {
                             line: inst.location.line.saturating_sub(1),
@@ -1390,17 +1347,7 @@ impl LanguageServer for Backend {
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri) {
             if let Some(ast) = &doc.ast {
-<<<<<<< Updated upstream
                 if let Some(element) = element_at_position(ast, pos.line + 1, pos.character as u16, &self.state.string_table) {
-=======
-                let source_pos = cwtools_parser::ast::SourcePos {
-                    line: pos.line + 1,
-                    col: pos.character as u16,
-                };
-                if let Some(element) =
-                    position::find_at_position(ast, &source_pos, &self.state.string_table)
-                {
->>>>>>> Stashed changes
                     let symbol = match &element {
                         PositionElement::Node { key } => key.clone(),
                         PositionElement::Leaf { key, .. } => key.clone(),
@@ -1409,7 +1356,6 @@ impl LanguageServer for Backend {
                     drop(docs);
                     let info = self.state.info_service.lock();
                     if let Some(defs) = info.find_definitions(&symbol) {
-<<<<<<< Updated upstream
                         let locations: Vec<Location> = defs.iter().map(|(file_uri, loc)| Location {
                             uri: parse_uri(file_uri, &params.text_document_position_params.text_document.uri),
                             range: Range {
@@ -1417,30 +1363,6 @@ impl LanguageServer for Backend {
                                 end: Position { line: loc.line.saturating_sub(1), character: (loc.col + symbol.len() as u16) as u32 },
                             },
                         }).collect();
-=======
-                        let locations: Vec<Location> = defs
-                            .iter()
-                            .map(|(file_uri, loc)| Location {
-                                uri: file_uri.parse().unwrap_or_else(|_| {
-                                    params
-                                        .text_document_position_params
-                                        .text_document
-                                        .uri
-                                        .clone()
-                                }),
-                                range: Range {
-                                    start: Position {
-                                        line: loc.line.saturating_sub(1),
-                                        character: loc.col as u32,
-                                    },
-                                    end: Position {
-                                        line: loc.line.saturating_sub(1),
-                                        character: (loc.col + symbol.len() as u16) as u32,
-                                    },
-                                },
-                            })
-                            .collect();
->>>>>>> Stashed changes
                         if !locations.is_empty() {
                             return Ok(Some(GotoDefinitionResponse::Array(locations)));
                         }
@@ -1535,13 +1457,7 @@ impl LanguageServer for Backend {
                     );
                     for (file_uri, loc) in use_sites {
                         all_locs.push(Location {
-<<<<<<< Updated upstream
                             uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
-=======
-                            uri: file_uri.parse().unwrap_or_else(|_| {
-                                params.text_document_position.text_document.uri.clone()
-                            }),
->>>>>>> Stashed changes
                             range: Range {
                                 start: Position {
                                     line: loc.line.saturating_sub(1),
@@ -1566,17 +1482,7 @@ impl LanguageServer for Backend {
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri) {
             if let Some(ast) = &doc.ast {
-<<<<<<< Updated upstream
                 if let Some(element) = element_at_position(ast, pos.line + 1, pos.character as u16, &self.state.string_table) {
-=======
-                let source_pos = cwtools_parser::ast::SourcePos {
-                    line: pos.line + 1,
-                    col: pos.character as u16,
-                };
-                if let Some(element) =
-                    position::find_at_position(ast, &source_pos, &self.state.string_table)
-                {
->>>>>>> Stashed changes
                     let symbol = match &element {
                         PositionElement::Node { key } => key.clone(),
                         PositionElement::Leaf { key, .. } => key.clone(),
@@ -1587,13 +1493,7 @@ impl LanguageServer for Backend {
                     let mut all_locs = Vec::new();
                     if let Some(defs) = info.find_definitions(&symbol) {
                         all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
-<<<<<<< Updated upstream
                             uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
-=======
-                            uri: file_uri.parse().unwrap_or_else(|_| {
-                                params.text_document_position.text_document.uri.clone()
-                            }),
->>>>>>> Stashed changes
                             range: Range {
                                 start: Position {
                                     line: loc.line.saturating_sub(1),
@@ -1608,13 +1508,7 @@ impl LanguageServer for Backend {
                     }
                     if let Some(refs) = info.find_references(&symbol) {
                         all_locs.extend(refs.iter().map(|(file_uri, loc)| Location {
-<<<<<<< Updated upstream
                             uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
-=======
-                            uri: file_uri.parse().unwrap_or_else(|_| {
-                                params.text_document_position.text_document.uri.clone()
-                            }),
->>>>>>> Stashed changes
                             range: Range {
                                 start: Position {
                                     line: loc.line.saturating_sub(1),
@@ -1991,19 +1885,7 @@ impl Backend {
             }
         };
 
-<<<<<<< Updated upstream
         let extensions: Vec<&str> = vec!["txt", "gui", "gfx", "sfx", "asset", "map"];
-=======
-        let language = {
-            let guard = self.state.language.lock().unwrap();
-            guard.clone()
-        };
-        let extensions: Vec<&str> = match language.as_str() {
-            "hoi4" | "stellaris" | "eu4" | "ck2" | "ck3" | "vic2" | "vic3" | "imperator"
-            | "eu5" => vec!["txt", "gfx", "gui", "asset"],
-            _ => vec!["txt", "gfx", "gui", "asset"],
-        };
->>>>>>> Stashed changes
 
         let mut files_to_validate = Vec::new();
         fn walk_dir(
@@ -2101,19 +1983,12 @@ impl Backend {
         self.send_loading_bar(true, "Validating workspace…").await;
         let mut total_errors = 0usize;
         let total_files = parsed_docs.len();
-<<<<<<< Updated upstream
         // Snapshot modifier_keys once before the loop; the set doesn't change
         // during validation and we can't hold the guard across await points.
         let modifier_keys_snap: HashSet<String> = self.state.modifier_keys.read().clone();
         for (i, (uri, _file_path, text, parsed)) in parsed_docs.into_iter().enumerate() {
             let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys_snap);
             total_errors += diagnostics.iter()
-=======
-        for (uri, text, parsed) in parsed_docs {
-            let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys);
-            total_errors += diagnostics
-                .iter()
->>>>>>> Stashed changes
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
                 .count();
 
@@ -2123,7 +1998,6 @@ impl Backend {
                     .await;
             }
 
-<<<<<<< Updated upstream
             {
                 let mut docs = self.state.documents.lock();
                 docs.insert(uri, ParsedDoc { version: 0, text, ast: Some(parsed) });
@@ -2131,17 +2005,6 @@ impl Backend {
             if i % 50 == 49 {
                 tokio::task::yield_now().await;
             }
-=======
-            let mut docs = self.state.documents.lock().unwrap();
-            docs.insert(
-                uri,
-                ParsedDoc {
-                    version: 0,
-                    text,
-                    ast: Some(parsed),
-                },
-            );
->>>>>>> Stashed changes
         }
 
         self.client
@@ -2212,17 +2075,8 @@ impl Backend {
         parsed: &ParsedFile,
         modifier_keys: &std::collections::HashSet<String>,
     ) -> Vec<Diagnostic> {
-<<<<<<< Updated upstream
         let mut diagnostics: Vec<Diagnostic> = parsed.errors.iter().map(parse_error_to_diagnostic).collect();
         let ruleset_guard = self.state.ruleset.lock();
-=======
-        let mut diagnostics: Vec<Diagnostic> = parsed
-            .errors
-            .iter()
-            .map(parse_error_to_diagnostic)
-            .collect();
-        let ruleset_guard = self.state.ruleset.lock().unwrap();
->>>>>>> Stashed changes
         if let Some(ruleset) = ruleset_guard.as_ref() {
             let language = self.state.language.lock().clone();
             let game = cwtools_game::constants::Game::from_str(&language);
@@ -2349,22 +2203,9 @@ impl Backend {
                         // Pass the workspace TypeIndex for cross-file type reference checking.
                         let info_guard = self.state.info_service.lock();
                         let type_index = &info_guard.type_index;
-<<<<<<< Updated upstream
                         let modifier_keys = self.state.modifier_keys.read();
                         let mut errs = validate_ast(&parsed, ruleset, &self.state.string_table, uri, game, Some(type_index), Some(&*modifier_keys));
                         drop(modifier_keys);
-=======
-                        let modifier_keys = build_modifier_keys(ruleset, type_index);
-                        let mut errs = validate_ast(
-                            &parsed,
-                            ruleset,
-                            &self.state.string_table,
-                            uri,
-                            game,
-                            Some(type_index),
-                            Some(&modifier_keys),
-                        );
->>>>>>> Stashed changes
                         drop(info_guard);
                         let elapsed = start.elapsed();
                         const MAX_ERRORS: usize = 100;

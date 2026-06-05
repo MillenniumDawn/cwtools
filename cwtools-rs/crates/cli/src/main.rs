@@ -198,7 +198,6 @@ fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
     ];
     let dir_name = directory.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-<<<<<<< Updated upstream
     // If this directory itself contains script files, search it directly.
     let script_exts = ["txt", "gui", "gfx", "sfx", "asset", "map"];
     let has_script_files = std::fs::read_dir(directory).ok().is_some_and(|mut entries| {
@@ -214,28 +213,6 @@ fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
     });
 
     if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") || has_script_files {
-=======
-    // If this directory itself contains script files (.txt/.gui/.gfx/.asset), search it directly.
-    let script_extensions = ["txt", "gui", "gfx", "asset"];
-    let has_script_files = std::fs::read_dir(directory).is_ok_and(|mut entries| {
-        entries.any(|e| {
-            e.is_ok_and(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| script_extensions.iter().any(|&se| ext == se))
-            })
-        })
-    });
-
-    if known_script_folders.contains(&dir_name)
-        || dir_name.ends_with(".txt")
-        || dir_name.ends_with(".gui")
-        || dir_name.ends_with(".gfx")
-        || dir_name.ends_with(".asset")
-        || has_script_files
-    {
->>>>>>> Stashed changes
         FileManagerConfig {
             root: directory.to_path_buf(),
             include_dirs: vec![".".into()],
@@ -558,16 +535,7 @@ fn main() {
             println!("  SingleAliases: {}", ruleset.single_aliases.len());
             println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
         }
-<<<<<<< Updated upstream
         Commands::Validate { game, directory, rules, vanilla, vanilla_cache, report_type, output_file, ignore_hashes, output_hashes } => {
-=======
-        Commands::Validate {
-            game,
-            directory,
-            rules,
-            vanilla,
-        } => {
->>>>>>> Stashed changes
             use cwtools_game::constants::Game;
             use cwtools_validation::validate_ast;
 
@@ -581,30 +549,12 @@ fn main() {
             } else {
                 format!("file {}", rules.display())
             };
-<<<<<<< Updated upstream
             eprintln!("Validating {} files in {} against rules {}", game_id, directory.display(), rules_label);
-=======
-            println!(
-                "Validating {} files in {} against rules {}",
-                game_id,
-                directory.display(),
-                rules_label
-            );
->>>>>>> Stashed changes
 
             // Parse rules (shares its StringTable with game files)
             let rules_table = StringTable::new();
             let ruleset = load_rules(&rules, &rules_table);
-<<<<<<< Updated upstream
             eprintln!("  Loaded {} types, {} enums, {} aliases", ruleset.types.len(), ruleset.enums.len(), ruleset.aliases.len());
-=======
-            println!(
-                "  Loaded {} types, {} enums, {} aliases",
-                ruleset.types.len(),
-                ruleset.enums.len(),
-                ruleset.aliases.len()
-            );
->>>>>>> Stashed changes
 
             // Discover and parse files using the SAME string table
             let config = search_config_for(&directory);
@@ -636,7 +586,6 @@ fn main() {
             // ship_names, focuses, … without "not a known instance" errors) but are
             // never validated themselves.
             if let Some(vanilla_dir) = &vanilla {
-<<<<<<< Updated upstream
                 let vanilla_index = index_game_dir(vanilla_dir, &ruleset, &rules_table);
                 for (type_name, entries) in vanilla_index.map {
                     let per_type = std::collections::HashMap::from([(
@@ -654,48 +603,12 @@ fn main() {
                     Ok((cache_game, per_type)) => {
                         if cache_game != game {
                             eprintln!("  warn: vanilla cache was built for game '{}', validating '{}'", cache_game, game);
-=======
-                let vanilla_config = search_config_for(vanilla_dir);
-                let mut vanilla_mgr =
-                    FileManager::with_string_table(vanilla_config, rules_table.clone());
-                match vanilla_mgr.discover_and_parse() {
-                    Ok(vanilla_files) => {
-                        println!(
-                            "  Indexing {} base-game files from {}",
-                            vanilla_files.len(),
-                            vanilla_dir.display()
-                        );
-                        for file in &vanilla_files {
-                            let text = match std::fs::read_to_string(&file.path) {
-                                Ok(t) => t,
-                                Err(_) => continue,
-                            };
-                            if let Ok(pf) =
-                                cwtools_parser::parser::parse_string(&text, &rules_table)
-                            {
-                                let instances = collect_type_instances(
-                                    &ruleset,
-                                    &pf,
-                                    &file.logical_path,
-                                    &rules_table,
-                                );
-                                type_index.merge(file.path.to_str().unwrap_or(""), instances);
-                            }
->>>>>>> Stashed changes
                         }
                         let total: usize = per_type.values().map(|v| v.len()).sum();
                         type_index.merge("<vanilla-cache>", per_type);
                         eprintln!("  Loaded {} base-game instances from cache {}", total, cache_path.display());
                     }
-<<<<<<< Updated upstream
                     Err(e) => eprintln!("  warn: could not load vanilla cache {}: {}", cache_path.display(), e),
-=======
-                    Err(e) => eprintln!(
-                        "  warn: could not read base-game dir {}: {}",
-                        vanilla_dir.display(),
-                        e
-                    ),
->>>>>>> Stashed changes
                 }
             }
 
@@ -739,7 +652,6 @@ fn main() {
                     errors: vec![],
                 };
                 let errors = validate_ast(
-<<<<<<< Updated upstream
                     &parser_file, &ruleset, &rules_table, &file_str,
                     Some(game_id), Some(&type_index), Some(&modifier_keys),
                 );
@@ -806,46 +718,6 @@ fn main() {
                 else { println!("Wrote {} diagnostic hashes to {}", hashes.len(), p.display()); }
             }
 
-=======
-                    &parser_file,
-                    &ruleset,
-                    &rules_table,
-                    file.path.to_str().unwrap_or(""),
-                    Some(game_id),
-                    Some(&type_index),
-                    Some(&modifier_keys),
-                );
-                let file_errors: Vec<_> = errors
-                    .iter()
-                    .filter(|e| e.severity == cwtools_validation::ErrorSeverity::Error)
-                    .collect();
-                let file_warnings: Vec<_> = errors
-                    .iter()
-                    .filter(|e| e.severity == cwtools_validation::ErrorSeverity::Warning)
-                    .collect();
-                total_errors += file_errors.len();
-                total_warnings += file_warnings.len();
-                if !errors.is_empty() {
-                    println!("\n  {}:", file.path.display());
-                    for err in &errors {
-                        let code_part = err
-                            .code
-                            .as_deref()
-                            .map(|c| format!("[{}] ", c))
-                            .unwrap_or_default();
-                        println!(
-                            "    [{:?}] {}{} (line {})",
-                            err.severity, code_part, err.message, err.line
-                        );
-                    }
-                }
-            }
-
-            println!(
-                "\nValidation complete: {} errors, {} warnings",
-                total_errors, total_warnings
-            );
->>>>>>> Stashed changes
             if total_errors > 0 {
                 std::process::exit(1);
             }

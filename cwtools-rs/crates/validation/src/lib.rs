@@ -558,16 +558,8 @@ fn should_skip_root_key(_key: &str, type_def: &TypeDefinition) -> bool {
 }
 
 /// Look up both the TypeDefinition and the actual validation rules for a given type name.
-<<<<<<< Updated upstream
 fn find_type_and_rules<'a>(name: &str, ruleset: &'a RuleSet) -> Option<(&'a TypeDefinition, &'a [(RuleType, Options)])> {
     let type_def = ruleset.type_by_name.get(name).map(|&i| &ruleset.types[i])?;
-=======
-fn find_type_and_rules<'a>(
-    name: &str,
-    ruleset: &'a RuleSet,
-) -> Option<(&'a TypeDefinition, &'a [(RuleType, Options)])> {
-    let type_def = ruleset.types.iter().find(|t| t.name == name)?;
->>>>>>> Stashed changes
     let rules = find_rules_by_name(name, ruleset);
     Some((type_def, rules))
 }
@@ -1360,24 +1352,14 @@ fn validate_children(
         match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-<<<<<<< Updated upstream
                 // Paradox keys are case-insensitive; key the counts in lowercase so
                 // a field written `texturefile` satisfies a rule keyed `textureFile`.
                 let key = unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default()).to_lowercase();
-=======
-                let key =
-                    unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default()).to_string();
->>>>>>> Stashed changes
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::Node(idx) => {
                 let node = &ast.arena.nodes[*idx as usize];
-<<<<<<< Updated upstream
                 let key = unquote_key(&table.get_string(node.key.normal).unwrap_or_default()).to_lowercase();
-=======
-                let key =
-                    unquote_key(&table.get_string(node.key.normal).unwrap_or_default()).to_string();
->>>>>>> Stashed changes
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::LeafValue(lvidx) => {
@@ -1620,7 +1602,6 @@ fn validate_children(
     // Cardinality enforcement. Report at the block's own location (its first
     // child) rather than line 0 — a missing required field belongs to THIS
     // entity (e.g. the specific decision), not the top of the file.
-<<<<<<< Updated upstream
     let (block_line, block_col) = children.iter().find_map(|c| child_start_pos(c, ast)).unwrap_or((0, 0));
 
     // Aggregate keyed-rule cardinality per (lowercased) key. Duplicate keys are
@@ -1640,12 +1621,6 @@ fn validate_children(
     }
     let mut reported_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-=======
-    let (block_line, block_col) = children
-        .iter()
-        .find_map(|c| child_start_pos(c, ast))
-        .unwrap_or((0, 0));
->>>>>>> Stashed changes
     for (rule_idx, (rule_type, opts)) in rules.iter().enumerate() {
         // Both under- and over-count default to a WARNING (config cardinalities are
         // often stricter than the game, and cardinality-max is emitted as a Warning);
@@ -1661,7 +1636,6 @@ fn validate_children(
         match rule_type {
             RuleType::LeafRule { .. } | RuleType::NodeRule { .. } => {
                 if let Some(key) = get_rule_key(rule_type) {
-<<<<<<< Updated upstream
                     let lkey = key.to_lowercase();
                     // Each distinct key is reported at most once (see key_card above).
                     if reported_keys.insert(lkey.clone()) {
@@ -1681,34 +1655,6 @@ fn validate_children(
                                 code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
                             });
                         }
-=======
-                    let count = key_counts.get(&key).copied().unwrap_or(0) as i32;
-                    if count < opts.min {
-                        errors.push(ValidationError {
-                            message: format!(
-                                "Field '{}' appears {} time(s), expected at least {}",
-                                key, count, opts.min
-                            ),
-                            severity: missing_sev,
-                            line: block_line,
-                            col: block_col,
-                            file: file_path.to_string(),
-                            code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
-                        });
-                    }
-                    if count > opts.max {
-                        errors.push(ValidationError {
-                            message: format!(
-                                "Field '{}' appears {} time(s), expected at most {}",
-                                key, count, opts.max
-                            ),
-                            severity: max_sev,
-                            line: block_line,
-                            col: block_col,
-                            file: file_path.to_string(),
-                            code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
-                        });
->>>>>>> Stashed changes
                     }
                 }
             }

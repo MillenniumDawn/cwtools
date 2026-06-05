@@ -201,13 +201,9 @@ fn parse_jomini(input: &str) -> Result<Vec<JominiCommand>, String> {
     Ok(commands)
 }
 
-<<<<<<< Updated upstream
 fn parse_jomini_params(
     chars: &mut std::iter::Peekable<std::str::Chars>,
 ) -> Result<Vec<JominiParam>, String> {
-=======
-fn parse_jomini_params(chars: &[char], i: &mut usize) -> Result<Vec<JominiParam>, String> {
->>>>>>> Stashed changes
     let mut params = Vec::new();
     let mut current = String::new();
 

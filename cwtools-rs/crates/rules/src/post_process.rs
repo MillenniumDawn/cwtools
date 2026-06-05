@@ -482,7 +482,6 @@ fn expand_ignore_in_rule(rule: &mut NewRule) {
 }
 
 fn expand_ignore_in_list(rules: &mut Vec<NewRule>) {
-<<<<<<< Updated upstream
     for rule in rules.iter_mut() {
         if matches!(rule.0, RuleType::LeafRule { right: NewField::IgnoreMarkerField, .. }) {
             let left = extract_leaf_left(&rule.0);
@@ -494,33 +493,6 @@ fn expand_ignore_in_list(rules: &mut Vec<NewRule>) {
                     expand_ignore_in_rule(rule);
                 }
                 _ => {}
-=======
-    let original = std::mem::take(rules);
-    for mut rule in original {
-        match &rule.0 {
-            RuleType::LeafRule {
-                right: NewField::IgnoreMarkerField,
-                ..
-            } => {
-                let left = extract_leaf_left(&rule.0);
-                let opts = rule.1.clone();
-                rules.push((
-                    RuleType::NodeRule {
-                        left: NewField::IgnoreField(Box::new(left)),
-                        rules: vec![],
-                    },
-                    opts,
-                ));
-            }
-            RuleType::NodeRule { .. }
-            | RuleType::ValueClauseRule { .. }
-            | RuleType::SubtypeRule { .. } => {
-                expand_ignore_in_rule(&mut rule);
-                rules.push(rule);
-            }
-            _ => {
-                rules.push(rule);
->>>>>>> Stashed changes
             }
         }
     }
