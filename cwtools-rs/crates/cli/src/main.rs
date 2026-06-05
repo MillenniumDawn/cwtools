@@ -6,7 +6,33 @@ use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+mod vanilla_cache;
+
+/// Build a TypeIndex from every script file under `dir` (used for a base-game
+/// install). Files are parsed and indexed for reference resolution; they are
+/// never validated.
+fn index_game_dir(dir: &Path, ruleset: &RuleSet, table: &StringTable) -> TypeIndex {
+    let mut index = TypeIndex::new();
+    let config = search_config_for(dir);
+    let mut mgr = FileManager::with_string_table(config, table.clone());
+    match mgr.discover_and_parse() {
+        Ok(files) => {
+            println!("  Indexing {} base-game files from {}", files.len(), dir.display());
+            for file in &files {
+                if let Ok(text) = std::fs::read_to_string(&file.path)
+                    && let Ok(pf) = parse_string(&text, table)
+                {
+                    let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
+                    index.merge(file.path.to_str().unwrap_or(""), instances);
+                }
+            }
+        }
+        Err(e) => eprintln!("  warn: could not read base-game dir {}: {}", dir.display(), e),
+    }
+    index
+}
 
 #[derive(Parser)]
 #[command(name = "cwtools")]
@@ -68,6 +94,28 @@ enum Commands {
         /// without false "not a known instance" errors.
         #[arg(long)]
         vanilla: Option<PathBuf>,
+        /// Optional pre-generated vanilla index (see `cache-vanilla`). Loaded for
+        /// reference resolution without re-parsing the game install. Faster than
+        /// `--vanilla`; can be combined with it.
+        #[arg(long)]
+        vanilla_cache: Option<PathBuf>,
+    },
+    /// Pre-generate a vanilla type index from a base-game install, for use with
+    /// `validate --vanilla-cache`. Parses and indexes the install once so later
+    /// runs resolve base-game references without re-parsing it.
+    CacheVanilla {
+        /// Game identifier (hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom)
+        #[arg(long, short)]
+        game: String,
+        /// Base-game install directory to index
+        #[arg(long)]
+        vanilla: PathBuf,
+        /// Path to a .cwt rules file OR a directory containing .cwt rule files
+        #[arg(long, short)]
+        rules: PathBuf,
+        /// Output cache file to write
+        #[arg(long, short)]
+        output: PathBuf,
     },
     /// Parse and validate localisation files (.yml)
     Loc {
@@ -98,12 +146,12 @@ fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
 
     // If this directory itself contains script files, search it directly.
     let script_exts = ["txt", "gui", "gfx", "sfx", "asset", "map"];
-    let has_script_files = std::fs::read_dir(directory).ok().map_or(false, |mut entries| {
+    let has_script_files = std::fs::read_dir(directory).ok().is_some_and(|mut entries| {
         entries.any(|e| {
             if let Ok(entry) = e {
                 entry.path().extension()
                     .and_then(|ext| ext.to_str())
-                    .map_or(false, |ext| script_exts.contains(&ext))
+                    .is_some_and(|ext| script_exts.contains(&ext))
             } else {
                 false
             }
@@ -352,7 +400,7 @@ fn main() {
             println!("  SingleAliases: {}", ruleset.single_aliases.len());
             println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
         }
-        Commands::Validate { game, directory, rules, vanilla } => {
+        Commands::Validate { game, directory, rules, vanilla, vanilla_cache } => {
             use cwtools_game::constants::Game;
             use cwtools_validation::validate_ast;
 
@@ -397,28 +445,34 @@ fn main() {
                 }
             }
 
-            // Also index the base-game install, if given. Vanilla files populate the
+            // Index the base-game install, if given. Vanilla files populate the
             // type index (so a mod can reference base-game operation_tokens,
             // ship_names, focuses, … without "not a known instance" errors) but are
             // never validated themselves.
             if let Some(vanilla_dir) = &vanilla {
-                let vanilla_config = search_config_for(vanilla_dir);
-                let mut vanilla_mgr = FileManager::with_string_table(vanilla_config, rules_table.clone());
-                match vanilla_mgr.discover_and_parse() {
-                    Ok(vanilla_files) => {
-                        println!("  Indexing {} base-game files from {}", vanilla_files.len(), vanilla_dir.display());
-                        for file in &vanilla_files {
-                            let text = match std::fs::read_to_string(&file.path) {
-                                Ok(t) => t,
-                                Err(_) => continue,
-                            };
-                            if let Ok(pf) = cwtools_parser::parser::parse_string(&text, &rules_table) {
-                                let instances = collect_type_instances(&ruleset, &pf, &file.logical_path, &rules_table);
-                                type_index.merge(file.path.to_str().unwrap_or(""), instances);
-                            }
+                let vanilla_index = index_game_dir(vanilla_dir, &ruleset, &rules_table);
+                for (type_name, entries) in vanilla_index.map {
+                    let per_type = std::collections::HashMap::from([(
+                        type_name,
+                        entries.into_iter().map(|(_, inst)| inst).collect(),
+                    )]);
+                    type_index.merge("<vanilla>", per_type);
+                }
+            }
+
+            // Load a pre-generated vanilla index, if given (faster than --vanilla;
+            // resolves base-game references without re-parsing the install).
+            if let Some(cache_path) = &vanilla_cache {
+                match vanilla_cache::load(cache_path) {
+                    Ok((cache_game, per_type)) => {
+                        if cache_game != game {
+                            eprintln!("  warn: vanilla cache was built for game '{}', validating '{}'", cache_game, game);
                         }
+                        let total: usize = per_type.values().map(|v| v.len()).sum();
+                        type_index.merge("<vanilla-cache>", per_type);
+                        println!("  Loaded {} base-game instances from cache {}", total, cache_path.display());
                     }
-                    Err(e) => eprintln!("  warn: could not read base-game dir {}: {}", vanilla_dir.display(), e),
+                    Err(e) => eprintln!("  warn: could not load vanilla cache {}: {}", cache_path.display(), e),
                 }
             }
 
@@ -473,6 +527,27 @@ fn main() {
             println!("\nValidation complete: {} errors, {} warnings", total_errors, total_warnings);
             if total_errors > 0 {
                 std::process::exit(1);
+            }
+        }
+        Commands::CacheVanilla { game, vanilla, rules, output } => {
+            use cwtools_game::constants::Game;
+
+            if Game::from_str(&game).is_none() {
+                eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
+                std::process::exit(1);
+            }
+
+            let rules_table = StringTable::new();
+            let ruleset = load_rules(&rules, &rules_table);
+            println!("  Loaded {} types from rules", ruleset.types.len());
+
+            let index = index_game_dir(&vanilla, &ruleset, &rules_table);
+            match vanilla_cache::save(&index, &game, &output) {
+                Ok(n) => println!("Wrote {} base-game instances to {}", n, output.display()),
+                Err(e) => {
+                    eprintln!("Error writing vanilla cache {}: {}", output.display(), e);
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Loc { directory } => {
