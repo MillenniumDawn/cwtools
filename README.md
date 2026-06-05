@@ -2,6 +2,8 @@
 A library for parsing, editing, and validating Paradox Interactive script files.  
 Supports all modern Paradox Interactive games, and targets .net standard 2.0.
 
+> **Fork notice:** This is a fork of [cwtools/cwtools](https://github.com/cwtools/cwtools). The upstream project has been largely inactive, so this fork has diverged and is being taken in a new direction long term.
+
 Considering contributing? [Start here!](https://github.com/tboby/cwtools/wiki/Contributing)
 
 ## Projects that use CW Tools
