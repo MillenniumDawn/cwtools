@@ -46,6 +46,10 @@ pub struct TypeInstance {
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
     pub map: HashMap<String, Vec<(String, TypeInstance)>>,
+    /// instance name → how many definitions carry that name (across all types and
+    /// files). Lets `is_any_instance` be O(1) instead of scanning every instance.
+    /// A refcount so `remove_file` can drop a name only when its last definition goes.
+    name_counts: HashMap<String, usize>,
 }
 
 impl TypeIndex {
@@ -68,7 +72,7 @@ impl TypeIndex {
     /// of a referenced type (character, state, ideology, ...) open its own scope,
     /// e.g. `LBA_some_character = { ... }`.
     pub fn is_any_instance(&self, name: &str) -> bool {
-        self.map.values().any(|v| v.iter().any(|(_, ti)| ti.name == name))
+        self.name_counts.contains_key(name)
     }
 
     /// All instances for a type (across all files).
@@ -84,6 +88,7 @@ impl TypeIndex {
         for (type_name, instances) in per_type {
             let entry = self.map.entry(type_name).or_default();
             for inst in instances {
+                *self.name_counts.entry(inst.name.clone()).or_insert(0) += 1;
                 entry.push((file_uri.to_string(), inst));
             }
         }
@@ -92,7 +97,18 @@ impl TypeIndex {
     /// Remove all instances contributed by `file_uri`.
     pub fn remove_file(&mut self, file_uri: &str) {
         for v in self.map.values_mut() {
-            v.retain(|(uri, _)| uri != file_uri);
+            v.retain(|(uri, inst)| {
+                let keep = uri != file_uri;
+                if !keep {
+                    if let Some(count) = self.name_counts.get_mut(&inst.name) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.name_counts.remove(&inst.name);
+                        }
+                    }
+                }
+                keep
+            });
         }
         self.map.retain(|_, v| !v.is_empty());
     }
@@ -375,15 +391,6 @@ fn collect_vars_recursive(
                             col: leaf.pos.start.col,
                         },
                     });
-                }
-
-                // Rule-driven: check if the value is a known value_set member
-                let value_str = leaf_value_string(&leaf.value, table);
-                if !value_str.is_empty() {
-                    // Match leaf rules: LeafRule(_, VariableSetField(ns))
-                    for (_, rules) in &ruleset.values {
-                        let _ = rules; // used below when we have full matching
-                    }
                 }
 
                 // Recurse into clause values
@@ -1442,6 +1449,32 @@ mod tests {
 
         idx.remove_file("file://b.txt");
         assert!(!idx.contains("event", "ev1"));
+    }
+
+    #[test]
+    fn test_is_any_instance_refcount() {
+        // is_any_instance is backed by a refcount so a name survives until its
+        // last definition is removed (two files defining the same name).
+        let mut idx = TypeIndex::new();
+        let mut map = HashMap::new();
+        map.insert(
+            "character".to_string(),
+            vec![TypeInstance {
+                name: "GER_some_char".to_string(),
+                location: SourceLocation { line: 1, col: 0 },
+            }],
+        );
+        idx.merge("file://a.txt", map.clone());
+        idx.merge("file://b.txt", map);
+        assert!(idx.is_any_instance("GER_some_char"));
+        assert!(!idx.is_any_instance("unknown_name"));
+
+        idx.remove_file("file://a.txt");
+        // still present via b.txt
+        assert!(idx.is_any_instance("GER_some_char"));
+
+        idx.remove_file("file://b.txt");
+        assert!(!idx.is_any_instance("GER_some_char"));
     }
 
     // ── Item 2 — defined variables ────────────────────────────────────────────

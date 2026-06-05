@@ -12,6 +12,11 @@ pub struct RuleSet {
     /// Names from a top-level `modifiers = { name = category ... }` block. These
     /// are the valid keys for `alias_name[modifier]` slots (modifier contexts).
     pub modifiers: Vec<String>,
+    /// Link names from a top-level `links = { name = { ... } }` block (links.cwt).
+    /// A from-data scope link (e.g. `character`, `state`, `owner`) can appear as a
+    /// scope-switching key, so these are the valid keys for an `[cat:scope_field]`
+    /// slot alongside scope commands and type instances. See [`crate`] consumers.
+    pub scope_links: std::collections::HashSet<String>,
     /// Lookup index over `aliases`, built by `reindex()`. Maps a full alias name
     /// (`"cat:key"`) to the indices of every matching overload, so alias
     /// resolution is O(1) instead of a linear scan over all aliases per key.
@@ -42,6 +47,7 @@ impl RuleSet {
             root_rules: Vec::new(),
             values: Vec::new(),
             modifiers: Vec::new(),
+            scope_links: std::collections::HashSet::new(),
             alias_exact: std::collections::HashMap::new(),
             alias_categories: std::collections::HashMap::new(),
         }

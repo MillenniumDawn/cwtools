@@ -50,6 +50,7 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                     "enums" => extract_enums_from_children(&node.children, ast, table, &mut ruleset),
                     "values" => extract_values_from_children(&node.children, ast, table, &mut ruleset),
                     "modifiers" => extract_modifier_names(&node.children, ast, table, &mut ruleset),
+                    "links" => extract_link_names(&node.children, ast, table, &mut ruleset),
                     _ => {
                         process_root_node(key, node, ast, table, &comments, &mut ruleset);
                     }
@@ -77,6 +78,11 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                     "modifiers" => {
                         if let Value::Clause(children) = &leaf.value {
                             extract_modifier_names(children, ast, table, &mut ruleset);
+                        }
+                    }
+                    "links" => {
+                        if let Value::Clause(children) = &leaf.value {
+                            extract_link_names(children, ast, table, &mut ruleset);
                         }
                     }
                     _ => {
@@ -721,6 +727,28 @@ fn extract_modifier_names(
         };
         if !name.is_empty() {
             ruleset.modifiers.push(name);
+        }
+    }
+}
+
+/// Collect link names from a top-level `links = { name = { ... } }` block
+/// (links.cwt). Each direct child key is a scope link; a from-data link can be
+/// used as a scope-switching key (`character = { ... }`, `owner = { ... }`), so
+/// the validator treats these as valid `scope_field` keys.
+fn extract_link_names(
+    children: &Vec<Child>,
+    ast: &ParsedFile,
+    table: &StringTable,
+    ruleset: &mut RuleSet,
+) {
+    for child in children {
+        let name = match child {
+            Child::Leaf(lidx) => table.get_string(ast.arena.leaves[*lidx as usize].key.normal).unwrap_or_default(),
+            Child::Node(nidx) => table.get_string(ast.arena.nodes[*nidx as usize].key.normal).unwrap_or_default(),
+            _ => continue,
+        };
+        if !name.is_empty() {
+            ruleset.scope_links.insert(name);
         }
     }
 }

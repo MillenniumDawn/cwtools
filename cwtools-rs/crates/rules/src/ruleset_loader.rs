@@ -33,6 +33,7 @@ pub fn merge_ruleset(dst: &mut RuleSet, src: RuleSet) {
     dst.root_rules.extend(src.root_rules);
     dst.values.extend(src.values);
     dst.modifiers.extend(src.modifiers);
+    dst.scope_links.extend(src.scope_links);
 }
 
 /// Walk `dir` for `*.cwt` files, parse each with `table`, convert via
@@ -72,4 +73,26 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<S
     combined.reindex();
 
     (combined, errors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// merge_ruleset must carry scope_links across files. links.cwt is a separate
+    /// file from the type/alias files, so dropping scope_links here silently breaks
+    /// from-data scope-link recognition (e.g. `character = { ... }`) for the whole
+    /// merged ruleset.
+    #[test]
+    fn merge_preserves_scope_links() {
+        let table = StringTable::new();
+        let links = parse_string("links = { character = { from_data = yes } }", &table).unwrap();
+        let mut a = ast_to_ruleset(&links, &table);
+
+        let other = parse_string("types = { type[evt] = { path = \"game/events\" } }", &table).unwrap();
+        let b = ast_to_ruleset(&other, &table);
+
+        merge_ruleset(&mut a, b);
+        assert!(a.scope_links.contains("character"), "scope_links lost during merge");
+    }
 }

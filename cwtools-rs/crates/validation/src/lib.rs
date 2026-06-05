@@ -983,12 +983,12 @@ fn validate_children(
         match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                let key = unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default()).to_string();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::Node(idx) => {
                 let node = &ast.arena.nodes[*idx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
+                let key = unquote_key(&table.get_string(node.key.normal).unwrap_or_default()).to_string();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::LeafValue(lvidx) => {
@@ -1036,7 +1036,7 @@ fn validate_children(
         match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                let key = unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default()).to_string();
                 let candidates = matching_candidates(rules, &key, ruleset, type_index, rule_matches_leaf_key);
                 if candidates.is_empty() {
                     // Item 5: dynamic modifier keys — if provided and this key is a
@@ -1065,7 +1065,7 @@ fn validate_children(
             }
             Child::Node(idx) => {
                 let node = &ast.arena.nodes[*idx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
+                let key = unquote_key(&table.get_string(node.key.normal).unwrap_or_default()).to_string();
                 let candidates = matching_candidates(rules, &key, ruleset, type_index, rule_matches_node_key);
                 if candidates.is_empty() {
                     // Item 5: dynamic modifier keys — accept known modifier block keys silently.
@@ -1296,8 +1296,10 @@ fn looks_like_scope_command(key: &str) -> bool {
 /// Whether `key` can open a scope in an effect/trigger block: a scope command
 /// (ROOT/FROM/tag/id/chain) OR an instance of any type — HOI4 from-data scope
 /// links let an instance (character, state, ideology, ...) open its own scope.
-fn is_scope_key(key: &str, type_index: Option<&cwtools_info::TypeIndex>) -> bool {
-    looks_like_scope_command(key) || type_index.is_some_and(|idx| idx.is_any_instance(key))
+fn is_scope_key(key: &str, ruleset: &RuleSet, type_index: Option<&cwtools_info::TypeIndex>) -> bool {
+    looks_like_scope_command(key)
+        || ruleset.scope_links.contains(key)
+        || type_index.is_some_and(|idx| idx.is_any_instance(key))
 }
 
 /// If `pattern` embeds a placeholder, test whether `key` matches: a literal
@@ -1397,7 +1399,7 @@ fn field_matches_key(field: &NewField, key: &str, ruleset: &RuleSet, type_index:
                             return true;
                         }
                     }
-                    cat.scope_field_idx.is_some() && is_scope_key(key, type_index)
+                    cat.scope_field_idx.is_some() && is_scope_key(key, ruleset, type_index)
                 }
             }
         }
@@ -1504,7 +1506,7 @@ fn validate_alias_usage(
             }
         }
         if let Some(sf_idx) = cat.scope_field_idx {
-            if is_scope_key(key, type_index) {
+            if is_scope_key(key, ruleset, type_index) {
                 overloads.push(&ruleset.aliases[sf_idx].1);
             }
         }
@@ -1695,6 +1697,15 @@ fn match_text(table: &StringTable, t: &StringTokens) -> String {
     let s = table.get_string(t.normal).unwrap_or_default();
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
         s[1..s.len() - 1].to_string()
+    } else {
+        s
+    }
+}
+
+/// Strip a balanced pair of surrounding double-quotes from a child key.
+fn unquote_key(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
     } else {
         s
     }

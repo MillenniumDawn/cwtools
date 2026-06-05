@@ -330,3 +330,127 @@ my_plan = {
     );
     assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
 }
+
+#[test]
+fn test_quoted_key_matches_same_rule_as_unquoted() {
+    // Regression: a quoted key like `"AST" = { ... }` is just an alternate spelling
+    // of the bare key and must match the same rule. The parser keeps the quotes in
+    // `key.normal`, so the validator unquotes the key before matching (mirroring how
+    // values are unquoted). Real case: `"LOG" = { has_war_with = CAR }` inside a
+    // trigger block was flagged "Unexpected field" while bare `LOG` was accepted.
+    let cwt = r#"
+types = {
+    type[diplo] = {
+        path = "game/common/diplo"
+    }
+}
+
+diplo = {
+    ## cardinality = 0..inf
+    enum[country_tags] = {
+        value = int
+    }
+}
+
+enums = {
+    enum[country_tags] = { AST LOG USA }
+}
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+
+    // Both quoted and unquoted tag keys must validate cleanly.
+    let script = r#"
+diplo = {
+    "AST" = { value = 1 }
+    LOG = { value = 2 }
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errors = validate_ast(
+        &parsed, &ruleset, &table, "game/common/diplo/test.txt",
+        Some(cwtools_game::constants::Game::Hoi4), None, None,
+    );
+    assert!(errors.is_empty(), "Expected no errors but got: {:?}", errors);
+
+    // Unquoting must not make matching blanket-permissive: a key that is not an
+    // enum member (quoted or not) is still unexpected.
+    let bad = r#"
+diplo = {
+    "XYZ" = { value = 1 }
+}
+"#;
+    let parsed_bad = parse_string(bad, &table).unwrap();
+    let errors = validate_ast(
+        &parsed_bad, &ruleset, &table, "game/common/diplo/test.txt",
+        Some(cwtools_game::constants::Game::Hoi4), None, None,
+    );
+    assert!(
+        errors.iter().any(|e| e.message.contains("Unexpected")),
+        "Expected an unexpected-field error for a non-member tag, got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_named_scope_link_is_valid_scope_key() {
+    // Regression: a from-data scope link declared in links.cwt (e.g. `character`)
+    // can appear as a scope-switching key in an effect block. The validator reads
+    // the `links = { ... }` block so `character = { ... }` matches the
+    // `alias[effect:scope_field]` overload instead of reading as "Unexpected field".
+    // Real case: HOI4 on_actions effect bodies with `character = { ... }`.
+    let cwt = r#"
+links = {
+    character = {
+        output_scope = character
+        input_scopes = country
+        from_data = yes
+        data_source = <character>
+    }
+}
+
+types = {
+    type[evt] = {
+        path = "game/events"
+    }
+}
+
+evt = {
+    effect = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+}
+
+alias[effect:scope_field] = {
+    alias_name[effect] = alias_match_left[effect]
+}
+
+alias[effect:add_attack] = int
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    assert!(
+        ruleset.scope_links.contains("character"),
+        "expected `character` to be collected as a scope link"
+    );
+
+    let script = r#"
+evt = {
+    effect = {
+        character = {
+            add_attack = 1
+        }
+    }
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errors = validate_ast(
+        &parsed, &ruleset, &table, "game/events/test.txt",
+        Some(cwtools_game::constants::Game::Hoi4), None, None,
+    );
+    assert!(
+        !errors.iter().any(|e| e.message.contains("character")),
+        "Expected no 'Unexpected field character' error, got: {:?}", errors
+    );
+}

@@ -62,6 +62,12 @@ enum Commands {
         /// Path to a .cwt rules file OR a directory containing .cwt rule files
         #[arg(long, short)]
         rules: PathBuf,
+        /// Optional path to the base game install (e.g. the vanilla HOI4 folder).
+        /// Its files are indexed for reference resolution but not validated, so a
+        /// mod can reference base-game content (operation_tokens, ship_names, …)
+        /// without false "not a known instance" errors.
+        #[arg(long)]
+        vanilla: Option<PathBuf>,
     },
     /// Parse and validate localisation files (.yml)
     Loc {
@@ -163,7 +169,7 @@ fn locate_fsharp_cli() -> Option<PathBuf> {
 /// `validate` subcommand is supported; everything else is rust-only.
 fn run_fsharp_engine(command: &Commands) -> ! {
     match command {
-        Commands::Validate { game, directory, rules } => {
+        Commands::Validate { game, directory, rules, .. } => {
             let dll = locate_fsharp_cli().unwrap_or_else(|| {
                 eprintln!(
                     "F# engine: CWToolsCLI.dll not found. Set CWTOOLS_FSHARP_CLI to its path, \
@@ -343,7 +349,7 @@ fn main() {
             println!("  SingleAliases: {}", ruleset.single_aliases.len());
             println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
         }
-        Commands::Validate { game, directory, rules } => {
+        Commands::Validate { game, directory, rules, vanilla } => {
             use cwtools_game::constants::Game;
             use cwtools_validation::validate_ast;
 
@@ -385,6 +391,31 @@ fn main() {
                 if let Ok(pf) = cwtools_parser::parser::parse_string(&text, &rules_table) {
                     let instances = collect_type_instances(&ruleset, &pf, &file.logical_path, &rules_table);
                     type_index.merge(file.path.to_str().unwrap_or(""), instances);
+                }
+            }
+
+            // Also index the base-game install, if given. Vanilla files populate the
+            // type index (so a mod can reference base-game operation_tokens,
+            // ship_names, focuses, … without "not a known instance" errors) but are
+            // never validated themselves.
+            if let Some(vanilla_dir) = &vanilla {
+                let vanilla_config = search_config_for(vanilla_dir);
+                let mut vanilla_mgr = FileManager::with_string_table(vanilla_config, rules_table.clone());
+                match vanilla_mgr.discover_and_parse() {
+                    Ok(vanilla_files) => {
+                        println!("  Indexing {} base-game files from {}", vanilla_files.len(), vanilla_dir.display());
+                        for file in &vanilla_files {
+                            let text = match std::fs::read_to_string(&file.path) {
+                                Ok(t) => t,
+                                Err(_) => continue,
+                            };
+                            if let Ok(pf) = cwtools_parser::parser::parse_string(&text, &rules_table) {
+                                let instances = collect_type_instances(&ruleset, &pf, &file.logical_path, &rules_table);
+                                type_index.merge(file.path.to_str().unwrap_or(""), instances);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("  warn: could not read base-game dir {}: {}", vanilla_dir.display(), e),
                 }
             }
 
