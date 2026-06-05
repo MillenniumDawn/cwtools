@@ -983,12 +983,14 @@ fn validate_children(
         match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-                let key = unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default()).to_string();
+                // Paradox keys are case-insensitive; key the counts in lowercase so
+                // a field written `texturefile` satisfies a rule keyed `textureFile`.
+                let key = unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default()).to_lowercase();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::Node(idx) => {
                 let node = &ast.arena.nodes[*idx as usize];
-                let key = unquote_key(&table.get_string(node.key.normal).unwrap_or_default()).to_string();
+                let key = unquote_key(&table.get_string(node.key.normal).unwrap_or_default()).to_lowercase();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::LeafValue(lvidx) => {
@@ -1165,6 +1167,24 @@ fn validate_children(
     // child) rather than line 0 — a missing required field belongs to THIS
     // entity (e.g. the specific decision), not the top of the file.
     let (block_line, block_col) = children.iter().find_map(|c| child_start_pos(c, ast)).unwrap_or((0, 0));
+
+    // Aggregate keyed-rule cardinality per (lowercased) key. Duplicate keys are
+    // overloads/alternatives (e.g. two `clicksound =` rules in one subtype), so
+    // the key is checked once against the most permissive bounds rather than
+    // once per overload — otherwise a present-once field reads as missing N-1
+    // times, or an absent optional alternative double-reports.
+    let mut key_card: HashMap<String, (i32, i32)> = HashMap::new();
+    for (rule_type, opts) in rules.iter() {
+        if matches!(rule_type, RuleType::LeafRule { .. } | RuleType::NodeRule { .. }) {
+            if let Some(k) = get_rule_key(rule_type) {
+                let e = key_card.entry(k.to_lowercase()).or_insert((opts.min, opts.max));
+                e.0 = e.0.min(opts.min);
+                e.1 = e.1.max(opts.max);
+            }
+        }
+    }
+    let mut reported_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for (rule_idx, (rule_type, opts)) in rules.iter().enumerate() {
         // Both under- and over-count default to a WARNING (config cardinalities are
         // often stricter than the game, and F# emits cardinality-max as a Warning);
@@ -1178,20 +1198,25 @@ fn validate_children(
         match rule_type {
             RuleType::LeafRule { .. } | RuleType::NodeRule { .. } => {
                 if let Some(key) = get_rule_key(rule_type) {
-                    let count = key_counts.get(&key).copied().unwrap_or(0) as i32;
-                    if count < opts.min {
-                        errors.push(ValidationError {
-                            message: format!("Field '{}' appears {} time(s), expected at least {}", key, count, opts.min),
-                            severity: missing_sev, line: block_line, col: block_col, file: file_path.to_string(),
-                            code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
-                        });
-                    }
-                    if count > opts.max {
-                        errors.push(ValidationError {
-                            message: format!("Field '{}' appears {} time(s), expected at most {}", key, count, opts.max),
-                            severity: max_sev, line: block_line, col: block_col, file: file_path.to_string(),
-                            code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
-                        });
+                    let lkey = key.to_lowercase();
+                    // Each distinct key is reported at most once (see key_card above).
+                    if reported_keys.insert(lkey.clone()) {
+                        let (kmin, kmax) = key_card.get(&lkey).copied().unwrap_or((opts.min, opts.max));
+                        let count = key_counts.get(&lkey).copied().unwrap_or(0) as i32;
+                        if count < kmin {
+                            errors.push(ValidationError {
+                                message: format!("Field '{}' appears {} time(s), expected at least {}", key, count, kmin),
+                                severity: missing_sev, line: block_line, col: block_col, file: file_path.to_string(),
+                                code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
+                            });
+                        }
+                        if count > kmax {
+                            errors.push(ValidationError {
+                                message: format!("Field '{}' appears {} time(s), expected at most {}", key, count, kmax),
+                                severity: max_sev, line: block_line, col: block_col, file: file_path.to_string(),
+                                code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
+                            });
+                        }
                     }
                 }
             }
