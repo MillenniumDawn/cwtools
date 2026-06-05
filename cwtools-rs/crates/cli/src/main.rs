@@ -8,7 +8,7 @@ use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 use std::path::{Path, PathBuf};
 
-mod vanilla_cache;
+use cwtools_info::vanilla_cache;
 
 /// Build a TypeIndex from every script file under `dir` (used for a base-game
 /// install). Files are parsed and indexed for reference resolution; they are

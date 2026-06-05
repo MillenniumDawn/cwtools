@@ -72,6 +72,9 @@ struct DocumentState {
     info_service: Mutex<cwtools_info::InfoService>,
     /// workspace folder URI captured from initialize params
     workspace_uri: Mutex<Option<String>>,
+    /// pre-generated base-game type instances (from a vanilla cache), merged
+    /// into the workspace index so the editor resolves base-game references.
+    vanilla_index: Mutex<Option<HashMap<String, Vec<cwtools_info::TypeInstance>>>>,
 }
 
 struct ParsedDoc {
@@ -91,6 +94,7 @@ impl DocumentState {
             symbol_index: Mutex::new(symbols::SymbolIndex::new()),
             info_service: Mutex::new(cwtools_info::InfoService::new()),
             workspace_uri: Mutex::new(None),
+            vanilla_index: Mutex::new(None),
         }
     }
 }
@@ -797,6 +801,27 @@ impl LanguageServer for Backend {
             self.client
                 .log_message(MessageType::INFO, format!("init options: {:?}", opts))
                 .await;
+
+            // Load a pre-generated vanilla cache if provided, so the editor
+            // resolves base-game references (sprites, operation_tokens, …)
+            // without re-parsing the install. Merged into the index in
+            // validate_entire_workspace.
+            if let Some(vc) = opts.get("vanillaCache").and_then(|v| v.as_str()) {
+                match cwtools_info::vanilla_cache::load(std::path::Path::new(vc)) {
+                    Ok((game, per_type)) => {
+                        let total: usize = per_type.values().map(|v| v.len()).sum();
+                        *self.state.vanilla_index.lock().unwrap() = Some(per_type);
+                        self.client
+                            .log_message(MessageType::INFO, format!("Loaded {} base-game instances from vanilla cache {} (game {})", total, vc, game))
+                            .await;
+                    }
+                    Err(e) => {
+                        self.client
+                            .log_message(MessageType::WARNING, format!("Could not load vanilla cache {}: {}", vc, e))
+                            .await;
+                    }
+                }
+            }
 
             // Load .cwt rules from rulesCache if provided
             if let Some(cache) = opts.get("rulesCache").and_then(|v| v.as_str()) {
@@ -1777,6 +1802,18 @@ impl Backend {
                 if let Some(parsed) = self.index_document(&uri, &text).await {
                     parsed_docs.push((uri, text, parsed));
                 }
+            }
+        }
+
+        // Merge the pre-generated vanilla index (if loaded) so base-game
+        // references resolve. Re-merge each pass after dropping the prior copy
+        // to avoid unbounded growth on re-validation.
+        {
+            let vanilla_guard = self.state.vanilla_index.lock().unwrap();
+            if let Some(per_type) = vanilla_guard.as_ref() {
+                let mut info_guard = self.state.info_service.lock().unwrap();
+                info_guard.type_index.remove_file("<vanilla-cache>");
+                info_guard.type_index.merge("<vanilla-cache>", per_type.clone());
             }
         }
 

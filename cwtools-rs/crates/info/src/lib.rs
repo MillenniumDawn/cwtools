@@ -6,6 +6,7 @@ use cwtools_rules::rules_types::{
 };
 
 pub mod inline_expansion;
+pub mod vanilla_cache;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 

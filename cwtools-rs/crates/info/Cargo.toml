@@ -8,3 +8,5 @@ license.workspace = true
 cwtools_parser = { workspace = true }
 cwtools_string_table = { workspace = true }
 cwtools_rules = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
