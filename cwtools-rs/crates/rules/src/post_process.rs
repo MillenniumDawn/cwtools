@@ -223,10 +223,21 @@ fn expand_colour_in_rule(rule: &mut NewRule) {
 }
 
 fn expand_colour_in_list(rules: &mut Vec<NewRule>) {
+    let needs_expand = rules.iter().any(|r| matches!(&r.0,
+        RuleType::LeafRule { right: NewField::MarkerField(Marker::ColourField), .. }
+        | RuleType::LeafRule { left: NewField::MarkerField(Marker::IrCountryTag), .. }
+        | RuleType::LeafRule { right: NewField::MarkerField(Marker::IrCountryTag), .. }
+        | RuleType::NodeRule { left: NewField::MarkerField(Marker::IrCountryTag), .. }
+    ));
+    if !needs_expand {
+        for rule in rules.iter_mut() {
+            expand_colour_in_rule(rule);
+        }
+        return;
+    }
     let original = std::mem::take(rules);
     for rule in original {
-        let expanded = expand_colour_rule(rule);
-        rules.extend(expanded);
+        rules.extend(expand_colour_rule(rule));
     }
 }
 
@@ -385,20 +396,17 @@ fn expand_ignore_in_rule(rule: &mut NewRule) {
 }
 
 fn expand_ignore_in_list(rules: &mut Vec<NewRule>) {
-    let original = std::mem::take(rules);
-    for mut rule in original {
-        match &rule.0 {
-            RuleType::LeafRule { right: NewField::IgnoreMarkerField, .. } => {
-                let left = extract_leaf_left(&rule.0);
-                let opts = rule.1.clone();
-                rules.push((RuleType::NodeRule { left: NewField::IgnoreField(Box::new(left)), rules: vec![] }, opts));
-            }
-            RuleType::NodeRule { .. } | RuleType::ValueClauseRule { .. } | RuleType::SubtypeRule { .. } => {
-                expand_ignore_in_rule(&mut rule);
-                rules.push(rule);
-            }
-            _ => {
-                rules.push(rule);
+    for rule in rules.iter_mut() {
+        if matches!(rule.0, RuleType::LeafRule { right: NewField::IgnoreMarkerField, .. }) {
+            let left = extract_leaf_left(&rule.0);
+            let opts = rule.1.clone();
+            *rule = (RuleType::NodeRule { left: NewField::IgnoreField(Box::new(left)), rules: vec![] }, opts);
+        } else {
+            match &rule.0 {
+                RuleType::NodeRule { .. } | RuleType::ValueClauseRule { .. } | RuleType::SubtypeRule { .. } => {
+                    expand_ignore_in_rule(rule);
+                }
+                _ => {}
             }
         }
     }

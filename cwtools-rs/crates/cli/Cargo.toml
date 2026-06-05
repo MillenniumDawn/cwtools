@@ -26,3 +26,5 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+assert_cmd = "2"
+predicates = "3"

@@ -699,6 +699,62 @@ pub enum PositionElement {
     LeafValue { value: String },
 }
 
+/// Find the AST element at `(line, col)` without rule classification.
+/// Use this when no ruleset is available or only the key/value is needed.
+pub fn element_at_position(
+    file: &ParsedFile,
+    line: u32,
+    col: u16,
+    table: &StringTable,
+) -> Option<PositionElement> {
+    let target = cwtools_parser::ast::SourcePos { line, col };
+    find_element_in_children(&file.root_children, &file.arena, &target, table)
+}
+
+fn find_element_in_children(
+    children: &[Child],
+    arena: &Arena,
+    target: &cwtools_parser::ast::SourcePos,
+    table: &StringTable,
+) -> Option<PositionElement> {
+    for child in children {
+        match child {
+            Child::Node(idx) => {
+                let node = &arena.nodes[*idx as usize];
+                if pos_in_range(target, &node.pos) {
+                    if let Some(inner) = find_element_in_children(&node.children, arena, target, table) {
+                        return Some(inner);
+                    }
+                    let key = table.get_string(node.key.normal).unwrap_or_default();
+                    return Some(PositionElement::Node { key });
+                }
+            }
+            Child::Leaf(idx) => {
+                let leaf = &arena.leaves[*idx as usize];
+                if pos_in_range(target, &leaf.pos) {
+                    let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                    let value = leaf_value_string(&leaf.value, table);
+                    if let Value::Clause(ch) = &leaf.value {
+                        if let Some(inner) = find_element_in_children(ch, arena, target, table) {
+                            return Some(inner);
+                        }
+                    }
+                    return Some(PositionElement::Leaf { key, value });
+                }
+            }
+            Child::LeafValue(idx) => {
+                let lv = &arena.leaf_values[*idx as usize];
+                if pos_in_range(target, &lv.pos) {
+                    let value = leaf_value_string(&lv.value, table);
+                    return Some(PositionElement::LeafValue { value });
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Find the element at `(line, col)` in `file` and, when possible, classify its
 /// rule-field type using `ruleset`.
 ///

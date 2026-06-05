@@ -66,47 +66,35 @@ for the CW500 case.
 subtype-required-field semantics risks regressing cardinality work. Revisit only
 with heavy F#-diff gating.
 
-### Perf + cosmetics
+### Remaining: clicksound/subtype CW203 noise (validation, delicate)
 
-These are "no behavior change" and must be verified by identical diagnostics on
-MD plus a green `cargo test --workspace`. The tracing profiler already landed;
-the rest:
+**Reduce clicksound/subtype CW203 noise (~36K).** `subtype[spriteType]` requires
+`clicksound` (comment-less field defaults to 1..1) where F# never flags it.
+Root cause not yet pinned. Attempt only with heavy F#-diff gating; back off on
+any regression.
 
-- **rules/info perf:** H6 hoist `replace_single_aliases`
-  clone, H7 in-place `iter_mut` in the inline/colour/ignore passes, H9
-  `precompute_comments` (kills an O(N^2) scan in `rules_converter`), H10
-  precomputed lowercased path patterns, M14 `type_by_name` index in `reindex()`.
-  Note: H3, M6, H4 already landed.
-- **LSP perf:** H5 `type_by_name` for `scan_use_sites`.
-  Note: H1 (yield_now), H2 (parking_lot Mutex), H8 (cached modifier_keys) landed.
-- **Idiomatic:** the medium/low cleanups across `rules_converter`, `info/lib.rs`,
-  `loc_string.rs`, `lsp/main.rs`, plus merging `position::find_at_position` with
-  `info::find_pos_in_children` (watch the `<` vs `<=` end-column divergence).
-- **Comment cleanup:** trim verbose F#-port comment blocks (e.g. the NOT-PORTED
-  block in `lsp/main.rs`, the F# preambles in `yaml_parser.rs` /
-  `scope_validation.rs`). Cosmetic; do last. The NOT-PORTED block is useful design
-  context if LSP graph/code-actions get ported.
+### All perf/idiomatic/cosmetic items — DONE
 
-Value note: the LSP already validates the ~6,877-file mod in ~6.4s, so these are
-marginal for the user; weigh the regression risk of rewriting hot files against
-the gain before doing them. The full per-file H/M/L findings list lived in the
-old `rust-rewrite-cleanup.md`; recover it from git history (`git log -- specs/`)
-if a detailed line-by-line reference is needed.
+All H/M-class perf items and idiomatic cleanups have landed. Summary:
+- H1 yield_now, H2 parking_lot, H3 dead-loop drop, H4 single-pass indexing,
+  H5 type_by_name in scan_use_sites, H6 replace_single_aliases no-clone,
+  H7 expand_ignore in-place + colour fast-path, H8 cached modifier_keys,
+  H9 precompute_comments, H10 paths_lower, M6 is_any_instance O(1),
+  M14 type_by_name + enum_by_name in reindex, M15 position.rs deleted
+  (callers use element_at_position from info/lib.rs).
+- loc_string.rs: Vec<char> allocations removed; all scanning uses &str + bytes.
+- NOT-PORTED block trimmed. F# preambles in yaml_parser/scope_validation gone.
 
-### LSP editor features (nice-to-have)
+### LSP editor features (deferred)
 
-**Graph / code-actions / metadata / progress notifications**
-(`lsp/src/main.rs` ~109-118 NOT-PORTED block, F# `LanguageFeatures.fs`). The
-contained, useful sub-part is the server->client progress notifications
-(`loadingBar`, `updateFileList`) so the extension's file explorer populates; the
-graph panel and Stellaris pre-trigger code-actions are large and low HOI4 value.
+Graph panel, code-actions, pre-trigger refactor — large, low HOI4 value.
+The `lsp/main.rs` NOT-PORTED comment points at F# `LanguageFeatures.fs`.
 
-## 4. Suggested order
+## 4. What's left
 
-1. Remaining rules/info perf (H6, H7, H9, H10, M14) — gate each with identical
-   diagnostics on MD.
-2. Idiomatic cleanups and comment cleanup — low regression risk, do last.
-3. LSP graph/code-actions — only if a concrete editor need appears.
+1. clicksound/CW203 noise — only with a careful, gated attempt.
+2. LSP graph/code-actions — only if a concrete editor need appears.
+3. Delete this file once both are resolved or permanently dropped.
 
 ## 5. This is the only spec
 

@@ -15,10 +15,9 @@ use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{validate_ast, ValidationError};
 use cwtools_info::TypeIndex;
 use cwtools_info::{
-    info_at_position, PositionElement, ReferenceHint,
+    element_at_position, info_at_position, PositionElement, ReferenceHint,
 };
 
-mod position;
 mod symbols;
 
 /// Build the set of valid modifier names for `alias_name[modifier]` slots from the
@@ -1074,20 +1073,16 @@ impl LanguageServer for Backend {
                     }));
                 }
 
-                // Fallback: use the simpler position finder (no rule context)
-                let source_pos = cwtools_parser::ast::SourcePos {
-                    line: pos.line + 1,
-                    col: pos.character as u16,
-                };
-                if let Some(element) = position::find_at_position(ast, &source_pos, &self.state.string_table) {
+                // Fallback: no-rule position finder
+                if let Some(element) = element_at_position(ast, pos.line + 1, pos.character as u16, &self.state.string_table) {
                     let contents = match element {
-                        position::AstElement::Node { key, .. } => {
+                        PositionElement::Node { key } => {
                             format!("**Node**: `{}`", key)
                         }
-                        position::AstElement::Leaf { key, value, .. } => {
+                        PositionElement::Leaf { key, value } => {
                             format!("**Field**: `{} = {}`", key, value)
                         }
-                        position::AstElement::LeafValue { value, .. } => {
+                        PositionElement::LeafValue { value } => {
                             format!("**Value**: `{}`", value)
                         }
                     };
@@ -1286,15 +1281,11 @@ impl LanguageServer for Backend {
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri) {
             if let Some(ast) = &doc.ast {
-                let source_pos = cwtools_parser::ast::SourcePos {
-                    line: pos.line + 1,
-                    col: pos.character as u16,
-                };
-                if let Some(element) = position::find_at_position(ast, &source_pos, &self.state.string_table) {
+                if let Some(element) = element_at_position(ast, pos.line + 1, pos.character as u16, &self.state.string_table) {
                     let symbol = match &element {
-                        position::AstElement::Node { key, .. } => key.clone(),
-                        position::AstElement::Leaf { key, .. } => key.clone(),
-                        position::AstElement::LeafValue { value, .. } => value.clone(),
+                        PositionElement::Node { key } => key.clone(),
+                        PositionElement::Leaf { key, .. } => key.clone(),
+                        PositionElement::LeafValue { value } => value.clone(),
                     };
                     drop(docs);
                     let info = self.state.info_service.lock();
@@ -1400,15 +1391,11 @@ impl LanguageServer for Backend {
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri) {
             if let Some(ast) = &doc.ast {
-                let source_pos = cwtools_parser::ast::SourcePos {
-                    line: pos.line + 1,
-                    col: pos.character as u16,
-                };
-                if let Some(element) = position::find_at_position(ast, &source_pos, &self.state.string_table) {
+                if let Some(element) = element_at_position(ast, pos.line + 1, pos.character as u16, &self.state.string_table) {
                     let symbol = match &element {
-                        position::AstElement::Node { key, .. } => key.clone(),
-                        position::AstElement::Leaf { key, .. } => key.clone(),
-                        position::AstElement::LeafValue { value, .. } => value.clone(),
+                        PositionElement::Node { key } => key.clone(),
+                        PositionElement::Leaf { key, .. } => key.clone(),
+                        PositionElement::LeafValue { value } => value.clone(),
                     };
                     drop(docs);
                     let info = self.state.info_service.lock();

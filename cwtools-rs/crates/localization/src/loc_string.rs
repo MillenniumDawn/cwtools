@@ -53,46 +53,35 @@ pub enum JominiParam {
 /// * `s` – the raw description string (may include surrounding quotes)
 pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
     let mut elements = Vec::new();
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0; // byte offset; always lands on a char boundary
 
-    while i < chars.len() {
-        match chars[i] {
-            '$' => {
-                if let Some((elem, new_i)) = parse_ref(&chars, i) {
+    while i < bytes.len() {
+        match bytes[i] {
+            b'$' => {
+                if let Some((elem, new_i)) = parse_ref(s, i) {
                     elements.push(elem);
                     i = new_i;
                 } else {
-                    // Lone '$' – treat as plain chars until next special
-                    let start = i;
-                    i += 1;
-                    while i < chars.len() && !['$', '[', ']'].contains(&chars[i]) {
-                        i += 1;
-                    }
-                    elements.push(LocElement::Chars(chars[start..i].iter().collect()));
+                    let end = next_special(s, i + 1);
+                    elements.push(LocElement::Chars(s[i..end].to_string()));
+                    i = end;
                 }
             }
-            '[' => {
-                if let Some((elem, new_i)) = parse_bracket(&chars, i) {
+            b'[' => {
+                if let Some((elem, new_i)) = parse_bracket(s, i) {
                     elements.push(elem);
                     i = new_i;
                 } else {
-                    // Lone '[' – treat as plain chars
-                    let start = i;
-                    i += 1;
-                    while i < chars.len() && !['$', '[', ']'].contains(&chars[i]) {
-                        i += 1;
-                    }
-                    elements.push(LocElement::Chars(chars[start..i].iter().collect()));
+                    let end = next_special(s, i + 1);
+                    elements.push(LocElement::Chars(s[i..end].to_string()));
+                    i = end;
                 }
             }
             _ => {
-                let start = i;
-                i += 1;
-                while i < chars.len() && !['$', '[', ']'].contains(&chars[i]) {
-                    i += 1;
-                }
-                elements.push(LocElement::Chars(chars[start..i].iter().collect()));
+                let end = next_special(s, i);
+                elements.push(LocElement::Chars(s[i..end].to_string()));
+                i = end;
             }
         }
     }
@@ -100,80 +89,81 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
     elements
 }
 
-/// Parse a `$ref$` starting at `chars[start]`.
+/// Return the byte offset of the next `$`, `[`, or `]` at or after `start`,
+/// or `s.len()` if none.  Safe because `$`/`[`/`]` are ASCII and can never
+/// appear as a continuation byte of a multi-byte UTF-8 sequence.
+fn next_special(s: &str, start: usize) -> usize {
+    s[start..]
+        .as_bytes()
+        .iter()
+        .position(|&b| matches!(b, b'$' | b'[' | b']'))
+        .map(|off| start + off)
+        .unwrap_or(s.len())
+}
+
+/// Parse a `$ref$` starting at `s[start]` where `s.as_bytes()[start] == b'$'`.
 ///
 /// Mirrors F# `dollarColour`: the ref name ends at `|` or `$`.
 /// So `$MY_KEY|Y$` yields `Ref("MY_KEY")`.
-fn parse_ref(chars: &[char], start: usize) -> Option<(LocElement, usize)> {
-    // chars[start] == '$'
-    let mut i = start + 1;
-    let content_start = i;
+fn parse_ref(s: &str, start: usize) -> Option<(LocElement, usize)> {
+    let bytes = s.as_bytes();
+    let content_start = start + 1; // skip opening '$'
 
-    // Collect key chars up to '|', '$', or end
-    while i < chars.len() && chars[i] != '$' && chars[i] != '|' {
-        i += 1;
+    // Find end of key: '|' or '$'
+    let key_end = bytes[content_start..]
+        .iter()
+        .position(|&b| b == b'$' || b == b'|')
+        .map(|off| content_start + off)?;
+
+    let key = &s[content_start..key_end];
+
+    if bytes[key_end] == b'|' {
+        // Skip colour suffix up to and including the closing '$'
+        let after_pipe = key_end + 1;
+        let close = bytes[after_pipe..]
+            .iter()
+            .position(|&b| b == b'$')
+            .map(|off| after_pipe + off)?;
+        Some((LocElement::Ref(key.to_string()), close + 1))
+    } else {
+        // bytes[key_end] == b'$' — consume it
+        Some((LocElement::Ref(key.to_string()), key_end + 1))
     }
-
-    if i >= chars.len() {
-        return None; // No closing '$'
-    }
-
-    let key = chars[content_start..i].iter().collect::<String>();
-
-    // Skip the colour suffix (|COLOR) if present, then consume the closing '$'
-    if chars[i] == '|' {
-        // skip everything up to and including the closing '$'
-        i += 1; // skip '|'
-        while i < chars.len() && chars[i] != '$' {
-            i += 1;
-        }
-        if i >= chars.len() {
-            return None; // No closing '$' after colour suffix
-        }
-    }
-
-    // chars[i] == '$' — consume it
-    Some((LocElement::Ref(key), i + 1))
 }
 
-/// Parse a `[...]` block starting at `chars[start]`.
-fn parse_bracket(chars: &[char], start: usize) -> Option<(LocElement, usize)> {
-    // chars[start] == '['
+/// Parse a `[...]` block starting at `s[start]` where `s.as_bytes()[start] == b'['`.
+fn parse_bracket(s: &str, start: usize) -> Option<(LocElement, usize)> {
+    let bytes = s.as_bytes();
+    let mut depth = 1usize;
     let mut i = start + 1;
-    let content_start = i;
-    let mut depth = 1;
 
-    while i < chars.len() && depth > 0 {
-        match chars[i] {
-            '[' => depth += 1,
-            ']' => depth -= 1,
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => depth -= 1,
             _ => {}
         }
         i += 1;
     }
 
     if depth != 0 {
-        return None; // Unmatched bracket
+        return None; // unmatched bracket
     }
 
-    // i now points one past the closing ']'
-    let content = chars[content_start..i - 1].iter().collect::<String>();
+    // i points one past the closing ']'; content is s[start+1..i-1]
+    let content = &s[start + 1..i - 1];
 
-    // Check if it's Jomini syntax (contains '.')
     if content.contains('.') || content.contains('(') {
-        if let Ok(commands) = parse_jomini(&content) {
+        if let Ok(commands) = parse_jomini(content) {
             return Some((LocElement::JominiCommand(commands), i));
         }
     }
 
-    // Simple command: key, optionally with |
-    let command = if let Some(pipe) = content.find('|') {
-        content[..pipe].to_string()
-    } else {
-        content
-    };
+    let command = content.find('|')
+        .map(|p| &content[..p])
+        .unwrap_or(content);
 
-    Some((LocElement::Command(command), i))
+    Some((LocElement::Command(command.to_string()), i))
 }
 
 /// Parse Jomini command chain / function call.
@@ -185,78 +175,53 @@ fn parse_bracket(chars: &[char], start: usize) -> Option<(LocElement, usize)> {
 fn parse_jomini(input: &str) -> Result<Vec<JominiCommand>, String> {
     let mut commands = Vec::new();
     let mut current = String::new();
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
+    let mut chars = input.chars().peekable();
 
-    while i < chars.len() {
-        match chars[i] {
+    while let Some(ch) = chars.next() {
+        match ch {
             '.' => {
                 if !current.is_empty() {
-                    commands.push(JominiCommand {
-                        key: current.clone(),
-                        params: Vec::new(),
-                    });
-                    current.clear();
+                    commands.push(JominiCommand { key: std::mem::take(&mut current), params: Vec::new() });
                 }
-                i += 1;
             }
             '(' => {
-                // Function call: key(params)
-                let key = current.clone();
-                current.clear();
-                i += 1; // skip '('
-                let params = parse_jomini_params(&chars, &mut i)?;
+                let key = std::mem::take(&mut current);
+                let params = parse_jomini_params(&mut chars)?;
                 commands.push(JominiCommand { key, params });
             }
-            ' ' | ',' => {
-                i += 1;
-            }
-            _ => {
-                current.push(chars[i]);
-                i += 1;
-            }
+            ' ' | ',' => {}
+            _ => current.push(ch),
         }
     }
 
     if !current.is_empty() {
-        commands.push(JominiCommand {
-            key: current,
-            params: Vec::new(),
-        });
+        commands.push(JominiCommand { key: current, params: Vec::new() });
     }
 
     Ok(commands)
 }
 
 fn parse_jomini_params(
-    chars: &[char],
-    i: &mut usize,
+    chars: &mut std::iter::Peekable<std::str::Chars>,
 ) -> Result<Vec<JominiParam>, String> {
     let mut params = Vec::new();
     let mut current = String::new();
 
-    while *i < chars.len() {
-        match chars[*i] {
+    for ch in chars.by_ref() {
+        match ch {
             ')' => {
-                *i += 1;
                 if !current.trim().is_empty() {
-                    let param = parse_jomini_param(&current)?;
-                    params.push(param);
+                    params.push(parse_jomini_param(&current)?);
                 }
                 return Ok(params);
             }
             ',' => {
-                *i += 1;
                 if !current.trim().is_empty() {
-                    let param = parse_jomini_param(&current)?;
-                    params.push(param);
+                    params.push(parse_jomini_param(&current)?);
                 }
                 current.clear();
             }
-            _ => {
-                current.push(chars[*i]);
-                *i += 1;
-            }
+            _ => current.push(ch),
         }
     }
 
