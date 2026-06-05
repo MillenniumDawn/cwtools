@@ -569,11 +569,25 @@ fn children_to_rules(
             }
             Child::LeafValue(lvidx) => {
                 let lv = &ast.arena.leaf_values[*lvidx as usize];
-                let val_str = value_to_string(&lv.value, table);
-                let field = field_from_string(&val_str);
-                let mut opts = options_from_comments(comments, false);
-                opts.leafvalue = true;
-                rules.push((RuleType::LeafValueRule { right: field }, opts));
+                if let Value::Clause(clause_ch) = &lv.value {
+                    // Anonymous {…} block in a rule definition — same as F# ValueClauseC.
+                    let opts = options_from_comments(comments, false);
+                    let inner = children_to_rules(clause_ch, ast, table, ruleset);
+                    rules.push((RuleType::ValueClauseRule { rules: inner }, opts));
+                } else {
+                    let val_str = value_to_string(&lv.value, table);
+                    let field = field_from_string(&val_str);
+                    let mut opts = options_from_comments(comments, false);
+                    opts.leafvalue = true;
+                    rules.push((RuleType::LeafValueRule { right: field }, opts));
+                }
+            }
+            Child::ValueClause(vcidx) => {
+                // Anonymous {…} parsed as a true ValueClause node (some parser versions).
+                let vc = &ast.arena.value_clauses[*vcidx as usize];
+                let opts = options_from_comments(comments, false);
+                let inner = children_to_rules(&vc.children, ast, table, ruleset);
+                rules.push((RuleType::ValueClauseRule { rules: inner }, opts));
             }
             _ => {}
         }

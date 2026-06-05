@@ -68,6 +68,13 @@ for rules inside subtype blocks; `checkCardinality` is called on the parent
 subtype rules into the flat list (both Path A and Path B in `validate_with_type`).
 Result: 36,826 fewer warnings (38,111 → 1,285) on MD, zero error regression.
 
+**ValueClauseRule in rule files** — FIXED. Anonymous `{…}` blocks in cwt rule
+definitions (e.g. `colors = { {float} }`) were parsed as `LeafValueRule{SpecificField("")}`
+instead of `ValueClauseRule`. Fix: in `children_to_rules`, detect `Child::LeafValue`
+with `Value::Clause` and `Child::ValueClause` and create `ValueClauseRule` from
+their children. Removed 818 spurious CW201/CW203 warnings from MD_ribbons.txt.
+Final MD tally: 13,458 errors, 945 warnings.
+
 ### All perf/idiomatic/cosmetic items — DONE
 
 All H/M-class perf items and idiomatic cleanups have landed. Summary:
@@ -87,13 +94,8 @@ The `lsp/main.rs` NOT-PORTED comment points at F# `LanguageFeatures.fs`.
 
 ## 4. What's left
 
-1. **MD_ribbons.txt ribbon/colors CW203 (818 warnings)** — pre-existing, not subtype noise.
-   `colors = { {float float float float} }` value-clause children are flagged CW201
-   "Unexpected value clause" and CW203 "LeafValue SpecificField("") appears 0 times".
-   Root cause: `ValueClauseRule` inside a `NodeRule` not being matched in child dispatch,
-   plus empty-string SpecificField appearing in cardinality output. Investigate separately.
-2. **LSP graph/code-actions** — only if a concrete editor need appears.
-3. Delete this file once both are resolved or permanently dropped.
+1. **LSP graph/code-actions** — only if a concrete editor need appears.
+2. Delete this file once resolved or permanently dropped.
 
 ## 5. This is the only spec
 
