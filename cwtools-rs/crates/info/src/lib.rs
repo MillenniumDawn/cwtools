@@ -9,6 +9,11 @@ pub mod inline_expansion;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
+/// Strip one layer of surrounding double-quotes, if present.
+fn unquote(s: &str) -> &str {
+    s.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(s)
+}
+
 /// Extract a plain string from a leaf value.
 fn leaf_value_string(value: &Value, table: &StringTable) -> String {
     match value {
@@ -198,17 +203,20 @@ fn instance_name_from_children(
     table: &StringTable,
 ) -> Option<String> {
     match &td.name_field {
-        None => Some(node_key.to_string()),
+        None => Some(unquote(node_key).to_string()),
         Some(field_name) => {
             // The instance name comes from a child leaf whose key equals `name_field`.
+            // Quoted values (e.g. spriteType `name = "GFX_x"`) are stored with their
+            // quotes, so strip them to match unquoted references like `icon = GFX_x`.
             for child in children {
                 if let Child::Leaf(li) = child {
                     let leaf = &arena.leaves[*li as usize];
                     let k = table.get_string(leaf.key.normal).unwrap_or_default();
                     if k.eq_ignore_ascii_case(field_name) {
                         let v = leaf_value_string(&leaf.value, table);
+                        let v = unquote(&v);
                         if !v.is_empty() {
-                            return Some(v);
+                            return Some(v.to_string());
                         }
                     }
                 }
@@ -1387,6 +1395,25 @@ mod tests {
         let instances = result.get("event").expect("should find event");
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].name, "my_event_001");
+    }
+
+    /// A quoted name_field value (e.g. spriteType `name = "GFX_x"`) must be
+    /// indexed without its quotes so unquoted references (`icon = GFX_x`) resolve.
+    #[test]
+    fn test_type_instance_name_field_quoted() {
+        let source = "spriteTypes = { spriteType = { name = \"GFX_test_icon\" } }";
+        let table = StringTable::new();
+        let parsed = parse_string(source, &table).unwrap();
+
+        let mut td = empty_type_def("spriteType", vec!["game/interface"]);
+        td.name_field = Some("name".to_string());
+        td.skip_root_key = vec![SkipRootKey::SpecificKey("spriteTypes".to_string())];
+        let rs = make_ruleset_with_type(td);
+
+        let result = collect_type_instances(&rs, &parsed, "game/interface/x.gfx", &table);
+        let instances = result.get("spriteType").expect("should find spriteType");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].name, "GFX_test_icon");
     }
 
     /// type_key_filter: only nodes with a matching key qualify.
