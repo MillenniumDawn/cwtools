@@ -179,7 +179,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_value(&mut self) -> Option<Value> {
+    /// Parse a value. `leafvalue` is true when the value is a bare value in a
+    /// clause (e.g. a namelist name), false when it is the RHS of `key = value`.
+    /// Only leafvalues may carry interior quotes; a key's RHS quoted string
+    /// closes strictly at the first `"` so that one-line `a = "x" b = "y"` pairs
+    /// (history/units, version_name, ...) parse as separate statements.
+    fn parse_value(&mut self, leafvalue: bool) -> Option<Value> {
         self.skip_whitespace();
         // Skip any comments that appear before the actual value (e.g. value on next line).
         // The AST has no place for comments inside Leaf values, so just discard them.
@@ -195,6 +200,14 @@ impl<'a> Parser<'a> {
             self.advance();
             let mut s = String::new();
             while let Some(c) = self.peek() {
+                if leafvalue && c == '\n' {
+                    // A leafvalue quoted string never spans lines. This bounds the
+                    // interior-quote heuristic: if it mis-judged a `"` as interior
+                    // (e.g. a name followed by Unicode smart quotes `“ ”`, which the
+                    // lexer sees as bare content), the damage stays on one line and
+                    // cannot swallow following statements / break file structure.
+                    break;
+                }
                 if c == '\\' {
                     self.advance(); // consume '\'
                     match self.peek() {
@@ -216,8 +229,52 @@ impl<'a> Parser<'a> {
                     }
                     continue;
                 } else if c == '"' {
-                    self.advance();
-                    break;
+                    if !leafvalue {
+                        // Key-RHS quoted string: `"` always closes (strict). Keeps
+                        // one-line `a = "x" b = "y"` as separate statements.
+                        self.advance();
+                        break;
+                    }
+                    // Decide: real terminator or interior literal quote. Paradox
+                    // namelists embed quotes inside a name, e.g.
+                    //   1 = { "Division "Castillejos"" }
+                    //   2 = { "Grupo de Operaciones Especiales "Granada" II" }
+                    // Rules, applied to the just-closed `"`:
+                    //   - immediately followed by another `"` (no gap): an interior
+                    //     `""` pair — keep one literal quote, let the next `"` be
+                    //     judged on its own.
+                    //   - otherwise look past whitespace to the next significant
+                    //     char: a delimiter (`{ } = #`), another opening `"`, or EOF
+                    //     closes the string; bare content means this `"` was an
+                    //     interior quote and the name continues.
+                    // This intentionally diverges from F#/Clausewitz (which split the
+                    // name at the first interior quote) so the Rust engine accepts
+                    // all valid game configuration as the F# engine is retired.
+                    self.advance(); // consume the `"`
+                    if self.peek() == Some('"') {
+                        s.push('"');
+                        continue;
+                    }
+                    // Look past same-line whitespace (space/tab/CR) ONLY. A newline
+                    // always ends the string: interior quotes appear within a single
+                    // line, so the close `"` of a normal `key = "value"` followed by a
+                    // newline must terminate (not swallow the next line).
+                    let next_sig = {
+                        let mut it = self.chars.clone();
+                        let mut nc = it.next();
+                        while matches!(nc, Some(' ') | Some('\t') | Some('\r')) {
+                            nc = it.next();
+                        }
+                        nc
+                    };
+                    match next_sig {
+                        None | Some('\n') | Some('}') | Some('{') | Some('=') | Some('#')
+                        | Some('"') => break,
+                        _ => {
+                            s.push('"');
+                            continue;
+                        }
+                    }
                 }
                 s.push(c);
                 self.advance();
@@ -449,7 +506,7 @@ impl<'a> Parser<'a> {
         let saved_chars = self.chars.clone();
         if let Some(key) = self.parse_key() {
             if let Some(op) = self.parse_operator() {
-                if let Some(value) = self.parse_value() {
+                if let Some(value) = self.parse_value(false) {
                     let end = self.pos();
                     let leaf = Leaf {
                         key,
@@ -505,7 +562,7 @@ impl<'a> Parser<'a> {
         }
 
         // Leaf value (bare value)
-        if let Some(value) = self.parse_value() {
+        if let Some(value) = self.parse_value(true) {
             let end = self.pos();
             let lv = LeafValue {
                 value,
@@ -865,6 +922,80 @@ mod tests {
             }
             v => panic!("expected QString, got {:?}", v),
         }
+    }
+
+    // Helper: the leafvalues (bare values) of `n = { ... }`.
+    fn clause_leafvalues(result: &ParsedFile, table: &StringTable) -> Vec<String> {
+        let leaf = match &result.root_children[0] {
+            Child::Leaf(i) => &result.arena.leaves[*i as usize],
+            _ => panic!("expected leaf"),
+        };
+        let children = match &leaf.value {
+            Value::Clause(c) => c,
+            v => panic!("expected clause, got {:?}", v),
+        };
+        children
+            .iter()
+            .filter_map(|c| match c {
+                Child::LeafValue(i) => {
+                    let raw = match &result.arena.leaf_values[*i as usize].value {
+                        Value::QString(t) | Value::String(t) => {
+                            table.get_string(t.normal).unwrap_or_default()
+                        }
+                        other => panic!("expected string leafvalue, got {:?}", other),
+                    };
+                    Some(
+                        raw.strip_prefix('"')
+                            .and_then(|s| s.strip_suffix('"'))
+                            .unwrap_or(&raw)
+                            .to_string(),
+                    )
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    // Paradox namelists embed quotes inside a single name. Each entry must parse
+    // as exactly ONE leafvalue with the interior quotes preserved (intentional
+    // divergence from F#, which splits the name at the first interior quote).
+    #[test]
+    fn qstr_interior_quotes_parse_as_single_value() {
+        let table = StringTable::new();
+        let cases = [
+            (
+                r#"n = { "Division "Castillejos"" }"#,
+                r#"Division "Castillejos""#,
+            ),
+            (
+                r#"n = { "Grupo de Operaciones Especiales "Granada" II" }"#,
+                r#"Grupo de Operaciones Especiales "Granada" II"#,
+            ),
+        ];
+        for (input, expected) in cases {
+            let result = parse_string(input, &table).unwrap();
+            let lvs = clause_leafvalues(&result, &table);
+            assert_eq!(lvs.len(), 1, "input {:?} should be ONE leafvalue", input);
+            assert_eq!(lvs[0], expected, "input {:?}", input);
+        }
+    }
+
+    // Whitespace-separated quoted strings must STILL split into separate values
+    // (e.g. `division_types = { "light_armor" "medium_armor" }`).
+    #[test]
+    fn qstr_space_separated_strings_still_split() {
+        let table = StringTable::new();
+        let result = parse_string(
+            r#"n = { "light_armor" "medium_armor" "heavy_armor" }"#,
+            &table,
+        )
+        .unwrap();
+        let lvs = clause_leafvalues(&result, &table);
+        assert_eq!(
+            lvs,
+            vec!["light_armor", "medium_armor", "heavy_armor"],
+            "space-separated quoted strings must remain separate"
+        );
     }
 
     #[test]

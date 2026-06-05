@@ -37,11 +37,22 @@ light = {
     // A top-level `animation` node in a .asset file: must validate as model_animation.
     let script = "animation = { name = \"a\" file = \"x.anim\" }\n";
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(&parsed, &rs, &table, "gfx/models/units/a.asset", None, None, None);
+    let errors = validate_ast(
+        &parsed,
+        &rs,
+        &table,
+        "gfx/models/units/a.asset",
+        None,
+        None,
+        None,
+    );
     assert!(
         errors.is_empty(),
         "expected model_animation routing (no light errors), got: {:?}",
-        errors.iter().map(|e| (&e.message, e.line)).collect::<Vec<_>>()
+        errors
+            .iter()
+            .map(|e| (&e.message, e.line))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -73,8 +84,18 @@ foo = {
         .iter()
         .filter(|e| e.message.contains("appears 0 time(s)"))
         .collect();
-    assert_eq!(card.len(), 1, "expected one cardinality diagnostic, got: {:?}",
-        errors.iter().map(|e| (&e.message, e.line)).collect::<Vec<_>>());
+    assert_eq!(
+        card.len(),
+        1,
+        "expected one cardinality diagnostic, got: {:?}",
+        errors
+            .iter()
+            .map(|e| (&e.message, e.line))
+            .collect::<Vec<_>>()
+    );
     // `sub = {` is on line 3 of the script; the diagnostic must land there, not 0.
-    assert_eq!(card[0].line, 3, "cardinality diagnostic should be inline on the block line, not the file root");
+    assert_eq!(
+        card[0].line, 3,
+        "cardinality diagnostic should be inline on the block line, not the file root"
+    );
 }

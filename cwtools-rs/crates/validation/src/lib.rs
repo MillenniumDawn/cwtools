@@ -100,8 +100,22 @@ fn validate_wrapper_grandchildren(
                     }
                     (t, r)
                 }
-                // No better match: keep the type the wrapper was resolved to.
-                None => (type_def, inner_rules),
+                // No better match. Only fall back to the wrapper's resolved type
+                // when that type actually applies to THIS grandchild's key. A type
+                // with `## type_key_filter = containerWindowType` must not validate
+                // a sibling `scrollbarType`/`guiButtonType` (top-level widgets under
+                // `guiTypes`) against the containerWindowType schema — F# excludes
+                // them via the filter and leaves them unvalidated. Without this the
+                // widgets' own fields (slider/track/priority/...) flag as CW201.
+                None => {
+                    if let Some((keys, negate)) = &type_def.type_key_filter {
+                        let hit = keys.iter().any(|k| k.eq_ignore_ascii_case(&gc_key));
+                        if hit == *negate {
+                            continue;
+                        }
+                    }
+                    (type_def, inner_rules)
+                }
             };
 
         validate_with_type(
@@ -183,14 +197,14 @@ pub fn validate_ast(
             Child::Node(node_idx) => {
                 let node = &ast.arena.nodes[*node_idx as usize];
                 let key = table.get_string(node.key.normal).unwrap_or_default();
-                find_type_and_rules(&key, ruleset)
+                find_type_and_rules_for_file(&key, file_path, ruleset)
                     .map(|(td, rules)| (key.clone(), td, node.children.as_slice(), rules))
             }
             Child::Leaf(leaf_idx) => {
                 let leaf = &ast.arena.leaves[*leaf_idx as usize];
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
                 if let Value::Clause(children) = &leaf.value {
-                    find_type_and_rules(&key, ruleset)
+                    find_type_and_rules_for_file(&key, file_path, ruleset)
                         .map(|(td, rules)| (key.clone(), td, children.as_slice(), rules))
                 } else {
                     None
@@ -205,7 +219,17 @@ pub fn validate_ast(
             // rule body) must not flag its instance fields as unexpected.
             let has_content_rules =
                 !inner_rules.is_empty() || type_def.subtypes.iter().any(|st| !st.rules.is_empty());
-            if has_content_rules {
+            // A type gated by skip_root_key only applies when the matched key is one
+            // of its skip keys (i.e. the key IS the wrapper). If it declares
+            // skip_root_key(s) but this key matches none, the name-match is spurious:
+            // the type's instances live nested under its wrapper, not at a root key
+            // equal to the type name (F# RulesHelpers.fs:98-112 only descends through
+            // the skip wrapper, never treats a name-matching root as an instance).
+            // Fall through to path matching so another type whose skip_root_key IS
+            // this key (e.g. `terrain={}` -> graphical_terrain) can own it.
+            let skip_gate_ok =
+                type_def.skip_root_key.is_empty() || should_skip_root_key(&type_key, type_def);
+            if has_content_rules && skip_gate_ok {
                 // When the matched key is itself a skip_root_key wrapper for this
                 // type (e.g. `ability = { force_attack = { ... } }` where the type
                 // is `ability` AND skip_root_key = ability), the key is a wrapper,
@@ -494,7 +518,9 @@ fn validate_with_type(
                         // zeroing min so subtype fields are validated when present but
                         // never required when absent.
                         merged.extend(st_rules.iter().map(|(rt, o)| {
-                            let mut o2 = o.clone(); o2.min = 0; (rt.clone(), o2)
+                            let mut o2 = o.clone();
+                            o2.min = 0;
+                            (rt.clone(), o2)
                         }));
                     }
                 }
@@ -511,7 +537,9 @@ fn validate_with_type(
             if matched_subtype_names.contains(&subtype.name.as_str()) {
                 // Same min=0 treatment as Path A.
                 merged.extend(subtype.rules.iter().map(|(rt, o)| {
-                    let mut o2 = o.clone(); o2.min = 0; (rt.clone(), o2)
+                    let mut o2 = o.clone();
+                    o2.min = 0;
+                    (rt.clone(), o2)
                 }));
             }
         }
@@ -578,10 +606,56 @@ fn should_skip_root_key(_key: &str, type_def: &TypeDefinition) -> bool {
 }
 
 /// Look up both the TypeDefinition and the actual validation rules for a given type name.
-fn find_type_and_rules<'a>(name: &str, ruleset: &'a RuleSet) -> Option<(&'a TypeDefinition, &'a [(RuleType, Options)])> {
+fn find_type_and_rules<'a>(
+    name: &str,
+    ruleset: &'a RuleSet,
+) -> Option<(&'a TypeDefinition, &'a [(RuleType, Options)])> {
     let type_def = ruleset.type_by_name.get(name).map(|&i| &ruleset.types[i])?;
     let rules = find_rules_by_name(name, ruleset);
     Some((type_def, rules))
+}
+
+/// True if `t` has no `path_extension` constraint, or `file_path` satisfies it.
+fn type_extension_matches(file_path: &str, t: &TypeDefinition) -> bool {
+    match &t.path_options.path_extension {
+        None => true,
+        Some(ext) => {
+            let ext = ext.to_lowercase();
+            let ext = ext.strip_prefix('.').unwrap_or(&ext);
+            if ext.is_empty() {
+                return true;
+            }
+            let path_lower = file_path.to_lowercase();
+            let basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
+            basename.rsplit('.').next().is_some_and(|e| e == ext)
+        }
+    }
+}
+
+/// Resolve a top-level entity's type by its root key, honoring `path_extension`.
+///
+/// The fast path matches the key against type NAMES (`find_type_and_rules`).
+/// But several types can share a `## type_key_filter` + path and differ only by
+/// `path_extension`: `music` is the `.txt` song lists while `musicasset` is the
+/// `.asset` definitions, both keyed `music`. The by-name lookup always returns
+/// `music`, so `.asset` bodies (name/file/volume) wrongly flag as unexpected and
+/// `song` reads as missing. When the by-name type is gated to an extension the
+/// file lacks, defer to the path/extension-aware resolver instead.
+fn find_type_and_rules_for_file<'a>(
+    name: &str,
+    file_path: &str,
+    ruleset: &'a RuleSet,
+) -> Option<(&'a TypeDefinition, &'a [(RuleType, Options)])> {
+    let by_name = find_type_and_rules(name, ruleset);
+    if let Some((td, _)) = by_name {
+        if type_extension_matches(file_path, td) {
+            return by_name;
+        }
+        if let Some(t) = find_type_by_path_and_key(file_path, Some(name), ruleset) {
+            return Some((t, find_rules_by_name(&t.name, ruleset)));
+        }
+    }
+    by_name
 }
 
 /// Map a ScopeId to a human-readable name for validation purposes.
@@ -1467,12 +1541,14 @@ fn validate_children(
                 let leaf = &ast.arena.leaves[*idx as usize];
                 // Paradox keys are case-insensitive; key the counts in lowercase so
                 // a field written `texturefile` satisfies a rule keyed `textureFile`.
-                let key = unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default()).to_lowercase();
+                let key = unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default())
+                    .to_lowercase();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::Node(idx) => {
                 let node = &ast.arena.nodes[*idx as usize];
-                let key = unquote_key(&table.get_string(node.key.normal).unwrap_or_default()).to_lowercase();
+                let key = unquote_key(&table.get_string(node.key.normal).unwrap_or_default())
+                    .to_lowercase();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::LeafValue(lvidx) => {
@@ -1527,7 +1603,12 @@ fn validate_children(
                     // Item 5: dynamic modifier keys — if provided and this key is a
                     // known modifier, accept silently (modifier context mechanism).
                     let is_modifier = modifier_keys.map(|mk| mk.contains(&key)).unwrap_or(false);
-                    if !is_modifier {
+                    // A `@name = value` leaf is a Paradox read-time variable
+                    // definition, valid anywhere in a block. F# skips these from the
+                    // unexpected-field check (RuleValidationService.fs:266,
+                    // `leaf.Key.[0] <> '@'`).
+                    let is_define = key.starts_with('@');
+                    if !is_modifier && !is_define {
                         errors.push(ValidationError {
                             message: format!("Unexpected field '{}'", key),
                             severity: ErrorSeverity::Error,
@@ -1717,20 +1798,33 @@ fn validate_children(
     // Cardinality enforcement. Report at the block's own location (its first
     // child) rather than line 0 — a missing required field belongs to THIS
     // entity (e.g. the specific decision), not the top of the file.
-    let (block_line, block_col) = children.iter().find_map(|c| child_start_pos(c, ast)).unwrap_or(block_pos);
+    let (block_line, block_col) = children
+        .iter()
+        .find_map(|c| child_start_pos(c, ast))
+        .unwrap_or(block_pos);
 
     // Aggregate keyed-rule cardinality per (lowercased) key. Duplicate keys are
     // overloads/alternatives (e.g. two `clicksound =` rules in one subtype), so
     // the key is checked once against the most permissive bounds rather than
     // once per overload — otherwise a present-once field reads as missing N-1
     // times, or an absent optional alternative double-reports.
-    let mut key_card: HashMap<String, (i32, i32)> = HashMap::new();
+    // Third field tracks strictness: a `~` (soft) minimum on ANY overload of a
+    // key makes the whole key's minimum soft, so an under-count is not flagged.
+    let mut key_card: HashMap<String, (i32, i32, bool)> = HashMap::new();
     for (rule_type, opts) in rules.iter() {
-        if matches!(rule_type, RuleType::LeafRule { .. } | RuleType::NodeRule { .. }) {
+        if matches!(
+            rule_type,
+            RuleType::LeafRule { .. } | RuleType::NodeRule { .. }
+        ) {
             if let Some(k) = get_rule_key(rule_type) {
-                let e = key_card.entry(k.to_lowercase()).or_insert((opts.min, opts.max));
+                let e = key_card.entry(k.to_lowercase()).or_insert((
+                    opts.min,
+                    opts.max,
+                    opts.strict_min,
+                ));
                 e.0 = e.0.min(opts.min);
                 e.1 = e.1.max(opts.max);
+                e.2 = e.2 && opts.strict_min;
             }
         }
     }
@@ -1754,19 +1848,35 @@ fn validate_children(
                     let lkey = key.to_lowercase();
                     // Each distinct key is reported at most once (see key_card above).
                     if reported_keys.insert(lkey.clone()) {
-                        let (kmin, kmax) = key_card.get(&lkey).copied().unwrap_or((opts.min, opts.max));
+                        let (kmin, kmax, kstrict) = key_card.get(&lkey).copied().unwrap_or((
+                            opts.min,
+                            opts.max,
+                            opts.strict_min,
+                        ));
                         let count = key_counts.get(&lkey).copied().unwrap_or(0) as i32;
-                        if count < kmin {
+                        if count < kmin && kstrict {
                             errors.push(ValidationError {
-                                message: format!("Field '{}' appears {} time(s), expected at least {}", key, count, kmin),
-                                severity: missing_sev, line: block_line, col: block_col, file: file_path.to_string(),
+                                message: format!(
+                                    "Field '{}' appears {} time(s), expected at least {}",
+                                    key, count, kmin
+                                ),
+                                severity: missing_sev,
+                                line: block_line,
+                                col: block_col,
+                                file: file_path.to_string(),
                                 code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
                             });
                         }
                         if count > kmax {
                             errors.push(ValidationError {
-                                message: format!("Field '{}' appears {} time(s), expected at most {}", key, count, kmax),
-                                severity: max_sev, line: block_line, col: block_col, file: file_path.to_string(),
+                                message: format!(
+                                    "Field '{}' appears {} time(s), expected at most {}",
+                                    key, count, kmax
+                                ),
+                                severity: max_sev,
+                                line: block_line,
+                                col: block_col,
+                                file: file_path.to_string(),
                                 code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
                             });
                         }
@@ -1776,7 +1886,13 @@ fn validate_children(
             // Item 5: LeafValueRule cardinality
             RuleType::LeafValueRule { right } => {
                 let count = leafvalue_counts[rule_idx] as i32;
-                if count < opts.min {
+                // `~` (soft) minimum: don't flag an under-count. These rules are
+                // typically a disjunction of overlapping leafvalue kinds (e.g.
+                // `ship_types` accepts <naval_equip> OR <ship_unit> OR
+                // enum[ship_units], each `~1..inf`); a value matching one leaves
+                // the others at 0, which is not an error. Genuinely invalid values
+                // are still caught by the per-value "Unexpected bare value" check.
+                if count < opts.min && opts.strict_min {
                     errors.push(ValidationError {
                         message: format!(
                             "LeafValue {:?} appears {} time(s), expected at least {}",
@@ -1806,7 +1922,7 @@ fn validate_children(
             // Item 5: ValueClauseRule cardinality
             RuleType::ValueClauseRule { .. } => {
                 let count = valueclause_counts[rule_idx] as i32;
-                if count < opts.min {
+                if count < opts.min && opts.strict_min {
                     errors.push(ValidationError {
                         message: format!(
                             "ValueClause appears {} time(s), expected at least {}",
@@ -2232,7 +2348,8 @@ fn validate_alias_usage(
                         ruleset,
                         type_index,
                         modifier_keys,
-                        leaf.map(|l| (l.pos.start.line, l.pos.start.col)).unwrap_or((0, 0)),
+                        leaf.map(|l| (l.pos.start.line, l.pos.start.col))
+                            .unwrap_or((0, 0)),
                     );
                     if let (Some(saved), Some(ctx)) = (saved, scope_context.as_mut()) {
                         ctx.restore(saved);
@@ -2298,8 +2415,17 @@ fn validate_leaf(
                 TypeType::Simple(n) => n.as_str(),
                 TypeType::Complex { name, .. } => name.as_str(),
             };
-            // Strip prefix/suffix for Complex TypeField before lookup.
-            let lookup_value = match type_type {
+            // Complex TypeField (`prefix<type>suffix`) maps a value to an instance
+            // and the game accepts any of these forms, so we try them all:
+            //   (a) strip: the value carries the affixes and the instance is
+            //       stored without them (`GFX_event_x` -> `x`).
+            //   (b) raw: the value IS already the full instance name
+            //       (HOI4 ideas may write `picture = GFX_idea_x` directly).
+            //   (c) prepend: the value is bare and the affixed form is the real
+            //       instance (HOI4 ideas: `picture = x` -> `GFX_idea_x`).
+            // The reference resolves if ANY candidate is a known instance, so this
+            // branch can only ever REMOVE false positives, never add them.
+            let (lookup_value, alt_candidates) = match type_type {
                 TypeType::Complex { prefix, suffix, .. } => {
                     let mut v = value_str.as_str();
                     if !prefix.is_empty() {
@@ -2308,14 +2434,17 @@ fn validate_leaf(
                     if !suffix.is_empty() {
                         v = v.strip_suffix(suffix.as_str()).unwrap_or(v);
                     }
-                    v.to_string()
+                    let prepended = format!("{}{}{}", prefix, value_str, suffix);
+                    (v.to_string(), vec![value_str.clone(), prepended])
                 }
-                _ => value_str.clone(),
+                _ => (value_str.clone(), Vec::new()),
             };
             if let Some(idx) = type_index {
                 // Only flag if we have at least one known instance for this type.
                 // If zero instances, vanilla data probably isn't loaded — accept.
-                if !idx.instances(type_name).is_empty() && !idx.contains(type_name, &lookup_value) {
+                let resolved = idx.contains(type_name, &lookup_value)
+                    || alt_candidates.iter().any(|c| idx.contains(type_name, c));
+                if !idx.instances(type_name).is_empty() && !resolved {
                     errors.push(ValidationError {
                         message: format!(
                             "Field '{}' references '{}' which is not a known instance of type '{}'",
@@ -2376,7 +2505,11 @@ fn is_datetime_shape(s: &str) -> bool {
 fn enum_contains(enum_map: &HashMap<&str, &EnumDefinition>, enum_name: &str, value: &str) -> bool {
     match enum_map.get(enum_name) {
         Some(def) if !def.values.is_empty() => {
-            if def.values.iter().any(|v| v == value) {
+            // Enum membership is case-insensitive (F# lowercases both the enum
+            // values and the checked key — FieldValidators.fs `getLowerKey` +
+            // RuleValidationService.fs `.lower`). e.g. `containerOrientations`
+            // is authored UPPER_LEFT/CENTER but files use upper_left/center.
+            if def.values.iter().any(|v| v.eq_ignore_ascii_case(value)) {
                 return true;
             }
             // An enum whose members are `@`-prefixed scripted constants (e.g.
