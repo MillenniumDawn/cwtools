@@ -172,7 +172,14 @@ impl Default for FileManagerConfig {
                 "decisions".into(),
                 "missions".into(),
             ],
-            file_patterns: vec!["*.txt".into()],
+            file_patterns: vec![
+                "*.txt".into(),
+                "*.gui".into(),
+                "*.gfx".into(),
+                "*.sfx".into(),
+                "*.asset".into(),
+                "*.map".into(),
+            ],
             exclude_patterns: vec![],
             exclude_dirs: vec![
                 ".git".into(),

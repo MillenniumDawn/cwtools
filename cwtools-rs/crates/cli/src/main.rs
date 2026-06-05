@@ -96,18 +96,21 @@ fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
-    // If this directory itself contains .txt files, search it directly.
-    let has_txt_files = std::fs::read_dir(directory).ok().map_or(false, |mut entries| {
+    // If this directory itself contains script files, search it directly.
+    let script_exts = ["txt", "gui", "gfx", "sfx", "asset", "map"];
+    let has_script_files = std::fs::read_dir(directory).ok().map_or(false, |mut entries| {
         entries.any(|e| {
             if let Ok(entry) = e {
-                entry.path().extension().map_or(false, |ext| ext == "txt")
+                entry.path().extension()
+                    .and_then(|ext| ext.to_str())
+                    .map_or(false, |ext| script_exts.contains(&ext))
             } else {
                 false
             }
         })
     });
 
-    if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") || has_txt_files {
+    if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") || has_script_files {
         FileManagerConfig {
             root: directory.to_path_buf(),
             include_dirs: vec![".".into()],

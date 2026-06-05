@@ -1714,22 +1714,7 @@ impl Backend {
             }
         };
 
-        let language = {
-            let guard = self.state.language.lock().unwrap();
-            guard.clone()
-        };
-        let extensions: Vec<&str> = match language.as_str() {
-            "hoi4" => vec!["txt"],
-            "stellaris" => vec!["txt"],
-            "eu4" => vec!["txt"],
-            "ck2" => vec!["txt"],
-            "ck3" => vec!["txt"],
-            "vic2" => vec!["txt"],
-            "vic3" => vec!["txt"],
-            "imperator" => vec!["txt"],
-            "eu5" => vec!["txt"],
-            _ => vec!["txt", "gfx", "gui"],
-        };
+        let extensions: Vec<&str> = vec!["txt", "gui", "gfx", "sfx", "asset", "map"];
 
         let mut files_to_validate = Vec::new();
         fn walk_dir(
