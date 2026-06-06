@@ -696,7 +696,7 @@ fn main() {
             // resolves base-game references without re-parsing the install).
             if let Some(cache_path) = &vanilla_cache {
                 match vanilla_cache::load(cache_path) {
-                    Ok((cache_game, per_type)) => {
+                    Ok((cache_game, _fingerprint, per_type)) => {
                         if cache_game != game {
                             eprintln!(
                                 "  warn: vanilla cache was built for game '{}', validating '{}'",
@@ -1032,7 +1032,9 @@ fn main() {
                 &rules_table,
                 &std::collections::HashSet::new(),
             );
-            match vanilla_cache::save(&index, &game, &output) {
+            let fingerprint = vanilla_cache::fingerprint(&vanilla);
+            println!("  Vanilla fingerprint: {}", fingerprint);
+            match vanilla_cache::save(&index, &game, &fingerprint, &output) {
                 Ok(n) => println!("Wrote {} base-game instances to {}", n, output.display()),
                 Err(e) => {
                     eprintln!("Error writing vanilla cache {}: {}", output.display(), e);

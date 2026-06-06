@@ -122,6 +122,37 @@ fn index_vanilla_dir(
 }
 
 /// Best-effort discovery of a base-game install for `game`, checking the usual
+/// OS cache directory for persistent caches, used when the client doesn't pass
+/// `cacheDir`. Honors `XDG_CACHE_HOME`/`LOCALAPPDATA`, then `~/.cache` (Linux) or
+/// `~/Library/Caches` (macOS), and finally the temp dir.
+fn default_cache_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
+        if !x.is_empty() {
+            return Some(PathBuf::from(x).join("cwtools"));
+        }
+    }
+    if let Ok(la) = std::env::var("LOCALAPPDATA") {
+        if !la.is_empty() {
+            return Some(PathBuf::from(la).join("cwtools"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            let home = PathBuf::from(home);
+            #[cfg(target_os = "macos")]
+            {
+                return Some(home.join("Library/Caches/cwtools"));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Some(home.join(".cache/cwtools"));
+            }
+        }
+    }
+    Some(std::env::temp_dir().join("cwtools"))
+}
+
 /// Steam library locations across platforms. Returns the first existing dir.
 /// Used as a fallback when the client passes neither `vanilla` nor `vanillaCache`.
 fn discover_vanilla_dir(game: &str) -> Option<std::path::PathBuf> {
@@ -214,6 +245,10 @@ struct DocumentState {
     /// so an english-targeted mod isn't flagged for every other language vanilla
     /// happens to ship.
     loc_languages: Mutex<Option<Vec<cwtools_localization::Lang>>>,
+    /// Writable directory for persistent caches (from the `cacheDir` init
+    /// option, else an OS cache dir). The base-game type index is cached here
+    /// keyed by game + version, so it isn't re-parsed on every startup.
+    cache_dir: Mutex<Option<std::path::PathBuf>>,
 }
 
 struct ParsedDoc {
@@ -238,6 +273,7 @@ impl DocumentState {
             modifier_keys: parking_lot::RwLock::new(HashSet::new()),
             loc_index: parking_lot::RwLock::new(None),
             loc_languages: Mutex::new(None),
+            cache_dir: Mutex::new(None),
         }
     }
 }
@@ -1026,6 +1062,13 @@ impl LanguageServer for Backend {
                     *self.state.loc_languages.lock() = Some(langs);
                 }
             }
+
+            // Persistent cache directory for the base-game index (so it isn't
+            // re-parsed every startup). The client should pass its global
+            // storage path; we fall back to an OS cache dir otherwise.
+            if let Some(cd) = opts.get("cacheDir").and_then(|v| v.as_str()) {
+                *self.state.cache_dir.lock() = Some(std::path::PathBuf::from(cd));
+            }
             self.client
                 .log_message(MessageType::INFO, format!("init options: {:?}", opts))
                 .await;
@@ -1036,7 +1079,7 @@ impl LanguageServer for Backend {
             // validate_entire_workspace.
             if let Some(vc) = opts.get("vanillaCache").and_then(|v| v.as_str()) {
                 match cwtools_info::vanilla_cache::load(std::path::Path::new(vc)) {
-                    Ok((game, per_type)) => {
+                    Ok((game, _fingerprint, per_type)) => {
                         let total: usize = per_type.values().map(|v| v.len()).sum();
                         *self.state.vanilla_index.lock() = Some(per_type);
                         self.client
@@ -2753,6 +2796,58 @@ impl Backend {
             Some(d) if d.is_dir() => d,
             _ => return,
         };
+
+        let game = self.state.language.lock().clone();
+        // Version fingerprint: the base game only changes when it updates, so a
+        // cache keyed by it is reused across sessions and is safe to publish.
+        let fingerprint = cwtools_info::vanilla_cache::fingerprint(&dir);
+        let cache_path = self.vanilla_cache_path(&game, &fingerprint);
+
+        // Try a fresh cache first — skip parsing the whole base game entirely.
+        if let Some(cp) = &cache_path {
+            if cp.exists() {
+                match cwtools_info::vanilla_cache::load(cp) {
+                    Ok((cache_game, cache_fp, per_type))
+                        if cache_game == game && cache_fp == fingerprint =>
+                    {
+                        let total: usize = per_type.values().map(|v| v.len()).sum();
+                        *self.state.vanilla_index.lock() = Some(per_type);
+                        self.client
+                            .log_message(
+                                MessageType::INFO,
+                                format!(
+                                    "Loaded {} base-game instances from cache {} ({})",
+                                    total,
+                                    cp.display(),
+                                    fingerprint
+                                ),
+                            )
+                            .await;
+                        return;
+                    }
+                    Ok((_, cache_fp, _)) => {
+                        self.client
+                            .log_message(
+                                MessageType::INFO,
+                                format!(
+                                    "Vanilla cache stale (cached {}, install {}); rebuilding",
+                                    cache_fp, fingerprint
+                                ),
+                            )
+                            .await;
+                    }
+                    Err(e) => {
+                        self.client
+                            .log_message(
+                                MessageType::WARNING,
+                                format!("Could not load vanilla cache {}: {}", cp.display(), e),
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
         // We need the ruleset to map definitions to their types. Clone it out so
         // the lock guard isn't held across the awaits below (parking_lot guards
         // aren't Send, and this runs inside a spawned task).
@@ -2774,18 +2869,51 @@ impl Backend {
         self.client
             .log_message(
                 MessageType::INFO,
-                format!("Indexing base game at {} …", dir.display()),
+                format!(
+                    "Indexing base game at {} ({}) …",
+                    dir.display(),
+                    fingerprint
+                ),
             )
             .await;
 
         // Indexing parses thousands of files; run it off the async executor.
         let table = self.state.string_table.clone();
+        let index_dir = dir.clone();
         let per_type =
-            tokio::task::spawn_blocking(move || index_vanilla_dir(&dir, &ruleset, &table))
+            tokio::task::spawn_blocking(move || index_vanilla_dir(&index_dir, &ruleset, &table))
                 .await
                 .unwrap_or_default();
 
         let total: usize = per_type.values().map(|v| v.len()).sum();
+
+        // Persist for next startup so the base game isn't re-parsed every time.
+        if let Some(cp) = &cache_path {
+            match cwtools_info::vanilla_cache::save_per_type(&per_type, &game, &fingerprint, cp) {
+                Ok(n) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "Cached {} base-game instances to {} ({})",
+                                n,
+                                cp.display(),
+                                fingerprint
+                            ),
+                        )
+                        .await
+                }
+                Err(e) => {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("Could not write vanilla cache {}: {}", cp.display(), e),
+                        )
+                        .await
+                }
+            }
+        }
+
         *self.state.vanilla_index.lock() = Some(per_type);
         self.client
             .log_message(
@@ -2793,6 +2921,31 @@ impl Backend {
                 format!("Indexed {} base-game instances.", total),
             )
             .await;
+    }
+
+    /// Path of the persistent base-game cache for `game` at `fingerprint`, under
+    /// the client-provided `cacheDir` (else an OS cache dir). Versioned in the
+    /// filename so multiple game versions can coexist and a published cache for a
+    /// given version drops straight in. `None` if no cache dir can be resolved.
+    fn vanilla_cache_path(&self, game: &str, fingerprint: &str) -> Option<std::path::PathBuf> {
+        let base = self
+            .state
+            .cache_dir
+            .lock()
+            .clone()
+            .or_else(default_cache_dir)?;
+        let safe = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        Some(base.join(format!("vanilla-{}-{}.json", safe(game), safe(fingerprint))))
     }
 
     async fn determine_file_types(&self, uri: &str) -> Vec<String> {
