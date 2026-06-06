@@ -130,6 +130,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW250 | Error | {} | A `planet_killer` definition is missing required configuration. | Defined, emission pending (vanilla data registries) |
 | CW251 | Warning | This {} is unnecessary | A boolean operator (`AND`/`OR`) is nested directly inside an identical operator. | Emitted |
 | CW253 | Information | Consider using "set_name" instead for consistency | `set_empire_name` or `set_planet_name` should be replaced with `set_name`. | Emitted |
+| CW280 | Information | {} = { always = ... } matches the default and can be removed | HOI4 cleanup hint: a field whose body is exactly `{ always = <bool> }` matching the field's default (e.g. `allowed_civil_war = { always = no }`) is a no-op and can be deleted. Rust-original (no F# equivalent); field/default table in `per_game::hoi4`. | Emitted |
 
 ### CW254-CW268 -- Localisation file headers and content
 

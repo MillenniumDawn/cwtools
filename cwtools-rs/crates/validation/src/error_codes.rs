@@ -411,6 +411,16 @@ pub const CW251_UNNECESSARY_BOOLEAN: ErrorCode = ErrorCode {
     message_template: "This {} is unnecessary",
 };
 
+/// A field whose body is exactly `{ always = <bool> }` where that bool matches
+/// the game default, so the whole field is a no-op and can be deleted. A
+/// Rust-original cleanup hint (no F# equivalent); the field/default table lives
+/// in `per_game::hoi4`. Arg is the field name.
+pub const CW280_REDUNDANT_DEFAULT_FIELD: ErrorCode = ErrorCode {
+    id: "CW280",
+    severity: ErrorSeverity::Information,
+    message_template: "{} = { always = ... } matches the default and can be removed",
+};
+
 // ── Tier B — Stellaris-specific if/else + set_name (per_game::stellaris) ────
 
 /// Nested `if`/`else` in effects, deprecated with Stellaris 2.1. F# `DeprecatedElse`.

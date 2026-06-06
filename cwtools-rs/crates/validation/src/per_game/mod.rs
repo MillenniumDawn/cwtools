@@ -6,6 +6,7 @@ use cwtools_string_table::string_table::StringTable;
 
 pub mod common;
 pub mod eu4;
+pub mod hoi4;
 pub mod stellaris;
 pub mod structural;
 
@@ -31,6 +32,9 @@ pub fn run_game_validators(
         }
         Game::Eu4 => {
             eu4::validate_eu4(ast, ruleset, table, file_path, &mut errors);
+        }
+        Game::Hoi4 => {
+            hoi4::validate_hoi4(ast, ruleset, table, file_path, &mut errors);
         }
         _ => {
             // Other games: only common checks for now
