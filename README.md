@@ -1,8 +1,9 @@
 # cwtools 	![nuget](https://img.shields.io/nuget/v/CWTools.svg)
-A library for parsing, editing, and validating Paradox Interactive script files.  
-Supports all modern Paradox Interactive games, and targets .net standard 2.0.
+A library for parsing, editing, and validating Paradox Interactive script files.
 
 > **Fork notice:** This is a fork of [cwtools/cwtools](https://github.com/cwtools/cwtools). The upstream project has been largely inactive, so this fork has diverged and is being taken in a new direction long term.
+
+> **Game support (Rust rewrite):** Right now we predominantly support **Hearts of Iron IV**. The validator is being rebuilt in Rust (see `cwtools-rs/`) and the structure is still settling, so HOI4 is where it's complete and tested. The other games (Stellaris, EU4, CK2/CK3, Vic2/Vic3, Imperator) parse, but their validation and per-game rules are partial while we get the foundation right. Full multi-game parity is tracked in the [issues](https://github.com/MillenniumDawn/cwtools/issues). The original F# library below still targets .NET Standard 2.0 and supports the modern Paradox games, but it is on its way out.
 
 Considering contributing? [Start here!](https://github.com/tboby/cwtools/wiki/Contributing)
 
