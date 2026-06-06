@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use tower_lsp::jsonrpc::Result;
@@ -249,13 +250,19 @@ struct DocumentState {
     /// option, else an OS cache dir). The base-game type index is cached here
     /// keyed by game + version, so it isn't re-parsed on every startup.
     cache_dir: Mutex<Option<std::path::PathBuf>>,
+    /// Monotonic edit counter, bumped on every `did_change`. A debounced
+    /// validation captures the value at spawn time; the cross-file dependent
+    /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
+    /// into the latest one instead of stacking up and double-validating.
+    edit_generation: AtomicU64,
 }
 
 struct ParsedDoc {
-    #[allow(dead_code)]
     version: i32,
     text: String,
-    ast: Option<ParsedFile>,
+    /// Shared so the cross-file dependent sweep can validate against it without
+    /// re-parsing (an `Arc` clone instead of a full re-parse per open file).
+    ast: Option<Arc<ParsedFile>>,
 }
 
 impl DocumentState {
@@ -274,6 +281,7 @@ impl DocumentState {
             loc_index: parking_lot::RwLock::new(None),
             loc_languages: Mutex::new(None),
             cache_dir: Mutex::new(None),
+            edit_generation: AtomicU64::new(0),
         }
     }
 }
@@ -1255,7 +1263,7 @@ impl LanguageServer for Backend {
                 ParsedDoc {
                     version,
                     text: text.clone(),
-                    ast: parsed,
+                    ast: parsed.map(Arc::new),
                 },
             );
         }
@@ -1285,6 +1293,10 @@ impl LanguageServer for Backend {
             docs.insert(uri.clone(), ParsedDoc { version, text, ast });
         }
 
+        // Bump the global edit counter so any in-flight dependent sweep from an
+        // earlier edit knows it has been superseded and can stop early.
+        let generation = self.state.edit_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
         // Validate in the background after a short debounce so a burst of
         // keystrokes coalesces into one validation and the handler returns
         // immediately (no per-keystroke re-parse lag).
@@ -1293,7 +1305,7 @@ impl LanguageServer for Backend {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(DEBOUNCE_MS)).await;
             let backend = Backend { client, state };
-            backend.debounced_validate(uri, version).await;
+            backend.debounced_validate(uri, version, generation).await;
         });
     }
 
@@ -2521,7 +2533,7 @@ impl Backend {
     /// changed file's diagnostics, then refreshes the other open documents so
     /// cross-file references reflect the edit instead of showing stale results.
     #[tracing::instrument(skip_all, fields(uri = %uri, version = expected_version))]
-    async fn debounced_validate(&self, uri: String, expected_version: i32) {
+    async fn debounced_validate(&self, uri: String, expected_version: i32, generation: u64) {
         // A newer change landed during the debounce — let that one validate.
         let text = {
             let docs = self.state.documents.lock();
@@ -2531,12 +2543,16 @@ impl Backend {
             }
         };
 
+        // Snapshot the file's cross-file exports before re-indexing, so we can
+        // tell whether this edit can affect any other file (see below).
+        let exports_before = self.export_fingerprint(&uri);
+
         let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
         {
             let mut docs = self.state.documents.lock();
             if let Some(d) = docs.get_mut(&uri) {
                 if d.version == expected_version {
-                    d.ast = parsed;
+                    d.ast = parsed.map(Arc::new);
                 }
             }
         }
@@ -2546,37 +2562,111 @@ impl Backend {
                 .await;
         }
 
-        // The changed file is now re-indexed; refresh the other open documents.
-        self.revalidate_open_dependents(&uri).await;
+        // Only sweep the other open files if this edit actually changed what the
+        // file exports (a definition added/renamed/removed). Editing inside a
+        // rule body leaves the exports identical, so no dependent can change and
+        // the sweep is skipped entirely — the common case stays cheap.
+        let exports_after = self.export_fingerprint(&uri);
+        if exports_before != exports_after {
+            // Tagged with this edit's generation so a newer edit preempts it.
+            self.revalidate_open_dependents(&uri, generation).await;
+        } else {
+            tracing::debug!(uri = %uri, "exports unchanged; skipping dependent sweep");
+        }
+    }
+
+    /// An order-independent hash of the cross-file-visible symbols a config file
+    /// exports: type instances (referenced as `<type>` elsewhere), defined
+    /// variables, and saved event targets. If an edit leaves this unchanged, no
+    /// other open file's diagnostics can change, so the dependent sweep can be
+    /// skipped. Snapshotted before and after the edit's re-index.
+    fn export_fingerprint(&self, uri: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        // Hash one symbol's identity, with separators so distinct parts can't
+        // run together (`a|bc` vs `ab|c`).
+        fn mix(parts: &[&str]) -> u64 {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for p in parts {
+                p.hash(&mut h);
+                0xffu8.hash(&mut h);
+            }
+            h.finish()
+        }
+        let info = self.state.info_service.lock();
+        // wrapping_add combines symbols order-independently while preserving
+        // multiplicity (XOR would cancel a duplicated symbol to zero).
+        let mut acc: u64 = 0;
+        for (ty, inst) in info.type_index.instances_in_file(uri) {
+            acc = acc.wrapping_add(mix(&["t", ty, &inst.name]));
+        }
+        if let Some(fi) = info.files.get(uri) {
+            for (ns, vars) in &fi.defined_variables_ns {
+                for v in vars {
+                    acc = acc.wrapping_add(mix(&["v", ns, &v.name]));
+                }
+            }
+            for et in &fi.saved_event_targets {
+                acc = acc.wrapping_add(mix(&["e", et]));
+            }
+        }
+        acc
     }
 
     /// Re-validate and republish every open document except `changed_uri`, using
     /// the freshly updated indexes. Bounded by the number of open files, so a
     /// definition edit propagates to the gui/event/etc. files that reference it.
-    async fn revalidate_open_dependents(&self, changed_uri: &str) {
-        let others: Vec<(String, String)> = {
+    ///
+    /// `generation` is the edit counter at the time the triggering change landed.
+    /// If a newer edit bumps the counter while the sweep is running, the sweep
+    /// stops: the newer edit's own sweep will revalidate everything against the
+    /// fully-updated index, so finishing this one is wasted work (and would
+    /// double-validate). Each dependent's diagnostics are published with that
+    /// doc's current version, and skipped if the doc changed mid-sweep, so the
+    /// sweep never clobbers a fresher in-flight result for a file being edited.
+    async fn revalidate_open_dependents(&self, changed_uri: &str, generation: u64) {
+        // Snapshot each open dependent's cached AST (a cheap `Arc` clone) with
+        // its version. The dependents' own text didn't change, so they don't
+        // need re-parsing or re-indexing — only re-validation against the
+        // now-updated global index.
+        let others: Vec<(String, i32, Arc<ParsedFile>)> = {
             let docs = self.state.documents.lock();
             docs.iter()
                 .filter(|(u, _)| u.as_str() != changed_uri)
-                .map(|(u, d)| (u.clone(), d.text.clone()))
+                .filter_map(|(u, d)| d.ast.clone().map(|ast| (u.clone(), d.version, ast)))
                 .collect()
         };
         if others.is_empty() {
             return;
         }
-        tracing::debug!(count = others.len(), "revalidate_open_dependents");
-        for (uri, text) in others {
-            let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
-            {
-                let mut docs = self.state.documents.lock();
-                if let Some(d) = docs.get_mut(&uri) {
-                    d.ast = parsed;
-                }
+        // Modifier keys only change on a full scan, so snapshot once for the
+        // whole sweep rather than re-locking per file.
+        let modifier_keys = self.state.modifier_keys.read().clone();
+        tracing::debug!(
+            count = others.len(),
+            generation,
+            "revalidate_open_dependents"
+        );
+        for (uri, snapshot_version, ast) in others {
+            // Preempt: a newer edit arrived, its sweep will cover everything.
+            if self.state.edit_generation.load(Ordering::SeqCst) != generation {
+                tracing::debug!(generation, "revalidate_open_dependents superseded");
+                return;
             }
-            if let Ok(uri_obj) = Url::parse(&uri) {
-                self.client
-                    .publish_diagnostics(uri_obj, diagnostics, None)
-                    .await;
+            let diagnostics = self.validate_parsed(&uri, &ast, &modifier_keys);
+            // Skip if this dependent was itself edited while we validated it —
+            // its own debounced pass owns the fresher result.
+            let still_current = {
+                let docs = self.state.documents.lock();
+                docs.get(&uri)
+                    .map(|d| d.version == snapshot_version)
+                    .unwrap_or(false)
+            };
+            if still_current {
+                if let Ok(uri_obj) = Url::parse(&uri) {
+                    self.client
+                        .publish_diagnostics(uri_obj, diagnostics, Some(snapshot_version))
+                        .await;
+                }
             }
         }
     }
@@ -3671,7 +3761,7 @@ mod tests {
             ParsedDoc {
                 version: 0,
                 text: source.to_string(),
-                ast: Some(parsed),
+                ast: Some(Arc::new(parsed)),
             },
         );
 
