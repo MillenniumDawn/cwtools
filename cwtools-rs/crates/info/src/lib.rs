@@ -205,6 +205,21 @@ impl TypeIndex {
         self.map.get(type_name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Every `(type_name, instance)` defined in `file_uri`. Scans the whole
+    /// index (O(total instances)); used by document-symbol/outline, which is
+    /// on-demand and infrequent. Lets `FileInfo` avoid a second per-file copy.
+    pub fn instances_in_file<'a>(&'a self, file_uri: &str) -> Vec<(&'a str, &'a TypeInstance)> {
+        let mut out = Vec::new();
+        for (type_name, entries) in &self.map {
+            for (uri, inst) in entries {
+                if uri == file_uri {
+                    out.push((type_name.as_str(), inst));
+                }
+            }
+        }
+        out
+    }
+
     /// Merge per-file results into the index.
     pub fn merge(&mut self, file_uri: &str, per_type: HashMap<String, Vec<TypeInstance>>) {
         for (type_name, instances) in per_type {
@@ -1268,9 +1283,6 @@ fn classify_leaf_value(
 /// Computed data for a single file.
 #[derive(Debug, Clone, Default)]
 pub struct FileInfo {
-    /// Type instances from rule-driven indexing.
-    /// Maps type name → instances defined in this file.
-    pub type_instances: HashMap<String, Vec<TypeInstance>>,
     /// Keys that define types (heuristic, kept for LSP compatibility).
     pub type_definitions: HashMap<String, Vec<SourceLocation>>,
     /// Referenced types (e.g. `<ethos>`).
@@ -1320,17 +1332,11 @@ impl InfoService {
     /// One-line size summary for profiling (counts only, not bytes).
     pub fn profile_summary(&self) -> String {
         let cross_file: usize = self.type_index.map.values().map(|v| v.len()).sum();
-        let per_file: usize = self
-            .files
-            .values()
-            .map(|f| f.type_instances.values().map(|v| v.len()).sum::<usize>())
-            .sum();
         format!(
-            "info: {} files | type_index {} instances / {} types | per-file {} instances | {} vars | {} targets | {} type_defs",
+            "info: {} files | type_index {} instances / {} types | {} vars | {} targets | {} type_defs",
             self.files.len(),
             cross_file,
             self.type_index.map.len(),
-            per_file,
             self.all_variables.len(),
             self.all_event_targets.len(),
             self.all_type_defs.len(),
@@ -1370,9 +1376,11 @@ impl InfoService {
         }
 
         // ── Rule-driven: type-instance index ─────────────────────────────────
+        // Move the instances straight into the cross-file index. We don't keep a
+        // second per-file copy on `FileInfo` (that doubled ~190K instances on
+        // MD); document-symbol derives a file's instances from the index instead.
         let instances = collect_type_instances(ruleset, ast, logical_path, table);
-        self.type_index.merge(uri, instances.clone());
-        info.type_instances = instances;
+        self.type_index.merge(uri, instances);
 
         // ── Rule-driven: defined variables ────────────────────────────────────
         // Convert the @-vars already collected by index_child_heuristic into

@@ -1802,40 +1802,42 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let info = self.state.info_service.lock();
 
-        let file_info = match info.files.get(&uri) {
-            Some(f) => f,
-            None => return Ok(None),
-        };
-
-        // Emit type instances as document symbols (one per named instance).
+        // Emit type instances as document symbols (one per named instance),
+        // derived from the cross-file index — `FileInfo` no longer keeps a
+        // per-file copy of these.
         let mut symbols: Vec<SymbolInformation> = Vec::new();
-        for (type_name, instances) in &file_info.type_instances {
-            for inst in instances {
-                #[allow(deprecated)]
-                symbols.push(SymbolInformation {
-                    name: inst.name.clone(),
-                    kind: SymbolKind::STRUCT,
-                    tags: None,
-                    deprecated: None,
-                    location: Location {
-                        uri: params.text_document.uri.clone(),
-                        range: Range {
-                            start: Position {
-                                line: inst.location.line.saturating_sub(1),
-                                character: inst.location.col as u32,
-                            },
-                            end: Position {
-                                line: inst.location.line.saturating_sub(1),
-                                character: inst.location.col as u32 + inst.name.len() as u32,
-                            },
+        for (type_name, inst) in info.type_index.instances_in_file(&uri) {
+            #[allow(deprecated)]
+            symbols.push(SymbolInformation {
+                name: inst.name.clone(),
+                kind: SymbolKind::STRUCT,
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri: params.text_document.uri.clone(),
+                    range: Range {
+                        start: Position {
+                            line: inst.location.line.saturating_sub(1),
+                            character: inst.location.col as u32,
+                        },
+                        end: Position {
+                            line: inst.location.line.saturating_sub(1),
+                            character: inst.location.col as u32 + inst.name.len() as u32,
                         },
                     },
-                    container_name: Some(type_name.clone()),
-                });
-            }
+                },
+                container_name: Some(type_name.to_string()),
+            });
         }
 
-        // Also include @-variables as symbols
+        // Also include @-variables as symbols (still tracked per-file).
+        let Some(file_info) = info.files.get(&uri) else {
+            return Ok(if symbols.is_empty() {
+                None
+            } else {
+                Some(DocumentSymbolResponse::Flat(symbols))
+            });
+        };
         for (name, loc) in &file_info.defined_variables {
             #[allow(deprecated)]
             symbols.push(SymbolInformation {
