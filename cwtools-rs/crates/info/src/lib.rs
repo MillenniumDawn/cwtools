@@ -1317,6 +1317,26 @@ impl InfoService {
         }
     }
 
+    /// One-line size summary for profiling (counts only, not bytes).
+    pub fn profile_summary(&self) -> String {
+        let cross_file: usize = self.type_index.map.values().map(|v| v.len()).sum();
+        let per_file: usize = self
+            .files
+            .values()
+            .map(|f| f.type_instances.values().map(|v| v.len()).sum::<usize>())
+            .sum();
+        format!(
+            "info: {} files | type_index {} instances / {} types | per-file {} instances | {} vars | {} targets | {} type_defs",
+            self.files.len(),
+            cross_file,
+            self.type_index.map.len(),
+            per_file,
+            self.all_variables.len(),
+            self.all_event_targets.len(),
+            self.all_type_defs.len(),
+        )
+    }
+
     /// Compute info for a single parsed file and merge into global indexes.
     pub fn index_file(
         &mut self,

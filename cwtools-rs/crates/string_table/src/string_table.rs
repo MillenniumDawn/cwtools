@@ -196,6 +196,46 @@ impl StringTable {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Approximate heap footprint of the interner, for profiling. Counts the
+    /// `id_to_string` byte payload, the metadata array, and the two key maps'
+    /// payloads. Pointer/control overhead is ignored, so this is a lower bound.
+    pub fn stats(&self) -> StringTableStats {
+        let inner = self.inner.read();
+        let id_to_string_bytes: usize = inner.id_to_string.iter().map(|s| s.len()).sum();
+        let map_key_bytes: usize = inner
+            .lower_map
+            .keys()
+            .chain(inner.exact_map.keys())
+            .map(|s| s.len())
+            .sum();
+        StringTableStats {
+            entries: inner.id_to_string.len(),
+            id_to_string_bytes,
+            metadata_bytes: inner.id_to_metadata.len() * std::mem::size_of::<StringMetadata>(),
+            map_key_bytes,
+        }
+    }
+}
+
+/// Approximate per-component heap footprint of a [`StringTable`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StringTableStats {
+    /// Number of slots in `id_to_string` (≈ interned strings, normal + lower).
+    pub entries: usize,
+    /// Total bytes of the interned string payloads.
+    pub id_to_string_bytes: usize,
+    /// Bytes held by the metadata array.
+    pub metadata_bytes: usize,
+    /// Total bytes of the lower_map + exact_map key payloads.
+    pub map_key_bytes: usize,
+}
+
+impl StringTableStats {
+    /// Sum of all counted byte fields (a lower bound on heap use).
+    pub fn total_bytes(&self) -> usize {
+        self.id_to_string_bytes + self.metadata_bytes + self.map_key_bytes
+    }
 }
 
 fn compute_metadata(s: &str) -> StringMetadata {

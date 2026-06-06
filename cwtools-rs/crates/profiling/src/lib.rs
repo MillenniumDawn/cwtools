@@ -64,6 +64,19 @@ pub fn format_mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+/// Return freed heap back to the OS (glibc `malloc_trim`). After a big transient
+/// (the workspace scan parses the whole base game + ~2M loc entries, then drops
+/// them) glibc holds the freed pages, so RSS stays at the peak. Calling this once
+/// the transients are gone drops RSS toward the real working set. No-op off glibc.
+pub fn trim_memory() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: malloc_trim takes no ownership and is safe to call at any time;
+    // it only releases free heap. The return value (1 = memory freed) is ignored.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// When profiling is enabled, log the current RSS at a named phase boundary.
 /// Cheap no-op otherwise. Use this around the expensive phases (workspace
 /// scan, loc rebuild) to see where memory is spent and whether it is released.

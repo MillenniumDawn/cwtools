@@ -871,9 +871,10 @@ fn main() {
                 .count();
 
             // Memory report (CWTOOLS_PROFILE=1): RSS at the end of a single
-            // validate pass, a good proxy for peak. Use this to track the
-            // 1.5 GB target across changes.
+            // validate pass (a good proxy for peak) plus a per-component
+            // breakdown, to track the 1.5 GB target and see where bytes go.
             if cwtools_profiling::profile_enabled() {
+                let mib = |b: usize| cwtools_profiling::format_mib(b as u64);
                 if let Some(rss) = cwtools_profiling::current_rss_bytes() {
                     eprintln!(
                         "  [profile] RSS {} after validating {} files",
@@ -881,6 +882,37 @@ fn main() {
                         parsed.len()
                     );
                 }
+                let st = rules_table.stats();
+                eprintln!(
+                    "  [profile]   string_table: {} ({} entries, strings {}, keys {}, meta {})",
+                    mib(st.total_bytes()),
+                    st.entries,
+                    mib(st.id_to_string_bytes),
+                    mib(st.map_key_bytes),
+                    mib(st.metadata_bytes),
+                );
+                let (mut nodes, mut leaves, mut values, mut clauses) = (0usize, 0, 0, 0);
+                for (_p, _l, pf) in &parsed {
+                    nodes += pf.arena.nodes.len();
+                    leaves += pf.arena.leaves.len();
+                    values += pf.arena.leaf_values.len();
+                    clauses += pf.arena.value_clauses.len();
+                }
+                let type_instances: usize = type_index.map.values().map(|v| v.len()).sum();
+                eprintln!(
+                    "  [profile]   arenas: {} nodes, {} leaves, {} values, {} clauses across {} files",
+                    nodes,
+                    leaves,
+                    values,
+                    clauses,
+                    parsed.len()
+                );
+                eprintln!(
+                    "  [profile]   type_index: {} instances in {} types; loc union: {} keys",
+                    type_instances,
+                    type_index.map.len(),
+                    loc_index.union().len()
+                );
             }
 
             // Render the report in the requested format.

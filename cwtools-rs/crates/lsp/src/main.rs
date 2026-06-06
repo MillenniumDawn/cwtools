@@ -1286,6 +1286,7 @@ impl LanguageServer for Backend {
             let mut info = self.state.info_service.lock();
             info.clear_file(&uri);
         }
+        cwtools_profiling::trim_memory();
         cwtools_profiling::log_rss("did_close");
         self.client
             .publish_diagnostics(params.text_document.uri, vec![], None)
@@ -2193,15 +2194,14 @@ impl Backend {
 
         // Pass 1: parse + index every file (types, scripted triggers/effects,
         // modifiers) so cross-file references resolve before any file is
-        // validated. Keep the parsed ASTs so pass 2 doesn't re-parse.
+        // validated. The parsed AST is dropped right after indexing — pass 2
+        // re-parses. Holding all 7413 ASTs+texts resident cost ~2.5 GB on MD;
+        // a second parse is far cheaper than that footprint.
         self.send_loading_bar(true, "Indexing workspace…").await;
-        let mut parsed_docs: Vec<(String, std::path::PathBuf, String, ParsedFile)> = Vec::new();
         for (i, file_path) in files_to_validate.iter().enumerate() {
             let uri = format!("file://{}", file_path.display());
             if let Ok(text) = std::fs::read_to_string(file_path) {
-                if let Some(parsed) = self.index_document(&uri, &text).await {
-                    parsed_docs.push((uri, file_path.clone(), text, parsed));
-                }
+                self.index_document(&uri, &text).await;
             }
             // Yield every 50 files so LSP requests (hover, completion) can
             // interleave with the workspace scan.
@@ -2238,16 +2238,26 @@ impl Backend {
         // publish loc-file diagnostics (CW225 etc.) for the workspace loc files.
         self.rebuild_and_publish_loc(&root_path).await;
 
-        // Pass 2: validate each stored AST against the complete index. No
-        // re-parsing and no per-file logging (that logging was ~2 LSP
-        // notifications per file — the main source of slowness).
+        // Pass 2: re-parse and validate each file against the now-complete
+        // index, then drop the AST. Diagnostics are published to the editor;
+        // the file is intentionally NOT stored in `self.state.documents`. That
+        // map holds only files the editor has open (populated by did_open) — the
+        // scan used to insert every workspace file there, pinning all texts+ASTs
+        // in memory for the whole session.
         self.send_loading_bar(true, "Validating workspace…").await;
         let mut total_errors = 0usize;
-        let total_files = parsed_docs.len();
+        let total_files = files_to_validate.len();
         // Snapshot modifier_keys once before the loop; the set doesn't change
         // during validation and we can't hold the guard across await points.
         let modifier_keys_snap: HashSet<String> = self.state.modifier_keys.read().clone();
-        for (i, (uri, _file_path, text, parsed)) in parsed_docs.into_iter().enumerate() {
+        for (i, file_path) in files_to_validate.iter().enumerate() {
+            let uri = format!("file://{}", file_path.display());
+            let Ok(text) = std::fs::read_to_string(file_path) else {
+                continue;
+            };
+            let Ok(parsed) = parse_string(&text, &self.state.string_table) else {
+                continue;
+            };
             let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys_snap);
             total_errors += diagnostics
                 .iter()
@@ -2258,18 +2268,6 @@ impl Backend {
                 self.client
                     .publish_diagnostics(uri_obj, diagnostics, None)
                     .await;
-            }
-
-            {
-                let mut docs = self.state.documents.lock();
-                docs.insert(
-                    uri,
-                    ParsedDoc {
-                        version: 0,
-                        text,
-                        ast: Some(parsed),
-                    },
-                );
             }
             if i % 50 == 49 {
                 tokio::task::yield_now().await;
@@ -2307,7 +2305,34 @@ impl Backend {
             .collect();
         self.send_update_file_list(file_list).await;
 
+        if cwtools_profiling::profile_enabled() {
+            let st = self.state.string_table.stats();
+            let info_summary = self.state.info_service.lock().profile_summary();
+            let vanilla = self
+                .state
+                .vanilla_index
+                .lock()
+                .as_ref()
+                .map(|m| m.values().map(|v| v.len()).sum::<usize>())
+                .unwrap_or(0);
+            let loc_keys = self
+                .state
+                .loc_index
+                .read()
+                .as_ref()
+                .map(|i| i.union().len())
+                .unwrap_or(0);
+            tracing::info!(target: "cwtools::profile", "{}", info_summary);
+            tracing::info!(target: "cwtools::profile",
+                "string_table {} MiB ({} entries) | vanilla_index {} instances | loc union {} keys",
+                st.total_bytes() / (1024 * 1024), st.entries, vanilla, loc_keys);
+        }
         cwtools_profiling::log_rss("workspace_scan_done");
+        // The scan dropped large transients (the whole base-game parse, ~2M loc
+        // entries, every file's AST). Hand the freed heap back to the OS so RSS
+        // reflects the real working set, not the scan peak.
+        cwtools_profiling::trim_memory();
+        cwtools_profiling::log_rss("after_trim");
         self.send_loading_bar(false, "").await;
     }
 
