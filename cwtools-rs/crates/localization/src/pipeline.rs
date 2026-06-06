@@ -149,7 +149,20 @@ fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
 }
 
 /// Validate every loaded loc file and return normalized diagnostics.
-pub fn validate_loc_project(service: &LocService, _game: Game) -> Vec<LocDiagnostic> {
+pub fn validate_loc_project(service: &LocService, game: Game) -> Vec<LocDiagnostic> {
+    validate_loc_project_scoped(service, game, None)
+}
+
+/// As [`validate_loc_project`], but only emit per-file diagnostics for files
+/// whose language is in `langs` (when `Some`). Files with no detectable language
+/// are always validated (they may be malformed). Every file still contributes to
+/// the key `union`, so `$ref$` existence resolves against all loaded languages.
+/// `langs = None` validates every file (the previous behavior).
+pub fn validate_loc_project_scoped(
+    service: &LocService,
+    _game: Game,
+    langs: Option<&[Lang]>,
+) -> Vec<LocDiagnostic> {
     // Union of keys across all languages, to resolve `$ref$` existence.
     // Borrowed from the service's single owned copy — no second copy of any loc
     // file is ever materialized (a full clone OOMs on large projects like MD).
@@ -168,6 +181,11 @@ pub fn validate_loc_project(service: &LocService, _game: Game) -> Vec<LocDiagnos
     service
         .files()
         .par_iter()
+        .filter(|file| match langs {
+            // None language can't be scoped out — keep validating it.
+            Some(set) => file.lang.map(|l| set.contains(&l)).unwrap_or(true),
+            None => true,
+        })
         .flat_map_iter(|file| {
             let lang = file.lang;
             let path = &file.path;

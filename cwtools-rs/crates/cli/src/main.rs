@@ -404,23 +404,10 @@ fn run_fsharp_engine(command: &Commands) -> ! {
     }
 }
 
-/// Initialize tracing only when RUST_LOG is set, so the default run stays quiet.
-/// Profile a run with e.g. `RUST_LOG=info cwtools validate ...` and add
-/// `#[tracing::instrument]` to any hot path you want timed. See PROFILING.md.
-fn tracing_init() {
-    if std::env::var("RUST_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_target(true)
-            // Emit span close events so instrumented hot paths report their
-            // busy/idle time — that's the profiling signal.
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-            .try_init();
-    }
-}
-
 fn main() {
-    tracing_init();
+    // Quiet by default; set RUST_LOG or CWTOOLS_PROFILE to turn on logging /
+    // profiling. See PROFILING.md and `cwtools_profiling`.
+    cwtools_profiling::init_tracing();
     let cli = Cli::parse();
 
     match cli.engine.as_str() {
@@ -882,6 +869,19 @@ fn main() {
                 .iter()
                 .filter(|d| d.severity == cwtools_validation::ErrorSeverity::Warning)
                 .count();
+
+            // Memory report (CWTOOLS_PROFILE=1): RSS at the end of a single
+            // validate pass, a good proxy for peak. Use this to track the
+            // 1.5 GB target across changes.
+            if cwtools_profiling::profile_enabled() {
+                if let Some(rss) = cwtools_profiling::current_rss_bytes() {
+                    eprintln!(
+                        "  [profile] RSS {} after validating {} files",
+                        cwtools_profiling::format_mib(rss),
+                        parsed.len()
+                    );
+                }
+            }
 
             // Render the report in the requested format.
             let mut out = String::new();

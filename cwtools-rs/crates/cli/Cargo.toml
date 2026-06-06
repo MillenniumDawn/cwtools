@@ -19,11 +19,10 @@ cwtools_validation = { workspace = true }
 cwtools_info = { workspace = true }
 cwtools_game = { workspace = true }
 cwtools_localization = { workspace = true }
+cwtools_profiling = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -37,6 +37,28 @@ impl fmt::Display for Lang {
     }
 }
 
+impl Lang {
+    /// Parse a plain language name (`english`, `simp_chinese`, …) into a `Lang`.
+    /// Tolerant of case and of an optional `l_` prefix, so both the loc-file
+    /// header form (`l_english`) and a bare setting value (`English`) resolve.
+    /// Also accepts the editor-setting spellings (`Chinese`, `Braz_Por`).
+    pub fn from_name(name: &str) -> Option<Lang> {
+        let lower = name.trim().to_ascii_lowercase();
+        // Editor-facing aliases that differ from the `l_xxx` loc-file keys.
+        match lower.as_str() {
+            "chinese" | "simp_chinese" => return Some(Lang::SimpChinese),
+            "braz_por" | "brazilian" | "brazilian_portuguese" => return Some(Lang::BrazPor),
+            _ => {}
+        }
+        let key = if lower.starts_with("l_") {
+            lower
+        } else {
+            format!("l_{lower}")
+        };
+        key_to_language(&key)
+    }
+}
+
 /// Parse an `l_xxx` prefix into a Lang variant.
 ///
 /// Accepts all known language keys including `l_default`.
@@ -258,6 +280,20 @@ mod tests {
         assert_eq!(key_to_language("l_english"), Some(Lang::English));
         assert_eq!(key_to_language("l_turkish"), Some(Lang::Turkish));
         assert_eq!(key_to_language("l_unknown"), None);
+    }
+
+    #[test]
+    fn test_lang_from_name_tolerant() {
+        // bare name, case-insensitive, and the l_ prefix all resolve
+        assert_eq!(Lang::from_name("english"), Some(Lang::English));
+        assert_eq!(Lang::from_name("English"), Some(Lang::English));
+        assert_eq!(Lang::from_name("  German "), Some(Lang::German));
+        assert_eq!(Lang::from_name("simp_chinese"), Some(Lang::SimpChinese));
+        assert_eq!(Lang::from_name("l_french"), Some(Lang::French));
+        // editor-setting spellings
+        assert_eq!(Lang::from_name("Chinese"), Some(Lang::SimpChinese));
+        assert_eq!(Lang::from_name("Braz_Por"), Some(Lang::BrazPor));
+        assert_eq!(Lang::from_name("klingon"), None);
     }
 
     #[test]

@@ -208,6 +208,12 @@ struct DocumentState {
     /// loc-key index (workspace + vanilla) for CW100/CW122 on config files and
     /// for scope-aware loc-command checks. Rebuilt on each full workspace scan.
     loc_index: parking_lot::RwLock<Option<cwtools_localization::LocIndex>>,
+    /// languages to validate loc against, from the `localisationLanguages` init
+    /// option. `None` = all languages with data (the default). When set, the
+    /// missing-translation check and per-file loc checks are scoped to these,
+    /// so an english-targeted mod isn't flagged for every other language vanilla
+    /// happens to ship.
+    loc_languages: Mutex<Option<Vec<cwtools_localization::Lang>>>,
 }
 
 struct ParsedDoc {
@@ -231,6 +237,7 @@ impl DocumentState {
             vanilla_dir: Mutex::new(None),
             modifier_keys: parking_lot::RwLock::new(HashSet::new()),
             loc_index: parking_lot::RwLock::new(None),
+            loc_languages: Mutex::new(None),
         }
     }
 }
@@ -239,6 +246,11 @@ struct Backend {
     client: Client,
     state: Arc<DocumentState>,
 }
+
+/// Debounce window for `did_change`: a burst of keystrokes within this window
+/// coalesces into a single validation. Short enough to feel live, long enough
+/// to skip the per-keystroke re-parse that made large files lag.
+const DEBOUNCE_MS: u64 = 250;
 
 // ── Custom notification stubs ─────────────────────────────────────────────────
 
@@ -994,6 +1006,26 @@ impl LanguageServer for Backend {
                     .log_message(MessageType::INFO, format!("language: {}", lang))
                     .await;
             }
+
+            // Optional list of loc languages to validate (e.g. ["english"]).
+            // Unknown/empty entries are ignored; an empty resulting list leaves
+            // scoping off (validate all languages). See `loc_languages`.
+            if let Some(arr) = opts.get("localisationLanguages").and_then(|v| v.as_array()) {
+                let langs: Vec<cwtools_localization::Lang> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(cwtools_localization::Lang::from_name)
+                    .collect();
+                if !langs.is_empty() {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!("localisation languages scoped to: {:?}", langs),
+                        )
+                        .await;
+                    *self.state.loc_languages.lock() = Some(langs);
+                }
+            }
             self.client
                 .log_message(MessageType::INFO, format!("init options: {:?}", opts))
                 .await;
@@ -1164,10 +1196,12 @@ impl LanguageServer for Backend {
     }
 
     // --- Text document sync ---
+    #[tracing::instrument(skip_all)]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let text = params.text_document.text;
         let version = params.text_document.version;
+        tracing::debug!(%uri, version, bytes = text.len(), "did_open");
 
         let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
 
@@ -1188,31 +1222,36 @@ impl LanguageServer for Backend {
             .await;
     }
 
+    #[tracing::instrument(skip_all)]
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
 
-        if let Some(change) = params.content_changes.into_iter().next() {
-            let text = change.text;
+        let Some(change) = params.content_changes.into_iter().next() else {
+            return;
+        };
+        let text = change.text;
+        tracing::debug!(%uri, version, bytes = text.len(), "did_change");
 
-            let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
-
-            {
-                let mut docs = self.state.documents.lock();
-                docs.insert(
-                    uri.clone(),
-                    ParsedDoc {
-                        version,
-                        text: text.clone(),
-                        ast: parsed,
-                    },
-                );
-            }
-
-            self.client
-                .publish_diagnostics(params.text_document.uri, diagnostics, Some(version))
-                .await;
+        // Store the new text+version immediately (keep the prior AST until we
+        // revalidate). The debounced task checks the version to know whether this
+        // is still the latest edit.
+        {
+            let mut docs = self.state.documents.lock();
+            let ast = docs.remove(&uri).and_then(|d| d.ast);
+            docs.insert(uri.clone(), ParsedDoc { version, text, ast });
         }
+
+        // Validate in the background after a short debounce so a burst of
+        // keystrokes coalesces into one validation and the handler returns
+        // immediately (no per-keystroke re-parse lag).
+        let client = self.client.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(DEBOUNCE_MS)).await;
+            let backend = Backend { client, state };
+            backend.debounced_validate(uri, version).await;
+        });
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -1228,12 +1267,26 @@ impl LanguageServer for Backend {
         }
     }
 
+    #[tracing::instrument(skip_all)]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
+        tracing::debug!(%uri, "did_close");
         {
             let mut docs = self.state.documents.lock();
             docs.remove(&uri);
         }
+        // Release the closed file's entries from the global indexes. Without
+        // this, opening then closing a file leaves its type instances,
+        // variables, event targets, and symbols in memory permanently.
+        {
+            let mut index = self.state.symbol_index.lock();
+            index.clear_document(&uri);
+        }
+        {
+            let mut info = self.state.info_service.lock();
+            info.clear_file(&uri);
+        }
+        cwtools_profiling::log_rss("did_close");
         self.client
             .publish_diagnostics(params.text_document.uri, vec![], None)
             .await;
@@ -2056,7 +2109,9 @@ impl Backend {
     }
 
     /// Scan the entire workspace for relevant game files and validate them all.
+    #[tracing::instrument(skip_all)]
     async fn validate_entire_workspace(&self) {
+        cwtools_profiling::log_rss("workspace_scan_start");
         self.send_loading_bar(true, "Indexing workspace…").await;
 
         let workspace_uri = {
@@ -2252,12 +2307,14 @@ impl Backend {
             .collect();
         self.send_update_file_list(file_list).await;
 
+        cwtools_profiling::log_rss("workspace_scan_done");
         self.send_loading_bar(false, "").await;
     }
 
     /// Build the loc-key index from the workspace root plus the vanilla install,
     /// store it in state (for CW100/CW122 on config files), and publish loc-file
     /// diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace loc files.
+    #[tracing::instrument(skip_all)]
     async fn rebuild_and_publish_loc(&self, root_path: &std::path::Path) {
         let game = {
             let language = self.state.language.lock().clone();
@@ -2271,14 +2328,23 @@ impl Backend {
         }
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
         let service = cwtools_localization::LocService::from_folders(&dir_refs);
-        let loc_index = cwtools_localization::LocIndex::build(&service, loc_game);
+        let loc_languages = self.state.loc_languages.lock().clone();
+        let loc_index = cwtools_localization::LocIndex::build_scoped(
+            &service,
+            loc_game,
+            loc_languages.as_deref(),
+        );
         *self.state.loc_index.write() = Some(loc_index);
 
         // Publish per-file loc diagnostics, but only for workspace loc files
         // (not vanilla). Group by file so each gets a complete diagnostic set.
         let root_str = root_path.to_string_lossy().to_string();
         let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
-        for d in cwtools_localization::validate_loc_project(&service, loc_game) {
+        for d in cwtools_localization::validate_loc_project_scoped(
+            &service,
+            loc_game,
+            loc_languages.as_deref(),
+        ) {
             if !d.file.starts_with(&root_str) {
                 continue;
             }
@@ -2294,6 +2360,7 @@ impl Backend {
                 self.client.publish_diagnostics(uri_obj, diags, None).await;
             }
         }
+        cwtools_profiling::log_rss("loc_rebuild_done");
     }
 
     /// Parse a file and add it to the symbol + info (type) indexes WITHOUT
@@ -2379,6 +2446,72 @@ impl Backend {
     }
 
     /// Parse and validate a single document.
+    /// Validate `uri` at `expected_version` after the debounce, but only if it is
+    /// still the latest edit (a newer change supersedes it). Publishes the
+    /// changed file's diagnostics, then refreshes the other open documents so
+    /// cross-file references reflect the edit instead of showing stale results.
+    #[tracing::instrument(skip_all, fields(uri = %uri, version = expected_version))]
+    async fn debounced_validate(&self, uri: String, expected_version: i32) {
+        // A newer change landed during the debounce — let that one validate.
+        let text = {
+            let docs = self.state.documents.lock();
+            match docs.get(&uri) {
+                Some(d) if d.version == expected_version => d.text.clone(),
+                _ => return,
+            }
+        };
+
+        let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
+        {
+            let mut docs = self.state.documents.lock();
+            if let Some(d) = docs.get_mut(&uri) {
+                if d.version == expected_version {
+                    d.ast = parsed;
+                }
+            }
+        }
+        if let Ok(uri_obj) = Url::parse(&uri) {
+            self.client
+                .publish_diagnostics(uri_obj, diagnostics, Some(expected_version))
+                .await;
+        }
+
+        // The changed file is now re-indexed; refresh the other open documents.
+        self.revalidate_open_dependents(&uri).await;
+    }
+
+    /// Re-validate and republish every open document except `changed_uri`, using
+    /// the freshly updated indexes. Bounded by the number of open files, so a
+    /// definition edit propagates to the gui/event/etc. files that reference it.
+    async fn revalidate_open_dependents(&self, changed_uri: &str) {
+        let others: Vec<(String, String)> = {
+            let docs = self.state.documents.lock();
+            docs.iter()
+                .filter(|(u, _)| u.as_str() != changed_uri)
+                .map(|(u, d)| (u.clone(), d.text.clone()))
+                .collect()
+        };
+        if others.is_empty() {
+            return;
+        }
+        tracing::debug!(count = others.len(), "revalidate_open_dependents");
+        for (uri, text) in others {
+            let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
+            {
+                let mut docs = self.state.documents.lock();
+                if let Some(d) = docs.get_mut(&uri) {
+                    d.ast = parsed;
+                }
+            }
+            if let Ok(uri_obj) = Url::parse(&uri) {
+                self.client
+                    .publish_diagnostics(uri_obj, diagnostics, None)
+                    .await;
+            }
+        }
+    }
+
+    #[tracing::instrument(skip_all, fields(uri = %uri, bytes = text.len()))]
     async fn parse_and_validate(
         &self,
         uri: &str,
@@ -2899,6 +3032,9 @@ fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnostic {
 }
 
 fn main() {
+    // Logs/profiling go to stderr (stdout is the LSP JSON-RPC channel). Quiet
+    // unless RUST_LOG or CWTOOLS_PROFILE is set. See PROFILING.md.
+    cwtools_profiling::init_tracing();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

@@ -31,7 +31,17 @@ pub struct LocIndex {
 impl LocIndex {
     /// Build from a loaded [`LocService`]. `game` is accepted for symmetry with
     /// the rest of the API (language restriction already happened at parse time).
-    pub fn build(service: &LocService, _game: Game) -> Self {
+    pub fn build(service: &LocService, game: Game) -> Self {
+        Self::build_scoped(service, game, None)
+    }
+
+    /// As [`build`], but restrict the "missing translation" check to a chosen
+    /// set of languages. With `langs = Some([English])`, an english-targeted mod
+    /// won't be told every key is missing in french/german/… that the loaded
+    /// vanilla install happens to ship. `langs = None` keeps all languages with
+    /// data (the previous behavior). The key `union` (existence resolution) is
+    /// never restricted, so config `$ref$` checks still resolve any loaded key.
+    pub fn build_scoped(service: &LocService, _game: Game, langs: Option<&[Lang]>) -> Self {
         let mut per_language: HashMap<Lang, HashSet<String>> = HashMap::new();
         let mut union: HashSet<String> = HashSet::new();
         let mut entries: HashMap<String, LocEntry> = HashMap::new();
@@ -59,7 +69,10 @@ impl LocIndex {
             }
         }
 
-        let languages_with_data = service.languages();
+        let mut languages_with_data = service.languages();
+        if let Some(set) = langs {
+            languages_with_data.retain(|l| set.contains(l));
+        }
         Self {
             per_language,
             union,
@@ -159,5 +172,24 @@ mod tests {
         assert_eq!(missing, vec![Lang::German]);
         // a project that ships no french never reports french missing
         assert!(!missing.contains(&Lang::French));
+    }
+
+    #[test]
+    fn build_scoped_restricts_missing_check_to_chosen_languages() {
+        // english + german present, key_b missing in german.
+        let svc = service_from(&[
+            (
+                "a_l_english.yml",
+                "l_english:\n key_a: \"a\"\n key_b: \"b\"\n",
+            ),
+            ("a_l_german.yml", "l_german:\n key_a: \"a\"\n"),
+        ]);
+        // Scoped to english only: german is not a language-with-data, so the
+        // missing-translation check no longer flags key_b.
+        let idx = LocIndex::build_scoped(&svc, Game::HOI4, Some(&[Lang::English]));
+        assert!(idx.missing_synced_languages("key_b").is_empty());
+        assert_eq!(idx.languages_with_data(), &[Lang::English]);
+        // Existence still resolves against every loaded language.
+        assert!(idx.exists_any("key_a"));
     }
 }
