@@ -68,7 +68,9 @@ impl Game {
     /// Scope definitions for this game (name, aliases, numeric id, subscope_of).
     pub fn scope_defs(&self) -> &'static [ScopeDef] {
         match self {
-            Game::Hoi4 => &HOI4_SCOPES,
+            // HOI4 scopes are loaded from `scopes.cwt` into the runtime
+            // ScopeRegistry; there is no hardcoded table.
+            Game::Hoi4 => &[],
             Game::Stellaris => &STELLARIS_SCOPES,
             Game::Eu4 => &EU4_SCOPES,
             Game::Ck2 => &CK2_SCOPES,
@@ -115,32 +117,8 @@ const HOI4_FOLDERS: &[&str] = &[
     "sound",
 ];
 
-const HOI4_SCOPES: &[ScopeDef] = &[
-    ScopeDef {
-        name: "Country",
-        aliases: &["country"],
-        id: Scope(100),
-        subscope_of: &[],
-    },
-    ScopeDef {
-        name: "State",
-        aliases: &["state"],
-        id: Scope(101),
-        subscope_of: &[],
-    },
-    ScopeDef {
-        name: "Unit Leader",
-        aliases: &["unit leader", "unit_leader"],
-        id: Scope(102),
-        subscope_of: &[],
-    },
-    ScopeDef {
-        name: "Air",
-        aliases: &["air"],
-        id: Scope(103),
-        subscope_of: &[],
-    },
-];
+// HOI4 scopes are now loaded from `scopes.cwt` into the runtime ScopeRegistry
+// (see `scope_registry.rs`); the hardcoded `HOI4_SCOPES` table was removed.
 
 const HOI4_MODIFIERS: &[ModifierCategory] = &[
     ModifierCategory {

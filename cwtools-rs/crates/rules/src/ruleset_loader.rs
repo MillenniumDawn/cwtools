@@ -34,6 +34,8 @@ pub fn merge_ruleset(dst: &mut RuleSet, src: RuleSet) {
     dst.values.extend(src.values);
     dst.modifiers.extend(src.modifiers);
     dst.scope_links.extend(src.scope_links);
+    dst.scope_inputs.extend(src.scope_inputs);
+    dst.link_inputs.extend(src.link_inputs);
 }
 
 /// Walk `dir` for `*.cwt` files, parse each with `table`, convert via

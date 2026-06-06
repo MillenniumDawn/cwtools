@@ -58,26 +58,49 @@ fn cp1252_byte(b: u8) -> char {
     }
 }
 
+/// How a file was encoded on disk, detected while reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileEncoding {
+    /// Valid UTF-8 starting with the UTF-8 BOM (`EF BB BF`). What Paradox wants
+    /// for localisation files.
+    Utf8Bom,
+    /// Valid UTF-8 but with no BOM.
+    Utf8NoBom,
+    /// Not valid UTF-8 (decoded via Windows-1252 fallback).
+    NonUtf8,
+}
+
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
 /// Read a file as text: try UTF-8 first, fall back to Windows-1252.
 ///
 /// Pre-Jomini games (CK2, EU4, VIC2, HOI4 old mods) often encode files in
 /// Windows-1252.  Blindly using `read_to_string` fails on any accented byte
 /// outside ASCII (e.g. `é` = 0xE9).  This helper avoids that breakage.
 pub fn read_text(path: &Path) -> Result<String, FileError> {
+    read_text_with_encoding(path).map(|(s, _)| s)
+}
+
+/// As [`read_text`], but also reports how the file was encoded so callers can
+/// enforce encoding rules (e.g. localisation must be UTF-8 BOM).
+pub fn read_text_with_encoding(path: &Path) -> Result<(String, FileEncoding), FileError> {
     let bytes = std::fs::read(path)?;
-    // Fast path: valid UTF-8 (includes pure ASCII)
+    let has_bom = bytes.starts_with(&UTF8_BOM);
+    // Fast path: valid UTF-8 (includes pure ASCII). The BOM, when present, is
+    // valid UTF-8 (U+FEFF) and is kept in the string — existing parsers already
+    // tolerate a leading BOM character.
     if let Ok(s) = std::str::from_utf8(&bytes) {
-        return Ok(s.to_owned());
+        let enc = if has_bom {
+            FileEncoding::Utf8Bom
+        } else {
+            FileEncoding::Utf8NoBom
+        };
+        return Ok((s.to_owned(), enc));
     }
-    // Strip UTF-8 BOM if present (still try to decode as CP-1252 below if the
-    // rest is not valid UTF-8, but this never happens in practice).
-    let bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        &bytes[3..]
-    } else {
-        &bytes
-    };
-    // Decode as Windows-1252
-    Ok(bytes.iter().map(|&b| cp1252_byte(b)).collect())
+    // Not valid UTF-8: strip a leading BOM if any, then decode as Windows-1252.
+    let body = if has_bom { &bytes[3..] } else { &bytes[..] };
+    let text = body.iter().map(|&b| cp1252_byte(b)).collect();
+    Ok((text, FileEncoding::NonUtf8))
 }
 
 /// How the file should be treated during discovery.
@@ -225,7 +248,13 @@ impl FileManager {
     /// Discover and parse all matching script files under the configured root.
     /// Non-script files (localisation, resources) are silently skipped.
     pub fn discover_and_parse(&mut self) -> Result<Vec<ParsedFile>, FileError> {
-        let mut files = Vec::new();
+        use rayon::prelude::*;
+
+        // Walk the tree to collect the candidate (path, logical_path) list first
+        // (cheap, ordered), then read+parse them in parallel. Parsing is the
+        // expensive part and is independent per file. `into_par_iter().collect()`
+        // preserves the input order, so discovery output is deterministic.
+        let mut paths: Vec<(PathBuf, String)> = Vec::new();
         let include_dirs: Vec<String> = self.config.include_dirs.clone();
         let root = self.config.root.clone();
 
@@ -238,13 +267,37 @@ impl FileManager {
             if !dir.exists() {
                 continue;
             }
-            self.walk_dir(&dir, &mut files)?;
+            self.collect_paths(&dir, &mut paths)?;
         }
+
+        let table = &self.string_table;
+        let files = paths
+            .into_par_iter()
+            .filter_map(|(path, logical_path)| {
+                let content = read_text(&path).ok()?;
+                match parse_string(&content, table) {
+                    Ok(parsed) => Some(ParsedFile {
+                        path,
+                        logical_path,
+                        arena: parsed.arena,
+                        root_children: parsed.root_children,
+                    }),
+                    Err(e) => {
+                        // Non-fatal: skip files that fail to parse and continue
+                        eprintln!("warn: skipping {}: {}", path.display(), e);
+                        None
+                    }
+                }
+            })
+            .collect();
 
         Ok(files)
     }
 
-    fn walk_dir(&mut self, dir: &Path, out: &mut Vec<ParsedFile>) -> Result<(), FileError> {
+    /// Walk `dir` collecting (path, logical_path) for every file that passes the
+    /// extension/pattern/size filters. Reading and parsing happen later, in
+    /// parallel; this pass is just filesystem traversal.
+    fn collect_paths(&self, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), FileError> {
         let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect();
         // Sort for deterministic ordering
         entries.sort_by_key(|e| e.as_ref().map(|e| e.file_name()).unwrap_or_default());
@@ -263,7 +316,7 @@ impl FileManager {
                 {
                     continue;
                 }
-                self.walk_dir(&path, out)?;
+                self.collect_paths(&path, out)?;
                 continue;
             }
 
@@ -309,23 +362,7 @@ impl FileManager {
 
             // Compute logical path relative to root
             let logical_path = compute_logical_path(&path, &self.config.root);
-
-            // Parse file (UTF-8 with CP-1252 fallback)
-            let content = read_text(&path)?;
-            match parse_string(&content, &self.string_table) {
-                Ok(parsed) => {
-                    out.push(ParsedFile {
-                        path,
-                        logical_path,
-                        arena: parsed.arena,
-                        root_children: parsed.root_children,
-                    });
-                }
-                Err(e) => {
-                    // Non-fatal: skip files that fail to parse and continue
-                    eprintln!("warn: skipping {}: {}", path.display(), e);
-                }
-            }
+            out.push((path, logical_path));
         }
         Ok(())
     }

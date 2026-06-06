@@ -1,0 +1,162 @@
+//! Tier B structural hints (F# CommonValidation.fs + STLValidation.fs):
+//! - CW121 empty if/else_if
+//! - CW223 NOT with multiple children
+//! - CW251 redundant AND-in-AND / OR-in-OR
+//! - CW236/237/238 Stellaris if/else (2.1)
+//! - CW253 deprecated set_empire_name/set_planet_name
+//!
+//! These run inside `per_game::run_game_validators`, so a `game` must be set.
+
+use cwtools_game::constants::Game;
+use cwtools_parser::parser::parse_string;
+use cwtools_rules::rules_converter::ast_to_ruleset;
+use cwtools_string_table::string_table::StringTable;
+use cwtools_validation::validate_ast;
+
+fn codes(game: Game, script: &str) -> Vec<String> {
+    let table = StringTable::new();
+    // Empty ruleset: the structural pass is rules-independent.
+    let parsed_cwt = parse_string("", &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let parsed = parse_string(script, &table).unwrap();
+    let errors = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "test.txt",
+        Some(game),
+        None,
+        None,
+    );
+    errors.into_iter().filter_map(|e| e.code).collect()
+}
+
+#[test]
+fn not_with_multiple_children_is_cw223() {
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    NOT = {
+        a = 1
+        b = 2
+    }
+}
+"#,
+    );
+    assert!(c.contains(&"CW223".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn not_with_single_child_is_clean() {
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    NOT = { a = 1 }
+}
+"#,
+    );
+    assert!(!c.contains(&"CW223".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn empty_if_is_cw121() {
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    if = {
+        limit = { a = 1 }
+    }
+}
+"#,
+    );
+    assert!(c.contains(&"CW121".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn if_with_effect_is_clean() {
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    if = {
+        limit = { a = 1 }
+        b = 2
+    }
+}
+"#,
+    );
+    assert!(!c.contains(&"CW121".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn and_in_and_is_cw251() {
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    AND = {
+        AND = { a = 1 }
+    }
+}
+"#,
+    );
+    assert!(c.contains(&"CW251".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn and_in_or_is_clean() {
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    OR = {
+        AND = { a = 1 }
+    }
+}
+"#,
+    );
+    assert!(!c.contains(&"CW251".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn else_without_if_is_cw238() {
+    let c = codes(
+        Game::Stellaris,
+        r#"
+foo = {
+    else = { a = 1 }
+}
+"#,
+    );
+    assert!(c.contains(&"CW238".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn if_then_else_is_clean_order() {
+    let c = codes(
+        Game::Stellaris,
+        r#"
+foo = {
+    if = { limit = { x = 1 } a = 1 }
+    else = { b = 2 }
+}
+"#,
+    );
+    assert!(!c.contains(&"CW238".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn deprecated_set_name_is_cw253() {
+    let c = codes(
+        Game::Stellaris,
+        r#"
+foo = {
+    set_empire_name = { key = "X" }
+}
+"#,
+    );
+    assert!(c.contains(&"CW253".to_string()), "got: {:?}", c);
+}

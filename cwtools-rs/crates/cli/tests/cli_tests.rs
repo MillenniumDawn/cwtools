@@ -3,7 +3,9 @@ use predicates::prelude::*;
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
 }
 
 fn cwtools() -> Command {
@@ -171,11 +173,7 @@ fn test_serialize_and_deserialize_roundtrip() {
 
     // Serialize
     cwtools()
-        .args([
-            "serialize",
-            simple.to_str().unwrap(),
-            cwb.to_str().unwrap(),
-        ])
+        .args(["serialize", simple.to_str().unwrap(), cwb.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Serialized"));
@@ -194,11 +192,7 @@ fn test_serialize_missing_input_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let cwb = tmp.path().join("out.cwb");
     cwtools()
-        .args([
-            "serialize",
-            "/nonexistent/file.txt",
-            cwb.to_str().unwrap(),
-        ])
+        .args(["serialize", "/nonexistent/file.txt", cwb.to_str().unwrap()])
         .assert()
         .failure();
 }
@@ -212,9 +206,12 @@ fn test_validate_with_rules() {
     cwtools()
         .args([
             "validate",
-            "--game", "stellaris",
-            "--directory", discover_dir.to_str().unwrap(),
-            "--rules", rules_dir.to_str().unwrap(),
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
         ])
         .assert()
         .success()
@@ -228,9 +225,12 @@ fn test_validate_bad_game_name_fails() {
     cwtools()
         .args([
             "validate",
-            "--game", "not_a_real_game",
-            "--directory", discover_dir.to_str().unwrap(),
-            "--rules", rules_dir.to_str().unwrap(),
+            "--game",
+            "not_a_real_game",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
         ])
         .assert()
         .failure();
@@ -243,10 +243,14 @@ fn test_validate_json_report() {
     cwtools()
         .args([
             "validate",
-            "--game", "stellaris",
-            "--directory", discover_dir.to_str().unwrap(),
-            "--rules", rules_dir.to_str().unwrap(),
-            "--report-type", "json",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--report-type",
+            "json",
         ])
         .assert()
         .success()
@@ -260,10 +264,14 @@ fn test_validate_csv_report() {
     cwtools()
         .args([
             "validate",
-            "--game", "stellaris",
-            "--directory", discover_dir.to_str().unwrap(),
-            "--rules", rules_dir.to_str().unwrap(),
-            "--report-type", "csv",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--report-type",
+            "csv",
         ])
         .assert()
         .success()
@@ -279,10 +287,14 @@ fn test_validate_output_file() {
     cwtools()
         .args([
             "validate",
-            "--game", "stellaris",
-            "--directory", discover_dir.to_str().unwrap(),
-            "--rules", rules_dir.to_str().unwrap(),
-            "--output-file", report.to_str().unwrap(),
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--output-file",
+            report.to_str().unwrap(),
         ])
         .assert()
         .success();

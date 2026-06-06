@@ -77,7 +77,10 @@ pub fn load(path: &Path) -> std::io::Result<(String, HashMap<String, Vec<TypeIns
     for ci in cache.instances {
         per_type.entry(ci.t).or_default().push(TypeInstance {
             name: ci.n,
-            location: SourceLocation { line: ci.l, col: ci.c },
+            location: SourceLocation {
+                line: ci.l,
+                col: ci.c,
+            },
         });
     }
     Ok((cache.game, per_type))
@@ -94,8 +97,14 @@ mod tests {
         per.insert(
             "spriteType".to_string(),
             vec![
-                TypeInstance { name: "GFX_a".into(), location: SourceLocation { line: 2, col: 1 } },
-                TypeInstance { name: "GFX_b".into(), location: SourceLocation { line: 5, col: 3 } },
+                TypeInstance {
+                    name: "GFX_a".into(),
+                    location: SourceLocation { line: 2, col: 1 },
+                },
+                TypeInstance {
+                    name: "GFX_b".into(),
+                    location: SourceLocation { line: 5, col: 3 },
+                },
             ],
         );
         idx.merge("vanilla/x.gfx", per);

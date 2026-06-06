@@ -7,6 +7,7 @@ use cwtools_string_table::string_table::StringTable;
 pub mod common;
 pub mod eu4;
 pub mod stellaris;
+pub mod structural;
 
 /// Run game-specific validators after generic rule validation.
 pub fn run_game_validators(
@@ -20,6 +21,9 @@ pub fn run_game_validators(
 
     // Common checks (unique types, should_be_referenced, warning_only downgrade)
     common::validate_common(ast, ruleset, table, file_path, &mut errors);
+
+    // Cross-game structural hints (empty if, NOT misuse, redundant booleans).
+    structural::validate_structural(ast, table, file_path, &mut errors);
 
     match game {
         Game::Stellaris => {

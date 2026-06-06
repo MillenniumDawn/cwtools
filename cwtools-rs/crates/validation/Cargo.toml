@@ -10,6 +10,7 @@ cwtools_rules = { path = "../rules" }
 cwtools_string_table = { path = "../string_table" }
 cwtools_game = { path = "../game" }
 cwtools_info = { path = "../info" }
+cwtools_localization = { path = "../localization" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

@@ -6,6 +6,11 @@ Supports all modern Paradox Interactive games, and targets .net standard 2.0.
 
 Considering contributing? [Start here!](https://github.com/tboby/cwtools/wiki/Contributing)
 
+## Documentation
+
+- [CWxxx error/warning code reference](cwtools-rs/docs/ERROR_CODES.md) — full catalog of diagnostic codes emitted by the Rust validator.
+- [Profiling guide](cwtools-rs/PROFILING.md) — how to measure validation performance.
+
 ## Projects that use CW Tools
 #### [Stellaris tech tree](http://www.draconas.co.uk/stellaristech): https://github.com/draconas1/stellaris-tech-tree
 An interactive tech tree visualiser that uses CW Tools to parse the vanilla tech files, and extract localisation.

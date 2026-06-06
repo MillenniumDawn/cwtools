@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// A unique identifier for an interned string.
 /// `NULL` (u32::MAX) is reserved and never assigned.
@@ -58,7 +59,11 @@ struct Inner {
 ///   every normal variant.
 /// * `quoted` is tracked per‑normal variant.
 pub struct StringTable {
-    inner: Arc<Mutex<Inner>>,
+    // RwLock (not Mutex): validation is read-only on the table (only
+    // `get_string`/`get_metadata`), so once parsing has interned everything the
+    // validation threads read concurrently. Interning (`intern`) still takes the
+    // write lock, so parse-time interning stays serialized.
+    inner: Arc<RwLock<Inner>>,
 }
 
 impl Clone for StringTable {
@@ -85,7 +90,7 @@ impl StringTable {
         id_to_metadata.push(StringMetadata::default());
 
         Self {
-            inner: Arc::new(Mutex::new(Inner {
+            inner: Arc::new(RwLock::new(Inner {
                 lower_map: HashMap::new(),
                 exact_map: HashMap::new(),
                 id_to_string,
@@ -104,12 +109,23 @@ impl StringTable {
     /// * If the lower‑cased form has never been seen, two consecutive IDs are
     ///   allocated: `normal` (exact text) and `lower` (lower‑cased text).
     pub fn intern(&self, s: &str) -> StringTokens {
+        // Fast path: exact string already interned. This is the overwhelming
+        // common case while parsing many files (identifiers repeat constantly),
+        // and it takes a shared read lock so parse threads don't serialize on it.
+        {
+            let inner = self.inner.read();
+            if let Some(&existing) = inner.exact_map.get(s) {
+                return existing;
+            }
+        }
+
         let quoted = s.starts_with('"') && s.ends_with('"');
         let lower_key = s.to_lowercase();
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write();
 
-        // Fast path 1: exact string already interned.
+        // Re-check after upgrading to the write lock: another thread may have
+        // interned this exact string in the gap (double-checked locking).
         if let Some(&existing) = inner.exact_map.get(s) {
             return existing;
         }
@@ -161,19 +177,19 @@ impl StringTable {
 
     /// Retrieve the original (case‑preserving) text for a `StringId`.
     pub fn get_string(&self, id: StringId) -> Option<String> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read();
         inner.id_to_string.get(id.0 as usize).cloned()
     }
 
     /// Retrieve the metadata for a `StringId`.
     pub fn get_metadata(&self, id: StringId) -> Option<StringMetadata> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read();
         inner.id_to_metadata.get(id.0 as usize).copied()
     }
 
     /// Number of unique lower‑cased strings (not counting normal variants).
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read();
         inner.lower_map.len()
     }
 

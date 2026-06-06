@@ -36,6 +36,165 @@ pub fn validate_stellaris(
             Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => {}
         }
     }
+
+    // Stellaris-specific structural hints (if/else 2.1, deprecated set_name).
+    walk_if_else(&ast.root_children, ast, table, file_path, errors);
+}
+
+// ── If/Else & set_name structural hints (Item: Tier B Stellaris) ───────────
+//
+// Ported from CWTools/Validation/Stellaris/STLValidation.fs `validateIfElse210`
+// (CW236/CW237), `validateIfElse` (CW238) and `validateDeprecatedSetName`
+// (CW253). F# scopes these to classified effect blocks; this walk keys off the
+// node names instead, which only appear in effect script.
+
+/// The `(key, children)` of a `key = { ... }` block (Node or Leaf-with-Clause).
+fn block_of<'a>(
+    child: &Child,
+    ast: &'a ParsedFile,
+    table: &StringTable,
+) -> Option<(String, &'a [Child], u32, u16)> {
+    match child {
+        Child::Node(idx) => {
+            let n = &ast.arena.nodes[*idx as usize];
+            Some((
+                table.get_string(n.key.normal).unwrap_or_default(),
+                &n.children,
+                n.pos.start.line,
+                n.pos.start.col,
+            ))
+        }
+        Child::Leaf(idx) => {
+            let l = &ast.arena.leaves[*idx as usize];
+            if let Value::Clause(children) = &l.value {
+                Some((
+                    table.get_string(l.key.normal).unwrap_or_default(),
+                    children,
+                    l.pos.start.line,
+                    l.pos.start.col,
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Keys of a block's direct children (Node + Leaf), in order.
+fn child_keys(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<String> {
+    children
+        .iter()
+        .filter_map(|c| match c {
+            Child::Node(idx) => Some(
+                table
+                    .get_string(ast.arena.nodes[*idx as usize].key.normal)
+                    .unwrap_or_default(),
+            ),
+            Child::Leaf(idx) => Some(
+                table
+                    .get_string(ast.arena.leaves[*idx as usize].key.normal)
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+fn walk_if_else(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    file_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    for child in children {
+        let Some((key, block_children, line, col)) = block_of(child, ast, table) else {
+            continue;
+        };
+
+        // CW253 — deprecated set_empire_name / set_planet_name.
+        if key == "set_empire_name" || key == "set_planet_name" {
+            errors.push(ValidationError {
+                message: error_codes::CW253_DEPRECATED_SET_NAME
+                    .message_template
+                    .to_string(),
+                severity: error_codes::CW253_DEPRECATED_SET_NAME.severity,
+                line,
+                col,
+                file: file_path.to_string(),
+                code: Some(error_codes::CW253_DEPRECATED_SET_NAME.id.to_string()),
+            });
+        }
+
+        if key != "limit" && key != "modifier" {
+            let has_else = block_children
+                .iter()
+                .any(|c| child_key_eq(c, ast, table, "else"));
+            let has_if = block_children
+                .iter()
+                .any(|c| child_key_eq(c, ast, table, "if"));
+            let deprecated_else = (key == "if" || key == "else_if") && has_else && !has_if;
+
+            // CW236 — old nested if/else style.
+            if deprecated_else {
+                errors.push(ValidationError {
+                    message: error_codes::CW236_DEPRECATED_ELSE
+                        .message_template
+                        .to_string(),
+                    severity: error_codes::CW236_DEPRECATED_ELSE.severity,
+                    line,
+                    col,
+                    file: file_path.to_string(),
+                    code: Some(error_codes::CW236_DEPRECATED_ELSE.id.to_string()),
+                });
+            }
+
+            // CW237 — ambiguous if = { if ... else }.
+            if key == "if" && has_else && has_if {
+                errors.push(ValidationError {
+                    message: error_codes::CW237_AMBIGUOUS_IF_ELSE
+                        .message_template
+                        .to_string(),
+                    severity: error_codes::CW237_AMBIGUOUS_IF_ELSE.severity,
+                    line,
+                    col,
+                    file: file_path.to_string(),
+                    code: Some(error_codes::CW237_AMBIGUOUS_IF_ELSE.id.to_string()),
+                });
+            }
+
+            // CW238 — else/else_if missing a preceding if (skip the deprecated case).
+            if !deprecated_else {
+                let mut prev_was_if = false;
+                for k in child_keys(block_children, ast, table) {
+                    if k != "if" && k != "else" && k != "else_if" {
+                        continue;
+                    }
+                    if prev_was_if {
+                        prev_was_if = k == "if" || k == "else_if";
+                    } else if k == "if" {
+                        prev_was_if = true;
+                    } else {
+                        // else / else_if with no preceding if.
+                        errors.push(ValidationError {
+                            message: error_codes::CW238_IF_ELSE_ORDER
+                                .message_template
+                                .to_string(),
+                            severity: error_codes::CW238_IF_ELSE_ORDER.severity,
+                            line,
+                            col,
+                            file: file_path.to_string(),
+                            code: Some(error_codes::CW238_IF_ELSE_ORDER.id.to_string()),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        walk_if_else(block_children, ast, table, file_path, errors);
+    }
 }
 
 // ── Event Validation ───────────────────────────────────
@@ -71,11 +230,11 @@ fn validate_event(
     if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
         errors.push(ValidationError {
             message: "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
-            severity: ErrorSeverity::Warning,
+            severity: ErrorSeverity::Information,
             line: node.pos.start.line,
             col: node.pos.start.col,
             file: file_path.to_string(),
-            code: Some(error_codes::CW300_EVENT_EVERY_TICK.id.to_string()),
+            code: Some(error_codes::CW107_EVENT_EVERY_TICK.id.to_string()),
         });
     }
 
@@ -141,11 +300,11 @@ fn validate_event_clause(
         let line = children.first().map(|c| child_line(c, ast)).unwrap_or(0);
         errors.push(ValidationError {
             message: "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
-            severity: ErrorSeverity::Warning,
+            severity: ErrorSeverity::Information,
             line,
             col: 0,
             file: file_path.to_string(),
-            code: Some(error_codes::CW300_EVENT_EVERY_TICK.id.to_string()),
+            code: Some(error_codes::CW107_EVENT_EVERY_TICK.id.to_string()),
         });
     }
 }

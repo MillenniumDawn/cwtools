@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 
 /// Supported languages across all games.
@@ -227,40 +226,18 @@ pub enum JominiParam {
 /// A parsed localization file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocFile {
+    /// Source path (or logical name) this file was parsed from.
+    pub path: String,
     pub language_prefix: String,
     pub lang: Option<Lang>,
     pub entries: Vec<LocEntry>,
     /// File-level diagnostics (BOM, header/filename mismatches, etc.).
     /// Empty when there are no issues.
     pub file_diagnostics: Vec<String>,
-}
-
-/// Per-language API over loaded loc files.
-pub struct LocApi {
-    entries: HashMap<String, LocEntry>,
-    pub keys: Vec<String>,
-}
-
-impl LocApi {
-    pub fn new(entries: HashMap<String, LocEntry>) -> Self {
-        let keys = entries.keys().cloned().collect::<Vec<_>>();
-        Self { entries, keys }
-    }
-
-    pub fn get_desc(&self, key: &str) -> String {
-        self.entries
-            .get(key)
-            .map(|e| e.desc.clone())
-            .unwrap_or_else(|| key.to_string())
-    }
-
-    pub fn get_entry(&self, key: &str) -> Option<&LocEntry> {
-        self.entries.get(key)
-    }
-
-    pub fn contains(&self, key: &str) -> bool {
-        self.entries.contains_key(key)
-    }
+    /// On-disk encoding, when the file was read from disk (used to enforce the
+    /// UTF-8-BOM rule, CW254). `None` when built from already-decoded text
+    /// (LSP single-file edits, tests) where the original bytes aren't available.
+    pub encoding: Option<cwtools_file_manager::FileEncoding>,
 }
 
 /* ======================================================================== */

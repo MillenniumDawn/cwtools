@@ -1,6 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 use serde_json::Value;
 use tower_lsp::jsonrpc::Result;
@@ -9,13 +9,16 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
 use cwtools_info::TypeIndex;
-use cwtools_info::{collect_type_instances, element_at_position, info_at_position, PositionElement, ReferenceHint, TypeInstance};
+use cwtools_info::{
+    PositionElement, ReferenceHint, TypeInstance, collect_type_instances, element_at_position,
+    info_at_position,
+};
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType, ValueType};
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::{validate_ast, ValidationError};
+use cwtools_validation::{ValidationError, validate_ast_with_loc};
 
 mod symbols;
 
@@ -42,6 +45,43 @@ fn build_modifier_keys(ruleset: &RuleSet, type_index: &TypeIndex) -> HashSet<Str
         }
     }
     mk
+}
+
+/// Map the engine `Game` to the localization crate's `Game` enum.
+fn engine_to_loc_game(game: Option<cwtools_game::constants::Game>) -> cwtools_localization::Game {
+    use cwtools_game::constants::Game as G;
+    use cwtools_localization::Game as LG;
+    match game {
+        Some(G::Hoi4) => LG::HOI4,
+        Some(G::Stellaris) => LG::Stellaris,
+        Some(G::Eu4) => LG::EU4,
+        Some(G::Ck3) => LG::CK3,
+        Some(G::Ir) => LG::IR,
+        Some(G::Vic3) => LG::VIC3,
+        Some(G::Eu5) => LG::EU5,
+        _ => LG::Generic,
+    }
+}
+
+/// Convert a loc-file diagnostic into a `ValidationError` so it shares the
+/// `validation_error_to_diagnostic` rendering path. Loc positions are 1-based;
+/// `ValidationError.col` is 0-based (used directly by the renderer).
+fn loc_diag_to_validation_error(d: &cwtools_localization::LocDiagnostic) -> ValidationError {
+    let severity = match d.severity {
+        cwtools_localization::LocSeverity::Error => cwtools_validation::ErrorSeverity::Error,
+        cwtools_localization::LocSeverity::Warning => cwtools_validation::ErrorSeverity::Warning,
+        cwtools_localization::LocSeverity::Information => {
+            cwtools_validation::ErrorSeverity::Information
+        }
+    };
+    ValidationError {
+        message: d.message.clone(),
+        severity,
+        line: d.line as u32,
+        col: d.col.saturating_sub(1) as u16,
+        file: d.file.clone(),
+        code: Some(d.code.to_string()),
+    }
 }
 
 /// Index a base-game ("vanilla") install into per-type instances, ready to merge
@@ -165,6 +205,9 @@ struct DocumentState {
     /// cached modifier-key set; rebuilt after ruleset load and after each full
     /// workspace scan when the type index is complete.
     modifier_keys: parking_lot::RwLock<HashSet<String>>,
+    /// loc-key index (workspace + vanilla) for CW100/CW122 on config files and
+    /// for scope-aware loc-command checks. Rebuilt on each full workspace scan.
+    loc_index: parking_lot::RwLock<Option<cwtools_localization::LocIndex>>,
 }
 
 struct ParsedDoc {
@@ -187,6 +230,7 @@ impl DocumentState {
             vanilla_index: Mutex::new(None),
             vanilla_dir: Mutex::new(None),
             modifier_keys: parking_lot::RwLock::new(HashSet::new()),
+            loc_index: parking_lot::RwLock::new(None),
         }
     }
 }
@@ -540,7 +584,10 @@ fn cwtools_info_path_check(
 
 /// Parse a string into an LSP Url, falling back to a clone of `fallback` on error.
 fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
-    uri_str.as_ref().parse().unwrap_or_else(|_| fallback.clone())
+    uri_str
+        .as_ref()
+        .parse()
+        .unwrap_or_else(|_| fallback.clone())
 }
 
 /// Build context-aware completion items from the child rules at the cursor's
@@ -961,12 +1008,21 @@ impl LanguageServer for Backend {
                         let total: usize = per_type.values().map(|v| v.len()).sum();
                         *self.state.vanilla_index.lock() = Some(per_type);
                         self.client
-                            .log_message(MessageType::INFO, format!("Loaded {} base-game instances from vanilla cache {} (game {})", total, vc, game))
+                            .log_message(
+                                MessageType::INFO,
+                                format!(
+                                    "Loaded {} base-game instances from vanilla cache {} (game {})",
+                                    total, vc, game
+                                ),
+                            )
                             .await;
                     }
                     Err(e) => {
                         self.client
-                            .log_message(MessageType::WARNING, format!("Could not load vanilla cache {}: {}", vc, e))
+                            .log_message(
+                                MessageType::WARNING,
+                                format!("Could not load vanilla cache {}: {}", vc, e),
+                            )
                             .await;
                     }
                 }
@@ -984,7 +1040,10 @@ impl LanguageServer for Backend {
                         .await;
                 } else {
                     self.client
-                        .log_message(MessageType::WARNING, format!("`vanilla` dir does not exist: {}", vd))
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("`vanilla` dir does not exist: {}", vd),
+                        )
                         .await;
                 }
             }
@@ -1217,11 +1276,8 @@ impl LanguageServer for Backend {
 
                 if let Some(info) = pos_info {
                     let ruleset_guard2 = self.state.ruleset.lock();
-                    let md = build_hover_markdown(
-                        &info.element,
-                        &info.hint,
-                        ruleset_guard2.as_ref(),
-                    );
+                    let md =
+                        build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
                             kind: MarkupKind::Markdown,
@@ -1232,7 +1288,12 @@ impl LanguageServer for Backend {
                 }
 
                 // Fallback: no-rule position finder
-                if let Some(element) = element_at_position(ast, pos.line + 1, pos.character as u16, &self.state.string_table) {
+                if let Some(element) = element_at_position(
+                    ast,
+                    pos.line + 1,
+                    pos.character as u16,
+                    &self.state.string_table,
+                ) {
                     let contents = match element {
                         PositionElement::Node { key } => {
                             format!("**Node**: `{}`", key)
@@ -1423,7 +1484,10 @@ impl LanguageServer for Backend {
                 .iter()
                 .filter(|(_, inst)| inst.name == instance_name)
                 .map(|(file_uri, inst)| Location {
-                    uri: parse_uri(file_uri, &params.text_document_position_params.text_document.uri),
+                    uri: parse_uri(
+                        file_uri,
+                        &params.text_document_position_params.text_document.uri,
+                    ),
                     range: Range {
                         start: Position {
                             line: inst.location.line.saturating_sub(1),
@@ -1445,7 +1509,12 @@ impl LanguageServer for Backend {
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri) {
             if let Some(ast) = &doc.ast {
-                if let Some(element) = element_at_position(ast, pos.line + 1, pos.character as u16, &self.state.string_table) {
+                if let Some(element) = element_at_position(
+                    ast,
+                    pos.line + 1,
+                    pos.character as u16,
+                    &self.state.string_table,
+                ) {
                     let symbol = match &element {
                         PositionElement::Node { key } => key.clone(),
                         PositionElement::Leaf { key, .. } => key.clone(),
@@ -1454,13 +1523,25 @@ impl LanguageServer for Backend {
                     drop(docs);
                     let info = self.state.info_service.lock();
                     if let Some(defs) = info.find_definitions(&symbol) {
-                        let locations: Vec<Location> = defs.iter().map(|(file_uri, loc)| Location {
-                            uri: parse_uri(file_uri, &params.text_document_position_params.text_document.uri),
-                            range: Range {
-                                start: Position { line: loc.line.saturating_sub(1), character: loc.col as u32 },
-                                end: Position { line: loc.line.saturating_sub(1), character: (loc.col + symbol.len() as u16) as u32 },
-                            },
-                        }).collect();
+                        let locations: Vec<Location> = defs
+                            .iter()
+                            .map(|(file_uri, loc)| Location {
+                                uri: parse_uri(
+                                    file_uri,
+                                    &params.text_document_position_params.text_document.uri,
+                                ),
+                                range: Range {
+                                    start: Position {
+                                        line: loc.line.saturating_sub(1),
+                                        character: loc.col as u32,
+                                    },
+                                    end: Position {
+                                        line: loc.line.saturating_sub(1),
+                                        character: (loc.col + symbol.len() as u16) as u32,
+                                    },
+                                },
+                            })
+                            .collect();
                         if !locations.is_empty() {
                             return Ok(Some(GotoDefinitionResponse::Array(locations)));
                         }
@@ -1555,7 +1636,10 @@ impl LanguageServer for Backend {
                     );
                     for (file_uri, loc) in use_sites {
                         all_locs.push(Location {
-                            uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
+                            uri: parse_uri(
+                                file_uri,
+                                &params.text_document_position.text_document.uri,
+                            ),
                             range: Range {
                                 start: Position {
                                     line: loc.line.saturating_sub(1),
@@ -1580,7 +1664,12 @@ impl LanguageServer for Backend {
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri) {
             if let Some(ast) = &doc.ast {
-                if let Some(element) = element_at_position(ast, pos.line + 1, pos.character as u16, &self.state.string_table) {
+                if let Some(element) = element_at_position(
+                    ast,
+                    pos.line + 1,
+                    pos.character as u16,
+                    &self.state.string_table,
+                ) {
                     let symbol = match &element {
                         PositionElement::Node { key } => key.clone(),
                         PositionElement::Leaf { key, .. } => key.clone(),
@@ -1591,7 +1680,10 @@ impl LanguageServer for Backend {
                     let mut all_locs = Vec::new();
                     if let Some(defs) = info.find_definitions(&symbol) {
                         all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
-                            uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
+                            uri: parse_uri(
+                                file_uri,
+                                &params.text_document_position.text_document.uri,
+                            ),
                             range: Range {
                                 start: Position {
                                     line: loc.line.saturating_sub(1),
@@ -1606,7 +1698,10 @@ impl LanguageServer for Backend {
                     }
                     if let Some(refs) = info.find_references(&symbol) {
                         all_locs.extend(refs.iter().map(|(file_uri, loc)| Location {
-                            uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
+                            uri: parse_uri(
+                                file_uri,
+                                &params.text_document_position.text_document.uri,
+                            ),
                             range: Range {
                                 start: Position {
                                     line: loc.line.saturating_sub(1),
@@ -1955,7 +2050,9 @@ impl Backend {
     /// Payload: `{ "fileList": [{ "scope": string, "uri": string, "logicalpath": string }] }`.
     async fn send_update_file_list(&self, file_list: Vec<serde_json::Value>) {
         let payload = serde_json::json!({ "fileList": file_list });
-        self.client.send_notification::<UpdateFileList>(payload).await;
+        self.client
+            .send_notification::<UpdateFileList>(payload)
+            .await;
     }
 
     /// Scan the entire workspace for relevant game files and validate them all.
@@ -2070,7 +2167,9 @@ impl Backend {
             if let Some(per_type) = vanilla_guard.as_ref() {
                 let mut info_guard = self.state.info_service.lock();
                 info_guard.type_index.remove_file("<vanilla-cache>");
-                info_guard.type_index.merge("<vanilla-cache>", per_type.clone());
+                info_guard
+                    .type_index
+                    .merge("<vanilla-cache>", per_type.clone());
             }
         }
 
@@ -2078,6 +2177,11 @@ impl Backend {
         // complete (templated modifiers like production_speed_<building>_factor
         // expand against the full instance list).
         self.rebuild_modifier_keys();
+
+        // Build the loc-key index (workspace + vanilla) so pass 2's config
+        // validation can check LocalisationField references (CW100/CW122), and
+        // publish loc-file diagnostics (CW225 etc.) for the workspace loc files.
+        self.rebuild_and_publish_loc(&root_path).await;
 
         // Pass 2: validate each stored AST against the complete index. No
         // re-parsing and no per-file logging (that logging was ~2 LSP
@@ -2090,7 +2194,8 @@ impl Backend {
         let modifier_keys_snap: HashSet<String> = self.state.modifier_keys.read().clone();
         for (i, (uri, _file_path, text, parsed)) in parsed_docs.into_iter().enumerate() {
             let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys_snap);
-            total_errors += diagnostics.iter()
+            total_errors += diagnostics
+                .iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
                 .count();
 
@@ -2102,7 +2207,14 @@ impl Backend {
 
             {
                 let mut docs = self.state.documents.lock();
-                docs.insert(uri, ParsedDoc { version: 0, text, ast: Some(parsed) });
+                docs.insert(
+                    uri,
+                    ParsedDoc {
+                        version: 0,
+                        text,
+                        ast: Some(parsed),
+                    },
+                );
             }
             if i % 50 == 49 {
                 tokio::task::yield_now().await;
@@ -2126,7 +2238,11 @@ impl Backend {
             .map(|file_path| {
                 let uri = format!("file://{}", file_path.display());
                 let logical_path = logical_path_from_uri(&uri, &ws_uri);
-                let scope = logical_path.split('/').next().unwrap_or("unknown").to_string();
+                let scope = logical_path
+                    .split('/')
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string();
                 serde_json::json!({
                     "scope": scope,
                     "uri": uri,
@@ -2137,6 +2253,47 @@ impl Backend {
         self.send_update_file_list(file_list).await;
 
         self.send_loading_bar(false, "").await;
+    }
+
+    /// Build the loc-key index from the workspace root plus the vanilla install,
+    /// store it in state (for CW100/CW122 on config files), and publish loc-file
+    /// diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace loc files.
+    async fn rebuild_and_publish_loc(&self, root_path: &std::path::Path) {
+        let game = {
+            let language = self.state.language.lock().clone();
+            cwtools_game::constants::Game::from_str(&language)
+        };
+        let loc_game = engine_to_loc_game(game);
+
+        let mut loc_dirs: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
+        if let Some(v) = self.state.vanilla_dir.lock().clone() {
+            loc_dirs.push(v);
+        }
+        let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
+        let service = cwtools_localization::LocService::from_folders(&dir_refs);
+        let loc_index = cwtools_localization::LocIndex::build(&service, loc_game);
+        *self.state.loc_index.write() = Some(loc_index);
+
+        // Publish per-file loc diagnostics, but only for workspace loc files
+        // (not vanilla). Group by file so each gets a complete diagnostic set.
+        let root_str = root_path.to_string_lossy().to_string();
+        let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
+        for d in cwtools_localization::validate_loc_project(&service, loc_game) {
+            if !d.file.starts_with(&root_str) {
+                continue;
+            }
+            let ve = loc_diag_to_validation_error(&d);
+            by_file
+                .entry(d.file.clone())
+                .or_default()
+                .push(validation_error_to_diagnostic(&ve));
+        }
+        for (file, diags) in by_file {
+            let uri = format!("file://{}", file);
+            if let Ok(uri_obj) = Url::parse(&uri) {
+                self.client.publish_diagnostics(uri_obj, diags, None).await;
+            }
+        }
     }
 
     /// Parse a file and add it to the symbol + info (type) indexes WITHOUT
@@ -2177,14 +2334,19 @@ impl Backend {
         parsed: &ParsedFile,
         modifier_keys: &std::collections::HashSet<String>,
     ) -> Vec<Diagnostic> {
-        let mut diagnostics: Vec<Diagnostic> = parsed.errors.iter().map(parse_error_to_diagnostic).collect();
+        let mut diagnostics: Vec<Diagnostic> = parsed
+            .errors
+            .iter()
+            .map(parse_error_to_diagnostic)
+            .collect();
         let ruleset_guard = self.state.ruleset.lock();
         if let Some(ruleset) = ruleset_guard.as_ref() {
             let language = self.state.language.lock().clone();
             let game = cwtools_game::constants::Game::from_str(&language);
             let info_guard = self.state.info_service.lock();
             let type_index = &info_guard.type_index;
-            let mut errs = validate_ast(
+            let loc_guard = self.state.loc_index.read();
+            let mut errs = validate_ast_with_loc(
                 parsed,
                 ruleset,
                 &self.state.string_table,
@@ -2192,7 +2354,9 @@ impl Backend {
                 game,
                 Some(type_index),
                 Some(modifier_keys),
+                loc_guard.as_ref(),
             );
+            drop(loc_guard);
             drop(info_guard);
             const MAX_ERRORS: usize = 100;
             let total = errs.len();
@@ -2221,6 +2385,23 @@ impl Backend {
         text: &str,
     ) -> (Vec<Diagnostic>, Option<ParsedFile>) {
         let mut diagnostics = Vec::new();
+
+        // Localisation files are parsed and validated as loc, not config.
+        if uri.ends_with(".yml") || uri.ends_with(".yaml") || uri.ends_with(".csv") {
+            let path = uri.strip_prefix("file://").unwrap_or(uri);
+            let union = {
+                let guard = self.state.loc_index.read();
+                guard
+                    .as_ref()
+                    .map(|idx| idx.union().clone())
+                    .unwrap_or_default()
+            };
+            for d in cwtools_localization::validate_loc_file_text(text, path, &union) {
+                let ve = loc_diag_to_validation_error(&d);
+                diagnostics.push(validation_error_to_diagnostic(&ve));
+            }
+            return (diagnostics, None);
+        }
 
         self.client
             .log_message(MessageType::INFO, format!("[validate] parsing: {}", uri))
@@ -2306,7 +2487,18 @@ impl Backend {
                         let info_guard = self.state.info_service.lock();
                         let type_index = &info_guard.type_index;
                         let modifier_keys = self.state.modifier_keys.read();
-                        let mut errs = validate_ast(&parsed, ruleset, &self.state.string_table, uri, game, Some(type_index), Some(&*modifier_keys));
+                        let loc_guard = self.state.loc_index.read();
+                        let mut errs = validate_ast_with_loc(
+                            &parsed,
+                            ruleset,
+                            &self.state.string_table,
+                            uri,
+                            game,
+                            Some(type_index),
+                            Some(&*modifier_keys),
+                            loc_guard.as_ref(),
+                        );
+                        drop(loc_guard);
                         drop(modifier_keys);
                         drop(info_guard);
                         let elapsed = start.elapsed();
@@ -2420,14 +2612,18 @@ impl Backend {
 
         self.send_loading_bar(true, "Indexing base game…").await;
         self.client
-            .log_message(MessageType::INFO, format!("Indexing base game at {} …", dir.display()))
+            .log_message(
+                MessageType::INFO,
+                format!("Indexing base game at {} …", dir.display()),
+            )
             .await;
 
         // Indexing parses thousands of files; run it off the async executor.
         let table = self.state.string_table.clone();
-        let per_type = tokio::task::spawn_blocking(move || index_vanilla_dir(&dir, &ruleset, &table))
-            .await
-            .unwrap_or_default();
+        let per_type =
+            tokio::task::spawn_blocking(move || index_vanilla_dir(&dir, &ruleset, &table))
+                .await
+                .unwrap_or_default();
 
         let total: usize = per_type.values().map(|v| v.len()).sum();
         *self.state.vanilla_index.lock() = Some(per_type);
