@@ -95,11 +95,10 @@ impl LocService {
     pub fn languages(&self) -> Vec<Lang> {
         let mut langs: Vec<Lang> = Vec::new();
         for f in &self.files {
-            if let Some(l) = f.lang {
-                if !langs.contains(&l) {
+            if let Some(l) = f.lang
+                && !langs.contains(&l) {
                     langs.push(l);
                 }
-            }
         }
         langs
     }

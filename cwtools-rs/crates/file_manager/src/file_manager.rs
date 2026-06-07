@@ -352,13 +352,11 @@ impl FileManager {
             }
 
             // Size guard
-            if self.config.max_file_size > 0 {
-                if let Ok(meta) = path.metadata() {
-                    if meta.len() > self.config.max_file_size {
+            if self.config.max_file_size > 0
+                && let Ok(meta) = path.metadata()
+                    && meta.len() > self.config.max_file_size {
                         continue;
                     }
-                }
-            }
 
             // Compute logical path relative to root
             let logical_path = compute_logical_path(&path, &self.config.root);
@@ -482,27 +480,21 @@ pub fn expand_multiple_mods(workspace: &Path) -> Vec<ResolvedMod> {
                 .extension()
                 .map(|e| e.eq_ignore_ascii_case("mod"))
                 .unwrap_or(false)
-            {
-                match parse_mod_descriptor(&path) {
-                    Ok(desc) => {
-                        if let Some(mod_path) = &desc.path {
-                            // `path` can be relative (to the workspace) or absolute
-                            let root = if std::path::Path::new(mod_path).is_absolute() {
-                                PathBuf::from(mod_path)
-                            } else {
-                                workspace.join(mod_path)
-                            };
-                            if root.is_dir() {
-                                out.push(ResolvedMod {
-                                    descriptor: desc,
-                                    root,
-                                });
-                            }
+                && let Ok(desc) = parse_mod_descriptor(&path)
+                    && let Some(mod_path) = &desc.path {
+                        // `path` can be relative (to the workspace) or absolute
+                        let root = if std::path::Path::new(mod_path).is_absolute() {
+                            PathBuf::from(mod_path)
+                        } else {
+                            workspace.join(mod_path)
+                        };
+                        if root.is_dir() {
+                            out.push(ResolvedMod {
+                                descriptor: desc,
+                                root,
+                            });
                         }
                     }
-                    Err(_) => {}
-                }
-            }
         }
     }
 

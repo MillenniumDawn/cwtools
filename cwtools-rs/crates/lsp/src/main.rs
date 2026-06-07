@@ -128,18 +128,16 @@ fn index_vanilla_dir(
 /// `~/Library/Caches` (macOS), and finally the temp dir.
 fn default_cache_dir() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
-    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
-        if !x.is_empty() {
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME")
+        && !x.is_empty() {
             return Some(PathBuf::from(x).join("cwtools"));
         }
-    }
-    if let Ok(la) = std::env::var("LOCALAPPDATA") {
-        if !la.is_empty() {
+    if let Ok(la) = std::env::var("LOCALAPPDATA")
+        && !la.is_empty() {
             return Some(PathBuf::from(la).join("cwtools"));
         }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty() {
             let home = PathBuf::from(home);
             #[cfg(target_os = "macos")]
             {
@@ -150,7 +148,6 @@ fn default_cache_dir() -> Option<std::path::PathBuf> {
                 return Some(home.join(".cache/cwtools"));
             }
         }
-    }
     Some(std::env::temp_dir().join("cwtools"))
 }
 
@@ -420,11 +417,10 @@ fn find_rule_description(rules: &RuleSet, key: &str) -> (Option<String>, Vec<Str
                 | RuleType::NodeRule {
                     left: NewField::SpecificField(k),
                     ..
-                } => {
-                    if k.eq_ignore_ascii_case(key) {
+                }
+                    if k.eq_ignore_ascii_case(key) => {
                         return (opts.description.clone(), opts.required_scopes.clone());
                     }
-                }
                 _ => {}
             }
         }
@@ -472,8 +468,8 @@ fn collect_enclosing_path(
             }
             Child::Leaf(idx) => {
                 let leaf = &arena.leaves[*idx as usize];
-                if let Value::Clause(ch) = &leaf.value {
-                    if pos_in_range_simple(target, &leaf.pos) {
+                if let Value::Clause(ch) = &leaf.value
+                    && pos_in_range_simple(target, &leaf.pos) {
                         let key = table.get_string(leaf.key.normal).unwrap_or_default();
                         path.push(key);
                         if collect_enclosing_path(ch, arena, target, table, path) {
@@ -481,7 +477,6 @@ fn collect_enclosing_path(
                         }
                         return true;
                     }
-                }
             }
             _ => {}
         }
@@ -595,11 +590,10 @@ fn descend_rules<'a>(
                 left: NewField::AliasValueKeysField(k),
                 rules: inner,
                 ..
-            } => {
-                if k.eq_ignore_ascii_case(next_key) {
+            }
+                if k.eq_ignore_ascii_case(next_key) => {
                     return descend_rules(inner, &remaining[1..]);
                 }
-            }
             _ => {}
         }
     }
@@ -653,9 +647,9 @@ fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
 /// following the alias chain, which can be large).  TypeField completions use
 /// the TypeIndex from the InfoService.  ScopeField completions are placeholder
 /// scope names.
-fn completions_from_rules<'a>(
+fn completions_from_rules(
     rules: &[(RuleType, cwtools_rules::rules_types::Options)],
-    ruleset: &'a RuleSet,
+    ruleset: &RuleSet,
     info: &cwtools_info::InfoService,
     language: &str,
 ) -> Vec<CompletionItem> {
@@ -811,7 +805,7 @@ fn completions_from_rules<'a>(
     items
 }
 
-fn enum_values_for<'a>(ruleset: &'a RuleSet, enum_name: &str) -> Vec<String> {
+fn enum_values_for(ruleset: &RuleSet, enum_name: &str) -> Vec<String> {
     if let Some(&idx) = ruleset.enum_by_name.get(enum_name) {
         return ruleset.enums[idx].values.clone();
     }
@@ -915,11 +909,10 @@ fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<CompletionIt
 
         // Add subtype typeKeyField alternatives.
         for st in &td.subtypes {
-            if let Some(tkf) = &st.type_key_field {
-                if !openers.contains(tkf) {
+            if let Some(tkf) = &st.type_key_field
+                && !openers.contains(tkf) {
                     openers.push(tkf.clone());
                 }
-            }
         }
 
         // Find the TypeRule for this type to get child rules for snippet body.
@@ -966,9 +959,7 @@ fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<CompletionIt
 fn loc_completions(info: &cwtools_info::InfoService, language: &str) -> Vec<CompletionItem> {
     // Collect all top-level keys from all files as potential loc keys
     let mut items: Vec<CompletionItem> = info
-        .files
-        .iter()
-        .flat_map(|(_, fi)| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
+        .files.values().flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .map(|k| CompletionItem {
@@ -1179,11 +1170,10 @@ impl LanguageServer for Backend {
         }
 
         // Store workspace URI if provided
-        if let Some(folders) = &params.workspace_folders {
-            if let Some(first) = folders.first() {
+        if let Some(folders) = &params.workspace_folders
+            && let Some(first) = folders.first() {
                 *self.state.workspace_uri.lock() = Some(first.uri.to_string());
             }
-        }
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -1359,8 +1349,8 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position_params.position;
 
         let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri) {
-            if let Some(ast) = &doc.ast {
+        if let Some(doc) = docs.get(&uri)
+            && let Some(ast) = &doc.ast {
                 let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
                 let lsp_col = pos.character as u16;
 
@@ -1423,7 +1413,6 @@ impl LanguageServer for Backend {
                     }));
                 }
             }
-        }
         Ok(None)
     }
 
@@ -1449,7 +1438,7 @@ impl LanguageServer for Backend {
         // .yml localisation file — offer loc-key / data-function completions.
         if uri.ends_with(".yml") || uri.ends_with(".yaml") {
             let info_guard = self.state.info_service.lock();
-            let items = loc_completions(&*info_guard, &language);
+            let items = loc_completions(&info_guard, &language);
             if !items.is_empty() {
                 return Ok(Some(CompletionResponse::Array(items)));
             }
@@ -1468,7 +1457,7 @@ impl LanguageServer for Backend {
                         // Top level — offer root-type snippets for this file's path.
                         root_type_snippets(rs, &logical_path)
                     } else if let Some(rules) = rules_for_context(rs, &key_path, &logical_path) {
-                        completions_from_rules(rules, rs, &*info_guard, &language)
+                        completions_from_rules(rules, rs, &info_guard, &language)
                     } else {
                         Vec::new()
                     }
@@ -1616,9 +1605,9 @@ impl LanguageServer for Backend {
 
         // Fallback: heuristic symbol-based lookup
         let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri) {
-            if let Some(ast) = &doc.ast {
-                if let Some(element) = element_at_position(
+        if let Some(doc) = docs.get(&uri)
+            && let Some(ast) = &doc.ast
+                && let Some(element) = element_at_position(
                     ast,
                     pos.line + 1,
                     pos.character as u16,
@@ -1656,8 +1645,6 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
-            }
-        }
         Ok(None)
     }
 
@@ -1738,7 +1725,7 @@ impl LanguageServer for Backend {
                     let use_sites = scan_use_sites(
                         &type_name,
                         &instance_name,
-                        &*docs,
+                        &docs,
                         rs,
                         &ws_uri,
                         &self.state.string_table,
@@ -1771,9 +1758,9 @@ impl LanguageServer for Backend {
 
         // Fallback: heuristic-based approach
         let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri) {
-            if let Some(ast) = &doc.ast {
-                if let Some(element) = element_at_position(
+        if let Some(doc) = docs.get(&uri)
+            && let Some(ast) = &doc.ast
+                && let Some(element) = element_at_position(
                     ast,
                     pos.line + 1,
                     pos.character as u16,
@@ -1845,8 +1832,6 @@ impl LanguageServer for Backend {
                         return Ok(Some(all_locs));
                     }
                 }
-            }
-        }
         Ok(None)
     }
 
@@ -2084,7 +2069,7 @@ impl LanguageServer for Backend {
                 let use_sites = scan_use_sites(
                     &type_name,
                     &instance_name,
-                    &*docs,
+                    &docs,
                     rs,
                     &ws_uri2,
                     &self.state.string_table,
@@ -2220,11 +2205,10 @@ impl Backend {
                         if !skip {
                             walk_dir(&path, extensions, out);
                         }
-                    } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if extensions.contains(&ext) {
+                    } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                        && extensions.contains(&ext) {
                             out.push(path);
                         }
-                    }
                 }
             }
         }
@@ -2550,11 +2534,10 @@ impl Backend {
         let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
         {
             let mut docs = self.state.documents.lock();
-            if let Some(d) = docs.get_mut(&uri) {
-                if d.version == expected_version {
+            if let Some(d) = docs.get_mut(&uri)
+                && d.version == expected_version {
                     d.ast = parsed.map(Arc::new);
                 }
-            }
         }
         if let Ok(uri_obj) = Url::parse(&uri) {
             self.client
@@ -2661,13 +2644,12 @@ impl Backend {
                     .map(|d| d.version == snapshot_version)
                     .unwrap_or(false)
             };
-            if still_current {
-                if let Ok(uri_obj) = Url::parse(&uri) {
+            if still_current
+                && let Ok(uri_obj) = Url::parse(&uri) {
                     self.client
                         .publish_diagnostics(uri_obj, diagnostics, Some(snapshot_version))
                         .await;
                 }
-            }
         }
     }
 
@@ -2894,8 +2876,8 @@ impl Backend {
         let cache_path = self.vanilla_cache_path(&game, &fingerprint);
 
         // Try a fresh cache first — skip parsing the whole base game entirely.
-        if let Some(cp) = &cache_path {
-            if cp.exists() {
+        if let Some(cp) = &cache_path
+            && cp.exists() {
                 match cwtools_info::vanilla_cache::load(cp) {
                     Ok((cache_game, cache_fp, per_type))
                         if cache_game == game && cache_fp == fingerprint =>
@@ -2936,7 +2918,6 @@ impl Backend {
                     }
                 }
             }
-        }
 
         // We need the ruleset to map definitions to their types. Clone it out so
         // the lock guard isn't held across the awaits below (parking_lot guards
@@ -3212,16 +3193,14 @@ fn is_type_ref_leaf(
         };
 
         // For TypeRules, check path filter
-        if let RootRule::TypeRule(..) = root_rule {
-            if let Some(name) = rule_type_name {
-                if let Some(&idx) = ruleset.type_by_name.get(name) {
+        if let RootRule::TypeRule(..) = root_rule
+            && let Some(name) = rule_type_name
+                && let Some(&idx) = ruleset.type_by_name.get(name) {
                     let td = &ruleset.types[idx];
                     if !cwtools_info_path_check(&td.path_options, logical_path) {
                         continue;
                     }
                 }
-            }
-        }
 
         let rules = match rule_type {
             RuleType::NodeRule { rules, .. } => rules.as_slice(),
@@ -3233,11 +3212,9 @@ fn is_type_ref_leaf(
                 left: NewField::SpecificField(k),
                 right: NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)),
             } = inner
-            {
-                if k.eq_ignore_ascii_case(leaf_key) && t == type_name {
+                && k.eq_ignore_ascii_case(leaf_key) && t == type_name {
                     return true;
                 }
-            }
         }
     }
     false
@@ -3469,11 +3446,9 @@ mod tests {
         // Add a description to the "kind" leaf rule
         if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
             rs.root_rules.first_mut()
-        {
-            if let Some((_, opts)) = rules.first_mut() {
+            && let Some((_, opts)) = rules.first_mut() {
                 opts.description = Some("The kind of this thing".to_string());
             }
-        }
 
         let md = build_hover_markdown(
             &PositionElement::Leaf {

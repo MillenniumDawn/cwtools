@@ -50,8 +50,8 @@ struct VanillaCacheFile {
 /// and falls back to the install directory's mtime when no version file exists.
 pub fn fingerprint(dir: &Path) -> String {
     let launcher = dir.join("launcher-settings.json");
-    if let Ok(text) = std::fs::read_to_string(&launcher) {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+    if let Ok(text) = std::fs::read_to_string(&launcher)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(ver) = v.get("rawVersion").and_then(|x| x.as_str()) {
                 return format!("v{ver}");
             }
@@ -59,14 +59,11 @@ pub fn fingerprint(dir: &Path) -> String {
                 return format!("ver-{ver}");
             }
         }
-    }
-    if let Ok(meta) = std::fs::metadata(dir) {
-        if let Ok(mtime) = meta.modified() {
-            if let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
+    if let Ok(meta) = std::fs::metadata(dir)
+        && let Ok(mtime) = meta.modified()
+            && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH) {
                 return format!("mtime-{}", dur.as_secs());
             }
-        }
-    }
     "unknown".to_string()
 }
 

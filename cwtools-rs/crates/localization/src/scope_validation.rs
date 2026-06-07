@@ -247,19 +247,16 @@ fn validate_jomini_chain(
 
     let mut ctx = build_loc_ctx(data, engine_game, initial_scope);
     let result = ctx.change_scope(seg);
-    match result {
-        ScopeResult::WrongScope {
+    if let ScopeResult::WrongScope {
             command,
             current,
             expected,
-        } => {
-            diags.push(LocCommandDiagnostic::WrongScope {
-                command,
-                current_scope: current.0,
-                expected_scopes: expected.iter().map(|s| s.0).collect(),
-            });
-        }
-        _ => {}
+        } = result {
+        diags.push(LocCommandDiagnostic::WrongScope {
+            command,
+            current_scope: current.0,
+            expected_scopes: expected.iter().map(|s| s.0).collect(),
+        });
     }
 }
 

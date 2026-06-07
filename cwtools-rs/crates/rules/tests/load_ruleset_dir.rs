@@ -41,7 +41,7 @@ fn load_ir_config_dir() {
         ruleset.types.len()
     );
     assert!(
-        ruleset.enums.len() > 0,
+        !ruleset.enums.is_empty(),
         "expected at least one enum, got {}",
         ruleset.enums.len()
     );

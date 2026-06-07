@@ -52,16 +52,16 @@ impl Game {
     /// Default script folders to scan for this game.
     pub fn script_folders(&self) -> &'static [&'static str] {
         match self {
-            Game::Hoi4 => &HOI4_FOLDERS,
-            Game::Stellaris => &STELLARIS_FOLDERS,
-            Game::Eu4 => &EU4_FOLDERS,
-            Game::Ck2 => &CK2_FOLDERS,
-            Game::Ck3 => &CK3_FOLDERS,
-            Game::Vic2 => &VIC2_FOLDERS,
-            Game::Vic3 => &VIC3_FOLDERS,
-            Game::Ir => &IR_FOLDERS,
-            Game::Eu5 => &EU5_FOLDERS,
-            Game::Custom => &CUSTOM_FOLDERS,
+            Game::Hoi4 => HOI4_FOLDERS,
+            Game::Stellaris => STELLARIS_FOLDERS,
+            Game::Eu4 => EU4_FOLDERS,
+            Game::Ck2 => CK2_FOLDERS,
+            Game::Ck3 => CK3_FOLDERS,
+            Game::Vic2 => VIC2_FOLDERS,
+            Game::Vic3 => VIC3_FOLDERS,
+            Game::Ir => IR_FOLDERS,
+            Game::Eu5 => EU5_FOLDERS,
+            Game::Custom => CUSTOM_FOLDERS,
         }
     }
 
@@ -71,31 +71,31 @@ impl Game {
             // HOI4 scopes are loaded from `scopes.cwt` into the runtime
             // ScopeRegistry; there is no hardcoded table.
             Game::Hoi4 => &[],
-            Game::Stellaris => &STELLARIS_SCOPES,
-            Game::Eu4 => &EU4_SCOPES,
-            Game::Ck2 => &CK2_SCOPES,
-            Game::Ck3 => &CK3_SCOPES,
-            Game::Vic2 => &VIC2_SCOPES,
-            Game::Vic3 => &VIC3_SCOPES,
-            Game::Ir => &IR_SCOPES,
-            Game::Eu5 => &EU5_SCOPES,
-            Game::Custom => &CUSTOM_SCOPES,
+            Game::Stellaris => STELLARIS_SCOPES,
+            Game::Eu4 => EU4_SCOPES,
+            Game::Ck2 => CK2_SCOPES,
+            Game::Ck3 => CK3_SCOPES,
+            Game::Vic2 => VIC2_SCOPES,
+            Game::Vic3 => VIC3_SCOPES,
+            Game::Ir => IR_SCOPES,
+            Game::Eu5 => EU5_SCOPES,
+            Game::Custom => CUSTOM_SCOPES,
         }
     }
 
     /// Modifier categories for this game.
     pub fn modifier_categories(&self) -> &'static [ModifierCategory] {
         match self {
-            Game::Hoi4 => &HOI4_MODIFIERS,
-            Game::Stellaris => &STELLARIS_MODIFIERS,
-            Game::Eu4 => &EU4_MODIFIERS,
-            Game::Ck2 => &CK2_MODIFIERS,
-            Game::Ck3 => &CK3_MODIFIERS,
-            Game::Vic2 => &VIC2_MODIFIERS,
-            Game::Vic3 => &VIC3_MODIFIERS,
-            Game::Ir => &IR_MODIFIERS,
-            Game::Eu5 => &EU5_MODIFIERS,
-            Game::Custom => &CUSTOM_MODIFIERS,
+            Game::Hoi4 => HOI4_MODIFIERS,
+            Game::Stellaris => STELLARIS_MODIFIERS,
+            Game::Eu4 => EU4_MODIFIERS,
+            Game::Ck2 => CK2_MODIFIERS,
+            Game::Ck3 => CK3_MODIFIERS,
+            Game::Vic2 => VIC2_MODIFIERS,
+            Game::Vic3 => VIC3_MODIFIERS,
+            Game::Ir => IR_MODIFIERS,
+            Game::Eu5 => EU5_MODIFIERS,
+            Game::Custom => CUSTOM_MODIFIERS,
         }
     }
 }

@@ -13,6 +13,12 @@ pub struct InlineRegistry {
     scripts: HashMap<String, (ParsedFile, StringTable)>,
 }
 
+impl Default for InlineRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InlineRegistry {
     pub fn new() -> Self {
         Self {
@@ -228,7 +234,7 @@ fn clone_and_expand_children(
                 let new_leaf = Leaf {
                     key: new_key,
                     value: new_value,
-                    op: src_leaf.op.clone(),
+                    op: src_leaf.op,
                     pos: src_leaf.pos,
                 };
                 let new_idx = dst_arena.leaves.len() as u32;
@@ -274,7 +280,7 @@ fn clone_and_expand_child_r(
             let new_leaf = Leaf {
                 key: new_key,
                 value: new_value,
-                op: src_leaf.op.clone(),
+                op: src_leaf.op,
                 pos: src_leaf.pos,
             };
             let new_idx = dst_arena.leaves.len() as u32;

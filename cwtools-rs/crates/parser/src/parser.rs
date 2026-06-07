@@ -304,7 +304,7 @@ impl<'a> Parser<'a> {
                 3
             };
             let after = trimmed.as_bytes().get(kw_len).map(|&b| b as char);
-            if after.map_or(true, |c| !c.is_alphanumeric()) {
+            if after.is_none_or(|c| !c.is_alphanumeric()) {
                 let saved = self.pos();
                 let saved_chars = self.chars.clone();
                 if let Some(v) = self.parse_rgb() {
@@ -322,7 +322,7 @@ impl<'a> Parser<'a> {
                 3
             };
             let after = trimmed.as_bytes().get(kw_len).map(|&b| b as char);
-            if after.map_or(true, |c| !c.is_alphanumeric()) {
+            if after.is_none_or(|c| !c.is_alphanumeric()) {
                 let saved = self.pos();
                 let saved_chars = self.chars.clone();
                 if let Some(v) = self.parse_hsv() {
@@ -541,8 +541,8 @@ impl<'a> Parser<'a> {
             }
             // No operator — check for shorthand `key { ... }`
             self.skip_whitespace();
-            if let Some('{') = self.peek() {
-                if let Some(value) = self.parse_clause() {
+            if let Some('{') = self.peek()
+                && let Some(value) = self.parse_clause() {
                     let end = self.pos();
                     let leaf = Leaf {
                         key,
@@ -554,7 +554,6 @@ impl<'a> Parser<'a> {
                     out.push(Child::Leaf(idx));
                     return;
                 }
-            }
             // Not a key=value or shorthand; restore and try leaf-value
             self.chars = saved_chars;
             self.line = saved.line;
@@ -752,7 +751,7 @@ mod tests {
         let table = StringTable::new();
         let result = parse_string(&input, &table).unwrap();
         assert!(!result.root_children.is_empty());
-        assert!(table.len() > 0);
+        assert!(!table.is_empty());
     }
 
     #[test]

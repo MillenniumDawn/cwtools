@@ -76,11 +76,10 @@ impl FileIndex {
             let path = entry.path();
             if path.is_dir() {
                 Self::walk(root, &path, out);
-            } else if let Ok(rel) = path.strip_prefix(root) {
-                if let Some(s) = rel.to_str() {
+            } else if let Ok(rel) = path.strip_prefix(root)
+                && let Some(s) = rel.to_str() {
                     out.insert(s.replace('\\', "/").to_ascii_lowercase());
                 }
-            }
         }
     }
 
@@ -236,14 +235,13 @@ impl TypeIndex {
         for v in self.map.values_mut() {
             v.retain(|(uri, inst)| {
                 let keep = uri != file_uri;
-                if !keep {
-                    if let Some(count) = self.name_counts.get_mut(&inst.name) {
+                if !keep
+                    && let Some(count) = self.name_counts.get_mut(&inst.name) {
                         *count -= 1;
                         if *count == 0 {
                             self.name_counts.remove(&inst.name);
                         }
                     }
-                }
                 keep
             });
         }
@@ -430,8 +428,8 @@ fn collect_skip_root_child(
     match skip_stack {
         [] => {
             // We are at the instance node.
-            if type_key_filter_matches(td, &key) && starts_with_matches(td, &key) {
-                if let Some(name) =
+            if type_key_filter_matches(td, &key) && starts_with_matches(td, &key)
+                && let Some(name) =
                     instance_name_from_children(td, &key, clause_children, arena, table)
                 {
                     out.push(TypeInstance {
@@ -442,7 +440,6 @@ fn collect_skip_root_child(
                         },
                     });
                 }
-            }
         }
         [head, tail @ ..] => {
             // Must match the skip-root layer; then descend into children.
@@ -731,9 +728,9 @@ fn scan_node_for_varset(
                         RuleType::LeafRule {
                             right: NewField::VariableSetField(ns),
                             ..
-                        } => {
+                        }
                             // Value is the defined name
-                            if !val.is_empty() {
+                            if !val.is_empty() => {
                                 out.entry(ns.clone()).or_default().push(DefinedVariable {
                                     name: val.clone(),
                                     namespace: Some(ns.clone()),
@@ -743,7 +740,6 @@ fn scan_node_for_varset(
                                     },
                                 });
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -916,8 +912,8 @@ fn collect_event_targets_rec(
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
                 let val = leaf_value_string(&leaf.value, table);
 
-                if key == "save_event_target_as" || key == "save_global_event_target_as" {
-                    if !val.is_empty() {
+                if (key == "save_event_target_as" || key == "save_global_event_target_as")
+                    && !val.is_empty() {
                         out.push(SavedEventTarget {
                             name: val,
                             location: SourceLocation {
@@ -927,7 +923,6 @@ fn collect_event_targets_rec(
                             is_global: key == "save_global_event_target_as",
                         });
                     }
-                }
 
                 if let Value::Clause(ch) = &leaf.value {
                     collect_event_targets_rec(ch, arena, table, out);
@@ -1026,11 +1021,10 @@ fn find_element_in_children(
                 if pos_in_range(target, &leaf.pos) {
                     let key = table.get_string(leaf.key.normal).unwrap_or_default();
                     let value = leaf_value_string(&leaf.value, table);
-                    if let Value::Clause(ch) = &leaf.value {
-                        if let Some(inner) = find_element_in_children(ch, arena, target, table) {
+                    if let Value::Clause(ch) = &leaf.value
+                        && let Some(inner) = find_element_in_children(ch, arena, target, table) {
                             return Some(inner);
                         }
-                    }
                     return Some(PositionElement::Leaf { key, value });
                 }
             }
@@ -1133,13 +1127,12 @@ fn find_pos_in_children(
                     let key = table.get_string(leaf.key.normal).unwrap_or_default();
                     let value = leaf_value_string(&leaf.value, table);
                     // If value is a clause, try to recurse into it
-                    if let Value::Clause(ch) = &leaf.value {
-                        if let Some(inner) =
+                    if let Value::Clause(ch) = &leaf.value
+                        && let Some(inner) =
                             find_pos_in_children(ch, arena, target, table, ruleset, logical_path)
                         {
                             return Some(inner);
                         }
-                    }
                     let hint = classify_leaf_value(&key, &value, ruleset, logical_path, table);
                     return Some(PositionInfo {
                         location: SourceLocation {
@@ -1223,52 +1216,48 @@ fn classify_leaf_value(
         };
 
         // Only try path-matching type rules
-        if let cwtools_rules::rules_types::RootRule::TypeRule(..) = root_rule {
-            if let Some(&idx) = ruleset.type_by_name.get(name) {
+        if let cwtools_rules::rules_types::RootRule::TypeRule(..) = root_rule
+            && let Some(&idx) = ruleset.type_by_name.get(name) {
                 let td = &ruleset.types[idx];
                 if !check_path_dir(&td.path_options, logical_path) {
                     continue;
                 }
             }
-        }
 
         for (inner_rule, _) in rules {
-            match inner_rule {
-                RuleType::LeafRule { left, right } => {
-                    let left_matches = match left {
-                        NewField::SpecificField(k) => k.eq_ignore_ascii_case(key),
-                        _ => false,
-                    };
-                    if !left_matches {
-                        continue;
-                    }
-                    match right {
-                        NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)) => {
-                            return ReferenceHint::TypeRef {
-                                type_name: t.clone(),
-                                value: value.to_string(),
-                            };
-                        }
-                        NewField::ValueField(cwtools_rules::rules_types::ValueType::Enum(e)) => {
-                            return ReferenceHint::EnumRef {
-                                enum_name: e.clone(),
-                                value: value.to_string(),
-                            };
-                        }
-                        NewField::LocalisationField { .. } => {
-                            return ReferenceHint::LocRef {
-                                key: value.to_string(),
-                            };
-                        }
-                        NewField::FilepathField { .. } => {
-                            return ReferenceHint::FileRef {
-                                path: value.to_string(),
-                            };
-                        }
-                        _ => {}
-                    }
+            if let RuleType::LeafRule { left, right } = inner_rule {
+                let left_matches = match left {
+                    NewField::SpecificField(k) => k.eq_ignore_ascii_case(key),
+                    _ => false,
+                };
+                if !left_matches {
+                    continue;
                 }
-                _ => {}
+                match right {
+                    NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)) => {
+                        return ReferenceHint::TypeRef {
+                            type_name: t.clone(),
+                            value: value.to_string(),
+                        };
+                    }
+                    NewField::ValueField(cwtools_rules::rules_types::ValueType::Enum(e)) => {
+                        return ReferenceHint::EnumRef {
+                            enum_name: e.clone(),
+                            value: value.to_string(),
+                        };
+                    }
+                    NewField::LocalisationField { .. } => {
+                        return ReferenceHint::LocRef {
+                            key: value.to_string(),
+                        };
+                    }
+                    NewField::FilepathField { .. } => {
+                        return ReferenceHint::FileRef {
+                            path: value.to_string(),
+                        };
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1315,6 +1304,12 @@ pub struct InfoService {
     pub all_event_targets: HashSet<String>,
     pub all_variables: HashSet<String>,
     pub all_inline_scripts: HashSet<String>,
+}
+
+impl Default for InfoService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InfoService {
@@ -1598,8 +1593,8 @@ impl InfoService {
                     }
                 }
 
-                if key == "save_event_target_as" || key == "save_global_event_target_as" {
-                    if !value_str.is_empty() {
+                if (key == "save_event_target_as" || key == "save_global_event_target_as")
+                    && !value_str.is_empty() {
                         info.saved_event_targets_detailed.push(SavedEventTarget {
                             name: value_str.clone(),
                             location: SourceLocation {
@@ -1609,10 +1604,9 @@ impl InfoService {
                             is_global: key == "save_global_event_target_as",
                         });
                     }
-                }
 
-                if key == "inline_script" {
-                    if let Value::Clause(children) = &leaf.value {
+                if key == "inline_script"
+                    && let Value::Clause(children) = &leaf.value {
                         for c in children {
                             if let Child::Leaf(script_idx) = c {
                                 let script_leaf = &arena.leaves[*script_idx as usize];
@@ -1633,7 +1627,6 @@ impl InfoService {
                             }
                         }
                     }
-                }
 
                 if key == "effect" || key.ends_with("_effect") {
                     info.effect_blocks.push(SourceLocation {
@@ -1773,7 +1766,7 @@ mod tests {
         let rs = make_ruleset_with_type(td);
 
         let result = collect_type_instances(&rs, &parsed, "events/my_events.txt", &table);
-        assert!(result.get("ethoses").map_or(true, |v| v.is_empty()));
+        assert!(result.get("ethoses").is_none_or(|v| v.is_empty()));
     }
 
     /// skip_root_key = AnyKey: grandchildren are the instances.

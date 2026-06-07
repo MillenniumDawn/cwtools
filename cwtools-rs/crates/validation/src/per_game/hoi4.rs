@@ -93,8 +93,7 @@ fn walk(
         if let Some((_, default)) = REDUNDANT_DEFAULT_FIELDS
             .iter()
             .find(|(k, _)| *k == block.key.as_str())
-        {
-            if sole_always_value(block.children, ast, table) == Some(*default) {
+            && sole_always_value(block.children, ast, table) == Some(*default) {
                 errors.push(ValidationError {
                     message: error_codes::CW280_REDUNDANT_DEFAULT_FIELD.format(&[&block.key]),
                     severity: error_codes::CW280_REDUNDANT_DEFAULT_FIELD.severity,
@@ -104,7 +103,6 @@ fn walk(
                     code: Some(error_codes::CW280_REDUNDANT_DEFAULT_FIELD.id.to_string()),
                 });
             }
-        }
 
         walk(block.children, ast, table, file_path, errors);
     }
