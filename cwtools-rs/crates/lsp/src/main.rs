@@ -2290,6 +2290,13 @@ impl Backend {
         // expand against the full instance list).
         self.rebuild_modifier_keys();
 
+        // Pass 1 just dropped every file's parsed AST; glibc may still be
+        // holding onto the heap pages. Trim now so the loc service's ~2M-entry
+        // allocation in rebuild_and_publish_loc doesn't sit on top of pages
+        // we're never going to touch again.
+        cwtools_profiling::trim_memory();
+        cwtools_profiling::log_rss("scan: post-index trim");
+
         // Build the loc-key index (workspace + vanilla) so pass 2's config
         // validation can check LocalisationField references (CW100/CW122), and
         // publish loc-file diagnostics (CW225 etc.) for the workspace loc files.
@@ -2409,34 +2416,44 @@ impl Backend {
             loc_dirs.push(v);
         }
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
-        let service = cwtools_localization::LocService::from_folders(&dir_refs);
         let loc_languages = self.state.loc_languages.lock().clone();
-        let loc_index = cwtools_localization::LocIndex::build_scoped(
-            &service,
-            loc_game,
-            loc_languages.as_deref(),
-        );
+
+        // Build the index and collect per-file diagnostics in one block, then
+        // drop the LocService before the index is published. The service holds
+        // the full per-file loc ASTs (~2M entries on Millennium Dawn); keeping
+        // it alive while we also hold the lowercased key set in LocIndex
+        // pushes peak RSS by hundreds of MiB for no reason. After the block
+        // closes only LocIndex (keys) and the diagnostic map survive.
+        let root_str = root_path.to_string_lossy().to_string();
+        let (loc_index, mut by_file) = {
+            let service = cwtools_localization::LocService::from_folders(&dir_refs);
+            let idx = cwtools_localization::LocIndex::build_scoped(
+                &service,
+                loc_game,
+                loc_languages.as_deref(),
+            );
+            let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
+            for d in cwtools_localization::validate_loc_project_scoped(
+                &service,
+                loc_game,
+                loc_languages.as_deref(),
+            ) {
+                if !d.file.starts_with(&root_str) {
+                    continue;
+                }
+                let ve = loc_diag_to_validation_error(&d);
+                by_file
+                    .entry(d.file.clone())
+                    .or_default()
+                    .push(validation_error_to_diagnostic(&ve));
+            }
+            (idx, by_file)
+        };
         *self.state.loc_index.write() = Some(loc_index);
 
         // Publish per-file loc diagnostics, but only for workspace loc files
         // (not vanilla). Group by file so each gets a complete diagnostic set.
-        let root_str = root_path.to_string_lossy().to_string();
-        let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
-        for d in cwtools_localization::validate_loc_project_scoped(
-            &service,
-            loc_game,
-            loc_languages.as_deref(),
-        ) {
-            if !d.file.starts_with(&root_str) {
-                continue;
-            }
-            let ve = loc_diag_to_validation_error(&d);
-            by_file
-                .entry(d.file.clone())
-                .or_default()
-                .push(validation_error_to_diagnostic(&ve));
-        }
-        for (file, diags) in by_file {
+        for (file, diags) in by_file.drain() {
             let uri = format!("file://{}", file);
             if let Ok(uri_obj) = Url::parse(&uri) {
                 self.client.publish_diagnostics(uri_obj, diags, None).await;
