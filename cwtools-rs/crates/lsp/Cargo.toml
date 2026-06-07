@@ -17,6 +17,7 @@ cwtools_validation = { workspace = true }
 cwtools_info = { workspace = true }
 cwtools_game = { workspace = true }
 cwtools_localization = { workspace = true }
+cwtools_cache = { workspace = true }
 cwtools_profiling = { workspace = true }
 tower-lsp = { workspace = true }
 tokio = { workspace = true, features = ["time"] }

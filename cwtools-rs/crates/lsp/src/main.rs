@@ -22,6 +22,7 @@ use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{ValidationError, validate_ast_with_loc};
 
 mod symbols;
+mod workspace_cache;
 
 /// Build the set of valid modifier names for `alias_name[modifier]` slots from the
 /// ruleset's `modifiers = { ... }` block. Templated entries like
@@ -2233,16 +2234,71 @@ impl Backend {
             )
             .await;
 
+        // Resolve the parse-cache directory and settings fingerprint. The
+        // fingerprint encodes the game, ruleset shape, and workspace root so
+        // stale caches are cleared automatically when any of those change.
+        let (cache_info, cache_was_valid) = {
+            let cache_dir = self.state.cache_dir.lock().clone();
+            match cache_dir {
+                Some(cd) => {
+                    let language = self.state.language.lock().clone();
+                    let ruleset_snap = self.state.ruleset.lock().clone();
+                    let fp = match ruleset_snap {
+                        Some(ref rs) => {
+                            workspace_cache::settings_fingerprint(&language, rs, &root_path)
+                        }
+                        None => workspace_cache::settings_fingerprint(
+                            &language,
+                            &RuleSet::new(),
+                            &root_path,
+                        ),
+                    };
+                    let valid = workspace_cache::validate_or_clear(&cd, fp);
+                    (Some((cd, fp)), valid)
+                }
+                None => (None, true),
+            }
+        };
+        self.client
+            .log_message(
+                MessageType::INFO,
+                if cache_was_valid {
+                    "Parse cache: hit (settings match)"
+                } else {
+                    "Parse cache: settings changed, cleared"
+                },
+            )
+            .await;
+
         // Pass 1: parse + index every file (types, scripted triggers/effects,
         // modifiers) so cross-file references resolve before any file is
-        // validated. The parsed AST is dropped right after indexing — pass 2
-        // re-parses. Holding all 7413 ASTs+texts resident cost ~2.5 GB on MD;
-        // a second parse is far cheaper than that footprint.
+        // validated. On a cache hit the AST is deserialized instead of parsed.
         self.send_loading_bar(true, "Indexing workspace…").await;
+        let mut cache_hits = 0u64;
+        let mut cache_misses = 0u64;
         for (i, file_path) in files_to_validate.iter().enumerate() {
             let uri = format!("file://{}", file_path.display());
             if let Ok(text) = std::fs::read_to_string(file_path) {
-                self.index_document(&uri, &text).await;
+                // Try the parse cache first.
+                if let Some((ref cd, fp)) = cache_info
+                    && let Some(parsed) =
+                        workspace_cache::load(cd, fp, &text, &self.state.string_table)
+                {
+                    self.index_parsed_file(&uri, &parsed);
+                    cache_hits += 1;
+                    if i % 50 == 49 {
+                        tokio::task::yield_now().await;
+                    }
+                    continue;
+                }
+                // Cache miss — parse from scratch and index.
+                if let Some(parsed) = self.index_document(&uri, &text).await {
+                    // Persist to cache for the next scan.
+                    if let Some((ref cd, fp)) = cache_info {
+                        workspace_cache::store(cd, fp, &text, &parsed, &self.state.string_table);
+                    }
+                    cache_misses += 1;
+                }
             }
             // Yield every 50 files so LSP requests (hover, completion) can
             // interleave with the workspace scan.
@@ -2250,6 +2306,16 @@ impl Backend {
                 tokio::task::yield_now().await;
             }
         }
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "Indexing pass: {} cache hits, {} misses",
+                    cache_hits, cache_misses
+                ),
+            )
+            .await;
 
         // Build the base-game index from a `vanilla` dir (or auto-discovery) if
         // we have one and haven't indexed it yet. Populates `vanilla_index`.
@@ -2279,12 +2345,10 @@ impl Backend {
         // publish loc-file diagnostics (CW225 etc.) for the workspace loc files.
         self.rebuild_and_publish_loc(&root_path).await;
 
-        // Pass 2: re-parse and validate each file against the now-complete
-        // index, then drop the AST. Diagnostics are published to the editor;
-        // the file is intentionally NOT stored in `self.state.documents`. That
-        // map holds only files the editor has open (populated by did_open) — the
-        // scan used to insert every workspace file there, pinning all texts+ASTs
-        // in memory for the whole session.
+        // Pass 2: validate each file against the now-complete index, then drop
+        // the AST. On a cache hit the AST is deserialized instead of parsed.
+        // Diagnostics are published to the editor; the file is intentionally NOT
+        // stored in `self.state.documents`.
         self.send_loading_bar(true, "Validating workspace…").await;
         let mut total_errors = 0usize;
         let total_files = files_to_validate.len();
@@ -2296,8 +2360,24 @@ impl Backend {
             let Ok(text) = std::fs::read_to_string(file_path) else {
                 continue;
             };
-            let Ok(parsed) = parse_string(&text, &self.state.string_table) else {
-                continue;
+            // Try cache first, fall back to parsing.
+            let parsed = if let Some((ref cd, fp)) = cache_info {
+                workspace_cache::load(cd, fp, &text, &self.state.string_table)
+            } else {
+                None
+            };
+            let parsed = match parsed {
+                Some(p) => p,
+                None => {
+                    let Ok(p) = parse_string(&text, &self.state.string_table) else {
+                        continue;
+                    };
+                    // Persist to cache for the next scan.
+                    if let Some((ref cd, fp)) = cache_info {
+                        workspace_cache::store(cd, fp, &text, &p, &self.state.string_table);
+                    }
+                    p
+                }
             };
             let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys_snap);
             total_errors += diagnostics
@@ -2436,10 +2516,18 @@ impl Backend {
     /// a file validated early can't see definitions that live in later files.
     async fn index_document(&self, uri: &str, text: &str) -> Option<ParsedFile> {
         let parsed = parse_string(text, &self.state.string_table).ok()?;
+        self.index_parsed_file(uri, &parsed);
+        Some(parsed)
+    }
+
+    /// Index an already-parsed AST into the symbol + info indexes. Extracted
+    /// from `index_document` so the workspace scan can index cache-hit ASTs
+    /// without re-parsing.
+    fn index_parsed_file(&self, uri: &str, parsed: &ParsedFile) {
         {
             let mut index = self.state.symbol_index.lock();
             index.clear_document(uri);
-            index.index_document(uri, &parsed, &self.state.string_table);
+            index.index_document(uri, parsed, &self.state.string_table);
         }
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(uri, &ws_uri);
@@ -2449,13 +2537,12 @@ impl Backend {
         if let Some(ruleset) = ruleset_guard.as_ref() {
             info.index_file_with_path(
                 uri,
-                &parsed,
+                parsed,
                 &self.state.string_table,
                 ruleset,
                 &logical_path,
             );
         }
-        Some(parsed)
     }
 
     /// Validate an already-parsed document against the (already-built) workspace
