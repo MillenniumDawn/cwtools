@@ -259,6 +259,83 @@ mod tests {
         assert!(load(tmp.path(), fp, text, &table).is_none());
     }
 
+    /// Cold (parse + store) vs warm (deserialize) over the real Millennium Dawn
+    /// corpus. The cache only earns its keep if `load` beats `parse_string`.
+    ///
+    /// Ignored by default (needs the MD mod on disk + is slow). Run with:
+    ///   cargo test -p cwtools_lsp --bin cwtools-server -- \
+    ///     --ignored --nocapture bench_parse_cache_vs_parse
+    #[test]
+    #[ignore]
+    fn bench_parse_cache_vs_parse() {
+        use std::time::Instant;
+
+        let root = Path::new("/mnt/Linux/Millennium-Dawn");
+        if !root.exists() {
+            eprintln!("SKIP: {} not present", root.display());
+            return;
+        }
+        let mut files = Vec::new();
+        for sub in ["common", "events", "history"] {
+            collect_txt(&root.join(sub), &mut files);
+        }
+        let texts: Vec<String> = files
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect();
+        eprintln!("corpus: {} readable .txt files", texts.len());
+
+        let table = StringTable::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let fp = 0xabc;
+        validate_or_clear(tmp.path(), fp);
+
+        // Cold pass: parse + persist.
+        let t0 = Instant::now();
+        let mut parsed_ok = 0usize;
+        for text in &texts {
+            if let Ok(parsed) = parse_string(text, &table) {
+                store(tmp.path(), fp, text, &parsed, &table);
+                parsed_ok += 1;
+            }
+        }
+        let cold = t0.elapsed();
+
+        // Warm pass: deserialize from cache.
+        let t1 = Instant::now();
+        let mut hits = 0usize;
+        for text in &texts {
+            if load(tmp.path(), fp, text, &table).is_some() {
+                hits += 1;
+            }
+        }
+        let warm = t1.elapsed();
+
+        eprintln!(
+            "cold parse+store: {:.3}s ({} parsed)\nwarm load:        {:.3}s ({} hits)\nspeedup: {:.2}x",
+            cold.as_secs_f64(),
+            parsed_ok,
+            warm.as_secs_f64(),
+            hits,
+            cold.as_secs_f64() / warm.as_secs_f64().max(1e-9),
+        );
+        assert!(hits > 0, "expected cache hits on the warm pass");
+    }
+
+    fn collect_txt(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_txt(&p, out);
+            } else if p.extension().is_some_and(|e| e == "txt") {
+                out.push(p);
+            }
+        }
+    }
+
     #[test]
     fn different_fingerprint_uses_separate_cache() {
         let tmp = tempfile::tempdir().unwrap();
