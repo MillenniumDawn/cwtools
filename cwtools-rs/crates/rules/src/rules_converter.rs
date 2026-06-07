@@ -1423,11 +1423,9 @@ fn process_type_node(
                                 let lv = &ast.arena.leaf_values[*lvidx as usize];
                                 let v = value_to_string(&lv.value, table);
                                 if !v.is_empty() {
-                                    if v == "any" {
-                                        block_keys.push(v);
-                                    } else {
-                                        block_keys.push(v);
-                                    }
+                                    // `any` flows through as a literal key here; any
+                                    // wildcard semantics live in the matcher.
+                                    block_keys.push(v);
                                 }
                             }
                         }

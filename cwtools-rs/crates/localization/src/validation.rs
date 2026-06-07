@@ -58,10 +58,9 @@ pub fn validate_loc_file(
 
     for entry in &file.entries {
         // ---- Invalid characters ----
-        if let Some(pos) = validate_invalid_chars(entry, &mut errors) {
-            // pos not used currently, but reserved for future diagnostics
-            pos;
-        }
+        // Return value (position) is reserved for future diagnostics; the call
+        // pushes into `errors` for its side effect.
+        let _ = validate_invalid_chars(entry, &mut errors);
 
         // ---- Quote balancing ----
         if !validate_quotes(entry) {
@@ -188,16 +187,10 @@ pub fn validate_quotes(entry: &LocEntry) -> bool {
     let starts = effective.starts_with('"');
     let ends = effective.ends_with('"');
 
-    if starts && ends {
-        true
-    } else if !starts && !ends {
-        true
-    } else {
-        // Unbalanced quotes -> CW268. (No mutation: the caller already ran the
-        // invalid-char check that reads `error_range`, so a write here would be
-        // dead anyway.)
-        false
-    }
+    // Balanced when both ends quote or neither does; mismatch -> CW268. (No
+    // mutation here: the caller already ran the invalid-char check that reads
+    // `error_range`, so a write would be dead anyway.)
+    starts == ends
 }
 
 /// Check for `REPLACE_ME` / `TODO_CD` placeholder values.
@@ -256,7 +249,7 @@ mod tests {
     #[test]
     fn test_validate_undefined_ref() {
         let text = "l_english:\n key1: \"Hello $undefined_key$\"\n";
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let file = parse_loc_text(text, "test.yml").unwrap();
         let keys: HashSet<String> = HashSet::new();
         let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
 
@@ -273,7 +266,7 @@ mod tests {
     #[test]
     fn test_validate_recursive_ref() {
         let text = "l_english:\n key1: \"Hello $key1$\"\n";
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let file = parse_loc_text(text, "test.yml").unwrap();
         let mut keys = HashSet::new();
         keys.insert("key1".to_string());
         let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
@@ -285,7 +278,7 @@ mod tests {
     #[test]
     fn test_validate_valid_ref() {
         let text = "l_english:\n key1: \"Hello $key2$\"\n";
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let file = parse_loc_text(text, "test.yml").unwrap();
         let mut keys = HashSet::new();
         keys.insert("key2".to_string());
         let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
@@ -296,7 +289,7 @@ mod tests {
     #[test]
     fn test_validate_replace_me() {
         let text = "l_english:\n key1: \"REPLACE_ME\"\n";
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let file = parse_loc_text(text, "test.yml").unwrap();
         let keys: HashSet<String> = HashSet::new();
 
         let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
@@ -308,7 +301,7 @@ mod tests {
     #[test]
     fn test_hardcoded_refs_ignored() {
         let text = "l_english:\n key1: \"Hello $Player$\"\n";
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let file = parse_loc_text(text, "test.yml").unwrap();
         let keys: HashSet<String> = HashSet::new();
         let errors = validate_loc_file(&file, &keys, &["Player"]);
 
@@ -320,7 +313,7 @@ mod tests {
         // U+FFFE is outside all allowed ranges and should trigger CW-LocInvalidChars
         let bad_char = '\u{FFFE}';
         let text = format!("l_english:\n key1: \"Hello {}world\"\n", bad_char);
-        let mut file = parse_loc_text(&text, "test.yml").unwrap();
+        let file = parse_loc_text(&text, "test.yml").unwrap();
 
         // error_range should be set by the parser
         assert!(
@@ -346,7 +339,7 @@ mod tests {
     fn test_valid_chars_no_error() {
         // Normal ASCII and Latin Extended chars should not trigger the check
         let text = "l_english:\n key1: \"Hello world — café\"\n";
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let file = parse_loc_text(text, "test.yml").unwrap();
 
         assert!(
             file.entries[0].error_range.is_none(),
@@ -371,7 +364,7 @@ mod tests {
     fn test_recursive_ref_case_insensitive() {
         // key "KEY1" references "$key1$" — different case, should still be recursive
         let text = "l_english:\n KEY1: \"Hello $key1$\"\n";
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let file = parse_loc_text(text, "test.yml").unwrap();
         let mut keys = HashSet::new();
         keys.insert("key1".to_string()); // stored lowercased in union
         let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
