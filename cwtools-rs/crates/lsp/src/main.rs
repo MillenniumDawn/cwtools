@@ -255,6 +255,15 @@ struct DocumentState {
     /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
     /// into the latest one instead of stacking up and double-validating.
     edit_generation: AtomicU64,
+    /// Extra filename glob patterns to skip during the workspace scan (on top
+    /// of the engine baseline like Changelog.txt / README.md). Sourced from
+    /// `ignoreFilePatterns` in `initializationOptions` and the
+    /// `workspace/didChangeConfiguration` payload.
+    ignore_file_patterns: parking_lot::RwLock<Vec<String>>,
+    /// Extra directory glob patterns to skip during the workspace scan. Sourced
+    /// from `ignoreDirectories` in `initializationOptions` and
+    /// `workspace/didChangeConfiguration`.
+    ignore_dir_patterns: parking_lot::RwLock<Vec<String>>,
 }
 
 struct ParsedDoc {
@@ -282,6 +291,8 @@ impl DocumentState {
             loc_languages: Mutex::new(None),
             cache_dir: Mutex::new(None),
             edit_generation: AtomicU64::new(0),
+            ignore_file_patterns: parking_lot::RwLock::new(Vec::new()),
+            ignore_dir_patterns: parking_lot::RwLock::new(Vec::new()),
         }
     }
 }
@@ -313,6 +324,69 @@ impl Backend {
 }
 
 // ── Hover helpers ─────────────────────────────────────────────────────────────
+
+/// Pull `ignoreFilePatterns` and `ignoreDirectories` arrays out of a
+/// `serde_json::Value` (the `initializationOptions` payload and the
+/// `workspace/didChangeConfiguration` payload share the same shape).
+/// Returns the two lists. Filters non-string and empty entries.
+fn extract_ignore_patterns(opts: &Value) -> (Vec<String>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    if let Some(arr) = opts.get("ignoreFilePatterns").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    files.push(s.to_string());
+                }
+            }
+        }
+    }
+    if let Some(arr) = opts.get("ignoreDirectories").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    dirs.push(s.to_string());
+                }
+            }
+        }
+    }
+    (files, dirs)
+}
+
+/// Tiny glob match supporting `*` (any chars) and `?` (single char), matching
+/// the semantics of `cwtools_file_manager::glob_match`. Kept inline to avoid a
+/// new public re-export from the file_manager crate.
+fn lsp_glob_match(pattern: &str, text: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if suffix.is_empty() {
+            return true;
+        }
+        return text.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return text.starts_with(prefix);
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (m, n) = (p.len(), t.len());
+    let mut dp = vec![vec![false; n + 1]; m + 1];
+    dp[0][0] = true;
+    for i in 1..=m {
+        if p[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=m {
+        for j in 1..=n {
+            if p[i - 1] == '*' {
+                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+            } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1];
+            }
+        }
+    }
+    dp[m][n]
+}
 
 /// Derive the logical path (relative to mod root) from a file:// URI and the
 /// workspace root URI.  Falls back to the raw path if the workspace prefix
@@ -1185,6 +1259,31 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Per-workspace ignore globs from the extension. The extension
+        // forwards `cwtools.ignore.filePatterns` and `cwtools.ignore.directories`
+        // into initializationOptions on first launch; runtime updates come
+        // through `workspace/didChangeConfiguration` and re-apply the same
+        // helper. We layer these on top of the engine's hard-coded baseline
+        // (Changelog.txt, README.*, LICENSE.*, *.md) — user patterns extend,
+        // they don't replace.
+        if let Some(opts) = &params.initialization_options {
+            let (files, dirs) = extract_ignore_patterns(opts);
+            if !files.is_empty() || !dirs.is_empty() {
+                *self.state.ignore_file_patterns.write() = files;
+                *self.state.ignore_dir_patterns.write() = dirs;
+                self.client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "ignore patterns: {} files, {} dirs (engine defaults still apply)",
+                            self.state.ignore_file_patterns.read().len(),
+                            self.state.ignore_dir_patterns.read().len(),
+                        ),
+                    )
+                    .await;
+            }
+        }
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -1244,6 +1343,27 @@ impl LanguageServer for Backend {
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Re-read ignore globs when the extension's `cwtools.ignore.*` settings
+    /// change. The shape mirrors what we accept in `initializationOptions`:
+    /// the payload is the `cwtools` namespace object, with optional
+    /// `ignoreFilePatterns` and `ignoreDirectories` arrays. The next
+    /// full-workspace scan will pick up the new values; an in-flight scan
+    /// finishes with the snapshot it took.
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        // The client may send either the whole `cwtools` section (when the
+        // section is registered via `configurationSection`) or just the
+        // changed slice. `extract_ignore_patterns` looks for the same two
+        // keys at the top level — works in both cases.
+        let (files, dirs) = extract_ignore_patterns(&params.settings);
+        *self.state.ignore_file_patterns.write() = files;
+        *self.state.ignore_dir_patterns.write() = dirs;
+        tracing::info!(
+            file_globs = self.state.ignore_file_patterns.read().len(),
+            dir_globs = self.state.ignore_dir_patterns.read().len(),
+            "ignore patterns updated via didChangeConfiguration"
+        );
     }
 
     // --- Text document sync ---
@@ -2195,41 +2315,78 @@ impl Backend {
 
         let extensions: Vec<&str> = vec!["txt", "gui", "gfx", "sfx", "asset", "map"];
 
+        // Snapshot the user-configured ignore globs once for the whole walk.
+        // The engine's hard-coded baseline (Changelog.txt, README.*, *.md)
+        // is layered on top inside the walker closure so it can't be
+        // accidentally cleared by a user who sets an empty list.
+        let extra_file_globs = self.state.ignore_file_patterns.read().clone();
+        let extra_dir_globs = self.state.ignore_dir_patterns.read().clone();
+
         let mut files_to_validate = Vec::new();
         fn walk_dir(
             path: &std::path::Path,
             extensions: &[&str],
+            extra_file_globs: &[String],
+            extra_dir_globs: &[String],
             out: &mut Vec<std::path::PathBuf>,
         ) {
             if let Ok(entries) = std::fs::read_dir(path) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() {
-                        let name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("")
-                            .to_lowercase();
+                        let raw_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        let lower_name = raw_name.to_lowercase();
                         let skip = matches!(
-                            name.as_str(),
+                            lower_name.as_str(),
                             ".git" | "node_modules" | "out" | "dist" | "target" | "bin" | "obj"
                             // `resources/` is a developer scratch area in many mods,
                             // not a path the game loads — don't validate it.
                             | "resources" | ".vscode"
-                        );
+                        ) || extra_dir_globs
+                            .iter()
+                            .any(|pat| lsp_glob_match(pat, raw_name));
                         if !skip {
-                            walk_dir(&path, extensions, out);
+                            walk_dir(&path, extensions, extra_file_globs, extra_dir_globs, out);
                         }
                     } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if extensions.contains(&ext) {
-                            out.push(path);
+                        if !extensions.contains(&ext) {
+                            continue;
                         }
+                        // Engine baseline for free-form text files. These are
+                        // NOT in the user globs (which only extend), so
+                        // Changelog.txt / README.* / LICENSE.* / *.md always
+                        // get skipped here even if the user sends an empty
+                        // `ignoreFilePatterns` list.
+                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        let engine_skip = matches!(
+                            file_name,
+                            "Changelog.txt"
+                                | "README.txt"
+                                | "LICENSE.txt"
+                                | "README.md"
+                                | "LICENSE.md"
+                        ) || file_name.to_ascii_lowercase().ends_with(".md");
+                        if engine_skip {
+                            continue;
+                        }
+                        if extra_file_globs
+                            .iter()
+                            .any(|pat| lsp_glob_match(pat, file_name))
+                        {
+                            continue;
+                        }
+                        out.push(path);
                     }
                 }
             }
         }
-        let ext_slice: &[&str] = &extensions;
-        walk_dir(&root_path, ext_slice, &mut files_to_validate);
+        walk_dir(
+            &root_path,
+            &extensions,
+            &extra_file_globs,
+            &extra_dir_globs,
+            &mut files_to_validate,
+        );
 
         if files_to_validate.is_empty() {
             self.client
@@ -2251,15 +2408,20 @@ impl Backend {
 
         // Pass 1: parse + index every file (types, scripted triggers/effects,
         // modifiers) so cross-file references resolve before any file is
-        // validated. The parsed AST is dropped right after indexing — pass 2
-        // re-parses. Holding all 7413 ASTs+texts resident cost ~2.5 GB on MD;
-        // a second parse is far cheaper than that footprint.
+        // validated. The parsed ASTs are kept resident in `parsed_files` and
+        // handed to pass 2 — re-parsing 7413 files in pass 2 cost ~4-6s on MD
+        // and produced no observable benefit, just CPU and allocator churn.
+        // The total resident set between the two passes is bounded by what the
+        // loc service allocates next, so peak RSS doesn't grow meaningfully.
         self.send_loading_bar(true, "Indexing workspace…").await;
+        let mut parsed_files: Vec<Option<ParsedFile>> = Vec::with_capacity(files_to_validate.len());
         for (i, file_path) in files_to_validate.iter().enumerate() {
             let uri = format!("file://{}", file_path.display());
-            if let Ok(text) = std::fs::read_to_string(file_path) {
-                self.index_document(&uri, &text).await;
-            }
+            let parsed = match std::fs::read_to_string(file_path) {
+                Ok(text) => self.index_document(&uri, &text).await,
+                Err(_) => None,
+            };
+            parsed_files.push(parsed);
             // Yield every 50 files so LSP requests (hover, completion) can
             // interleave with the workspace scan.
             if i % 50 == 49 {
@@ -2290,32 +2452,41 @@ impl Backend {
         // expand against the full instance list).
         self.rebuild_modifier_keys();
 
+        // Pass 1 just dropped every file's parsed AST; glibc may still be
+        // holding onto the heap pages. Trim now so the loc service's ~2M-entry
+        // allocation in rebuild_and_publish_loc doesn't sit on top of pages
+        // we're never going to touch again.
+        cwtools_profiling::trim_memory();
+        cwtools_profiling::log_rss("scan: post-index trim");
+
         // Build the loc-key index (workspace + vanilla) so pass 2's config
         // validation can check LocalisationField references (CW100/CW122), and
         // publish loc-file diagnostics (CW225 etc.) for the workspace loc files.
         self.rebuild_and_publish_loc(&root_path).await;
 
-        // Pass 2: re-parse and validate each file against the now-complete
-        // index, then drop the AST. Diagnostics are published to the editor;
-        // the file is intentionally NOT stored in `self.state.documents`. That
-        // map holds only files the editor has open (populated by did_open) — the
-        // scan used to insert every workspace file there, pinning all texts+ASTs
-        // in memory for the whole session.
+        // Pass 2: validate each file against the now-complete index using
+        // the ASTs we already parsed in pass 1. Diagnostics are published to
+        // the editor; the file is intentionally NOT stored in
+        // `self.state.documents`. That map holds only files the editor has
+        // open (populated by did_open) — the scan used to insert every
+        // workspace file there, pinning all texts+ASTs in memory for the
+        // whole session.
         self.send_loading_bar(true, "Validating workspace…").await;
         let mut total_errors = 0usize;
         let total_files = files_to_validate.len();
         // Snapshot modifier_keys once before the loop; the set doesn't change
         // during validation and we can't hold the guard across await points.
         let modifier_keys_snap: HashSet<String> = self.state.modifier_keys.read().clone();
-        for (i, file_path) in files_to_validate.iter().enumerate() {
+        for (i, (file_path, parsed_opt)) in
+            files_to_validate.iter().zip(parsed_files.iter()).enumerate()
+        {
+            // Skip files that failed to parse in pass 1 (matches the previous
+            // `continue` on parse error in the re-parse path).
+            let Some(parsed) = parsed_opt else {
+                continue;
+            };
             let uri = format!("file://{}", file_path.display());
-            let Ok(text) = std::fs::read_to_string(file_path) else {
-                continue;
-            };
-            let Ok(parsed) = parse_string(&text, &self.state.string_table) else {
-                continue;
-            };
-            let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys_snap);
+            let diagnostics = self.validate_parsed(&uri, parsed, &modifier_keys_snap);
             total_errors += diagnostics
                 .iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -2330,6 +2501,11 @@ impl Backend {
                 tokio::task::yield_now().await;
             }
         }
+        // Pass 2 is done. Drop the per-file ASTs before the file-list / profile
+        // summary so the RSS we report reflects the steady-state working set
+        // (loc index + type index + open documents), not the in-flight
+        // validation peak.
+        drop(parsed_files);
 
         self.client
             .log_message(
@@ -2409,34 +2585,44 @@ impl Backend {
             loc_dirs.push(v);
         }
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
-        let service = cwtools_localization::LocService::from_folders(&dir_refs);
         let loc_languages = self.state.loc_languages.lock().clone();
-        let loc_index = cwtools_localization::LocIndex::build_scoped(
-            &service,
-            loc_game,
-            loc_languages.as_deref(),
-        );
+
+        // Build the index and collect per-file diagnostics in one block, then
+        // drop the LocService before the index is published. The service holds
+        // the full per-file loc ASTs (~2M entries on Millennium Dawn); keeping
+        // it alive while we also hold the lowercased key set in LocIndex
+        // pushes peak RSS by hundreds of MiB for no reason. After the block
+        // closes only LocIndex (keys) and the diagnostic map survive.
+        let root_str = root_path.to_string_lossy().to_string();
+        let (loc_index, mut by_file) = {
+            let service = cwtools_localization::LocService::from_folders(&dir_refs);
+            let idx = cwtools_localization::LocIndex::build_scoped(
+                &service,
+                loc_game,
+                loc_languages.as_deref(),
+            );
+            let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
+            for d in cwtools_localization::validate_loc_project_scoped(
+                &service,
+                loc_game,
+                loc_languages.as_deref(),
+            ) {
+                if !d.file.starts_with(&root_str) {
+                    continue;
+                }
+                let ve = loc_diag_to_validation_error(&d);
+                by_file
+                    .entry(d.file.clone())
+                    .or_default()
+                    .push(validation_error_to_diagnostic(&ve));
+            }
+            (idx, by_file)
+        };
         *self.state.loc_index.write() = Some(loc_index);
 
         // Publish per-file loc diagnostics, but only for workspace loc files
         // (not vanilla). Group by file so each gets a complete diagnostic set.
-        let root_str = root_path.to_string_lossy().to_string();
-        let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
-        for d in cwtools_localization::validate_loc_project_scoped(
-            &service,
-            loc_game,
-            loc_languages.as_deref(),
-        ) {
-            if !d.file.starts_with(&root_str) {
-                continue;
-            }
-            let ve = loc_diag_to_validation_error(&d);
-            by_file
-                .entry(d.file.clone())
-                .or_default()
-                .push(validation_error_to_diagnostic(&ve));
-        }
-        for (file, diags) in by_file {
+        for (file, diags) in by_file.drain() {
             let uri = format!("file://{}", file);
             if let Ok(uri_obj) = Url::parse(&uri) {
                 self.client.publish_diagnostics(uri_obj, diags, None).await;
