@@ -146,6 +146,15 @@ enum Commands {
         /// use later with --ignore-hashes.
         #[arg(long)]
         output_hashes: Option<PathBuf>,
+        /// Extra filename glob patterns to skip (in addition to the engine
+        /// defaults like Changelog.txt, README.md, *.md). May be repeated.
+        /// Examples: --ignore-file "secret*" --ignore-file "*.notes"
+        #[arg(long = "ignore-file", value_name = "GLOB")]
+        ignore_files: Vec<String>,
+        /// Extra directory glob patterns to skip during workspace discovery.
+        /// May be repeated. Examples: --ignore-dir "build" --ignore-dir "temp*"
+        #[arg(long = "ignore-dir", value_name = "GLOB")]
+        ignore_dirs: Vec<String>,
     },
     /// Pre-generate a vanilla type index from a base-game install, for use with
     /// `validate --vanilla-cache`. Parses and indexes the install once so later
@@ -573,6 +582,8 @@ fn main() {
             output_file,
             ignore_hashes,
             output_hashes,
+            ignore_files,
+            ignore_dirs,
         } => {
             use cwtools_game::constants::Game;
             use cwtools_validation::validate_ast_with_loc;
@@ -615,8 +626,18 @@ fn main() {
                 }};
             }
 
-            // Discover and parse files using the SAME string table
-            let config = search_config_for(&directory);
+            // Discover and parse files using the SAME string table.
+            // Layer user-supplied --ignore-file / --ignore-dir globs on top of
+            // the engine defaults (Changelog.txt, README.*, *.md, etc.).
+            let mut config = search_config_for(&directory);
+            if !ignore_files.is_empty() {
+                config.exclude_patterns.extend(ignore_files.iter().cloned());
+            }
+            if !ignore_dirs.is_empty() {
+                config
+                    .exclude_dir_patterns
+                    .extend(ignore_dirs.iter().cloned());
+            }
             let mut manager = FileManager::with_string_table(config, rules_table.clone());
             let files = manager.discover_and_parse().unwrap_or_else(|e| {
                 eprintln!("Error discovering files: {}", e);
