@@ -44,3 +44,26 @@ args aren't formatted), and make sure the crate has `tracing` in its
   there is a one-off cost, not per-file.
 - `collect_type_instances` adds up across files; if indexing is slow, that's the
   span to drill into.
+
+## Per-workspace ignore globs
+
+The LSP workspace walk consults three lists, layered in this order:
+
+1. **Engine baseline (always on)**: toolchain junk (`node_modules`, `bin`,
+   `obj`, `target`, `dist`, `out`, `.git`, `.idea`, `.vscode`, `resources`)
+   and free-form text files (`Changelog.txt`, `README.txt`, `LICENSE.txt`,
+   `README.md`, `LICENSE.md`, `*.md`). These are hard-coded and cannot be
+   disabled per-workspace — they exist because matching them otherwise
+   wastes validator time on files that almost never contain script.
+2. **User file globs**: forwarded by the extension from
+   `cwtools.ignore.filePatterns` (in `settings.json`) into
+   `initializationOptions.ignoreFilePatterns`. Re-read on every
+   `workspace/didChangeConfiguration`.
+3. **User directory globs**: same as above, key
+   `cwtools.ignore.directories` → `initializationOptions.ignoreDirectories`.
+
+Both user lists default to empty and extend (not replace) the engine
+baseline. Patterns use `*` and `?` only (no `**`).
+
+The CLI exposes the same two lists as repeatable flags:
+`--ignore-file GLOB` and `--ignore-dir GLOB` on `validate`.
