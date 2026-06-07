@@ -1,28 +1,32 @@
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
-use std::path::Path;
+use std::path::PathBuf;
 
-/// End-to-end test: load the Imperator Rome config directory and check that
-/// we get a non-trivial combined RuleSet.
+/// End-to-end test: load the real HOI4 config (`cwtools-hoi4-config`) and check
+/// that we get a non-trivial combined RuleSet.
 ///
-/// The config lives at CWToolsDocs/testconfig/cwtools-ir-config relative to
-/// the repository root.  The test is skipped gracefully if the path does not
-/// exist (e.g. on CI without the submodule).
+/// The config is its own repo. By default it's expected as a sibling checkout
+/// (`<github-projects>/cwtools-hoi4-config/Config`); set `CWTOOLS_HOI4_CONFIG`
+/// to point elsewhere. The test is skipped gracefully if it isn't present
+/// (e.g. CI without the clone, or a git worktree that isn't a sibling).
 #[test]
-fn load_ir_config_dir() {
-    let config_dir =
-        Path::new("/mnt/Linux/github-projects/cwtools/CWToolsDocs/testconfig/cwtools-ir-config");
+fn load_hoi4_config_dir() {
+    let config_dir = std::env::var_os("CWTOOLS_HOI4_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../cwtools-hoi4-config/Config")
+        });
 
     if !config_dir.exists() {
-        eprintln!("ir-config not found at {:?}, skipping test", config_dir);
+        eprintln!("hoi4-config not found at {:?}, skipping test", config_dir);
         return;
     }
 
     let table = StringTable::new();
-    let (ruleset, errors) = load_ruleset_from_dir(config_dir, &table);
+    let (ruleset, errors) = load_ruleset_from_dir(&config_dir, &table);
 
-    // Report any parse errors but don't fail the test on them — some .cwt
-    // files in the test config may use features not yet implemented.
+    // Report parse errors but don't fail on them — some .cwt files may use
+    // features the Rust loader doesn't implement yet.
     for err in &errors {
         eprintln!("warn: {}", err);
     }

@@ -15,16 +15,23 @@ shelling out to `CWToolsCLI.dll` via `dotnet`. So "delete F#" is gated on:
 
 Until that, keep the F# build working but stop investing in it.
 
-## Delete (superseded, nothing depends on them)
+## Deleted
 
 - ~~**`.vscode_ext_extension.ts`, `.vscode_ext_executable.ts`** (repo root)~~ — stale
-  TypeScript templates. Were already gitignored (never tracked); removed. DONE.
+  TypeScript templates. Were already gitignored (never tracked); removed.
+- ~~**`CWToolsCSTests/`**~~ — C# tests against the F# lib. Removed, along with its
+  entries in `cwtools.slnx` and `build/Program.fs`.
+- ~~**`CWToolsDocs/`**~~ — F# API-doc generator (superseded by `cwtools-rs/docs/`).
+  Removed, along with its `cwtools.slnx` / `build/Program.fs` entries. Its
+  `testconfig/cwtools-ir-config/` had been the fixture for the Rust
+  `load_ruleset_dir` test; that test now loads the real `cwtools-hoi4-config`
+  repo instead (a sibling checkout, or `CWTOOLS_HOI4_CONFIG`). Bundling a dead
+  Imperator config inside the engine repo was the wrong place for it — the whole
+  point of `.cwt` is that the config lives in its own repo.
 
-`CWToolsCSTests/` and `CWToolsDocs/` were briefly in this tier and deleted, then
-restored: both are still members of `cwtools.slnx` and `build/Program.fs` (so the
-solution build needs them), and `CWToolsDocs/testconfig/cwtools-ir-config` is live
-test data for the Rust `load_ruleset_dir` test. "Dead once F# goes" is not "dead
-now" — they moved to the keep tier below.
+  Note: the first attempt deleted these two without removing their `.slnx` /
+  build refs and silently broke the Rust test (it skips when the path is absent).
+  Always grep `cwtools.slnx` + `build/Program.fs` before deleting an F#/C# project.
 
 ## Move / reconcile
 
@@ -48,17 +55,13 @@ now" — they moved to the keep tier below.
 - **`CWToolsPerformanceCLI/`** (6) — F# perf harness. The Rust side now has its
   own profiling (`cwtools-rs/crates/profiling`, `CWTOOLS_PROFILE=1`), so this is
   redundant once F# is gone.
-- **`CWToolsCSTests/`** — C# tests in `cwtools.slnx` + `build/Program.fs`. Delete
-  with the F# stack, not before.
-- **`CWToolsDocs/`** — F# API-doc generator, in `cwtools.slnx` + `build/Program.fs`.
-  Its `testconfig/cwtools-ir-config/` is also the fixture for the Rust
-  `load_ruleset_dir` test, so the testconfig outlives the F# generator even after #6.
 
 ## Suggested order
 
-1. The stale `.vscode_ext_*.ts` templates are gone (zero risk). Before deleting any
-   F#/C# project, grep `cwtools.slnx` and `build/Program.fs` first — solution
-   membership was missed once and `CWToolsCSTests/`/`CWToolsDocs/` had to be restored.
+1. `.vscode_ext_*.ts`, `CWToolsCSTests/`, `CWToolsDocs/` are gone (the latter two
+   with their `.slnx` / `build/Program.fs` refs). Before deleting any other F#/C#
+   project, grep `cwtools.slnx` and `build/Program.fs` first — solution membership
+   was missed once and those two had to be restored before deleting them properly.
 2. Resolve the root `.cwt` files into the config repo or remove them.
 3. Drive Rust parity (the open `enhancement` issues) until the `fsharp` engine is
    no longer needed.
