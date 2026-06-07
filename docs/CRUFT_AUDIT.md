@@ -1,8 +1,8 @@
 # Cruft audit (F#-era leftovers)
 
-Read-only inventory of what predates the Rust rewrite. The end goal is deleting
-the F# stack (issue #6), but nothing here is deleted yet. This is the keep / move
-/ delete list to work from. 216 F#/C# files are tracked today.
+Inventory of what predates the Rust rewrite. The end goal is deleting the F#
+stack (issue #6). The "delete now" tier is done (see below); the rest is the
+keep / move list to work from.
 
 ## The live dependency to break first
 
@@ -15,14 +15,13 @@ shelling out to `CWToolsCLI.dll` via `dotnet`. So "delete F#" is gated on:
 
 Until that, keep the F# build working but stop investing in it.
 
-## Delete (superseded, nothing depends on them)
+## Delete (superseded, nothing depends on them) — DONE
 
-- **`.vscode_ext_extension.ts`, `.vscode_ext_executable.ts`** (repo root) — stale
-  TypeScript templates. The real extension is `cwtools-vscode/client/extension/*.ts`.
-  Safe to delete now; confirm nothing in this repo imports them (nothing does).
-- **`CWToolsCSTests/`** (5 files) — old C# tests against the F# library. Dead once
-  F# goes; no Rust path uses them.
-- **`CWToolsDocs/`** (3 files) — F# API docs. Superseded by `cwtools-rs/docs/`.
+- ~~**`.vscode_ext_extension.ts`, `.vscode_ext_executable.ts`** (repo root)~~ — stale
+  TypeScript templates. Were already gitignored (never tracked); removed locally.
+- ~~**`CWToolsCSTests/`**~~ — old C# tests against the F# library. Deleted; no .sln,
+  no ProjectReference, no CI step referenced them.
+- ~~**`CWToolsDocs/`**~~ — F# API docs, superseded by `cwtools-rs/docs/`. Deleted.
 
 ## Move / reconcile
 
