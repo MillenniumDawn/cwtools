@@ -33,6 +33,9 @@ impl std::fmt::Display for Game {
 }
 
 impl Game {
+    // Returns Option (no parse error type), so it can't be the Result-returning
+    // std::str::FromStr; keeping the conventional `from_str` name.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "hoi4" => Some(Game::Hoi4),

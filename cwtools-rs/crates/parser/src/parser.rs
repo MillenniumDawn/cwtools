@@ -804,9 +804,9 @@ mod tests {
     #[test]
     fn normal_float_parses() {
         let table = StringTable::new();
-        let result = parse_string("x = 3.14", &table).unwrap();
+        let result = parse_string("x = 2.75", &table).unwrap();
         match value_of(&result, &table, 0) {
-            Value::Float(f) => assert!((f - 3.14).abs() < 1e-9),
+            Value::Float(f) => assert!((f - 2.75).abs() < 1e-9),
             v => panic!("expected Float, got {:?}", v),
         }
     }
@@ -854,9 +854,9 @@ mod tests {
     #[test]
     fn leading_plus_float() {
         let table = StringTable::new();
-        let result = parse_string("x = +3.14", &table).unwrap();
+        let result = parse_string("x = +2.75", &table).unwrap();
         match value_of(&result, &table, 0) {
-            Value::Float(f) => assert!((f - 3.14).abs() < 1e-9),
+            Value::Float(f) => assert!((f - 2.75).abs() < 1e-9),
             v => panic!("expected Float, got {:?}", v),
         }
     }

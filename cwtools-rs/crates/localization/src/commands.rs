@@ -197,8 +197,6 @@ pub fn key_to_language_for_game(game: Game, prefix: &str) -> Option<Lang> {
     }
 }
 
-/// A parsed localization file.
-
 /// A localized entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocEntry {

@@ -485,6 +485,9 @@ pub fn validate_ast_with_loc(
 ///   - cardinality is counted over the merged rule set, not per-subtype in isolation
 ///   - a field that exists in any matching subtype is not "unexpected"
 ///   - SubtypeRule entries that don't match are silently skipped
+// Threads type/ruleset/scope context and output buffers through mutual
+// recursion; a context struct here would churn the validation hot path.
+#[allow(clippy::too_many_arguments)]
 fn validate_with_type(
     type_def: &TypeDefinition,
     children: &[Child],
@@ -1276,6 +1279,7 @@ fn find_grandchild_type<'a>(
 ///   - a required rule (min >= 1) whose key is absent (or under-count),
 ///   - a key present more than its max,
 ///   - a PRESENT field whose value doesn't match the rule.
+///
 /// Fields the rules don't mention are ignored, so a subtype whose rules are
 /// all optional (`## cardinality = 0..1`) and absent matches vacuously.
 /// The real discriminators are the un-annotated rules (default `1..1`, required)
@@ -1568,6 +1572,7 @@ fn rule_left_is_ignore(rule_type: &RuleType) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_leaf_against_rule(
     leaf: &cwtools_parser::ast::Leaf,
     key: &str,
@@ -1881,6 +1886,7 @@ fn flatten_nested_subtype_rules(rules: &[(RuleType, Options)]) -> Vec<(RuleType,
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_children(
     children: &[Child],
     ast: &ParsedFile,
@@ -2407,6 +2413,7 @@ fn looks_like_data_ref(key: &str) -> bool {
 ///    (`sp:foo`, `state:5`, any `prefix:data`), enter ANY scope so inner
 ///    effects aren't falsely scope-checked. Plain effect blocks keep the
 ///    current scope unchanged.
+///
 /// Apply a `## push_scope = <scope>` value (or a `{ a b }` list): resolve the
 /// scope NAME through the registry and push that scope id. `any`/`all` push the
 /// wildcard, which is the correct lenient behaviour for `for_each_scope_loop`

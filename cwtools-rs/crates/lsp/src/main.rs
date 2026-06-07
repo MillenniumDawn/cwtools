@@ -3092,6 +3092,7 @@ fn scan_use_sites(
 
 /// Recursively walk children and record leaves whose value classifies as a
 /// TypeRef for the specified type+name.
+#[allow(clippy::too_many_arguments)]
 fn scan_ast_for_type_ref(
     children: &[cwtools_parser::ast::Child],
     arena: &cwtools_parser::ast::Arena,
@@ -3663,8 +3664,6 @@ mod tests {
     fn test_is_type_ref_leaf() {
         let mut rs = bool_enum_ruleset();
         // Add a TypeRule with a leaf that references type "my_type"
-        let mut other_opts = Options::default();
-        other_opts.description = Some("a type ref field".to_string());
         rs.root_rules.push(RootRule::TypeRule(
             "owner_type".to_string(),
             (

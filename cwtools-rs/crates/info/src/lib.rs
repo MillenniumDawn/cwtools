@@ -548,6 +548,10 @@ pub fn collect_defined_variables(
     result
 }
 
+// `ruleset` / `value_set_namespaces` are threaded for the rule-aware value_set
+// collection that this @-prefix pass doesn't yet implement; kept so the
+// signature is ready and the caller's API stays stable.
+#[allow(clippy::only_used_in_recursion)]
 fn collect_vars_recursive(
     children: &[Child],
     arena: &Arena,

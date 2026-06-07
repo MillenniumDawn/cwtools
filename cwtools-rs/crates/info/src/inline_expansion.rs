@@ -1,3 +1,8 @@
+// The recursive clone/expand helpers thread the same source+dest arena, table,
+// depth and call-stack set; splitting them into a context struct buys nothing
+// and obscures the recursion.
+#![allow(clippy::too_many_arguments)]
+
 use cwtools_parser::ast::{Arena, Child, Leaf, Node, ParsedFile, Value};
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::{StringTable, StringTokens};

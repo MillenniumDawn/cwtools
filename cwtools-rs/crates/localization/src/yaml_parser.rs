@@ -245,11 +245,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         // strip one leading space (the convention after `:`)
         // but keep everything else including # comments,
         // because in F# `#` is a valid `isLocValueChar`.
-        let desc = if remainder.starts_with(' ') {
-            &remainder[1..]
-        } else {
-            remainder
-        };
+        let desc = remainder.strip_prefix(' ').unwrap_or(remainder);
 
         let position = Position::new(name, i + 1, 1); // 1-based line numbers
 

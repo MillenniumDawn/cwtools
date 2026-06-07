@@ -106,8 +106,7 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
 /// or `s.len()` if none.  Safe because `$`/`[`/`]` are ASCII and can never
 /// appear as a continuation byte of a multi-byte UTF-8 sequence.
 fn next_special(s: &str, start: usize) -> usize {
-    s[start..]
-        .as_bytes()
+    s.as_bytes()[start..]
         .iter()
         .position(|&b| matches!(b, b'$' | b'[' | b']'))
         .map(|off| start + off)

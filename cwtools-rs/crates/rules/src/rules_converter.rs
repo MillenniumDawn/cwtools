@@ -618,8 +618,11 @@ fn parse_int_range_as_float(inner: &str, default_min: f64, default_max: f64) -> 
     }
 }
 
+// `ruleset` is threaded so nested rules can register types/enums as the engine
+// grows; today only the recursive descent forwards it.
+#[allow(clippy::only_used_in_recursion)]
 fn children_to_rules(
-    children: &Vec<Child>,
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
@@ -813,7 +816,7 @@ fn build_colour_rules(colour_spec: &str) -> Vec<NewRule> {
 }
 
 fn extract_types_from_children(
-    children: &Vec<Child>,
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
@@ -861,7 +864,7 @@ fn extract_types_from_children(
 }
 
 fn extract_enums_from_children(
-    children: &Vec<Child>,
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
@@ -2029,10 +2032,9 @@ fn options_from_comments(comments: &[String], is_comparison: bool) -> Options {
                 if let Some((min_s, max_s)) = spec.split_once("..") {
                     let min_s = min_s.trim();
                     // Handle ~ prefix for strict_min=false
-                    let (min_s, strict) = if min_s.starts_with('~') {
-                        (&min_s[1..], false)
-                    } else {
-                        (min_s, true)
+                    let (min_s, strict) = match min_s.strip_prefix('~') {
+                        Some(rest) => (rest, false),
+                        None => (min_s, true),
                     };
                     let min = min_s.parse::<i32>().unwrap_or(1);
                     let max = if max_s.trim() == "inf" {
