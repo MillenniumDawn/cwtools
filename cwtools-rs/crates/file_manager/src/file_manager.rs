@@ -174,10 +174,15 @@ pub struct FileManagerConfig {
     pub include_dirs: Vec<String>,
     /// Glob patterns for files (e.g., "*.txt").
     pub file_patterns: Vec<String>,
-    /// Patterns to exclude (filename-level).
+    /// Filename patterns to exclude. Matched with the same `glob_match`
+    /// semantics as `file_patterns` (supports `*` and `?`).
     pub exclude_patterns: Vec<String>,
-    /// Directory names to skip entirely.
+    /// Directory names to skip entirely (exact, case-insensitive).
     pub exclude_dirs: Vec<String>,
+    /// Directory glob patterns to skip entirely. Like `exclude_dirs` but each
+    /// entry is a glob (`*`, `?`) matched against the directory's basename.
+    /// Layers on top of `exclude_dirs` — both lists are checked.
+    pub exclude_dir_patterns: Vec<String>,
     /// Skip files larger than this (bytes). 0 = no limit.
     pub max_file_size: u64,
 }
@@ -205,7 +210,17 @@ impl Default for FileManagerConfig {
                 "*.asset".into(),
                 "*.map".into(),
             ],
-            exclude_patterns: vec![],
+            exclude_patterns: vec![
+                // Free-form text/markdown files that aren't Paradox script —
+                // matching `*.txt` would otherwise send them through the full
+                // validator. Users can opt back in by clearing the list.
+                "Changelog.txt".into(),
+                "README.txt".into(),
+                "LICENSE.txt".into(),
+                "README.md".into(),
+                "LICENSE.md".into(),
+                "*.md".into(),
+            ],
             exclude_dirs: vec![
                 ".git".into(),
                 "target".into(),
@@ -220,6 +235,7 @@ impl Default for FileManagerConfig {
                 // developer scratch area in many mods, not loaded by the game
                 "resources".into(),
             ],
+            exclude_dir_patterns: vec![],
             max_file_size: 2 * 1024 * 1024, // 2 MB
         }
     }
@@ -313,6 +329,14 @@ impl FileManager {
                     .exclude_dirs
                     .iter()
                     .any(|ex| dir_name.eq_ignore_ascii_case(ex))
+                {
+                    continue;
+                }
+                if self
+                    .config
+                    .exclude_dir_patterns
+                    .iter()
+                    .any(|pat| glob_match(pat, dir_name))
                 {
                     continue;
                 }
@@ -723,6 +747,63 @@ mod tests {
         assert!(!glob_match("foo*", "barfoo"));
         assert!(glob_match("f?o.txt", "foo.txt"));
         assert!(!glob_match("f?o.txt", "fooo.txt"));
+    }
+
+    #[test]
+    fn default_excludes_skip_changelog_and_markdown() {
+        let cfg = FileManagerConfig::default();
+        assert!(cfg.exclude_patterns.iter().any(|p| p == "Changelog.txt"));
+        assert!(cfg.exclude_patterns.iter().any(|p| p == "*.md"));
+    }
+
+    #[test]
+    fn exclude_dir_patterns_skips_matching_dirs() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+
+        // Layout:
+        //   root/common/foo.txt          (include)
+        //   root/temp/skipme.txt         (skip: dir matches "temp")
+        //   root/template/keepme.txt     (include: dir does NOT match "temp")
+        //   root/notes/Changelog.txt     (skip: filename matches)
+        for rel in [
+            "common/foo.txt",
+            "temp/skipme.txt",
+            "template/keepme.txt",
+            "notes/Changelog.txt",
+        ] {
+            if let Some(parent) = std::path::Path::new(rel).parent() {
+                fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            fs::write(root.join(rel), "").unwrap();
+        }
+
+        let cfg = FileManagerConfig {
+            root: root.to_path_buf(),
+            include_dirs: vec![".".into()],
+            exclude_dir_patterns: vec!["temp".into()],
+            ..Default::default()
+        };
+
+        let fm = FileManager::new(cfg);
+        let mut paths = Vec::new();
+        fm.collect_paths(root, &mut paths).unwrap();
+        let names: Vec<String> = paths.iter().map(|(_, lp)| lp.clone()).collect();
+
+        assert!(names.iter().any(|n| n.ends_with("common/foo.txt")));
+        assert!(
+            names.iter().any(|n| n.ends_with("template/keepme.txt")),
+            "template/ should NOT match the exact 'temp' pattern"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("temp/skipme.txt")),
+            "temp/ should be skipped by exclude_dir_patterns"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("notes/Changelog.txt")),
+            "Changelog.txt should be skipped by default exclude_patterns"
+        );
     }
 
     #[test]
