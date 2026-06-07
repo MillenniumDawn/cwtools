@@ -176,3 +176,100 @@ pub fn store(
     let cached = arena_to_cached(&parsed.arena, &parsed.root_children, table);
     let _ = serialize_to_file(&cached, &path);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cwtools_parser::ast::ParseError;
+    use cwtools_parser::parser::parse_string;
+
+    #[test]
+    fn content_hash_is_deterministic_and_distinguishes() {
+        assert_eq!(content_hash("foo = 1"), content_hash("foo = 1"));
+        assert_ne!(content_hash("foo = 1"), content_hash("foo = 2"));
+    }
+
+    #[test]
+    fn settings_fingerprint_stable_and_sensitive() {
+        let rs = RuleSet::new();
+        let root = Path::new("/tmp/ws");
+        let base = settings_fingerprint("hoi4", &rs, root);
+        // Identical inputs -> identical fingerprint.
+        assert_eq!(base, settings_fingerprint("hoi4", &rs, root));
+        // A language/game change must invalidate.
+        assert_ne!(base, settings_fingerprint("stellaris", &rs, root));
+        // A workspace-root change must invalidate.
+        assert_ne!(base, settings_fingerprint("hoi4", &rs, Path::new("/tmp/other")));
+    }
+
+    #[test]
+    fn validate_or_clear_first_miss_then_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fp = 0xdead_beef_u64;
+        // No settings.sig yet -> not valid (dir created + sig written).
+        assert!(!validate_or_clear(tmp.path(), fp));
+        // Same fingerprint on the next scan -> valid.
+        assert!(validate_or_clear(tmp.path(), fp));
+    }
+
+    #[test]
+    fn store_then_load_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = StringTable::new();
+        let fp = 1234;
+        validate_or_clear(tmp.path(), fp); // create the dir + sig
+        let text = "foo = { bar = 1 baz = \"two\" }\n";
+        let parsed = parse_string(text, &table).unwrap();
+
+        // Miss before anything is stored.
+        assert!(load(tmp.path(), fp, text, &table).is_none());
+
+        store(tmp.path(), fp, text, &parsed, &table);
+
+        // Hit after store, with equivalent structure and no errors.
+        let loaded = load(tmp.path(), fp, text, &table).expect("expected a cache hit");
+        assert_eq!(loaded.root_children.len(), parsed.root_children.len());
+        assert!(loaded.errors.is_empty());
+    }
+
+    #[test]
+    fn load_misses_on_changed_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = StringTable::new();
+        let fp = 99;
+        validate_or_clear(tmp.path(), fp);
+        let text = "a = 1\n";
+        let parsed = parse_string(text, &table).unwrap();
+        store(tmp.path(), fp, text, &parsed, &table);
+        // Edited content hashes to a different .cwb path -> miss (forces re-parse).
+        assert!(load(tmp.path(), fp, "a = 2\n", &table).is_none());
+    }
+
+    #[test]
+    fn store_skips_files_with_parse_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = StringTable::new();
+        let fp = 7;
+        validate_or_clear(tmp.path(), fp);
+        let text = "x = 1\n";
+        let mut parsed = parse_string(text, &table).unwrap();
+        parsed.errors.push(ParseError::General("boom".into()));
+        store(tmp.path(), fp, text, &parsed, &table);
+        // A file with parse errors must not be cached (diagnostics would be lost).
+        assert!(load(tmp.path(), fp, text, &table).is_none());
+    }
+
+    #[test]
+    fn different_fingerprint_uses_separate_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = StringTable::new();
+        let text = "k = 1\n";
+        let parsed = parse_string(text, &table).unwrap();
+        validate_or_clear(tmp.path(), 1);
+        store(tmp.path(), 1, text, &parsed, &table);
+        // Same text, different settings fingerprint -> different dir -> miss.
+        assert!(load(tmp.path(), 2, text, &table).is_none());
+        // The original fingerprint still hits.
+        assert!(load(tmp.path(), 1, text, &table).is_some());
+    }
+}
