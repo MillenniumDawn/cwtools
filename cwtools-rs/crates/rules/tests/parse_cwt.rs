@@ -37,7 +37,7 @@ enums = {
     assert_eq!(ruleset.aliases.len(), 1); // alias[effect:create_starbase] extracted
     assert_eq!(ruleset.root_rules.len(), 0); // no top-level type rules in this snippet
     assert_eq!(ruleset.types.len(), 1);
-    assert_eq!(ruleset.root_rules.is_empty(), true);
+    assert!(ruleset.root_rules.is_empty());
     assert_eq!(ruleset.types[0].name, "ship_size");
     assert_eq!(
         ruleset.types[0].path_options.paths,

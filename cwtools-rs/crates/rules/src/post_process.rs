@@ -464,7 +464,7 @@ fn rewrite_vsm_in_rule(rule: &mut NewRule) {
     }
 }
 
-fn rewrite_vsm_in_list(rules: &mut Vec<NewRule>) {
+fn rewrite_vsm_in_list(rules: &mut [NewRule]) {
     for rule in rules.iter_mut() {
         rewrite_vsm_in_rule(rule);
     }
@@ -512,7 +512,7 @@ fn expand_ignore_in_rule(rule: &mut NewRule) {
     }
 }
 
-fn expand_ignore_in_list(rules: &mut Vec<NewRule>) {
+fn expand_ignore_in_list(rules: &mut [NewRule]) {
     for rule in rules.iter_mut() {
         if matches!(
             rule.0,

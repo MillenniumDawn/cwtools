@@ -223,8 +223,8 @@ pub fn validate_ast_with_loc(
     // type_per_file: the WHOLE file is a single instance of this type (e.g. an
     // OOB file). Its root children ARE the instance body — there is no per-entry
     // wrapper key — so validate them once against the type's rules and stop.
-    if let Some(td) = path_type {
-        if td.type_per_file {
+    if let Some(td) = path_type
+        && td.type_per_file {
             let inner_rules = find_rules_by_name(&td.name, ruleset);
             let has_content_rules =
                 !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
@@ -254,7 +254,6 @@ pub fn validate_ast_with_loc(
             }
             return errors;
         }
-    }
 
     for child in &ast.root_children {
         // 1. Try exact root key match (e.g. ai_strategy_plan = { ... })
@@ -486,6 +485,9 @@ pub fn validate_ast_with_loc(
 ///   - cardinality is counted over the merged rule set, not per-subtype in isolation
 ///   - a field that exists in any matching subtype is not "unexpected"
 ///   - SubtypeRule entries that don't match are silently skipped
+// Threads type/ruleset/scope context and output buffers through mutual
+// recursion; a context struct here would churn the validation hot path.
+#[allow(clippy::too_many_arguments)]
 fn validate_with_type(
     type_def: &TypeDefinition,
     children: &[Child],
@@ -1019,13 +1021,11 @@ fn validate_scope_target(
 /// Find the actual validation rules for a type by looking in root_rules.
 fn find_rules_by_name<'a>(name: &str, ruleset: &'a RuleSet) -> &'a [(RuleType, Options)] {
     for rr in &ruleset.root_rules {
-        if let RootRule::TypeRule(rule_name, (rule, _opts)) = rr {
-            if rule_name == name {
-                if let RuleType::NodeRule { rules, .. } = rule {
+        if let RootRule::TypeRule(rule_name, (rule, _opts)) = rr
+            && rule_name == name
+                && let RuleType::NodeRule { rules, .. } = rule {
                     return rules.as_slice();
                 }
-            }
-        }
     }
     &[]
 }
@@ -1134,18 +1134,17 @@ fn find_type_by_path_and_key<'a>(
     for t in &ruleset.types {
         // path_file pins the type to one specific filename (e.g. several types
         // share path "map" but only airports.txt is the `airports` type).
-        if let Some(pf) = &t.path_options.path_file {
-            if basename != pf.to_lowercase() {
+        if let Some(pf) = &t.path_options.path_file
+            && basename != pf.to_lowercase() {
                 continue;
             }
-        }
         // path_extension restricts the type to files with a given extension
         // (e.g. sound types require `.asset`, so a `.txt` combat-sounds file must
         // NOT match them). Treat the extension as a hard filter.
         if let Some(ext) = &t.path_options.path_extension {
             let ext = ext.to_lowercase();
             let ext = ext.strip_prefix('.').unwrap_or(&ext);
-            if !basename.rsplit('.').next().is_some_and(|e| e == ext) {
+            if basename.rsplit('.').next().is_none_or(|e| e != ext) {
                 continue;
             }
         }
@@ -1217,15 +1216,14 @@ fn type_path_matches(file_path: &str, t: &TypeDefinition) -> bool {
         .strip_suffix(basename)
         .unwrap_or(&path_lower)
         .trim_end_matches('/');
-    if let Some(pf) = &t.path_options.path_file {
-        if basename != pf.to_lowercase() {
+    if let Some(pf) = &t.path_options.path_file
+        && basename != pf.to_lowercase() {
             return false;
         }
-    }
     if let Some(ext) = &t.path_options.path_extension {
         let ext = ext.to_lowercase();
         let ext = ext.strip_prefix('.').unwrap_or(&ext);
-        if !basename.rsplit('.').next().is_some_and(|e| e == ext) {
+        if basename.rsplit('.').next().is_none_or(|e| e != ext) {
             return false;
         }
     }
@@ -1281,6 +1279,7 @@ fn find_grandchild_type<'a>(
 ///   - a required rule (min >= 1) whose key is absent (or under-count),
 ///   - a key present more than its max,
 ///   - a PRESENT field whose value doesn't match the rule.
+///
 /// Fields the rules don't mention are ignored, so a subtype whose rules are
 /// all optional (`## cardinality = 0..1`) and absent matches vacuously.
 /// The real discriminators are the un-annotated rules (default `1..1`, required)
@@ -1398,14 +1397,13 @@ fn subtype_rules_match(
                     }
                 }
             }
-            if let Some(ic) = clause {
-                if group.node_inners.iter().any(|(inner, _)| {
+            if let Some(ic) = clause
+                && group.node_inners.iter().any(|(inner, _)| {
                     subtype_rules_match(inner, ic, ast, table, enum_map, type_index)
                 }) {
                     any_match = true;
                     activated = true;
                 }
-            }
         }
         // Present but matching none of the disjuncts (of the applicable kind) → contradiction.
         if count > 0 && !any_match {
@@ -1574,6 +1572,7 @@ fn rule_left_is_ignore(rule_type: &RuleType) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_leaf_against_rule(
     leaf: &cwtools_parser::ast::Leaf,
     key: &str,
@@ -1887,6 +1886,7 @@ fn flatten_nested_subtype_rules(rules: &[(RuleType, Options)]) -> Vec<(RuleType,
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_children(
     children: &[Child],
     ast: &ParsedFile,
@@ -1965,11 +1965,10 @@ fn validate_children(
                     // which accepts any token) starve a later `enum[...]` rule,
                     // producing a spurious "appears 0 time(s)" cardinality error.
                     for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
-                        if let RuleType::LeafValueRule { right } = rule_type {
-                            if field_matches_value(right, &lv.value, table, enum_map) {
+                        if let RuleType::LeafValueRule { right } = rule_type
+                            && field_matches_value(right, &lv.value, table, enum_map) {
                                 leafvalue_counts[rule_idx] += 1;
                             }
-                        }
                     }
                 }
             }
@@ -2165,12 +2164,11 @@ fn validate_children(
                 } else {
                     let mut matched = false;
                     for (rule_type, _opts) in rules {
-                        if let RuleType::LeafValueRule { right } = rule_type {
-                            if field_matches_value(right, &lv.value, table, enum_map) {
+                        if let RuleType::LeafValueRule { right } = rule_type
+                            && field_matches_value(right, &lv.value, table, enum_map) {
                                 matched = true;
                                 break;
                             }
-                        }
                     }
                     if !matched {
                         let val_str = leaf_value_to_string(&lv.value, table);
@@ -2254,8 +2252,8 @@ fn validate_children(
         if matches!(
             rule_type,
             RuleType::LeafRule { .. } | RuleType::NodeRule { .. }
-        ) {
-            if let Some(k) = get_rule_key(rule_type) {
+        )
+            && let Some(k) = get_rule_key(rule_type) {
                 let e = key_card.entry(k.to_lowercase()).or_insert((
                     opts.min,
                     opts.max,
@@ -2265,7 +2263,6 @@ fn validate_children(
                 e.1 = e.1.max(opts.max);
                 e.2 = e.2 && opts.strict_min;
             }
-        }
     }
     let mut reported_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -2416,6 +2413,7 @@ fn looks_like_data_ref(key: &str) -> bool {
 ///    (`sp:foo`, `state:5`, any `prefix:data`), enter ANY scope so inner
 ///    effects aren't falsely scope-checked. Plain effect blocks keep the
 ///    current scope unchanged.
+///
 /// Apply a `## push_scope = <scope>` value (or a `{ a b }` list): resolve the
 /// scope NAME through the registry and push that scope id. `any`/`all` push the
 /// wildcard, which is the correct lenient behaviour for `for_each_scope_loop`
@@ -2600,7 +2598,7 @@ fn alias_pattern_matches(
             if let Some(open) = pattern.find(marker) {
                 let inner = open + marker.len();
                 let close = inner + pattern[inner..].find(']')?;
-                if found.map_or(true, |(o, ..)| open < o) {
+                if found.is_none_or(|(o, ..)| open < o) {
                     found = Some((
                         open,
                         &pattern[..open],
@@ -2805,11 +2803,10 @@ fn validate_alias_usage(
                 overloads.push(rule);
             }
         }
-        if let Some(sf_idx) = cat.scope_field_idx {
-            if is_scope_key(key, ruleset, type_index) {
+        if let Some(sf_idx) = cat.scope_field_idx
+            && is_scope_key(key, ruleset, type_index) {
                 overloads.push(&ruleset.aliases[sf_idx].1);
             }
-        }
     }
     if overloads.is_empty() {
         // Category unloaded or no such alias key — accept silently, matching the
@@ -3047,7 +3044,7 @@ fn validate_localisation_field(
         let code = &error_codes::CW100_MISSING_LOCALISATION;
         errors.push(ValidationError {
             message: code.format(&[key_raw, lang]),
-            severity: code.severity.clone(),
+            severity: code.severity,
             line: leaf.pos.start.line,
             col: leaf.pos.start.col,
             file: file_path.to_string(),
@@ -3062,7 +3059,7 @@ fn validate_localisation_field(
                 let code = &error_codes::CW122_LOC_KEY_IN_INLINE;
                 errors.push(ValidationError {
                     message: code.format(&[key_raw]),
-                    severity: code.severity.clone(),
+                    severity: code.severity,
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
                     file: file_path.to_string(),
@@ -3084,8 +3081,8 @@ fn validate_localisation_field(
 
     // Scope-aware loc-command validation at the reference site: validate the
     // referenced loc string's `[command]` chains against the scope of THIS field.
-    if exists {
-        if let Some(entry) = idx.entry(&key_lower) {
+    if exists
+        && let Some(entry) = idx.entry(&key_lower) {
             let initial = scope_context
                 .and_then(|c| c.current())
                 .unwrap_or(cwtools_game::scope_engine::SCOPE_ANY);
@@ -3104,7 +3101,6 @@ fn validate_localisation_field(
                 );
             }
         }
-    }
 }
 
 /// Convert a `LocCommandDiagnostic` (from the loc scope engine) into a
@@ -3150,7 +3146,7 @@ fn push_loc_command_diagnostic(
     };
     errors.push(ValidationError {
         message,
-        severity: code.severity.clone(),
+        severity: code.severity,
         line: leaf.pos.start.line,
         col: leaf.pos.start.col,
         file: file_path.to_string(),
@@ -3266,8 +3262,8 @@ fn validate_leaf(
         // FilepathField: check the referenced file exists (CW113). Only when the
         // file index is populated (vanilla loaded); otherwise stay silent.
         if let NewField::FilepathField { prefix, extension } = right {
-            if let Some(idx) = type_index {
-                if !idx.file_index.is_empty() {
+            if let Some(idx) = type_index
+                && !idx.file_index.is_empty() {
                     let raw = leaf_value_to_string(&leaf.value, table);
                     let value = raw.trim_matches('"').trim();
                     // Skip dynamic / templated paths we can't resolve statically.
@@ -3286,15 +3282,14 @@ fn validate_leaf(
                             }
                             _ => value.to_string(),
                         };
-                        if let Some(ext) = extension {
-                            if !ext.is_empty()
+                        if let Some(ext) = extension
+                            && !ext.is_empty()
                                 && !candidate
                                     .to_ascii_lowercase()
                                     .ends_with(&ext.to_ascii_lowercase())
                             {
                                 candidate.push_str(ext);
                             }
-                        }
                         if !idx.file_index.contains(&candidate) {
                             let code = &error_codes::CW113_MISSING_FILE;
                             errors.push(ValidationError {
@@ -3308,7 +3303,6 @@ fn validate_leaf(
                         }
                     }
                 }
-            }
             return;
         }
 

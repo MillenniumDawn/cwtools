@@ -1,3 +1,8 @@
+// The recursive clone/expand helpers thread the same source+dest arena, table,
+// depth and call-stack set; splitting them into a context struct buys nothing
+// and obscures the recursion.
+#![allow(clippy::too_many_arguments)]
+
 use cwtools_parser::ast::{Arena, Child, Leaf, Node, ParsedFile, Value};
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
@@ -11,6 +16,12 @@ const MAX_INLINE_DEPTH: usize = 5;
 pub struct InlineRegistry {
     /// script name → parsed file (with its own string table, arena, etc.)
     scripts: HashMap<String, (ParsedFile, StringTable)>,
+}
+
+impl Default for InlineRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InlineRegistry {
@@ -228,7 +239,7 @@ fn clone_and_expand_children(
                 let new_leaf = Leaf {
                     key: new_key,
                     value: new_value,
-                    op: src_leaf.op.clone(),
+                    op: src_leaf.op,
                     pos: src_leaf.pos,
                 };
                 let new_idx = dst_arena.leaves.len() as u32;
@@ -274,7 +285,7 @@ fn clone_and_expand_child_r(
             let new_leaf = Leaf {
                 key: new_key,
                 value: new_value,
-                op: src_leaf.op.clone(),
+                op: src_leaf.op,
                 pos: src_leaf.pos,
             };
             let new_idx = dst_arena.leaves.len() as u32;

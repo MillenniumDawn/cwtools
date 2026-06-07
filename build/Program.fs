@@ -68,11 +68,10 @@ let libraryProjects = !!"CWTools/CWTools.fsproj"
 
 let toolProjects =
     !!"CWToolsCLI/CWToolsCLI.fsproj"
-    ++ "CWToolsDocs/CWToolsDocs.fsproj"
     ++ "CWToolsScripts/CWToolsScripts.fsproj"
 
 let testProjects =
-    !!"CWTools.Tests/CWTools.Tests.fsproj" ++ "CWToolsCSTests/CWToolsCSTests.fsproj"
+    !!"CWTools.Tests/CWTools.Tests.fsproj"
 
 let pkgPath = Path.GetFullPath "./pkg"
 
@@ -88,8 +87,6 @@ let testAll () =
                 RunSettingsArguments = Some "Expecto.parallel=false"
                 Configuration = DotNet.BuildConfiguration.Release })
         "CWToolsTests/CWToolsTests.fsproj"
-
-    DotNet.test id "CWToolsCSTests/CWToolsCSTests.csproj"
 
 // testProjects |> Seq.iter (fun p -> DotNet.test (DotNet.Options.withWorkingDirectory p) p)
 

@@ -22,6 +22,7 @@ use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{ValidationError, validate_ast_with_loc};
 
 mod symbols;
+mod workspace_cache;
 
 /// Build the set of valid modifier names for `alias_name[modifier]` slots from the
 /// ruleset's `modifiers = { ... }` block. Templated entries like
@@ -128,18 +129,16 @@ fn index_vanilla_dir(
 /// `~/Library/Caches` (macOS), and finally the temp dir.
 fn default_cache_dir() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
-    if let Ok(x) = std::env::var("XDG_CACHE_HOME") {
-        if !x.is_empty() {
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME")
+        && !x.is_empty() {
             return Some(PathBuf::from(x).join("cwtools"));
         }
-    }
-    if let Ok(la) = std::env::var("LOCALAPPDATA") {
-        if !la.is_empty() {
+    if let Ok(la) = std::env::var("LOCALAPPDATA")
+        && !la.is_empty() {
             return Some(PathBuf::from(la).join("cwtools"));
         }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty() {
             let home = PathBuf::from(home);
             #[cfg(target_os = "macos")]
             {
@@ -150,7 +149,6 @@ fn default_cache_dir() -> Option<std::path::PathBuf> {
                 return Some(home.join(".cache/cwtools"));
             }
         }
-    }
     Some(std::env::temp_dir().join("cwtools"))
 }
 
@@ -334,19 +332,19 @@ fn extract_ignore_patterns(opts: &Value) -> (Vec<String>, Vec<String>) {
     let mut dirs = Vec::new();
     if let Some(arr) = opts.get("ignoreFilePatterns").and_then(|v| v.as_array()) {
         for v in arr {
-            if let Some(s) = v.as_str() {
-                if !s.is_empty() {
-                    files.push(s.to_string());
-                }
+            if let Some(s) = v.as_str()
+                && !s.is_empty()
+            {
+                files.push(s.to_string());
             }
         }
     }
     if let Some(arr) = opts.get("ignoreDirectories").and_then(|v| v.as_array()) {
         for v in arr {
-            if let Some(s) = v.as_str() {
-                if !s.is_empty() {
-                    dirs.push(s.to_string());
-                }
+            if let Some(s) = v.as_str()
+                && !s.is_empty()
+            {
+                dirs.push(s.to_string());
             }
         }
     }
@@ -494,11 +492,10 @@ fn find_rule_description(rules: &RuleSet, key: &str) -> (Option<String>, Vec<Str
                 | RuleType::NodeRule {
                     left: NewField::SpecificField(k),
                     ..
-                } => {
-                    if k.eq_ignore_ascii_case(key) {
+                }
+                    if k.eq_ignore_ascii_case(key) => {
                         return (opts.description.clone(), opts.required_scopes.clone());
                     }
-                }
                 _ => {}
             }
         }
@@ -546,8 +543,8 @@ fn collect_enclosing_path(
             }
             Child::Leaf(idx) => {
                 let leaf = &arena.leaves[*idx as usize];
-                if let Value::Clause(ch) = &leaf.value {
-                    if pos_in_range_simple(target, &leaf.pos) {
+                if let Value::Clause(ch) = &leaf.value
+                    && pos_in_range_simple(target, &leaf.pos) {
                         let key = table.get_string(leaf.key.normal).unwrap_or_default();
                         path.push(key);
                         if collect_enclosing_path(ch, arena, target, table, path) {
@@ -555,7 +552,6 @@ fn collect_enclosing_path(
                         }
                         return true;
                     }
-                }
             }
             _ => {}
         }
@@ -669,11 +665,10 @@ fn descend_rules<'a>(
                 left: NewField::AliasValueKeysField(k),
                 rules: inner,
                 ..
-            } => {
-                if k.eq_ignore_ascii_case(next_key) {
+            }
+                if k.eq_ignore_ascii_case(next_key) => {
                     return descend_rules(inner, &remaining[1..]);
                 }
-            }
             _ => {}
         }
     }
@@ -727,9 +722,9 @@ fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
 /// following the alias chain, which can be large).  TypeField completions use
 /// the TypeIndex from the InfoService.  ScopeField completions are placeholder
 /// scope names.
-fn completions_from_rules<'a>(
+fn completions_from_rules(
     rules: &[(RuleType, cwtools_rules::rules_types::Options)],
-    ruleset: &'a RuleSet,
+    ruleset: &RuleSet,
     info: &cwtools_info::InfoService,
     language: &str,
 ) -> Vec<CompletionItem> {
@@ -885,7 +880,7 @@ fn completions_from_rules<'a>(
     items
 }
 
-fn enum_values_for<'a>(ruleset: &'a RuleSet, enum_name: &str) -> Vec<String> {
+fn enum_values_for(ruleset: &RuleSet, enum_name: &str) -> Vec<String> {
     if let Some(&idx) = ruleset.enum_by_name.get(enum_name) {
         return ruleset.enums[idx].values.clone();
     }
@@ -989,11 +984,10 @@ fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<CompletionIt
 
         // Add subtype typeKeyField alternatives.
         for st in &td.subtypes {
-            if let Some(tkf) = &st.type_key_field {
-                if !openers.contains(tkf) {
+            if let Some(tkf) = &st.type_key_field
+                && !openers.contains(tkf) {
                     openers.push(tkf.clone());
                 }
-            }
         }
 
         // Find the TypeRule for this type to get child rules for snippet body.
@@ -1040,9 +1034,7 @@ fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<CompletionIt
 fn loc_completions(info: &cwtools_info::InfoService, language: &str) -> Vec<CompletionItem> {
     // Collect all top-level keys from all files as potential loc keys
     let mut items: Vec<CompletionItem> = info
-        .files
-        .iter()
-        .flat_map(|(_, fi)| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
+        .files.values().flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .map(|k| CompletionItem {
@@ -1253,11 +1245,10 @@ impl LanguageServer for Backend {
         }
 
         // Store workspace URI if provided
-        if let Some(folders) = &params.workspace_folders {
-            if let Some(first) = folders.first() {
+        if let Some(folders) = &params.workspace_folders
+            && let Some(first) = folders.first() {
                 *self.state.workspace_uri.lock() = Some(first.uri.to_string());
             }
-        }
 
         // Per-workspace ignore globs from the extension. The extension
         // forwards `cwtools.ignore.filePatterns` and `cwtools.ignore.directories`
@@ -1479,8 +1470,8 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position_params.position;
 
         let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri) {
-            if let Some(ast) = &doc.ast {
+        if let Some(doc) = docs.get(&uri)
+            && let Some(ast) = &doc.ast {
                 let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
                 let lsp_col = pos.character as u16;
 
@@ -1543,7 +1534,6 @@ impl LanguageServer for Backend {
                     }));
                 }
             }
-        }
         Ok(None)
     }
 
@@ -1569,7 +1559,7 @@ impl LanguageServer for Backend {
         // .yml localisation file — offer loc-key / data-function completions.
         if uri.ends_with(".yml") || uri.ends_with(".yaml") {
             let info_guard = self.state.info_service.lock();
-            let items = loc_completions(&*info_guard, &language);
+            let items = loc_completions(&info_guard, &language);
             if !items.is_empty() {
                 return Ok(Some(CompletionResponse::Array(items)));
             }
@@ -1588,7 +1578,7 @@ impl LanguageServer for Backend {
                         // Top level — offer root-type snippets for this file's path.
                         root_type_snippets(rs, &logical_path)
                     } else if let Some(rules) = rules_for_context(rs, &key_path, &logical_path) {
-                        completions_from_rules(rules, rs, &*info_guard, &language)
+                        completions_from_rules(rules, rs, &info_guard, &language)
                     } else {
                         Vec::new()
                     }
@@ -1736,9 +1726,9 @@ impl LanguageServer for Backend {
 
         // Fallback: heuristic symbol-based lookup
         let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri) {
-            if let Some(ast) = &doc.ast {
-                if let Some(element) = element_at_position(
+        if let Some(doc) = docs.get(&uri)
+            && let Some(ast) = &doc.ast
+                && let Some(element) = element_at_position(
                     ast,
                     pos.line + 1,
                     pos.character as u16,
@@ -1776,8 +1766,6 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
-            }
-        }
         Ok(None)
     }
 
@@ -1858,7 +1846,7 @@ impl LanguageServer for Backend {
                     let use_sites = scan_use_sites(
                         &type_name,
                         &instance_name,
-                        &*docs,
+                        &docs,
                         rs,
                         &ws_uri,
                         &self.state.string_table,
@@ -1891,9 +1879,9 @@ impl LanguageServer for Backend {
 
         // Fallback: heuristic-based approach
         let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri) {
-            if let Some(ast) = &doc.ast {
-                if let Some(element) = element_at_position(
+        if let Some(doc) = docs.get(&uri)
+            && let Some(ast) = &doc.ast
+                && let Some(element) = element_at_position(
                     ast,
                     pos.line + 1,
                     pos.character as u16,
@@ -1965,8 +1953,6 @@ impl LanguageServer for Backend {
                         return Ok(Some(all_locs));
                     }
                 }
-            }
-        }
         Ok(None)
     }
 
@@ -2204,7 +2190,7 @@ impl LanguageServer for Backend {
                 let use_sites = scan_use_sites(
                     &type_name,
                     &instance_name,
-                    &*docs,
+                    &docs,
                     rs,
                     &ws_uri2,
                     &self.state.string_table,
@@ -2406,6 +2392,42 @@ impl Backend {
             )
             .await;
 
+        // Resolve the parse-cache directory and settings fingerprint. The
+        // fingerprint encodes the game, ruleset shape, and workspace root so
+        // stale caches are cleared automatically when any of those change.
+        let (cache_info, cache_was_valid) = {
+            let cache_dir = self.state.cache_dir.lock().clone();
+            match cache_dir {
+                Some(cd) => {
+                    let language = self.state.language.lock().clone();
+                    let ruleset_snap = self.state.ruleset.lock().clone();
+                    let fp = match ruleset_snap {
+                        Some(ref rs) => {
+                            workspace_cache::settings_fingerprint(&language, rs, &root_path)
+                        }
+                        None => workspace_cache::settings_fingerprint(
+                            &language,
+                            &RuleSet::new(),
+                            &root_path,
+                        ),
+                    };
+                    let valid = workspace_cache::validate_or_clear(&cd, fp);
+                    (Some((cd, fp)), valid)
+                }
+                None => (None, true),
+            }
+        };
+        self.client
+            .log_message(
+                MessageType::INFO,
+                if cache_was_valid {
+                    "Parse cache: hit (settings match)"
+                } else {
+                    "Parse cache: settings changed, cleared"
+                },
+            )
+            .await;
+
         // Pass 1: parse + index every file (types, scripted triggers/effects,
         // modifiers) so cross-file references resolve before any file is
         // validated. The parsed ASTs are kept resident in `parsed_files` and
@@ -2413,12 +2435,39 @@ impl Backend {
         // and produced no observable benefit, just CPU and allocator churn.
         // The total resident set between the two passes is bounded by what the
         // loc service allocates next, so peak RSS doesn't grow meaningfully.
+        //
+        // On a cache hit the AST is deserialized from disk (.cwb) instead of
+        // parsed, then kept resident like any other; on a miss we parse and
+        // persist for the next scan. The disk cache speeds the cold→warm scan
+        // across restarts; keeping the AST resident avoids a pass-2 re-parse
+        // within a single scan.
         self.send_loading_bar(true, "Indexing workspace…").await;
         let mut parsed_files: Vec<Option<ParsedFile>> = Vec::with_capacity(files_to_validate.len());
+        let mut cache_hits = 0u64;
+        let mut cache_misses = 0u64;
         for (i, file_path) in files_to_validate.iter().enumerate() {
             let uri = format!("file://{}", file_path.display());
             let parsed = match std::fs::read_to_string(file_path) {
-                Ok(text) => self.index_document(&uri, &text).await,
+                Ok(text) => {
+                    // Try the parse cache first.
+                    if let Some((ref cd, fp)) = cache_info
+                        && let Some(parsed) =
+                            workspace_cache::load(cd, fp, &text, &self.state.string_table)
+                    {
+                        self.index_parsed_file(&uri, &parsed);
+                        cache_hits += 1;
+                        Some(parsed)
+                    } else if let Some(parsed) = self.index_document(&uri, &text).await {
+                        // Cache miss — parse + index, then persist for next scan.
+                        if let Some((ref cd, fp)) = cache_info {
+                            workspace_cache::store(cd, fp, &text, &parsed, &self.state.string_table);
+                        }
+                        cache_misses += 1;
+                        Some(parsed)
+                    } else {
+                        None
+                    }
+                }
                 Err(_) => None,
             };
             parsed_files.push(parsed);
@@ -2428,6 +2477,16 @@ impl Backend {
                 tokio::task::yield_now().await;
             }
         }
+
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "Indexing pass: {} cache hits, {} misses",
+                    cache_hits, cache_misses
+                ),
+            )
+            .await;
 
         // Build the base-game index from a `vanilla` dir (or auto-discovery) if
         // we have one and haven't indexed it yet. Populates `vanilla_index`.
@@ -2638,10 +2697,18 @@ impl Backend {
     /// a file validated early can't see definitions that live in later files.
     async fn index_document(&self, uri: &str, text: &str) -> Option<ParsedFile> {
         let parsed = parse_string(text, &self.state.string_table).ok()?;
+        self.index_parsed_file(uri, &parsed);
+        Some(parsed)
+    }
+
+    /// Index an already-parsed AST into the symbol + info indexes. Extracted
+    /// from `index_document` so the workspace scan can index cache-hit ASTs
+    /// without re-parsing.
+    fn index_parsed_file(&self, uri: &str, parsed: &ParsedFile) {
         {
             let mut index = self.state.symbol_index.lock();
             index.clear_document(uri);
-            index.index_document(uri, &parsed, &self.state.string_table);
+            index.index_document(uri, parsed, &self.state.string_table);
         }
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(uri, &ws_uri);
@@ -2651,13 +2718,12 @@ impl Backend {
         if let Some(ruleset) = ruleset_guard.as_ref() {
             info.index_file_with_path(
                 uri,
-                &parsed,
+                parsed,
                 &self.state.string_table,
                 ruleset,
                 &logical_path,
             );
         }
-        Some(parsed)
     }
 
     /// Validate an already-parsed document against the (already-built) workspace
@@ -2736,11 +2802,10 @@ impl Backend {
         let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
         {
             let mut docs = self.state.documents.lock();
-            if let Some(d) = docs.get_mut(&uri) {
-                if d.version == expected_version {
+            if let Some(d) = docs.get_mut(&uri)
+                && d.version == expected_version {
                     d.ast = parsed.map(Arc::new);
                 }
-            }
         }
         if let Ok(uri_obj) = Url::parse(&uri) {
             self.client
@@ -2847,13 +2912,12 @@ impl Backend {
                     .map(|d| d.version == snapshot_version)
                     .unwrap_or(false)
             };
-            if still_current {
-                if let Ok(uri_obj) = Url::parse(&uri) {
+            if still_current
+                && let Ok(uri_obj) = Url::parse(&uri) {
                     self.client
                         .publish_diagnostics(uri_obj, diagnostics, Some(snapshot_version))
                         .await;
                 }
-            }
         }
     }
 
@@ -3080,8 +3144,8 @@ impl Backend {
         let cache_path = self.vanilla_cache_path(&game, &fingerprint);
 
         // Try a fresh cache first — skip parsing the whole base game entirely.
-        if let Some(cp) = &cache_path {
-            if cp.exists() {
+        if let Some(cp) = &cache_path
+            && cp.exists() {
                 match cwtools_info::vanilla_cache::load(cp) {
                     Ok((cache_game, cache_fp, per_type))
                         if cache_game == game && cache_fp == fingerprint =>
@@ -3122,7 +3186,6 @@ impl Backend {
                     }
                 }
             }
-        }
 
         // We need the ruleset to map definitions to their types. Clone it out so
         // the lock guard isn't held across the awaits below (parking_lot guards
@@ -3297,6 +3360,7 @@ fn scan_use_sites(
 
 /// Recursively walk children and record leaves whose value classifies as a
 /// TypeRef for the specified type+name.
+#[allow(clippy::too_many_arguments)]
 fn scan_ast_for_type_ref(
     children: &[cwtools_parser::ast::Child],
     arena: &cwtools_parser::ast::Arena,
@@ -3398,16 +3462,14 @@ fn is_type_ref_leaf(
         };
 
         // For TypeRules, check path filter
-        if let RootRule::TypeRule(..) = root_rule {
-            if let Some(name) = rule_type_name {
-                if let Some(&idx) = ruleset.type_by_name.get(name) {
+        if let RootRule::TypeRule(..) = root_rule
+            && let Some(name) = rule_type_name
+                && let Some(&idx) = ruleset.type_by_name.get(name) {
                     let td = &ruleset.types[idx];
                     if !cwtools_info_path_check(&td.path_options, logical_path) {
                         continue;
                     }
                 }
-            }
-        }
 
         let rules = match rule_type {
             RuleType::NodeRule { rules, .. } => rules.as_slice(),
@@ -3419,11 +3481,9 @@ fn is_type_ref_leaf(
                 left: NewField::SpecificField(k),
                 right: NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)),
             } = inner
-            {
-                if k.eq_ignore_ascii_case(leaf_key) && t == type_name {
+                && k.eq_ignore_ascii_case(leaf_key) && t == type_name {
                     return true;
                 }
-            }
         }
     }
     false
@@ -3655,11 +3715,9 @@ mod tests {
         // Add a description to the "kind" leaf rule
         if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
             rs.root_rules.first_mut()
-        {
-            if let Some((_, opts)) = rules.first_mut() {
+            && let Some((_, opts)) = rules.first_mut() {
                 opts.description = Some("The kind of this thing".to_string());
             }
-        }
 
         let md = build_hover_markdown(
             &PositionElement::Leaf {
@@ -3874,8 +3932,6 @@ mod tests {
     fn test_is_type_ref_leaf() {
         let mut rs = bool_enum_ruleset();
         // Add a TypeRule with a leaf that references type "my_type"
-        let mut other_opts = Options::default();
-        other_opts.description = Some("a type ref field".to_string());
         rs.root_rules.push(RootRule::TypeRule(
             "owner_type".to_string(),
             (

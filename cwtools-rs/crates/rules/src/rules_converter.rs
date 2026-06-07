@@ -561,8 +561,8 @@ fn field_from_string(s: &str) -> NewField {
     // prefix<type>suffix complex
     if trimmed.contains('<') && trimmed.contains('>') {
         let s = trimmed.trim_matches('"');
-        if let (Some(pi), Some(si)) = (s.find('<'), s.find('>')) {
-            if pi < si {
+        if let (Some(pi), Some(si)) = (s.find('<'), s.find('>'))
+            && pi < si {
                 let prefix = s[..pi].to_string();
                 let name = s[pi + 1..si].to_string();
                 let suffix = s[si + 1..].to_string();
@@ -572,7 +572,6 @@ fn field_from_string(s: &str) -> NewField {
                     suffix,
                 });
             }
-        }
     }
 
     // Default: specific string value
@@ -619,8 +618,11 @@ fn parse_int_range_as_float(inner: &str, default_min: f64, default_max: f64) -> 
     }
 }
 
+// `ruleset` is threaded so nested rules can register types/enums as the engine
+// grows; today only the recursive descent forwards it.
+#[allow(clippy::only_used_in_recursion)]
 fn children_to_rules(
-    children: &Vec<Child>,
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
@@ -814,7 +816,7 @@ fn build_colour_rules(colour_spec: &str) -> Vec<NewRule> {
 }
 
 fn extract_types_from_children(
-    children: &Vec<Child>,
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
@@ -833,8 +835,8 @@ fn extract_types_from_children(
             }
             _ => continue,
         };
-        if key.starts_with("type[") {
-            if let Some(typename) = extract_bracket_content(&key, "type") {
+        if key.starts_with("type[")
+            && let Some(typename) = extract_bracket_content(&key, "type") {
                 let typedef = if is_leaf {
                     if let Child::Leaf(lidx) = tchild {
                         process_type_node(
@@ -858,12 +860,11 @@ fn extract_types_from_children(
                 };
                 ruleset.types.push(typedef);
             }
-        }
     }
 }
 
 fn extract_enums_from_children(
-    children: &Vec<Child>,
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
@@ -911,8 +912,8 @@ fn extract_enums_from_children(
                 };
                 ruleset.enums.push(def);
             }
-        } else if key.starts_with("complex_enum[") {
-            if let Some(enum_name) = extract_bracket_content(&key, "complex_enum") {
+        } else if key.starts_with("complex_enum[")
+            && let Some(enum_name) = extract_bracket_content(&key, "complex_enum") {
                 if !is_leaf {
                     if let Child::Node(nidx) = echild {
                         let node = &ast.arena.nodes[*nidx as usize];
@@ -929,7 +930,6 @@ fn extract_enums_from_children(
                     }
                 }
             }
-        }
     }
 }
 
@@ -1151,8 +1151,8 @@ fn extract_values_from_children(
             }
             _ => continue,
         };
-        if key.starts_with("value[") {
-            if let Some(value_name) = extract_bracket_content(&key, "value") {
+        if key.starts_with("value[")
+            && let Some(value_name) = extract_bracket_content(&key, "value") {
                 let vals = if is_leaf {
                     if let Child::Leaf(lidx) = vchild {
                         collect_leaf_values_from_clause(
@@ -1173,7 +1173,6 @@ fn extract_values_from_children(
                 };
                 ruleset.values.push((value_name, vals));
             }
-        }
     }
 }
 
@@ -1229,7 +1228,7 @@ fn process_type_node_from_node(
         key: node.key,
         value: Value::Clause(node.children.clone()),
         op: cwtools_parser::ast::Operator::Equals,
-        pos: node.pos.clone(),
+        pos: node.pos,
     };
     process_type_node(name, &synthetic_leaf, ast, table, ruleset, comments)
 }
@@ -1245,17 +1244,16 @@ fn process_enum_node_from_node(
         key: node.key,
         value: Value::Clause(node.children.clone()),
         op: cwtools_parser::ast::Operator::Equals,
-        pos: node.pos.clone(),
+        pos: node.pos,
     };
     process_enum_node(name, &synthetic_leaf, ast, table, comments)
 }
 
 fn extract_bracket_content(full: &str, prefix: &str) -> Option<String> {
-    if let Some(body) = full.strip_prefix(prefix) {
-        if let Some(inner) = body.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+    if let Some(body) = full.strip_prefix(prefix)
+        && let Some(inner) = body.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             return Some(inner.to_string());
         }
-    }
     None
 }
 
@@ -1333,11 +1331,10 @@ fn process_type_node(
                                 let v = clean_path(&leaf_value_string(l, table));
                                 def.path_options.paths.push(v);
                             }
-                            "path_strict" => {
-                                if leaf_value_string(l, table) == "yes" {
+                            "path_strict"
+                                if leaf_value_string(l, table) == "yes" => {
                                     def.path_options.path_strict = true;
                                 }
-                            }
                             "path_file" => {
                                 def.path_options.path_file = Some(leaf_value_string(l, table));
                             }
@@ -1347,32 +1344,28 @@ fn process_type_node(
                             "name_field" => {
                                 def.name_field = Some(leaf_value_string(l, table));
                             }
-                            "type_per_file" => {
-                                if leaf_value_string(l, table) == "yes" {
+                            "type_per_file"
+                                if leaf_value_string(l, table) == "yes" => {
                                     def.type_per_file = true;
                                 }
-                            }
                             "starts_with" => {
                                 def.starts_with = Some(leaf_value_string(l, table));
                             }
                             "type_key_prefix" => {
                                 def.key_prefix = Some(leaf_value_string(l, table));
                             }
-                            "severity" => {
-                                if leaf_value_string(l, table) == "warning" {
+                            "severity"
+                                if leaf_value_string(l, table) == "warning" => {
                                     def.warning_only = true;
                                 }
-                            }
-                            "unique" => {
-                                if leaf_value_string(l, table) == "yes" {
+                            "unique"
+                                if leaf_value_string(l, table) == "yes" => {
                                     def.unique = true;
                                 }
-                            }
-                            "should_be_used" => {
-                                if leaf_value_string(l, table) == "yes" {
+                            "should_be_used"
+                                if leaf_value_string(l, table) == "yes" => {
                                     def.should_be_referenced = true;
                                 }
-                            }
                             "skip_root_key" => {
                                 let op = l.op;
                                 let v = leaf_value_string(l, table);
@@ -1433,11 +1426,9 @@ fn process_type_node(
                                 let lv = &ast.arena.leaf_values[*lvidx as usize];
                                 let v = value_to_string(&lv.value, table);
                                 if !v.is_empty() {
-                                    if v == "any" {
-                                        block_keys.push(v);
-                                    } else {
-                                        block_keys.push(v);
-                                    }
+                                    // `any` flows through as a literal key here; any
+                                    // wildcard semantics live in the matcher.
+                                    block_keys.push(v);
                                 }
                             }
                         }
@@ -1527,8 +1518,8 @@ fn parse_type_key_filter_from_comments(comments: &[String]) -> Option<(Vec<Strin
 }
 
 fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
-    if let Some(c) = comments.iter().find(|s| s.contains("graph_related_types")) {
-        if let Some(idx) = c.find('=') {
+    if let Some(c) = comments.iter().find(|s| s.contains("graph_related_types"))
+        && let Some(idx) = c.find('=') {
             let rhs = c[idx + 1..].trim().to_string();
             if rhs.starts_with('{') && rhs.ends_with('}') {
                 let inner = rhs.trim_matches(|c| c == '{' || c == '}');
@@ -1541,7 +1532,6 @@ fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
                 return vec![rhs];
             }
         }
-    }
     Vec::new()
 }
 
@@ -1608,12 +1598,11 @@ fn parse_subtype_localisation(
         if let Child::Node(nidx) = child {
             let n = &ast.arena.nodes[*nidx as usize];
             let nk = table.get_string(n.key.normal).unwrap_or_default();
-            if nk.starts_with("subtype[") {
-                if let Some(st_name) = extract_bracket_content(&nk, "subtype") {
+            if nk.starts_with("subtype[")
+                && let Some(st_name) = extract_bracket_content(&nk, "subtype") {
                     let locs = parse_localisation_block(&n.children, ast, table);
                     out.push((st_name, locs));
                 }
-            }
         }
     }
     out
@@ -1676,12 +1665,11 @@ fn parse_subtype_modifiers(
         if let Child::Node(nidx) = child {
             let n = &ast.arena.nodes[*nidx as usize];
             let nk = table.get_string(n.key.normal).unwrap_or_default();
-            if nk.starts_with("subtype[") {
-                if let Some(st_name) = extract_bracket_content(&nk, "subtype") {
+            if nk.starts_with("subtype[")
+                && let Some(st_name) = extract_bracket_content(&nk, "subtype") {
                     let mods = parse_modifiers_block(&n.children, ast, table);
                     out.push((st_name, mods));
                 }
-            }
         }
     }
     out
@@ -1785,8 +1773,8 @@ fn extract_comment_value(comments: &[String], key: &str) -> Option<String> {
 }
 
 fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {
-    if let Some(c) = comments.iter().find(|s| s.contains("only_if_not")) {
-        if let Some(idx) = c.find('=') {
+    if let Some(c) = comments.iter().find(|s| s.contains("only_if_not"))
+        && let Some(idx) = c.find('=') {
             let rhs = c[idx + 1..].trim().to_string();
             if rhs.starts_with('{') && rhs.ends_with('}') {
                 let inner = rhs.trim_matches(|c| c == '{' || c == '}');
@@ -1799,7 +1787,6 @@ fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {
                 return vec![rhs];
             }
         }
-    }
     Vec::new()
 }
 
@@ -1892,31 +1879,28 @@ fn process_complex_enum_from_children(
                 let l = &ast.arena.leaves[*lidx as usize];
                 let k = table.get_string(l.key.normal).unwrap_or_default();
                 // Handle `name = { ... }` as a Leaf with Clause value
-                if k == "name" {
-                    if let Value::Clause(name_ch) = &l.value {
+                if k == "name"
+                    && let Value::Clause(name_ch) = &l.value {
                         name_tree = Some(build_name_tree(name_ch, ast, table));
                         continue;
                     }
-                }
                 let v = leaf_value_string(l, table);
                 match k.as_str() {
                     "path" => paths.push(clean_path(&v)),
-                    "path_strict" => {
-                        if v == "yes" {
+                    "path_strict"
+                        if v == "yes" => {
                             path_strict = true;
                         }
-                    }
                     "path_file" => {
                         path_file = Some(v);
                     }
                     "path_extension" => {
                         path_extension = Some(v);
                     }
-                    "start_from_root" => {
-                        if v == "yes" {
+                    "start_from_root"
+                        if v == "yes" => {
                             start_from_root = true;
                         }
-                    }
                     _ => {}
                 }
             }
@@ -2048,10 +2032,9 @@ fn options_from_comments(comments: &[String], is_comparison: bool) -> Options {
                 if let Some((min_s, max_s)) = spec.split_once("..") {
                     let min_s = min_s.trim();
                     // Handle ~ prefix for strict_min=false
-                    let (min_s, strict) = if min_s.starts_with('~') {
-                        (&min_s[1..], false)
-                    } else {
-                        (min_s, true)
+                    let (min_s, strict) = match min_s.strip_prefix('~') {
+                        Some(rest) => (rest, false),
+                        None => (min_s, true),
                     };
                     let min = min_s.parse::<i32>().unwrap_or(1);
                     let max = if max_s.trim() == "inf" {

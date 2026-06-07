@@ -245,11 +245,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         // strip one leading space (the convention after `:`)
         // but keep everything else including # comments,
         // because in F# `#` is a valid `isLocValueChar`.
-        let desc = if remainder.starts_with(' ') {
-            &remainder[1..]
-        } else {
-            remainder
-        };
+        let desc = remainder.strip_prefix(' ').unwrap_or(remainder);
 
         let position = Position::new(name, i + 1, 1); // 1-based line numbers
 
@@ -372,46 +368,46 @@ pub fn is_loc_value_char(c: char) -> bool {
     // ASCII letters
     c.is_ascii_alphabetic()
     // U+0020–U+007E  (printable ASCII)
-    || (u >= 0x0020 && u <= 0x007E)
+    || (0x0020..=0x007E).contains(&u)
     // U+00A0–U+024F  (Latin Extended)
-    || (u >= 0x00A0 && u <= 0x024F)
+    || (0x00A0..=0x024F).contains(&u)
     // U+0401–U+045F  (Cyrillic)
-    || (u >= 0x0401 && u <= 0x045F)
+    || (0x0401..=0x045F).contains(&u)
     // U+0490–U+0491  (Cyrillic supplement)
-    || (u >= 0x0490 && u <= 0x0491)
+    || (0x0490..=0x0491).contains(&u)
     // U+1E00–U+1EFF  (Latin Extended Additional)
-    || (u >= 0x1E00 && u <= 0x1EFF)
+    || (0x1E00..=0x1EFF).contains(&u)
     // U+2013–U+2044  (General Punctuation subset)
-    || (u >= 0x2013 && u <= 0x2044)
+    || (0x2013..=0x2044).contains(&u)
     // U+2460–U+24FF  (Enclosed Alphanumerics)
-    || (u >= 0x2460 && u <= 0x24FF)
+    || (0x2460..=0x24FF).contains(&u)
     // U+4E00–U+9FFF  (CJK Unified Ideographs)
-    || (u >= 0x4E00 && u <= 0x9FFF)
+    || (0x4E00..=0x9FFF).contains(&u)
     // U+3000–U+30FF  (CJK Symbols + Katakana/Hiragana — Japanese)
-    || (u >= 0x3000 && u <= 0x30FF)
+    || (0x3000..=0x30FF).contains(&u)
     // U+3400–U+4DBF  (CJK Unified Ideographs Extension A — Chinese)
-    || (u >= 0x3400 && u <= 0x4DBF)
+    || (0x3400..=0x4DBF).contains(&u)
     // U+FE30–U+FE4F  (CJK Compatibility Forms)
-    || (u >= 0xFE30 && u <= 0xFE4F)
+    || (0xFE30..=0xFE4F).contains(&u)
     // U+FF00–U+FFEF  (Halfwidth and Fullwidth Forms)
-    || (u >= 0xFF00 && u <= 0xFFEF)
+    || (0xFF00..=0xFFEF).contains(&u)
     // ── Intentional divergence from F# `isLocValueChar`: accept scripts the
     // game renders fine but F# rejected. Per project goal, the game wins over
     // strict F# parity (see project memory). ──
     // U+1100–U+11FF  (Hangul Jamo — Korean)
-    || (u >= 0x1100 && u <= 0x11FF)
+    || (0x1100..=0x11FF).contains(&u)
     // U+3130–U+318F  (Hangul Compatibility Jamo — Korean)
-    || (u >= 0x3130 && u <= 0x318F)
+    || (0x3130..=0x318F).contains(&u)
     // U+AC00–U+D7A3  (Hangul Syllables — Korean)
-    || (u >= 0xAC00 && u <= 0xD7A3)
+    || (0xAC00..=0xD7A3).contains(&u)
     // U+0600–U+06FF  (Arabic)
-    || (u >= 0x0600 && u <= 0x06FF)
+    || (0x0600..=0x06FF).contains(&u)
     // U+0750–U+077F  (Arabic Supplement)
-    || (u >= 0x0750 && u <= 0x077F)
+    || (0x0750..=0x077F).contains(&u)
     // U+FB50–U+FDFF  (Arabic Presentation Forms-A)
-    || (u >= 0xFB50 && u <= 0xFDFF)
+    || (0xFB50..=0xFDFF).contains(&u)
     // U+FE70–U+FEFF  (Arabic Presentation Forms-B)
-    || (u >= 0xFE70 && u <= 0xFEFF)
+    || (0xFE70..=0xFEFF).contains(&u)
 }
 
 /// Scan `desc` for the first character that fails `is_loc_value_char`.

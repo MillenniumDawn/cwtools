@@ -79,6 +79,12 @@ pub struct AliasCategoryIndex {
     pub scope_field_idx: Option<usize>,
 }
 
+impl Default for RuleSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuleSet {
     pub fn new() -> Self {
         Self {
