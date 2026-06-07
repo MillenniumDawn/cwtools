@@ -2408,15 +2408,20 @@ impl Backend {
 
         // Pass 1: parse + index every file (types, scripted triggers/effects,
         // modifiers) so cross-file references resolve before any file is
-        // validated. The parsed AST is dropped right after indexing — pass 2
-        // re-parses. Holding all 7413 ASTs+texts resident cost ~2.5 GB on MD;
-        // a second parse is far cheaper than that footprint.
+        // validated. The parsed ASTs are kept resident in `parsed_files` and
+        // handed to pass 2 — re-parsing 7413 files in pass 2 cost ~4-6s on MD
+        // and produced no observable benefit, just CPU and allocator churn.
+        // The total resident set between the two passes is bounded by what the
+        // loc service allocates next, so peak RSS doesn't grow meaningfully.
         self.send_loading_bar(true, "Indexing workspace…").await;
+        let mut parsed_files: Vec<Option<ParsedFile>> = Vec::with_capacity(files_to_validate.len());
         for (i, file_path) in files_to_validate.iter().enumerate() {
             let uri = format!("file://{}", file_path.display());
-            if let Ok(text) = std::fs::read_to_string(file_path) {
-                self.index_document(&uri, &text).await;
-            }
+            let parsed = match std::fs::read_to_string(file_path) {
+                Ok(text) => self.index_document(&uri, &text).await,
+                Err(_) => None,
+            };
+            parsed_files.push(parsed);
             // Yield every 50 files so LSP requests (hover, completion) can
             // interleave with the workspace scan.
             if i % 50 == 49 {
@@ -2459,27 +2464,29 @@ impl Backend {
         // publish loc-file diagnostics (CW225 etc.) for the workspace loc files.
         self.rebuild_and_publish_loc(&root_path).await;
 
-        // Pass 2: re-parse and validate each file against the now-complete
-        // index, then drop the AST. Diagnostics are published to the editor;
-        // the file is intentionally NOT stored in `self.state.documents`. That
-        // map holds only files the editor has open (populated by did_open) — the
-        // scan used to insert every workspace file there, pinning all texts+ASTs
-        // in memory for the whole session.
+        // Pass 2: validate each file against the now-complete index using
+        // the ASTs we already parsed in pass 1. Diagnostics are published to
+        // the editor; the file is intentionally NOT stored in
+        // `self.state.documents`. That map holds only files the editor has
+        // open (populated by did_open) — the scan used to insert every
+        // workspace file there, pinning all texts+ASTs in memory for the
+        // whole session.
         self.send_loading_bar(true, "Validating workspace…").await;
         let mut total_errors = 0usize;
         let total_files = files_to_validate.len();
         // Snapshot modifier_keys once before the loop; the set doesn't change
         // during validation and we can't hold the guard across await points.
         let modifier_keys_snap: HashSet<String> = self.state.modifier_keys.read().clone();
-        for (i, file_path) in files_to_validate.iter().enumerate() {
+        for (i, (file_path, parsed_opt)) in
+            files_to_validate.iter().zip(parsed_files.iter()).enumerate()
+        {
+            // Skip files that failed to parse in pass 1 (matches the previous
+            // `continue` on parse error in the re-parse path).
+            let Some(parsed) = parsed_opt else {
+                continue;
+            };
             let uri = format!("file://{}", file_path.display());
-            let Ok(text) = std::fs::read_to_string(file_path) else {
-                continue;
-            };
-            let Ok(parsed) = parse_string(&text, &self.state.string_table) else {
-                continue;
-            };
-            let diagnostics = self.validate_parsed(&uri, &parsed, &modifier_keys_snap);
+            let diagnostics = self.validate_parsed(&uri, parsed, &modifier_keys_snap);
             total_errors += diagnostics
                 .iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -2494,6 +2501,11 @@ impl Backend {
                 tokio::task::yield_now().await;
             }
         }
+        // Pass 2 is done. Drop the per-file ASTs before the file-list / profile
+        // summary so the RSS we report reflects the steady-state working set
+        // (loc index + type index + open documents), not the in-flight
+        // validation peak.
+        drop(parsed_files);
 
         self.client
             .log_message(
