@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
-use cwtools_info::{TypeIndex, collect_type_instances};
+use cwtools_info::{
+    TypeIndex, collect_set_variable_names, collect_type_instances, variable_defining_effects,
+};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::RuleSet;
@@ -13,23 +15,54 @@ use cwtools_info::vanilla_cache;
 /// Build a TypeIndex from every script file under `dir` (used for a base-game
 /// install). Files are parsed and indexed for reference resolution; they are
 /// never validated.
-fn index_game_dir(dir: &Path, ruleset: &RuleSet, table: &StringTable) -> TypeIndex {
-    let mut index = TypeIndex::new();
+fn index_game_dir(
+    dir: &Path,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    var_effects: &std::collections::HashSet<String>,
+) -> TypeIndex {
     let config = search_config_for(dir);
     let mut mgr = FileManager::with_string_table(config, table.clone());
-    match mgr.discover_and_parse() {
-        Ok(files) => {
-            eprintln!("  Indexing {} base-game files from {}", files.len(), dir.display());
-            for file in &files {
-                if let Ok(text) = std::fs::read_to_string(&file.path)
-                    && let Ok(pf) = parse_string(&text, table)
-                {
-                    let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
-                    index.merge(file.path.to_str().unwrap_or(""), instances);
-                }
+    // `discover_and_parse` already parses the base-game files in parallel; the
+    // expensive part. Collect type instances straight from those arenas (no
+    // re-read/re-parse, unlike before) and stream-merge them sequentially so we
+    // never hold every file's instances at once.
+    let files = match mgr.discover_and_parse() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "  warn: could not read base-game dir {}: {}",
+                dir.display(),
+                e
+            );
+            return TypeIndex::new();
+        }
+    };
+    eprintln!(
+        "  Indexing {} base-game files from {}",
+        files.len(),
+        dir.display()
+    );
+
+    let mut index = TypeIndex::new();
+    for file in files {
+        let path = file.path.to_str().unwrap_or("").to_string();
+        let pf = cwtools_parser::ast::ParsedFile {
+            arena: file.arena,
+            root_children: file.root_children,
+            errors: vec![],
+        };
+        let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
+        index.merge(&path, instances);
+        // Collect base-game variable definitions too, so a mod referencing a
+        // vanilla variable isn't flagged as unset (CW246).
+        if !var_effects.is_empty() {
+            let mut names: Vec<String> = Vec::new();
+            collect_set_variable_names(&pf, table, var_effects, &mut names);
+            for n in &names {
+                index.var_index.add_name(n);
             }
         }
-        Err(e) => eprintln!("  warn: could not read base-game dir {}: {}", dir.display(), e),
     }
     index
 }
@@ -113,6 +146,15 @@ enum Commands {
         /// use later with --ignore-hashes.
         #[arg(long)]
         output_hashes: Option<PathBuf>,
+        /// Extra filename glob patterns to skip (in addition to the engine
+        /// defaults like Changelog.txt, README.md, *.md). May be repeated.
+        /// Examples: --ignore-file "secret*" --ignore-file "*.notes"
+        #[arg(long = "ignore-file", value_name = "GLOB")]
+        ignore_files: Vec<String>,
+        /// Extra directory glob patterns to skip during workspace discovery.
+        /// May be repeated. Examples: --ignore-dir "build" --ignore-dir "temp*"
+        #[arg(long = "ignore-dir", value_name = "GLOB")]
+        ignore_dirs: Vec<String>,
     },
     /// Pre-generate a vanilla type index from a base-game install, for use with
     /// `validate --vanilla-cache`. Parses and indexes the install once so later
@@ -200,17 +242,21 @@ fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
 
     // If this directory itself contains script files, search it directly.
     let script_exts = ["txt", "gui", "gfx", "sfx", "asset", "map"];
-    let has_script_files = std::fs::read_dir(directory).ok().is_some_and(|mut entries| {
-        entries.any(|e| {
-            if let Ok(entry) = e {
-                entry.path().extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| script_exts.contains(&ext))
-            } else {
-                false
-            }
-        })
-    });
+    let has_script_files = std::fs::read_dir(directory)
+        .ok()
+        .is_some_and(|mut entries| {
+            entries.any(|e| {
+                if let Ok(entry) = e {
+                    entry
+                        .path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| script_exts.contains(&ext))
+                } else {
+                    false
+                }
+            })
+        });
 
     if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") || has_script_files {
         FileManagerConfig {
@@ -230,9 +276,13 @@ fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
 /// Stable across runs and machines (unlike std's DefaultHasher seed).
 fn diag_hash(file: &str, code: &str, message: &str, line: u32) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in file.bytes().chain(b"|".iter().copied())
-        .chain(code.bytes()).chain(b"|".iter().copied())
-        .chain(message.bytes()).chain(b"|".iter().copied())
+    for b in file
+        .bytes()
+        .chain(b"|".iter().copied())
+        .chain(code.bytes())
+        .chain(b"|".iter().copied())
+        .chain(message.bytes())
+        .chain(b"|".iter().copied())
         .chain(line.to_string().bytes())
     {
         h ^= b as u64;
@@ -363,23 +413,10 @@ fn run_fsharp_engine(command: &Commands) -> ! {
     }
 }
 
-/// Initialize tracing only when RUST_LOG is set, so the default run stays quiet.
-/// Profile a run with e.g. `RUST_LOG=info cwtools validate ...` and add
-/// `#[tracing::instrument]` to any hot path you want timed. See PROFILING.md.
-fn tracing_init() {
-    if std::env::var("RUST_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_target(true)
-            // Emit span close events so instrumented hot paths report their
-            // busy/idle time — that's the profiling signal.
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-            .try_init();
-    }
-}
-
 fn main() {
-    tracing_init();
+    // Quiet by default; set RUST_LOG or CWTOOLS_PROFILE to turn on logging /
+    // profiling. See PROFILING.md and `cwtools_profiling`.
+    cwtools_profiling::init_tracing();
     let cli = Cli::parse();
 
     match cli.engine.as_str() {
@@ -535,9 +572,21 @@ fn main() {
             println!("  SingleAliases: {}", ruleset.single_aliases.len());
             println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
         }
-        Commands::Validate { game, directory, rules, vanilla, vanilla_cache, report_type, output_file, ignore_hashes, output_hashes } => {
+        Commands::Validate {
+            game,
+            directory,
+            rules,
+            vanilla,
+            vanilla_cache,
+            report_type,
+            output_file,
+            ignore_hashes,
+            output_hashes,
+            ignore_files,
+            ignore_dirs,
+        } => {
             use cwtools_game::constants::Game;
-            use cwtools_validation::validate_ast;
+            use cwtools_validation::validate_ast_with_loc;
 
             let game_id = Game::from_str(&game).unwrap_or_else(|| {
                 eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
@@ -549,44 +598,105 @@ fn main() {
             } else {
                 format!("file {}", rules.display())
             };
-            eprintln!("Validating {} files in {} against rules {}", game_id, directory.display(), rules_label);
+            eprintln!(
+                "Validating {} files in {} against rules {}",
+                game_id,
+                directory.display(),
+                rules_label
+            );
 
             // Parse rules (shares its StringTable with game files)
             let rules_table = StringTable::new();
             let ruleset = load_rules(&rules, &rules_table);
-            eprintln!("  Loaded {} types, {} enums, {} aliases", ruleset.types.len(), ruleset.enums.len(), ruleset.aliases.len());
+            eprintln!(
+                "  Loaded {} types, {} enums, {} aliases",
+                ruleset.types.len(),
+                ruleset.enums.len(),
+                ruleset.aliases.len()
+            );
+            // Per-phase timings on stderr when CWTOOLS_TIMINGS is set.
+            let _timings = std::env::var_os("CWTOOLS_TIMINGS").is_some();
+            let mut _tprev = std::time::Instant::now();
+            macro_rules! tlog {
+                ($label:expr) => {{
+                    if _timings {
+                        eprintln!("  [t] {} {:?}", $label, _tprev.elapsed());
+                    }
+                    _tprev = std::time::Instant::now();
+                }};
+            }
 
-            // Discover and parse files using the SAME string table
-            let config = search_config_for(&directory);
+            // Discover and parse files using the SAME string table.
+            // Layer user-supplied --ignore-file / --ignore-dir globs on top of
+            // the engine defaults (Changelog.txt, README.*, *.md, etc.).
+            let mut config = search_config_for(&directory);
+            if !ignore_files.is_empty() {
+                config.exclude_patterns.extend(ignore_files.iter().cloned());
+            }
+            if !ignore_dirs.is_empty() {
+                config
+                    .exclude_dir_patterns
+                    .extend(ignore_dirs.iter().cloned());
+            }
             let mut manager = FileManager::with_string_table(config, rules_table.clone());
             let files = manager.discover_and_parse().unwrap_or_else(|e| {
                 eprintln!("Error discovering files: {}", e);
                 std::process::exit(1);
             });
             eprintln!("  Discovered {} files", files.len());
+            tlog!("discover+parse");
 
-            // Build cross-file TypeIndex from all discovered files (Item 2).
-            // Arena doesn't derive Clone, so we re-read each file to build the
-            // index, then use the already-parsed arenas for validation.
+            // Take ownership of each parsed AST once, as the parser's ParsedFile.
+            // The TypeIndex build and the validation pass both borrow this set, so
+            // nothing is parsed (or held) twice.
+            let parsed: Vec<(std::path::PathBuf, String, cwtools_parser::ast::ParsedFile)> = files
+                .into_iter()
+                .map(|f| {
+                    let pf = cwtools_parser::ast::ParsedFile {
+                        arena: f.arena,
+                        root_children: f.root_children,
+                        errors: vec![],
+                    };
+                    (f.path, f.logical_path, pf)
+                })
+                .collect();
+
+            // Build cross-file TypeIndex from the already-parsed arenas (Item 2).
+            // This is cheap (~0.1s on MD), so keep it sequential and streaming:
+            // merge each file's instances then drop them, rather than holding
+            // every file's instances at once. Lower peak memory, and first-seen
+            // dedup stays in deterministic input order.
+            use rayon::prelude::*;
             let mut type_index = TypeIndex::new();
-            for file in &files {
-                let text = match std::fs::read_to_string(&file.path) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if let Ok(pf) = cwtools_parser::parser::parse_string(&text, &rules_table) {
-                    let instances =
-                        collect_type_instances(&ruleset, &pf, &file.logical_path, &rules_table);
-                    type_index.merge(file.path.to_str().unwrap_or(""), instances);
+            for (path, logical_path, pf) in &parsed {
+                let instances = collect_type_instances(&ruleset, pf, logical_path, &rules_table);
+                type_index.merge(path.to_str().unwrap_or(""), instances);
+            }
+            tlog!("typeindex");
+
+            // Project-wide variable index for `variable_field` reference checks
+            // (CW246). Collect every variable defined by a `set_variable`-family
+            // effect across the mod (the effect set is config-derived). Used only
+            // when the var checks are enabled (CWTOOLS_VAR_CHECKS); building it is
+            // cheap so it is always populated.
+            let var_effects = variable_defining_effects(&ruleset);
+            for (_path, _logical_path, pf) in &parsed {
+                let mut names: Vec<String> = Vec::new();
+                collect_set_variable_names(pf, &rules_table, &var_effects, &mut names);
+                for n in &names {
+                    type_index.var_index.add_name(n);
                 }
             }
+            tlog!("varindex");
 
             // Index the base-game install, if given. Vanilla files populate the
             // type index (so a mod can reference base-game operation_tokens,
             // ship_names, focuses, … without "not a known instance" errors) but are
             // never validated themselves.
             if let Some(vanilla_dir) = &vanilla {
-                let vanilla_index = index_game_dir(vanilla_dir, &ruleset, &rules_table);
+                let vanilla_index =
+                    index_game_dir(vanilla_dir, &ruleset, &rules_table, &var_effects);
+                type_index.var_index.merge(&vanilla_index.var_index);
                 for (type_name, entries) in vanilla_index.map {
                     let per_type = std::collections::HashMap::from([(
                         type_name,
@@ -594,21 +704,39 @@ fn main() {
                     )]);
                     type_index.merge("<vanilla>", per_type);
                 }
+                // Build the file index (mod + vanilla) for `filepath` reference
+                // checks (CW113). Only when vanilla is present: mod files commonly
+                // reference base-game assets, so an index missing vanilla would
+                // flag every such reference as not-found.
+                type_index.file_index.add_root(&directory);
+                type_index.file_index.add_root(vanilla_dir);
+                tlog!("fileindex");
             }
 
             // Load a pre-generated vanilla index, if given (faster than --vanilla;
             // resolves base-game references without re-parsing the install).
             if let Some(cache_path) = &vanilla_cache {
                 match vanilla_cache::load(cache_path) {
-                    Ok((cache_game, per_type)) => {
+                    Ok((cache_game, _fingerprint, per_type)) => {
                         if cache_game != game {
-                            eprintln!("  warn: vanilla cache was built for game '{}', validating '{}'", cache_game, game);
+                            eprintln!(
+                                "  warn: vanilla cache was built for game '{}', validating '{}'",
+                                cache_game, game
+                            );
                         }
                         let total: usize = per_type.values().map(|v| v.len()).sum();
                         type_index.merge("<vanilla-cache>", per_type);
-                        eprintln!("  Loaded {} base-game instances from cache {}", total, cache_path.display());
+                        eprintln!(
+                            "  Loaded {} base-game instances from cache {}",
+                            total,
+                            cache_path.display()
+                        );
                     }
-                    Err(e) => eprintln!("  warn: could not load vanilla cache {}: {}", cache_path.display(), e),
+                    Err(e) => eprintln!(
+                        "  warn: could not load vanilla cache {}: {}",
+                        cache_path.display(),
+                        e
+                    ),
                 }
             }
 
@@ -635,36 +763,178 @@ fn main() {
                 }
             }
 
+            // Load localisation: the mod directory plus the vanilla install (so
+            // mod config referencing base-game loc keys doesn't false-positive).
+            // The combined service feeds the loc-key index (CW100/CW122) and the
+            // loc-file checks; only mod-path loc files are reported.
+            let mut loc_dirs: Vec<&std::path::Path> = vec![directory.as_path()];
+            if let Some(v) = &vanilla {
+                loc_dirs.push(v.as_path());
+            }
+            let loc_service = cwtools_localization::LocService::from_folders(&loc_dirs);
+            let loc_game = match game_id {
+                Game::Hoi4 => cwtools_localization::Game::HOI4,
+                Game::Stellaris => cwtools_localization::Game::Stellaris,
+                Game::Eu4 => cwtools_localization::Game::EU4,
+                Game::Ck3 => cwtools_localization::Game::CK3,
+                Game::Ir => cwtools_localization::Game::IR,
+                Game::Vic3 => cwtools_localization::Game::VIC3,
+                Game::Eu5 => cwtools_localization::Game::EU5,
+                _ => cwtools_localization::Game::Generic,
+            };
+            tlog!("vanilla+modifiers");
+            let loc_index = cwtools_localization::LocIndex::build(&loc_service, loc_game);
+            tlog!("loc-load");
+
             // Load the ignore-hash baseline, if given.
-            let ignored: std::collections::HashSet<String> = ignore_hashes.as_ref()
+            let ignored: std::collections::HashSet<String> = ignore_hashes
+                .as_ref()
                 .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+                .map(|s| {
+                    s.lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default();
 
             // Validate each file, collecting all (file, error, hash) diagnostics.
-            struct Diag { file: String, severity: cwtools_validation::ErrorSeverity, code: String, message: String, line: u32, hash: String }
-            let mut diags: Vec<Diag> = Vec::new();
-            for file in files {
-                let file_str = file.path.to_str().unwrap_or("").to_string();
-                let parser_file = cwtools_parser::ast::ParsedFile {
-                    arena: file.arena,
-                    root_children: file.root_children,
-                    errors: vec![],
-                };
-                let errors = validate_ast(
-                    &parser_file, &ruleset, &rules_table, &file_str,
-                    Some(game_id), Some(&type_index), Some(&modifier_keys),
-                );
-                for err in errors {
-                    let code = err.code.clone().unwrap_or_default();
-                    let hash = diag_hash(&file_str, &code, &err.message, err.line);
-                    if ignored.contains(&hash) { continue; }
-                    diags.push(Diag { file: file_str.clone(), severity: err.severity, code, message: err.message, line: err.line, hash });
-                }
+            struct Diag {
+                file: String,
+                severity: cwtools_validation::ErrorSeverity,
+                code: String,
+                message: String,
+                line: u32,
+                hash: String,
             }
+            // Validate files in parallel. Each file's validation reads only
+            // shared, immutable state (ruleset, rules_table behind its own lock,
+            // type_index, modifier_keys, loc_index) and produces its own Vec, so
+            // there's no contention on `diags`. `par_iter` over the indexed
+            // `parsed` Vec collects in input order, so the report is byte-for-byte
+            // identical to the sequential version.
+            let ignored_ref = &ignored;
+            let mut diags: Vec<Diag> = parsed
+                .par_iter()
+                .flat_map_iter(|(path, _logical_path, parser_file)| {
+                    let file_str = path.to_str().unwrap_or("").to_string();
+                    let errors = validate_ast_with_loc(
+                        parser_file,
+                        &ruleset,
+                        &rules_table,
+                        &file_str,
+                        Some(game_id),
+                        Some(&type_index),
+                        Some(&modifier_keys),
+                        Some(&loc_index),
+                    );
+                    errors.into_iter().filter_map(move |err| {
+                        let code = err.code.clone().unwrap_or_default();
+                        let hash = diag_hash(&file_str, &code, &err.message, err.line);
+                        if ignored_ref.contains(&hash) {
+                            return None;
+                        }
+                        Some(Diag {
+                            file: file_str.clone(),
+                            severity: err.severity,
+                            code,
+                            message: err.message,
+                            line: err.line,
+                            hash,
+                        })
+                    })
+                })
+                .collect();
+            tlog!("validate-config");
 
-            let total_errors = diags.iter().filter(|d| d.severity == cwtools_validation::ErrorSeverity::Error).count();
-            let total_warnings = diags.iter().filter(|d| d.severity == cwtools_validation::ErrorSeverity::Warning).count();
+            // Loc-file checks (CW225/CW234/CW259/CW268/CW275). Resolve refs
+            // against the full mod+vanilla union but only report mod-path files.
+            let dir_prefix = directory.to_string_lossy().to_string();
+            for d in cwtools_localization::validate_loc_project(&loc_service, loc_game) {
+                if !d.file.starts_with(&dir_prefix) {
+                    continue;
+                }
+                let severity = match d.severity {
+                    cwtools_localization::LocSeverity::Error => {
+                        cwtools_validation::ErrorSeverity::Error
+                    }
+                    cwtools_localization::LocSeverity::Warning => {
+                        cwtools_validation::ErrorSeverity::Warning
+                    }
+                    cwtools_localization::LocSeverity::Information => {
+                        cwtools_validation::ErrorSeverity::Information
+                    }
+                };
+                let line = d.line as u32;
+                let code = d.code.to_string();
+                let hash = diag_hash(&d.file, &code, &d.message, line);
+                if ignored.contains(&hash) {
+                    continue;
+                }
+                diags.push(Diag {
+                    file: d.file,
+                    severity,
+                    code,
+                    message: d.message,
+                    line,
+                    hash,
+                });
+            }
+            tlog!("validate-loc");
+
+            let total_errors = diags
+                .iter()
+                .filter(|d| d.severity == cwtools_validation::ErrorSeverity::Error)
+                .count();
+            let total_warnings = diags
+                .iter()
+                .filter(|d| d.severity == cwtools_validation::ErrorSeverity::Warning)
+                .count();
+
+            // Memory report (CWTOOLS_PROFILE=1): RSS at the end of a single
+            // validate pass (a good proxy for peak) plus a per-component
+            // breakdown, to track the 1.5 GB target and see where bytes go.
+            if cwtools_profiling::profile_enabled() {
+                let mib = |b: usize| cwtools_profiling::format_mib(b as u64);
+                if let Some(rss) = cwtools_profiling::current_rss_bytes() {
+                    eprintln!(
+                        "  [profile] RSS {} after validating {} files",
+                        cwtools_profiling::format_mib(rss),
+                        parsed.len()
+                    );
+                }
+                let st = rules_table.stats();
+                eprintln!(
+                    "  [profile]   string_table: {} ({} entries, strings {}, keys {}, meta {})",
+                    mib(st.total_bytes()),
+                    st.entries,
+                    mib(st.id_to_string_bytes),
+                    mib(st.map_key_bytes),
+                    mib(st.metadata_bytes),
+                );
+                let (mut nodes, mut leaves, mut values, mut clauses) = (0usize, 0, 0, 0);
+                for (_p, _l, pf) in &parsed {
+                    nodes += pf.arena.nodes.len();
+                    leaves += pf.arena.leaves.len();
+                    values += pf.arena.leaf_values.len();
+                    clauses += pf.arena.value_clauses.len();
+                }
+                let type_instances: usize = type_index.map.values().map(|v| v.len()).sum();
+                eprintln!(
+                    "  [profile]   arenas: {} nodes, {} leaves, {} values, {} clauses across {} files",
+                    nodes,
+                    leaves,
+                    values,
+                    clauses,
+                    parsed.len()
+                );
+                eprintln!(
+                    "  [profile]   type_index: {} instances in {} types; loc union: {} keys",
+                    type_instances,
+                    type_index.map.len(),
+                    loc_index.union().len()
+                );
+            }
 
             // Render the report in the requested format.
             let mut out = String::new();
@@ -672,8 +942,15 @@ fn main() {
                 "csv" => {
                     out.push_str("file,line,severity,code,message,hash\n");
                     for d in &diags {
-                        out.push_str(&format!("{},{},{:?},{},{},{}\n",
-                            csv_escape(&d.file), d.line, d.severity, csv_escape(&d.code), csv_escape(&d.message), d.hash));
+                        out.push_str(&format!(
+                            "{},{},{:?},{},{},{}\n",
+                            csv_escape(&d.file),
+                            d.line,
+                            d.severity,
+                            csv_escape(&d.code),
+                            csv_escape(&d.message),
+                            d.hash
+                        ));
                     }
                 }
                 "json" => {
@@ -694,17 +971,36 @@ fn main() {
                             out.push_str(&format!("\n  {}:\n", d.file));
                             current = &d.file;
                         }
-                        let code_part = if d.code.is_empty() { String::new() } else { format!("[{}] ", d.code) };
-                        out.push_str(&format!("    [{:?}] {}{} (line {})\n", d.severity, code_part, d.message, d.line));
+                        let code_part = if d.code.is_empty() {
+                            String::new()
+                        } else {
+                            format!("[{}] ", d.code)
+                        };
+                        out.push_str(&format!(
+                            "    [{:?}] {}{} (line {})\n",
+                            d.severity, code_part, d.message, d.line
+                        ));
                     }
-                    out.push_str(&format!("\nValidation complete: {} errors, {} warnings\n", total_errors, total_warnings));
+                    out.push_str(&format!(
+                        "\nValidation complete: {} errors, {} warnings\n",
+                        total_errors, total_warnings
+                    ));
                 }
             }
 
             match &output_file {
                 Some(p) => {
-                    if let Err(e) = std::fs::write(p, &out) { eprintln!("Error writing report {}: {}", p.display(), e); }
-                    else { println!("Wrote {} report ({} errors, {} warnings) to {}", report_type, total_errors, total_warnings, p.display()); }
+                    if let Err(e) = std::fs::write(p, &out) {
+                        eprintln!("Error writing report {}: {}", p.display(), e);
+                    } else {
+                        println!(
+                            "Wrote {} report ({} errors, {} warnings) to {}",
+                            report_type,
+                            total_errors,
+                            total_warnings,
+                            p.display()
+                        );
+                    }
                 }
                 None => print!("{}", out),
             }
@@ -714,19 +1010,34 @@ fn main() {
                 let mut hashes: Vec<&str> = diags.iter().map(|d| d.hash.as_str()).collect();
                 hashes.sort_unstable();
                 hashes.dedup();
-                if let Err(e) = std::fs::write(p, hashes.join("\n")) { eprintln!("Error writing hashes {}: {}", p.display(), e); }
-                else { println!("Wrote {} diagnostic hashes to {}", hashes.len(), p.display()); }
+                if let Err(e) = std::fs::write(p, hashes.join("\n")) {
+                    eprintln!("Error writing hashes {}: {}", p.display(), e);
+                } else {
+                    println!(
+                        "Wrote {} diagnostic hashes to {}",
+                        hashes.len(),
+                        p.display()
+                    );
+                }
             }
 
             if total_errors > 0 {
                 std::process::exit(1);
             }
         }
-        Commands::CacheVanilla { game, vanilla, rules, output } => {
+        Commands::CacheVanilla {
+            game,
+            vanilla,
+            rules,
+            output,
+        } => {
             use cwtools_game::constants::Game;
 
             if Game::from_str(&game).is_none() {
-                eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
+                eprintln!(
+                    "Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom",
+                    game
+                );
                 std::process::exit(1);
             }
 
@@ -734,8 +1045,17 @@ fn main() {
             let ruleset = load_rules(&rules, &rules_table);
             println!("  Loaded {} types from rules", ruleset.types.len());
 
-            let index = index_game_dir(&vanilla, &ruleset, &rules_table);
-            match vanilla_cache::save(&index, &game, &output) {
+            // The vanilla cache stores type instances only; no variable
+            // collection needed here (empty effect set skips it).
+            let index = index_game_dir(
+                &vanilla,
+                &ruleset,
+                &rules_table,
+                &std::collections::HashSet::new(),
+            );
+            let fingerprint = vanilla_cache::fingerprint(&vanilla);
+            println!("  Vanilla fingerprint: {}", fingerprint);
+            match vanilla_cache::save(&index, &game, &fingerprint, &output) {
                 Ok(n) => println!("Wrote {} base-game instances to {}", n, output.display()),
                 Err(e) => {
                     eprintln!("Error writing vanilla cache {}: {}", output.display(), e);
@@ -744,78 +1064,41 @@ fn main() {
             }
         }
         Commands::Loc { directory } => {
-            use cwtools_localization::service::LocService;
-            use cwtools_localization::validation::build_key_union;
-            use cwtools_localization::validation::validate_loc_file;
+            use cwtools_localization::{LocService, validate_loc_project};
 
             println!("Scanning localisation in {}", directory.display());
             let service = LocService::from_folder(&directory);
 
-            let mut all_files = Vec::new();
-            for (_, result) in service.results() {
-                if let Ok(file) = result {
-                    all_files.push(file.clone());
+            let total_entries: usize = service.files().iter().map(|f| f.entries.len()).sum();
+
+            // Standalone loc lint uses the scope-independent checks (CW225 etc.);
+            // scope-aware command checks need the referencing config's scope.
+            let diags = validate_loc_project(&service, cwtools_localization::Game::Generic);
+
+            // Surface parse failures too.
+            let parse_errors: Vec<(String, String)> = service.errors().to_vec();
+
+            let mut by_file: std::collections::BTreeMap<String, Vec<_>> =
+                std::collections::BTreeMap::new();
+            for d in &diags {
+                by_file.entry(d.file.clone()).or_default().push(d);
+            }
+            for (file, ds) in &by_file {
+                println!("\n  {} — {} issues:", file, ds.len());
+                for d in ds {
+                    println!("    [line {}] {}: {}", d.line, d.code, d.message);
                 }
             }
-            let all_keys = build_key_union(&all_files);
-            println!("  Total unique keys: {}", all_keys.len());
-
-            let hardcoded: Vec<&str> = vec![
-                "Player",
-                "Root",
-                "From",
-                "Prev",
-                "Capital",
-                "Random",
-                "This",
-                "Country",
-                "Ruler",
-                "GetName",
-                "GetName2",
-                "GetSpeciesName",
-                "GetSpeciesNamePlural",
-                "GetSpeciesAdj",
-                "GetTitle",
-                "Owner",
-                "Controller",
-                "GetGovernmentName",
-                "GetClassName",
-                "GetAdj",
-                "GetIcon",
-                "GetRegnalName",
-                "Date",
-                "GetDate",
-            ];
-
-            let mut total_errors = 0;
-            let mut total_entries = 0;
-
-            for (path, result) in service.results() {
-                match result {
-                    Ok(file) => {
-                        let mut file_copy = file.clone();
-                        let errors = validate_loc_file(&mut file_copy, &all_keys, &hardcoded);
-                        total_entries += file.entries.len();
-                        if !errors.is_empty() {
-                            println!("\n  {} — {} errors:", path, errors.len());
-                            for err in &errors {
-                                println!("    [line {}] {}", err.line, err.message);
-                            }
-                            total_errors += errors.len();
-                        }
-                    }
-                    Err(e) => {
-                        println!("\n  {} — PARSE ERROR: {}", path, e);
-                        total_errors += 1;
-                    }
-                }
+            for (p, e) in &parse_errors {
+                println!("\n  {} — PARSE ERROR: {}", p, e);
             }
 
+            let total_issues = diags.len() + parse_errors.len();
             println!(
-                "\nLoc validation complete: {} entries, {} errors",
-                total_entries, total_errors
+                "\nLoc validation complete: {} entries, {} issues",
+                total_entries, total_issues
             );
-            if total_errors > 0 {
+            if total_issues > 0 {
                 std::process::exit(1);
             }
         }

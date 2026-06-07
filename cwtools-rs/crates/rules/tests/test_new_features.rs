@@ -98,8 +98,8 @@ values = {
     assert_eq!(mt.key_prefix, Some("MY_".to_string()));
 
     // B: cardinality parsing
-    if let Some((_name, (rule, _opts))) = ruleset.aliases.first() {
-        if let RuleType::NodeRule { rules, .. } = rule {
+    if let Some((_name, (rule, _opts))) = ruleset.aliases.first()
+        && let RuleType::NodeRule { rules, .. } = rule {
             // name: 1..1 strict
             let (_, name_opts) = &rules[0];
             assert_eq!(name_opts.min, 1);
@@ -168,5 +168,4 @@ values = {
                 ));
             }
         }
-    }
 }

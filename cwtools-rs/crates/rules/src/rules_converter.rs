@@ -56,7 +56,8 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                         extract_values_from_children(&node.children, ast, table, &mut ruleset)
                     }
                     "modifiers" => extract_modifier_names(&node.children, ast, table, &mut ruleset),
-                    "links" => extract_link_names(&node.children, ast, table, &mut ruleset),
+                    "links" => extract_links(&node.children, ast, table, &mut ruleset),
+                    "scopes" => extract_scope_defs(&node.children, ast, table, &mut ruleset),
                     _ => {
                         process_root_node(key, node, ast, table, comments, &mut ruleset);
                     }
@@ -88,7 +89,12 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                     }
                     "links" => {
                         if let Value::Clause(children) = &leaf.value {
-                            extract_link_names(children, ast, table, &mut ruleset);
+                            extract_links(children, ast, table, &mut ruleset);
+                        }
+                    }
+                    "scopes" => {
+                        if let Value::Clause(children) = &leaf.value {
+                            extract_scope_defs(children, ast, table, &mut ruleset);
                         }
                     }
                     _ => {
@@ -555,8 +561,8 @@ fn field_from_string(s: &str) -> NewField {
     // prefix<type>suffix complex
     if trimmed.contains('<') && trimmed.contains('>') {
         let s = trimmed.trim_matches('"');
-        if let (Some(pi), Some(si)) = (s.find('<'), s.find('>')) {
-            if pi < si {
+        if let (Some(pi), Some(si)) = (s.find('<'), s.find('>'))
+            && pi < si {
                 let prefix = s[..pi].to_string();
                 let name = s[pi + 1..si].to_string();
                 let suffix = s[si + 1..].to_string();
@@ -566,7 +572,6 @@ fn field_from_string(s: &str) -> NewField {
                     suffix,
                 });
             }
-        }
     }
 
     // Default: specific string value
@@ -613,8 +618,11 @@ fn parse_int_range_as_float(inner: &str, default_min: f64, default_max: f64) -> 
     }
 }
 
+// `ruleset` is threaded so nested rules can register types/enums as the engine
+// grows; today only the recursive descent forwards it.
+#[allow(clippy::only_used_in_recursion)]
 fn children_to_rules(
-    children: &Vec<Child>,
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
@@ -641,7 +649,11 @@ fn children_to_rules(
                             _ => Vec::new(),
                         };
                         rules.push((
-                            RuleType::SubtypeRule { name, positive, rules: inner },
+                            RuleType::SubtypeRule {
+                                name,
+                                positive,
+                                rules: inner,
+                            },
                             options_from_comments(comments, false),
                         ));
                     }
@@ -690,7 +702,11 @@ fn children_to_rules(
                         };
                         let inner = children_to_rules(&node.children, ast, table, ruleset);
                         rules.push((
-                            RuleType::SubtypeRule { name, positive, rules: inner },
+                            RuleType::SubtypeRule {
+                                name,
+                                positive,
+                                rules: inner,
+                            },
                             options_from_comments(comments, false),
                         ));
                     }
@@ -800,7 +816,7 @@ fn build_colour_rules(colour_spec: &str) -> Vec<NewRule> {
 }
 
 fn extract_types_from_children(
-    children: &Vec<Child>,
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
@@ -819,11 +835,18 @@ fn extract_types_from_children(
             }
             _ => continue,
         };
-        if key.starts_with("type[") {
-            if let Some(typename) = extract_bracket_content(&key, "type") {
+        if key.starts_with("type[")
+            && let Some(typename) = extract_bracket_content(&key, "type") {
                 let typedef = if is_leaf {
                     if let Child::Leaf(lidx) = tchild {
-                        process_type_node(typename, &ast.arena.leaves[*lidx as usize], ast, table, ruleset, comments)
+                        process_type_node(
+                            typename,
+                            &ast.arena.leaves[*lidx as usize],
+                            ast,
+                            table,
+                            ruleset,
+                            comments,
+                        )
                     } else {
                         continue;
                     }
@@ -837,12 +860,11 @@ fn extract_types_from_children(
                 };
                 ruleset.types.push(typedef);
             }
-        }
     }
 }
 
 fn extract_enums_from_children(
-    children: &Vec<Child>,
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
@@ -865,21 +887,33 @@ fn extract_enums_from_children(
             if let Some(enum_name) = extract_bracket_content(&key, "enum") {
                 let def = if is_leaf {
                     if let Child::Leaf(lidx) = echild {
-                        process_enum_node(enum_name, &ast.arena.leaves[*lidx as usize], ast, table, comments)
+                        process_enum_node(
+                            enum_name,
+                            &ast.arena.leaves[*lidx as usize],
+                            ast,
+                            table,
+                            comments,
+                        )
                     } else {
                         continue;
                     }
                 } else {
                     if let Child::Node(nidx) = echild {
-                        process_enum_node_from_node(enum_name, &ast.arena.nodes[*nidx as usize], ast, table, comments)
+                        process_enum_node_from_node(
+                            enum_name,
+                            &ast.arena.nodes[*nidx as usize],
+                            ast,
+                            table,
+                            comments,
+                        )
                     } else {
                         continue;
                     }
                 };
                 ruleset.enums.push(def);
             }
-        } else if key.starts_with("complex_enum[") {
-            if let Some(enum_name) = extract_bracket_content(&key, "complex_enum") {
+        } else if key.starts_with("complex_enum[")
+            && let Some(enum_name) = extract_bracket_content(&key, "complex_enum") {
                 if !is_leaf {
                     if let Child::Node(nidx) = echild {
                         let node = &ast.arena.nodes[*nidx as usize];
@@ -890,12 +924,12 @@ fn extract_enums_from_children(
                     let leaf = &ast.arena.leaves[*lidx as usize];
                     if let Value::Clause(ch) = &leaf.value {
                         // Synthesize a node-like view from the clause children
-                        let def = process_complex_enum_from_children(enum_name, ch, ast, table, comments);
+                        let def =
+                            process_complex_enum_from_children(enum_name, ch, ast, table, comments);
                         ruleset.complex_enums.push(def);
                     }
                 }
             }
-        }
     }
 }
 
@@ -924,29 +958,178 @@ fn extract_modifier_names(
     }
 }
 
-/// Collect link names from a top-level `links = { name = { ... } }` block
-/// (links.cwt). Each direct child key is a scope link; a from-data link can be
-/// used as a scope-switching key (`character = { ... }`, `owner = { ... }`), so
-/// the validator treats these as valid `scope_field` keys.
-fn extract_link_names(
-    children: &Vec<Child>,
+/// The `(key, body-children)` of a `key = { ... }` config entry, stored by this
+/// parser as either a `Node` or a `Leaf` with a `Clause` value. Key is unquoted.
+fn entry_body<'a>(
+    child: &Child,
+    ast: &'a ParsedFile,
+    table: &StringTable,
+) -> Option<(String, &'a [Child])> {
+    match child {
+        Child::Node(nidx) => {
+            let n = &ast.arena.nodes[*nidx as usize];
+            Some((
+                table.get_string(n.key.normal).unwrap_or_default(),
+                n.children.as_slice(),
+            ))
+        }
+        Child::Leaf(lidx) => {
+            let l = &ast.arena.leaves[*lidx as usize];
+            if let Value::Clause(ch) = &l.value {
+                Some((
+                    table.get_string(l.key.normal).unwrap_or_default(),
+                    ch.as_slice(),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Bare values inside a child `key = { a b c }` clause (e.g. `aliases`, `input_scopes`).
+fn child_clause_values(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    key: &str,
+) -> Vec<String> {
+    for child in children {
+        match child {
+            Child::Leaf(lidx) => {
+                let l = &ast.arena.leaves[*lidx as usize];
+                if table.get_string(l.key.normal).unwrap_or_default() == key {
+                    return collect_leaf_values_from_clause(&l.value, ast, table);
+                }
+            }
+            Child::Node(nidx) => {
+                let n = &ast.arena.nodes[*nidx as usize];
+                if table.get_string(n.key.normal).unwrap_or_default() == key {
+                    return collect_leaf_values_from_children(&n.children, ast, table);
+                }
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
+}
+
+/// First scalar `key = value` (not a clause) for `key`.
+fn child_scalar(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    key: &str,
+) -> Option<String> {
+    children.iter().find_map(|child| {
+        if let Child::Leaf(lidx) = child {
+            let l = &ast.arena.leaves[*lidx as usize];
+            if table.get_string(l.key.normal).unwrap_or_default() == key
+                && !matches!(l.value, Value::Clause(_))
+            {
+                return Some(value_to_string(&l.value, table));
+            }
+        }
+        None
+    })
+}
+
+/// All scalar values for a possibly-repeated key (`data_source = <a>` repeated).
+fn child_scalars(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    key: &str,
+) -> Vec<String> {
+    children
+        .iter()
+        .filter_map(|child| {
+            if let Child::Leaf(lidx) = child {
+                let l = &ast.arena.leaves[*lidx as usize];
+                if table.get_string(l.key.normal).unwrap_or_default() == key
+                    && !matches!(l.value, Value::Clause(_))
+                {
+                    return Some(value_to_string(&l.value, table));
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// A scope list that may be written as `key = scope` (scalar) or `key = { a b }` (clause).
+fn child_scope_list(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    key: &str,
+) -> Vec<String> {
+    let clause = child_clause_values(children, ast, table, key);
+    if !clause.is_empty() {
+        return clause;
+    }
+    child_scalar(children, ast, table, key)
+        .into_iter()
+        .collect()
+}
+
+/// Parse a top-level `scopes = { Name = { aliases = {..} is_subscope_of = {..} } }`
+/// block (scopes.cwt) into `ScopeInput`s for the runtime scope registry.
+fn extract_scope_defs(
+    children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &mut RuleSet,
 ) {
     for child in children {
-        let name = match child {
-            Child::Leaf(lidx) => table
-                .get_string(ast.arena.leaves[*lidx as usize].key.normal)
-                .unwrap_or_default(),
-            Child::Node(nidx) => table
-                .get_string(ast.arena.nodes[*nidx as usize].key.normal)
-                .unwrap_or_default(),
-            _ => continue,
+        let Some((name, body)) = entry_body(child, ast, table) else {
+            continue;
         };
-        if !name.is_empty() {
-            ruleset.scope_links.insert(name);
+        let name = name.trim_matches('"').to_string();
+        if name.is_empty() {
+            continue;
         }
+        ruleset.scope_inputs.push(ScopeInput {
+            aliases: child_clause_values(body, ast, table, "aliases"),
+            is_subscope_of: child_clause_values(body, ast, table, "is_subscope_of"),
+            name,
+        });
+    }
+}
+
+/// Parse a top-level `links = { name = { output_scope=.. input_scopes=.. ... } }`
+/// block (links.cwt) into full `LinkInput`s, and record link/prefix names in
+/// `scope_links` (the valid-key set used by `scope_field` matching).
+fn extract_links(children: &[Child], ast: &ParsedFile, table: &StringTable, ruleset: &mut RuleSet) {
+    for child in children {
+        let Some((name, body)) = entry_body(child, ast, table) else {
+            // A `name = value` shorthand link still contributes its name.
+            if let Child::Leaf(lidx) = child {
+                let n = table
+                    .get_string(ast.arena.leaves[*lidx as usize].key.normal)
+                    .unwrap_or_default();
+                if !n.is_empty() {
+                    ruleset.scope_links.insert(n);
+                }
+            }
+            continue;
+        };
+        let name = name.trim_matches('"').to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let prefix = child_scalar(body, ast, table, "prefix");
+        ruleset.scope_links.insert(name.clone());
+        ruleset.link_inputs.push(LinkInput {
+            output_scope: child_scalar(body, ast, table, "output_scope"),
+            input_scopes: child_scope_list(body, ast, table, "input_scopes"),
+            from_data: child_scalar(body, ast, table, "from_data")
+                .is_some_and(|v| v.eq_ignore_ascii_case("yes")),
+            data_source: child_scalars(body, ast, table, "data_source"),
+            prefix,
+            name,
+        });
     }
 }
 
@@ -968,8 +1151,8 @@ fn extract_values_from_children(
             }
             _ => continue,
         };
-        if key.starts_with("value[") {
-            if let Some(value_name) = extract_bracket_content(&key, "value") {
+        if key.starts_with("value[")
+            && let Some(value_name) = extract_bracket_content(&key, "value") {
                 let vals = if is_leaf {
                     if let Child::Leaf(lidx) = vchild {
                         collect_leaf_values_from_clause(
@@ -990,7 +1173,6 @@ fn extract_values_from_children(
                 };
                 ruleset.values.push((value_name, vals));
             }
-        }
     }
 }
 
@@ -1046,7 +1228,7 @@ fn process_type_node_from_node(
         key: node.key,
         value: Value::Clause(node.children.clone()),
         op: cwtools_parser::ast::Operator::Equals,
-        pos: node.pos.clone(),
+        pos: node.pos,
     };
     process_type_node(name, &synthetic_leaf, ast, table, ruleset, comments)
 }
@@ -1062,17 +1244,16 @@ fn process_enum_node_from_node(
         key: node.key,
         value: Value::Clause(node.children.clone()),
         op: cwtools_parser::ast::Operator::Equals,
-        pos: node.pos.clone(),
+        pos: node.pos,
     };
     process_enum_node(name, &synthetic_leaf, ast, table, comments)
 }
 
 fn extract_bracket_content(full: &str, prefix: &str) -> Option<String> {
-    if let Some(body) = full.strip_prefix(prefix) {
-        if let Some(inner) = body.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+    if let Some(body) = full.strip_prefix(prefix)
+        && let Some(inner) = body.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             return Some(inner.to_string());
         }
-    }
     None
 }
 
@@ -1126,7 +1307,14 @@ fn process_type_node(
                     let k = table.get_string(l.key.normal).unwrap_or_default();
                     if k.starts_with("subtype[") {
                         if let Some(st_name) = extract_bracket_content(&k, "subtype") {
-                            let st = process_subtype_node_from_leaf(st_name, l, ast, table, ruleset, child_comments);
+                            let st = process_subtype_node_from_leaf(
+                                st_name,
+                                l,
+                                ast,
+                                table,
+                                ruleset,
+                                child_comments,
+                            );
                             def.subtypes.push(st);
                         }
                     } else if k == "localisation" || k == "modifiers" {
@@ -1143,11 +1331,10 @@ fn process_type_node(
                                 let v = clean_path(&leaf_value_string(l, table));
                                 def.path_options.paths.push(v);
                             }
-                            "path_strict" => {
-                                if leaf_value_string(l, table) == "yes" {
+                            "path_strict"
+                                if leaf_value_string(l, table) == "yes" => {
                                     def.path_options.path_strict = true;
                                 }
-                            }
                             "path_file" => {
                                 def.path_options.path_file = Some(leaf_value_string(l, table));
                             }
@@ -1157,32 +1344,28 @@ fn process_type_node(
                             "name_field" => {
                                 def.name_field = Some(leaf_value_string(l, table));
                             }
-                            "type_per_file" => {
-                                if leaf_value_string(l, table) == "yes" {
+                            "type_per_file"
+                                if leaf_value_string(l, table) == "yes" => {
                                     def.type_per_file = true;
                                 }
-                            }
                             "starts_with" => {
                                 def.starts_with = Some(leaf_value_string(l, table));
                             }
                             "type_key_prefix" => {
                                 def.key_prefix = Some(leaf_value_string(l, table));
                             }
-                            "severity" => {
-                                if leaf_value_string(l, table) == "warning" {
+                            "severity"
+                                if leaf_value_string(l, table) == "warning" => {
                                     def.warning_only = true;
                                 }
-                            }
-                            "unique" => {
-                                if leaf_value_string(l, table) == "yes" {
+                            "unique"
+                                if leaf_value_string(l, table) == "yes" => {
                                     def.unique = true;
                                 }
-                            }
-                            "should_be_used" => {
-                                if leaf_value_string(l, table) == "yes" {
+                            "should_be_used"
+                                if leaf_value_string(l, table) == "yes" => {
                                     def.should_be_referenced = true;
                                 }
-                            }
                             "skip_root_key" => {
                                 let op = l.op;
                                 let v = leaf_value_string(l, table);
@@ -1221,7 +1404,14 @@ fn process_type_node(
                     let nk = table.get_string(n.key.normal).unwrap_or_default();
                     if nk.starts_with("subtype[") {
                         if let Some(st_name) = extract_bracket_content(&nk, "subtype") {
-                            let st = process_subtype_node(st_name, n, ast, table, ruleset, child_comments);
+                            let st = process_subtype_node(
+                                st_name,
+                                n,
+                                ast,
+                                table,
+                                ruleset,
+                                child_comments,
+                            );
                             def.subtypes.push(st);
                         }
                     } else if nk == "localisation" {
@@ -1236,11 +1426,9 @@ fn process_type_node(
                                 let lv = &ast.arena.leaf_values[*lvidx as usize];
                                 let v = value_to_string(&lv.value, table);
                                 if !v.is_empty() {
-                                    if v == "any" {
-                                        block_keys.push(v);
-                                    } else {
-                                        block_keys.push(v);
-                                    }
+                                    // `any` flows through as a literal key here; any
+                                    // wildcard semantics live in the matcher.
+                                    block_keys.push(v);
                                 }
                             }
                         }
@@ -1330,8 +1518,8 @@ fn parse_type_key_filter_from_comments(comments: &[String]) -> Option<(Vec<Strin
 }
 
 fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
-    if let Some(c) = comments.iter().find(|s| s.contains("graph_related_types")) {
-        if let Some(idx) = c.find('=') {
+    if let Some(c) = comments.iter().find(|s| s.contains("graph_related_types"))
+        && let Some(idx) = c.find('=') {
             let rhs = c[idx + 1..].trim().to_string();
             if rhs.starts_with('{') && rhs.ends_with('}') {
                 let inner = rhs.trim_matches(|c| c == '{' || c == '}');
@@ -1344,7 +1532,6 @@ fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
                 return vec![rhs];
             }
         }
-    }
     Vec::new()
 }
 
@@ -1411,12 +1598,11 @@ fn parse_subtype_localisation(
         if let Child::Node(nidx) = child {
             let n = &ast.arena.nodes[*nidx as usize];
             let nk = table.get_string(n.key.normal).unwrap_or_default();
-            if nk.starts_with("subtype[") {
-                if let Some(st_name) = extract_bracket_content(&nk, "subtype") {
+            if nk.starts_with("subtype[")
+                && let Some(st_name) = extract_bracket_content(&nk, "subtype") {
                     let locs = parse_localisation_block(&n.children, ast, table);
                     out.push((st_name, locs));
                 }
-            }
         }
     }
     out
@@ -1479,12 +1665,11 @@ fn parse_subtype_modifiers(
         if let Child::Node(nidx) = child {
             let n = &ast.arena.nodes[*nidx as usize];
             let nk = table.get_string(n.key.normal).unwrap_or_default();
-            if nk.starts_with("subtype[") {
-                if let Some(st_name) = extract_bracket_content(&nk, "subtype") {
+            if nk.starts_with("subtype[")
+                && let Some(st_name) = extract_bracket_content(&nk, "subtype") {
                     let mods = parse_modifiers_block(&n.children, ast, table);
                     out.push((st_name, mods));
                 }
-            }
         }
     }
     out
@@ -1588,8 +1773,8 @@ fn extract_comment_value(comments: &[String], key: &str) -> Option<String> {
 }
 
 fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {
-    if let Some(c) = comments.iter().find(|s| s.contains("only_if_not")) {
-        if let Some(idx) = c.find('=') {
+    if let Some(c) = comments.iter().find(|s| s.contains("only_if_not"))
+        && let Some(idx) = c.find('=') {
             let rhs = c[idx + 1..].trim().to_string();
             if rhs.starts_with('{') && rhs.ends_with('}') {
                 let inner = rhs.trim_matches(|c| c == '{' || c == '}');
@@ -1602,7 +1787,6 @@ fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {
                 return vec![rhs];
             }
         }
-    }
     Vec::new()
 }
 
@@ -1695,31 +1879,28 @@ fn process_complex_enum_from_children(
                 let l = &ast.arena.leaves[*lidx as usize];
                 let k = table.get_string(l.key.normal).unwrap_or_default();
                 // Handle `name = { ... }` as a Leaf with Clause value
-                if k == "name" {
-                    if let Value::Clause(name_ch) = &l.value {
+                if k == "name"
+                    && let Value::Clause(name_ch) = &l.value {
                         name_tree = Some(build_name_tree(name_ch, ast, table));
                         continue;
                     }
-                }
                 let v = leaf_value_string(l, table);
                 match k.as_str() {
                     "path" => paths.push(clean_path(&v)),
-                    "path_strict" => {
-                        if v == "yes" {
+                    "path_strict"
+                        if v == "yes" => {
                             path_strict = true;
                         }
-                    }
                     "path_file" => {
                         path_file = Some(v);
                     }
                     "path_extension" => {
                         path_extension = Some(v);
                     }
-                    "start_from_root" => {
-                        if v == "yes" {
+                    "start_from_root"
+                        if v == "yes" => {
                             start_from_root = true;
                         }
-                    }
                     _ => {}
                 }
             }
@@ -1739,7 +1920,13 @@ fn process_complex_enum_from_children(
     ComplexEnumDef {
         name,
         description,
-        path_options: PathOptions { paths, path_strict, path_file, path_extension, paths_lower: Vec::new() },
+        path_options: PathOptions {
+            paths,
+            path_strict,
+            path_file,
+            path_extension,
+            paths_lower: Vec::new(),
+        },
         name_tree: name_tree.unwrap_or(ComplexEnumNameTree::Empty),
         start_from_root,
     }
@@ -1845,10 +2032,9 @@ fn options_from_comments(comments: &[String], is_comparison: bool) -> Options {
                 if let Some((min_s, max_s)) = spec.split_once("..") {
                     let min_s = min_s.trim();
                     // Handle ~ prefix for strict_min=false
-                    let (min_s, strict) = if min_s.starts_with('~') {
-                        (&min_s[1..], false)
-                    } else {
-                        (min_s, true)
+                    let (min_s, strict) = match min_s.strip_prefix('~') {
+                        Some(rest) => (rest, false),
+                        None => (min_s, true),
                     };
                     let min = min_s.parse::<i32>().unwrap_or(1);
                     let max = if max_s.trim() == "inf" {
@@ -2043,20 +2229,29 @@ fn parse_replace_scopes_from_comments(comments: &[String]) -> Option<ReplaceScop
 }
 
 fn parse_required_scopes(comments: &[String]) -> Vec<String> {
-    // Match F#: looks for "# scope =" (single #, starts_with "# scope =")
-    if let Some(c) = comments.iter().find(|s| {
-        s.starts_with("# scope =") || s.starts_with("#scope =") || s.starts_with("# scope=")
-    }) {
-        let eq_idx = c.find('=').unwrap_or(0);
-        let rhs = c[eq_idx + 1..].trim();
+    // The parser keeps the leading `#`s in comment text, so a `## scope = X`
+    // annotation arrives as "## scope = X". Strip the `#`s + whitespace, then
+    // match the bare `scope` directive (NOT `push_scope` / `replace_scope`,
+    // which don't start with "scope").
+    //
+    // Scan from the END: comments accumulate across commented-out rules
+    // (`# alias[...]`), so the `## scope` closest to this rule (the last one) is
+    // the relevant one, not an earlier orphaned annotation.
+    for c in comments.iter().rev() {
+        let t = c.trim_start_matches('#').trim();
+        let Some(rest) = t.strip_prefix("scope") else {
+            continue;
+        };
+        let Some(rhs) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rhs = rhs.trim();
         if rhs.starts_with('{') && rhs.ends_with('}') {
-            let inner = &rhs[1..rhs.len() - 1];
-            return inner
+            return rhs[1..rhs.len() - 1]
                 .split_whitespace()
-                .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .collect();
-        } else {
+        } else if !rhs.is_empty() {
             return vec![rhs.to_string()];
         }
     }

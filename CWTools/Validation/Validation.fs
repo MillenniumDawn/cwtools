@@ -97,69 +97,11 @@ type ErrorCodes =
           Severity = Severity.Error
           Message = "No category found for this technology" }
 
-    static member ButtonEffectMissing =
-        fun effect ->
-            { ID = "CW111"
-              Severity = Severity.Error
-              Message = sprintf "Button effect %s not found" effect }
-
-    static member SpriteMissing =
-        fun sprite ->
-            { ID = "CW112"
-              Severity = Severity.Error
-              Message = sprintf "Sprite type %s not found" sprite }
-
     static member MissingFile =
         fun file ->
             { ID = "CW113"
               Severity = Severity.Error
               Message = sprintf "File %s not found, this is case sensitive" file }
-
-    static member UndefinedStaticModifier =
-        fun modifier ->
-            { ID = "CW114"
-              Severity = Severity.Error
-              Message = sprintf "unknown static modifier %s used." modifier }
-
-    static member IncorrectStaticModifierScope =
-        fun (modifier: string) (actual: string) (expected: string) ->
-            { ID = "CW115"
-              Severity = Severity.Warning
-              Message =
-                sprintf
-                    "%s static modifier possibly used in incorrect scope. In %s but expected %s. Please feedback verified usage"
-                    modifier
-                    actual
-                    expected }
-
-    static member IncorrectScopeAsLeaf =
-        fun (scope: string) (leaf: string) ->
-            { ID = "CW116"
-              Severity = Severity.Error
-              Message = sprintf "%s scope command used incorrectly, did you mean _%s = { %s }" scope scope leaf }
-
-    static member UndefinedScriptVariable =
-        fun (variable: string) ->
-            { ID = "CW117"
-              Severity = Severity.Error
-              Message = sprintf "%s variable is never defined" variable }
-
-    static member UndefinedModifier =
-        fun (modifier: string) ->
-            { ID = "CW118"
-              Severity = Severity.Error
-              Message = sprintf "unknown modifier %s used. Experimental, please report errors" modifier }
-
-    static member IncorrectModifierScope =
-        fun (modifier: string) (actual: string) (expected: string) ->
-            { ID = "CW119"
-              Severity = Severity.Error
-              Message =
-                sprintf
-                    "%s modifier used in incorrect scope. In %s but expected %s. Experimental, please report errors"
-                    modifier
-                    actual
-                    expected }
 
     static member PossiblePretrigger =
         fun (trigger: string) ->
@@ -212,11 +154,6 @@ type ErrorCodes =
           Severity = Severity.Information
           Message = "Do not use NOT with multiple children, replace this with either NOR or NAND to avoid ambiguity" }
 
-    static member RedundantBoolean =
-        { ID = "CW224"
-          Severity = Severity.Information
-          Message = "This boolean operator is redundant" }
-
     static member UndefinedLocReference =
         fun (thisLoc: string) (otherLoc: string) language ->
             { ID = "CW225"
@@ -265,12 +202,6 @@ type ErrorCodes =
             { ID = "CW231"
               Severity = Severity.Warning
               Message = sprintf "Technology %s is not used" tech }
-
-    static member UndefinedPDXMesh =
-        fun (mesh: string) ->
-            { ID = "CW232"
-              Severity = Severity.Error
-              Message = sprintf "Mesh %s is not defined" mesh }
 
     static member UndefinedSectionEntity =
         fun (entity: string) (culture: string) ->

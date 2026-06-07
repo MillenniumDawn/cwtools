@@ -1,4 +1,4 @@
-use crate::{ErrorSeverity, ValidationError, error_codes};
+use crate::{ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile};
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 use cwtools_string_table::string_table::StringTable;
@@ -29,22 +29,26 @@ pub fn validate_common(
         *type_counts.entry(key.clone()).or_insert(0) += 1;
 
         // Check if this type is defined with unique=true
-        if let Some(type_def) = find_matching_type(&key, ruleset) {
-            if type_def.unique {
-                let count = type_counts.get(&key).copied().unwrap_or(0);
-                if count > 1 {
-                    errors.push(ValidationError {
-                        message: format!(
-                            "Type '{}' appears {} times in file (unique violation)",
-                            key, count
-                        ),
-                        severity: ErrorSeverity::Warning,
-                        line: 0,
-                        col: 0,
-                        file: file_path.to_string(),
-                        code: Some(error_codes::CW501_DUPLICATE_TYPE.id.to_string()),
-                    });
-                }
+        if let Some(type_def) = find_matching_type(&key, ruleset)
+            && type_def.unique
+        {
+            let count = type_counts.get(&key).copied().unwrap_or(0);
+            if count > 1 {
+                // CW261 (DuplicateTypeDef). F#'s message is
+                // "Key {id} of type {typename} is defined multiple times";
+                // this per-file detection keys off the type name appearing
+                // as repeated sibling keys, so `id` and `typename` collapse
+                // to the same token. F#'s check is project-wide and grouped
+                // by extracted instance id — a known refinement gap.
+                let code = &error_codes::CW261_DUPLICATE_TYPE_DEF;
+                errors.push(ValidationError {
+                    message: code.format(&[&key, &key]),
+                    severity: code.severity,
+                    line: 0,
+                    col: 0,
+                    file: file_path.to_string(),
+                    code: Some(code.id.to_string()),
+                });
             }
         }
     }

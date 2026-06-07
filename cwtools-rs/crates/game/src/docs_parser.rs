@@ -1,26 +1,26 @@
-/// Parsers for game-generated documentation / log files.
-///
-/// Three formats are covered:
-///
-/// 1. **Legacy docs** (CK2/EU4/HOI4/VIC2) — `trigger_docs.log` /
-///    `effect_docs.log`.  Header `DOCUMENTATION ==`, then one entry per
-///    block of: `name - desc`, `Usage …`, `Supported scopes: …`,
-///    optionally `Supported targets: …`, footer `==================`.
-///    Parsed by `parse_legacy_docs`.
-///
-/// 2. **Jomini docs** (CK3/IR/VIC3/EU5) — `triggers.log` / `effects.log`.
-///    Header `Trigger Documentation:` or `Effect Documentation:`, then
-///    blocks separated by `--------------------`.  Each block has:
-///    `name - desc`, optional `Traits: …`, optional `Supported Scopes: …`,
-///    optional `Supported Targets: …`.  Parsed by `parse_jomini_triggers`
-///    and `parse_jomini_effects`.
-///
-/// 3. **Stellaris modifier log** — `modifiers.log`.  After
-///    `Printing Modifier Definitions:`, one line per modifier:
-///    `- tag, Category: Cat`.  Parsed by `parse_modifier_log`.
-///
-/// 4. **Jomini data-type dump** — produced by some Jomini games.
-///    Parsed by `parse_data_type_dump` (basic).
+//! Parsers for game-generated documentation / log files.
+//!
+//! Three formats are covered:
+//!
+//! 1. **Legacy docs** (CK2/EU4/HOI4/VIC2) — `trigger_docs.log` /
+//!    `effect_docs.log`.  Header `DOCUMENTATION ==`, then one entry per
+//!    block of: `name - desc`, `Usage …`, `Supported scopes: …`,
+//!    optionally `Supported targets: …`, footer `==================`.
+//!    Parsed by `parse_legacy_docs`.
+//!
+//! 2. **Jomini docs** (CK3/IR/VIC3/EU5) — `triggers.log` / `effects.log`.
+//!    Header `Trigger Documentation:` or `Effect Documentation:`, then
+//!    blocks separated by `--------------------`.  Each block has:
+//!    `name - desc`, optional `Traits: …`, optional `Supported Scopes: …`,
+//!    optional `Supported Targets: …`.  Parsed by `parse_jomini_triggers`
+//!    and `parse_jomini_effects`.
+//!
+//! 3. **Stellaris modifier log** — `modifiers.log`.  After
+//!    `Printing Modifier Definitions:`, one line per modifier:
+//!    `- tag, Category: Cat`.  Parsed by `parse_modifier_log`.
+//!
+//! 4. **Jomini data-type dump** — produced by some Jomini games.
+//!    Parsed by `parse_data_type_dump` (basic).
 
 // ── Result types ─────────────────────────────────────────────────────────────
 

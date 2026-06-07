@@ -98,11 +98,15 @@ fn test_lsp_initialize_handshake() {
 
     let mut reader = BufReader::new(child.stdout.take().unwrap());
 
-    let body = jsonrpc_request(1, "initialize", serde_json::json!({
-        "processId": std::process::id(),
-        "rootUri": uri,
-        "capabilities": {}
-    }));
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": uri,
+            "capabilities": {}
+        }),
+    );
     write_frame(&mut child, &body).unwrap();
     let resp_str = read_response(&mut reader).expect("no response");
     child.kill().ok();
@@ -128,11 +132,15 @@ fn test_lsp_shutdown_without_scan() {
 
     let mut reader = BufReader::new(child.stdout.take().unwrap());
 
-    let body = jsonrpc_request(1, "initialize", serde_json::json!({
-        "processId": std::process::id(),
-        "rootUri": uri,
-        "capabilities": {}
-    }));
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": uri,
+            "capabilities": {}
+        }),
+    );
     write_frame(&mut child, &body).unwrap();
     let resp_str = read_response(&mut reader).expect("no init response");
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
@@ -164,11 +172,15 @@ fn test_lsp_full_lifecycle() {
 
     let mut reader = BufReader::new(child.stdout.take().unwrap());
 
-    let body = jsonrpc_request(1, "initialize", serde_json::json!({
-        "processId": std::process::id(),
-        "rootUri": uri,
-        "capabilities": {}
-    }));
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": uri,
+            "capabilities": {}
+        }),
+    );
     write_frame(&mut child, &body).unwrap();
     let resp_str = read_response(&mut reader).expect("no init response");
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
@@ -203,11 +215,15 @@ fn test_lsp_unknown_notification_does_not_crash() {
 
     let mut reader = BufReader::new(child.stdout.take().unwrap());
 
-    let body = jsonrpc_request(1, "initialize", serde_json::json!({
-        "processId": std::process::id(),
-        "rootUri": uri,
-        "capabilities": {}
-    }));
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": uri,
+            "capabilities": {}
+        }),
+    );
     write_frame(&mut child, &body).unwrap();
     let _ = read_response(&mut reader);
 

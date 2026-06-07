@@ -78,7 +78,20 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
                     i = end;
                 }
             }
+            b']' => {
+                // A closing bracket with no matching open is literal text.
+                // It is special (so `next_special` stops on it); consume the
+                // single ASCII byte explicitly, otherwise the `_` arm below
+                // would make no progress and loop forever (OOM).
+                elements.push(LocElement::Chars("]".to_string()));
+                i += 1;
+            }
             _ => {
+                // `bytes[i]` is a non-special byte at a char boundary, so
+                // `next_special(s, i)` returns a position strictly greater than
+                // `i` (it can't match at `i`) — the loop always advances, and
+                // `i` stays on a char boundary. Searching from `i + 1` would be
+                // unsafe: `i + 1` may fall inside a multi-byte UTF-8 sequence.
                 let end = next_special(s, i);
                 elements.push(LocElement::Chars(s[i..end].to_string()));
                 i = end;
@@ -93,8 +106,7 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
 /// or `s.len()` if none.  Safe because `$`/`[`/`]` are ASCII and can never
 /// appear as a continuation byte of a multi-byte UTF-8 sequence.
 fn next_special(s: &str, start: usize) -> usize {
-    s[start..]
-        .as_bytes()
+    s.as_bytes()[start..]
         .iter()
         .position(|&b| matches!(b, b'$' | b'[' | b']'))
         .map(|off| start + off)
@@ -153,15 +165,12 @@ fn parse_bracket(s: &str, start: usize) -> Option<(LocElement, usize)> {
     // i points one past the closing ']'; content is s[start+1..i-1]
     let content = &s[start + 1..i - 1];
 
-    if content.contains('.') || content.contains('(') {
-        if let Ok(commands) = parse_jomini(content) {
+    if (content.contains('.') || content.contains('('))
+        && let Ok(commands) = parse_jomini(content) {
             return Some((LocElement::JominiCommand(commands), i));
         }
-    }
 
-    let command = content.find('|')
-        .map(|p| &content[..p])
-        .unwrap_or(content);
+    let command = content.find('|').map(|p| &content[..p]).unwrap_or(content);
 
     Some((LocElement::Command(command.to_string()), i))
 }
@@ -181,7 +190,10 @@ fn parse_jomini(input: &str) -> Result<Vec<JominiCommand>, String> {
         match ch {
             '.' => {
                 if !current.is_empty() {
-                    commands.push(JominiCommand { key: std::mem::take(&mut current), params: Vec::new() });
+                    commands.push(JominiCommand {
+                        key: std::mem::take(&mut current),
+                        params: Vec::new(),
+                    });
                 }
             }
             '(' => {
@@ -195,7 +207,10 @@ fn parse_jomini(input: &str) -> Result<Vec<JominiCommand>, String> {
     }
 
     if !current.is_empty() {
-        commands.push(JominiCommand { key: current, params: Vec::new() });
+        commands.push(JominiCommand {
+            key: current,
+            params: Vec::new(),
+        });
     }
 
     Ok(commands)
@@ -343,6 +358,42 @@ mod tests {
         // Plain ref without colour suffix still works
         let elems = parse_loc_elements("$MY_KEY$");
         assert_eq!(elems, vec![LocElement::Ref("MY_KEY".to_string())]);
+    }
+
+    #[test]
+    fn test_stray_closing_bracket_terminates() {
+        // Regression: `[cmd]]` has an extra `]`. A lone `]` is special, so the
+        // old `_` arm called next_special(s, i) == i and looped forever pushing
+        // empty Chars (OOM). It must now terminate and treat `]` as literal text.
+        let elems = parse_loc_elements("[USA.GetName]], rest");
+        // Last elements include the stray `]` and the trailing text.
+        let joined: String = elems
+            .iter()
+            .map(|e| match e {
+                LocElement::Chars(c) => c.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(
+            joined.contains(']'),
+            "stray bracket kept as text: {elems:?}"
+        );
+        assert!(joined.contains(", rest"), "trailing text parsed: {elems:?}");
+    }
+
+    #[test]
+    fn test_only_closing_bracket() {
+        // A bare `]` must not loop.
+        let elems = parse_loc_elements("]");
+        assert_eq!(elems, vec![LocElement::Chars("]".to_string())]);
+    }
+
+    #[test]
+    fn test_multibyte_text_with_stray_bracket() {
+        // Cyrillic text (multi-byte) around a stray `]` — must not panic on a
+        // non-char-boundary index and must terminate.
+        let elems = parse_loc_elements("мнения[USA.GetName]], потому");
+        assert!(!elems.is_empty());
     }
 
     #[test]

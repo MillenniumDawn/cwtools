@@ -1,5 +1,7 @@
 use cwtools_game::constants::Game;
-use cwtools_game::scope_engine::{ScopeContext, ScopeId};
+use cwtools_game::scope_engine::{SCOPE_ANY, SCOPE_INVALID, ScopeContext, ScopeId, ScopeLink};
+use cwtools_game::scope_registry::{ScopeDefOwned, ScopeRegistry};
+use cwtools_localization::LocIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
@@ -15,7 +17,7 @@ pub struct ValidationError {
     pub line: u32,
     pub col: u16,
     pub file: String,
-    /// CW### error code, e.g. "CW201" for unexpected field.
+    /// CW### error code, e.g. "CW262" for an unexpected property node.
     pub code: Option<String>,
 }
 
@@ -45,6 +47,7 @@ fn validate_wrapper_grandchildren(
     ruleset: &RuleSet,
     type_index: Option<&cwtools_info::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
+    loc_index: Option<&LocIndex>,
 ) {
     for grandchild in grandchildren {
         // Pull the grandchild's key and body uniformly for Node and Leaf-clause.
@@ -76,7 +79,11 @@ fn validate_wrapper_grandchildren(
                     line: lv.pos.start.line,
                     col: lv.pos.start.col,
                     file: file_path.to_string(),
-                    code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
+                    code: Some(
+                        error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE
+                            .id
+                            .to_string(),
+                    ),
                 });
                 continue;
             }
@@ -132,12 +139,14 @@ fn validate_wrapper_grandchildren(
             ruleset,
             type_index,
             modifier_keys,
+            loc_index,
             Some(&gc_key),
         );
     }
 }
 
-#[tracing::instrument(skip_all)]
+/// Validate a parsed file against the ruleset. Localisation-key checks
+/// (CW100/CW122) are skipped; use [`validate_ast_with_loc`] to enable them.
 pub fn validate_ast(
     ast: &ParsedFile,
     ruleset: &RuleSet,
@@ -147,11 +156,66 @@ pub fn validate_ast(
     type_index: Option<&cwtools_info::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
 ) -> Vec<ValidationError> {
+    validate_ast_with_loc(
+        ast,
+        ruleset,
+        table,
+        file_path,
+        game,
+        type_index,
+        modifier_keys,
+        None,
+    )
+}
+
+/// As [`validate_ast`], but with a loaded [`LocIndex`] so `LocalisationField`
+/// references are checked for existence and scope-correct loc commands.
+#[tracing::instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
+pub fn validate_ast_with_loc(
+    ast: &ParsedFile,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    file_path: &str,
+    game: Option<Game>,
+    type_index: Option<&cwtools_info::TypeIndex>,
+    modifier_keys: Option<&HashSet<String>>,
+    loc_index: Option<&LocIndex>,
+) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     let enum_map: HashMap<&str, &EnumDefinition> =
         ruleset.enums.iter().map(|e| (e.key.as_str(), e)).collect();
 
-    let mut scope_context = game.map(|g| ScopeContext::new(g, ScopeId(100)));
+    // Scope-agnostic content is reused from many calling scopes (or operates on a
+    // data-dependent element scope), so it can't be pinned to one. Seed ANY so its
+    // body isn't scope-checked against an arbitrary default. Everything else starts
+    // at the game's primary scope (HOI4 country = 100).
+    //   - scripted_effects/triggers/localisation: called from any scope.
+    //   - collections: the `limit`/`operators` run in the input element's scope
+    //     (`game:all_states` -> state, `game:all_countries` -> country); per the
+    //     HOI4 collections docs the element scope is data-dependent.
+    //   - dynamic_modifiers: the `enable`/`remove_trigger` run in the scope the
+    //     modifier is applied to (country, state, or unit leader; "root is the
+    //     effect scope" per the HOI4 docs).
+    let clean = file_path.to_ascii_lowercase().replace('\\', "/");
+    let scope_agnostic = path_contains_segment(&clean, "scripted_effects")
+        || path_contains_segment(&clean, "scripted_triggers")
+        || path_contains_segment(&clean, "scripted_localisation")
+        || path_contains_segment(&clean, "collections")
+        || path_contains_segment(&clean, "dynamic_modifiers");
+    // Build the config-driven scope/link registry once for this file, shared by
+    // the validation context and (via LocScopeData) the loc-command path.
+    let registry = game.map(|g| std::sync::Arc::new(build_scope_registry(ruleset, g)));
+    let default_root = registry
+        .as_ref()
+        .and_then(|r| r.id_of("country"))
+        .unwrap_or(ScopeId(100));
+    let initial_scope = if scope_agnostic {
+        SCOPE_ANY
+    } else {
+        default_root
+    };
+    let mut scope_context = registry.map(|r| ScopeContext::from_registry(r, initial_scope));
 
     // Pre-compute path-based type match (most specific wins)
     let path_type = find_type_by_path(file_path, ruleset);
@@ -159,8 +223,8 @@ pub fn validate_ast(
     // type_per_file: the WHOLE file is a single instance of this type (e.g. an
     // OOB file). Its root children ARE the instance body — there is no per-entry
     // wrapper key — so validate them once against the type's rules and stop.
-    if let Some(td) = path_type {
-        if td.type_per_file {
+    if let Some(td) = path_type
+        && td.type_per_file {
             let inner_rules = find_rules_by_name(&td.name, ruleset);
             let has_content_rules =
                 !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
@@ -179,6 +243,7 @@ pub fn validate_ast(
                     ruleset,
                     type_index,
                     modifier_keys,
+                    loc_index,
                     None,
                 );
             }
@@ -189,7 +254,6 @@ pub fn validate_ast(
             }
             return errors;
         }
-    }
 
     for child in &ast.root_children {
         // 1. Try exact root key match (e.g. ai_strategy_plan = { ... })
@@ -251,6 +315,7 @@ pub fn validate_ast(
                         ruleset,
                         type_index,
                         modifier_keys,
+                        loc_index,
                     );
                 } else {
                     validate_with_type(
@@ -267,6 +332,7 @@ pub fn validate_ast(
                         ruleset,
                         type_index,
                         modifier_keys,
+                        loc_index,
                         Some(&type_key),
                     );
                 }
@@ -338,6 +404,7 @@ pub fn validate_ast(
                     ruleset,
                     type_index,
                     modifier_keys,
+                    loc_index,
                 );
                 continue;
             }
@@ -370,6 +437,7 @@ pub fn validate_ast(
                         ruleset,
                         type_index,
                         modifier_keys,
+                        loc_index,
                         Some(&child_root_key),
                     );
                 }
@@ -390,6 +458,7 @@ pub fn validate_ast(
                             ruleset,
                             type_index,
                             modifier_keys,
+                            loc_index,
                             Some(&child_root_key),
                         );
                     }
@@ -416,6 +485,9 @@ pub fn validate_ast(
 ///   - cardinality is counted over the merged rule set, not per-subtype in isolation
 ///   - a field that exists in any matching subtype is not "unexpected"
 ///   - SubtypeRule entries that don't match are silently skipped
+// Threads type/ruleset/scope context and output buffers through mutual
+// recursion; a context struct here would churn the validation hot path.
+#[allow(clippy::too_many_arguments)]
 fn validate_with_type(
     type_def: &TypeDefinition,
     children: &[Child],
@@ -430,10 +502,15 @@ fn validate_with_type(
     ruleset: &RuleSet,
     type_index: Option<&cwtools_info::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
+    loc_index: Option<&LocIndex>,
     node_key: Option<&str>,
 ) {
     if type_def.subtypes.is_empty() {
         let pre_count = errors.len();
+        let saved = scope_context.as_ref().map(|ctx| ctx.save());
+        if let Some(ctx) = scope_context.as_mut() {
+            seed_root_scope(ctx, type_def, None, node_key, ruleset, game);
+        }
         validate_children(
             children,
             ast,
@@ -447,8 +524,12 @@ fn validate_with_type(
             ruleset,
             type_index,
             modifier_keys,
+            loc_index,
             (0, 0),
         );
+        if let (Some(saved), Some(ctx)) = (saved, scope_context.as_mut()) {
+            ctx.restore(saved);
+        }
         // Item 9: warning_only
         if type_def.warning_only {
             for err in errors[pre_count..].iter_mut() {
@@ -560,8 +641,8 @@ fn validate_with_type(
         .find_map(|s| s.push_scope.as_deref());
 
     let saved = scope_context.as_ref().map(|ctx| ctx.save());
-    if let (Some(ps), Some(ctx)) = (push_scope, scope_context.as_mut()) {
-        ctx.change_scope(ps);
+    if let Some(ctx) = scope_context.as_mut() {
+        seed_root_scope(ctx, type_def, push_scope, node_key, ruleset, game);
     }
 
     // Step 5: validate children once against the merged rule set.
@@ -579,6 +660,7 @@ fn validate_with_type(
         ruleset,
         type_index,
         modifier_keys,
+        loc_index,
         (0, 0),
     );
 
@@ -659,32 +741,339 @@ fn find_type_and_rules_for_file<'a>(
 }
 
 /// Map a ScopeId to a human-readable name for validation purposes.
-fn get_scope_name(scope: ScopeId, game: Game) -> String {
-    for def in game.scope_defs() {
-        if def.id.0 == scope.0 {
-            return def.aliases.first().unwrap_or(&def.name).to_string();
+/// Build the runtime [`ScopeRegistry`] from a parsed config (`scopes.cwt` +
+/// `links.cwt`). When the config carries no scope defs (e.g. a game without a
+/// scopes.cwt), fall back to that game's hardcoded table. This is the bridge
+/// that makes the scope engine data-driven.
+fn build_scope_registry(ruleset: &RuleSet, game: Game) -> ScopeRegistry {
+    if ruleset.scope_inputs.is_empty() {
+        return ScopeRegistry::from_hardcoded(game);
+    }
+    let mut reg = ScopeRegistry::default();
+    let mut next_id = 100u32;
+
+    // Pass 1: assign ids and names. `any`/`all` -> sentinel ANY, `invalid` -> INVALID.
+    for si in &ruleset.scope_inputs {
+        let is_invalid = si.name.eq_ignore_ascii_case("invalid")
+            || si.aliases.iter().any(|a| a.eq_ignore_ascii_case("invalid"));
+        let is_any = si.name.eq_ignore_ascii_case("any")
+            || si.aliases.iter().any(|a| a.eq_ignore_ascii_case("any"));
+        let id = if is_invalid {
+            SCOPE_INVALID
+        } else if is_any {
+            SCOPE_ANY
+        } else {
+            let id = ScopeId(next_id);
+            next_id += 1;
+            id
+        };
+        reg.by_name.insert(si.name.to_ascii_lowercase(), id);
+        for a in &si.aliases {
+            reg.by_name.insert(a.to_ascii_lowercase(), id);
+        }
+        if id != SCOPE_ANY && id != SCOPE_INVALID {
+            reg.by_id.insert(
+                id,
+                ScopeDefOwned {
+                    name: si.name.clone(),
+                    aliases: si.aliases.clone(),
+                    subscope_of: Vec::new(),
+                },
+            );
         }
     }
-    format!("scope_{}", scope.0)
+
+    // Pass 2: resolve subscope_of names -> ids (resolve first, then assign).
+    for si in &ruleset.scope_inputs {
+        let Some(id) = reg.id_of(&si.name) else {
+            continue;
+        };
+        let parents: Vec<ScopeId> = si
+            .is_subscope_of
+            .iter()
+            .filter_map(|n| reg.id_of(n))
+            .collect();
+        if let Some(def) = reg.by_id.get_mut(&id) {
+            def.subscope_of = parents;
+        }
+    }
+
+    // Links: resolve output/input scope names -> ids; prefix links go to a
+    // separate list matched by key prefix.
+    for li in &ruleset.link_inputs {
+        let target = li.output_scope.as_deref().and_then(|n| reg.id_of(n));
+        let valid: Vec<ScopeId> = li
+            .input_scopes
+            .iter()
+            .filter_map(|n| reg.id_of(n))
+            .collect();
+        let link = ScopeLink {
+            valid_scopes: valid,
+            target,
+            is_scope_change: target.is_some(),
+            ignore_keys: Vec::new(),
+        };
+        match &li.prefix {
+            Some(p) => reg.prefix_links.push((p.to_ascii_lowercase(), link)),
+            None => {
+                reg.links.insert(li.name.to_ascii_lowercase(), link);
+            }
+        }
+    }
+
+    // Synthesize the simple iterators (`every_/random_/any_/all_<scope>`), which
+    // links.cwt doesn't list (F# synthesizes them too). Relation iterators
+    // (`every_owned_state`, …) are handled by the alias `## push_scope` path.
+    let scope_aliases: Vec<(String, ScopeId)> = reg
+        .by_id
+        .iter()
+        .flat_map(|(id, def)| {
+            def.aliases
+                .iter()
+                .filter(|a| a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .map(move |a| (a.to_ascii_lowercase(), *id))
+        })
+        .collect();
+    for (alias, id) in scope_aliases {
+        for pre in ["every_", "random_", "any_", "all_"] {
+            reg.links
+                .entry(format!("{pre}{alias}"))
+                .or_insert(ScopeLink {
+                    valid_scopes: Vec::new(),
+                    target: Some(id),
+                    is_scope_change: true,
+                    ignore_keys: Vec::new(),
+                });
+        }
+    }
+
+    reg
 }
 
-fn scope_matches_required(current: ScopeId, game: Game, required: &[String]) -> bool {
-    let name = get_scope_name(current, game);
-    required.iter().any(|s| s.eq_ignore_ascii_case(&name))
+fn get_scope_name(scope: ScopeId, registry: &ScopeRegistry) -> String {
+    registry.name_of(scope)
+}
+
+/// Number of significant decimal places in a numeric string; trailing zeros do
+/// not count (`0.1230` has 3). Used for the CW270 32-bit precision check.
+fn decimal_places(s: &str) -> usize {
+    match s.split_once('.') {
+        Some((_, frac)) => frac.trim_end_matches('0').len(),
+        None => 0,
+    }
+}
+
+/// Whether `key` names a scope (keyword, scope link, or iterator) rather than a
+/// variable. A `variable_field` value naming a scope must not be flagged as an
+/// unset variable (CW246).
+fn resolves_as_scope_key(ctx: &ScopeContext, key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    matches!(
+        k.as_str(),
+        "this"
+            | "root"
+            | "prev"
+            | "prevprev"
+            | "prevprevprev"
+            | "from"
+            | "fromfrom"
+            | "fromfromfrom"
+            | "fromfromfromfrom"
+    ) || ctx.registry.id_of(&k).is_some()
+        || ctx.registry.links.contains_key(&k)
+}
+
+/// Whether the trigger/effect/target scope checks (CW104/105/106/243/244/245/248)
+/// are on. Now ON by default (the scope engine is config-driven and accurate);
+/// set `CWTOOLS_NO_SCOPE_CHECKS=1` as an escape hatch to turn them off.
+fn scope_checks_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("CWTOOLS_NO_SCOPE_CHECKS").is_err());
+    *ON
+}
+
+/// Whether the project-wide "variable has not been set" check (CW246) is on.
+/// OFF by default: it needs a COMPLETE variable index, and a mod that defines
+/// variables through dynamic `@`-concatenation or base-game scripts the index
+/// hasn't collected would flood. Opt in with `CWTOOLS_VAR_CHECKS=1` once the
+/// index is proven complete for a corpus. The local numeric checks (CW270/271)
+/// run regardless of this gate.
+fn var_checks_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("CWTOOLS_VAR_CHECKS").is_ok());
+    *ON
+}
+
+/// True when a leaf value is numerically zero (`0`, `0.0`, `"0"`, …). Used by
+/// the CW235 zero-modifier check.
+fn value_is_zero(value: &Value) -> bool {
+    match value {
+        Value::Int(n) => *n == 0,
+        Value::Float(f) => *f == 0.0,
+        Value::String(_) | Value::QString(_) => false,
+        _ => false,
+    }
+}
+
+fn scope_matches_required(current: ScopeId, registry: &ScopeRegistry, required: &[String]) -> bool {
+    // No restriction declared -> valid anywhere.
+    if required.is_empty() {
+        return true;
+    }
+    // `## scope = any` / `all` mean unrestricted (very common on triggers).
+    if required
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case("any") || s.eq_ignore_ascii_case("all"))
+    {
+        return true;
+    }
+    // Current scope is the open wildcard -> lenient.
+    if current == SCOPE_ANY {
+        return true;
+    }
+    // Current scope didn't resolve to a known name (scope tracking gap) -> be
+    // lenient rather than emit a false wrong-scope error.
+    if registry.name_of(current).starts_with("scope_") {
+        return true;
+    }
+    // A requirement is satisfied if the current scope is that scope or a subscope
+    // of it (e.g. `character` satisfies a `country` requirement). Unresolvable
+    // requirement names are treated leniently.
+    required.iter().any(|r| {
+        registry
+            .id_of(r)
+            .is_none_or(|rid| registry.is_subscope_or_eq(current, rid))
+    })
+}
+
+/// Validate a scope-target value (`owner`, `root.capital_scope`, …) by resolving
+/// the chain from the current scope on a throwaway clone of the context:
+/// - CW245 (error in target) if a link in the chain is used in the wrong scope;
+/// - CW243 (target wrong scope) if the resolved scope doesn't satisfy the
+///   field's expected scopes.
+///
+/// Lenient: empty, data-ref (tags/ids/`prefix:`), upper-case magic-word and
+/// unresolved targets are accepted, so only genuine lower-case link chains are
+/// checked. Gated with the other scope checks by the caller.
+fn validate_scope_target(
+    ctx: &ScopeContext,
+    value: &str,
+    expected: &[String],
+    leaf: &cwtools_parser::ast::Leaf,
+    file_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if value.is_empty() || looks_like_data_ref(value) {
+        return;
+    }
+    let reg = ctx.registry.as_ref();
+    // Only validate genuine scope fields: every expected scope name must resolve
+    // in the registry. A garbage entry (e.g. `country].value[variable` from a
+    // mis-parsed `scope[country].value[variable]`) means this isn't really a
+    // scope target slot — skip rather than flag the value as an invalid target.
+    if expected.iter().any(|s| {
+        !s.eq_ignore_ascii_case("any") && !s.eq_ignore_ascii_case("all") && reg.id_of(s).is_none()
+    }) {
+        return;
+    }
+    let mut probe = ctx.clone();
+    let (code, message) = match probe.change_scope(value) {
+        cwtools_game::scope_engine::ScopeResult::WrongScope {
+            command,
+            current,
+            expected: exp,
+        } => {
+            let exp_names: Vec<String> = exp.iter().map(|s| reg.name_of(*s)).collect();
+            let code = &error_codes::CW245_ERROR_IN_TARGET;
+            (
+                code,
+                code.format(&[&command, &reg.name_of(current), &exp_names.join(" or ")]),
+            )
+        }
+        cwtools_game::scope_engine::ScopeResult::NewScope { scope, .. }
+            if !expected.is_empty() && !scope_matches_required(scope, reg, expected) =>
+        {
+            let code = &error_codes::CW243_TARGET_WRONG_SCOPE;
+            (
+                code,
+                code.format(&[value, &reg.name_of(scope), &expected.join(" or ")]),
+            )
+        }
+        // The token is not a recognised link/var/value target at all. With the
+        // full config link map loaded, NotFound is reliable -> CW244.
+        cwtools_game::scope_engine::ScopeResult::NotFound => {
+            let code = &error_codes::CW244_INVALID_TARGET;
+            (code, code.format(&[value, &expected.join(" or ")]))
+        }
+        // NewScope-in-expected / VarFound / ValueFound / AnyScope -> lenient.
+        _ => return,
+    };
+    errors.push(ValidationError {
+        message,
+        severity: code.severity,
+        line: leaf.pos.start.line,
+        col: leaf.pos.start.col,
+        file: file_path.to_string(),
+        code: Some(code.id.to_string()),
+    });
 }
 
 /// Find the actual validation rules for a type by looking in root_rules.
 fn find_rules_by_name<'a>(name: &str, ruleset: &'a RuleSet) -> &'a [(RuleType, Options)] {
     for rr in &ruleset.root_rules {
-        if let RootRule::TypeRule(rule_name, (rule, _opts)) = rr {
-            if rule_name == name {
-                if let RuleType::NodeRule { rules, .. } = rule {
+        if let RootRule::TypeRule(rule_name, (rule, _opts)) = rr
+            && rule_name == name
+                && let RuleType::NodeRule { rules, .. } = rule {
                     return rules.as_slice();
                 }
-            }
-        }
     }
     &[]
+}
+
+/// The `Options` of a type's root rule (carries `## replace_scope` / `## push_scope`
+/// that seed the instance's scope, e.g. the state-history `state` object).
+fn find_type_rule_opts<'a>(name: &str, ruleset: &'a RuleSet) -> Option<&'a Options> {
+    for rr in &ruleset.root_rules {
+        if let RootRule::TypeRule(rule_name, (_rule, opts)) = rr
+            && rule_name == name
+        {
+            return Some(opts);
+        }
+    }
+    None
+}
+
+/// Seed the scope context for a type instance's body. Precedence:
+/// 1. a matched subtype's `## push_scope`;
+/// 2. the type's root rule `## push_scope` or `## replace_scope` (the
+///    state-history `state` object uses `replace_scope = { this = state ... }`);
+/// 3. the instance's own key when that's a scope link / data ref (`state = {…}`).
+///
+/// Caller must `save()` first and `restore()` after.
+fn seed_root_scope(
+    ctx: &mut ScopeContext,
+    type_def: &TypeDefinition,
+    subtype_push: Option<&str>,
+    node_key: Option<&str>,
+    ruleset: &RuleSet,
+    game: Option<Game>,
+) {
+    if let Some(ps) = subtype_push {
+        push_named_scope(ctx, ps);
+        return;
+    }
+    let root_opts = find_type_rule_opts(&type_def.name, ruleset);
+    if let Some(push) = root_opts.and_then(|o| o.push_scope.as_deref()) {
+        push_named_scope(ctx, push);
+    } else if let Some(replace) = root_opts.and_then(|o| o.replace_scopes.as_ref()) {
+        apply_replace_scopes(ctx, replace, game);
+    } else if let Some(k) = node_key {
+        let before = ctx.scope_depth();
+        ctx.change_scope(k);
+        if ctx.scope_depth() == before && looks_like_data_ref(k) {
+            ctx.push_scope(SCOPE_ANY);
+        }
+    }
 }
 
 /// Returns true only when `needle` appears in `haystack` as a whole sequence of
@@ -745,18 +1134,17 @@ fn find_type_by_path_and_key<'a>(
     for t in &ruleset.types {
         // path_file pins the type to one specific filename (e.g. several types
         // share path "map" but only airports.txt is the `airports` type).
-        if let Some(pf) = &t.path_options.path_file {
-            if basename != pf.to_lowercase() {
+        if let Some(pf) = &t.path_options.path_file
+            && basename != pf.to_lowercase() {
                 continue;
             }
-        }
         // path_extension restricts the type to files with a given extension
         // (e.g. sound types require `.asset`, so a `.txt` combat-sounds file must
         // NOT match them). Treat the extension as a hard filter.
         if let Some(ext) = &t.path_options.path_extension {
             let ext = ext.to_lowercase();
             let ext = ext.strip_prefix('.').unwrap_or(&ext);
-            if !basename.rsplit('.').next().is_some_and(|e| e == ext) {
+            if basename.rsplit('.').next().is_none_or(|e| e != ext) {
                 continue;
             }
         }
@@ -828,15 +1216,14 @@ fn type_path_matches(file_path: &str, t: &TypeDefinition) -> bool {
         .strip_suffix(basename)
         .unwrap_or(&path_lower)
         .trim_end_matches('/');
-    if let Some(pf) = &t.path_options.path_file {
-        if basename != pf.to_lowercase() {
+    if let Some(pf) = &t.path_options.path_file
+        && basename != pf.to_lowercase() {
             return false;
         }
-    }
     if let Some(ext) = &t.path_options.path_extension {
         let ext = ext.to_lowercase();
         let ext = ext.strip_prefix('.').unwrap_or(&ext);
-        if !basename.rsplit('.').next().is_some_and(|e| e == ext) {
+        if basename.rsplit('.').next().is_none_or(|e| e != ext) {
             return false;
         }
     }
@@ -892,6 +1279,7 @@ fn find_grandchild_type<'a>(
 ///   - a required rule (min >= 1) whose key is absent (or under-count),
 ///   - a key present more than its max,
 ///   - a PRESENT field whose value doesn't match the rule.
+///
 /// Fields the rules don't mention are ignored, so a subtype whose rules are
 /// all optional (`## cardinality = 0..1`) and absent matches vacuously.
 /// The real discriminators are the un-annotated rules (default `1..1`, required)
@@ -1009,14 +1397,13 @@ fn subtype_rules_match(
                     }
                 }
             }
-            if let Some(ic) = clause {
-                if group.node_inners.iter().any(|(inner, _)| {
+            if let Some(ic) = clause
+                && group.node_inners.iter().any(|(inner, _)| {
                     subtype_rules_match(inner, ic, ast, table, enum_map, type_index)
                 }) {
                     any_match = true;
                     activated = true;
                 }
-            }
         }
         // Present but matching none of the disjuncts (of the applicable kind) → contradiction.
         if count > 0 && !any_match {
@@ -1185,6 +1572,7 @@ fn rule_left_is_ignore(rule_type: &RuleType) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_leaf_against_rule(
     leaf: &cwtools_parser::ast::Leaf,
     key: &str,
@@ -1200,31 +1588,32 @@ fn validate_leaf_against_rule(
     ruleset: &RuleSet,
     type_index: Option<&cwtools_info::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
+    loc_index: Option<&LocIndex>,
 ) {
     // `key = ignore_field`: the field's value is accepted unvalidated.
     if rule_left_is_ignore(rule_type) {
         return;
     }
-    if let Some(current) = scope_context.as_ref().and_then(|ctx| ctx.current()) {
-        if let Some(g) = game {
-            if !opts.required_scopes.is_empty()
-                && !scope_matches_required(current, g, &opts.required_scopes)
-            {
-                errors.push(ValidationError {
-                    message: format!(
-                        "Field '{}' requires scope {:?}, but current scope is '{}'",
-                        key,
-                        opts.required_scopes,
-                        get_scope_name(current, g)
-                    ),
-                    severity: ErrorSeverity::Warning,
-                    line: leaf.pos.start.line,
-                    col: leaf.pos.start.col,
-                    file: file_path.to_string(),
-                    code: Some(error_codes::CW400_UNKNOWN_SCOPE.id.to_string()),
-                });
-            }
-        }
+    if let Some(ctx) = scope_context.as_ref()
+        && let Some(current) = ctx.current()
+        && !opts.required_scopes.is_empty()
+        && !scope_matches_required(current, ctx.registry.as_ref(), &opts.required_scopes)
+    {
+        // F# `ConfigRulesRuleWrongScope` (CW247): a trigger/effect/modifier rule
+        // used in a scope it doesn't support. (Was the Rust-invented CW400.)
+        let code = &error_codes::CW247_RULE_WRONG_SCOPE;
+        errors.push(ValidationError {
+            message: code.format(&[
+                key,
+                &get_scope_name(current, ctx.registry.as_ref()),
+                &opts.required_scopes.join(" or "),
+            ]),
+            severity: code.severity,
+            line: leaf.pos.start.line,
+            col: leaf.pos.start.col,
+            file: file_path.to_string(),
+            code: Some(code.id.to_string()),
+        });
     }
     match rule_type {
         RuleType::LeafRule { left, .. } => {
@@ -1244,10 +1633,20 @@ fn validate_leaf_against_rule(
                     ruleset,
                     type_index,
                     modifier_keys,
+                    loc_index,
                 );
             } else {
                 validate_leaf(
-                    leaf, rule_type, table, enum_map, errors, file_path, type_index,
+                    leaf,
+                    rule_type,
+                    table,
+                    enum_map,
+                    errors,
+                    file_path,
+                    type_index,
+                    scope_context.as_ref(),
+                    game,
+                    loc_index,
                 );
             }
         }
@@ -1272,16 +1671,12 @@ fn validate_leaf_against_rule(
                     ruleset,
                     type_index,
                     modifier_keys,
+                    loc_index,
                 );
             } else if let Value::Clause(clause_children) = &leaf.value {
                 let saved = scope_context.as_ref().map(|ctx| ctx.save());
                 if let Some(ctx) = scope_context.as_mut() {
-                    if let Some(ref push) = opts.push_scope {
-                        ctx.change_scope(push);
-                    }
-                    if let Some(ref replace) = opts.replace_scopes {
-                        apply_replace_scopes(ctx, replace, game);
-                    }
+                    enter_block_scope(ctx, key, opts, game);
                 }
                 validate_children(
                     clause_children,
@@ -1296,6 +1691,7 @@ fn validate_leaf_against_rule(
                     ruleset,
                     type_index,
                     modifier_keys,
+                    loc_index,
                     (leaf.pos.start.line, leaf.pos.start.col),
                 );
                 if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
@@ -1324,31 +1720,31 @@ fn validate_node_against_rule(
     ruleset: &RuleSet,
     type_index: Option<&cwtools_info::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
+    loc_index: Option<&LocIndex>,
 ) {
     // `key = ignore_field`: the block is accepted unvalidated.
     if rule_left_is_ignore(rule_type) {
         return;
     }
-    if let Some(current) = scope_context.as_ref().and_then(|ctx| ctx.current()) {
-        if let Some(g) = game {
-            if !opts.required_scopes.is_empty()
-                && !scope_matches_required(current, g, &opts.required_scopes)
-            {
-                errors.push(ValidationError {
-                    message: format!(
-                        "Block '{}' requires scope {:?}, but current scope is '{}'",
-                        key,
-                        opts.required_scopes,
-                        get_scope_name(current, g)
-                    ),
-                    severity: ErrorSeverity::Warning,
-                    line: node.pos.start.line,
-                    col: node.pos.start.col,
-                    file: file_path.to_string(),
-                    code: Some(error_codes::CW400_UNKNOWN_SCOPE.id.to_string()),
-                });
-            }
-        }
+    if let Some(ctx) = scope_context.as_ref()
+        && let Some(current) = ctx.current()
+        && !opts.required_scopes.is_empty()
+        && !scope_matches_required(current, ctx.registry.as_ref(), &opts.required_scopes)
+    {
+        // F# `ConfigRulesRuleWrongScope` (CW247); see the leaf site above.
+        let code = &error_codes::CW247_RULE_WRONG_SCOPE;
+        errors.push(ValidationError {
+            message: code.format(&[
+                key,
+                &get_scope_name(current, ctx.registry.as_ref()),
+                &opts.required_scopes.join(" or "),
+            ]),
+            severity: code.severity,
+            line: node.pos.start.line,
+            col: node.pos.start.col,
+            file: file_path.to_string(),
+            code: Some(code.id.to_string()),
+        });
     }
     if let RuleType::NodeRule {
         left,
@@ -1372,16 +1768,12 @@ fn validate_node_against_rule(
                 ruleset,
                 type_index,
                 modifier_keys,
+                loc_index,
             );
         } else {
             let saved = scope_context.as_ref().map(|ctx| ctx.save());
             if let Some(ctx) = scope_context.as_mut() {
-                if let Some(ref push) = opts.push_scope {
-                    ctx.change_scope(push);
-                }
-                if let Some(ref replace) = opts.replace_scopes {
-                    apply_replace_scopes(ctx, replace, game);
-                }
+                enter_block_scope(ctx, key, opts, game);
             }
             validate_children(
                 &node.children,
@@ -1396,6 +1788,7 @@ fn validate_node_against_rule(
                 ruleset,
                 type_index,
                 modifier_keys,
+                loc_index,
                 (node.pos.start.line, node.pos.start.col),
             );
             if let (Some(saved), Some(ref mut ctx)) = (saved, scope_context.as_mut()) {
@@ -1493,6 +1886,7 @@ fn flatten_nested_subtype_rules(rules: &[(RuleType, Options)]) -> Vec<(RuleType,
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_children(
     children: &[Child],
     ast: &ParsedFile,
@@ -1506,6 +1900,7 @@ fn validate_children(
     ruleset: &RuleSet,
     type_index: Option<&cwtools_info::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
+    loc_index: Option<&LocIndex>,
     // Position of the block that owns `children` (its opening `key = {`). Used to
     // anchor cardinality diagnostics when the block is empty — so a missing
     // required field reports on the block's line, not at the file root (0,0).
@@ -1570,11 +1965,10 @@ fn validate_children(
                     // which accepts any token) starve a later `enum[...]` rule,
                     // producing a spurious "appears 0 time(s)" cardinality error.
                     for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
-                        if let RuleType::LeafValueRule { right } = rule_type {
-                            if field_matches_value(right, &lv.value, table, enum_map) {
+                        if let RuleType::LeafValueRule { right } = rule_type
+                            && field_matches_value(right, &lv.value, table, enum_map) {
                                 leafvalue_counts[rule_idx] += 1;
                             }
-                        }
                     }
                 }
             }
@@ -1603,19 +1997,47 @@ fn validate_children(
                     // Item 5: dynamic modifier keys — if provided and this key is a
                     // known modifier, accept silently (modifier context mechanism).
                     let is_modifier = modifier_keys.map(|mk| mk.contains(&key)).unwrap_or(false);
+                    // CW235 (F# `ZeroModifier`): a known modifier set to 0 is a no-op
+                    // (modifiers are additive). Only fires on confirmed modifiers.
+                    if is_modifier && value_is_zero(&leaf.value) {
+                        let code = &error_codes::CW235_ZERO_MODIFIER;
+                        errors.push(ValidationError {
+                            message: code.format(&[&key]),
+                            severity: code.severity,
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                            file: file_path.to_string(),
+                            code: Some(code.id.to_string()),
+                        });
+                    }
                     // A `@name = value` leaf is a Paradox read-time variable
                     // definition, valid anywhere in a block. F# skips these from the
                     // unexpected-field check (RuleValidationService.fs:266,
                     // `leaf.Key.[0] <> '@'`).
                     let is_define = key.starts_with('@');
                     if !is_modifier && !is_define {
+                        // This parser stores `key = { ... }` as a Leaf with a
+                        // Clause value, so split the F# way: a clause value is an
+                        // unexpected property NODE (CW262), a scalar value an
+                        // unexpected property LEAF (CW263).
+                        let (msg, code) = if matches!(leaf.value, Value::Clause(_)) {
+                            (
+                                format!("Unexpected block '{}'", key),
+                                &error_codes::CW262_UNEXPECTED_PROPERTY_NODE,
+                            )
+                        } else {
+                            (
+                                format!("Unexpected field '{}'", key),
+                                &error_codes::CW263_UNEXPECTED_PROPERTY_LEAF,
+                            )
+                        };
                         errors.push(ValidationError {
-                            message: format!("Unexpected field '{}'", key),
+                            message: msg,
                             severity: ErrorSeverity::Error,
                             line: leaf.pos.start.line,
                             col: leaf.pos.start.col,
                             file: file_path.to_string(),
-                            code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
+                            code: Some(code.id.to_string()),
                         });
                     }
                 } else {
@@ -1641,6 +2063,7 @@ fn validate_children(
                                 ruleset,
                                 type_index,
                                 modifier_keys,
+                                loc_index,
                             );
                         },
                         errors,
@@ -1664,7 +2087,7 @@ fn validate_children(
                             line: node.pos.start.line,
                             col: node.pos.start.col,
                             file: file_path.to_string(),
-                            code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
+                            code: Some(error_codes::CW262_UNEXPECTED_PROPERTY_NODE.id.to_string()),
                         });
                     }
                 } else {
@@ -1687,6 +2110,7 @@ fn validate_children(
                                 ruleset,
                                 type_index,
                                 modifier_keys,
+                                loc_index,
                             );
                         },
                         errors,
@@ -1717,6 +2141,7 @@ fn validate_children(
                                 ruleset,
                                 type_index,
                                 modifier_keys,
+                                loc_index,
                                 (lv.pos.start.line, lv.pos.start.col),
                             );
                             break;
@@ -1729,18 +2154,21 @@ fn validate_children(
                             line: lv.pos.start.line,
                             col: lv.pos.start.col,
                             file: file_path.to_string(),
-                            code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
+                            code: Some(
+                                error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE
+                                    .id
+                                    .to_string(),
+                            ),
                         });
                     }
                 } else {
                     let mut matched = false;
                     for (rule_type, _opts) in rules {
-                        if let RuleType::LeafValueRule { right } = rule_type {
-                            if field_matches_value(right, &lv.value, table, enum_map) {
+                        if let RuleType::LeafValueRule { right } = rule_type
+                            && field_matches_value(right, &lv.value, table, enum_map) {
                                 matched = true;
                                 break;
                             }
-                        }
                     }
                     if !matched {
                         let val_str = leaf_value_to_string(&lv.value, table);
@@ -1750,7 +2178,11 @@ fn validate_children(
                             line: lv.pos.start.line,
                             col: lv.pos.start.col,
                             file: file_path.to_string(),
-                            code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
+                            code: Some(
+                                error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE
+                                    .id
+                                    .to_string(),
+                            ),
                         });
                     }
                 }
@@ -1775,6 +2207,7 @@ fn validate_children(
                             ruleset,
                             type_index,
                             modifier_keys,
+                            loc_index,
                             (vc.pos.start.line, vc.pos.start.col),
                         );
                         break;
@@ -1787,7 +2220,11 @@ fn validate_children(
                         line: vc.pos.start.line,
                         col: vc.pos.start.col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW201_UNEXPECTED_FIELD.id.to_string()),
+                        code: Some(
+                            error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE
+                                .id
+                                .to_string(),
+                        ),
                     });
                 }
             }
@@ -1815,8 +2252,8 @@ fn validate_children(
         if matches!(
             rule_type,
             RuleType::LeafRule { .. } | RuleType::NodeRule { .. }
-        ) {
-            if let Some(k) = get_rule_key(rule_type) {
+        )
+            && let Some(k) = get_rule_key(rule_type) {
                 let e = key_card.entry(k.to_lowercase()).or_insert((
                     opts.min,
                     opts.max,
@@ -1826,7 +2263,6 @@ fn validate_children(
                 e.1 = e.1.max(opts.max);
                 e.2 = e.2 && opts.strict_min;
             }
-        }
     }
     let mut reported_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1864,7 +2300,7 @@ fn validate_children(
                                 line: block_line,
                                 col: block_col,
                                 file: file_path.to_string(),
-                                code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
+                                code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
                             });
                         }
                         if count > kmax {
@@ -1877,7 +2313,7 @@ fn validate_children(
                                 line: block_line,
                                 col: block_col,
                                 file: file_path.to_string(),
-                                code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
+                                code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
                             });
                         }
                     }
@@ -1902,7 +2338,7 @@ fn validate_children(
                         line: block_line,
                         col: block_col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
+                        code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
                     });
                 }
                 if count > opts.max {
@@ -1915,7 +2351,7 @@ fn validate_children(
                         line: block_line,
                         col: block_col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
+                        code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
                     });
                 }
             }
@@ -1932,7 +2368,7 @@ fn validate_children(
                         line: block_line,
                         col: block_col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW203_CARDINALITY_MIN.id.to_string()),
+                        code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
                     });
                 }
                 if count > opts.max {
@@ -1945,7 +2381,7 @@ fn validate_children(
                         line: block_line,
                         col: block_col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW204_CARDINALITY_MAX.id.to_string()),
+                        code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
                     });
                 }
             }
@@ -1954,14 +2390,88 @@ fn validate_children(
     }
 }
 
+/// A block key that isn't a known scope command but resolves to a scope via the
+/// game data: a numeric state/province id, an upper-case country/state tag, or a
+/// `prefix:data` reference. Plain lowercase effect/trigger names are excluded.
+fn looks_like_data_ref(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    key.contains(':')
+        || key.bytes().all(|b| b.is_ascii_digit())
+        || key.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// Apply the scope change for entering a `key = { ... }` block. The caller must
+/// have `save()`d the context first and `restore()` after.
+///
+/// Order of precedence:
+/// 1. an explicit `## push_scope` on the rule (alias effects like `every_state`);
+/// 2. otherwise the scope produced by the key itself when it's a scope-change
+///    link/iterator/data-ref (`owner`, `random_owned_state`, `root`, `prev`, …);
+/// 3. otherwise, if the key looks like a data reference we don't model
+///    (`sp:foo`, `state:5`, any `prefix:data`), enter ANY scope so inner
+///    effects aren't falsely scope-checked. Plain effect blocks keep the
+///    current scope unchanged.
+///
+/// Apply a `## push_scope = <scope>` value (or a `{ a b }` list): resolve the
+/// scope NAME through the registry and push that scope id. `any`/`all` push the
+/// wildcard, which is the correct lenient behaviour for `for_each_scope_loop`
+/// etc. Falls back to `change_scope` for command-like values (`prev`, `root`).
+fn push_named_scope(ctx: &mut ScopeContext, push: &str) {
+    let first = push
+        .trim_matches(|c: char| c == '{' || c == '}' || c.is_whitespace())
+        .split_whitespace()
+        .next()
+        .unwrap_or(push);
+    match ctx.registry.id_of(first) {
+        Some(id) => ctx.push_scope(id),
+        None => {
+            ctx.change_scope(push);
+        }
+    }
+}
+
+fn enter_block_scope(ctx: &mut ScopeContext, key: &str, opts: &Options, game: Option<Game>) {
+    if key.contains(':') {
+        // A `prefix:data` key (`var:x`, `event_target:y`, `sp:z`) is resolved by
+        // the registry prefix link, NOT by a matched rule's `## push_scope` — that
+        // would be an unreliable guess (a `var:` ref holds a data-dependent scope).
+        // change_scope pushes ANY for value prefixes (var:/event_target:) or the
+        // target scope for scope-change prefixes (sp: -> project). Unknown prefix
+        // -> ANY (lenient).
+        let before = ctx.scope_depth();
+        ctx.change_scope(key);
+        if ctx.scope_depth() == before {
+            ctx.push_scope(SCOPE_ANY);
+        }
+    } else if let Some(ref push) = opts.push_scope {
+        push_named_scope(ctx, push);
+    } else {
+        let before = ctx.scope_depth();
+        ctx.change_scope(key);
+        // change_scope didn't recognise the key, but a from-data reference used
+        // as a block key DOES change scope to whatever it resolves to: a numeric
+        // state/province id (`857 = {...}`) or a country tag (`GER = {...}`). We
+        // can't pin the exact scope here without the full data index, so enter
+        // ANY — lenient, so the block's body isn't validated against the (wrong)
+        // outer scope.
+        if ctx.scope_depth() == before && looks_like_data_ref(key) {
+            ctx.push_scope(SCOPE_ANY);
+        }
+    }
+    if let Some(ref replace) = opts.replace_scopes {
+        apply_replace_scopes(ctx, replace, game);
+    }
+}
+
 fn apply_replace_scopes(ctx: &mut ScopeContext, replace: &ReplaceScopes, game: Option<Game>) {
-    if let Some(g) = game {
+    if game.is_some() {
         ctx.apply_replace_scope(
             replace.root.as_deref(),
             replace.this.as_deref(),
             &replace.froms,
             &replace.prevs,
-            g,
         );
     }
 }
@@ -2088,7 +2598,7 @@ fn alias_pattern_matches(
             if let Some(open) = pattern.find(marker) {
                 let inner = open + marker.len();
                 let close = inner + pattern[inner..].find(']')?;
-                if found.map_or(true, |(o, ..)| open < o) {
+                if found.is_none_or(|(o, ..)| open < o) {
                     found = Some((
                         open,
                         &pattern[..open],
@@ -2262,6 +2772,7 @@ fn validate_alias_usage(
     ruleset: &RuleSet,
     type_index: Option<&cwtools_info::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
+    loc_index: Option<&LocIndex>,
 ) {
     // Gather candidate overloads via the precomputed alias index (O(1) exact +
     // O(patterns)) rather than scanning every alias.
@@ -2292,16 +2803,90 @@ fn validate_alias_usage(
                 overloads.push(rule);
             }
         }
-        if let Some(sf_idx) = cat.scope_field_idx {
-            if is_scope_key(key, ruleset, type_index) {
+        if let Some(sf_idx) = cat.scope_field_idx
+            && is_scope_key(key, ruleset, type_index) {
                 overloads.push(&ruleset.aliases[sf_idx].1);
             }
-        }
     }
     if overloads.is_empty() {
         // Category unloaded or no such alias key — accept silently, matching the
         // permissive key-match in field_matches_key.
         return;
+    }
+
+    // CW248: an invalid scope command in a chain. Restricted to dotted lower-case
+    // chains (`owner.capital`): a bare command that's missing from this config's
+    // links.cwt (e.g. `overlord`) is valid-but-unlisted, not invalid, so only
+    // chains — where a segment is genuinely unresolvable — are flagged.
+    if scope_checks_enabled()
+        && key.contains('.')
+        && looks_like_scope_command(key)
+        && !looks_like_data_ref(key)
+        && let Some(ctx) = scope_context.as_ref()
+    {
+        let mut probe = ctx.clone();
+        if matches!(
+            probe.change_scope(key),
+            cwtools_game::scope_engine::ScopeResult::NotFound
+        ) {
+            let code = &error_codes::CW248_INVALID_SCOPE_COMMAND;
+            let (line, col) = leaf
+                .map(|l| (l.pos.start.line, l.pos.start.col))
+                .unwrap_or((0, 0));
+            errors.push(ValidationError {
+                message: code.format(&[key]),
+                severity: code.severity,
+                line,
+                col,
+                file: file_path.to_string(),
+                code: Some(code.id.to_string()),
+            });
+        }
+    }
+
+    // CW104/105/106: scope check. A trigger/effect (alias) carries a `## scope`
+    // restriction in the config; if NONE of its overloads is valid in the current
+    // scope, it's used in the wrong place. `scope_matches_required` treats
+    // unrestricted / `any` / unresolved scopes leniently, so this only fires when
+    // the current scope is known and every overload demands a different one.
+    //
+    // ON by default (escape hatch CWTOOLS_NO_SCOPE_CHECKS=1). Accurate firing
+    // needs scope-change tracking: the engine seeds the right root scope per file
+    // type (e.g. state-history files are state-scoped, not country) and pushes
+    // scope through every scope-change effect/trigger link (`random_owned_state`,
+    // leader abilities, iterators). With the config-driven scope/link registry
+    // that tracking is now in place, so this runs by default.
+    if scope_checks_enabled()
+        && let Some(ctx) = scope_context.as_ref()
+        && let Some(current) = ctx.current()
+    {
+        let reg = ctx.registry.as_ref();
+        let any_ok = overloads
+            .iter()
+            .any(|(_, opts)| scope_matches_required(current, reg, &opts.required_scopes));
+        if !any_ok {
+            let mut expected: Vec<String> = overloads
+                .iter()
+                .flat_map(|(_, o)| o.required_scopes.iter().cloned())
+                .collect();
+            expected.dedup();
+            let code = match category {
+                "trigger" => &error_codes::CW104_INCORRECT_TRIGGER_SCOPE,
+                "effect" => &error_codes::CW105_INCORRECT_EFFECT_SCOPE,
+                _ => &error_codes::CW106_INCORRECT_SCOPE_SCOPE,
+            };
+            let (line, col) = leaf
+                .map(|l| (l.pos.start.line, l.pos.start.col))
+                .unwrap_or((0, 0));
+            errors.push(ValidationError {
+                message: code.format(&[key, &reg.name_of(current), &expected.join(" or ")]),
+                severity: code.severity,
+                line,
+                col,
+                file: file_path.to_string(),
+                code: Some(code.id.to_string()),
+            });
+        }
     }
 
     let mut best: Option<Vec<ValidationError>> = None;
@@ -2311,7 +2896,16 @@ fn validate_alias_usage(
             RuleType::LeafRule { .. } => {
                 if let Some(leaf) = leaf {
                     validate_leaf(
-                        leaf, rule_type, table, enum_map, &mut temp, file_path, type_index,
+                        leaf,
+                        rule_type,
+                        table,
+                        enum_map,
+                        &mut temp,
+                        file_path,
+                        type_index,
+                        scope_context.as_ref(),
+                        game,
+                        loc_index,
                     );
                 } else {
                     // Scalar-valued overload but the usage is a block — not a match.
@@ -2328,12 +2922,7 @@ fn validate_alias_usage(
                 if let Some(children) = children {
                     let saved = scope_context.as_ref().map(|ctx| ctx.save());
                     if let Some(ctx) = scope_context.as_mut() {
-                        if let Some(ref push) = opts.push_scope {
-                            ctx.change_scope(push);
-                        }
-                        if let Some(ref replace) = opts.replace_scopes {
-                            apply_replace_scopes(ctx, replace, game);
-                        }
+                        enter_block_scope(ctx, key, opts, game);
                     }
                     validate_children(
                         children,
@@ -2348,6 +2937,7 @@ fn validate_alias_usage(
                         ruleset,
                         type_index,
                         modifier_keys,
+                        loc_index,
                         leaf.map(|l| (l.pos.start.line, l.pos.start.col))
                             .unwrap_or((0, 0)),
                     );
@@ -2386,10 +2976,185 @@ fn alias_mismatch_error(file_path: &str) -> ValidationError {
         line: 0,
         col: 0,
         file: file_path.to_string(),
-        code: Some(error_codes::CW202_INVALID_VALUE.id.to_string()),
+        code: Some(error_codes::CW240_UNEXPECTED_VALUE.id.to_string()),
     }
 }
 
+/// Map the engine `Game` to the localization crate's `Game` enum.
+fn engine_game_to_loc_game(game: Option<Game>) -> cwtools_localization::Game {
+    use cwtools_localization::Game as LG;
+    match game {
+        Some(Game::Hoi4) => LG::HOI4,
+        Some(Game::Stellaris) => LG::Stellaris,
+        Some(Game::Eu4) => LG::EU4,
+        Some(Game::Ck3) => LG::CK3,
+        Some(Game::Ir) => LG::IR,
+        Some(Game::Vic3) => LG::VIC3,
+        Some(Game::Eu5) => LG::EU5,
+        _ => LG::Generic,
+    }
+}
+
+/// Validate a `LocalisationField` leaf: that the referenced loc key exists
+/// (CW100 / CW122) and, when the scope is known, that the loc string's commands
+/// are valid in that scope (CW260 / CW262). Mirrors F# `checkLocKey*` plus the
+/// scope-aware loc-command checks.
+#[allow(clippy::too_many_arguments)]
+fn validate_localisation_field(
+    leaf: &cwtools_parser::ast::Leaf,
+    synced: bool,
+    is_inline: bool,
+    table: &StringTable,
+    errors: &mut Vec<ValidationError>,
+    file_path: &str,
+    scope_context: Option<&ScopeContext>,
+    game: Option<Game>,
+    loc_index: Option<&LocIndex>,
+) {
+    // The meta-localisation block form `{ localization_key = X PARAM = ... }` is
+    // accepted unconditionally (its inner key is validated as its own leaf).
+    if let Value::Clause(_) = &leaf.value {
+        return;
+    }
+
+    let was_quoted = matches!(leaf.value, Value::QString(_));
+    let raw = leaf_value_to_string(&leaf.value, table);
+    let key_raw = raw.trim_matches('"');
+
+    // F# skip rules: empty keys, keys with spaces (prose / compound), `[...]`
+    // inline command blocks, `$VAR$` scripted references, and `@`-vars are not
+    // plain key references and are accepted.
+    if key_raw.is_empty()
+        || key_raw.contains(' ')
+        || (key_raw.starts_with('[') && key_raw.ends_with(']'))
+        || key_raw.contains('$')
+        || key_raw.starts_with('@')
+    {
+        return;
+    }
+
+    // No loc data loaded → accept leniently (e.g. vanilla loc absent).
+    let Some(idx) = loc_index else {
+        return;
+    };
+    let key_lower = key_raw.to_lowercase();
+    let exists = idx.exists_any(&key_lower);
+
+    let push_missing = |errors: &mut Vec<ValidationError>, lang: &str| {
+        let code = &error_codes::CW100_MISSING_LOCALISATION;
+        errors.push(ValidationError {
+            message: code.format(&[key_raw, lang]),
+            severity: code.severity,
+            line: leaf.pos.start.line,
+            col: leaf.pos.start.col,
+            file: file_path.to_string(),
+            code: Some(code.id.to_string()),
+        });
+    };
+
+    if is_inline {
+        // F# four-way logic for inline loc keys.
+        match (was_quoted, exists) {
+            (true, true) => {
+                let code = &error_codes::CW122_LOC_KEY_IN_INLINE;
+                errors.push(ValidationError {
+                    message: code.format(&[key_raw]),
+                    severity: code.severity,
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                    file: file_path.to_string(),
+                    code: Some(code.id.to_string()),
+                });
+            }
+            (true, false) => {} // quoted + missing → skip (lenient, matches F#)
+            (false, true) => {} // unquoted + exists → ok
+            (false, false) => push_missing(errors, "any language"),
+        }
+    } else if synced {
+        // Must exist in every language the project ships loc data for.
+        for lang in idx.missing_synced_languages(&key_lower) {
+            push_missing(errors, &lang.to_string());
+        }
+    } else if !exists {
+        push_missing(errors, "any language");
+    }
+
+    // Scope-aware loc-command validation at the reference site: validate the
+    // referenced loc string's `[command]` chains against the scope of THIS field.
+    if exists
+        && let Some(entry) = idx.entry(&key_lower) {
+            let initial = scope_context
+                .and_then(|c| c.current())
+                .unwrap_or(cwtools_game::scope_engine::SCOPE_ANY);
+            let data = cwtools_localization::LocScopeData {
+                game: engine_game_to_loc_game(game),
+                registry: scope_context.map(|c| c.registry.clone()),
+                ..Default::default()
+            };
+            for diag in cwtools_localization::validate_loc_commands(entry, initial, &data) {
+                push_loc_command_diagnostic(
+                    &diag,
+                    leaf,
+                    file_path,
+                    scope_context.map(|c| c.registry.as_ref()),
+                    errors,
+                );
+            }
+        }
+}
+
+/// Convert a `LocCommandDiagnostic` (from the loc scope engine) into a
+/// `ValidationError` with the matching F# numeric code.
+fn push_loc_command_diagnostic(
+    diag: &cwtools_localization::LocCommandDiagnostic,
+    leaf: &cwtools_parser::ast::Leaf,
+    file_path: &str,
+    registry: Option<&ScopeRegistry>,
+    errors: &mut Vec<ValidationError>,
+) {
+    use cwtools_localization::LocCommandDiagnostic as D;
+    let scope_name = |id: u32| -> String {
+        match registry {
+            Some(reg) => reg.name_of(ScopeId(id)),
+            None => id.to_string(),
+        }
+    };
+    let (code, message) = match diag {
+        D::WrongScope {
+            command,
+            current_scope,
+            expected_scopes,
+        } => {
+            let expected = expected_scopes
+                .iter()
+                .map(|s| scope_name(*s))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let code = &error_codes::CW260_LOC_COMMAND_WRONG_SCOPE;
+            (
+                code,
+                code.format(&[command, &scope_name(*current_scope), &expected]),
+            )
+        }
+        D::ChainEndsInScope { command } => {
+            let code = &error_codes::CW266_LOC_COMMAND_NOT_IN_DATA_TYPE;
+            (
+                code,
+                code.format(&[command.as_str(), command.as_str(), "scope"]),
+            )
+        }
+    };
+    errors.push(ValidationError {
+        message,
+        severity: code.severity,
+        line: leaf.pos.start.line,
+        col: leaf.pos.start.col,
+        file: file_path.to_string(),
+        code: Some(code.id.to_string()),
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_leaf(
     leaf: &cwtools_parser::ast::Leaf,
     rule_type: &RuleType,
@@ -2398,8 +3163,28 @@ fn validate_leaf(
     errors: &mut Vec<ValidationError>,
     file_path: &str,
     type_index: Option<&cwtools_info::TypeIndex>,
+    scope_context: Option<&ScopeContext>,
+    game: Option<Game>,
+    loc_index: Option<&LocIndex>,
 ) {
     if let RuleType::LeafRule { right, .. } = rule_type {
+        // LocalisationField: check the referenced loc key exists (CW100/CW122)
+        // and, when we know the scope, validate the loc string's commands
+        // (CW260/CW262). See `validate_localisation_field`.
+        if let NewField::LocalisationField { synced, is_inline } = right {
+            validate_localisation_field(
+                leaf,
+                *synced,
+                *is_inline,
+                table,
+                errors,
+                file_path,
+                scope_context,
+                game,
+                loc_index,
+            );
+            return;
+        }
         // TypeField: check type_index when available (Item 1).
         if let NewField::TypeField(type_type) = right {
             // Unquote: `load_oob = "EU_frontex_basic_2017"` references the instance
@@ -2445,21 +3230,171 @@ fn validate_leaf(
                 let resolved = idx.contains(type_name, &lookup_value)
                     || alt_candidates.iter().any(|c| idx.contains(type_name, c));
                 if !idx.instances(type_name).is_empty() && !resolved {
+                    // An unknown `<event>` / `<event.country_event>` reference is
+                    // F#'s CW222 (UndefinedEvent, Warning); other unknown type
+                    // refs keep the Rust-only CW500.
+                    let is_event = type_name == "event" || type_name.starts_with("event.");
+                    let (code, message) = if is_event {
+                        let c = &error_codes::CW222_UNDEFINED_EVENT;
+                        (c, c.format(&[&lookup_value]))
+                    } else {
+                        (
+                            &error_codes::CW500_TYPE_NOT_FOUND,
+                            format!(
+                                "Field '{}' references '{}' which is not a known instance of type '{}'",
+                                key, lookup_value, type_name
+                            ),
+                        )
+                    };
                     errors.push(ValidationError {
-                        message: format!(
-                            "Field '{}' references '{}' which is not a known instance of type '{}'",
-                            key, lookup_value, type_name
-                        ),
-                        severity: ErrorSeverity::Error,
+                        message,
+                        severity: code.severity,
                         line: leaf.pos.start.line,
                         col: leaf.pos.start.col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW500_TYPE_NOT_FOUND.id.to_string()),
+                        code: Some(code.id.to_string()),
                     });
                 }
             }
             // TypeField is otherwise accepted (non-empty check done by field_matches_value).
             return;
+        }
+        // FilepathField: check the referenced file exists (CW113). Only when the
+        // file index is populated (vanilla loaded); otherwise stay silent.
+        if let NewField::FilepathField { prefix, extension } = right {
+            if let Some(idx) = type_index
+                && !idx.file_index.is_empty() {
+                    let raw = leaf_value_to_string(&leaf.value, table);
+                    let value = raw.trim_matches('"').trim();
+                    // Skip dynamic / templated paths we can't resolve statically.
+                    let dynamic = value.is_empty()
+                        || value.contains('$')
+                        || value.contains('[')
+                        || value.contains('<');
+                    if !dynamic {
+                        let mut candidate = match prefix {
+                            Some(p)
+                                if !value
+                                    .to_ascii_lowercase()
+                                    .starts_with(&p.to_ascii_lowercase()) =>
+                            {
+                                format!("{}{}", p, value)
+                            }
+                            _ => value.to_string(),
+                        };
+                        if let Some(ext) = extension
+                            && !ext.is_empty()
+                                && !candidate
+                                    .to_ascii_lowercase()
+                                    .ends_with(&ext.to_ascii_lowercase())
+                            {
+                                candidate.push_str(ext);
+                            }
+                        if !idx.file_index.contains(&candidate) {
+                            let code = &error_codes::CW113_MISSING_FILE;
+                            errors.push(ValidationError {
+                                message: code.format(&[&candidate]),
+                                severity: code.severity,
+                                line: leaf.pos.start.line,
+                                col: leaf.pos.start.col,
+                                file: file_path.to_string(),
+                                code: Some(code.id.to_string()),
+                            });
+                        }
+                    }
+                }
+            return;
+        }
+
+        // VariableField: a value that must be a number-in-range or a defined
+        // variable reference (`add = 5`, `value = my_var`). Mirrors F#
+        // `checkVariableField`. Two parts:
+        //   - numeric checks (CW271 int-only / CW270 3-decimal precision) run
+        //     always — they only fire on a value that parses as a number and
+        //     violates the field's int/precision constraint, so they cannot
+        //     flood valid config.
+        //   - the "variable has not been set" check (CW246) is gated behind
+        //     `var_checks_enabled()` because it needs a complete variable index.
+        if let NewField::VariableField {
+            is_int, is_32bit, ..
+        } = right
+        {
+            let raw = leaf_value_to_string(&leaf.value, table);
+            let v = raw.trim_matches('"').trim();
+            // Accept at-vars (@x), inline math ([...]), loc refs ($$) and boolean
+            // literals (`yes`/`no`, used by boolean modifiers) — all valid in a
+            // value slot (F# FieldValidators bypasses).
+            let is_bool = matches!(leaf.value, Value::Bool(_))
+                || matches!(v.to_ascii_lowercase().as_str(), "yes" | "no");
+            let bypass = v.is_empty()
+                || v.starts_with('@')
+                || v.starts_with('[')
+                || v.contains("$$")
+                || is_bool;
+            if !bypass {
+                // Strip a `?`/`^` default-value selector before parsing.
+                let core = v.split(['?', '^']).next().unwrap_or(v).trim();
+                if let Ok(f) = core.parse::<f64>() {
+                    // Numeric value: enforce int-ness / decimal precision.
+                    if *is_int && f.fract() != 0.0 {
+                        let code = &error_codes::CW271_VARIABLE_INT_ONLY;
+                        errors.push(ValidationError {
+                            message: code.message_template.to_string(),
+                            severity: code.severity,
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                            file: file_path.to_string(),
+                            code: Some(code.id.to_string()),
+                        });
+                    } else if *is_32bit && decimal_places(core) > 3 {
+                        let code = &error_codes::CW270_VARIABLE_TOO_SMALL;
+                        errors.push(ValidationError {
+                            message: code.message_template.to_string(),
+                            severity: code.severity,
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                            file: file_path.to_string(),
+                            code: Some(code.id.to_string()),
+                        });
+                    }
+                } else if var_checks_enabled() {
+                    // Non-numeric value: it must name a defined variable. Stay
+                    // lenient: only flag a single bare token (a `.`-chain is a
+                    // scope/target, handled elsewhere) that isn't a scope
+                    // keyword/link and isn't in the project variable index.
+                    let single_token = !core.contains('.') && !core.contains(':');
+                    let is_scopeish = scope_context
+                        .map(|ctx| resolves_as_scope_key(ctx, core))
+                        .unwrap_or(false);
+                    if single_token
+                        && !is_scopeish
+                        && let Some(idx) = type_index
+                        && !idx.var_index.is_empty()
+                        && !idx.var_index.contains(core)
+                    {
+                        let code = &error_codes::CW246_UNSET_VARIABLE;
+                        errors.push(ValidationError {
+                            message: code.format(&[core]),
+                            severity: code.severity,
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                            file: file_path.to_string(),
+                            code: Some(code.id.to_string()),
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
+        // Scope-target validation (CW243 target-wrong-scope / CW245 error-in-target):
+        // resolve the chain from the current scope. Gated with the other scope checks.
+        if let NewField::ScopeField(expected) = right
+            && scope_checks_enabled()
+            && let Some(ctx) = scope_context
+        {
+            let value = leaf_value_to_string(&leaf.value, table);
+            validate_scope_target(ctx, &value, expected, leaf, file_path, errors);
         }
 
         if !field_matches_value(right, &leaf.value, table, enum_map) {
@@ -2475,7 +3410,7 @@ fn validate_leaf(
                 line: leaf.pos.start.line,
                 col: leaf.pos.start.col,
                 file: file_path.to_string(),
-                code: Some(error_codes::CW202_INVALID_VALUE.id.to_string()),
+                code: Some(error_codes::CW240_UNEXPECTED_VALUE.id.to_string()),
             });
         }
     }

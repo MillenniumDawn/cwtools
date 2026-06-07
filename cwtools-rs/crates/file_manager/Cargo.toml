@@ -11,6 +11,7 @@ cwtools_string_table = { workspace = true }
 walkdir = { workspace = true }
 globset = { workspace = true }
 thiserror = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

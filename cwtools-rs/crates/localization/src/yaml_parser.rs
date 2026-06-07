@@ -166,6 +166,13 @@ pub fn check_loc_file_lang(file: &str, header_key: &str) -> Option<LangHeaderDia
 /// Entries with invalid content still parse; the caller is responsible for
 /// calling `validate_quotes` / `validate_invalid_chars`.
 pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
+    // Strip leading UTF-8 BOM(s). Loc files are required to be UTF-8-with-BOM
+    // (see CW254) and the disk reader keeps the BOM in the string, so without
+    // this the `l_english:` header parses as `\u{FEFF}l_english` and the
+    // language comes back unknown — which silently empties the loc-key index.
+    // Some real files in the wild carry a doubled BOM (`\u{FEFF}\u{FEFF}`);
+    // F# tolerates it via a substring match, so strip every leading BOM.
+    let text = text.trim_start_matches('\u{feff}');
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0;
 
@@ -188,7 +195,10 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     let colon = header
         .find(':')
         .ok_or_else(|| format!("missing ':' in language header: {header:?}"))?;
-    let language_key = header[..colon].trim_end();
+    // Trim both ends: a header may carry leading whitespace (`  l_english:`),
+    // which F# tolerates via `line.Trim()`. `trim_end` alone would leave the
+    // leading space and fail the exact `key_to_language` lookup.
+    let language_key = header[..colon].trim();
     let lang = key_to_language(language_key);
     i += 1;
 
@@ -235,11 +245,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         // strip one leading space (the convention after `:`)
         // but keep everything else including # comments,
         // because in F# `#` is a valid `isLocValueChar`.
-        let desc = if remainder.starts_with(' ') {
-            &remainder[1..]
-        } else {
-            remainder
-        };
+        let desc = remainder.strip_prefix(' ').unwrap_or(remainder);
 
         let position = Position::new(name, i + 1, 1); // 1-based line numbers
 
@@ -341,10 +347,14 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     }
 
     Ok(LocFile {
+        path: name.to_string(),
         language_prefix: language_key.to_string(),
         lang,
         entries,
         file_diagnostics,
+        // Unknown here; set by the disk-reading path (`LocService`) where the
+        // raw bytes are available.
+        encoding: None,
     })
 }
 
@@ -358,27 +368,46 @@ pub fn is_loc_value_char(c: char) -> bool {
     // ASCII letters
     c.is_ascii_alphabetic()
     // U+0020–U+007E  (printable ASCII)
-    || (u >= 0x0020 && u <= 0x007E)
+    || (0x0020..=0x007E).contains(&u)
     // U+00A0–U+024F  (Latin Extended)
-    || (u >= 0x00A0 && u <= 0x024F)
+    || (0x00A0..=0x024F).contains(&u)
     // U+0401–U+045F  (Cyrillic)
-    || (u >= 0x0401 && u <= 0x045F)
+    || (0x0401..=0x045F).contains(&u)
     // U+0490–U+0491  (Cyrillic supplement)
-    || (u >= 0x0490 && u <= 0x0491)
+    || (0x0490..=0x0491).contains(&u)
     // U+1E00–U+1EFF  (Latin Extended Additional)
-    || (u >= 0x1E00 && u <= 0x1EFF)
+    || (0x1E00..=0x1EFF).contains(&u)
     // U+2013–U+2044  (General Punctuation subset)
-    || (u >= 0x2013 && u <= 0x2044)
+    || (0x2013..=0x2044).contains(&u)
     // U+2460–U+24FF  (Enclosed Alphanumerics)
-    || (u >= 0x2460 && u <= 0x24FF)
+    || (0x2460..=0x24FF).contains(&u)
     // U+4E00–U+9FFF  (CJK Unified Ideographs)
-    || (u >= 0x4E00 && u <= 0x9FFF)
-    // U+3000–U+30FF  (CJK Symbols + Katakana/Hiragana)
-    || (u >= 0x3000 && u <= 0x30FF)
+    || (0x4E00..=0x9FFF).contains(&u)
+    // U+3000–U+30FF  (CJK Symbols + Katakana/Hiragana — Japanese)
+    || (0x3000..=0x30FF).contains(&u)
+    // U+3400–U+4DBF  (CJK Unified Ideographs Extension A — Chinese)
+    || (0x3400..=0x4DBF).contains(&u)
     // U+FE30–U+FE4F  (CJK Compatibility Forms)
-    || (u >= 0xFE30 && u <= 0xFE4F)
+    || (0xFE30..=0xFE4F).contains(&u)
     // U+FF00–U+FFEF  (Halfwidth and Fullwidth Forms)
-    || (u >= 0xFF00 && u <= 0xFFEF)
+    || (0xFF00..=0xFFEF).contains(&u)
+    // ── Intentional divergence from F# `isLocValueChar`: accept scripts the
+    // game renders fine but F# rejected. Per project goal, the game wins over
+    // strict F# parity (see project memory). ──
+    // U+1100–U+11FF  (Hangul Jamo — Korean)
+    || (0x1100..=0x11FF).contains(&u)
+    // U+3130–U+318F  (Hangul Compatibility Jamo — Korean)
+    || (0x3130..=0x318F).contains(&u)
+    // U+AC00–U+D7A3  (Hangul Syllables — Korean)
+    || (0xAC00..=0xD7A3).contains(&u)
+    // U+0600–U+06FF  (Arabic)
+    || (0x0600..=0x06FF).contains(&u)
+    // U+0750–U+077F  (Arabic Supplement)
+    || (0x0750..=0x077F).contains(&u)
+    // U+FB50–U+FDFF  (Arabic Presentation Forms-A)
+    || (0xFB50..=0xFDFF).contains(&u)
+    // U+FE70–U+FEFF  (Arabic Presentation Forms-B)
+    || (0xFE70..=0xFEFF).contains(&u)
 }
 
 /// Scan `desc` for the first character that fails `is_loc_value_char`.
@@ -464,6 +493,33 @@ pub fn validate_replace_me(entry: &LocEntry) -> Option<String> {
 mod tests {
     use super::*;
     use crate::commands::Lang;
+
+    #[test]
+    fn test_loc_value_char_accepts_supported_scripts() {
+        // Korean (Hangul syllable + jamo), Arabic, Japanese (hiragana/katakana/
+        // kanji) and Chinese (incl. Ext A) must all be accepted.
+        for c in [
+            '한', 'ᄀ', 'ㄱ', // Korean
+            'م', 'ا', // Arabic
+            'あ', 'カ', '日', // Japanese
+            '中', '文', '㐀', // Chinese (㐀 = U+3400, Ext A)
+        ] {
+            assert!(
+                is_loc_value_char(c),
+                "char {c:?} (U+{:04X}) should be valid",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn test_loc_value_char_finds_no_invalid_in_korean_value() {
+        // A realistic Korean loc value must not report an invalid character.
+        assert_eq!(
+            find_invalid_loc_char("\"전쟁이 시작되었다 [USA.GetName]\""),
+            None
+        );
+    }
 
     #[test]
     fn test_parse_language() {
@@ -663,6 +719,49 @@ mod tests {
         assert!(
             file.file_diagnostics.is_empty(),
             "l_default should not produce diagnostics: {:?}",
+            file.file_diagnostics
+        );
+    }
+
+    #[test]
+    fn test_bom_prefixed_header_resolves_language() {
+        // Loc files are UTF-8-with-BOM and the disk reader keeps the BOM in the
+        // string. The header must still resolve to a language (else the loc-key
+        // index silently empties → mass false CW100). See the BOM-strip in
+        // parse_loc_text.
+        let text = "\u{feff}l_english:\n KEY_A: \"value\"\n";
+        let file = parse_loc_text(text, "abilities_l_english.yml").unwrap();
+        assert_eq!(file.lang, Some(Lang::English), "BOM must not hide the lang");
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(file.entries[0].key, "KEY_A");
+    }
+
+    #[test]
+    fn test_leading_space_header_resolves_language() {
+        // `<BOM> l_english:` — a leading space before the language token. F#
+        // trims the line before matching, so this must resolve to English (and
+        // produce no CW256). Real MD files ship this.
+        let text = "\u{feff} l_english:\n KEY_A: \"value\"\n";
+        let file = parse_loc_text(text, "factions_l_english.yml").unwrap();
+        assert_eq!(file.lang, Some(Lang::English));
+        assert_eq!(file.language_prefix, "l_english");
+        assert!(
+            file.file_diagnostics.is_empty(),
+            "leading-space header should not flag: {:?}",
+            file.file_diagnostics
+        );
+    }
+
+    #[test]
+    fn test_double_bom_header_resolves_language() {
+        // `<BOM><BOM>l_french:` — a doubled BOM. F# matches the language as a
+        // substring and tolerates it; strip every leading BOM.
+        let text = "\u{feff}\u{feff}l_french:\n KEY_A: \"value\"\n";
+        let file = parse_loc_text(text, "lockeys_l_french.yml").unwrap();
+        assert_eq!(file.lang, Some(Lang::French));
+        assert!(
+            file.file_diagnostics.is_empty(),
+            "double-BOM header should not flag: {:?}",
             file.file_diagnostics
         );
     }

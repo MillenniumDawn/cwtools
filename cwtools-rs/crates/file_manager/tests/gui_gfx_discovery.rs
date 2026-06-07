@@ -1,5 +1,5 @@
-use std::fs;
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
+use std::fs;
 
 /// Write a minimal .gfx and .gui file into a tempdir and verify both are discovered.
 #[test]
@@ -20,13 +20,7 @@ fn discovers_gui_and_gfx_files() {
 
     let names: Vec<String> = files
         .iter()
-        .map(|f| {
-            f.path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        })
+        .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
 
     assert!(

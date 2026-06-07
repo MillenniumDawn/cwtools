@@ -8,6 +8,8 @@
 use crate::commands::{Game, JominiCommand, LocEntry};
 use cwtools_game::constants::Game as EngineGame;
 use cwtools_game::scope_engine::{SCOPE_ANY, ScopeContext, ScopeId, ScopeResult};
+use cwtools_game::scope_registry::ScopeRegistry;
+use std::sync::Arc;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -52,6 +54,9 @@ pub struct LocScopeData {
     pub question_mark_variable: bool,
     /// Whether `parameter:xxx` references are accepted.
     pub parameter_variables: bool,
+    /// Config-driven scope/link registry. When set, the loc scope engine uses it
+    /// (shared with the validation path) instead of the hardcoded per-game table.
+    pub registry: Option<Arc<ScopeRegistry>>,
 }
 
 impl Default for LocScopeData {
@@ -61,7 +66,17 @@ impl Default for LocScopeData {
             terminal_commands: Vec::new(),
             question_mark_variable: true,
             parameter_variables: true,
+            registry: None,
         }
+    }
+}
+
+/// Build the loc scope context: from the config registry when provided (shared
+/// with the validation path), else from the game's hardcoded table.
+fn build_loc_ctx(data: &LocScopeData, engine_game: EngineGame, initial: ScopeId) -> ScopeContext {
+    match &data.registry {
+        Some(reg) => ScopeContext::from_registry(reg.clone(), initial),
+        None => ScopeContext::new(engine_game, initial),
     }
 }
 
@@ -137,7 +152,7 @@ fn validate_command_string(
     let segments: Vec<&str> = cmd.split('.').collect();
     let last_idx = segments.len().saturating_sub(1);
 
-    let mut ctx = ScopeContext::new(engine_game, initial_scope);
+    let mut ctx = build_loc_ctx(data, engine_game, initial_scope);
 
     for (i, seg) in segments.iter().enumerate() {
         let is_last = i == last_idx;
@@ -230,21 +245,18 @@ fn validate_jomini_chain(
         return; // accepted without scope check
     }
 
-    let mut ctx = ScopeContext::new(engine_game, initial_scope);
+    let mut ctx = build_loc_ctx(data, engine_game, initial_scope);
     let result = ctx.change_scope(seg);
-    match result {
-        ScopeResult::WrongScope {
+    if let ScopeResult::WrongScope {
             command,
             current,
             expected,
-        } => {
-            diags.push(LocCommandDiagnostic::WrongScope {
-                command,
-                current_scope: current.0,
-                expected_scopes: expected.iter().map(|s| s.0).collect(),
-            });
-        }
-        _ => {}
+        } = result {
+        diags.push(LocCommandDiagnostic::WrongScope {
+            command,
+            current_scope: current.0,
+            expected_scopes: expected.iter().map(|s| s.0).collect(),
+        });
     }
 }
 
@@ -305,6 +317,32 @@ mod tests {
     }
 
     fn hoi4_data() -> LocScopeData {
+        // HOI4 is config-driven: supply a minimal registry (country/state +
+        // owner/controller links) so the scope chains resolve in tests.
+        use cwtools_game::scope_engine::{ScopeId, ScopeLink};
+        let mut reg = ScopeRegistry::default();
+        for (name, id) in [("country", 100u32), ("state", 101u32)] {
+            reg.by_name.insert(name.to_string(), ScopeId(id));
+            reg.by_id.insert(
+                ScopeId(id),
+                cwtools_game::scope_registry::ScopeDefOwned {
+                    name: name.to_string(),
+                    aliases: vec![name.to_string()],
+                    subscope_of: vec![],
+                },
+            );
+        }
+        for name in ["owner", "controller"] {
+            reg.links.insert(
+                name.to_string(),
+                ScopeLink {
+                    valid_scopes: vec![ScopeId(101)], // state only
+                    target: Some(ScopeId(100)),       // -> country
+                    is_scope_change: true,
+                    ignore_keys: vec![],
+                },
+            );
+        }
         LocScopeData {
             game: Game::HOI4,
             terminal_commands: vec![
@@ -315,6 +353,7 @@ mod tests {
             ],
             question_mark_variable: true,
             parameter_variables: true,
+            registry: Some(Arc::new(reg)),
         }
     }
 

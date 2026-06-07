@@ -102,8 +102,9 @@ pub struct ScopeContext {
     pub scopes: Vec<ScopeId>,
     /// FROM chain: index 0 = FROM, 1 = FROMFROM, 2 = FROMFROMFROM, 3 = FROMFROMFROMFROM.
     pub from: Vec<ScopeId>,
-    /// Pre-built lookup table for game-specific named scope-links.
-    pub scope_links: HashMap<String, ScopeLink>,
+    /// Config-driven scope/link registry (named links, prefixes, scope names).
+    /// Shared (cheap to clone for `save`/recursion).
+    pub registry: std::sync::Arc<crate::scope_registry::ScopeRegistry>,
 }
 
 /// A single named scope-link definition (a scoped effect / one-to-one link).
@@ -122,26 +123,34 @@ pub struct ScopeLink {
 impl ScopeContext {
     // ── Constructors ────────────────────────────────────────────────────────
 
-    /// Create a fresh context rooted at `root` for the given `game`.
+    /// Create a fresh context rooted at `root` for the given `game`, using the
+    /// hardcoded scope/link tables (Stellaris/EU4/tests; HOI4 is config-driven
+    /// via [`Self::from_registry`]).
     pub fn new(game: Game, root: ScopeId) -> Self {
-        let mut links = HashMap::new();
-        load_scope_links(game, &mut links);
-        Self {
+        Self::from_registry(
+            std::sync::Arc::new(crate::scope_registry::ScopeRegistry::from_hardcoded(game)),
             root,
-            scopes: vec![root],
-            from: Vec::new(),
-            scope_links: links,
-        }
+        )
     }
 
-    /// Create a context with no game-specific links (useful for tests /
-    /// generic validation).
+    /// Create a context with an empty registry (no links; lenient).
     pub fn new_generic(root: ScopeId) -> Self {
+        Self::from_registry(
+            std::sync::Arc::new(crate::scope_registry::ScopeRegistry::default()),
+            root,
+        )
+    }
+
+    /// Create a context backed by a prebuilt (config-driven) registry.
+    pub fn from_registry(
+        registry: std::sync::Arc<crate::scope_registry::ScopeRegistry>,
+        root: ScopeId,
+    ) -> Self {
         Self {
             root,
             scopes: vec![root],
             from: Vec::new(),
-            scope_links: HashMap::new(),
+            registry,
         }
     }
 
@@ -151,6 +160,12 @@ impl ScopeContext {
     /// somehow empty.
     pub fn current(&self) -> Option<ScopeId> {
         self.scopes.last().copied()
+    }
+
+    /// Depth of the scope stack. Used by callers to detect whether a
+    /// `change_scope` call actually pushed a new scope.
+    pub fn scope_depth(&self) -> usize {
+        self.scopes.len()
     }
 
     /// Push a new scope onto the stack (used by callers that already resolved
@@ -220,27 +235,24 @@ impl ScopeContext {
         this: Option<&str>,
         froms: &[String],
         prevs: &[String],
-        game: Game,
     ) {
+        // Resolve all names up front through the registry (clone the Arc so the
+        // closure doesn't borrow `self` while we mutate the scope stack below).
+        // The integer fallback supports id literals used in some tests.
+        let reg = self.registry.clone();
         let resolve = |name: &str| -> Option<ScopeId> {
-            let lower = name.to_lowercase();
-            game.scope_defs()
-                .iter()
-                .find(|d| {
-                    d.name.eq_ignore_ascii_case(name)
-                        || d.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
-                })
-                .map(|d| ScopeId::from(d.id))
-                .or_else(|| {
-                    // Fallback: parse the integer id literals sometimes used in tests
-                    lower.parse::<u32>().ok().map(ScopeId)
-                })
+            reg.id_of(name)
+                .or_else(|| name.trim().parse::<u32>().ok().map(ScopeId))
         };
+        let root_id = root.and_then(&resolve);
+        let this_id = this.and_then(&resolve);
+        let from_ids: Vec<ScopeId> = froms.iter().filter_map(|n| resolve(n)).collect();
+        let prev_ids: Vec<ScopeId> = prevs.iter().filter_map(|n| resolve(n)).collect();
 
-        if let Some(r) = root.and_then(|n| resolve(n)) {
+        if let Some(r) = root_id {
             self.root = r;
         }
-        if let Some(t) = this.and_then(|n| resolve(n)) {
+        if let Some(t) = this_id {
             // "this" becomes the new current scope (push on top)
             if let Some(last) = self.scopes.last_mut() {
                 *last = t;
@@ -248,14 +260,14 @@ impl ScopeContext {
                 self.scopes.push(t);
             }
         }
-        if !froms.is_empty() {
-            self.from = froms.iter().filter_map(|n| resolve(n)).collect();
+        if !from_ids.is_empty() {
+            self.from = from_ids;
         }
-        if !prevs.is_empty() {
+        if !prev_ids.is_empty() {
             // Replace the bottom of the scope stack with the prev chain.
             // Keep the current scope on top.
             let current = self.scopes.last().copied().unwrap_or(self.root);
-            let mut new_scopes: Vec<ScopeId> = prevs.iter().filter_map(|n| resolve(n)).collect();
+            let mut new_scopes = prev_ids;
             new_scopes.push(current);
             self.scopes = new_scopes;
         }
@@ -280,8 +292,28 @@ impl ScopeContext {
             key
         };
 
-        // Special prefixes that always yield AnyScope (F# Scopes.fs:153-164).
         let lower = key.to_ascii_lowercase();
+
+        // Config-driven prefix links (`var:`, `sp:`, `mio:`, `event_target:`, …).
+        // A scope-changing prefix (`sp:` → special_project) pushes its target; a
+        // value/data prefix (`var:`, `event_target:`) opens ANY.
+        for (prefix, link) in &self.registry.prefix_links {
+            if lower.starts_with(prefix.as_str()) {
+                if link.is_scope_change {
+                    let target = link.target.unwrap_or(SCOPE_ANY);
+                    self.scopes.push(target);
+                    return ScopeResult::NewScope {
+                        scope: target,
+                        ignore_keys: link.ignore_keys.clone(),
+                    };
+                }
+                self.scopes.push(SCOPE_ANY);
+                return ScopeResult::AnyScope;
+            }
+        }
+
+        // Hardcoded fallback prefixes that always yield AnyScope (F# Scopes.fs:153-164),
+        // used when the registry carries no matching prefix link.
         if lower.starts_with("event_target:")
             || lower.starts_with("parameter:")
             || lower.starts_with("scope:")
@@ -416,7 +448,7 @@ impl ScopeContext {
         }
 
         // Game-specific named link lookup
-        let link_opt = self.scope_links.get(&lower).cloned();
+        let link_opt = self.registry.links.get(&lower).cloned();
         if let Some(link) = link_opt {
             let current = self.scopes.last().copied().unwrap_or(self.root);
 
@@ -476,10 +508,13 @@ impl ScopeContext {
 
 // ── Scope link loading ────────────────────────────────────────────────────────
 
-fn load_scope_links(game: Game, links: &mut HashMap<String, ScopeLink>) {
+/// Populate the hardcoded scope-link table for a game. HOI4 is config-driven
+/// (its links come from `links.cwt` via the scope registry), so it adds nothing
+/// here. Used only by [`crate::scope_registry::ScopeRegistry::from_hardcoded`].
+pub fn load_scope_links(game: Game, links: &mut HashMap<String, ScopeLink>) {
     use crate::constants::Game::*;
     match game {
-        Hoi4 => load_hoi4_links(links),
+        Hoi4 => {}
         Stellaris => load_stellaris_links(links),
         Eu4 => load_eu4_links(links),
         Ck2 => load_ck2_links(links),
@@ -506,139 +541,6 @@ fn sc(valid: &[u32], target: u32) -> ScopeLink {
 fn insert_aliases(links: &mut HashMap<String, ScopeLink>, names: &[&str], link: ScopeLink) {
     for name in names {
         links.insert(name.to_string(), link.clone());
-    }
-}
-
-// ── HOI4 ────────────────────────────────────────────────────────────────────
-
-// Scope IDs: Country=100, State=101, UnitLeader=102, Air=103
-//
-// Source: HOI4Scopes.fs (oneToOneScopes + scopedEffects).
-// The F# file has no scopedEffects table — links come from config rules and
-// from game-data observations.  Listed here are the complete set known from
-// HOI4 CWT rules and from the HOI4 modding docs.
-fn load_hoi4_links(links: &mut HashMap<String, ScopeLink>) {
-    const COUNTRY: u32 = 100;
-    const STATE: u32 = 101;
-    const UNIT_LEADER: u32 = 102;
-    const AIR: u32 = 103;
-
-    let entries: &[(&[&str], &[u32], u32)] = &[
-        // ── Global iterators (any → target) ─────────────────────────────
-        (
-            &["every_country", "random_country", "any_country", "country"],
-            &[],
-            COUNTRY,
-        ),
-        (
-            &["every_state", "random_state", "any_state", "state"],
-            &[],
-            STATE,
-        ),
-        (
-            &[
-                "every_unit_leader",
-                "random_unit_leader",
-                "any_unit_leader",
-                "unit_leader",
-            ],
-            &[],
-            UNIT_LEADER,
-        ),
-        (
-            &["every_air_unit", "random_air_unit", "any_air_unit"],
-            &[],
-            AIR,
-        ),
-        // ── Iterators scoped to Country ──────────────────────────────────
-        (
-            &["every_owned_state", "random_owned_state", "any_owned_state"],
-            &[COUNTRY],
-            STATE,
-        ),
-        (
-            &[
-                "every_controlled_state",
-                "random_controlled_state",
-                "any_controlled_state",
-            ],
-            &[COUNTRY],
-            STATE,
-        ),
-        (
-            &[
-                "every_subject_country",
-                "random_subject_country",
-                "any_subject_country",
-            ],
-            &[COUNTRY],
-            COUNTRY,
-        ),
-        (
-            &[
-                "every_other_country",
-                "random_other_country",
-                "any_other_country",
-            ],
-            &[COUNTRY],
-            COUNTRY,
-        ),
-        (
-            &[
-                "every_neighbor_country",
-                "random_neighbor_country",
-                "any_neighbor_country",
-            ],
-            &[COUNTRY],
-            COUNTRY,
-        ),
-        (
-            &["every_ally", "random_ally", "any_ally"],
-            &[COUNTRY],
-            COUNTRY,
-        ),
-        (
-            &[
-                "every_enemy_country",
-                "random_enemy_country",
-                "any_enemy_country",
-            ],
-            &[COUNTRY],
-            COUNTRY,
-        ),
-        (
-            &["every_army_leader", "random_army_leader", "any_army_leader"],
-            &[COUNTRY],
-            UNIT_LEADER,
-        ),
-        (
-            &["every_navy_leader", "random_navy_leader", "any_navy_leader"],
-            &[COUNTRY],
-            UNIT_LEADER,
-        ),
-        // ── Iterators scoped to State ────────────────────────────────────
-        (
-            &[
-                "every_neighbor_state",
-                "random_neighbor_state",
-                "any_neighbor_state",
-            ],
-            &[STATE],
-            STATE,
-        ),
-        // ── Country named links ──────────────────────────────────────────
-        (&["capital_scope"], &[COUNTRY], STATE),
-        (&["overlord"], &[COUNTRY], COUNTRY),
-        (&["faction_leader"], &[COUNTRY], COUNTRY),
-        // ── State named links ────────────────────────────────────────────
-        (&["controller"], &[STATE], COUNTRY),
-        (&["owner"], &[STATE], COUNTRY),
-        // ── Unit leader named links ──────────────────────────────────────
-        (&["unit_leader_scope"], &[COUNTRY], UNIT_LEADER),
-    ];
-
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
     }
 }
 
@@ -1912,7 +1814,8 @@ pub fn validate_scope_field(context: &ScopeContext, field: &str) -> bool {
     // field is something like "country" or "province"
     let lower = field.to_ascii_lowercase();
     context
-        .scope_links
+        .registry
+        .links
         .get(&lower)
         .map(|l| l.valid_scopes.contains(&cur) || l.valid_scopes.is_empty())
         .unwrap_or(true) // unknown field → lenient
@@ -2186,7 +2089,20 @@ mod tests {
 
     #[test]
     fn hoi4_state_owner() {
-        let mut ctx = ScopeContext::new(Game::Hoi4, ScopeId(101)); // State
+        // HOI4 is config-driven: build a minimal registry (state -> owner ->
+        // country) instead of the removed hardcoded table.
+        use crate::scope_registry::ScopeRegistry;
+        let mut reg = ScopeRegistry::default();
+        reg.links.insert(
+            "owner".to_string(),
+            ScopeLink {
+                valid_scopes: vec![ScopeId(101)],
+                target: Some(ScopeId(100)),
+                is_scope_change: true,
+                ignore_keys: vec![],
+            },
+        );
+        let mut ctx = ScopeContext::from_registry(std::sync::Arc::new(reg), ScopeId(101)); // State
         let res = ctx.change_scope("owner");
         assert!(matches!(
             res,

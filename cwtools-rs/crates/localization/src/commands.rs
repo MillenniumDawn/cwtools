@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 
 /// Supported languages across all games.
@@ -35,6 +34,28 @@ impl fmt::Display for Lang {
             Lang::Turkish => write!(f, "turkish"),
             Lang::Default => write!(f, "default"),
         }
+    }
+}
+
+impl Lang {
+    /// Parse a plain language name (`english`, `simp_chinese`, …) into a `Lang`.
+    /// Tolerant of case and of an optional `l_` prefix, so both the loc-file
+    /// header form (`l_english`) and a bare setting value (`English`) resolve.
+    /// Also accepts the editor-setting spellings (`Chinese`, `Braz_Por`).
+    pub fn from_name(name: &str) -> Option<Lang> {
+        let lower = name.trim().to_ascii_lowercase();
+        // Editor-facing aliases that differ from the `l_xxx` loc-file keys.
+        match lower.as_str() {
+            "chinese" | "simp_chinese" => return Some(Lang::SimpChinese),
+            "braz_por" | "brazilian" | "brazilian_portuguese" => return Some(Lang::BrazPor),
+            _ => {}
+        }
+        let key = if lower.starts_with("l_") {
+            lower
+        } else {
+            format!("l_{lower}")
+        };
+        key_to_language(&key)
     }
 }
 
@@ -176,8 +197,6 @@ pub fn key_to_language_for_game(game: Game, prefix: &str) -> Option<Lang> {
     }
 }
 
-/// A parsed localization file.
-
 /// A localized entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocEntry {
@@ -227,40 +246,18 @@ pub enum JominiParam {
 /// A parsed localization file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocFile {
+    /// Source path (or logical name) this file was parsed from.
+    pub path: String,
     pub language_prefix: String,
     pub lang: Option<Lang>,
     pub entries: Vec<LocEntry>,
     /// File-level diagnostics (BOM, header/filename mismatches, etc.).
     /// Empty when there are no issues.
     pub file_diagnostics: Vec<String>,
-}
-
-/// Per-language API over loaded loc files.
-pub struct LocApi {
-    entries: HashMap<String, LocEntry>,
-    pub keys: Vec<String>,
-}
-
-impl LocApi {
-    pub fn new(entries: HashMap<String, LocEntry>) -> Self {
-        let keys = entries.keys().cloned().collect::<Vec<_>>();
-        Self { entries, keys }
-    }
-
-    pub fn get_desc(&self, key: &str) -> String {
-        self.entries
-            .get(key)
-            .map(|e| e.desc.clone())
-            .unwrap_or_else(|| key.to_string())
-    }
-
-    pub fn get_entry(&self, key: &str) -> Option<&LocEntry> {
-        self.entries.get(key)
-    }
-
-    pub fn contains(&self, key: &str) -> bool {
-        self.entries.contains_key(key)
-    }
+    /// On-disk encoding, when the file was read from disk (used to enforce the
+    /// UTF-8-BOM rule, CW254). `None` when built from already-decoded text
+    /// (LSP single-file edits, tests) where the original bytes aren't available.
+    pub encoding: Option<cwtools_file_manager::FileEncoding>,
 }
 
 /* ======================================================================== */
@@ -281,6 +278,20 @@ mod tests {
         assert_eq!(key_to_language("l_english"), Some(Lang::English));
         assert_eq!(key_to_language("l_turkish"), Some(Lang::Turkish));
         assert_eq!(key_to_language("l_unknown"), None);
+    }
+
+    #[test]
+    fn test_lang_from_name_tolerant() {
+        // bare name, case-insensitive, and the l_ prefix all resolve
+        assert_eq!(Lang::from_name("english"), Some(Lang::English));
+        assert_eq!(Lang::from_name("English"), Some(Lang::English));
+        assert_eq!(Lang::from_name("  German "), Some(Lang::German));
+        assert_eq!(Lang::from_name("simp_chinese"), Some(Lang::SimpChinese));
+        assert_eq!(Lang::from_name("l_french"), Some(Lang::French));
+        // editor-setting spellings
+        assert_eq!(Lang::from_name("Chinese"), Some(Lang::SimpChinese));
+        assert_eq!(Lang::from_name("Braz_Por"), Some(Lang::BrazPor));
+        assert_eq!(Lang::from_name("klingon"), None);
     }
 
     #[test]

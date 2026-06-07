@@ -16,7 +16,15 @@ pub struct RuleSet {
     /// A from-data scope link (e.g. `character`, `state`, `owner`) can appear as a
     /// scope-switching key, so these are the valid keys for an `[cat:scope_field]`
     /// slot alongside scope commands and type instances. See [`crate`] consumers.
+    /// Derived from `link_inputs` (names + prefixes) during reindex.
     pub scope_links: std::collections::HashSet<String>,
+    /// Scope definitions from a top-level `scopes = { Name = { aliases = {..} } }`
+    /// block (scopes.cwt). Used to build the runtime scope registry. Empty when no
+    /// scopes.cwt is loaded (the engine then falls back to the hardcoded table).
+    pub scope_inputs: Vec<ScopeInput>,
+    /// Full link definitions from `links = { name = { ... } }` (links.cwt), with
+    /// every field the scope engine needs (output/input scopes, prefix, from_data).
+    pub link_inputs: Vec<LinkInput>,
     /// Lookup index over `aliases`, built by `reindex()`. Maps a full alias name
     /// (`"cat:key"`) to the indices of every matching overload, so alias
     /// resolution is O(1) instead of a linear scan over all aliases per key.
@@ -32,6 +40,35 @@ pub struct RuleSet {
     pub enum_by_name: std::collections::HashMap<String, usize>,
 }
 
+/// A scope definition parsed from `scopes.cwt` (`Country = { aliases = { country } }`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeInput {
+    /// The formal scope name (the block key), e.g. `Country`, `Special Project`.
+    pub name: String,
+    /// Alternative names (`aliases = { country }`); the first is the canonical short form.
+    pub aliases: Vec<String>,
+    /// Parent scopes (`is_subscope_of = { country }`), for hierarchical matching.
+    pub is_subscope_of: Vec<String>,
+}
+
+/// A scope/event-target link parsed from `links.cwt`. Mirrors the fields the F#
+/// engine reads (`UtilityParser.parseLink`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkInput {
+    /// Link name / key (e.g. `owner`, `state`, `var`).
+    pub name: String,
+    /// Resulting scope name (`output_scope = country`); `None` = any.
+    pub output_scope: Option<String>,
+    /// Scopes the link is valid in (`input_scopes`); empty = any.
+    pub input_scopes: Vec<String>,
+    /// Data prefix for parameterised links (`prefix = var:` / `sp:` / `event_target:`).
+    pub prefix: Option<String>,
+    /// `from_data = yes` — the link takes a data argument (state id, tag, value, …).
+    pub from_data: bool,
+    /// `data_source` entries (`<state>`, `enum[country_tags]`, `value[variable]`), may repeat.
+    pub data_source: Vec<String>,
+}
+
 /// Per-category alias index entry (see `RuleSet::alias_categories`).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AliasCategoryIndex {
@@ -40,6 +77,12 @@ pub struct AliasCategoryIndex {
     pub type_pattern_idxs: Vec<usize>,
     /// Index of this category's `scope_field` alias, if any.
     pub scope_field_idx: Option<usize>,
+}
+
+impl Default for RuleSet {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RuleSet {
@@ -54,6 +97,8 @@ impl RuleSet {
             values: Vec::new(),
             modifiers: Vec::new(),
             scope_links: std::collections::HashSet::new(),
+            scope_inputs: Vec::new(),
+            link_inputs: Vec::new(),
             alias_exact: std::collections::HashMap::new(),
             alias_categories: std::collections::HashMap::new(),
             type_by_name: std::collections::HashMap::new(),
@@ -88,14 +133,20 @@ impl RuleSet {
             }
         }
         for td in &mut self.types {
-            td.path_options.paths_lower = td.path_options.paths.iter().map(|p| {
-                p.replace('\\', "/").trim_matches('/').to_lowercase()
-            }).collect();
+            td.path_options.paths_lower = td
+                .path_options
+                .paths
+                .iter()
+                .map(|p| p.replace('\\', "/").trim_matches('/').to_lowercase())
+                .collect();
         }
         for ce in &mut self.complex_enums {
-            ce.path_options.paths_lower = ce.path_options.paths.iter().map(|p| {
-                p.replace('\\', "/").trim_matches('/').to_lowercase()
-            }).collect();
+            ce.path_options.paths_lower = ce
+                .path_options
+                .paths
+                .iter()
+                .map(|p| p.replace('\\', "/").trim_matches('/').to_lowercase())
+                .collect();
         }
         self.type_by_name.clear();
         for (i, td) in self.types.iter().enumerate() {

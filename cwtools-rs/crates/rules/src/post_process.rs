@@ -63,20 +63,31 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)], chang
     // Resolve it in place so the alias body becomes the referenced rules and is
     // deep-validated like an inline body, instead of staying an opaque
     // SingleAliasField that validates permissively.
-    if let RuleType::LeafRule { right: NewField::SingleAliasField(name), .. } = &rule.0 {
+    if let RuleType::LeafRule {
+        right: NewField::SingleAliasField(name),
+        ..
+    } = &rule.0
+    {
         let name = name.clone();
         if let Some(resolved) = lookup_single_alias(&name, map) {
             let left = extract_leaf_left(&rule.0);
             match resolved.0 {
-                RuleType::LeafRule { right: ar, .. } => rule.0 = RuleType::LeafRule { left, right: ar },
-                RuleType::NodeRule { rules: ar, .. } => rule.0 = RuleType::NodeRule { left, rules: ar },
+                RuleType::LeafRule { right: ar, .. } => {
+                    rule.0 = RuleType::LeafRule { left, right: ar }
+                }
+                RuleType::NodeRule { rules: ar, .. } => {
+                    rule.0 = RuleType::NodeRule { left, rules: ar }
+                }
                 _ => {}
             }
             *changed = true;
         }
         return;
     }
-    if let RuleType::LeafValueRule { right: NewField::SingleAliasClauseField(_, name) } = &rule.0 {
+    if let RuleType::LeafValueRule {
+        right: NewField::SingleAliasClauseField(_, name),
+    } = &rule.0
+    {
         let name = name.clone();
         if let Some(resolved) = lookup_single_alias(&name, map) {
             if let RuleType::NodeRule { rules: ar, .. } = resolved.0 {
@@ -103,10 +114,18 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)], chang
 /// Walk a `Vec<NewRule>` in place, replacing SingleAliasField entries by
 /// substituting the resolved body and recursing into nested rules.
 fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)], changed: &mut bool) {
-    let needs_rewrite = rules.iter().any(|r| matches!(r.0,
-        RuleType::LeafRule { right: NewField::SingleAliasField(..), .. } |
-        RuleType::LeafValueRule { right: NewField::SingleAliasClauseField(..), .. }
-    ));
+    let needs_rewrite = rules.iter().any(|r| {
+        matches!(
+            r.0,
+            RuleType::LeafRule {
+                right: NewField::SingleAliasField(..),
+                ..
+            } | RuleType::LeafValueRule {
+                right: NewField::SingleAliasClauseField(..),
+                ..
+            }
+        )
+    });
     if !needs_rewrite {
         for rule in rules.iter_mut() {
             inline_single_alias_rule(rule, map, changed);
@@ -240,12 +259,24 @@ fn expand_colour_in_rule(rule: &mut NewRule) {
 }
 
 fn expand_colour_in_list(rules: &mut Vec<NewRule>) {
-    let needs_expand = rules.iter().any(|r| matches!(&r.0,
-        RuleType::LeafRule { right: NewField::MarkerField(Marker::ColourField), .. }
-        | RuleType::LeafRule { left: NewField::MarkerField(Marker::IrCountryTag), .. }
-        | RuleType::LeafRule { right: NewField::MarkerField(Marker::IrCountryTag), .. }
-        | RuleType::NodeRule { left: NewField::MarkerField(Marker::IrCountryTag), .. }
-    ));
+    let needs_expand = rules.iter().any(|r| {
+        matches!(
+            &r.0,
+            RuleType::LeafRule {
+                right: NewField::MarkerField(Marker::ColourField),
+                ..
+            } | RuleType::LeafRule {
+                left: NewField::MarkerField(Marker::IrCountryTag),
+                ..
+            } | RuleType::LeafRule {
+                right: NewField::MarkerField(Marker::IrCountryTag),
+                ..
+            } | RuleType::NodeRule {
+                left: NewField::MarkerField(Marker::IrCountryTag),
+                ..
+            }
+        )
+    });
     if !needs_expand {
         for rule in rules.iter_mut() {
             expand_colour_in_rule(rule);
@@ -433,7 +464,7 @@ fn rewrite_vsm_in_rule(rule: &mut NewRule) {
     }
 }
 
-fn rewrite_vsm_in_list(rules: &mut Vec<NewRule>) {
+fn rewrite_vsm_in_list(rules: &mut [NewRule]) {
     for rule in rules.iter_mut() {
         rewrite_vsm_in_rule(rule);
     }
@@ -481,15 +512,29 @@ fn expand_ignore_in_rule(rule: &mut NewRule) {
     }
 }
 
-fn expand_ignore_in_list(rules: &mut Vec<NewRule>) {
+fn expand_ignore_in_list(rules: &mut [NewRule]) {
     for rule in rules.iter_mut() {
-        if matches!(rule.0, RuleType::LeafRule { right: NewField::IgnoreMarkerField, .. }) {
+        if matches!(
+            rule.0,
+            RuleType::LeafRule {
+                right: NewField::IgnoreMarkerField,
+                ..
+            }
+        ) {
             let left = extract_leaf_left(&rule.0);
             let opts = rule.1.clone();
-            *rule = (RuleType::NodeRule { left: NewField::IgnoreField(Box::new(left)), rules: vec![] }, opts);
+            *rule = (
+                RuleType::NodeRule {
+                    left: NewField::IgnoreField(Box::new(left)),
+                    rules: vec![],
+                },
+                opts,
+            );
         } else {
             match &rule.0 {
-                RuleType::NodeRule { .. } | RuleType::ValueClauseRule { .. } | RuleType::SubtypeRule { .. } => {
+                RuleType::NodeRule { .. }
+                | RuleType::ValueClauseRule { .. }
+                | RuleType::SubtypeRule { .. } => {
                     expand_ignore_in_rule(rule);
                 }
                 _ => {}
@@ -605,7 +650,11 @@ single_alias[every_clause] = {
 alias[effect:every_country] = single_alias_right[every_clause]
 "#;
         let rs = parse_and_post(input);
-        let (_, (rule, _)) = rs.aliases.iter().find(|(n, _)| n == "effect:every_country").unwrap();
+        let (_, (rule, _)) = rs
+            .aliases
+            .iter()
+            .find(|(n, _)| n == "effect:every_country")
+            .unwrap();
         match rule {
             RuleType::NodeRule { rules, .. } => {
                 assert!(
@@ -614,7 +663,10 @@ alias[effect:every_country] = single_alias_right[every_clause]
                     "expected 'limit' rule from inlined every_clause, got {:?}", rules
                 );
             }
-            other => panic!("expected NodeRule after whole-body single_alias inline, got {:?}", other),
+            other => panic!(
+                "expected NodeRule after whole-body single_alias inline, got {:?}",
+                other
+            ),
         }
     }
 

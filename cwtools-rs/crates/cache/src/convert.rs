@@ -36,7 +36,7 @@ pub fn arena_to_cached(
         comments: arena
             .comments
             .iter()
-            .map(|c| comment_to_cached(c))
+            .map(comment_to_cached)
             .collect(),
     }
 }

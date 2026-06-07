@@ -12,7 +12,9 @@ pub mod vanilla_cache;
 
 /// Strip one layer of surrounding double-quotes, if present.
 fn unquote(s: &str) -> &str {
-    s.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(s)
+    s.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(s)
 }
 
 /// Extract a plain string from a leaf value.
@@ -48,6 +50,113 @@ pub struct TypeInstance {
 }
 
 /// Holds all known instances for every type, aggregated across files.
+/// An index of every file path under the game roots (mod + vanilla), used to
+/// check that `filepath` references resolve (CW113). Paths are stored lowercased
+/// and forward-slashed, relative to their root, so lookups are case-insensitive.
+#[derive(Debug, Default)]
+pub struct FileIndex {
+    files: HashSet<String>,
+}
+
+impl FileIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Walk `root` recursively and add every file's path relative to `root`.
+    pub fn add_root(&mut self, root: &std::path::Path) {
+        Self::walk(root, root, &mut self.files);
+    }
+
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut HashSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::walk(root, &path, out);
+            } else if let Ok(rel) = path.strip_prefix(root)
+                && let Some(s) = rel.to_str() {
+                    out.insert(s.replace('\\', "/").to_ascii_lowercase());
+                }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Whether a game-relative path exists (case-insensitive). The argument is
+    /// normalised (lowercased, forward slashes, leading slash stripped).
+    pub fn contains(&self, path: &str) -> bool {
+        let norm = path
+            .trim()
+            .trim_start_matches('/')
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        self.files.contains(&norm)
+    }
+}
+
+/// Project-wide set of defined script-variable names (every `value_set[...]`
+/// definition collected across the mod + base game), used to check that a
+/// `variable_field` reference resolves (CW246). Names are normalised to a
+/// canonical key so a definition like `morale@ROOT` and a read like
+/// `morale@GER` both resolve to `morale`. Empty unless the CLI populated it.
+#[derive(Debug, Default)]
+pub struct VarIndex {
+    names: HashSet<String>,
+}
+
+impl VarIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Canonical lookup key for a raw variable token: lowercased, unquoted, the
+    /// base before any `@`-concatenation, the last `.`-segment of that base, and
+    /// before any `?`/`^` selector. Mirrors F# `getVariableFromString` plus the
+    /// read-side dot-split in `changeScope`.
+    pub fn normalize(raw: &str) -> String {
+        let s = raw.trim().trim_matches('"');
+        let before_amp = s.split('@').next().unwrap_or(s);
+        let last_seg = before_amp.rsplit('.').next().unwrap_or(before_amp);
+        let core = last_seg.split(['?', '^']).next().unwrap_or(last_seg);
+        core.trim().to_ascii_lowercase()
+    }
+
+    pub fn add_name(&mut self, raw: &str) {
+        let n = Self::normalize(raw);
+        if !n.is_empty() {
+            self.names.insert(n);
+        }
+    }
+
+    /// Whether a raw reference resolves to a known defined variable.
+    pub fn contains(&self, raw: &str) -> bool {
+        self.names.contains(&Self::normalize(raw))
+    }
+
+    /// Fold another index's names into this one (e.g. base-game variables into
+    /// the mod's index).
+    pub fn merge(&mut self, other: &VarIndex) {
+        self.names.extend(other.names.iter().cloned());
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
@@ -56,6 +165,12 @@ pub struct TypeIndex {
     /// files). Lets `is_any_instance` be O(1) instead of scanning every instance.
     /// A refcount so `remove_file` can drop a name only when its last definition goes.
     name_counts: HashMap<String, usize>,
+    /// Index of every asset/file path under the game roots, for `filepath`
+    /// reference checks (CW113). Empty unless the CLI populated it.
+    pub file_index: FileIndex,
+    /// Project-wide set of defined variable names, for `variable_field`
+    /// reference checks (CW246). Empty unless the CLI populated it.
+    pub var_index: VarIndex,
 }
 
 impl TypeIndex {
@@ -89,6 +204,21 @@ impl TypeIndex {
         self.map.get(type_name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Every `(type_name, instance)` defined in `file_uri`. Scans the whole
+    /// index (O(total instances)); used by document-symbol/outline, which is
+    /// on-demand and infrequent. Lets `FileInfo` avoid a second per-file copy.
+    pub fn instances_in_file<'a>(&'a self, file_uri: &str) -> Vec<(&'a str, &'a TypeInstance)> {
+        let mut out = Vec::new();
+        for (type_name, entries) in &self.map {
+            for (uri, inst) in entries {
+                if uri == file_uri {
+                    out.push((type_name.as_str(), inst));
+                }
+            }
+        }
+        out
+    }
+
     /// Merge per-file results into the index.
     pub fn merge(&mut self, file_uri: &str, per_type: HashMap<String, Vec<TypeInstance>>) {
         for (type_name, instances) in per_type {
@@ -105,14 +235,13 @@ impl TypeIndex {
         for v in self.map.values_mut() {
             v.retain(|(uri, inst)| {
                 let keep = uri != file_uri;
-                if !keep {
-                    if let Some(count) = self.name_counts.get_mut(&inst.name) {
+                if !keep
+                    && let Some(count) = self.name_counts.get_mut(&inst.name) {
                         *count -= 1;
                         if *count == 0 {
                             self.name_counts.remove(&inst.name);
                         }
                     }
-                }
                 keep
             });
         }
@@ -299,8 +428,8 @@ fn collect_skip_root_child(
     match skip_stack {
         [] => {
             // We are at the instance node.
-            if type_key_filter_matches(td, &key) && starts_with_matches(td, &key) {
-                if let Some(name) =
+            if type_key_filter_matches(td, &key) && starts_with_matches(td, &key)
+                && let Some(name) =
                     instance_name_from_children(td, &key, clause_children, arena, table)
                 {
                     out.push(TypeInstance {
@@ -311,7 +440,6 @@ fn collect_skip_root_child(
                         },
                     });
                 }
-            }
         }
         [head, tail @ ..] => {
             // Must match the skip-root layer; then descend into children.
@@ -420,6 +548,10 @@ pub fn collect_defined_variables(
     result
 }
 
+// `ruleset` / `value_set_namespaces` are threaded for the rule-aware value_set
+// collection that this @-prefix pass doesn't yet implement; kept so the
+// signature is ready and the caller's API stays stable.
+#[allow(clippy::only_used_in_recursion)]
 fn collect_vars_recursive(
     children: &[Child],
     arena: &Arena,
@@ -486,8 +618,12 @@ pub fn collect_defined_variables_from_rules(
     let mut result: HashMap<String, Vec<DefinedVariable>> = HashMap::new();
 
     match at_vars {
-        Some(vars) if !vars.is_empty() => { result.insert("@".to_string(), vars); }
-        _ => { collect_at_vars(&file.root_children, &file.arena, table, &mut result); }
+        Some(vars) if !vars.is_empty() => {
+            result.insert("@".to_string(), vars);
+        }
+        _ => {
+            collect_at_vars(&file.root_children, &file.arena, table, &mut result);
+        }
     }
 
     // Walk type instances (path-filtered) and scan their rules for VariableSetField
@@ -596,9 +732,9 @@ fn scan_node_for_varset(
                         RuleType::LeafRule {
                             right: NewField::VariableSetField(ns),
                             ..
-                        } => {
+                        }
                             // Value is the defined name
-                            if !val.is_empty() {
+                            if !val.is_empty() => {
                                 out.entry(ns.clone()).or_default().push(DefinedVariable {
                                     name: val.clone(),
                                     namespace: Some(ns.clone()),
@@ -608,7 +744,6 @@ fn scan_node_for_varset(
                                     },
                                 });
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -624,6 +759,125 @@ fn scan_node_for_varset(
             _ => {}
         }
     }
+}
+
+/// The set of effect/trigger names that DEFINE a `value_set[variable]` (e.g.
+/// `set_variable`, `set_temp_variable`, `add_to_variable`). An alias qualifies
+/// when its rule body contains a `VariableSetField("variable")`. Config-driven,
+/// so it tracks whatever the game's `.cwt` declares rather than a hardcoded list.
+pub fn variable_defining_effects(ruleset: &RuleSet) -> HashSet<String> {
+    fn is_var_set(f: &NewField) -> bool {
+        matches!(f, NewField::VariableSetField(ns) if ns == "variable")
+    }
+    fn defines(rule: &RuleType) -> bool {
+        match rule {
+            RuleType::LeafRule { left, right } => is_var_set(left) || is_var_set(right),
+            RuleType::LeafValueRule { right } => is_var_set(right),
+            RuleType::NodeRule { left, rules } => {
+                is_var_set(left) || rules.iter().any(|(rt, _)| defines(rt))
+            }
+            RuleType::ValueClauseRule { rules } | RuleType::SubtypeRule { rules, .. } => {
+                rules.iter().any(|(rt, _)| defines(rt))
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    for (name, (rule, _opts)) in &ruleset.aliases {
+        if let Some((cat, key)) = name.split_once(':')
+            && (cat == "effect" || cat == "trigger")
+            && defines(rule)
+        {
+            out.insert(key.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// Scan a file's AST for variable definitions and push each raw name into `out`.
+/// For every block whose key is a variable-defining effect, the defined name is
+/// the value of an explicit `var`/`variable` child, or — in the shorthand form
+/// `set_variable = { my_var = 3 }` — the inner assignment's key. The rule-driven
+/// [`collect_defined_variables_from_rules`] misses these because they live inside
+/// `alias[effect]` expansions the type-rule walk never reaches; this direct scan
+/// does not depend on rule matching.
+pub fn collect_set_variable_names(
+    file: &ParsedFile,
+    table: &StringTable,
+    effects: &HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    fn extract(children: &[Child], arena: &Arena, table: &StringTable, out: &mut Vec<String>) {
+        // Explicit form: a `var`/`variable` child holds the name as its value.
+        let mut explicit = false;
+        for child in children {
+            if let Child::Leaf(li) = child {
+                let leaf = &arena.leaves[*li as usize];
+                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                if key.eq_ignore_ascii_case("var") || key.eq_ignore_ascii_case("variable") {
+                    let v = leaf_value_string(&leaf.value, table);
+                    if !v.is_empty() {
+                        out.push(v);
+                    }
+                    explicit = true;
+                }
+            }
+        }
+        if explicit {
+            return;
+        }
+        // Shorthand form: the inner assignment key is the variable name.
+        for child in children {
+            let key = match child {
+                Child::Leaf(li) => table
+                    .get_string(arena.leaves[*li as usize].key.normal)
+                    .unwrap_or_default(),
+                Child::Node(ni) => table
+                    .get_string(arena.nodes[*ni as usize].key.normal)
+                    .unwrap_or_default(),
+                _ => continue,
+            };
+            if !matches!(
+                key.to_ascii_lowercase().as_str(),
+                "value" | "tooltip" | "var" | "variable" | "amount"
+            ) {
+                out.push(key);
+            }
+        }
+    }
+
+    fn walk(
+        children: &[Child],
+        arena: &Arena,
+        table: &StringTable,
+        effects: &HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        for child in children {
+            match child {
+                Child::Leaf(li) => {
+                    let leaf = &arena.leaves[*li as usize];
+                    if let Value::Clause(ch) = &leaf.value {
+                        let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                        if effects.contains(&key.to_ascii_lowercase()) {
+                            extract(ch, arena, table, out);
+                        }
+                        walk(ch, arena, table, effects, out);
+                    }
+                }
+                Child::Node(ni) => {
+                    let node = &arena.nodes[*ni as usize];
+                    let key = table.get_string(node.key.normal).unwrap_or_default();
+                    if effects.contains(&key.to_ascii_lowercase()) {
+                        extract(&node.children, arena, table, out);
+                    }
+                    walk(&node.children, arena, table, effects, out);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk(&file.root_children, &file.arena, table, effects, out);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -662,8 +916,8 @@ fn collect_event_targets_rec(
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
                 let val = leaf_value_string(&leaf.value, table);
 
-                if key == "save_event_target_as" || key == "save_global_event_target_as" {
-                    if !val.is_empty() {
+                if (key == "save_event_target_as" || key == "save_global_event_target_as")
+                    && !val.is_empty() {
                         out.push(SavedEventTarget {
                             name: val,
                             location: SourceLocation {
@@ -673,7 +927,6 @@ fn collect_event_targets_rec(
                             is_global: key == "save_global_event_target_as",
                         });
                     }
-                }
 
                 if let Value::Clause(ch) = &leaf.value {
                     collect_event_targets_rec(ch, arena, table, out);
@@ -758,7 +1011,9 @@ fn find_element_in_children(
             Child::Node(idx) => {
                 let node = &arena.nodes[*idx as usize];
                 if pos_in_range(target, &node.pos) {
-                    if let Some(inner) = find_element_in_children(&node.children, arena, target, table) {
+                    if let Some(inner) =
+                        find_element_in_children(&node.children, arena, target, table)
+                    {
                         return Some(inner);
                     }
                     let key = table.get_string(node.key.normal).unwrap_or_default();
@@ -770,11 +1025,10 @@ fn find_element_in_children(
                 if pos_in_range(target, &leaf.pos) {
                     let key = table.get_string(leaf.key.normal).unwrap_or_default();
                     let value = leaf_value_string(&leaf.value, table);
-                    if let Value::Clause(ch) = &leaf.value {
-                        if let Some(inner) = find_element_in_children(ch, arena, target, table) {
+                    if let Value::Clause(ch) = &leaf.value
+                        && let Some(inner) = find_element_in_children(ch, arena, target, table) {
                             return Some(inner);
                         }
-                    }
                     return Some(PositionElement::Leaf { key, value });
                 }
             }
@@ -877,13 +1131,12 @@ fn find_pos_in_children(
                     let key = table.get_string(leaf.key.normal).unwrap_or_default();
                     let value = leaf_value_string(&leaf.value, table);
                     // If value is a clause, try to recurse into it
-                    if let Value::Clause(ch) = &leaf.value {
-                        if let Some(inner) =
+                    if let Value::Clause(ch) = &leaf.value
+                        && let Some(inner) =
                             find_pos_in_children(ch, arena, target, table, ruleset, logical_path)
                         {
                             return Some(inner);
                         }
-                    }
                     let hint = classify_leaf_value(&key, &value, ruleset, logical_path, table);
                     return Some(PositionInfo {
                         location: SourceLocation {
@@ -967,52 +1220,48 @@ fn classify_leaf_value(
         };
 
         // Only try path-matching type rules
-        if let cwtools_rules::rules_types::RootRule::TypeRule(..) = root_rule {
-            if let Some(&idx) = ruleset.type_by_name.get(name) {
+        if let cwtools_rules::rules_types::RootRule::TypeRule(..) = root_rule
+            && let Some(&idx) = ruleset.type_by_name.get(name) {
                 let td = &ruleset.types[idx];
                 if !check_path_dir(&td.path_options, logical_path) {
                     continue;
                 }
             }
-        }
 
         for (inner_rule, _) in rules {
-            match inner_rule {
-                RuleType::LeafRule { left, right } => {
-                    let left_matches = match left {
-                        NewField::SpecificField(k) => k.eq_ignore_ascii_case(key),
-                        _ => false,
-                    };
-                    if !left_matches {
-                        continue;
-                    }
-                    match right {
-                        NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)) => {
-                            return ReferenceHint::TypeRef {
-                                type_name: t.clone(),
-                                value: value.to_string(),
-                            };
-                        }
-                        NewField::ValueField(cwtools_rules::rules_types::ValueType::Enum(e)) => {
-                            return ReferenceHint::EnumRef {
-                                enum_name: e.clone(),
-                                value: value.to_string(),
-                            };
-                        }
-                        NewField::LocalisationField { .. } => {
-                            return ReferenceHint::LocRef {
-                                key: value.to_string(),
-                            };
-                        }
-                        NewField::FilepathField { .. } => {
-                            return ReferenceHint::FileRef {
-                                path: value.to_string(),
-                            };
-                        }
-                        _ => {}
-                    }
+            if let RuleType::LeafRule { left, right } = inner_rule {
+                let left_matches = match left {
+                    NewField::SpecificField(k) => k.eq_ignore_ascii_case(key),
+                    _ => false,
+                };
+                if !left_matches {
+                    continue;
                 }
-                _ => {}
+                match right {
+                    NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)) => {
+                        return ReferenceHint::TypeRef {
+                            type_name: t.clone(),
+                            value: value.to_string(),
+                        };
+                    }
+                    NewField::ValueField(cwtools_rules::rules_types::ValueType::Enum(e)) => {
+                        return ReferenceHint::EnumRef {
+                            enum_name: e.clone(),
+                            value: value.to_string(),
+                        };
+                    }
+                    NewField::LocalisationField { .. } => {
+                        return ReferenceHint::LocRef {
+                            key: value.to_string(),
+                        };
+                    }
+                    NewField::FilepathField { .. } => {
+                        return ReferenceHint::FileRef {
+                            path: value.to_string(),
+                        };
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1027,9 +1276,6 @@ fn classify_leaf_value(
 /// Computed data for a single file.
 #[derive(Debug, Clone, Default)]
 pub struct FileInfo {
-    /// Type instances from rule-driven indexing.
-    /// Maps type name → instances defined in this file.
-    pub type_instances: HashMap<String, Vec<TypeInstance>>,
     /// Keys that define types (heuristic, kept for LSP compatibility).
     pub type_definitions: HashMap<String, Vec<SourceLocation>>,
     /// Referenced types (e.g. `<ethos>`).
@@ -1064,6 +1310,12 @@ pub struct InfoService {
     pub all_inline_scripts: HashSet<String>,
 }
 
+impl Default for InfoService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InfoService {
     pub fn new() -> Self {
         Self {
@@ -1074,6 +1326,20 @@ impl InfoService {
             all_variables: HashSet::new(),
             all_inline_scripts: HashSet::new(),
         }
+    }
+
+    /// One-line size summary for profiling (counts only, not bytes).
+    pub fn profile_summary(&self) -> String {
+        let cross_file: usize = self.type_index.map.values().map(|v| v.len()).sum();
+        format!(
+            "info: {} files | type_index {} instances / {} types | {} vars | {} targets | {} type_defs",
+            self.files.len(),
+            cross_file,
+            self.type_index.map.len(),
+            self.all_variables.len(),
+            self.all_event_targets.len(),
+            self.all_type_defs.len(),
+        )
     }
 
     /// Compute info for a single parsed file and merge into global indexes.
@@ -1109,17 +1375,25 @@ impl InfoService {
         }
 
         // ── Rule-driven: type-instance index ─────────────────────────────────
+        // Move the instances straight into the cross-file index. We don't keep a
+        // second per-file copy on `FileInfo` (that doubled ~190K instances on
+        // MD); document-symbol derives a file's instances from the index instead.
         let instances = collect_type_instances(ruleset, ast, logical_path, table);
-        self.type_index.merge(uri, instances.clone());
-        info.type_instances = instances;
+        self.type_index.merge(uri, instances);
 
         // ── Rule-driven: defined variables ────────────────────────────────────
         // Convert the @-vars already collected by index_child_heuristic into
         // DefinedVariable form so collect_defined_variables_from_rules can skip
         // re-scanning the AST for them.
-        let at_vars: Vec<DefinedVariable> = info.defined_variables.iter().map(|(name, loc)| {
-            DefinedVariable { name: name.clone(), namespace: None, location: *loc }
-        }).collect();
+        let at_vars: Vec<DefinedVariable> = info
+            .defined_variables
+            .iter()
+            .map(|(name, loc)| DefinedVariable {
+                name: name.clone(),
+                namespace: None,
+                location: *loc,
+            })
+            .collect();
         info.defined_variables_ns =
             collect_defined_variables_from_rules(ruleset, ast, logical_path, table, Some(at_vars));
         // Flatten non-@-var entries back into the legacy map for compat.
@@ -1323,8 +1597,8 @@ impl InfoService {
                     }
                 }
 
-                if key == "save_event_target_as" || key == "save_global_event_target_as" {
-                    if !value_str.is_empty() {
+                if (key == "save_event_target_as" || key == "save_global_event_target_as")
+                    && !value_str.is_empty() {
                         info.saved_event_targets_detailed.push(SavedEventTarget {
                             name: value_str.clone(),
                             location: SourceLocation {
@@ -1334,10 +1608,9 @@ impl InfoService {
                             is_global: key == "save_global_event_target_as",
                         });
                     }
-                }
 
-                if key == "inline_script" {
-                    if let Value::Clause(children) = &leaf.value {
+                if key == "inline_script"
+                    && let Value::Clause(children) = &leaf.value {
                         for c in children {
                             if let Child::Leaf(script_idx) = c {
                                 let script_leaf = &arena.leaves[*script_idx as usize];
@@ -1358,7 +1631,6 @@ impl InfoService {
                             }
                         }
                     }
-                }
 
                 if key == "effect" || key.ends_with("_effect") {
                     info.effect_blocks.push(SourceLocation {
@@ -1498,7 +1770,7 @@ mod tests {
         let rs = make_ruleset_with_type(td);
 
         let result = collect_type_instances(&rs, &parsed, "events/my_events.txt", &table);
-        assert!(result.get("ethoses").map_or(true, |v| v.is_empty()));
+        assert!(result.get("ethoses").is_none_or(|v| v.is_empty()));
     }
 
     /// skip_root_key = AnyKey: grandchildren are the instances.
@@ -1733,5 +2005,49 @@ effect = {
             ReferenceHint::TypeRef { type_name, .. } => assert_eq!(type_name, "my_ethos"),
             other => panic!("expected TypeRef, got {:?}", other),
         }
+    }
+
+    /// `variable_defining_effects` picks out aliases whose body declares a
+    /// `value_set[variable]`, and `collect_set_variable_names` then extracts the
+    /// defined names from both the explicit (`var = X`) and shorthand
+    /// (`X = value`) forms.
+    #[test]
+    fn test_collect_set_variable_names() {
+        const RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:set_variable] = {
+    var = value_set[variable]
+    value = int_variable_field
+}
+alias[effect:set_temp_variable] = {
+    value_set[variable] = int_variable_field
+}
+"#;
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        let table = StringTable::new();
+        let parsed_cwt = parse_string(RULES, &table).unwrap();
+        let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+
+        let effects = variable_defining_effects(&ruleset);
+        assert!(effects.contains("set_variable"), "got: {:?}", effects);
+        assert!(effects.contains("set_temp_variable"), "got: {:?}", effects);
+
+        let script = "foo = { set_variable = { var = my_explicit value = 3 } set_temp_variable = { my_shorthand = 5 } }";
+        let parsed = parse_string(script, &table).unwrap();
+        let mut names = Vec::new();
+        collect_set_variable_names(&parsed, &table, &effects, &mut names);
+        assert!(
+            names.contains(&"my_explicit".to_string()),
+            "got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"my_shorthand".to_string()),
+            "got: {:?}",
+            names
+        );
+        // The reserved `value` key must not be collected as a variable name.
+        assert!(!names.contains(&"value".to_string()), "got: {:?}", names);
     }
 }

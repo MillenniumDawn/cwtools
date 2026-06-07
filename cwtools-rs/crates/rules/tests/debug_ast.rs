@@ -48,51 +48,45 @@ types = {
                 let leaf = &parsed.arena.leaves[*idx as usize];
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
                 println!("root[{}] Leaf key={}", i, key);
-                match &leaf.value {
-                    cwtools_parser::ast::Value::Clause(children) => {
-                        for (j, c) in children.iter().enumerate() {
-                            match c {
-                                cwtools_parser::ast::Child::Leaf(lidx) => {
-                                    let l = &parsed.arena.leaves[*lidx as usize];
-                                    let k = table.get_string(l.key.normal).unwrap_or_default();
-                                    println!("  clause_child[{}] Leaf key={}", j, k);
-                                    match &l.value {
-                                        cwtools_parser::ast::Value::Clause(cc) => {
-                                            for (m, cc2) in cc.iter().enumerate() {
-                                                match cc2 {
-                                                    cwtools_parser::ast::Child::Leaf(l2idx) => {
-                                                        let l2 =
-                                                            &parsed.arena.leaves[*l2idx as usize];
-                                                        let k2 = table
-                                                            .get_string(l2.key.normal)
-                                                            .unwrap_or_default();
-                                                        println!(
-                                                            "    inner[{}] Leaf key={}",
-                                                            m, k2
-                                                        );
-                                                    }
-                                                    cwtools_parser::ast::Child::Node(nidx) => {
-                                                        let n = &parsed.arena.nodes[*nidx as usize];
-                                                        let nk = table
-                                                            .get_string(n.key.normal)
-                                                            .unwrap_or_default();
-                                                        println!(
-                                                            "    inner[{}] Node key={}",
-                                                            m, nk
-                                                        );
-                                                    }
-                                                    _ => {}
-                                                }
+                if let cwtools_parser::ast::Value::Clause(children) = &leaf.value {
+                    for (j, c) in children.iter().enumerate() {
+                        match c {
+                            cwtools_parser::ast::Child::Leaf(lidx) => {
+                                let l = &parsed.arena.leaves[*lidx as usize];
+                                let k = table.get_string(l.key.normal).unwrap_or_default();
+                                println!("  clause_child[{}] Leaf key={}", j, k);
+                                if let cwtools_parser::ast::Value::Clause(cc) = &l.value {
+                                    for (m, cc2) in cc.iter().enumerate() {
+                                        match cc2 {
+                                            cwtools_parser::ast::Child::Leaf(l2idx) => {
+                                                let l2 =
+                                                    &parsed.arena.leaves[*l2idx as usize];
+                                                let k2 = table
+                                                    .get_string(l2.key.normal)
+                                                    .unwrap_or_default();
+                                                println!(
+                                                    "    inner[{}] Leaf key={}",
+                                                    m, k2
+                                                );
                                             }
+                                            cwtools_parser::ast::Child::Node(nidx) => {
+                                                let n = &parsed.arena.nodes[*nidx as usize];
+                                                let nk = table
+                                                    .get_string(n.key.normal)
+                                                    .unwrap_or_default();
+                                                println!(
+                                                    "    inner[{}] Node key={}",
+                                                    m, nk
+                                                );
+                                            }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
-                                _ => println!("  clause_child[{}] other", j),
                             }
+                            _ => println!("  clause_child[{}] other", j),
                         }
                     }
-                    _ => {}
                 }
             }
             _ => println!("root[{}] other", i),

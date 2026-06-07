@@ -58,26 +58,49 @@ fn cp1252_byte(b: u8) -> char {
     }
 }
 
+/// How a file was encoded on disk, detected while reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileEncoding {
+    /// Valid UTF-8 starting with the UTF-8 BOM (`EF BB BF`). What Paradox wants
+    /// for localisation files.
+    Utf8Bom,
+    /// Valid UTF-8 but with no BOM.
+    Utf8NoBom,
+    /// Not valid UTF-8 (decoded via Windows-1252 fallback).
+    NonUtf8,
+}
+
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
 /// Read a file as text: try UTF-8 first, fall back to Windows-1252.
 ///
 /// Pre-Jomini games (CK2, EU4, VIC2, HOI4 old mods) often encode files in
 /// Windows-1252.  Blindly using `read_to_string` fails on any accented byte
 /// outside ASCII (e.g. `é` = 0xE9).  This helper avoids that breakage.
 pub fn read_text(path: &Path) -> Result<String, FileError> {
+    read_text_with_encoding(path).map(|(s, _)| s)
+}
+
+/// As [`read_text`], but also reports how the file was encoded so callers can
+/// enforce encoding rules (e.g. localisation must be UTF-8 BOM).
+pub fn read_text_with_encoding(path: &Path) -> Result<(String, FileEncoding), FileError> {
     let bytes = std::fs::read(path)?;
-    // Fast path: valid UTF-8 (includes pure ASCII)
+    let has_bom = bytes.starts_with(&UTF8_BOM);
+    // Fast path: valid UTF-8 (includes pure ASCII). The BOM, when present, is
+    // valid UTF-8 (U+FEFF) and is kept in the string — existing parsers already
+    // tolerate a leading BOM character.
     if let Ok(s) = std::str::from_utf8(&bytes) {
-        return Ok(s.to_owned());
+        let enc = if has_bom {
+            FileEncoding::Utf8Bom
+        } else {
+            FileEncoding::Utf8NoBom
+        };
+        return Ok((s.to_owned(), enc));
     }
-    // Strip UTF-8 BOM if present (still try to decode as CP-1252 below if the
-    // rest is not valid UTF-8, but this never happens in practice).
-    let bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        &bytes[3..]
-    } else {
-        &bytes
-    };
-    // Decode as Windows-1252
-    Ok(bytes.iter().map(|&b| cp1252_byte(b)).collect())
+    // Not valid UTF-8: strip a leading BOM if any, then decode as Windows-1252.
+    let body = if has_bom { &bytes[3..] } else { &bytes[..] };
+    let text = body.iter().map(|&b| cp1252_byte(b)).collect();
+    Ok((text, FileEncoding::NonUtf8))
 }
 
 /// How the file should be treated during discovery.
@@ -151,10 +174,15 @@ pub struct FileManagerConfig {
     pub include_dirs: Vec<String>,
     /// Glob patterns for files (e.g., "*.txt").
     pub file_patterns: Vec<String>,
-    /// Patterns to exclude (filename-level).
+    /// Filename patterns to exclude. Matched with the same `glob_match`
+    /// semantics as `file_patterns` (supports `*` and `?`).
     pub exclude_patterns: Vec<String>,
-    /// Directory names to skip entirely.
+    /// Directory names to skip entirely (exact, case-insensitive).
     pub exclude_dirs: Vec<String>,
+    /// Directory glob patterns to skip entirely. Like `exclude_dirs` but each
+    /// entry is a glob (`*`, `?`) matched against the directory's basename.
+    /// Layers on top of `exclude_dirs` — both lists are checked.
+    pub exclude_dir_patterns: Vec<String>,
     /// Skip files larger than this (bytes). 0 = no limit.
     pub max_file_size: u64,
 }
@@ -182,7 +210,17 @@ impl Default for FileManagerConfig {
                 "*.asset".into(),
                 "*.map".into(),
             ],
-            exclude_patterns: vec![],
+            exclude_patterns: vec![
+                // Free-form text/markdown files that aren't Paradox script —
+                // matching `*.txt` would otherwise send them through the full
+                // validator. Users can opt back in by clearing the list.
+                "Changelog.txt".into(),
+                "README.txt".into(),
+                "LICENSE.txt".into(),
+                "README.md".into(),
+                "LICENSE.md".into(),
+                "*.md".into(),
+            ],
             exclude_dirs: vec![
                 ".git".into(),
                 "target".into(),
@@ -197,6 +235,7 @@ impl Default for FileManagerConfig {
                 // developer scratch area in many mods, not loaded by the game
                 "resources".into(),
             ],
+            exclude_dir_patterns: vec![],
             max_file_size: 2 * 1024 * 1024, // 2 MB
         }
     }
@@ -225,7 +264,13 @@ impl FileManager {
     /// Discover and parse all matching script files under the configured root.
     /// Non-script files (localisation, resources) are silently skipped.
     pub fn discover_and_parse(&mut self) -> Result<Vec<ParsedFile>, FileError> {
-        let mut files = Vec::new();
+        use rayon::prelude::*;
+
+        // Walk the tree to collect the candidate (path, logical_path) list first
+        // (cheap, ordered), then read+parse them in parallel. Parsing is the
+        // expensive part and is independent per file. `into_par_iter().collect()`
+        // preserves the input order, so discovery output is deterministic.
+        let mut paths: Vec<(PathBuf, String)> = Vec::new();
         let include_dirs: Vec<String> = self.config.include_dirs.clone();
         let root = self.config.root.clone();
 
@@ -238,13 +283,37 @@ impl FileManager {
             if !dir.exists() {
                 continue;
             }
-            self.walk_dir(&dir, &mut files)?;
+            self.collect_paths(&dir, &mut paths)?;
         }
+
+        let table = &self.string_table;
+        let files = paths
+            .into_par_iter()
+            .filter_map(|(path, logical_path)| {
+                let content = read_text(&path).ok()?;
+                match parse_string(&content, table) {
+                    Ok(parsed) => Some(ParsedFile {
+                        path,
+                        logical_path,
+                        arena: parsed.arena,
+                        root_children: parsed.root_children,
+                    }),
+                    Err(e) => {
+                        // Non-fatal: skip files that fail to parse and continue
+                        eprintln!("warn: skipping {}: {}", path.display(), e);
+                        None
+                    }
+                }
+            })
+            .collect();
 
         Ok(files)
     }
 
-    fn walk_dir(&mut self, dir: &Path, out: &mut Vec<ParsedFile>) -> Result<(), FileError> {
+    /// Walk `dir` collecting (path, logical_path) for every file that passes the
+    /// extension/pattern/size filters. Reading and parsing happen later, in
+    /// parallel; this pass is just filesystem traversal.
+    fn collect_paths(&self, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), FileError> {
         let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect();
         // Sort for deterministic ordering
         entries.sort_by_key(|e| e.as_ref().map(|e| e.file_name()).unwrap_or_default());
@@ -263,7 +332,15 @@ impl FileManager {
                 {
                     continue;
                 }
-                self.walk_dir(&path, out)?;
+                if self
+                    .config
+                    .exclude_dir_patterns
+                    .iter()
+                    .any(|pat| glob_match(pat, dir_name))
+                {
+                    continue;
+                }
+                self.collect_paths(&path, out)?;
                 continue;
             }
 
@@ -299,33 +376,15 @@ impl FileManager {
             }
 
             // Size guard
-            if self.config.max_file_size > 0 {
-                if let Ok(meta) = path.metadata() {
-                    if meta.len() > self.config.max_file_size {
+            if self.config.max_file_size > 0
+                && let Ok(meta) = path.metadata()
+                    && meta.len() > self.config.max_file_size {
                         continue;
                     }
-                }
-            }
 
             // Compute logical path relative to root
             let logical_path = compute_logical_path(&path, &self.config.root);
-
-            // Parse file (UTF-8 with CP-1252 fallback)
-            let content = read_text(&path)?;
-            match parse_string(&content, &self.string_table) {
-                Ok(parsed) => {
-                    out.push(ParsedFile {
-                        path,
-                        logical_path,
-                        arena: parsed.arena,
-                        root_children: parsed.root_children,
-                    });
-                }
-                Err(e) => {
-                    // Non-fatal: skip files that fail to parse and continue
-                    eprintln!("warn: skipping {}: {}", path.display(), e);
-                }
-            }
+            out.push((path, logical_path));
         }
         Ok(())
     }
@@ -445,27 +504,21 @@ pub fn expand_multiple_mods(workspace: &Path) -> Vec<ResolvedMod> {
                 .extension()
                 .map(|e| e.eq_ignore_ascii_case("mod"))
                 .unwrap_or(false)
-            {
-                match parse_mod_descriptor(&path) {
-                    Ok(desc) => {
-                        if let Some(mod_path) = &desc.path {
-                            // `path` can be relative (to the workspace) or absolute
-                            let root = if std::path::Path::new(mod_path).is_absolute() {
-                                PathBuf::from(mod_path)
-                            } else {
-                                workspace.join(mod_path)
-                            };
-                            if root.is_dir() {
-                                out.push(ResolvedMod {
-                                    descriptor: desc,
-                                    root,
-                                });
-                            }
+                && let Ok(desc) = parse_mod_descriptor(&path)
+                    && let Some(mod_path) = &desc.path {
+                        // `path` can be relative (to the workspace) or absolute
+                        let root = if std::path::Path::new(mod_path).is_absolute() {
+                            PathBuf::from(mod_path)
+                        } else {
+                            workspace.join(mod_path)
+                        };
+                        if root.is_dir() {
+                            out.push(ResolvedMod {
+                                descriptor: desc,
+                                root,
+                            });
                         }
                     }
-                    Err(_) => {}
-                }
-            }
         }
     }
 
@@ -694,6 +747,63 @@ mod tests {
         assert!(!glob_match("foo*", "barfoo"));
         assert!(glob_match("f?o.txt", "foo.txt"));
         assert!(!glob_match("f?o.txt", "fooo.txt"));
+    }
+
+    #[test]
+    fn default_excludes_skip_changelog_and_markdown() {
+        let cfg = FileManagerConfig::default();
+        assert!(cfg.exclude_patterns.iter().any(|p| p == "Changelog.txt"));
+        assert!(cfg.exclude_patterns.iter().any(|p| p == "*.md"));
+    }
+
+    #[test]
+    fn exclude_dir_patterns_skips_matching_dirs() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+
+        // Layout:
+        //   root/common/foo.txt          (include)
+        //   root/temp/skipme.txt         (skip: dir matches "temp")
+        //   root/template/keepme.txt     (include: dir does NOT match "temp")
+        //   root/notes/Changelog.txt     (skip: filename matches)
+        for rel in [
+            "common/foo.txt",
+            "temp/skipme.txt",
+            "template/keepme.txt",
+            "notes/Changelog.txt",
+        ] {
+            if let Some(parent) = std::path::Path::new(rel).parent() {
+                fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            fs::write(root.join(rel), "").unwrap();
+        }
+
+        let cfg = FileManagerConfig {
+            root: root.to_path_buf(),
+            include_dirs: vec![".".into()],
+            exclude_dir_patterns: vec!["temp".into()],
+            ..Default::default()
+        };
+
+        let fm = FileManager::new(cfg);
+        let mut paths = Vec::new();
+        fm.collect_paths(root, &mut paths).unwrap();
+        let names: Vec<String> = paths.iter().map(|(_, lp)| lp.clone()).collect();
+
+        assert!(names.iter().any(|n| n.ends_with("common/foo.txt")));
+        assert!(
+            names.iter().any(|n| n.ends_with("template/keepme.txt")),
+            "template/ should NOT match the exact 'temp' pattern"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("temp/skipme.txt")),
+            "temp/ should be skipped by exclude_dir_patterns"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("notes/Changelog.txt")),
+            "Changelog.txt should be skipped by default exclude_patterns"
+        );
     }
 
     #[test]
