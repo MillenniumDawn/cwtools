@@ -15,13 +15,16 @@ shelling out to `CWToolsCLI.dll` via `dotnet`. So "delete F#" is gated on:
 
 Until that, keep the F# build working but stop investing in it.
 
-## Delete (superseded, nothing depends on them) — DONE
+## Delete (superseded, nothing depends on them)
 
 - ~~**`.vscode_ext_extension.ts`, `.vscode_ext_executable.ts`** (repo root)~~ — stale
-  TypeScript templates. Were already gitignored (never tracked); removed locally.
-- ~~**`CWToolsCSTests/`**~~ — old C# tests against the F# library. Deleted; no .sln,
-  no ProjectReference, no CI step referenced them.
-- ~~**`CWToolsDocs/`**~~ — F# API docs, superseded by `cwtools-rs/docs/`. Deleted.
+  TypeScript templates. Were already gitignored (never tracked); removed. DONE.
+
+`CWToolsCSTests/` and `CWToolsDocs/` were briefly in this tier and deleted, then
+restored: both are still members of `cwtools.slnx` and `build/Program.fs` (so the
+solution build needs them), and `CWToolsDocs/testconfig/cwtools-ir-config` is live
+test data for the Rust `load_ruleset_dir` test. "Dead once F# goes" is not "dead
+now" — they moved to the keep tier below.
 
 ## Move / reconcile
 
@@ -45,10 +48,17 @@ Until that, keep the F# build working but stop investing in it.
 - **`CWToolsPerformanceCLI/`** (6) — F# perf harness. The Rust side now has its
   own profiling (`cwtools-rs/crates/profiling`, `CWTOOLS_PROFILE=1`), so this is
   redundant once F# is gone.
+- **`CWToolsCSTests/`** — C# tests in `cwtools.slnx` + `build/Program.fs`. Delete
+  with the F# stack, not before.
+- **`CWToolsDocs/`** — F# API-doc generator, in `cwtools.slnx` + `build/Program.fs`.
+  Its `testconfig/cwtools-ir-config/` is also the fixture for the Rust
+  `load_ruleset_dir` test, so the testconfig outlives the F# generator even after #6.
 
 ## Suggested order
 
-1. Delete the three "Delete" items now (zero risk).
+1. The stale `.vscode_ext_*.ts` templates are gone (zero risk). Before deleting any
+   F#/C# project, grep `cwtools.slnx` and `build/Program.fs` first — solution
+   membership was missed once and `CWToolsCSTests/`/`CWToolsDocs/` had to be restored.
 2. Resolve the root `.cwt` files into the config repo or remove them.
 3. Drive Rust parity (the open `enhancement` issues) until the `fsharp` engine is
    no longer needed.
