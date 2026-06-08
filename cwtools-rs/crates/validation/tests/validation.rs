@@ -363,6 +363,74 @@ my_strat = {
 }
 
 #[test]
+fn test_alias_value_mismatch_is_cw267() {
+    // An alias with only a block overload, used as a scalar value, doesn't match
+    // any overload. The surfaced diagnostic must be CW267 (not CW240) and carry
+    // the real source position of the offending leaf, not 0,0.
+    let cwt = r#"
+types = {
+    type[ai_strategy] = {
+        path = "game/common/ai_strategy"
+    }
+}
+
+ai_strategy = {
+    alias_name[ai_strategy_rule] = alias_match_left[ai_strategy_rule]
+}
+
+alias[ai_strategy_rule:ai_strategy] = {
+    id = scalar
+    value = int
+}
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+
+    // `ai_strategy` is a block-only overload, but it's used as a bare scalar.
+    let script = r#"my_strat = {
+    ai_strategy = oops
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errors = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/common/ai_strategy/test.txt",
+        Some(cwtools_game::constants::Game::Hoi4),
+        None,
+        None,
+    );
+    let cw267: Vec<_> = errors
+        .iter()
+        .filter(|e| e.code.as_deref() == Some("CW267"))
+        .collect();
+    assert!(
+        !cw267.is_empty(),
+        "Expected a CW267 alias mismatch, got: {:?}",
+        errors
+    );
+    assert!(
+        errors.iter().all(|e| e.code.as_deref() != Some("CW240")),
+        "CW240 must not be emitted for an alias shape mismatch, got: {:?}",
+        errors
+    );
+    let err = cw267[0];
+    assert!(
+        err.line > 0,
+        "CW267 must carry a real source line, got line {} col {}",
+        err.line,
+        err.col
+    );
+    assert!(
+        err.message.contains("ai_strategy_rule") && err.message.contains("oops"),
+        "CW267 message should name the alias category and offending value, got: {:?}",
+        err.message
+    );
+}
+
+#[test]
 fn test_enum_keyed_rule_matches_key() {
     // Regression: a rule keyed by `enum[x] = value` must match keys that are
     // members of enum x (HOI4 `research = { enum[tech_category] = float }`).

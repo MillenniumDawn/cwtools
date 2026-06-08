@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/profiling",
+    "crates/error_codes",
     "crates/string_table",
     "crates/parser",
     "crates/file_manager",
@@ -23,6 +24,7 @@ repository = "https://github.com/MillenniumDawn/cwtools"
 
 [workspace.dependencies]
 cwtools_profiling = { path = "crates/profiling" }
+cwtools_error_codes = { path = "crates/error_codes" }
 cwtools_string_table = { path = "crates/string_table" }
 cwtools_parser = { path = "crates/parser" }
 cwtools_file_manager = { path = "crates/file_manager" }

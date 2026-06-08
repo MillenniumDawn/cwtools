@@ -11,15 +11,16 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
 use cwtools_info::TypeIndex;
 use cwtools_info::{
-    PositionElement, ReferenceHint, TypeInstance, collect_type_instances, element_at_position,
-    info_at_position,
+    PositionElement, ReferenceHint, TypeInstance, element_at_position, info_at_position,
 };
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType, ValueType};
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::{ValidationError, validate_ast_with_loc};
+use cwtools_validation::{
+    ValidationError, build_enum_map, build_scope_registry_arc, validate_ast_with_loc_prebuilt,
+};
 
 mod symbols;
 mod workspace_cache;
@@ -101,20 +102,10 @@ fn index_vanilla_dir(
         ..Default::default()
     };
     let mut mgr = FileManager::with_string_table(config, table.clone());
-    let mut index = TypeIndex::new();
-    if let Ok(files) = mgr.discover_and_parse() {
-        for file in files {
-            let path = file.path.clone();
-            let logical = file.logical_path.clone();
-            let pf = ParsedFile {
-                arena: file.arena,
-                root_children: file.root_children,
-                errors: vec![],
-            };
-            let instances = collect_type_instances(ruleset, &pf, &logical, table);
-            index.merge(path.to_str().unwrap_or(""), instances);
-        }
-    }
+    let index = match mgr.discover_and_parse() {
+        Ok(files) => cwtools_info::index_discovered_files(files, ruleset, table, None),
+        Err(_) => TypeIndex::new(),
+    };
     // Drop the per-instance file_uri; the merge slot only needs the instances.
     index
         .map
@@ -221,8 +212,11 @@ struct DocumentState {
     language: Mutex<String>,
     /// symbol index for goto-definition and references
     symbol_index: Mutex<symbols::SymbolIndex>,
-    /// computed info service for type/references/definitions
-    info_service: Mutex<cwtools_info::InfoService>,
+    /// computed info service for type/references/definitions. `RwLock` so the
+    /// full-workspace pass-2 validation can share a single read guard across
+    /// rayon threads, and the many read-only consumers (hover, completion,
+    /// document-symbol, export fingerprinting, validation) don't serialize.
+    info_service: parking_lot::RwLock<cwtools_info::InfoService>,
     /// workspace folder URI captured from initialize params
     workspace_uri: Mutex<Option<String>>,
     /// pre-generated base-game type instances (from a vanilla cache OR a live
@@ -262,6 +256,13 @@ struct DocumentState {
     /// from `ignoreDirectories` in `initializationOptions` and
     /// `workspace/didChangeConfiguration`.
     ignore_dir_patterns: parking_lot::RwLock<Vec<String>>,
+    /// Per open document, the set of lowercased identifier-like tokens it
+    /// mentions (keys + string values from its parsed AST). Used by the
+    /// dependent sweep to revalidate only the open docs that actually reference a
+    /// changed export, instead of every open doc. A SOUND OVER-APPROXIMATION:
+    /// when a doc's token set is missing, it's always included. Updated on
+    /// did_open / did_change, removed on did_close.
+    doc_tokens: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
 }
 
 struct ParsedDoc {
@@ -280,7 +281,7 @@ impl DocumentState {
             string_table: StringTable::new(),
             language: Mutex::new("paradox".to_string()),
             symbol_index: Mutex::new(symbols::SymbolIndex::new()),
-            info_service: Mutex::new(cwtools_info::InfoService::new()),
+            info_service: parking_lot::RwLock::new(cwtools_info::InfoService::new()),
             workspace_uri: Mutex::new(None),
             vanilla_index: Mutex::new(None),
             vanilla_dir: Mutex::new(None),
@@ -291,6 +292,7 @@ impl DocumentState {
             edit_generation: AtomicU64::new(0),
             ignore_file_patterns: parking_lot::RwLock::new(Vec::new()),
             ignore_dir_patterns: parking_lot::RwLock::new(Vec::new()),
+            doc_tokens: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 }
@@ -1368,13 +1370,15 @@ impl LanguageServer for Backend {
         let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
 
         {
+            let ast = parsed.map(Arc::new);
+            self.update_doc_tokens(&uri, ast.as_ref());
             let mut docs = self.state.documents.lock();
             docs.insert(
                 uri.clone(),
                 ParsedDoc {
                     version,
                     text: text.clone(),
-                    ast: parsed.map(Arc::new),
+                    ast,
                 },
             );
         }
@@ -1449,9 +1453,10 @@ impl LanguageServer for Backend {
             index.clear_document(&uri);
         }
         {
-            let mut info = self.state.info_service.lock();
+            let mut info = self.state.info_service.write();
             info.clear_file(&uri);
         }
+        self.state.doc_tokens.write().remove(&uri);
         cwtools_profiling::trim_memory();
         cwtools_profiling::log_rss("did_close");
         self.client
@@ -1558,7 +1563,7 @@ impl LanguageServer for Backend {
 
         // .yml localisation file — offer loc-key / data-function completions.
         if uri.ends_with(".yml") || uri.ends_with(".yaml") {
-            let info_guard = self.state.info_service.lock();
+            let info_guard = self.state.info_service.read();
             let items = loc_completions(&info_guard, &language);
             if !items.is_empty() {
                 return Ok(Some(CompletionResponse::Array(items)));
@@ -1568,7 +1573,7 @@ impl LanguageServer for Backend {
         let context_items: Vec<CompletionItem> = {
             let docs = self.state.documents.lock();
             let ruleset_guard = self.state.ruleset.lock();
-            let info_guard = self.state.info_service.lock();
+            let info_guard = self.state.info_service.read();
 
             if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
                 if let Some(ast) = &doc.ast {
@@ -1619,7 +1624,7 @@ impl LanguageServer for Backend {
         }
         drop(ruleset);
 
-        let info = self.state.info_service.lock();
+        let info = self.state.info_service.read();
         for var in &info.all_variables {
             items.push(CompletionItem {
                 label: var.clone(),
@@ -1697,7 +1702,7 @@ impl LanguageServer for Backend {
 
         if let Some((type_name, instance_name)) = type_ref {
             // Look up in the TypeIndex
-            let info = self.state.info_service.lock();
+            let info = self.state.info_service.read();
             let instances = info.type_index.instances(&type_name);
             let found: Vec<Location> = instances
                 .iter()
@@ -1740,7 +1745,7 @@ impl LanguageServer for Backend {
                         PositionElement::LeafValue { value } => value.clone(),
                     };
                     drop(docs);
-                    let info = self.state.info_service.lock();
+                    let info = self.state.info_service.read();
                     if let Some(defs) = info.find_definitions(&symbol) {
                         let locations: Vec<Location> = defs
                             .iter()
@@ -1813,7 +1818,7 @@ impl LanguageServer for Backend {
 
             // 1. Definition location(s) from TypeIndex.
             {
-                let info = self.state.info_service.lock();
+                let info = self.state.info_service.read();
                 let instances = info.type_index.instances(&type_name);
                 for (file_uri, inst) in instances
                     .iter()
@@ -1893,7 +1898,7 @@ impl LanguageServer for Backend {
                         PositionElement::LeafValue { value } => value.clone(),
                     };
                     drop(docs);
-                    let info = self.state.info_service.lock();
+                    let info = self.state.info_service.read();
                     let mut all_locs = Vec::new();
                     if let Some(defs) = info.find_definitions(&symbol) {
                         all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
@@ -1961,7 +1966,7 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri.to_string();
-        let info = self.state.info_service.lock();
+        let info = self.state.info_service.read();
 
         // Emit type instances as document symbols (one per named instance),
         // derived from the cross-file index — `FileInfo` no longer keeps a
@@ -2035,7 +2040,7 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
-        let info = self.state.info_service.lock();
+        let info = self.state.info_service.read();
         let mut symbols: Vec<SymbolInformation> = Vec::new();
 
         for (type_name, instances) in &info.type_index.map {
@@ -2175,7 +2180,7 @@ impl LanguageServer for Backend {
         let mut all_locs: Vec<(String, cwtools_info::SourceLocation, usize)> = Vec::new();
 
         {
-            let info = self.state.info_service.lock();
+            let info = self.state.info_service.read();
             let instances = info.type_index.instances(&type_name);
             for (file_uri, inst) in instances.iter().filter(|(_, i)| i.name == instance_name) {
                 all_locs.push((file_uri.clone(), inst.location, instance_name.len()));
@@ -2498,7 +2503,7 @@ impl Backend {
         {
             let vanilla_guard = self.state.vanilla_index.lock();
             if let Some(per_type) = vanilla_guard.as_ref() {
-                let mut info_guard = self.state.info_service.lock();
+                let mut info_guard = self.state.info_service.write();
                 info_guard.type_index.remove_file("<vanilla-cache>");
                 info_guard
                     .type_index
@@ -2536,16 +2541,74 @@ impl Backend {
         // Snapshot modifier_keys once before the loop; the set doesn't change
         // during validation and we can't hold the guard across await points.
         let modifier_keys_snap: HashSet<String> = self.state.modifier_keys.read().clone();
-        for (i, (file_path, parsed_opt)) in
-            files_to_validate.iter().zip(parsed_files.iter()).enumerate()
-        {
-            // Skip files that failed to parse in pass 1 (matches the previous
-            // `continue` on parse error in the re-parse path).
-            let Some(parsed) = parsed_opt else {
-                continue;
-            };
-            let uri = format!("file://{}", file_path.display());
-            let diagnostics = self.validate_parsed(&uri, parsed, &modifier_keys_snap);
+        // Build the scope registry + enum_map ONCE for the whole scan instead of
+        // once per file: they depend only on (ruleset, game) and are the
+        // expensive part of per-file setup (many inserts + lowercasing +
+        // per-iterator `format!`). Both are reused across the rayon section.
+        let scan_game = {
+            let language = self.state.language.lock().clone();
+            cwtools_game::constants::Game::from_str(&language)
+        };
+        // Own an `Arc<RuleSet>` clone for the whole batch so the `enum_map`
+        // (which borrows the ruleset) stays valid across the parallel section
+        // without holding the ruleset mutex across rayon work.
+        let scan_ruleset: Option<Arc<RuleSet>> = {
+            let ruleset_guard = self.state.ruleset.lock();
+            ruleset_guard.as_ref().map(|rs| Arc::new(rs.clone()))
+        };
+        let scan_registry = scan_ruleset
+            .as_ref()
+            .map(|rs| build_scope_registry_arc(rs, scan_game));
+
+        // Validate every file in parallel, then publish serially. The
+        // CPU-bound validation runs under a single shared `info_service` /
+        // `loc_index` read guard (both `&...` references are `Sync`), with no
+        // async and no client calls inside the rayon section. Publishing is
+        // async and stays out of the parallel block.
+        use rayon::prelude::*;
+        let results: Vec<(String, Vec<Diagnostic>)> = {
+            let info_guard = self.state.info_service.read();
+            let loc_guard = self.state.loc_index.read();
+            let type_index = &info_guard.type_index;
+            let loc_index = loc_guard.as_ref();
+            let registry = scan_registry.as_ref().and_then(|r| r.as_ref());
+            // Build enum_map once for the batch; it borrows `scan_ruleset`,
+            // which is owned for the whole parallel section above.
+            let enum_map = scan_ruleset.as_ref().map(|rs| build_enum_map(rs));
+
+            files_to_validate
+                .par_iter()
+                .zip(parsed_files.par_iter())
+                .filter_map(|(file_path, parsed_opt)| {
+                    // Skip files that failed to parse in pass 1.
+                    let parsed = parsed_opt.as_ref()?;
+                    let uri = format!("file://{}", file_path.display());
+                    let diagnostics = match (scan_ruleset.as_ref(), enum_map.as_ref()) {
+                        (Some(ruleset), Some(enum_map)) => validate_parsed_with_indexes(
+                            &uri,
+                            parsed,
+                            &modifier_keys_snap,
+                            ruleset,
+                            scan_game,
+                            registry,
+                            enum_map,
+                            type_index,
+                            loc_index,
+                            &self.state.string_table,
+                        ),
+                        _ => parsed
+                            .errors
+                            .iter()
+                            .map(parse_error_to_diagnostic)
+                            .collect(),
+                    };
+                    Some((uri, diagnostics))
+                })
+                .collect()
+            // info_guard / loc_guard dropped here, before any await.
+        };
+
+        for (i, (uri, diagnostics)) in results.into_iter().enumerate() {
             total_errors += diagnostics
                 .iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -2599,7 +2662,7 @@ impl Backend {
 
         if cwtools_profiling::profile_enabled() {
             let st = self.state.string_table.stats();
-            let info_summary = self.state.info_service.lock().profile_summary();
+            let info_summary = self.state.info_service.read().profile_summary();
             let vanilla = self
                 .state
                 .vanilla_index
@@ -2701,6 +2764,21 @@ impl Backend {
         Some(parsed)
     }
 
+    /// Refresh the per-document token set used to scope the dependent sweep.
+    /// `ast = None` (e.g. a file that failed to parse) clears the set, so the
+    /// sweep treats the doc as "unknown" and always includes it.
+    fn update_doc_tokens(&self, uri: &str, ast: Option<&Arc<ParsedFile>>) {
+        let mut tokens = self.state.doc_tokens.write();
+        match ast {
+            Some(ast) => {
+                tokens.insert(uri.to_string(), collect_doc_tokens(ast, &self.state.string_table));
+            }
+            None => {
+                tokens.remove(uri);
+            }
+        }
+    }
+
     /// Index an already-parsed AST into the symbol + info indexes. Extracted
     /// from `index_document` so the workspace scan can index cache-hit ASTs
     /// without re-parsing.
@@ -2713,7 +2791,7 @@ impl Backend {
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(uri, &ws_uri);
         let ruleset_guard = self.state.ruleset.lock();
-        let mut info = self.state.info_service.lock();
+        let mut info = self.state.info_service.write();
         info.clear_file(uri);
         if let Some(ruleset) = ruleset_guard.as_ref() {
             info.index_file_with_path(
@@ -2735,48 +2813,61 @@ impl Backend {
         parsed: &ParsedFile,
         modifier_keys: &std::collections::HashSet<String>,
     ) -> Vec<Diagnostic> {
-        let mut diagnostics: Vec<Diagnostic> = parsed
-            .errors
-            .iter()
-            .map(parse_error_to_diagnostic)
-            .collect();
         let ruleset_guard = self.state.ruleset.lock();
-        if let Some(ruleset) = ruleset_guard.as_ref() {
-            let language = self.state.language.lock().clone();
-            let game = cwtools_game::constants::Game::from_str(&language);
-            let info_guard = self.state.info_service.lock();
-            let type_index = &info_guard.type_index;
-            let loc_guard = self.state.loc_index.read();
-            let mut errs = validate_ast_with_loc(
-                parsed,
-                ruleset,
-                &self.state.string_table,
-                uri,
-                game,
-                Some(type_index),
-                Some(modifier_keys),
-                loc_guard.as_ref(),
-            );
-            drop(loc_guard);
-            drop(info_guard);
-            const MAX_ERRORS: usize = 100;
-            let total = errs.len();
-            if total > MAX_ERRORS {
-                errs.truncate(MAX_ERRORS);
-                errs.push(cwtools_validation::ValidationError {
-                    message: format!("... {} additional errors truncated", total - MAX_ERRORS),
-                    severity: cwtools_validation::ErrorSeverity::Information,
-                    line: 0,
-                    col: 0,
-                    file: uri.to_string(),
-                    code: None,
-                });
-            }
-            for err in &errs {
-                diagnostics.push(validation_error_to_diagnostic(err));
-            }
-        }
-        diagnostics
+        let Some(ruleset) = ruleset_guard.as_ref() else {
+            // No ruleset: only the parse errors apply.
+            return parsed
+                .errors
+                .iter()
+                .map(parse_error_to_diagnostic)
+                .collect();
+        };
+        let language = self.state.language.lock().clone();
+        let game = cwtools_game::constants::Game::from_str(&language);
+        // Build the per-run shared state for this single file. Multi-file callers
+        // (the workspace scan) should build these ONCE and call
+        // `validate_parsed_prebuilt` to avoid rebuilding per file.
+        let registry = build_scope_registry_arc(ruleset, game);
+        let enum_map = build_enum_map(ruleset);
+        self.validate_parsed_prebuilt(
+            uri,
+            parsed,
+            modifier_keys,
+            ruleset,
+            game,
+            registry.as_ref(),
+            &enum_map,
+        )
+    }
+
+    /// As [`validate_parsed`], but with the ruleset already locked and the
+    /// per-run scope registry / enum_map prebuilt by the caller. The
+    /// full-workspace scan builds those ONCE outside its loop and reuses them.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_parsed_prebuilt(
+        &self,
+        uri: &str,
+        parsed: &ParsedFile,
+        modifier_keys: &std::collections::HashSet<String>,
+        ruleset: &RuleSet,
+        game: Option<cwtools_game::constants::Game>,
+        registry: Option<&std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
+        enum_map: &std::collections::HashMap<&str, &cwtools_rules::rules_types::EnumDefinition>,
+    ) -> Vec<Diagnostic> {
+        let info_guard = self.state.info_service.read();
+        let loc_guard = self.state.loc_index.read();
+        validate_parsed_with_indexes(
+            uri,
+            parsed,
+            modifier_keys,
+            ruleset,
+            game,
+            registry,
+            enum_map,
+            &info_guard.type_index,
+            loc_guard.as_ref(),
+            &self.state.string_table,
+        )
     }
 
     /// Parse and validate a single document.
@@ -2796,15 +2887,22 @@ impl Backend {
         };
 
         // Snapshot the file's cross-file exports before re-indexing, so we can
-        // tell whether this edit can affect any other file (see below).
-        let exports_before = self.export_fingerprint(&uri);
+        // tell whether this edit can affect any other file (see below). The
+        // name set lets the dependent sweep target only docs that reference a
+        // name that changed.
+        let (exports_before, names_before) = {
+            let info = self.state.info_service.read();
+            (info.export_fingerprint(&uri), info.export_names(&uri))
+        };
 
         let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
         {
+            let ast = parsed.map(Arc::new);
             let mut docs = self.state.documents.lock();
             if let Some(d) = docs.get_mut(&uri)
                 && d.version == expected_version {
-                    d.ast = parsed.map(Arc::new);
+                    self.update_doc_tokens(&uri, ast.as_ref());
+                    d.ast = ast;
                 }
         }
         if let Ok(uri_obj) = Url::parse(&uri) {
@@ -2817,50 +2915,36 @@ impl Backend {
         // file exports (a definition added/renamed/removed). Editing inside a
         // rule body leaves the exports identical, so no dependent can change and
         // the sweep is skipped entirely — the common case stays cheap.
-        let exports_after = self.export_fingerprint(&uri);
+        let (exports_after, names_after) = {
+            let info = self.state.info_service.read();
+            (info.export_fingerprint(&uri), info.export_names(&uri))
+        };
         if exports_before != exports_after {
+            // Only the names that were added or removed can change another
+            // file's diagnostics. Revalidate the open docs that reference any of
+            // them (symmetric difference of the before/after name sets).
+            //
+            // The fingerprint also tracks multiplicity, so it can differ while
+            // the name SET is unchanged (e.g. a duplicate definition added, or a
+            // type changed under the same name) — a case that can still flip a
+            // dependent's diagnostic. When that happens `changed_names` is empty;
+            // fall back to `None` (revalidate every dependent) so we never miss
+            // one. Soundness beats scoping here.
+            let changed_names: HashSet<String> = names_before
+                .symmetric_difference(&names_after)
+                .cloned()
+                .collect();
+            let scope = if changed_names.is_empty() {
+                None
+            } else {
+                Some(&changed_names)
+            };
             // Tagged with this edit's generation so a newer edit preempts it.
-            self.revalidate_open_dependents(&uri, generation).await;
+            self.revalidate_open_dependents(&uri, generation, scope)
+                .await;
         } else {
             tracing::debug!(uri = %uri, "exports unchanged; skipping dependent sweep");
         }
-    }
-
-    /// An order-independent hash of the cross-file-visible symbols a config file
-    /// exports: type instances (referenced as `<type>` elsewhere), defined
-    /// variables, and saved event targets. If an edit leaves this unchanged, no
-    /// other open file's diagnostics can change, so the dependent sweep can be
-    /// skipped. Snapshotted before and after the edit's re-index.
-    fn export_fingerprint(&self, uri: &str) -> u64 {
-        use std::hash::{Hash, Hasher};
-        // Hash one symbol's identity, with separators so distinct parts can't
-        // run together (`a|bc` vs `ab|c`).
-        fn mix(parts: &[&str]) -> u64 {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            for p in parts {
-                p.hash(&mut h);
-                0xffu8.hash(&mut h);
-            }
-            h.finish()
-        }
-        let info = self.state.info_service.lock();
-        // wrapping_add combines symbols order-independently while preserving
-        // multiplicity (XOR would cancel a duplicated symbol to zero).
-        let mut acc: u64 = 0;
-        for (ty, inst) in info.type_index.instances_in_file(uri) {
-            acc = acc.wrapping_add(mix(&["t", ty, &inst.name]));
-        }
-        if let Some(fi) = info.files.get(uri) {
-            for (ns, vars) in &fi.defined_variables_ns {
-                for v in vars {
-                    acc = acc.wrapping_add(mix(&["v", ns, &v.name]));
-                }
-            }
-            for et in &fi.saved_event_targets {
-                acc = acc.wrapping_add(mix(&["e", et]));
-            }
-        }
-        acc
     }
 
     /// Re-validate and republish every open document except `changed_uri`, using
@@ -2874,15 +2958,38 @@ impl Backend {
     /// double-validate). Each dependent's diagnostics are published with that
     /// doc's current version, and skipped if the doc changed mid-sweep, so the
     /// sweep never clobbers a fresher in-flight result for a file being edited.
-    async fn revalidate_open_dependents(&self, changed_uri: &str, generation: u64) {
+    ///
+    /// `changed_names`, when `Some`, scopes the sweep to the open docs whose
+    /// token set mentions one of the (lowercased) names that were added or
+    /// removed. A doc with no recorded token set is always included (sound
+    /// over-approximation: never skip a file that might depend on the change).
+    /// `None` revalidates every open dependent (used when the exact set of
+    /// changed names can't be pinned down, e.g. a multiplicity-only change).
+    async fn revalidate_open_dependents(
+        &self,
+        changed_uri: &str,
+        generation: u64,
+        changed_names: Option<&HashSet<String>>,
+    ) {
         // Snapshot each open dependent's cached AST (a cheap `Arc` clone) with
         // its version. The dependents' own text didn't change, so they don't
         // need re-parsing or re-indexing — only re-validation against the
-        // now-updated global index.
+        // now-updated global index. When `changed_names` is `Some`, skip docs
+        // whose token set references none of the changed names.
         let others: Vec<(String, i32, Arc<ParsedFile>)> = {
+            let tokens = self.state.doc_tokens.read();
             let docs = self.state.documents.lock();
             docs.iter()
                 .filter(|(u, _)| u.as_str() != changed_uri)
+                .filter(|(u, _)| match changed_names {
+                    None => true,
+                    Some(names) => match tokens.get(u.as_str()) {
+                        // No token set recorded for this doc — include it rather
+                        // than risk missing a real dependent.
+                        None => true,
+                        Some(doc_set) => names.iter().any(|n| doc_set.contains(n)),
+                    },
+                })
                 .filter_map(|(u, d)| d.ast.clone().map(|ast| (u.clone(), d.version, ast)))
                 .collect()
         };
@@ -3006,7 +3113,7 @@ impl Backend {
                 // Update info service
                 {
                     let ruleset_guard = self.state.ruleset.lock();
-                    let mut info = self.state.info_service.lock();
+                    let mut info = self.state.info_service.write();
                     info.clear_file(uri);
                     if let Some(ruleset) = ruleset_guard.as_ref() {
                         info.index_file_with_path(
@@ -3027,11 +3134,15 @@ impl Backend {
                         let game = cwtools_game::constants::Game::from_str(&language);
                         let start = std::time::Instant::now();
                         // Pass the workspace TypeIndex for cross-file type reference checking.
-                        let info_guard = self.state.info_service.lock();
+                        let info_guard = self.state.info_service.read();
                         let type_index = &info_guard.type_index;
                         let modifier_keys = self.state.modifier_keys.read();
                         let loc_guard = self.state.loc_index.read();
-                        let mut errs = validate_ast_with_loc(
+                        // Single-file path: build the per-run shared state once
+                        // for this one file.
+                        let registry = build_scope_registry_arc(ruleset, game);
+                        let enum_map = build_enum_map(ruleset);
+                        let mut errs = validate_ast_with_loc_prebuilt(
                             &parsed,
                             ruleset,
                             &self.state.string_table,
@@ -3040,6 +3151,8 @@ impl Backend {
                             Some(type_index),
                             Some(&*modifier_keys),
                             loc_guard.as_ref(),
+                            registry.as_ref(),
+                            &enum_map,
                         );
                         drop(loc_guard);
                         drop(modifier_keys);
@@ -3107,7 +3220,7 @@ impl Backend {
     /// Rebuild the cached modifier-key set from the current ruleset and type index.
     fn rebuild_modifier_keys(&self) {
         let ruleset_guard = self.state.ruleset.lock();
-        let info_guard = self.state.info_service.lock();
+        let info_guard = self.state.info_service.read();
         let keys = match ruleset_guard.as_ref() {
             Some(rs) => build_modifier_keys(rs, &info_guard.type_index),
             None => HashSet::new(),
@@ -3138,9 +3251,31 @@ impl Backend {
         };
 
         let game = self.state.language.lock().clone();
-        // Version fingerprint: the base game only changes when it updates, so a
-        // cache keyed by it is reused across sessions and is safe to publish.
-        let fingerprint = cwtools_info::vanilla_cache::fingerprint(&dir);
+
+        // We need the ruleset both to key the cache (the fingerprint folds in the
+        // ruleset shape) and to map definitions to their types when rebuilding.
+        // Clone it out in its own statement so the parking_lot guard is dropped
+        // before the `match` (guards aren't Send and the None arm awaits below).
+        let ruleset_opt = self.state.ruleset.lock().clone();
+        let ruleset = match ruleset_opt {
+            Some(rs) => rs,
+            None => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        "Base-game dir set but no rules loaded yet; skipping vanilla index.",
+                    )
+                    .await;
+                return;
+            }
+        };
+
+        // Fingerprint = base-game version + ruleset shape. The base game only
+        // changes when it updates and the rules only when the config changes, so a
+        // cache keyed by both is reused across sessions and is safe to publish, yet
+        // a rules change correctly invalidates it (the cached instances are
+        // extracted by the rules; see `vanilla_cache::combined_fingerprint`).
+        let fingerprint = cwtools_info::vanilla_cache::combined_fingerprint(&dir, &ruleset);
         let cache_path = self.vanilla_cache_path(&game, &fingerprint);
 
         // Try a fresh cache first — skip parsing the whole base game entirely.
@@ -3186,23 +3321,6 @@ impl Backend {
                     }
                 }
             }
-
-        // We need the ruleset to map definitions to their types. Clone it out so
-        // the lock guard isn't held across the awaits below (parking_lot guards
-        // aren't Send, and this runs inside a spawned task).
-        let ruleset_opt = self.state.ruleset.lock().clone();
-        let ruleset = match ruleset_opt {
-            Some(rs) => rs,
-            None => {
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        "Base-game dir set but no rules loaded yet; skipping vanilla index.",
-                    )
-                    .await;
-                return;
-            }
-        };
 
         self.send_loading_bar(true, "Indexing base game…").await;
         self.client
@@ -3487,6 +3605,108 @@ fn is_type_ref_leaf(
         }
     }
     false
+}
+
+/// Collect the lowercased identifier-like tokens a parsed file mentions: every
+/// key and every (quoted or unquoted) string value, plus key/value prefixes.
+/// Used by the dependent sweep to decide which open docs reference a changed
+/// export. Deliberately broad (an over-approximation): including a token that
+/// isn't really a cross-file reference only costs an extra revalidation, while
+/// missing one would silently skip a file that should be revalidated.
+fn collect_doc_tokens(ast: &ParsedFile, table: &StringTable) -> HashSet<String> {
+    use cwtools_parser::ast::Value;
+    let mut tokens = HashSet::new();
+    let push = |id: cwtools_string_table::string_table::StringId, set: &mut HashSet<String>| {
+        if let Some(s) = table.get_string(id)
+            && !s.is_empty()
+        {
+            set.insert(s);
+        }
+    };
+    // The arena holds every element flatly, so iterating the per-kind vectors
+    // covers the whole tree without a recursive walk. `.lower` is the canonical
+    // lowercased form, so the resulting set is already case-folded.
+    let arena = &ast.arena;
+    for leaf in &arena.leaves {
+        push(leaf.key.lower, &mut tokens);
+        if let Value::String(t) | Value::QString(t) = &leaf.value {
+            push(t.lower, &mut tokens);
+        }
+    }
+    for node in &arena.nodes {
+        push(node.key.lower, &mut tokens);
+        if let Some(p) = &node.key_prefix {
+            push(p.lower, &mut tokens);
+        }
+        if let Some(p) = &node.value_prefix {
+            push(p.lower, &mut tokens);
+        }
+    }
+    for lv in &arena.leaf_values {
+        if let Value::String(t) | Value::QString(t) = &lv.value {
+            push(t.lower, &mut tokens);
+        }
+    }
+    for vc in &arena.value_clauses {
+        for k in &vc.keys {
+            push(k.lower, &mut tokens);
+        }
+    }
+    tokens
+}
+
+/// Validate one already-parsed file against caller-supplied indexes, returning
+/// LSP diagnostics. The `type_index` / `loc_index` references are passed in (not
+/// re-locked here) so the full-workspace pass can take a single read guard and
+/// share it across rayon threads — `&TypeIndex` / `&LocIndex` are `Sync`. This
+/// is the lock-free core of [`Backend::validate_parsed_prebuilt`].
+#[allow(clippy::too_many_arguments)]
+fn validate_parsed_with_indexes(
+    uri: &str,
+    parsed: &ParsedFile,
+    modifier_keys: &std::collections::HashSet<String>,
+    ruleset: &RuleSet,
+    game: Option<cwtools_game::constants::Game>,
+    registry: Option<&std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
+    enum_map: &std::collections::HashMap<&str, &cwtools_rules::rules_types::EnumDefinition>,
+    type_index: &TypeIndex,
+    loc_index: Option<&cwtools_localization::LocIndex>,
+    string_table: &StringTable,
+) -> Vec<Diagnostic> {
+    let mut diagnostics: Vec<Diagnostic> = parsed
+        .errors
+        .iter()
+        .map(parse_error_to_diagnostic)
+        .collect();
+    let mut errs = validate_ast_with_loc_prebuilt(
+        parsed,
+        ruleset,
+        string_table,
+        uri,
+        game,
+        Some(type_index),
+        Some(modifier_keys),
+        loc_index,
+        registry,
+        enum_map,
+    );
+    const MAX_ERRORS: usize = 100;
+    let total = errs.len();
+    if total > MAX_ERRORS {
+        errs.truncate(MAX_ERRORS);
+        errs.push(cwtools_validation::ValidationError {
+            message: format!("... {} additional errors truncated", total - MAX_ERRORS),
+            severity: cwtools_validation::ErrorSeverity::Information,
+            line: 0,
+            col: 0,
+            file: uri.to_string(),
+            code: None,
+        });
+    }
+    for err in &errs {
+        diagnostics.push(validation_error_to_diagnostic(err));
+    }
+    diagnostics
 }
 
 fn parse_error_to_diagnostic(e: &ParseError) -> Diagnostic {

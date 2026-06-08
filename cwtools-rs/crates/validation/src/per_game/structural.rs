@@ -15,7 +15,7 @@
 
 use crate::{ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
-use cwtools_string_table::string_table::StringTable;
+use cwtools_string_table::string_table::{StringId, StringTable};
 
 /// The implicit boolean context a node sits in, mirroring F#'s `BoolState`.
 #[derive(Clone, Copy, PartialEq)]
@@ -24,19 +24,48 @@ enum BoolState {
     Or,
 }
 
+/// A reserved boolean keyword that opens a block (`AND`/`OR`/`NOR`).
+#[derive(Clone, Copy, PartialEq)]
+enum BoolKeyword {
+    And,
+    Or,
+    Nor,
+}
+
+impl BoolKeyword {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "AND" => Some(Self::And),
+            "OR" => Some(Self::Or),
+            "NOR" => Some(Self::Nor),
+            _ => None,
+        }
+    }
+}
+
 /// A `key = { ... }` block, normalised from either a `Node` or a `Leaf`-with-`Clause`.
+/// The key is kept as a `StringId` so the per-block keyword checks compare the
+/// borrowed text (via [`StringTable::with_string`]) without an owned `String`.
 struct Block<'a> {
-    key: String,
+    key: StringId,
     children: &'a [Child],
     range: SourceRange,
 }
 
-fn as_block<'a>(child: &Child, ast: &'a ParsedFile, table: &StringTable) -> Option<Block<'a>> {
+impl Block<'_> {
+    /// True if the block's key equals `kw` exactly (case-sensitive, matching the
+    /// reserved keyword spellings `NOT`/`AND`/`OR`/`if`/...).
+    fn key_is(&self, table: &StringTable, kw: &str) -> bool {
+        table.with_string(self.key, |s| s == kw).unwrap_or(false)
+    }
+}
+
+fn as_block<'a>(child: &Child, ast: &'a ParsedFile) -> Option<Block<'a>> {
     match child {
         Child::Node(idx) => {
             let n = &ast.arena.nodes[*idx as usize];
             Some(Block {
-                key: table.get_string(n.key.normal).unwrap_or_default(),
+                key: n.key.normal,
                 children: &n.children,
                 range: n.pos,
             })
@@ -45,7 +74,7 @@ fn as_block<'a>(child: &Child, ast: &'a ParsedFile, table: &StringTable) -> Opti
             let l = &ast.arena.leaves[*idx as usize];
             if let Value::Clause(children) = &l.value {
                 Some(Block {
-                    key: table.get_string(l.key.normal).unwrap_or_default(),
+                    key: l.key.normal,
                     children,
                     range: l.pos,
                 })
@@ -77,13 +106,13 @@ fn is_empty_if(children: &[Child], ast: &ParsedFile, table: &StringTable) -> boo
                     return false;
                 }
                 // A `key = { ... }` leaf-clause: only `limit` is allowed.
-                if table.get_string(l.key.normal).unwrap_or_default() != "limit" {
+                if !table.with_string(l.key.normal, |s| s == "limit").unwrap_or(false) {
                     return false;
                 }
             }
             Child::Node(idx) => {
                 let n = &ast.arena.nodes[*idx as usize];
-                if table.get_string(n.key.normal).unwrap_or_default() != "limit" {
+                if !table.with_string(n.key.normal, |s| s == "limit").unwrap_or(false) {
                     return false;
                 }
             }
@@ -120,12 +149,12 @@ fn walk(
     errors: &mut Vec<ValidationError>,
 ) {
     for child in children {
-        let Some(block) = as_block(child, ast, table) else {
+        let Some(block) = as_block(child, ast) else {
             continue;
         };
 
         // CW223 — NOT with more than one child.
-        if block.key == "NOT" && non_comment_count(block.children) > 1 {
+        if block.key_is(table, "NOT") && non_comment_count(block.children) > 1 {
             push(
                 errors,
                 &error_codes::CW223_INCORRECT_NOT_USAGE,
@@ -138,7 +167,8 @@ fn walk(
         }
 
         // CW121 — empty if/else_if.
-        if (block.key == "if" || block.key == "else_if") && is_empty_if(block.children, ast, table)
+        if (block.key_is(table, "if") || block.key_is(table, "else_if"))
+            && is_empty_if(block.children, ast, table)
         {
             push(
                 errors,
@@ -150,8 +180,13 @@ fn walk(
         }
 
         // CW251 — redundant boolean nesting; also compute the child context.
-        let state = match (parent, block.key.as_str()) {
-            (BoolState::And, "AND") => {
+        // Resolve the key once into the boolean keyword (if any), comparing the
+        // borrowed text rather than cloning it.
+        let kw = table
+            .with_string(block.key, BoolKeyword::from_str)
+            .flatten();
+        let state = match (parent, kw) {
+            (BoolState::And, Some(BoolKeyword::And)) => {
                 push(
                     errors,
                     &error_codes::CW251_UNNECESSARY_BOOLEAN,
@@ -161,7 +196,7 @@ fn walk(
                 );
                 BoolState::And
             }
-            (BoolState::Or, "OR") => {
+            (BoolState::Or, Some(BoolKeyword::Or)) => {
                 push(
                     errors,
                     &error_codes::CW251_UNNECESSARY_BOOLEAN,
@@ -171,7 +206,9 @@ fn walk(
                 );
                 BoolState::Or
             }
-            (_, "OR") | (_, "NOR") => BoolState::Or,
+            // OR and NOR both put their children in an Or context (NOR never
+            // pushes CW251, matching F#).
+            (_, Some(BoolKeyword::Or)) | (_, Some(BoolKeyword::Nor)) => BoolState::Or,
             _ => BoolState::And,
         };
 

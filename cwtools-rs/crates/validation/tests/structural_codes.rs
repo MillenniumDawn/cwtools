@@ -122,6 +122,41 @@ foo = {
 }
 
 #[test]
+fn nor_itself_does_not_fire_cw251() {
+    // NOR puts its children in an Or context but is never itself a redundant
+    // boolean: `NOR { NOR {...} }` must stay clean (only OR-in-OR / AND-in-AND
+    // fire CW251).
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    NOR = {
+        NOR = { a = 1 }
+    }
+}
+"#,
+    );
+    assert!(!c.contains(&"CW251".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn or_inside_nor_is_cw251() {
+    // NOR's children sit in an Or context, so an OR directly inside it is
+    // redundant OR-in-OR and fires CW251 (matching the pre-refactor behavior).
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    NOR = {
+        OR = { a = 1 }
+    }
+}
+"#,
+    );
+    assert!(c.contains(&"CW251".to_string()), "got: {:?}", c);
+}
+
+#[test]
 fn else_without_if_is_cw238() {
     let c = codes(
         Game::Stellaris,

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cwtools_error_codes = { workspace = true }
 cwtools_string_table = { workspace = true }
 cwtools_game = { workspace = true }
 cwtools_file_manager = { workspace = true }

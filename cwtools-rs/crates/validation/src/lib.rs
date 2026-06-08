@@ -21,12 +21,23 @@ pub struct ValidationError {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ErrorSeverity {
-    Error,
-    Warning,
-    Information,
-    Hint,
+pub use cwtools_error_codes::ErrorSeverity;
+use cwtools_error_codes::ErrorCode;
+
+impl ValidationError {
+    /// Build a diagnostic from a catalog [`ErrorCode`]: pulls severity and id
+    /// from the code and formats its template with `args`. Centralizes the
+    /// code→severity mapping so call sites don't restate it.
+    fn from_code(code: &ErrorCode, file: &str, line: u32, col: u16, args: &[&str]) -> Self {
+        ValidationError {
+            message: code.format(args),
+            severity: code.severity,
+            line,
+            col,
+            file: file.to_string(),
+            code: Some(code.id.to_string()),
+        }
+    }
 }
 
 /// Iterate grandchildren of a skip_root_key wrapper and validate each one uniformly.
@@ -73,18 +84,13 @@ fn validate_wrapper_grandchildren(
             Child::LeafValue(idx) => {
                 let lv = &ast.arena.leaf_values[*idx as usize];
                 let value = leaf_value_to_string(&lv.value, table);
-                errors.push(ValidationError {
-                    message: format!("Unexpected bare value '{}'", value),
-                    severity: ErrorSeverity::Warning,
-                    line: lv.pos.start.line,
-                    col: lv.pos.start.col,
-                    file: file_path.to_string(),
-                    code: Some(
-                        error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE
-                            .id
-                            .to_string(),
-                    ),
-                });
+                errors.push(ValidationError::from_code(
+                    &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
+                    file_path,
+                    lv.pos.start.line,
+                    lv.pos.start.col,
+                    &[&format!("Unexpected bare value '{}'", value)],
+                ));
                 continue;
             }
             _ => continue,
@@ -182,9 +188,61 @@ pub fn validate_ast_with_loc(
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
 ) -> Vec<ValidationError> {
+    // Single-file/test entry point: build the per-run shared state (enum_map +
+    // scope registry) here and delegate. Hot multi-file callers should instead
+    // build these ONCE outside their loop and call `validate_ast_with_loc_prebuilt`.
+    let enum_map = build_enum_map(ruleset);
+    let registry = build_scope_registry_arc(ruleset, game);
+    validate_ast_with_loc_prebuilt(
+        ast,
+        ruleset,
+        table,
+        file_path,
+        game,
+        type_index,
+        modifier_keys,
+        loc_index,
+        registry.as_ref(),
+        &enum_map,
+    )
+}
+
+/// Build the `enum name -> definition` lookup used throughout validation. It
+/// borrows from `ruleset`, so the caller must keep `ruleset` alive for the
+/// returned map's lifetime. Cheap to call but pointless to repeat per file, so
+/// hot multi-file loops build it once and reuse it.
+pub fn build_enum_map(ruleset: &RuleSet) -> HashMap<&str, &EnumDefinition> {
+    ruleset.enums.iter().map(|e| (e.key.as_str(), e)).collect()
+}
+
+/// Build the config-driven scope/link registry once, wrapped in an `Arc` so it
+/// can be shared (cheaply cloned) across every file in a validation run. Returns
+/// `None` when no game is set (no scope checks).
+pub fn build_scope_registry_arc(
+    ruleset: &RuleSet,
+    game: Option<Game>,
+) -> Option<std::sync::Arc<ScopeRegistry>> {
+    game.map(|g| std::sync::Arc::new(build_scope_registry(ruleset, g)))
+}
+
+/// As [`validate_ast_with_loc`], but takes the per-run shared state (the scope
+/// registry and `enum_map`) prebuilt so multi-file callers can construct them
+/// ONCE and reuse them across every file instead of rebuilding per file.
+#[tracing::instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
+pub fn validate_ast_with_loc_prebuilt(
+    ast: &ParsedFile,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    file_path: &str,
+    game: Option<Game>,
+    type_index: Option<&cwtools_info::TypeIndex>,
+    modifier_keys: Option<&HashSet<String>>,
+    loc_index: Option<&LocIndex>,
+    registry: Option<&std::sync::Arc<ScopeRegistry>>,
+    enum_map: &HashMap<&str, &EnumDefinition>,
+) -> Vec<ValidationError> {
     let mut errors = Vec::new();
-    let enum_map: HashMap<&str, &EnumDefinition> =
-        ruleset.enums.iter().map(|e| (e.key.as_str(), e)).collect();
 
     // Scope-agnostic content is reused from many calling scopes (or operates on a
     // data-dependent element scope), so it can't be pinned to one. Seed ANY so its
@@ -203,11 +261,7 @@ pub fn validate_ast_with_loc(
         || path_contains_segment(&clean, "scripted_localisation")
         || path_contains_segment(&clean, "collections")
         || path_contains_segment(&clean, "dynamic_modifiers");
-    // Build the config-driven scope/link registry once for this file, shared by
-    // the validation context and (via LocScopeData) the loc-command path.
-    let registry = game.map(|g| std::sync::Arc::new(build_scope_registry(ruleset, g)));
     let default_root = registry
-        .as_ref()
         .and_then(|r| r.id_of("country"))
         .unwrap_or(ScopeId(100));
     let initial_scope = if scope_agnostic {
@@ -215,7 +269,8 @@ pub fn validate_ast_with_loc(
     } else {
         default_root
     };
-    let mut scope_context = registry.map(|r| ScopeContext::from_registry(r, initial_scope));
+    let mut scope_context =
+        registry.map(|r| ScopeContext::from_registry(std::sync::Arc::clone(r), initial_scope));
 
     // Pre-compute path-based type match (most specific wins)
     let path_type = find_type_by_path(file_path, ruleset);
@@ -234,7 +289,7 @@ pub fn validate_ast_with_loc(
                     &ast.root_children,
                     ast,
                     inner_rules,
-                    &enum_map,
+                    enum_map,
                     table,
                     &mut errors,
                     file_path,
@@ -306,7 +361,7 @@ pub fn validate_ast_with_loc(
                         &type_key,
                         ast,
                         inner_rules,
-                        &enum_map,
+                        enum_map,
                         table,
                         &mut errors,
                         file_path,
@@ -323,7 +378,7 @@ pub fn validate_ast_with_loc(
                         children,
                         ast,
                         inner_rules,
-                        &enum_map,
+                        enum_map,
                         table,
                         &mut errors,
                         file_path,
@@ -395,7 +450,7 @@ pub fn validate_ast_with_loc(
                     &child_root_key,
                     ast,
                     inner_rules,
-                    &enum_map,
+                    enum_map,
                     table,
                     &mut errors,
                     file_path,
@@ -428,7 +483,7 @@ pub fn validate_ast_with_loc(
                         node.children.as_slice(),
                         ast,
                         inner_rules,
-                        &enum_map,
+                        enum_map,
                         table,
                         &mut errors,
                         file_path,
@@ -449,7 +504,7 @@ pub fn validate_ast_with_loc(
                             children.as_slice(),
                             ast,
                             inner_rules,
-                            &enum_map,
+                            enum_map,
                             table,
                             &mut errors,
                             file_path,
@@ -1355,7 +1410,10 @@ fn subtype_rules_match(
                 match c {
                     Child::Leaf(idx) => {
                         let leaf = &ast.arena.leaves[*idx as usize];
-                        if table.get_string(leaf.key.normal).unwrap_or_default() == *k {
+                        if table
+                            .with_string(leaf.key.normal, |s| s == *k)
+                            .unwrap_or(false)
+                        {
                             match &leaf.value {
                                 Value::Clause(ch) => (true, None, Some(ch.as_slice())),
                                 v => (true, Some(v), None),
@@ -1366,7 +1424,10 @@ fn subtype_rules_match(
                     }
                     Child::Node(idx) => {
                         let node = &ast.arena.nodes[*idx as usize];
-                        if table.get_string(node.key.normal).unwrap_or_default() == *k {
+                        if table
+                            .with_string(node.key.normal, |s| s == *k)
+                            .unwrap_or(false)
+                        {
                             (true, None, Some(node.children.as_slice()))
                         } else {
                             (false, None, None)
@@ -1543,11 +1604,15 @@ fn child_key_matches(
     match child {
         Child::Leaf(idx) => {
             let leaf = &ast.arena.leaves[*idx as usize];
-            table.get_string(leaf.key.normal).unwrap_or_default() == filter_key
+            table
+                .with_string(leaf.key.normal, |s| s == filter_key)
+                .unwrap_or(false)
         }
         Child::Node(idx) => {
             let node = &ast.arena.nodes[*idx as usize];
-            table.get_string(node.key.normal).unwrap_or_default() == filter_key
+            table
+                .with_string(node.key.normal, |s| s == filter_key)
+                .unwrap_or(false)
         }
         _ => false,
     }
@@ -1602,18 +1667,17 @@ fn validate_leaf_against_rule(
         // F# `ConfigRulesRuleWrongScope` (CW247): a trigger/effect/modifier rule
         // used in a scope it doesn't support. (Was the Rust-invented CW400.)
         let code = &error_codes::CW247_RULE_WRONG_SCOPE;
-        errors.push(ValidationError {
-            message: code.format(&[
+        errors.push(ValidationError::from_code(
+            code,
+            file_path,
+            leaf.pos.start.line,
+            leaf.pos.start.col,
+            &[
                 key,
                 &get_scope_name(current, ctx.registry.as_ref()),
                 &opts.required_scopes.join(" or "),
-            ]),
-            severity: code.severity,
-            line: leaf.pos.start.line,
-            col: leaf.pos.start.col,
-            file: file_path.to_string(),
-            code: Some(code.id.to_string()),
-        });
+            ],
+        ));
     }
     match rule_type {
         RuleType::LeafRule { left, .. } => {
@@ -1733,18 +1797,17 @@ fn validate_node_against_rule(
     {
         // F# `ConfigRulesRuleWrongScope` (CW247); see the leaf site above.
         let code = &error_codes::CW247_RULE_WRONG_SCOPE;
-        errors.push(ValidationError {
-            message: code.format(&[
+        errors.push(ValidationError::from_code(
+            code,
+            file_path,
+            node.pos.start.line,
+            node.pos.start.col,
+            &[
                 key,
                 &get_scope_name(current, ctx.registry.as_ref()),
                 &opts.required_scopes.join(" or "),
-            ]),
-            severity: code.severity,
-            line: node.pos.start.line,
-            col: node.pos.start.col,
-            file: file_path.to_string(),
-            code: Some(code.id.to_string()),
-        });
+            ],
+        ));
     }
     if let RuleType::NodeRule {
         left,
@@ -2001,14 +2064,13 @@ fn validate_children(
                     // (modifiers are additive). Only fires on confirmed modifiers.
                     if is_modifier && value_is_zero(&leaf.value) {
                         let code = &error_codes::CW235_ZERO_MODIFIER;
-                        errors.push(ValidationError {
-                            message: code.format(&[&key]),
-                            severity: code.severity,
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                            file: file_path.to_string(),
-                            code: Some(code.id.to_string()),
-                        });
+                        errors.push(ValidationError::from_code(
+                            code,
+                            file_path,
+                            leaf.pos.start.line,
+                            leaf.pos.start.col,
+                            &[&key],
+                        ));
                     }
                     // A `@name = value` leaf is a Paradox read-time variable
                     // definition, valid anywhere in a block. F# skips these from the
@@ -2081,14 +2143,13 @@ fn validate_children(
                     // Item 5: dynamic modifier keys — accept known modifier block keys silently.
                     let is_modifier = modifier_keys.map(|mk| mk.contains(&key)).unwrap_or(false);
                     if !is_modifier {
-                        errors.push(ValidationError {
-                            message: format!("Unexpected block '{}'", key),
-                            severity: ErrorSeverity::Error,
-                            line: node.pos.start.line,
-                            col: node.pos.start.col,
-                            file: file_path.to_string(),
-                            code: Some(error_codes::CW262_UNEXPECTED_PROPERTY_NODE.id.to_string()),
-                        });
+                        errors.push(ValidationError::from_code(
+                            &error_codes::CW262_UNEXPECTED_PROPERTY_NODE,
+                            file_path,
+                            node.pos.start.line,
+                            node.pos.start.col,
+                            &[&format!("Unexpected block '{}'", key)],
+                        ));
                     }
                 } else {
                     let n = candidates.len();
@@ -2148,18 +2209,13 @@ fn validate_children(
                         }
                     }
                     if !matched {
-                        errors.push(ValidationError {
-                            message: "Unexpected value clause '{...}'".to_string(),
-                            severity: ErrorSeverity::Warning,
-                            line: lv.pos.start.line,
-                            col: lv.pos.start.col,
-                            file: file_path.to_string(),
-                            code: Some(
-                                error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE
-                                    .id
-                                    .to_string(),
-                            ),
-                        });
+                        errors.push(ValidationError::from_code(
+                            &error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE,
+                            file_path,
+                            lv.pos.start.line,
+                            lv.pos.start.col,
+                            &["Unexpected value clause '{...}'"],
+                        ));
                     }
                 } else {
                     let mut matched = false;
@@ -2172,18 +2228,13 @@ fn validate_children(
                     }
                     if !matched {
                         let val_str = leaf_value_to_string(&lv.value, table);
-                        errors.push(ValidationError {
-                            message: format!("Unexpected bare value '{}'", val_str),
-                            severity: ErrorSeverity::Warning,
-                            line: lv.pos.start.line,
-                            col: lv.pos.start.col,
-                            file: file_path.to_string(),
-                            code: Some(
-                                error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE
-                                    .id
-                                    .to_string(),
-                            ),
-                        });
+                        errors.push(ValidationError::from_code(
+                            &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
+                            file_path,
+                            lv.pos.start.line,
+                            lv.pos.start.col,
+                            &[&format!("Unexpected bare value '{}'", val_str)],
+                        ));
                     }
                 }
             }
@@ -2214,18 +2265,13 @@ fn validate_children(
                     }
                 }
                 if !matched {
-                    errors.push(ValidationError {
-                        message: "Unexpected value clause '{...}'".to_string(),
-                        severity: ErrorSeverity::Warning,
-                        line: vc.pos.start.line,
-                        col: vc.pos.start.col,
-                        file: file_path.to_string(),
-                        code: Some(
-                            error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE
-                                .id
-                                .to_string(),
-                        ),
-                    });
+                    errors.push(ValidationError::from_code(
+                        &error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE,
+                        file_path,
+                        vc.pos.start.line,
+                        vc.pos.start.col,
+                        &["Unexpected value clause '{...}'"],
+                    ));
                 }
             }
             _ => {}
@@ -2833,14 +2879,7 @@ fn validate_alias_usage(
             let (line, col) = leaf
                 .map(|l| (l.pos.start.line, l.pos.start.col))
                 .unwrap_or((0, 0));
-            errors.push(ValidationError {
-                message: code.format(&[key]),
-                severity: code.severity,
-                line,
-                col,
-                file: file_path.to_string(),
-                code: Some(code.id.to_string()),
-            });
+            errors.push(ValidationError::from_code(code, file_path, line, col, &[key]));
         }
     }
 
@@ -2878,14 +2917,13 @@ fn validate_alias_usage(
             let (line, col) = leaf
                 .map(|l| (l.pos.start.line, l.pos.start.col))
                 .unwrap_or((0, 0));
-            errors.push(ValidationError {
-                message: code.format(&[key, &reg.name_of(current), &expected.join(" or ")]),
-                severity: code.severity,
+            errors.push(ValidationError::from_code(
+                code,
+                file_path,
                 line,
                 col,
-                file: file_path.to_string(),
-                code: Some(code.id.to_string()),
-            });
+                &[key, &reg.name_of(current), &expected.join(" or ")],
+            ));
         }
     }
 
@@ -2909,7 +2947,10 @@ fn validate_alias_usage(
                     );
                 } else {
                     // Scalar-valued overload but the usage is a block — not a match.
-                    temp.push(alias_mismatch_error(file_path));
+                    let (line, col) = leaf
+                        .map(|l| (l.pos.start.line, l.pos.start.col))
+                        .unwrap_or((0, 0));
+                    temp.push(alias_mismatch_error(file_path, category, "{...}", line, col));
                 }
             }
             RuleType::NodeRule {
@@ -2946,7 +2987,16 @@ fn validate_alias_usage(
                     }
                 } else {
                     // Block overload but the usage is a scalar — not a match.
-                    temp.push(alias_mismatch_error(file_path));
+                    let (value, line, col) = leaf
+                        .map(|l| {
+                            (
+                                leaf_value_to_string(&l.value, table),
+                                l.pos.start.line,
+                                l.pos.start.col,
+                            )
+                        })
+                        .unwrap_or_else(|| (String::new(), 0, 0));
+                    temp.push(alias_mismatch_error(file_path, category, &value, line, col));
                 }
             }
             _ => continue,
@@ -2966,17 +3016,24 @@ fn validate_alias_usage(
     }
 }
 
-/// Placeholder error used when an alias overload's shape (scalar vs block) can't
-/// match the usage; it only ranks a candidate, it's never surfaced when a better
-/// candidate exists.
-fn alias_mismatch_error(file_path: &str) -> ValidationError {
+/// Error used when an alias overload's shape (scalar vs block) can't match the
+/// usage; it ranks a candidate and, when no better candidate exists, is surfaced
+/// at the offending leaf's position. F# `ConfigRulesUnexpectedAliasKeyValue`.
+fn alias_mismatch_error(
+    file_path: &str,
+    category: &str,
+    value: &str,
+    line: u32,
+    col: u16,
+) -> ValidationError {
+    let code = &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE;
     ValidationError {
-        message: "value does not match alias".to_string(),
-        severity: ErrorSeverity::Error,
-        line: 0,
-        col: 0,
+        message: code.format(&[category, value]),
+        severity: code.severity,
+        line,
+        col,
         file: file_path.to_string(),
-        code: Some(error_codes::CW240_UNEXPECTED_VALUE.id.to_string()),
+        code: Some(code.id.to_string()),
     }
 }
 
@@ -3042,14 +3099,13 @@ fn validate_localisation_field(
 
     let push_missing = |errors: &mut Vec<ValidationError>, lang: &str| {
         let code = &error_codes::CW100_MISSING_LOCALISATION;
-        errors.push(ValidationError {
-            message: code.format(&[key_raw, lang]),
-            severity: code.severity,
-            line: leaf.pos.start.line,
-            col: leaf.pos.start.col,
-            file: file_path.to_string(),
-            code: Some(code.id.to_string()),
-        });
+        errors.push(ValidationError::from_code(
+            code,
+            file_path,
+            leaf.pos.start.line,
+            leaf.pos.start.col,
+            &[key_raw, lang],
+        ));
     };
 
     if is_inline {
@@ -3057,14 +3113,13 @@ fn validate_localisation_field(
         match (was_quoted, exists) {
             (true, true) => {
                 let code = &error_codes::CW122_LOC_KEY_IN_INLINE;
-                errors.push(ValidationError {
-                    message: code.format(&[key_raw]),
-                    severity: code.severity,
-                    line: leaf.pos.start.line,
-                    col: leaf.pos.start.col,
-                    file: file_path.to_string(),
-                    code: Some(code.id.to_string()),
-                });
+                errors.push(ValidationError::from_code(
+                    code,
+                    file_path,
+                    leaf.pos.start.line,
+                    leaf.pos.start.col,
+                    &[key_raw],
+                ));
             }
             (true, false) => {} // quoted + missing → skip (lenient, matches F#)
             (false, true) => {} // unquoted + exists → ok
@@ -3292,14 +3347,13 @@ fn validate_leaf(
                             }
                         if !idx.file_index.contains(&candidate) {
                             let code = &error_codes::CW113_MISSING_FILE;
-                            errors.push(ValidationError {
-                                message: code.format(&[&candidate]),
-                                severity: code.severity,
-                                line: leaf.pos.start.line,
-                                col: leaf.pos.start.col,
-                                file: file_path.to_string(),
-                                code: Some(code.id.to_string()),
-                            });
+                            errors.push(ValidationError::from_code(
+                                code,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                &[&candidate],
+                            ));
                         }
                     }
                 }
@@ -3338,24 +3392,22 @@ fn validate_leaf(
                     // Numeric value: enforce int-ness / decimal precision.
                     if *is_int && f.fract() != 0.0 {
                         let code = &error_codes::CW271_VARIABLE_INT_ONLY;
-                        errors.push(ValidationError {
-                            message: code.message_template.to_string(),
-                            severity: code.severity,
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                            file: file_path.to_string(),
-                            code: Some(code.id.to_string()),
-                        });
+                        errors.push(ValidationError::from_code(
+                            code,
+                            file_path,
+                            leaf.pos.start.line,
+                            leaf.pos.start.col,
+                            &[],
+                        ));
                     } else if *is_32bit && decimal_places(core) > 3 {
                         let code = &error_codes::CW270_VARIABLE_TOO_SMALL;
-                        errors.push(ValidationError {
-                            message: code.message_template.to_string(),
-                            severity: code.severity,
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                            file: file_path.to_string(),
-                            code: Some(code.id.to_string()),
-                        });
+                        errors.push(ValidationError::from_code(
+                            code,
+                            file_path,
+                            leaf.pos.start.line,
+                            leaf.pos.start.col,
+                            &[],
+                        ));
                     }
                 } else if var_checks_enabled() {
                     // Non-numeric value: it must name a defined variable. Stay
@@ -3373,14 +3425,13 @@ fn validate_leaf(
                         && !idx.var_index.contains(core)
                     {
                         let code = &error_codes::CW246_UNSET_VARIABLE;
-                        errors.push(ValidationError {
-                            message: code.format(&[core]),
-                            severity: code.severity,
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                            file: file_path.to_string(),
-                            code: Some(code.id.to_string()),
-                        });
+                        errors.push(ValidationError::from_code(
+                            code,
+                            file_path,
+                            leaf.pos.start.line,
+                            leaf.pos.start.col,
+                            &[core],
+                        ));
                     }
                 }
             }
@@ -3401,17 +3452,16 @@ fn validate_leaf(
             let expected = field_to_description(right);
             let actual = leaf_value_to_string(&leaf.value, table);
             let key = table.get_string(leaf.key.normal).unwrap_or_default();
-            errors.push(ValidationError {
-                message: format!(
+            errors.push(ValidationError::from_code(
+                &error_codes::CW240_UNEXPECTED_VALUE,
+                file_path,
+                leaf.pos.start.line,
+                leaf.pos.start.col,
+                &[&format!(
                     "Field '{}' has value '{}', expected {}",
                     key, actual, expected
-                ),
-                severity: ErrorSeverity::Error,
-                line: leaf.pos.start.line,
-                col: leaf.pos.start.col,
-                file: file_path.to_string(),
-                code: Some(error_codes::CW240_UNEXPECTED_VALUE.id.to_string()),
-            });
+                )],
+            ));
         }
     }
 }
@@ -3600,7 +3650,9 @@ fn field_matches_value(
 
         // --- SpecificField: exact string match ---
         (NewField::SpecificField(s), Value::String(t))
-        | (NewField::SpecificField(s), Value::QString(t)) => match_text(table, t) == *s,
+        | (NewField::SpecificField(s), Value::QString(t)) => table
+            .with_string(t.normal, |text| unquote_key(text) == *s)
+            .unwrap_or(false),
         // A `= yes` / `= no` rule literal is a SpecificField, but the parser emits
         // Bool for those values — match them up (affects every boolean rule field).
         (NewField::SpecificField(s), Value::Bool(b)) => (s == "yes" && *b) || (s == "no" && !*b),
@@ -3608,13 +3660,13 @@ fn field_matches_value(
 
         // --- TypeField: accept string (cross-file existence is a separate pass) ---
         (NewField::TypeField(TypeType::Simple(type_name)), Value::String(t))
-        | (NewField::TypeField(TypeType::Simple(type_name)), Value::QString(t)) => {
-            validate_type_reference(&table.get_string(t.normal).unwrap_or_default(), type_name)
-        }
+        | (NewField::TypeField(TypeType::Simple(type_name)), Value::QString(t)) => table
+            .with_string(t.normal, |s| validate_type_reference(s, type_name))
+            .unwrap_or(false),
         (NewField::TypeField(TypeType::Complex { name, .. }), Value::String(t))
-        | (NewField::TypeField(TypeType::Complex { name, .. }), Value::QString(t)) => {
-            validate_type_reference(&table.get_string(t.normal).unwrap_or_default(), name)
-        }
+        | (NewField::TypeField(TypeType::Complex { name, .. }), Value::QString(t)) => table
+            .with_string(t.normal, |s| validate_type_reference(s, name))
+            .unwrap_or(false),
         // Numeric type instances — state/province ids are written as bare integers
         // (`states = { 599 600 }`, `<state>`). Accept; existence is a separate pass.
         (NewField::TypeField(_), Value::Int(_) | Value::Float(_)) => true,
@@ -3626,9 +3678,9 @@ fn field_matches_value(
         // scope engine's job; at the field level accept any non-empty token rather
         // than flag every tag/id as an error.
         (NewField::ScopeField(_), Value::String(t))
-        | (NewField::ScopeField(_), Value::QString(t)) => {
-            !table.get_string(t.normal).unwrap_or_default().is_empty()
-        }
+        | (NewField::ScopeField(_), Value::QString(t)) => table
+            .with_string(t.normal, |s| !s.is_empty())
+            .unwrap_or(false),
         (NewField::ScopeField(_), Value::Int(_)) | (NewField::ScopeField(_), Value::Float(_)) => {
             true
         }
