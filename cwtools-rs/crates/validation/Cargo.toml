@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cwtools_error_codes = { workspace = true }
 cwtools_parser = { path = "../parser" }
 cwtools_rules = { path = "../rules" }
 cwtools_string_table = { path = "../string_table" }

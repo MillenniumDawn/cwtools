@@ -113,13 +113,13 @@ fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
         &file.language_prefix,
     )? {
         LangHeaderDiagnostic::MissingLocFileLangHeader { .. } => (
-            "CW256",
+            cwtools_error_codes::CW256_MISSING_LOC_FILE_LANG_HEADER.id,
             LocSeverity::Error,
             "Localisation file should start with \"l_language:\" on the first line (or a comment)"
                 .to_string(),
         ),
         LangHeaderDiagnostic::MissingLocFileLang { .. } => (
-            "CW255",
+            cwtools_error_codes::CW255_MISSING_LOC_FILE_LANG.id,
             LocSeverity::Error,
             "Localisation file name should contain (and ideally end with) \"l_language.yml\""
                 .to_string(),
@@ -129,7 +129,7 @@ fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
             header_lang,
             ..
         } => (
-            "CW257",
+            cwtools_error_codes::CW257_LOC_FILE_LANG_MISMATCH.id,
             LocSeverity::Error,
             format!(
                 "Localisation file's name has language {} doesn't match the header language {}",
@@ -207,7 +207,7 @@ pub fn validate_loc_project_scoped(
                     file: path.clone(),
                     line: 1,
                     col: 1,
-                    code: "CW254",
+                    code: cwtools_error_codes::CW254_WRONG_ENCODING.id,
                     severity: LocSeverity::Error,
                     message: "Localisation files must be UTF-8 BOM, this file is not".to_string(),
                 });

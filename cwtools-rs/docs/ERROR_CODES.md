@@ -18,6 +18,7 @@ Each diagnostic the validator emits carries a `CWxxx` code. The codes mirror the
 - **Emitted** -- the check runs and produces this code today.
 - **Emitted (reconciled from F# CWxxx)** -- emitted today under the F# ID after an intentional renumber; the old Rust-invented ID is retired.
 - **Defined, emission pending (subsystem)** -- the const exists but the check is not wired in; see [Pending subsystems](#currently-not-emitted-pending-subsystems).
+- **Defined, not wired** -- the const exists but nothing emits it yet. Either it's superseded by a more specific code, or a generic check would need a complete registry to stay false-positive-safe (the project never trades correctness for coverage).
 - **Emitted (escape hatch `CWTOOLS_...`)** -- runs by default; the env var disables it.
 
 Every F# code (71 after the experimental/dead cleanup) has a Rust definition.
@@ -30,7 +31,7 @@ Codes with no emission site in either engine were removed from both; see
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW002 | Error | This block has mixed key/values and values, it is probably a missing equals sign inside it. | A block mixes bare values with key-value pairs, which usually means a missing `=`. | Emitted |
+| CW002 | Error | This block has mixed key/values and values, it is probably a missing equals sign inside it. | A block mixes bare values with key-value pairs, which usually means a missing `=`. | Defined, not wired (parser does not flag this yet) |
 
 ---
 
@@ -39,9 +40,9 @@ Codes with no emission site in either engine were removed from both; see
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | CW100 | Warning | Localisation key {} is not defined for {} | A referenced localisation key has no entry for the named language. | Emitted |
-| CW101 | Error | {} is not defined | A `@variable` is used but never defined. | Emitted |
-| CW102 | Error | unknown trigger {} used. | A trigger name is not in the known trigger list. | Emitted |
-| CW103 | Error | unknown effect {} used. | An effect name is not in the known effect list. | Emitted |
+| CW101 | Error | {} is not defined | A `@variable` is used but never defined. | Defined, not wired (needs FP-safe @-var def/use tracking) |
+| CW102 | Error | unknown trigger {} used. | A trigger name is not in the known trigger list. | Defined, not wired (rules-engine structural codes CW262-265 cover this; a generic check needs a complete trigger registry to avoid false positives) |
+| CW103 | Error | unknown effect {} used. | An effect name is not in the known effect list. | Defined, not wired (as CW102, needs a complete effect registry) |
 | CW104 | Error | {} trigger used in incorrect scope. In {} but expected {} | A trigger is used in a scope it doesn't accept. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`). Scope tracking handles links/iterators/data-refs/root-scope; a DLC-scope long tail remains, so off by default |
 | CW105 | Error | {} effect used in incorrect scope. In {} but expected {} | An effect is used in the wrong scope. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`) |
 | CW106 | Error | {} scope command used in incorrect scope. In {} but expected {} | A scope command is used outside its valid scope. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`) |
@@ -77,7 +78,7 @@ Codes with no emission site in either engine were removed from both; see
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | CW225 | Error | Localisation key "{}" references "{}" which doesn't exist in {} | A loc string's `$KEY$` reference points to a key that has no definition. | Emitted |
-| CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command]` references a scope/data command that isn't valid. | Emitted |
+| CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command]` references a scope/data command that isn't valid. | Defined, not wired (the loc-command path emits the more specific CW260/CW266) |
 
 ### CW227-CW233 -- Section/component/mesh/entity (Stellaris-specific)
 
@@ -113,7 +114,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | CW240 | Error | {} | A value didn't match its rule's field type (int/float/enum/bool/date, etc.). | Emitted |
-| CW241 | Error | {} | An unexpected property was found (generic). | Emitted |
+| CW241 | Error | {} | An unexpected property was found (generic). | Defined, not wired (superseded by the node-kind-specific CW262-CW265) |
 | CW242 | Warning | {} | A field appears too few or too many times (cardinality violation). | Emitted |
 | CW243 | Error | Target "{}" has incorrect scope. Is {} but expect {} | A scope target resolves to a scope the field doesn't expect. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
 | CW244 | Error | {} is not a target. Expected a target in scope(s) {} | A value is not a valid target in any of the expected scopes. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
@@ -159,9 +160,9 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW269 | Hint | Optimise by merging this with {} by using {} | Two lists could be merged for a minor script optimisation. | Defined, emission pending (vanilla data registries) |
 | CW270 | Warning | Value too small, only 3 decimal places are supported in this context | A numeric value has more decimal places than the engine supports here. | Emitted (32-bit `variable_field` with >3 decimal places) |
 | CW271 | Warning | Expected an integer | A field that requires an integer received a float or non-numeric value. | Emitted (`int_variable_field` given a fractional value) |
-| CW272 | Error | {} | A custom error attached to a rule via `## error = ...`. | Emitted |
+| CW272 | Error | {} | A custom error attached to a rule via `## error = ...`. | Defined, not wired (rules loader does not parse the `## error` option yet) |
 | CW273 | Warning | Modifier type {} is not defined but is used | A modifier's type reference points to a modifier-type that isn't defined. | Defined, emission pending (modifier-type registry) |
-| CW274 | Error | This usage of inline_script results in an error, see related | An `inline_script` call resolves to content that itself fails validation. | Emitted |
+| CW274 | Error | This usage of inline_script results in an error, see related | An `inline_script` call resolves to content that itself fails validation. | Defined, not wired (inline-script expansion does not propagate child errors yet) |
 | CW275 | Warning | Localisation key {} contains unexpected characters, and may not render correctly | A loc value contains characters outside the expected set for that game. | Emitted |
 
 ---
@@ -195,8 +196,8 @@ CW501 (duplicate type) and CW502 (unused type) were Rust-invented IDs that have 
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW998 | Error | {} | An internal rules-engine error (malformed rule definition, etc.). | Emitted |
-| CW999 | Error | {} | A custom user error from a `.cwt` rule file. | Emitted |
+| CW998 | Error | {} | An internal rules-engine error (malformed rule definition, etc.). | Defined, not wired (rules loader does not surface internal errors as diagnostics yet) |
+| CW999 | Error | {} | A custom user error from a `.cwt` rule file. | Defined, not wired (needs the custom-error rule option) |
 
 ---
 

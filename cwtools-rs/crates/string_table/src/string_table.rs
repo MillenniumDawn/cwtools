@@ -181,6 +181,18 @@ impl StringTable {
         inner.id_to_string.get(id.0 as usize).cloned()
     }
 
+    /// Borrow the original (case-preserving) text for a `StringId` without
+    /// cloning it. Takes the read lock once and calls `f` on the borrowed
+    /// `&str`, returning `f`'s result (or `None` if the id is out of range).
+    ///
+    /// Prefer this over [`get_string`](Self::get_string) on hot paths that only
+    /// need to compare or inspect the text (e.g. `== "NOT"`,
+    /// `eq_ignore_ascii_case`): it avoids a per-call `String` allocation.
+    pub fn with_string<R>(&self, id: StringId, f: impl FnOnce(&str) -> R) -> Option<R> {
+        let inner = self.inner.read();
+        inner.id_to_string.get(id.0 as usize).map(|s| f(s.as_str()))
+    }
+
     /// Retrieve the metadata for a `StringId`.
     pub fn get_metadata(&self, id: StringId) -> Option<StringMetadata> {
         let inner = self.inner.read();
@@ -279,6 +291,25 @@ mod tests {
         assert_eq!(table.get_string(a.normal), Some("hello".to_string()));
         assert_eq!(table.get_string(b.normal), Some("HELLO".to_string()));
         assert_eq!(table.get_string(a.lower), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn with_string_borrows_without_clone() {
+        let table = StringTable::new();
+        let a = table.intern("NOT");
+        // Borrow + compare without allocating an owned String.
+        assert_eq!(table.with_string(a.normal, |s| s == "NOT"), Some(true));
+        assert_eq!(
+            table.with_string(a.lower, |s| s.eq_ignore_ascii_case("not")),
+            Some(true)
+        );
+        // Out-of-range id yields None and never calls the closure.
+        assert_eq!(table.with_string(StringId(9_999), |_| true), None);
+        // Same text as get_string.
+        assert_eq!(
+            table.with_string(a.normal, |s| s.to_string()),
+            table.get_string(a.normal)
+        );
     }
 
     #[test]

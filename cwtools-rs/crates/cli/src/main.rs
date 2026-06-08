@@ -44,27 +44,7 @@ fn index_game_dir(
         dir.display()
     );
 
-    let mut index = TypeIndex::new();
-    for file in files {
-        let path = file.path.to_str().unwrap_or("").to_string();
-        let pf = cwtools_parser::ast::ParsedFile {
-            arena: file.arena,
-            root_children: file.root_children,
-            errors: vec![],
-        };
-        let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
-        index.merge(&path, instances);
-        // Collect base-game variable definitions too, so a mod referencing a
-        // vanilla variable isn't flagged as unset (CW246).
-        if !var_effects.is_empty() {
-            let mut names: Vec<String> = Vec::new();
-            collect_set_variable_names(&pf, table, var_effects, &mut names);
-            for n in &names {
-                index.var_index.add_name(n);
-            }
-        }
-    }
-    index
+    cwtools_info::index_discovered_files(files, ruleset, table, Some(var_effects))
 }
 
 #[derive(Parser)]
@@ -586,7 +566,9 @@ fn main() {
             ignore_dirs,
         } => {
             use cwtools_game::constants::Game;
-            use cwtools_validation::validate_ast_with_loc;
+            use cwtools_validation::{
+                build_enum_map, build_scope_registry_arc, validate_ast_with_loc_prebuilt,
+            };
 
             let game_id = Game::from_str(&game).unwrap_or_else(|| {
                 eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
@@ -814,11 +796,19 @@ fn main() {
             // `parsed` Vec collects in input order, so the report is byte-for-byte
             // identical to the sequential version.
             let ignored_ref = &ignored;
+            // Build the per-run shared state (scope registry + enum_map) ONCE,
+            // not once per file: both depend only on (ruleset, game). The
+            // registry is an Arc shared across threads; enum_map borrows from
+            // `ruleset`, which outlives the parallel loop.
+            let registry = build_scope_registry_arc(&ruleset, Some(game_id));
+            let enum_map = build_enum_map(&ruleset);
+            let registry_ref = registry.as_ref();
+            let enum_map_ref = &enum_map;
             let mut diags: Vec<Diag> = parsed
                 .par_iter()
                 .flat_map_iter(|(path, _logical_path, parser_file)| {
                     let file_str = path.to_str().unwrap_or("").to_string();
-                    let errors = validate_ast_with_loc(
+                    let errors = validate_ast_with_loc_prebuilt(
                         parser_file,
                         &ruleset,
                         &rules_table,
@@ -827,6 +817,8 @@ fn main() {
                         Some(&type_index),
                         Some(&modifier_keys),
                         Some(&loc_index),
+                        registry_ref,
+                        enum_map_ref,
                     );
                     errors.into_iter().filter_map(move |err| {
                         let code = err.code.clone().unwrap_or_default();
@@ -1053,7 +1045,11 @@ fn main() {
                 &rules_table,
                 &std::collections::HashSet::new(),
             );
-            let fingerprint = vanilla_cache::fingerprint(&vanilla);
+            // Combined fingerprint = game version + ruleset shape, so a cache
+            // built against one rules set is treated as stale by another (the
+            // cached instances are extracted by the rules; a rules change can
+            // change which instances exist and under what name).
+            let fingerprint = vanilla_cache::combined_fingerprint(&vanilla, &ruleset);
             println!("  Vanilla fingerprint: {}", fingerprint);
             match vanilla_cache::save(&index, &game, &fingerprint, &output) {
                 Ok(n) => println!("Wrote {} base-game instances to {}", n, output.display()),

@@ -161,10 +161,18 @@ impl VarIndex {
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
     pub map: HashMap<String, Vec<(String, TypeInstance)>>,
-    /// instance name → how many definitions carry that name (across all types and
-    /// files). Lets `is_any_instance` be O(1) instead of scanning every instance.
-    /// A refcount so `remove_file` can drop a name only when its last definition goes.
+    /// lowercased instance name → how many definitions carry that name (across all
+    /// types and files). Lets `is_any_instance` be O(1) instead of scanning every
+    /// instance. A refcount so `remove_file` can drop a name only when its last
+    /// definition goes. Keyed lowercase because Paradox identifiers are
+    /// case-insensitive (same normalization as `contains`/`instance_sets`).
     name_counts: HashMap<String, usize>,
+    /// type_name → (lowercased instance name → refcount). Makes `contains` an O(1)
+    /// hash lookup instead of a linear scan over every instance of the type, which
+    /// was quadratic over the corpus for high-cardinality types (state, character,
+    /// country_event). The refcount lets `remove_file` drop a name only when its
+    /// last definition in that type goes.
+    instance_sets: HashMap<String, HashMap<String, usize>>,
     /// Index of every asset/file path under the game roots, for `filepath`
     /// reference checks (CW113). Empty unless the CLI populated it.
     pub file_index: FileIndex,
@@ -182,12 +190,9 @@ impl TypeIndex {
     /// Paradox script identifiers are case-insensitive, so a reference like
     /// `LBA_AI_BEHAVIOR` resolves to the `LBA_ai_behavior` definition.
     pub fn contains(&self, type_name: &str, instance: &str) -> bool {
-        self.map
+        self.instance_sets
             .get(type_name)
-            .map(|v| {
-                v.iter()
-                    .any(|(_, ti)| ti.name.eq_ignore_ascii_case(instance))
-            })
+            .map(|names| names.contains_key(&instance.to_ascii_lowercase()))
             .unwrap_or(false)
     }
 
@@ -196,7 +201,7 @@ impl TypeIndex {
     /// of a referenced type (character, state, ideology, ...) open its own scope,
     /// e.g. `LBA_some_character = { ... }`.
     pub fn is_any_instance(&self, name: &str) -> bool {
-        self.name_counts.contains_key(name)
+        self.name_counts.contains_key(&name.to_ascii_lowercase())
     }
 
     /// All instances for a type (across all files).
@@ -222,9 +227,12 @@ impl TypeIndex {
     /// Merge per-file results into the index.
     pub fn merge(&mut self, file_uri: &str, per_type: HashMap<String, Vec<TypeInstance>>) {
         for (type_name, instances) in per_type {
+            let set = self.instance_sets.entry(type_name.clone()).or_default();
             let entry = self.map.entry(type_name).or_default();
             for inst in instances {
-                *self.name_counts.entry(inst.name.clone()).or_insert(0) += 1;
+                let lower = inst.name.to_ascii_lowercase();
+                *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
+                *set.entry(lower).or_insert(0) += 1;
                 entry.push((file_uri.to_string(), inst));
             }
         }
@@ -232,20 +240,30 @@ impl TypeIndex {
 
     /// Remove all instances contributed by `file_uri`.
     pub fn remove_file(&mut self, file_uri: &str) {
-        for v in self.map.values_mut() {
+        for (type_name, v) in self.map.iter_mut() {
             v.retain(|(uri, inst)| {
                 let keep = uri != file_uri;
-                if !keep
-                    && let Some(count) = self.name_counts.get_mut(&inst.name) {
+                if !keep {
+                    let lower = inst.name.to_ascii_lowercase();
+                    if let Some(count) = self.name_counts.get_mut(&lower) {
                         *count -= 1;
                         if *count == 0 {
-                            self.name_counts.remove(&inst.name);
+                            self.name_counts.remove(&lower);
                         }
                     }
+                    if let Some(set) = self.instance_sets.get_mut(type_name)
+                        && let Some(count) = set.get_mut(&lower) {
+                            *count -= 1;
+                            if *count == 0 {
+                                set.remove(&lower);
+                            }
+                        }
+                }
                 keep
             });
         }
         self.map.retain(|_, v| !v.is_empty());
+        self.instance_sets.retain(|_, names| !names.is_empty());
     }
 }
 
@@ -453,6 +471,32 @@ fn collect_skip_root_child(
 }
 
 /// Collect all type instances defined in `file` for the given `logical_path`.
+/// Hash one exported symbol's identity, with separators so distinct parts can't
+/// run together (`a|bc` vs `ab|c`).
+fn mix_export_symbol(parts: &[&str]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+        0xffu8.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Order-independent hash of a file's exported type instances, computed from the
+/// per-file `type -> instances` map produced at index time. Mirrors the symbol
+/// mixing used for variables/event targets in
+/// [`InfoService::export_fingerprint`].
+fn hash_instance_exports(per_type: &HashMap<String, Vec<TypeInstance>>) -> u64 {
+    let mut acc: u64 = 0;
+    for (ty, instances) in per_type {
+        for inst in instances {
+            acc = acc.wrapping_add(mix_export_symbol(&["t", ty, &inst.name]));
+        }
+    }
+    acc
+}
+
 ///
 /// Returns a map from type name → list of instances found in this file.
 /// Collect type instances from AST nodes, applying skip_root_key navigation.
@@ -880,6 +924,42 @@ pub fn collect_set_variable_names(
     walk(&file.root_children, &file.arena, table, effects, out);
 }
 
+/// Build a [`TypeIndex`] from already-discovered+parsed files. Shared by the CLI
+/// (`index_game_dir`) and LSP (`index_vanilla_dir`) base-game indexing paths so
+/// the per-file merge loop lives in one place. Each file's AST is consumed in
+/// place (no re-parse) and its type instances are stream-merged.
+///
+/// When `var_effects` is `Some(non_empty)`, base-game variable definitions are
+/// also folded into `index.var_index` (so a mod referencing a vanilla variable
+/// isn't flagged as unset, CW246). Pass `None` to skip variable collection.
+pub fn index_discovered_files(
+    files: impl IntoIterator<Item = cwtools_file_manager::file_manager::ParsedFile>,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    var_effects: Option<&HashSet<String>>,
+) -> TypeIndex {
+    let var_effects = var_effects.filter(|e| !e.is_empty());
+    let mut index = TypeIndex::new();
+    for file in files {
+        let path = file.path.to_str().unwrap_or("").to_string();
+        let pf = ParsedFile {
+            arena: file.arena,
+            root_children: file.root_children,
+            errors: vec![],
+        };
+        let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
+        index.merge(&path, instances);
+        if let Some(effects) = var_effects {
+            let mut names: Vec<String> = Vec::new();
+            collect_set_variable_names(&pf, table, effects, &mut names);
+            for n in &names {
+                index.var_index.add_name(n);
+            }
+        }
+    }
+    index
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Item 3 — Saved event targets with position
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1296,6 +1376,17 @@ pub struct FileInfo {
     pub inline_scripts: HashMap<String, SourceLocation>,
     /// All top-level keys.
     pub top_level_keys: Vec<(String, SourceLocation)>,
+    /// Order-independent hash of this file's exported type instances
+    /// (`(type, name)` pairs), computed at index time from the per-file
+    /// instance map so the cross-file "did exports change?" check doesn't have
+    /// to scan the global type index. See [`InfoService::export_fingerprint`].
+    pub export_instances_hash: u64,
+    /// Lowercased names of this file's exported type instances, captured at
+    /// index time from the per-file instance map. Combined with the variable /
+    /// event-target names (already on this struct) by
+    /// [`InfoService::export_names`] to scope the dependent sweep without
+    /// scanning the global index.
+    pub export_instance_names: HashSet<String>,
 }
 
 /// InfoService holds computed data for all files in a workspace.
@@ -1379,6 +1470,16 @@ impl InfoService {
         // second per-file copy on `FileInfo` (that doubled ~190K instances on
         // MD); document-symbol derives a file's instances from the index instead.
         let instances = collect_type_instances(ruleset, ast, logical_path, table);
+        // Hash this file's exported instances now, while we still hold the local
+        // per-type map, so the cross-file export check never has to scan the
+        // global index. Order-independent (wrapping_add) and stable for a given
+        // set of `(type, name)` pairs.
+        info.export_instances_hash = hash_instance_exports(&instances);
+        info.export_instance_names = instances
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|inst| inst.name.to_ascii_lowercase())
+            .collect();
         self.type_index.merge(uri, instances);
 
         // ── Rule-driven: defined variables ────────────────────────────────────
@@ -1431,6 +1532,54 @@ impl InfoService {
             .extend(info.inline_scripts.keys().cloned());
 
         self.files.insert(uri.to_string(), info);
+    }
+
+    /// Order-independent hash of the cross-file-visible symbols a file exports:
+    /// type instances, defined variables, and saved event targets. If this is
+    /// unchanged across an edit, no other file's diagnostics can change, so the
+    /// dependent sweep can be skipped.
+    ///
+    /// O(symbols-in-this-file): reads the precomputed instance hash plus the
+    /// file's variable/event-target lists, never scanning the global index.
+    /// Returns 0 for an unknown file (treated as "no exports").
+    pub fn export_fingerprint(&self, uri: &str) -> u64 {
+        let Some(fi) = self.files.get(uri) else {
+            return 0;
+        };
+        // wrapping_add combines symbols order-independently while preserving
+        // multiplicity (XOR would cancel a duplicated symbol to zero).
+        let mut acc: u64 = fi.export_instances_hash;
+        for (ns, vars) in &fi.defined_variables_ns {
+            for v in vars {
+                acc = acc.wrapping_add(mix_export_symbol(&["v", ns, &v.name]));
+            }
+        }
+        for et in &fi.saved_event_targets {
+            acc = acc.wrapping_add(mix_export_symbol(&["e", et]));
+        }
+        acc
+    }
+
+    /// The lowercased names of every cross-file-visible symbol a file exports:
+    /// type instances, defined variables, and saved event targets. Used to scope
+    /// the dependent sweep to the open docs that actually reference a name that
+    /// changed. O(symbols-in-file): instance names come from the global index
+    /// filtered to this file (cheap relative to a full revalidation), the rest
+    /// from the file's own `FileInfo`.
+    pub fn export_names(&self, uri: &str) -> HashSet<String> {
+        let mut names = HashSet::new();
+        if let Some(fi) = self.files.get(uri) {
+            names.extend(fi.export_instance_names.iter().cloned());
+            for vars in fi.defined_variables_ns.values() {
+                for v in vars {
+                    names.insert(v.name.to_ascii_lowercase());
+                }
+            }
+            for et in &fi.saved_event_targets {
+                names.insert(et.to_ascii_lowercase());
+            }
+        }
+        names
     }
 
     /// Remove a file from all indexes.
@@ -1922,6 +2071,30 @@ mod tests {
 
         idx.remove_file("file://b.txt");
         assert!(!idx.is_any_instance("GER_some_char"));
+    }
+
+    #[test]
+    fn test_contains_case_insensitive() {
+        // Paradox identifiers are case-insensitive: a reference in any case must
+        // resolve to a definition in any case (both `contains` and the
+        // `is_any_instance` refcount index agree on lowercase normalization).
+        let mut idx = TypeIndex::new();
+        let mut map = HashMap::new();
+        map.insert(
+            "ai_behavior".to_string(),
+            vec![TypeInstance {
+                name: "LBA_ai_behavior".to_string(),
+                location: SourceLocation { line: 1, col: 0 },
+            }],
+        );
+        idx.merge("file://a.txt", map);
+        assert!(idx.contains("ai_behavior", "LBA_AI_BEHAVIOR"));
+        assert!(idx.contains("ai_behavior", "lba_ai_behavior"));
+        assert!(idx.is_any_instance("LBA_AI_BEHAVIOR"));
+        // Removing the only definition clears both indexes regardless of case.
+        idx.remove_file("file://a.txt");
+        assert!(!idx.contains("ai_behavior", "LBA_ai_behavior"));
+        assert!(!idx.is_any_instance("lba_ai_behavior"));
     }
 
     // ── Item 2 — defined variables ────────────────────────────────────────────

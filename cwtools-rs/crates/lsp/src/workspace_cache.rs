@@ -5,9 +5,7 @@
 //! game type, ruleset shape, and workspace root so the entire cache is cleared
 //! automatically when any of those change.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use cwtools_cache::convert::{arena_to_cached, cached_to_arena};
@@ -16,58 +14,86 @@ use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 
-/// Cache format version. Bump when the `CachedFile` layout changes so stale
-/// `.cwb` files are ignored automatically.
-const CACHE_VERSION: u32 = 1;
+/// Cache format version. Bump when the `CachedFile` layout changes (or the
+/// fingerprint algorithm changes) so stale `.cwb` files are ignored
+/// automatically.
+///
+/// v2: switched fingerprinting from `DefaultHasher` (SipHash, toolchain-unstable)
+/// to a stable FNV-1a. The version is folded into the fingerprint, so old
+/// SipHash-keyed cache directories no longer match and are treated as a miss
+/// (one-time cold rebuild).
+const CACHE_VERSION: u32 = 2;
 
 // ── Fingerprinting ──────────────────────────────────────────────────────────
+
+/// FNV-1a over `bytes`, continuing from `hash`. A stable, dependency-free hash
+/// (unlike `std::hash::DefaultHasher`, whose SipHash output isn't guaranteed
+/// stable across Rust toolchains) so cache keys stay comparable across restarts.
+/// Mirrors `cwtools_info::vanilla_cache::fnv1a`.
+fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// FNV-1a offset basis — the conventional seed for a fresh hash.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// Content hash of a file's text. FNV-1a is fast for short-to-medium files and
 /// the collision surface is tiny (local cache only, not security-critical).
 pub fn content_hash(text: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
+    fnv1a(text.as_bytes(), FNV_OFFSET)
 }
 
 /// Settings fingerprint: encodes everything that changes the parse or validation
 /// output for a workspace. If the fingerprint differs from `settings.sig`, the
 /// cached workspace directory is stale and must be cleared.
 pub fn settings_fingerprint(language: &str, ruleset: &RuleSet, workspace_root: &Path) -> u64 {
-    let mut h = DefaultHasher::new();
+    // A record separator between fields so concatenation is unambiguous
+    // (`a` + `bc` can't collide with `ab` + `c`).
+    let mut h = FNV_OFFSET;
+    let sep = |h: u64| fnv1a(b"\x1e", h);
     // Game/language — changes scope definitions, keywords, etc.
-    language.hash(&mut h);
+    h = fnv1a(language.as_bytes(), h);
+    h = sep(h);
     // Workspace root — distinguishes two mods opened in different windows that
     // happen to share the same ruleset.
-    workspace_root.hash(&mut h);
+    h = fnv1a(workspace_root.to_string_lossy().as_bytes(), h);
+    h = sep(h);
     // Ruleset shape — we can't hash the full RuleSet cheaply (no Hash impl),
     // so hash the counts and names of its top-level components. This is a
     // fast approximation; if two rulesets have identical shape they almost
     // certainly produce identical parse/validation output.
-    ruleset.types.len().hash(&mut h);
+    h = fnv1a(&ruleset.types.len().to_le_bytes(), h);
     for t in &ruleset.types {
-        t.name.hash(&mut h);
+        h = fnv1a(t.name.as_bytes(), h);
+        h = sep(h);
     }
-    ruleset.aliases.len().hash(&mut h);
+    h = fnv1a(&ruleset.aliases.len().to_le_bytes(), h);
     for (name, _) in &ruleset.aliases {
-        name.hash(&mut h);
+        h = fnv1a(name.as_bytes(), h);
+        h = sep(h);
     }
-    ruleset.single_aliases.len().hash(&mut h);
+    h = fnv1a(&ruleset.single_aliases.len().to_le_bytes(), h);
     for (name, _) in &ruleset.single_aliases {
-        name.hash(&mut h);
+        h = fnv1a(name.as_bytes(), h);
+        h = sep(h);
     }
-    ruleset.enums.len().hash(&mut h);
+    h = fnv1a(&ruleset.enums.len().to_le_bytes(), h);
     for e in &ruleset.enums {
-        e.key.hash(&mut h);
+        h = fnv1a(e.key.as_bytes(), h);
+        h = sep(h);
     }
-    ruleset.complex_enums.len().hash(&mut h);
-    ruleset.root_rules.len().hash(&mut h);
-    ruleset.modifiers.len().hash(&mut h);
-    ruleset.link_inputs.len().hash(&mut h);
-    ruleset.scope_inputs.len().hash(&mut h);
+    h = fnv1a(&ruleset.complex_enums.len().to_le_bytes(), h);
+    h = fnv1a(&ruleset.root_rules.len().to_le_bytes(), h);
+    h = fnv1a(&ruleset.modifiers.len().to_le_bytes(), h);
+    h = fnv1a(&ruleset.link_inputs.len().to_le_bytes(), h);
+    h = fnv1a(&ruleset.scope_inputs.len().to_le_bytes(), h);
     // Bump version together so a format change also invalidates.
-    CACHE_VERSION.hash(&mut h);
-    h.finish()
+    fnv1a(&CACHE_VERSION.to_le_bytes(), h)
 }
 
 // ── Directory layout ────────────────────────────────────────────────────────
@@ -118,7 +144,12 @@ fn write_settings_sig(dir: &Path, sig: u64) {
 pub fn validate_or_clear(cache_dir: &Path, fingerprint: u64) -> bool {
     let dir = workspace_cache_dir(cache_dir, fingerprint);
     match read_settings_sig(&dir) {
-        Some(stored) if stored == fingerprint => true,
+        Some(stored) if stored == fingerprint => {
+            // Valid cache: evict stale-content `.cwb` entries if the dir has
+            // grown past the cap. (A cleared dir below is already empty.)
+            prune_cache_dir(&dir);
+            true
+        }
         _ => {
             // Stale or missing — wipe the directory and recreate.
             let _ = fs::remove_dir_all(&dir);
@@ -127,6 +158,87 @@ pub fn validate_or_clear(cache_dir: &Path, fingerprint: u64) -> bool {
             false
         }
     }
+}
+
+// ── Bounded cleanup ───────────────────────────────────────────────────────────
+
+/// Cap on the number of `.cwb` entries kept in a single workspace cache dir.
+/// Each file's content hash gets its own entry and nothing is evicted on edit,
+/// so without a bound, every distinct version of every file accumulates forever.
+const MAX_CACHE_ENTRIES: usize = 50_000;
+
+/// Cap on total `.cwb` bytes in a single workspace cache dir.
+const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Prune to ~80% of the caps so we don't re-prune on every scan.
+const PRUNE_TARGET_RATIO: f64 = 0.8;
+
+/// If the cache dir exceeds either cap (entry count or total size), delete the
+/// oldest `.cwb` entries by mtime until it's back under ~80% of both caps. One
+/// directory scan; runs at most once per workspace scan. No-op when under cap.
+fn prune_cache_dir(dir: &Path) {
+    prune_cache_dir_with_caps(dir, MAX_CACHE_ENTRIES, MAX_CACHE_BYTES);
+}
+
+/// Cap-parameterized core of [`prune_cache_dir`] (lets tests use small caps
+/// instead of writing 50k files).
+fn prune_cache_dir_with_caps(dir: &Path, max_entries: usize, max_bytes: u64) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    // (mtime, size, path) for each `.cwb` entry.
+    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "cwb") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let size = meta.len();
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        total_bytes += size;
+        entries.push((mtime, size, path));
+    }
+
+    let over_count = entries.len() > max_entries;
+    let over_bytes = total_bytes > max_bytes;
+    if !over_count && !over_bytes {
+        return;
+    }
+
+    // Oldest first, so we evict least-recently-written entries.
+    entries.sort_by_key(|(mtime, _, _)| *mtime);
+
+    let target_count = (max_entries as f64 * PRUNE_TARGET_RATIO) as usize;
+    let target_bytes = (max_bytes as f64 * PRUNE_TARGET_RATIO) as u64;
+    let mut cur_count = entries.len();
+    let mut cur_bytes = total_bytes;
+    let mut pruned_count = 0usize;
+    let mut pruned_bytes = 0u64;
+
+    for (_, size, path) in &entries {
+        if cur_count <= target_count && cur_bytes <= target_bytes {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            cur_count -= 1;
+            cur_bytes = cur_bytes.saturating_sub(*size);
+            pruned_count += 1;
+            pruned_bytes += *size;
+        }
+    }
+
+    tracing::info!(
+        dir = %dir.display(),
+        pruned_entries = pruned_count,
+        pruned_bytes,
+        remaining_entries = cur_count,
+        remaining_bytes = cur_bytes,
+        "pruned parse cache (over {} entries or {} bytes)",
+        max_entries,
+        max_bytes,
+    );
 }
 
 // ── Per-file load / store ───────────────────────────────────────────────────
@@ -334,6 +446,57 @@ mod tests {
                 out.push(p);
             }
         }
+    }
+
+    #[test]
+    fn prune_cache_dir_evicts_oldest_over_entry_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let max_entries = 10usize;
+        // Write more `.cwb` files than the (small) cap, staggered mtimes.
+        let n = max_entries + 5;
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(n as u64 + 10);
+        let mut paths = Vec::with_capacity(n);
+        for i in 0..n {
+            let p = dir.join(format!("{:016x}.cwb", i as u64));
+            fs::write(&p, b"x").unwrap();
+            filetime_set(&p, base + std::time::Duration::from_secs(i as u64));
+            paths.push(p);
+        }
+        assert_eq!(count_cwb(dir), n);
+        prune_cache_dir_with_caps(dir, max_entries, u64::MAX);
+        let remaining = count_cwb(dir);
+        // Pruned down to ~80% of the cap.
+        let target = (max_entries as f64 * PRUNE_TARGET_RATIO) as usize;
+        assert!(remaining <= target + 1, "pruned to {remaining}, want ~{target}");
+        // The oldest entries are gone; the newest survives.
+        assert!(paths.last().unwrap().exists(), "newest entry was evicted");
+        assert!(!paths.first().unwrap().exists(), "oldest entry survived");
+    }
+
+    #[test]
+    fn prune_cache_dir_noop_under_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for i in 0..10u64 {
+            fs::write(dir.join(format!("{:016x}.cwb", i)), b"x").unwrap();
+        }
+        prune_cache_dir_with_caps(dir, 50, u64::MAX);
+        assert_eq!(count_cwb(dir), 10);
+    }
+
+    fn count_cwb(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "cwb"))
+            .count()
+    }
+
+    fn filetime_set(path: &Path, t: std::time::SystemTime) {
+        // Set mtime via `File::set_modified` (stable since 1.75), no extra crate.
+        let f = fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
     }
 
     #[test]
