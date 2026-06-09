@@ -8,8 +8,8 @@ pub mod inline_expansion;
 // The index half of this crate now lives in `cwtools_index`. Re-export it so
 // existing `cwtools_info::TypeIndex` / `cwtools_info::collect_type_instances`
 // (and the rest) keep resolving for the LSP/CLI callers.
-pub use cwtools_index::*;
 pub use cwtools_index::vanilla_cache;
+pub use cwtools_index::*;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Item 4 — Position query for hover / goto-definition
@@ -96,9 +96,10 @@ fn find_element_in_children(
                     let key = table.get_string(leaf.key.normal).unwrap_or_default();
                     let value = leaf_value_string(&leaf.value, table);
                     if let Value::Clause(ch) = &leaf.value
-                        && let Some(inner) = find_element_in_children(ch, arena, target, table) {
-                            return Some(inner);
-                        }
+                        && let Some(inner) = find_element_in_children(ch, arena, target, table)
+                    {
+                        return Some(inner);
+                    }
                     return Some(PositionElement::Leaf { key, value });
                 }
             }
@@ -204,9 +205,9 @@ fn find_pos_in_children(
                     if let Value::Clause(ch) = &leaf.value
                         && let Some(inner) =
                             find_pos_in_children(ch, arena, target, table, ruleset, logical_path)
-                        {
-                            return Some(inner);
-                        }
+                    {
+                        return Some(inner);
+                    }
                     let hint = classify_leaf_value(&key, &value, ruleset, logical_path, table);
                     return Some(PositionInfo {
                         location: SourceLocation {
@@ -291,12 +292,13 @@ fn classify_leaf_value(
 
         // Only try path-matching type rules
         if let cwtools_rules::rules_types::RootRule::TypeRule(..) = root_rule
-            && let Some(&idx) = ruleset.type_by_name.get(name) {
-                let td = &ruleset.types[idx];
-                if !check_path_dir(&td.path_options, logical_path) {
-                    continue;
-                }
+            && let Some(&idx) = ruleset.type_by_name.get(name)
+        {
+            let td = &ruleset.types[idx];
+            if !check_path_dir(&td.path_options, logical_path) {
+                continue;
             }
+        }
 
         for (inner_rule, _) in rules {
             if let RuleType::LeafRule { left, right } = inner_rule {
@@ -737,39 +739,41 @@ impl InfoService {
                 }
 
                 if (key == "save_event_target_as" || key == "save_global_event_target_as")
-                    && !value_str.is_empty() {
-                        info.saved_event_targets_detailed.push(SavedEventTarget {
-                            name: value_str.clone(),
-                            location: SourceLocation {
-                                line: leaf.pos.start.line,
-                                col: leaf.pos.start.col,
-                            },
-                            is_global: key == "save_global_event_target_as",
-                        });
-                    }
+                    && !value_str.is_empty()
+                {
+                    info.saved_event_targets_detailed.push(SavedEventTarget {
+                        name: value_str.clone(),
+                        location: SourceLocation {
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                        },
+                        is_global: key == "save_global_event_target_as",
+                    });
+                }
 
                 if key == "inline_script"
-                    && let Value::Clause(children) = &leaf.value {
-                        for c in children {
-                            if let Child::Leaf(script_idx) = c {
-                                let script_leaf = &arena.leaves[*script_idx as usize];
-                                let script_key =
-                                    table.get_string(script_leaf.key.normal).unwrap_or_default();
-                                if script_key == "script" {
-                                    let script_name = leaf_value_string(&script_leaf.value, table);
-                                    if !script_name.is_empty() {
-                                        info.inline_scripts.insert(
-                                            script_name,
-                                            SourceLocation {
-                                                line: script_leaf.pos.start.line,
-                                                col: script_leaf.pos.start.col,
-                                            },
-                                        );
-                                    }
+                    && let Value::Clause(children) = &leaf.value
+                {
+                    for c in children {
+                        if let Child::Leaf(script_idx) = c {
+                            let script_leaf = &arena.leaves[*script_idx as usize];
+                            let script_key =
+                                table.get_string(script_leaf.key.normal).unwrap_or_default();
+                            if script_key == "script" {
+                                let script_name = leaf_value_string(&script_leaf.value, table);
+                                if !script_name.is_empty() {
+                                    info.inline_scripts.insert(
+                                        script_name,
+                                        SourceLocation {
+                                            line: script_leaf.pos.start.line,
+                                            col: script_leaf.pos.start.col,
+                                        },
+                                    );
                                 }
                             }
                         }
                     }
+                }
 
                 if key == "effect" || key.ends_with("_effect") {
                     info.effect_blocks.push(SourceLocation {

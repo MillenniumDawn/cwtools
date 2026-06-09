@@ -542,18 +542,19 @@ impl<'a> Parser<'a> {
             // No operator — check for shorthand `key { ... }`
             self.skip_whitespace();
             if let Some('{') = self.peek()
-                && let Some(value) = self.parse_clause() {
-                    let end = self.pos();
-                    let leaf = Leaf {
-                        key,
-                        value,
-                        op: Operator::Equals,
-                        pos: SourceRange { start: saved, end },
-                    };
-                    let idx = self.arena.push_leaf(leaf);
-                    out.push(Child::Leaf(idx));
-                    return;
-                }
+                && let Some(value) = self.parse_clause()
+            {
+                let end = self.pos();
+                let leaf = Leaf {
+                    key,
+                    value,
+                    op: Operator::Equals,
+                    pos: SourceRange { start: saved, end },
+                };
+                let idx = self.arena.push_leaf(leaf);
+                out.push(Child::Leaf(idx));
+                return;
+            }
             // Not a key=value or shorthand; restore and try leaf-value
             self.chars = saved_chars;
             self.line = saved.line;

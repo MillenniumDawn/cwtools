@@ -72,25 +72,28 @@ fn index_vanilla_dir(
 fn default_cache_dir() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
     if let Ok(x) = std::env::var("XDG_CACHE_HOME")
-        && !x.is_empty() {
-            return Some(PathBuf::from(x).join("cwtools"));
-        }
+        && !x.is_empty()
+    {
+        return Some(PathBuf::from(x).join("cwtools"));
+    }
     if let Ok(la) = std::env::var("LOCALAPPDATA")
-        && !la.is_empty() {
-            return Some(PathBuf::from(la).join("cwtools"));
-        }
+        && !la.is_empty()
+    {
+        return Some(PathBuf::from(la).join("cwtools"));
+    }
     if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty() {
-            let home = PathBuf::from(home);
-            #[cfg(target_os = "macos")]
-            {
-                return Some(home.join("Library/Caches/cwtools"));
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                return Some(home.join(".cache/cwtools"));
-            }
+        && !home.is_empty()
+    {
+        let home = PathBuf::from(home);
+        #[cfg(target_os = "macos")]
+        {
+            return Some(home.join("Library/Caches/cwtools"));
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Some(home.join(".cache/cwtools"));
+        }
+    }
     Some(std::env::temp_dir().join("cwtools"))
 }
 
@@ -410,10 +413,9 @@ fn find_rule_description(rules: &RuleSet, key: &str) -> (Option<String>, Vec<Str
                 | RuleType::NodeRule {
                     left: NewField::SpecificField(k),
                     ..
+                } if k.eq_ignore_ascii_case(key) => {
+                    return (opts.description.clone(), opts.required_scopes.clone());
                 }
-                    if k.eq_ignore_ascii_case(key) => {
-                        return (opts.description.clone(), opts.required_scopes.clone());
-                    }
                 _ => {}
             }
         }
@@ -462,14 +464,15 @@ fn collect_enclosing_path(
             Child::Leaf(idx) => {
                 let leaf = &arena.leaves[*idx as usize];
                 if let Value::Clause(ch) = &leaf.value
-                    && pos_in_range_simple(target, &leaf.pos) {
-                        let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                        path.push(key);
-                        if collect_enclosing_path(ch, arena, target, table, path) {
-                            return true;
-                        }
+                    && pos_in_range_simple(target, &leaf.pos)
+                {
+                    let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                    path.push(key);
+                    if collect_enclosing_path(ch, arena, target, table, path) {
                         return true;
                     }
+                    return true;
+                }
             }
             _ => {}
         }
@@ -583,10 +586,9 @@ fn descend_rules<'a>(
                 left: NewField::AliasValueKeysField(k),
                 rules: inner,
                 ..
+            } if k.eq_ignore_ascii_case(next_key) => {
+                return descend_rules(inner, &remaining[1..]);
             }
-                if k.eq_ignore_ascii_case(next_key) => {
-                    return descend_rules(inner, &remaining[1..]);
-                }
             _ => {}
         }
     }
@@ -903,9 +905,10 @@ fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<CompletionIt
         // Add subtype typeKeyField alternatives.
         for st in &td.subtypes {
             if let Some(tkf) = &st.type_key_field
-                && !openers.contains(tkf) {
-                    openers.push(tkf.clone());
-                }
+                && !openers.contains(tkf)
+            {
+                openers.push(tkf.clone());
+            }
         }
 
         // Find the TypeRule for this type to get child rules for snippet body.
@@ -952,7 +955,9 @@ fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<CompletionIt
 fn loc_completions(info: &cwtools_info::InfoService, language: &str) -> Vec<CompletionItem> {
     // Collect all top-level keys from all files as potential loc keys
     let mut items: Vec<CompletionItem> = info
-        .files.values().flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
+        .files
+        .values()
+        .flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .map(|k| CompletionItem {
@@ -1164,9 +1169,10 @@ impl LanguageServer for Backend {
 
         // Store workspace URI if provided
         if let Some(folders) = &params.workspace_folders
-            && let Some(first) = folders.first() {
-                *self.state.workspace_uri.lock() = Some(first.uri.to_string());
-            }
+            && let Some(first) = folders.first()
+        {
+            *self.state.workspace_uri.lock() = Some(first.uri.to_string());
+        }
 
         // Per-workspace ignore globs from the extension. The extension
         // forwards `cwtools.ignore.filePatterns` and `cwtools.ignore.directories`
@@ -1392,69 +1398,69 @@ impl LanguageServer for Backend {
 
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri)
-            && let Some(ast) = &doc.ast {
-                let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
-                let lsp_col = pos.character as u16;
+            && let Some(ast) = &doc.ast
+        {
+            let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
+            let lsp_col = pos.character as u16;
 
-                let ws_uri = self.state.workspace_uri.lock().clone();
-                let logical_path = logical_path_from_uri(&uri, &ws_uri);
+            let ws_uri = self.state.workspace_uri.lock().clone();
+            let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-                let ruleset_guard = self.state.ruleset.lock();
-                let pos_info = if let Some(rs) = ruleset_guard.as_ref() {
-                    info_at_position(
-                        ast,
-                        lsp_line,
-                        lsp_col,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    )
-                } else {
-                    // No rules: fall back to position-only lookup
-                    None
-                };
-                drop(ruleset_guard);
-
-                if let Some(info) = pos_info {
-                    let ruleset_guard2 = self.state.ruleset.lock();
-                    let md =
-                        build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: md,
-                        }),
-                        range: None,
-                    }));
-                }
-
-                // Fallback: no-rule position finder
-                if let Some(element) = element_at_position(
+            let ruleset_guard = self.state.ruleset.lock();
+            let pos_info = if let Some(rs) = ruleset_guard.as_ref() {
+                info_at_position(
                     ast,
-                    pos.line + 1,
-                    pos.character as u16,
+                    lsp_line,
+                    lsp_col,
+                    rs,
+                    &logical_path,
                     &self.state.string_table,
-                ) {
-                    let contents = match element {
-                        PositionElement::Node { key } => {
-                            format!("**Node**: `{}`", key)
-                        }
-                        PositionElement::Leaf { key, value } => {
-                            format!("**Field**: `{} = {}`", key, value)
-                        }
-                        PositionElement::LeafValue { value } => {
-                            format!("**Value**: `{}`", value)
-                        }
-                    };
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: contents,
-                        }),
-                        range: None,
-                    }));
-                }
+                )
+            } else {
+                // No rules: fall back to position-only lookup
+                None
+            };
+            drop(ruleset_guard);
+
+            if let Some(info) = pos_info {
+                let ruleset_guard2 = self.state.ruleset.lock();
+                let md = build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: md,
+                    }),
+                    range: None,
+                }));
             }
+
+            // Fallback: no-rule position finder
+            if let Some(element) = element_at_position(
+                ast,
+                pos.line + 1,
+                pos.character as u16,
+                &self.state.string_table,
+            ) {
+                let contents = match element {
+                    PositionElement::Node { key } => {
+                        format!("**Node**: `{}`", key)
+                    }
+                    PositionElement::Leaf { key, value } => {
+                        format!("**Field**: `{} = {}`", key, value)
+                    }
+                    PositionElement::LeafValue { value } => {
+                        format!("**Value**: `{}`", value)
+                    }
+                };
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: contents,
+                    }),
+                    range: None,
+                }));
+            }
+        }
         Ok(None)
     }
 
@@ -1649,44 +1655,45 @@ impl LanguageServer for Backend {
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri)
             && let Some(ast) = &doc.ast
-                && let Some(element) = element_at_position(
-                    ast,
-                    pos.line + 1,
-                    pos.character as u16,
-                    &self.state.string_table,
-                ) {
-                    let symbol = match &element {
-                        PositionElement::Node { key } => key.clone(),
-                        PositionElement::Leaf { key, .. } => key.clone(),
-                        PositionElement::LeafValue { value } => value.clone(),
-                    };
-                    drop(docs);
-                    let info = self.state.info_service.read();
-                    if let Some(defs) = info.find_definitions(&symbol) {
-                        let locations: Vec<Location> = defs
-                            .iter()
-                            .map(|(file_uri, loc)| Location {
-                                uri: parse_uri(
-                                    file_uri,
-                                    &params.text_document_position_params.text_document.uri,
-                                ),
-                                range: Range {
-                                    start: Position {
-                                        line: loc.line.saturating_sub(1),
-                                        character: loc.col as u32,
-                                    },
-                                    end: Position {
-                                        line: loc.line.saturating_sub(1),
-                                        character: (loc.col + symbol.len() as u16) as u32,
-                                    },
-                                },
-                            })
-                            .collect();
-                        if !locations.is_empty() {
-                            return Ok(Some(GotoDefinitionResponse::Array(locations)));
-                        }
-                    }
+            && let Some(element) = element_at_position(
+                ast,
+                pos.line + 1,
+                pos.character as u16,
+                &self.state.string_table,
+            )
+        {
+            let symbol = match &element {
+                PositionElement::Node { key } => key.clone(),
+                PositionElement::Leaf { key, .. } => key.clone(),
+                PositionElement::LeafValue { value } => value.clone(),
+            };
+            drop(docs);
+            let info = self.state.info_service.read();
+            if let Some(defs) = info.find_definitions(&symbol) {
+                let locations: Vec<Location> = defs
+                    .iter()
+                    .map(|(file_uri, loc)| Location {
+                        uri: parse_uri(
+                            file_uri,
+                            &params.text_document_position_params.text_document.uri,
+                        ),
+                        range: Range {
+                            start: Position {
+                                line: loc.line.saturating_sub(1),
+                                character: loc.col as u32,
+                            },
+                            end: Position {
+                                line: loc.line.saturating_sub(1),
+                                character: (loc.col + symbol.len() as u16) as u32,
+                            },
+                        },
+                    })
+                    .collect();
+                if !locations.is_empty() {
+                    return Ok(Some(GotoDefinitionResponse::Array(locations)));
                 }
+            }
+        }
         Ok(None)
     }
 
@@ -1802,78 +1809,73 @@ impl LanguageServer for Backend {
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri)
             && let Some(ast) = &doc.ast
-                && let Some(element) = element_at_position(
-                    ast,
-                    pos.line + 1,
-                    pos.character as u16,
-                    &self.state.string_table,
-                ) {
-                    let symbol = match &element {
-                        PositionElement::Node { key } => key.clone(),
-                        PositionElement::Leaf { key, .. } => key.clone(),
-                        PositionElement::LeafValue { value } => value.clone(),
-                    };
-                    drop(docs);
-                    let info = self.state.info_service.read();
-                    let mut all_locs = Vec::new();
-                    if let Some(defs) = info.find_definitions(&symbol) {
-                        all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
-                            uri: parse_uri(
-                                file_uri,
-                                &params.text_document_position.text_document.uri,
-                            ),
-                            range: Range {
-                                start: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: loc.col as u32,
-                                },
-                                end: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: (loc.col + symbol.len() as u16) as u32,
-                                },
-                            },
-                        }));
-                    }
-                    if let Some(refs) = info.find_references(&symbol) {
-                        all_locs.extend(refs.iter().map(|(file_uri, loc)| Location {
-                            uri: parse_uri(
-                                file_uri,
-                                &params.text_document_position.text_document.uri,
-                            ),
-                            range: Range {
-                                start: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: loc.col as u32,
-                                },
-                                end: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: (loc.col + symbol.len() as u16) as u32,
-                                },
-                            },
-                        }));
-                    }
-                    let index = self.state.symbol_index.lock();
-                    if let Some(locs) = index.find_references(&symbol) {
-                        all_locs.extend(locs.iter().map(|l| Location {
-                            uri: l.uri.parse().unwrap_or_else(|_| {
-                                params.text_document_position.text_document.uri.clone()
-                            }),
-                            range: Range {
-                                start: Position {
-                                    line: l.line.saturating_sub(1),
-                                    character: l.col as u32,
-                                },
-                                end: Position {
-                                    line: l.line.saturating_sub(1),
-                                    character: (l.col + symbol.len() as u16) as u32,
-                                },
-                            },
-                        }));
-                    }
-                    if !all_locs.is_empty() {
-                        return Ok(Some(all_locs));
-                    }
-                }
+            && let Some(element) = element_at_position(
+                ast,
+                pos.line + 1,
+                pos.character as u16,
+                &self.state.string_table,
+            )
+        {
+            let symbol = match &element {
+                PositionElement::Node { key } => key.clone(),
+                PositionElement::Leaf { key, .. } => key.clone(),
+                PositionElement::LeafValue { value } => value.clone(),
+            };
+            drop(docs);
+            let info = self.state.info_service.read();
+            let mut all_locs = Vec::new();
+            if let Some(defs) = info.find_definitions(&symbol) {
+                all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
+                    uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
+                    range: Range {
+                        start: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: loc.col as u32,
+                        },
+                        end: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: (loc.col + symbol.len() as u16) as u32,
+                        },
+                    },
+                }));
+            }
+            if let Some(refs) = info.find_references(&symbol) {
+                all_locs.extend(refs.iter().map(|(file_uri, loc)| Location {
+                    uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
+                    range: Range {
+                        start: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: loc.col as u32,
+                        },
+                        end: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: (loc.col + symbol.len() as u16) as u32,
+                        },
+                    },
+                }));
+            }
+            let index = self.state.symbol_index.lock();
+            if let Some(locs) = index.find_references(&symbol) {
+                all_locs.extend(locs.iter().map(|l| Location {
+                    uri: l.uri.parse().unwrap_or_else(|_| {
+                        params.text_document_position.text_document.uri.clone()
+                    }),
+                    range: Range {
+                        start: Position {
+                            line: l.line.saturating_sub(1),
+                            character: l.col as u32,
+                        },
+                        end: Position {
+                            line: l.line.saturating_sub(1),
+                            character: (l.col + symbol.len() as u16) as u32,
+                        },
+                    },
+                }));
+            }
+            if !all_locs.is_empty() {
+                return Ok(Some(all_locs));
+            }
+        }
         Ok(None)
     }
 
@@ -2325,7 +2327,13 @@ impl Backend {
                     } else if let Some(parsed) = self.index_document(&uri, &text).await {
                         // Cache miss — parse + index, then persist for next scan.
                         if let Some((ref cd, fp)) = cache_info {
-                            workspace_cache::store(cd, fp, &text, &parsed, &self.state.string_table);
+                            workspace_cache::store(
+                                cd,
+                                fp,
+                                &text,
+                                &parsed,
+                                &self.state.string_table,
+                            );
                         }
                         cache_misses += 1;
                         Some(parsed)
@@ -2444,18 +2452,20 @@ impl Backend {
             let enum_map = scan_ruleset.as_ref().map(|rs| build_enum_map(rs));
             // One Prepared for the whole batch (None if the ruleset isn't loaded).
             // It is Copy + all-borrows, so it is shared freely across rayon threads.
-            let prepared = scan_ruleset.as_ref().zip(enum_map.as_ref()).map(
-                |(ruleset, enum_map)| Prepared {
-                    ruleset,
-                    table: &self.state.string_table,
-                    game: scan_game,
-                    type_index: Some(type_index),
-                    modifier_keys: Some(&modifier_keys_snap),
-                    loc_index,
-                    registry,
-                    enum_map,
-                },
-            );
+            let prepared =
+                scan_ruleset
+                    .as_ref()
+                    .zip(enum_map.as_ref())
+                    .map(|(ruleset, enum_map)| Prepared {
+                        ruleset,
+                        table: &self.state.string_table,
+                        game: scan_game,
+                        type_index: Some(type_index),
+                        modifier_keys: Some(&modifier_keys_snap),
+                        loc_index,
+                        registry,
+                        enum_map,
+                    });
 
             files_to_validate
                 .par_iter()
@@ -2466,7 +2476,11 @@ impl Backend {
                     let uri = format!("file://{}", file_path.display());
                     let diagnostics = match &prepared {
                         Some(prepared) => validate_parsed_with_indexes(&uri, parsed, prepared),
-                        None => parsed.errors.iter().map(parse_error_to_diagnostic).collect(),
+                        None => parsed
+                            .errors
+                            .iter()
+                            .map(parse_error_to_diagnostic)
+                            .collect(),
                     };
                     Some((uri, diagnostics))
                 })
@@ -2637,7 +2651,10 @@ impl Backend {
         let mut tokens = self.state.doc_tokens.write();
         match ast {
             Some(ast) => {
-                tokens.insert(uri.to_string(), collect_doc_tokens(ast, &self.state.string_table));
+                tokens.insert(
+                    uri.to_string(),
+                    collect_doc_tokens(ast, &self.state.string_table),
+                );
             }
             None => {
                 tokens.remove(uri);
@@ -2733,10 +2750,11 @@ impl Backend {
             let ast = parsed.map(Arc::new);
             let mut docs = self.state.documents.lock();
             if let Some(d) = docs.get_mut(&uri)
-                && d.version == expected_version {
-                    self.update_doc_tokens(&uri, ast.as_ref());
-                    d.ast = ast;
-                }
+                && d.version == expected_version
+            {
+                self.update_doc_tokens(&uri, ast.as_ref());
+                d.ast = ast;
+            }
         }
         if let Ok(uri_obj) = Url::parse(&uri) {
             self.client
@@ -3133,47 +3151,48 @@ impl Backend {
 
         // Try a fresh cache first — skip parsing the whole base game entirely.
         if let Some(cp) = &cache_path
-            && cp.exists() {
-                match cwtools_info::vanilla_cache::load(cp) {
-                    Ok((cache_game, cache_fp, per_type))
-                        if cache_game == game && cache_fp == fingerprint =>
-                    {
-                        let total: usize = per_type.values().map(|v| v.len()).sum();
-                        *self.state.vanilla_index.lock() = Some(per_type);
-                        self.client
-                            .log_message(
-                                MessageType::INFO,
-                                format!(
-                                    "Loaded {} base-game instances from cache {} ({})",
-                                    total,
-                                    cp.display(),
-                                    fingerprint
-                                ),
-                            )
-                            .await;
-                        return;
-                    }
-                    Ok((_, cache_fp, _)) => {
-                        self.client
-                            .log_message(
-                                MessageType::INFO,
-                                format!(
-                                    "Vanilla cache stale (cached {}, install {}); rebuilding",
-                                    cache_fp, fingerprint
-                                ),
-                            )
-                            .await;
-                    }
-                    Err(e) => {
-                        self.client
-                            .log_message(
-                                MessageType::WARNING,
-                                format!("Could not load vanilla cache {}: {}", cp.display(), e),
-                            )
-                            .await;
-                    }
+            && cp.exists()
+        {
+            match cwtools_info::vanilla_cache::load(cp) {
+                Ok((cache_game, cache_fp, per_type))
+                    if cache_game == game && cache_fp == fingerprint =>
+                {
+                    let total: usize = per_type.values().map(|v| v.len()).sum();
+                    *self.state.vanilla_index.lock() = Some(per_type);
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "Loaded {} base-game instances from cache {} ({})",
+                                total,
+                                cp.display(),
+                                fingerprint
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+                Ok((_, cache_fp, _)) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "Vanilla cache stale (cached {}, install {}); rebuilding",
+                                cache_fp, fingerprint
+                            ),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("Could not load vanilla cache {}: {}", cp.display(), e),
+                        )
+                        .await;
                 }
             }
+        }
 
         self.send_loading_bar(true, "Indexing base game…").await;
         self.client
@@ -3431,12 +3450,13 @@ fn is_type_ref_leaf(
         // For TypeRules, check path filter
         if let RootRule::TypeRule(..) = root_rule
             && let Some(name) = rule_type_name
-                && let Some(&idx) = ruleset.type_by_name.get(name) {
-                    let td = &ruleset.types[idx];
-                    if !cwtools_info_path_check(&td.path_options, logical_path) {
-                        continue;
-                    }
-                }
+            && let Some(&idx) = ruleset.type_by_name.get(name)
+        {
+            let td = &ruleset.types[idx];
+            if !cwtools_info_path_check(&td.path_options, logical_path) {
+                continue;
+            }
+        }
 
         let rules = match rule_type {
             RuleType::NodeRule { rules, .. } => rules.as_slice(),
@@ -3448,9 +3468,11 @@ fn is_type_ref_leaf(
                 left: NewField::SpecificField(k),
                 right: NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)),
             } = inner
-                && k.eq_ignore_ascii_case(leaf_key) && t == type_name {
-                    return true;
-                }
+                && k.eq_ignore_ascii_case(leaf_key)
+                && t == type_name
+            {
+                return true;
+            }
         }
     }
     false
@@ -3781,9 +3803,10 @@ mod tests {
         // Add a description to the "kind" leaf rule
         if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
             rs.root_rules.first_mut()
-            && let Some((_, opts)) = rules.first_mut() {
-                opts.description = Some("The kind of this thing".to_string());
-            }
+            && let Some((_, opts)) = rules.first_mut()
+        {
+            opts.description = Some("The kind of this thing".to_string());
+        }
 
         let md = build_hover_markdown(
             &PositionElement::Leaf {

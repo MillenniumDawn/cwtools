@@ -166,9 +166,10 @@ fn parse_bracket(s: &str, start: usize) -> Option<(LocElement, usize)> {
     let content = &s[start + 1..i - 1];
 
     if (content.contains('.') || content.contains('('))
-        && let Ok(commands) = parse_jomini(content) {
-            return Some((LocElement::JominiCommand(commands), i));
-        }
+        && let Ok(commands) = parse_jomini(content)
+    {
+        return Some((LocElement::JominiCommand(commands), i));
+    }
 
     let command = content.find('|').map(|p| &content[..p]).unwrap_or(content);
 

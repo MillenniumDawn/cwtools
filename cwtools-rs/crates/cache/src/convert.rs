@@ -33,11 +33,7 @@ pub fn arena_to_cached(
             .iter()
             .map(|vc| value_clause_to_cached(vc, string_table))
             .collect(),
-        comments: arena
-            .comments
-            .iter()
-            .map(comment_to_cached)
-            .collect(),
+        comments: arena.comments.iter().map(comment_to_cached).collect(),
     }
 }
 

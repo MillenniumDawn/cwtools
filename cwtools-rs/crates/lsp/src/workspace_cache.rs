@@ -311,7 +311,10 @@ mod tests {
         // A language/game change must invalidate.
         assert_ne!(base, settings_fingerprint("stellaris", &rs, root));
         // A workspace-root change must invalidate.
-        assert_ne!(base, settings_fingerprint("hoi4", &rs, Path::new("/tmp/other")));
+        assert_ne!(
+            base,
+            settings_fingerprint("hoi4", &rs, Path::new("/tmp/other"))
+        );
     }
 
     #[test]
@@ -468,7 +471,10 @@ mod tests {
         let remaining = count_cwb(dir);
         // Pruned down to ~80% of the cap.
         let target = (max_entries as f64 * PRUNE_TARGET_RATIO) as usize;
-        assert!(remaining <= target + 1, "pruned to {remaining}, want ~{target}");
+        assert!(
+            remaining <= target + 1,
+            "pruned to {remaining}, want ~{target}"
+        );
         // The oldest entries are gone; the newest survives.
         assert!(paths.last().unwrap().exists(), "newest entry was evicted");
         assert!(!paths.first().unwrap().exists(), "oldest entry survived");

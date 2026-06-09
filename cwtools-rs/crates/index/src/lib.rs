@@ -76,9 +76,10 @@ impl FileIndex {
             if path.is_dir() {
                 Self::walk(root, &path, out);
             } else if let Ok(rel) = path.strip_prefix(root)
-                && let Some(s) = rel.to_str() {
-                    out.insert(s.replace('\\', "/").to_ascii_lowercase());
-                }
+                && let Some(s) = rel.to_str()
+            {
+                out.insert(s.replace('\\', "/").to_ascii_lowercase());
+            }
         }
     }
 
@@ -256,12 +257,13 @@ impl TypeIndex {
                         }
                     }
                     if let Some(set) = self.instance_sets.get_mut(type_name)
-                        && let Some(count) = set.get_mut(&lower) {
-                            *count -= 1;
-                            if *count == 0 {
-                                set.remove(&lower);
-                            }
+                        && let Some(count) = set.get_mut(&lower)
+                    {
+                        *count -= 1;
+                        if *count == 0 {
+                            set.remove(&lower);
                         }
+                    }
                 }
                 keep
             });
@@ -454,18 +456,19 @@ fn collect_skip_root_child(
     match skip_stack {
         [] => {
             // We are at the instance node.
-            if type_key_filter_matches(td, &key) && starts_with_matches(td, &key)
+            if type_key_filter_matches(td, &key)
+                && starts_with_matches(td, &key)
                 && let Some(name) =
                     instance_name_from_children(td, &key, clause_children, arena, table)
-                {
-                    out.push(TypeInstance {
-                        name,
-                        location: SourceLocation {
-                            line: start_line,
-                            col: start_col,
-                        },
-                    });
-                }
+            {
+                out.push(TypeInstance {
+                    name,
+                    location: SourceLocation {
+                        line: start_line,
+                        col: start_col,
+                    },
+                });
+            }
         }
         [head, tail @ ..] => {
             // Must match the skip-root layer; then descend into children.
@@ -1005,16 +1008,17 @@ fn collect_event_targets_rec(
                 let val = leaf_value_string(&leaf.value, table);
 
                 if (key == "save_event_target_as" || key == "save_global_event_target_as")
-                    && !val.is_empty() {
-                        out.push(SavedEventTarget {
-                            name: val,
-                            location: SourceLocation {
-                                line: leaf.pos.start.line,
-                                col: leaf.pos.start.col,
-                            },
-                            is_global: key == "save_global_event_target_as",
-                        });
-                    }
+                    && !val.is_empty()
+                {
+                    out.push(SavedEventTarget {
+                        name: val,
+                        location: SourceLocation {
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                        },
+                        is_global: key == "save_global_event_target_as",
+                    });
+                }
 
                 if let Value::Clause(ch) = &leaf.value {
                     collect_event_targets_rec(ch, arena, table, out);
@@ -1028,4 +1032,3 @@ fn collect_event_targets_rec(
         }
     }
 }
-

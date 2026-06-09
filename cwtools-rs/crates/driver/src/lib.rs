@@ -259,10 +259,7 @@ impl Session {
     /// Bundle this session's prebuilt state into a [`Prepared`] for validation.
     /// `enum_map` is passed in (not stored) because it borrows `self.ruleset`;
     /// callers build it once and reuse it across a batch.
-    fn prepared<'a>(
-        &'a self,
-        enum_map: &'a HashMap<&'a str, &'a EnumDefinition>,
-    ) -> Prepared<'a> {
+    fn prepared<'a>(&'a self, enum_map: &'a HashMap<&'a str, &'a EnumDefinition>) -> Prepared<'a> {
         Prepared {
             ruleset: &self.ruleset,
             table: &self.rules_table,

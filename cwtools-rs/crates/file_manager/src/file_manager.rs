@@ -378,9 +378,10 @@ impl FileManager {
             // Size guard
             if self.config.max_file_size > 0
                 && let Ok(meta) = path.metadata()
-                    && meta.len() > self.config.max_file_size {
-                        continue;
-                    }
+                && meta.len() > self.config.max_file_size
+            {
+                continue;
+            }
 
             // Compute logical path relative to root
             let logical_path = compute_logical_path(&path, &self.config.root);
@@ -505,20 +506,21 @@ pub fn expand_multiple_mods(workspace: &Path) -> Vec<ResolvedMod> {
                 .map(|e| e.eq_ignore_ascii_case("mod"))
                 .unwrap_or(false)
                 && let Ok(desc) = parse_mod_descriptor(&path)
-                    && let Some(mod_path) = &desc.path {
-                        // `path` can be relative (to the workspace) or absolute
-                        let root = if std::path::Path::new(mod_path).is_absolute() {
-                            PathBuf::from(mod_path)
-                        } else {
-                            workspace.join(mod_path)
-                        };
-                        if root.is_dir() {
-                            out.push(ResolvedMod {
-                                descriptor: desc,
-                                root,
-                            });
-                        }
-                    }
+                && let Some(mod_path) = &desc.path
+            {
+                // `path` can be relative (to the workspace) or absolute
+                let root = if std::path::Path::new(mod_path).is_absolute() {
+                    PathBuf::from(mod_path)
+                } else {
+                    workspace.join(mod_path)
+                };
+                if root.is_dir() {
+                    out.push(ResolvedMod {
+                        descriptor: desc,
+                        root,
+                    });
+                }
+            }
         }
     }
 
@@ -644,7 +646,14 @@ pub fn walk_workspace_files(
 ) -> Vec<PathBuf> {
     let cfg = FileManagerConfig::default();
     let mut out = Vec::new();
-    walk_workspace_inner(root, extensions, &cfg, extra_file_globs, extra_dir_globs, &mut out);
+    walk_workspace_inner(
+        root,
+        extensions,
+        &cfg,
+        extra_file_globs,
+        extra_dir_globs,
+        &mut out,
+    );
     out
 }
 
@@ -673,7 +682,14 @@ fn walk_workspace_inner(
                     .any(|pat| glob_match(pat, name))
                 || extra_dir_globs.iter().any(|pat| glob_match(pat, name));
             if !skip {
-                walk_workspace_inner(&path, extensions, cfg, extra_file_globs, extra_dir_globs, out);
+                walk_workspace_inner(
+                    &path,
+                    extensions,
+                    cfg,
+                    extra_file_globs,
+                    extra_dir_globs,
+                    out,
+                );
             }
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             if !extensions.contains(&ext) {
@@ -686,7 +702,9 @@ fn walk_workspace_inner(
                 .exclude_patterns
                 .iter()
                 .any(|pat| glob_match(pat, file_name))
-                || extra_file_globs.iter().any(|pat| glob_match(pat, file_name));
+                || extra_file_globs
+                    .iter()
+                    .any(|pat| glob_match(pat, file_name));
             if !skip {
                 out.push(path);
             }
