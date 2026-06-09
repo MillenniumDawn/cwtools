@@ -18,8 +18,8 @@ use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{
-    ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
-    validate_ast_with_loc_prebuilt,
+    Prepared, ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
+    validate_prepared,
 };
 
 mod symbols;
@@ -3003,17 +3003,19 @@ impl Backend {
                         // for this one file.
                         let registry = build_scope_registry_arc(ruleset, game);
                         let enum_map = build_enum_map(ruleset);
-                        let mut errs = validate_ast_with_loc_prebuilt(
+                        let mut errs = validate_prepared(
                             &parsed,
-                            ruleset,
-                            &self.state.string_table,
                             uri,
-                            game,
-                            Some(type_index),
-                            Some(&*modifier_keys),
-                            loc_guard.as_ref(),
-                            registry.as_ref(),
-                            &enum_map,
+                            &Prepared {
+                                ruleset,
+                                table: &self.state.string_table,
+                                game,
+                                type_index: Some(type_index),
+                                modifier_keys: Some(&*modifier_keys),
+                                loc_index: loc_guard.as_ref(),
+                                registry: registry.as_ref(),
+                                enum_map: &enum_map,
+                            },
                         );
                         drop(loc_guard);
                         drop(modifier_keys);
@@ -3539,17 +3541,19 @@ fn validate_parsed_with_indexes(
         .iter()
         .map(parse_error_to_diagnostic)
         .collect();
-    let mut errs = validate_ast_with_loc_prebuilt(
+    let mut errs = validate_prepared(
         parsed,
-        ruleset,
-        string_table,
         uri,
-        game,
-        Some(type_index),
-        Some(modifier_keys),
-        loc_index,
-        registry,
-        enum_map,
+        &Prepared {
+            ruleset,
+            table: string_table,
+            game,
+            type_index: Some(type_index),
+            modifier_keys: Some(modifier_keys),
+            loc_index,
+            registry,
+            enum_map,
+        },
     );
     const MAX_ERRORS: usize = 100;
     let total = errs.len();

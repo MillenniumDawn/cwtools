@@ -167,20 +167,22 @@ pub fn validate_ast_with_loc(
 ) -> Vec<ValidationError> {
     // Single-file/test entry point: build the per-run shared state (enum_map +
     // scope registry) here and delegate. Hot multi-file callers should instead
-    // build these ONCE outside their loop and call `validate_ast_with_loc_prebuilt`.
+    // build a `Prepared` ONCE outside their loop and call `validate_prepared`.
     let enum_map = build_enum_map(ruleset);
     let registry = build_scope_registry_arc(ruleset, game);
-    validate_ast_with_loc_prebuilt(
+    validate_prepared(
         ast,
-        ruleset,
-        table,
         file_path,
-        game,
-        type_index,
-        modifier_keys,
-        loc_index,
-        registry.as_ref(),
-        &enum_map,
+        &Prepared {
+            ruleset,
+            table,
+            game,
+            type_index,
+            modifier_keys,
+            loc_index,
+            registry: registry.as_ref(),
+            enum_map: &enum_map,
+        },
     )
 }
 
@@ -202,23 +204,41 @@ pub fn build_scope_registry_arc(
     game.map(|g| std::sync::Arc::new(build_scope_registry(ruleset, g)))
 }
 
-/// As [`validate_ast_with_loc`], but takes the per-run shared state (the scope
-/// registry and `enum_map`) prebuilt so multi-file callers can construct them
-/// ONCE and reuse them across every file instead of rebuilding per file.
+/// The per-run shared validation state, built once and reused across every file
+/// in a run. Bundles everything [`validate_prepared`] needs beyond the per-file
+/// `ast` and `file_path`, so callers pass one value instead of a ten-argument
+/// call. All fields are borrows, so it is cheap to copy.
+#[derive(Clone, Copy)]
+pub struct Prepared<'a> {
+    pub ruleset: &'a RuleSet,
+    pub table: &'a StringTable,
+    pub game: Option<Game>,
+    pub type_index: Option<&'a cwtools_index::TypeIndex>,
+    pub modifier_keys: Option<&'a HashSet<String>>,
+    pub loc_index: Option<&'a LocIndex>,
+    pub registry: Option<&'a std::sync::Arc<ScopeRegistry>>,
+    pub enum_map: &'a HashMap<&'a str, &'a EnumDefinition>,
+}
+
+/// Validate one parsed file against prebuilt per-run state. The hot path: build
+/// [`Prepared`] once (scope registry + enum map + indexes) and call this per file
+/// instead of rebuilding that state for every file.
 #[tracing::instrument(skip_all)]
-#[allow(clippy::too_many_arguments)]
-pub fn validate_ast_with_loc_prebuilt(
+pub fn validate_prepared(
     ast: &ParsedFile,
-    ruleset: &RuleSet,
-    table: &StringTable,
     file_path: &str,
-    game: Option<Game>,
-    type_index: Option<&cwtools_index::TypeIndex>,
-    modifier_keys: Option<&HashSet<String>>,
-    loc_index: Option<&LocIndex>,
-    registry: Option<&std::sync::Arc<ScopeRegistry>>,
-    enum_map: &HashMap<&str, &EnumDefinition>,
+    prepared: &Prepared,
 ) -> Vec<ValidationError> {
+    let Prepared {
+        ruleset,
+        table,
+        game,
+        type_index,
+        modifier_keys,
+        loc_index,
+        registry,
+        enum_map,
+    } = *prepared;
     let mut errors = Vec::new();
 
     // Scope-agnostic content is reused from many calling scopes (or operates on a

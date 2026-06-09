@@ -33,8 +33,8 @@ use cwtools_rules::rules_types::{EnumDefinition, RuleSet};
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{
-    ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
-    validate_ast_with_loc_prebuilt,
+    Prepared, ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
+    validate_prepared,
 };
 
 /// A parsed workspace/mod file: its on-disk path, mod-relative logical path, and AST.
@@ -239,22 +239,30 @@ impl Session {
         }
     }
 
+    /// Bundle this session's prebuilt state into a [`Prepared`] for validation.
+    /// `enum_map` is passed in (not stored) because it borrows `self.ruleset`;
+    /// callers build it once and reuse it across a batch.
+    fn prepared<'a>(
+        &'a self,
+        enum_map: &'a HashMap<&'a str, &'a EnumDefinition>,
+    ) -> Prepared<'a> {
+        Prepared {
+            ruleset: &self.ruleset,
+            table: &self.rules_table,
+            game: Some(self.game),
+            type_index: Some(&self.type_index),
+            modifier_keys: Some(&self.modifier_keys),
+            loc_index: Some(&self.loc_index),
+            registry: self.registry.as_ref(),
+            enum_map,
+        }
+    }
+
     /// Validate one already-parsed file against this session's prebuilt indexes,
     /// registry, and enum map. The single-file (incremental) entry point.
     pub fn validate_file(&self, file_path: &str, parsed: &ParsedFile) -> Vec<ValidationError> {
         let enum_map = build_enum_map(&self.ruleset);
-        validate_ast_with_loc_prebuilt(
-            parsed,
-            &self.ruleset,
-            &self.rules_table,
-            file_path,
-            Some(self.game),
-            Some(&self.type_index),
-            Some(&self.modifier_keys),
-            Some(&self.loc_index),
-            self.registry.as_ref(),
-            &enum_map,
-        )
+        validate_prepared(parsed, file_path, &self.prepared(&enum_map))
     }
 
     /// Loc-project diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace,
@@ -333,23 +341,12 @@ impl SessionWithFiles {
         use rayon::prelude::*;
 
         let enum_map = self.session.enum_map();
-        let registry_ref = self.session.registry.as_ref();
+        let prepared = self.session.prepared(&enum_map);
         self.parsed
             .par_iter()
             .map(|src| {
                 let file_str = src.path.to_str().unwrap_or("").to_string();
-                let errors = validate_ast_with_loc_prebuilt(
-                    &src.parsed,
-                    &self.session.ruleset,
-                    &self.session.rules_table,
-                    &file_str,
-                    Some(self.session.game),
-                    Some(&self.session.type_index),
-                    Some(&self.session.modifier_keys),
-                    Some(&self.session.loc_index),
-                    registry_ref,
-                    &enum_map,
-                );
+                let errors = validate_prepared(&src.parsed, &file_str, &prepared);
                 (src.path.clone(), errors)
             })
             .collect()
