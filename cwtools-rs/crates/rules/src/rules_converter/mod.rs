@@ -565,12 +565,6 @@ pub(crate) fn leaf_value_string(leaf: &cwtools_parser::ast::Leaf, table: &String
     value_to_string(&leaf.value, table)
 }
 
-// Keep process_right_field as a thin wrapper for any callers outside this file
-#[allow(dead_code)]
-fn process_right_field(value: &str, _table: &StringTable) -> NewField {
-    field_from_string(value)
-}
-
 #[cfg(test)]
 mod description_tests {
     use super::extract_description_from_comments;

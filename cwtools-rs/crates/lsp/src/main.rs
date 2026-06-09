@@ -2368,6 +2368,13 @@ impl Backend {
                 info_guard
                     .type_index
                     .merge("<vanilla-cache>", per_type.clone());
+                // Vanilla data is loaded, so the index now holds every base-game
+                // instance. Mark it complete so the CW500/CW222 type-reference
+                // checks fire (they're gated on `complete` to avoid false
+                // positives during mod-only validation). The driver's Session
+                // sets this for the CLI path; the LSP merges vanilla directly and
+                // must set it here too. See rule_core.rs gate on `idx.complete`.
+                info_guard.type_index.complete = true;
             }
         }
 
@@ -2664,44 +2671,9 @@ impl Backend {
     }
 
     /// Validate an already-parsed document against the (already-built) workspace
-    /// index, using a precomputed modifier-key set. No parsing, no re-indexing,
-    /// no per-file logging — this is the hot path for a full-workspace scan.
-    fn validate_parsed(
-        &self,
-        uri: &str,
-        parsed: &ParsedFile,
-        modifier_keys: &std::collections::HashSet<String>,
-    ) -> Vec<Diagnostic> {
-        let ruleset_guard = self.state.ruleset.lock();
-        let Some(ruleset) = ruleset_guard.as_ref() else {
-            // No ruleset: only the parse errors apply.
-            return parsed
-                .errors
-                .iter()
-                .map(parse_error_to_diagnostic)
-                .collect();
-        };
-        let language = self.state.language.lock().clone();
-        let game = cwtools_game::constants::Game::from_str(&language);
-        // Build the per-run shared state for this single file. Multi-file callers
-        // (the workspace scan) should build these ONCE and call
-        // `validate_parsed_prebuilt` to avoid rebuilding per file.
-        let registry = build_scope_registry_arc(ruleset, game);
-        let enum_map = build_enum_map(ruleset);
-        self.validate_parsed_prebuilt(
-            uri,
-            parsed,
-            modifier_keys,
-            ruleset,
-            game,
-            registry.as_ref(),
-            &enum_map,
-        )
-    }
-
-    /// As [`validate_parsed`], but with the ruleset already locked and the
-    /// per-run scope registry / enum_map prebuilt by the caller. The
-    /// full-workspace scan builds those ONCE outside its loop and reuses them.
+    /// index, with the ruleset already locked and the per-run scope registry /
+    /// enum_map prebuilt by the caller. Multi-file callers (the workspace scan,
+    /// the dependent sweep) build those ONCE outside their loop and reuse them.
     #[allow(clippy::too_many_arguments)]
     fn validate_parsed_prebuilt(
         &self,
@@ -2865,27 +2837,60 @@ impl Backend {
             generation,
             "revalidate_open_dependents"
         );
-        for (uri, snapshot_version, ast) in others {
-            // Preempt: a newer edit arrived, its sweep will cover everything.
-            if self.state.edit_generation.load(Ordering::SeqCst) != generation {
-                tracing::debug!(generation, "revalidate_open_dependents superseded");
-                return;
-            }
-            let diagnostics = self.validate_parsed(&uri, &ast, &modifier_keys);
-            // Skip if this dependent was itself edited while we validated it —
-            // its own debounced pass owns the fresher result.
-            let still_current = {
-                let docs = self.state.documents.lock();
-                docs.get(&uri)
-                    .map(|d| d.version == snapshot_version)
-                    .unwrap_or(false)
-            };
-            if still_current
-                && let Ok(uri_obj) = Url::parse(&uri) {
-                    self.client
-                        .publish_diagnostics(uri_obj, diagnostics, Some(snapshot_version))
-                        .await;
+        let game = {
+            let language = self.state.language.lock().clone();
+            cwtools_game::constants::Game::from_str(&language)
+        };
+        // Validate every dependent synchronously, then publish. The scope
+        // registry + enum_map depend only on (ruleset, game) and are the
+        // expensive part of per-file setup, so build them ONCE for the whole
+        // sweep instead of per file (which `validate_parsed` would do). No
+        // await is held across the ruleset lock.
+        let to_publish: Vec<(String, i32, Vec<Diagnostic>)> = {
+            let ruleset_guard = self.state.ruleset.lock();
+            let registry = ruleset_guard
+                .as_ref()
+                .map(|rs| build_scope_registry_arc(rs, game));
+            let enum_map = ruleset_guard.as_ref().map(|rs| build_enum_map(rs));
+            let mut out = Vec::with_capacity(others.len());
+            for (uri, snapshot_version, ast) in others {
+                // Preempt: a newer edit arrived, its sweep will cover everything.
+                if self.state.edit_generation.load(Ordering::SeqCst) != generation {
+                    tracing::debug!(generation, "revalidate_open_dependents superseded");
+                    return;
                 }
+                let diagnostics = match (ruleset_guard.as_ref(), enum_map.as_ref()) {
+                    (Some(ruleset), Some(enum_map)) => self.validate_parsed_prebuilt(
+                        &uri,
+                        &ast,
+                        &modifier_keys,
+                        ruleset,
+                        game,
+                        registry.as_ref().and_then(|r| r.as_ref()),
+                        enum_map,
+                    ),
+                    _ => ast.errors.iter().map(parse_error_to_diagnostic).collect(),
+                };
+                // Skip if this dependent was itself edited while we validated it —
+                // its own debounced pass owns the fresher result.
+                let still_current = {
+                    let docs = self.state.documents.lock();
+                    docs.get(&uri)
+                        .map(|d| d.version == snapshot_version)
+                        .unwrap_or(false)
+                };
+                if still_current {
+                    out.push((uri, snapshot_version, diagnostics));
+                }
+            }
+            out
+        };
+        for (uri, snapshot_version, diagnostics) in to_publish {
+            if let Ok(uri_obj) = Url::parse(&uri) {
+                self.client
+                    .publish_diagnostics(uri_obj, diagnostics, Some(snapshot_version))
+                    .await;
+            }
         }
     }
 
@@ -3021,22 +3026,7 @@ impl Backend {
                         drop(modifier_keys);
                         drop(info_guard);
                         let elapsed = start.elapsed();
-                        const MAX_ERRORS: usize = 100;
-                        let total = errs.len();
-                        if total > MAX_ERRORS {
-                            errs.truncate(MAX_ERRORS);
-                            errs.push(cwtools_validation::ValidationError {
-                                message: format!(
-                                    "... {} additional errors truncated",
-                                    total - MAX_ERRORS
-                                ),
-                                severity: cwtools_validation::ErrorSeverity::Information,
-                                line: 0,
-                                col: 0,
-                                file: uri.to_string(),
-                                code: None,
-                            });
-                        }
+                        let total = truncate_validation_errors(&mut errs, uri);
                         let msg = format!(
                             "[validate] {} errors in {:?} ({} types, {} enums, {} aliases)",
                             total,
@@ -3518,6 +3508,35 @@ fn collect_doc_tokens(ast: &ParsedFile, table: &StringTable) -> HashSet<String> 
 /// returning LSP diagnostics. The prebuilt state is passed in (not re-locked
 /// here) so the full-workspace pass can take its read guards once and share the
 /// `Prepared` across rayon threads — it is `Copy` and all-borrows, so `Sync`.
+/// Per-file diagnostic cap. Beyond this, a file's errors are truncated with a
+/// summary marker so one broken file can't flood the editor.
+const MAX_FILE_ERRORS: usize = 100;
+
+/// Cap a file's validation errors at [`MAX_FILE_ERRORS`], appending a summary
+/// marker for the remainder. Returns the pre-truncation total (for logging).
+/// Shared by the batch and single-file paths so the cap stays consistent.
+fn truncate_validation_errors(
+    errs: &mut Vec<cwtools_validation::ValidationError>,
+    uri: &str,
+) -> usize {
+    let total = errs.len();
+    if total > MAX_FILE_ERRORS {
+        errs.truncate(MAX_FILE_ERRORS);
+        errs.push(cwtools_validation::ValidationError {
+            message: format!(
+                "... {} additional errors truncated",
+                total - MAX_FILE_ERRORS
+            ),
+            severity: cwtools_validation::ErrorSeverity::Information,
+            line: 0,
+            col: 0,
+            file: uri.to_string(),
+            code: None,
+        });
+    }
+    total
+}
+
 fn validate_parsed_with_indexes(
     uri: &str,
     parsed: &ParsedFile,
@@ -3529,19 +3548,7 @@ fn validate_parsed_with_indexes(
         .map(parse_error_to_diagnostic)
         .collect();
     let mut errs = validate_prepared(parsed, uri, prepared);
-    const MAX_ERRORS: usize = 100;
-    let total = errs.len();
-    if total > MAX_ERRORS {
-        errs.truncate(MAX_ERRORS);
-        errs.push(cwtools_validation::ValidationError {
-            message: format!("... {} additional errors truncated", total - MAX_ERRORS),
-            severity: cwtools_validation::ErrorSeverity::Information,
-            line: 0,
-            col: 0,
-            file: uri.to_string(),
-            code: None,
-        });
-    }
+    truncate_validation_errors(&mut errs, uri);
     for err in &errs {
         diagnostics.push(validation_error_to_diagnostic(err));
     }

@@ -1,8 +1,6 @@
 use crate::ValidationError;
+use crate::ctx::ValidationCtx;
 use cwtools_game::constants::Game;
-use cwtools_parser::ast::ParsedFile;
-use cwtools_rules::rules_types::RuleSet;
-use cwtools_string_table::string_table::StringTable;
 
 pub mod common;
 pub mod eu4;
@@ -11,14 +9,18 @@ pub mod stellaris;
 pub mod structural;
 
 /// Run game-specific validators after generic rule validation.
-pub fn run_game_validators(
-    ast: &ParsedFile,
-    ruleset: &RuleSet,
-    table: &StringTable,
-    file_path: &str,
-    game: Game,
-) -> Vec<ValidationError> {
+///
+/// Takes the shared [`ValidationCtx`] (not a handful of positional args) so the
+/// per-game layer reads from the same context the rest of the engine threads,
+/// and so checks that need cross-file state (the loc-key index for
+/// missing-localisation checks, the type index, …) can reach it here instead of
+/// being limited to the local AST.
+pub(crate) fn run_game_validators(ctx: &ValidationCtx, game: Game) -> Vec<ValidationError> {
     let mut errors = Vec::new();
+    let ast = ctx.ast;
+    let ruleset = ctx.ruleset;
+    let table = ctx.table;
+    let file_path = ctx.file_path;
 
     // Common checks (unique types, should_be_referenced, warning_only downgrade)
     common::validate_common(ast, ruleset, table, file_path, &mut errors);

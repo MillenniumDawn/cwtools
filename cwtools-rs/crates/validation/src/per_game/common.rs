@@ -1,8 +1,63 @@
 use crate::{ValidationError, error_codes};
-use cwtools_parser::ast::{Child, ParsedFile};
+use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
-use cwtools_string_table::string_table::StringTable;
+use cwtools_string_table::string_table::{StringId, StringTable};
 use std::collections::HashMap;
+
+/// A `key = { ... }` block, normalised from either a `Node` or a
+/// `Leaf`-with-`Clause` (the parser stores either form depending on context).
+/// Centralises the `Value::Clause` normalisation every per-game structural
+/// walker needs — see `docs/ARCHITECTURE_BUGS.md` on the Leaf→Clause hazard
+/// (a walker that handles `Node.children` but forgets the leaf-clause case
+/// silently skips a subtree). The key is kept as a `StringId` so callers that
+/// only compare it avoid an owned `String`.
+pub(crate) struct Block<'a> {
+    pub key: StringId,
+    pub children: &'a [Child],
+    pub range: SourceRange,
+}
+
+impl Block<'_> {
+    /// True if the block's key equals `kw` exactly (case-sensitive, matching
+    /// reserved keyword spellings like `NOT`/`AND`/`if`).
+    pub fn key_is(&self, table: &StringTable, kw: &str) -> bool {
+        table.with_string(self.key, |s| s == kw).unwrap_or(false)
+    }
+
+    /// The block's key as an owned `String` (empty if interning lost it).
+    pub fn key_string(&self, table: &StringTable) -> String {
+        table.get_string(self.key).unwrap_or_default()
+    }
+}
+
+/// Normalise a `key = { ... }` child (Node or Leaf-with-Clause) into a [`Block`].
+/// Returns `None` for leaves whose value isn't a clause, and for comments / bare
+/// values.
+pub(crate) fn as_block<'a>(child: &Child, ast: &'a ParsedFile) -> Option<Block<'a>> {
+    match child {
+        Child::Node(idx) => {
+            let n = &ast.arena.nodes[*idx as usize];
+            Some(Block {
+                key: n.key.normal,
+                children: &n.children,
+                range: n.pos,
+            })
+        }
+        Child::Leaf(idx) => {
+            let l = &ast.arena.leaves[*idx as usize];
+            if let Value::Clause(children) = &l.value {
+                Some(Block {
+                    key: l.key.normal,
+                    children,
+                    range: l.pos,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 
 /// Validate common features across all games.
 pub fn validate_common(

@@ -423,67 +423,6 @@ pub fn find_invalid_loc_char(desc: &str) -> Option<usize> {
     None
 }
 
-/// Quote / imbalanced-quote validation (mirrors F# `validateQuotes`).
-///
-/// Returns `true` if the entry passes validation (no CW-quote-error).
-/// Populates `entry.error_range` and returns `false` on failure.
-pub fn validate_quotes(entry: &mut LocEntry) -> bool {
-    let trimmed = entry.desc.trim();
-
-    // 1.  Find last double-quote in trimmed desc
-    let last_quote = trimmed.rfind('"');
-
-    // 2.  Find first '#' after that last quote
-    let first_hash_after_quote = last_quote
-        .and_then(|q| trimmed[q..].find('#').map(|h| q + h))
-        .or_else(|| {
-            // no last quote → look for first '#' overall
-            trimmed.find('#')
-        });
-
-    // 3.  Truncate at the first '#' after last quote (if any)
-    let mut effective = match (first_hash_after_quote, last_quote) {
-        (Some(h), Some(q)) if h > q => &trimmed[..h],
-        _ => trimmed,
-    };
-
-    // Edge: HOI4 allows quoted text like:
-    //   "...text" #comment   → effective = "...text"  (trim stops at #)
-    // The Trim() would have already removed leading/trailing spaces.
-    // We strip trailing spaces after hash truncation.
-    effective = effective.trim_end();
-
-    // 4.  HOI4 "cursed" behaviour:  if the desc contains quotes but
-    //     doesn't START with a quote and doesn't END with a quote,
-    //     we DON'T generate a quote error.
-    let starts = effective.starts_with('"');
-    let ends = effective.ends_with('"');
-
-    if starts && ends {
-        // fully quoted → fine (CW doesn't complain)
-        true
-    } else if !starts && !ends {
-        // no quotes at all → fine
-        true
-    } else {
-        // starts XOR ends → imbalanced quotes
-        entry.error_range = Some(entry.position.clone());
-        false
-    }
-}
-
-/// Check for REPLACE_ME / TODO_CD placeholders.
-pub fn validate_replace_me(entry: &LocEntry) -> Option<String> {
-    let inner = entry.desc.trim().trim_matches('"');
-    if inner == "REPLACE_ME" || inner == "TODO_CD" {
-        Some(format!(
-            "CW-ReplaceMe: localisation key '{}' contains placeholder",
-            entry.key
-        ))
-    } else {
-        None
-    }
-}
 
 /* ======================================================================== */
 /* Tests                                                                   */
@@ -574,29 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_cursed_quotes() {
-        let text = "l_english:\n loc_key1: \"this is valid loc\"\n loc_key2: \"this is \"also\" valid loc\"\n loc_key6: \"this is invalid loc\n loc_key7: this is invalid loc\"\n";
-
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
-
-        // Valid: balanced quotes
-        assert!(validate_quotes(&mut file.entries[0]), "loc1 should pass");
-        assert!(file.entries[0].error_range.is_none());
-
-        // Valid: balanced quotes (embedded quotes are inside)
-        assert!(validate_quotes(&mut file.entries[1]), "loc2 should pass");
-        assert!(file.entries[1].error_range.is_none());
-
-        // Invalid: opening quote but no closing
-        let ok = validate_quotes(&mut file.entries[2]);
-        assert!(!ok, "loc6 should fail (missing closing quote)");
-
-        // Invalid: closing quote but no opening
-        let ok = validate_quotes(&mut file.entries[3]);
-        assert!(!ok, "loc7 should fail (missing opening quote)");
-    }
-
-    #[test]
     fn test_version_number() {
         let text = "l_english:\n key:0 \"desc\" \n";
         let file = parse_loc_text(text, "test.yml").unwrap();
@@ -610,17 +526,13 @@ mod tests {
         let file = parse_loc_text(text, "test.yml").unwrap();
         // `#comment` is part of desc (per F# parser)
         assert_eq!(file.entries[0].desc, "\"a\"#comment");
-
-        let mut entry = file.entries[0].clone();
-        assert!(validate_quotes(&mut entry), "hash truncation test");
     }
 
     #[test]
     fn test_loc_key11_complex() {
         let text = "l_english:\n loc_key11: \"this is valid loc\" #but this is also valid and read as part of the string due to quote after\n";
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let file = parse_loc_text(text, "test.yml").unwrap();
         assert_eq!(file.entries[0].key, "loc_key11");
-        assert!(validate_quotes(&mut file.entries[0]), "loc11 should pass");
     }
 
     #[test]

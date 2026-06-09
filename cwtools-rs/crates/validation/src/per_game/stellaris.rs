@@ -1,3 +1,4 @@
+use super::common::as_block;
 use crate::{ErrorSeverity, ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::RuleSet;
@@ -48,39 +49,6 @@ pub fn validate_stellaris(
 // (CW253). F# scopes these to classified effect blocks; this walk keys off the
 // node names instead, which only appear in effect script.
 
-/// The `(key, children)` of a `key = { ... }` block (Node or Leaf-with-Clause).
-fn block_of<'a>(
-    child: &Child,
-    ast: &'a ParsedFile,
-    table: &StringTable,
-) -> Option<(String, &'a [Child], u32, u16)> {
-    match child {
-        Child::Node(idx) => {
-            let n = &ast.arena.nodes[*idx as usize];
-            Some((
-                table.get_string(n.key.normal).unwrap_or_default(),
-                &n.children,
-                n.pos.start.line,
-                n.pos.start.col,
-            ))
-        }
-        Child::Leaf(idx) => {
-            let l = &ast.arena.leaves[*idx as usize];
-            if let Value::Clause(children) = &l.value {
-                Some((
-                    table.get_string(l.key.normal).unwrap_or_default(),
-                    children,
-                    l.pos.start.line,
-                    l.pos.start.col,
-                ))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 /// Keys of a block's direct children (Node + Leaf), in order.
 fn child_keys(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<String> {
     children
@@ -109,9 +77,13 @@ fn walk_if_else(
     errors: &mut Vec<ValidationError>,
 ) {
     for child in children {
-        let Some((key, block_children, line, col)) = block_of(child, ast, table) else {
+        let Some(block) = as_block(child, ast) else {
             continue;
         };
+        let key = block.key_string(table);
+        let block_children = block.children;
+        let line = block.range.start.line;
+        let col = block.range.start.col;
 
         // CW253 — deprecated set_empire_name / set_planet_name.
         if key == "set_empire_name" || key == "set_planet_name" {
@@ -487,10 +459,13 @@ fn check_loc_key_pair(
 /// localisation keys.  Requires loc_keys; no-op if None.
 /// valPolicies follows the same pattern.
 ///
-/// Note: Full `valTechLocs`/`valPolicies` porting depends on localisation-key
-/// plumbing not yet available at this call site.  The mechanism is in place;
-/// call `check_key_and_desc` with the appropriate `node_key_filter` from the
-/// CLI/LSP layer once loc keys are available.
+/// Not yet wired into [`run_game_validators`]. The loc-key plumbing it cited as
+/// missing IS now available (the dispatcher takes a `ValidationCtx` carrying
+/// `loc_index`), so the only remaining gap is the entry matching: F# operated on
+/// the rules engine's *classified* tech/policy nodes, whereas `check_key_and_desc`
+/// matches a literal root key. Stellaris tech entries are keyed by tech name (not
+/// wrapped in a `technology` node), so the filter below needs porting to a
+/// path/type-driven match (and a Stellaris corpus to verify) before this fires.
 pub fn validate_stellaris_loc(
     ast: &ParsedFile,
     table: &StringTable,

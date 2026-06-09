@@ -1,14 +1,22 @@
-//! Shared validation driver for the CLI and LSP.
+//! Shared validation driver.
 //!
-//! Both entry points need the same pipeline: load rules -> discover/parse files
-//! -> build the `TypeIndex` (+ var index + vanilla index) -> expand modifier keys
-//! -> build the loc index -> build the prebuilt `enum_map` + `ScopeRegistry` ->
-//! validate. Before this crate, the CLI's `Validate` arm and the LSP's
-//! `validate_entire_workspace` each reimplemented that sequence and drifted.
+//! The full pipeline is: load rules -> discover/parse files -> build the
+//! `TypeIndex` (+ var index + vanilla index) -> expand modifier keys -> build the
+//! loc index -> build the prebuilt `enum_map` + `ScopeRegistry` -> validate. The
+//! reusable primitives for this live in the shared crates ([`index_game_dir`],
+//! `cwtools_validation::{build_scope_registry_arc, build_enum_map, Prepared,
+//! validate_prepared}`); both the CLI and the LSP call those directly so the
+//! sequence isn't reimplemented and can't drift the way it did before.
 //!
-//! [`Session`] owns the immutable-after-load engine state both surfaces share and
-//! exposes the two entry points they need: [`Session::validate_all`] for the batch
-//! (CLI) path and [`Session::validate_file`] for incremental (LSP) re-validation.
+//! [`Session`] bundles those primitives into the CLI's batch model: load
+//! everything from disk once into immutable-after-load state, then validate the
+//! whole set ([`Session::validate_all`]). The LSP does NOT use `Session` — its
+//! index is mutable and incremental (single files are re-indexed on each edit,
+//! behind an `RwLock`, with no whole-workspace re-parse), which doesn't fit
+//! `Session`'s load-once/immutable ownership. Instead the LSP holds its own
+//! workspace state and builds a [`Prepared`] from the same shared primitives per
+//! validation. [`Session::validate_file`] offers the incremental shape for any
+//! caller whose index IS owned by the session.
 //!
 //! Loc-file diagnostics (CW225 etc.) need the parsed `LocService`, so the session
 //! keeps it resident and serves both the loc-key index and the project lint from
@@ -83,11 +91,12 @@ pub struct SessionConfig<'a> {
     pub on_rules_warning: Option<&'a mut dyn FnMut(String)>,
 }
 
-/// The immutable-after-load engine state both entry points share.
+/// The immutable-after-load engine state for the batch (CLI) path.
 ///
 /// Built once by [`Session::load`]; thereafter read-only for validation. The CLI
-/// builds one per run. The LSP can rebuild one per full-workspace scan and serve
-/// incremental single-file validation from it via [`Session::validate_file`].
+/// builds one per run. The LSP does not use this (its index is mutable and
+/// re-indexed per edit); it builds [`Prepared`] from the shared primitives
+/// directly. See the module docs.
 pub struct Session {
     game: Game,
     rules_table: StringTable,

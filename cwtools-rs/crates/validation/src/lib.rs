@@ -305,9 +305,7 @@ pub fn validate_prepared(
             );
         }
         if let Some(g) = game {
-            errors.extend(per_game::run_game_validators(
-                ast, ruleset, table, file_path, g,
-            ));
+            errors.extend(per_game::run_game_validators(&ctx, g));
         }
         return errors;
     }
@@ -487,7 +485,7 @@ pub fn validate_prepared(
 
     // Run game-specific validators if game is provided
     if let Some(g) = game {
-        let game_errors = per_game::run_game_validators(ast, ruleset, table, file_path, g);
+        let game_errors = per_game::run_game_validators(&ctx, g);
         errors.extend(game_errors);
     }
 
