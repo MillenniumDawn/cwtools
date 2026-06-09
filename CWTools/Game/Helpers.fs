@@ -199,6 +199,7 @@ module Helpers =
                                 false,
                                 refHint
                             )
+                    | _ -> ()
                 }
 
             let all = typeDefinedKeys |> Seq.collect keyToEffect

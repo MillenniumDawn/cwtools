@@ -125,6 +125,7 @@ module CK2GameFunctions =
             | TitleType.County, false -> (ells, es, klls, ks, dnlls, dns, dhlls, dhs, clls, value :: cs, blls, bs)
             | TitleType.Barony, true -> (ells, es, klls, ks, dnlls, dns, dhlls, dhs, clls, cs, value :: blls, bs)
             | TitleType.Barony, false -> (ells, es, klls, ks, dnlls, dns, dhlls, dhs, clls, cs, blls, value :: bs)
+            | _ -> (ells, es, klls, ks, dnlls, dns, dhlls, dhs, clls, cs, blls, bs)
 
         let ells, es, klls, ks, dnlls, dns, dhlls, dhs, clls, cs, blls, bs =
             titles |> List.fold inner ([], [], [], [], [], [], [], [], [], [], [], [])
