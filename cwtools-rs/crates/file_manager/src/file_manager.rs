@@ -626,6 +626,74 @@ fn collect_files_recursive(
     }
 }
 
+/// Recursively collect every file under `root` whose extension is in
+/// `extensions`, skipping engine/IDE directories and free-form text files.
+///
+/// This is the whole-tree walker used by the LSP full-workspace pass. The skip
+/// lists (directories and free-form filenames) come from
+/// `FileManagerConfig::default()` so they are defined in exactly one place and
+/// stay consistent with the CLI's `discover_and_parse`. `extra_file_globs` and
+/// `extra_dir_globs` layer on top of those defaults (they extend, never
+/// replace, the engine baseline). Traversal order follows `read_dir` and is not
+/// sorted; callers that need determinism should sort the result.
+pub fn walk_workspace_files(
+    root: &Path,
+    extensions: &[&str],
+    extra_file_globs: &[String],
+    extra_dir_globs: &[String],
+) -> Vec<PathBuf> {
+    let cfg = FileManagerConfig::default();
+    let mut out = Vec::new();
+    walk_workspace_inner(root, extensions, &cfg, extra_file_globs, extra_dir_globs, &mut out);
+    out
+}
+
+fn walk_workspace_inner(
+    dir: &Path,
+    extensions: &[&str],
+    cfg: &FileManagerConfig,
+    extra_file_globs: &[String],
+    extra_dir_globs: &[String],
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let skip = cfg
+                .exclude_dirs
+                .iter()
+                .any(|ex| name.eq_ignore_ascii_case(ex))
+                || cfg
+                    .exclude_dir_patterns
+                    .iter()
+                    .any(|pat| glob_match(pat, name))
+                || extra_dir_globs.iter().any(|pat| glob_match(pat, name));
+            if !skip {
+                walk_workspace_inner(&path, extensions, cfg, extra_file_globs, extra_dir_globs, out);
+            }
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if !extensions.contains(&ext) {
+                continue;
+            }
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Engine baseline (Changelog.txt, README.*, LICENSE.*, *.md) lives in
+            // the default config's exclude_patterns; user globs extend it.
+            let skip = cfg
+                .exclude_patterns
+                .iter()
+                .any(|pat| glob_match(pat, file_name))
+                || extra_file_globs.iter().any(|pat| glob_match(pat, file_name));
+            if !skip {
+                out.push(path);
+            }
+        }
+    }
+}
+
 /// Classify a directory following F# FileManager.fs:80-147.
 ///
 /// - `Vanilla` if it contains `game/` or `common/` typical structure

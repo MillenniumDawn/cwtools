@@ -2238,69 +2238,14 @@ impl Backend {
         let extra_file_globs = self.state.ignore_file_patterns.read().clone();
         let extra_dir_globs = self.state.ignore_dir_patterns.read().clone();
 
-        let mut files_to_validate = Vec::new();
-        fn walk_dir(
-            path: &std::path::Path,
-            extensions: &[&str],
-            extra_file_globs: &[String],
-            extra_dir_globs: &[String],
-            out: &mut Vec<std::path::PathBuf>,
-        ) {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let raw_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        let lower_name = raw_name.to_lowercase();
-                        let skip = matches!(
-                            lower_name.as_str(),
-                            ".git" | "node_modules" | "out" | "dist" | "target" | "bin" | "obj"
-                            // `resources/` is a developer scratch area in many mods,
-                            // not a path the game loads — don't validate it.
-                            | "resources" | ".vscode"
-                        ) || extra_dir_globs.iter().any(|pat| {
-                            cwtools_file_manager::file_manager::glob_match(pat, raw_name)
-                        });
-                        if !skip {
-                            walk_dir(&path, extensions, extra_file_globs, extra_dir_globs, out);
-                        }
-                    } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if !extensions.contains(&ext) {
-                            continue;
-                        }
-                        // Engine baseline for free-form text files. These are
-                        // NOT in the user globs (which only extend), so
-                        // Changelog.txt / README.* / LICENSE.* / *.md always
-                        // get skipped here even if the user sends an empty
-                        // `ignoreFilePatterns` list.
-                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        let engine_skip = matches!(
-                            file_name,
-                            "Changelog.txt"
-                                | "README.txt"
-                                | "LICENSE.txt"
-                                | "README.md"
-                                | "LICENSE.md"
-                        ) || file_name.to_ascii_lowercase().ends_with(".md");
-                        if engine_skip {
-                            continue;
-                        }
-                        if extra_file_globs.iter().any(|pat| {
-                            cwtools_file_manager::file_manager::glob_match(pat, file_name)
-                        }) {
-                            continue;
-                        }
-                        out.push(path);
-                    }
-                }
-            }
-        }
-        walk_dir(
+        // Whole-tree discovery shares file_manager's skip/exclude config so the
+        // LSP and CLI agree on what to skip (engine/IDE dirs, free-form text).
+        // The user-configured globs extend that baseline.
+        let files_to_validate = cwtools_file_manager::file_manager::walk_workspace_files(
             &root_path,
             &extensions,
             &extra_file_globs,
             &extra_dir_globs,
-            &mut files_to_validate,
         );
 
         if files_to_validate.is_empty() {
