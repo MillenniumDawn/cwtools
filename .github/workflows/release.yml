@@ -1,8 +1,10 @@
+name: Release
+
 on:
   workflow_dispatch:
     inputs:
       username:
-        description: Github username of the person triggering the release
+        description: GitHub username of the person triggering the release
         default: "tboby"
         required: true
       email:
@@ -10,34 +12,99 @@ on:
         default: "th.boby@gmail.com"
         required: true
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
-name: Release
+permissions:
+  contents: write
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  CARGO_TERM_COLOR: always
 
 jobs:
-  release:
+  # -------------------------------------------------------------------------
+  # F# / .NET: existing manual release path (NuGet + GitHub release).
+  # -------------------------------------------------------------------------
+  release-fs:
+    name: F# NuGet + GitHub release
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v3
-      with:
-        ref: ${{ github.head_ref }}
-    - name: Setup .NET Core
-      uses: actions/setup-dotnet@v3
-      with:
-        dotnet-version: 9.0.x
-    - name: Set chmod
-      run: chmod +x ./build.sh
-    - name: Test and Pack
-      run: /bin/sh ./build.sh PackTools
-    - name: upload artifact package
-      uses: actions/upload-artifact@v4
-      with:
-        name: cwtools-nugets
-        path: pkg/
-    - name: Publish Release
-      env:
-        github-user: ${{ github.event.inputs.username }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        NUGET_TOKEN: ${{ secrets.NUGET_TOKEN }}
-        user-email: ${{ github.event.inputs.email }}
-      run: dotnet run --project build -- -t ReleaseGitHub
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/paket.dependencies', '**/*.fsproj', 'Directory.Packages.props', '.config/dotnet-tools.json') }}
+          restore-keys: ${{ runner.os }}-nuget-
+      - name: Set chmod
+        run: chmod +x ./build.sh
+      - name: Test and Pack
+        run: /bin/sh ./build.sh PackTools
+      - name: Upload NuGet packages artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cwtools-nugets
+          path: pkg/
+      - name: Publish Release
+        env:
+          github-user: ${{ github.event.inputs.username }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NUGET_TOKEN: ${{ secrets.NUGET_TOKEN }}
+          user-email: ${{ github.event.inputs.email }}
+        run: dotnet run --project build -- -t ReleaseGitHub
+
+  # -------------------------------------------------------------------------
+  # Rust: build release binaries for the major targets and upload as
+  # workflow run artifacts (the F# GitHub release above also attaches
+  # these manually if/when the project ships a combined release).
+  # -------------------------------------------------------------------------
+  release-rs:
+    name: Rust release binaries
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cwtools-rs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cwtools-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('cwtools-rs/Cargo.lock', 'cwtools-rs/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: cargo build --release
+        run: cargo build --workspace --release
+      - name: Strip + archive binaries
+        run: |
+          mkdir -p dist
+          for bin in cwtools cwtools-server; do
+            if [ -f "target/release/$bin" ]; then
+              strip "target/release/$bin"
+              cp "target/release/$bin" "dist/$bin"
+            fi
+          done
+          tar -C dist -czf cwtools-rs-linux-x86_64.tar.gz .
+      - name: Upload Rust binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: cwtools-rs-linux-x86_64
+          path: cwtools-rs/cwtools-rs-linux-x86_64.tar.gz
+          if-no-files-found: error

@@ -1,0 +1,55 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  schedule:
+    # Weekly scan to catch newly-published queries against existing code.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  # CodeQL needs read on contents, write on security-events to upload SARIF.
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # F# is not a CodeQL language. C# (CSharpHelpers) and Rust (cwtools-rs)
+        # are, and the GitHub Actions pack covers the workflow files.
+        include:
+          - language: actions
+            paths: .github/workflows
+          - language: csharp
+            paths: CSharpHelpers
+          - language: rust
+            paths: cwtools-rs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history is required for accurate security scanning.
+          fetch-depth: 0
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # Restrict scanning to the directories the language actually lives in.
+          paths: ${{ matrix.paths }}
+          # Queries: use the security-and-quality query pack; tweak if you want
+          # a leaner scan (security-extended gives more coverage, slower).
+          queries: security-extended
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

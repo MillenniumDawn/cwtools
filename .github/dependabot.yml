@@ -1,0 +1,46 @@
+version: 2
+updates:
+  # Rust workspace (cwtools-rs/) — primary ecosystem.
+  - package-ecosystem: "cargo"
+    directory: "/cwtools-rs"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 10
+    # Don't bump MSRV on a whim — surface as PRs but require human review.
+    labels:
+      - "dependencies"
+      - "rust"
+    groups:
+      # Keep patch updates from clobbering PR list; bundle into one weekly PR.
+      patch-and-minor:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # F# / .NET: centralised package versions live in Directory.Packages.props,
+  # so the manifest lookup points at the repo root.
+  - package-ecosystem: "nuget"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "fsharp"
+
+  # Keep GitHub Actions pinned to recent versions.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
