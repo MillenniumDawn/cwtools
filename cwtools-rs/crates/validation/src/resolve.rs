@@ -6,12 +6,15 @@ use cwtools_rules::rules_types::*;
 use crate::common::path_contains_segment;
 
 /// Check if this type says its root key should be skipped (children are the real entries).
-pub(crate) fn should_skip_root_key(_key: &str, type_def: &TypeDefinition) -> bool {
-    type_def.skip_root_key.iter().any(|sk| match sk {
-        SkipRootKey::AnyKey => true,
-        SkipRootKey::SpecificKey(v) => v == _key,
-        SkipRootKey::MultipleKeys(keys, _) => keys.iter().any(|k| k == _key),
-    })
+///
+/// Delegates to the indexer's matcher so indexing and validation never disagree
+/// on which root keys to skip (the matcher is case-insensitive and honours the
+/// `should_match` negation flag).
+pub(crate) fn should_skip_root_key(key: &str, type_def: &TypeDefinition) -> bool {
+    type_def
+        .skip_root_key
+        .iter()
+        .any(|sk| cwtools_index::skip_root_key_matches(sk, key))
 }
 
 /// Look up both the TypeDefinition and the actual validation rules for a given type name.

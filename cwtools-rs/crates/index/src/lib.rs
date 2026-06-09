@@ -348,7 +348,11 @@ pub fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
 
 // ── skip_root_key helper ─────────────────────────────────────────────────────
 
-fn skip_root_key_matches(srk: &SkipRootKey, key: &str) -> bool {
+/// Does this `skip_root_key` rule match `key`? Case-insensitive (matching the
+/// engine), and honours the `should_match` negation flag on `MultipleKeys`.
+/// Shared with the validator (cwtools_validation::resolve) so indexing and
+/// validation agree on which root keys to skip.
+pub fn skip_root_key_matches(srk: &SkipRootKey, key: &str) -> bool {
     match srk {
         SkipRootKey::SpecificKey(k) => k.eq_ignore_ascii_case(key),
         SkipRootKey::AnyKey => true,
