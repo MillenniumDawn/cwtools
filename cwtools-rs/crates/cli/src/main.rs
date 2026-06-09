@@ -1,51 +1,14 @@
 use clap::{Parser, Subcommand};
+use cwtools_driver::{index_game_dir, search_config_for};
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
-use cwtools_info::{
-    TypeIndex, collect_set_variable_names, collect_type_instances, variable_defining_effects,
-};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use cwtools_info::vanilla_cache;
-
-/// Build a TypeIndex from every script file under `dir` (used for a base-game
-/// install). Files are parsed and indexed for reference resolution; they are
-/// never validated.
-fn index_game_dir(
-    dir: &Path,
-    ruleset: &RuleSet,
-    table: &StringTable,
-    var_effects: &std::collections::HashSet<String>,
-) -> TypeIndex {
-    let config = search_config_for(dir);
-    let mut mgr = FileManager::with_string_table(config, table.clone());
-    // `discover_and_parse` already parses the base-game files in parallel; the
-    // expensive part. Collect type instances straight from those arenas (no
-    // re-read/re-parse, unlike before) and stream-merge them sequentially so we
-    // never hold every file's instances at once.
-    let files = match mgr.discover_and_parse() {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "  warn: could not read base-game dir {}: {}",
-                dir.display(),
-                e
-            );
-            return TypeIndex::new();
-        }
-    };
-    eprintln!(
-        "  Indexing {} base-game files from {}",
-        files.len(),
-        dir.display()
-    );
-
-    cwtools_info::index_discovered_files(files, ruleset, table, Some(var_effects))
-}
 
 #[derive(Parser)]
 #[command(name = "cwtools")]
@@ -158,98 +121,6 @@ enum Commands {
         /// Directory containing localisation .yml files
         directory: PathBuf,
     },
-}
-
-/// Decide whether to search a directory directly (as a leaf directory containing .txt files)
-/// or as a mod root with standard subfolders.
-fn search_config_for(directory: &std::path::Path) -> FileManagerConfig {
-    let known_script_folders = [
-        "common",
-        "events",
-        "history",
-        "interface",
-        "decisions",
-        "missions",
-        "gfx",
-        "sound",
-        "music",
-        "static_modifiers",
-        "buildings",
-        "technologies",
-        "ethics",
-        "policies",
-        "ship_sizes",
-        "pop_faction",
-        "starbases_consolidated",
-        "traits",
-        "edicts",
-        "traditions",
-        "ascension_perks",
-        "governments",
-        "country_types",
-        "bypass",
-        "dlc_list",
-        "subject_types",
-        "casus_belli",
-        "war_goals",
-        "bombardment_stances",
-        "armies",
-        "deposits",
-        "planet_classes",
-        "tile_blockers",
-        "species_rights",
-        "observation_station_missions",
-        "star_classes",
-        "ambient_objects",
-        "name_lists",
-        "notification_modifier",
-        "component_tags",
-        "event_chains",
-        "personalities",
-        "global_ship_designs",
-        "graphical_cultures",
-        "species_archetypes",
-        "resources",
-        "species_classes",
-        "buildable_pops",
-        "opinion_modifiers",
-        "leader_class_enum",
-        "asteroid_belt",
-        "solar_system_initializers",
-        "fallen_empires",
-    ];
-    let dir_name = directory.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-    // If this directory itself contains script files, search it directly.
-    let script_exts = ["txt", "gui", "gfx", "sfx", "asset", "map"];
-    let has_script_files = std::fs::read_dir(directory)
-        .ok()
-        .is_some_and(|mut entries| {
-            entries.any(|e| {
-                if let Ok(entry) = e {
-                    entry
-                        .path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| script_exts.contains(&ext))
-                } else {
-                    false
-                }
-            })
-        });
-
-    if known_script_folders.contains(&dir_name) || dir_name.ends_with(".txt") || has_script_files {
-        FileManagerConfig {
-            root: directory.to_path_buf(),
-            include_dirs: vec![".".into()],
-            ..Default::default()
-        }
-    } else {
-        FileManagerConfig {
-            root: directory.to_path_buf(),
-            ..Default::default()
-        }
-    }
 }
 
 /// Stable FNV-1a-64 hex digest of a diagnostic, for baseline/ignore matching.
@@ -565,10 +436,8 @@ fn main() {
             ignore_files,
             ignore_dirs,
         } => {
+            use cwtools_driver::{RulesInput, Session, SessionConfig};
             use cwtools_game::constants::Game;
-            use cwtools_validation::{
-                build_enum_map, build_scope_registry_arc, validate_ast_with_loc_prebuilt,
-            };
 
             let game_id = Game::from_str(&game).unwrap_or_else(|| {
                 eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
@@ -587,15 +456,6 @@ fn main() {
                 rules_label
             );
 
-            // Parse rules (shares its StringTable with game files)
-            let rules_table = StringTable::new();
-            let ruleset = load_rules(&rules, &rules_table);
-            eprintln!(
-                "  Loaded {} types, {} enums, {} aliases",
-                ruleset.types.len(),
-                ruleset.enums.len(),
-                ruleset.aliases.len()
-            );
             // Per-phase timings on stderr when CWTOOLS_TIMINGS is set.
             let _timings = std::env::var_os("CWTOOLS_TIMINGS").is_some();
             let mut _tprev = std::time::Instant::now();
@@ -608,96 +468,9 @@ fn main() {
                 }};
             }
 
-            // Discover and parse files using the SAME string table.
-            // Layer user-supplied --ignore-file / --ignore-dir globs on top of
-            // the engine defaults (Changelog.txt, README.*, *.md, etc.).
-            let mut config = search_config_for(&directory);
-            if !ignore_files.is_empty() {
-                config.exclude_patterns.extend(ignore_files.iter().cloned());
-            }
-            if !ignore_dirs.is_empty() {
-                config
-                    .exclude_dir_patterns
-                    .extend(ignore_dirs.iter().cloned());
-            }
-            let mut manager = FileManager::with_string_table(config, rules_table.clone());
-            let files = manager.discover_and_parse().unwrap_or_else(|e| {
-                eprintln!("Error discovering files: {}", e);
-                std::process::exit(1);
-            });
-            eprintln!("  Discovered {} files", files.len());
-            tlog!("discover+parse");
-
-            // Take ownership of each parsed AST once, as the parser's ParsedFile.
-            // The TypeIndex build and the validation pass both borrow this set, so
-            // nothing is parsed (or held) twice.
-            let parsed: Vec<(std::path::PathBuf, String, cwtools_parser::ast::ParsedFile)> = files
-                .into_iter()
-                .map(|f| {
-                    let pf = cwtools_parser::ast::ParsedFile {
-                        arena: f.arena,
-                        root_children: f.root_children,
-                        errors: vec![],
-                    };
-                    (f.path, f.logical_path, pf)
-                })
-                .collect();
-
-            // Build cross-file TypeIndex from the already-parsed arenas (Item 2).
-            // This is cheap (~0.1s on MD), so keep it sequential and streaming:
-            // merge each file's instances then drop them, rather than holding
-            // every file's instances at once. Lower peak memory, and first-seen
-            // dedup stays in deterministic input order.
-            use rayon::prelude::*;
-            let mut type_index = TypeIndex::new();
-            for (path, logical_path, pf) in &parsed {
-                let instances = collect_type_instances(&ruleset, pf, logical_path, &rules_table);
-                type_index.merge(path.to_str().unwrap_or(""), instances);
-            }
-            tlog!("typeindex");
-
-            // Project-wide variable index for `variable_field` reference checks
-            // (CW246). Collect every variable defined by a `set_variable`-family
-            // effect across the mod (the effect set is config-derived). Used only
-            // when the var checks are enabled (CWTOOLS_VAR_CHECKS); building it is
-            // cheap so it is always populated.
-            let var_effects = variable_defining_effects(&ruleset);
-            for (_path, _logical_path, pf) in &parsed {
-                let mut names: Vec<String> = Vec::new();
-                collect_set_variable_names(pf, &rules_table, &var_effects, &mut names);
-                for n in &names {
-                    type_index.var_index.add_name(n);
-                }
-            }
-            tlog!("varindex");
-
-            // Index the base-game install, if given. Vanilla files populate the
-            // type index (so a mod can reference base-game operation_tokens,
-            // ship_names, focuses, … without "not a known instance" errors) but are
-            // never validated themselves.
-            if let Some(vanilla_dir) = &vanilla {
-                let vanilla_index =
-                    index_game_dir(vanilla_dir, &ruleset, &rules_table, &var_effects);
-                type_index.var_index.merge(&vanilla_index.var_index);
-                for (type_name, entries) in vanilla_index.map {
-                    let per_type = std::collections::HashMap::from([(
-                        type_name,
-                        entries.into_iter().map(|(_, inst)| inst).collect(),
-                    )]);
-                    type_index.merge("<vanilla>", per_type);
-                }
-                // Build the file index (mod + vanilla) for `filepath` reference
-                // checks (CW113). Only when vanilla is present: mod files commonly
-                // reference base-game assets, so an index missing vanilla would
-                // flag every such reference as not-found.
-                type_index.file_index.add_root(&directory);
-                type_index.file_index.add_root(vanilla_dir);
-                tlog!("fileindex");
-            }
-
             // Load a pre-generated vanilla index, if given (faster than --vanilla;
             // resolves base-game references without re-parsing the install).
-            if let Some(cache_path) = &vanilla_cache {
+            let vanilla_cache_index = vanilla_cache.as_ref().and_then(|cache_path| {
                 match vanilla_cache::load(cache_path) {
                     Ok((cache_game, _fingerprint, per_type)) => {
                         if cache_game != game {
@@ -707,41 +480,48 @@ fn main() {
                             );
                         }
                         let total: usize = per_type.values().map(|v| v.len()).sum();
-                        type_index.merge("<vanilla-cache>", per_type);
                         eprintln!(
                             "  Loaded {} base-game instances from cache {}",
                             total,
                             cache_path.display()
                         );
+                        Some(per_type)
                     }
-                    Err(e) => eprintln!(
-                        "  warn: could not load vanilla cache {}: {}",
-                        cache_path.display(),
-                        e
-                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "  warn: could not load vanilla cache {}: {}",
+                            cache_path.display(),
+                            e
+                        );
+                        None
+                    }
                 }
-            }
+            });
 
-            // Modifier names valid in `alias_name[modifier]` slots (from the
-            // top-level `modifiers = { ... }` block in the rules). Templated
-            // entries like `production_speed_<building>_factor` /
-            // `local_resources_<resource>_factor` / `<ideology>_drift` are
-            // expanded against the type index, one per instance.
-            let modifier_keys = cwtools_validation::build_modifier_keys(&ruleset, &type_index);
-
-            // Load localisation: the mod directory plus the vanilla install (so
-            // mod config referencing base-game loc keys doesn't false-positive).
-            // The combined service feeds the loc-key index (CW100/CW122) and the
-            // loc-file checks; only mod-path loc files are reported.
-            let mut loc_dirs: Vec<&std::path::Path> = vec![directory.as_path()];
-            if let Some(v) = &vanilla {
-                loc_dirs.push(v.as_path());
-            }
-            let loc_service = cwtools_localization::LocService::from_folders(&loc_dirs);
-            let loc_game = cwtools_localization::Game::from_engine(Some(game_id));
-            tlog!("vanilla+modifiers");
-            let loc_index = cwtools_localization::LocIndex::build(&loc_service, loc_game);
-            tlog!("loc-load");
+            // Build the whole engine pipeline through the shared driver: parse
+            // rules, discover/parse mod files, build the type/var/vanilla indexes,
+            // expand modifier keys, build the loc index, prebuild the scope
+            // registry. The CLI and LSP share this one implementation.
+            let session = Session::load(SessionConfig {
+                game: game_id,
+                rules: RulesInput::from_path(rules.clone()),
+                directory: directory.clone(),
+                vanilla: vanilla.clone(),
+                vanilla_cache: vanilla_cache_index,
+                ignore_files: &ignore_files,
+                ignore_dirs: &ignore_dirs,
+                loc_languages: None,
+                on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
+            });
+            let ruleset = session.ruleset();
+            eprintln!(
+                "  Loaded {} types, {} enums, {} aliases",
+                ruleset.types.len(),
+                ruleset.enums.len(),
+                ruleset.aliases.len()
+            );
+            eprintln!("  Discovered {} files", session.parsed_files().len());
+            tlog!("load");
 
             // Load the ignore-hash baseline, if given.
             let ignored: std::collections::HashSet<String> = ignore_hashes
@@ -764,37 +544,14 @@ fn main() {
                 line: u32,
                 hash: String,
             }
-            // Validate files in parallel. Each file's validation reads only
-            // shared, immutable state (ruleset, rules_table behind its own lock,
-            // type_index, modifier_keys, loc_index) and produces its own Vec, so
-            // there's no contention on `diags`. `par_iter` over the indexed
-            // `parsed` Vec collects in input order, so the report is byte-for-byte
-            // identical to the sequential version.
+            // The driver validates files in parallel, in input order, so the
+            // report is byte-for-byte identical to the sequential version.
             let ignored_ref = &ignored;
-            // Build the per-run shared state (scope registry + enum_map) ONCE,
-            // not once per file: both depend only on (ruleset, game). The
-            // registry is an Arc shared across threads; enum_map borrows from
-            // `ruleset`, which outlives the parallel loop.
-            let registry = build_scope_registry_arc(&ruleset, Some(game_id));
-            let enum_map = build_enum_map(&ruleset);
-            let registry_ref = registry.as_ref();
-            let enum_map_ref = &enum_map;
-            let mut diags: Vec<Diag> = parsed
-                .par_iter()
-                .flat_map_iter(|(path, _logical_path, parser_file)| {
+            let mut diags: Vec<Diag> = session
+                .validate_all()
+                .into_iter()
+                .flat_map(|(path, errors)| {
                     let file_str = path.to_str().unwrap_or("").to_string();
-                    let errors = validate_ast_with_loc_prebuilt(
-                        parser_file,
-                        &ruleset,
-                        &rules_table,
-                        &file_str,
-                        Some(game_id),
-                        Some(&type_index),
-                        Some(&modifier_keys),
-                        Some(&loc_index),
-                        registry_ref,
-                        enum_map_ref,
-                    );
                     errors.into_iter().filter_map(move |err| {
                         let code = err.code.clone().unwrap_or_default();
                         let hash = diag_hash(&file_str, &code, &err.message, err.line);
@@ -817,7 +574,7 @@ fn main() {
             // Loc-file checks (CW225/CW234/CW259/CW268/CW275). Resolve refs
             // against the full mod+vanilla union but only report mod-path files.
             let dir_prefix = directory.to_string_lossy().to_string();
-            for d in cwtools_localization::validate_loc_project(&loc_service, loc_game) {
+            for d in session.loc_project_diagnostics() {
                 if !d.file.starts_with(&dir_prefix) {
                     continue;
                 }
@@ -863,6 +620,10 @@ fn main() {
             // breakdown, to track the 1.5 GB target and see where bytes go.
             if cwtools_profiling::profile_enabled() {
                 let mib = |b: usize| cwtools_profiling::format_mib(b as u64);
+                let parsed = session.parsed_files();
+                let type_index = session.type_index();
+                let loc_index = session.loc_index();
+                let rules_table = session.string_table();
                 if let Some(rss) = cwtools_profiling::current_rss_bytes() {
                     eprintln!(
                         "  [profile] RSS {} after validating {} files",
@@ -880,11 +641,11 @@ fn main() {
                     mib(st.metadata_bytes),
                 );
                 let (mut nodes, mut leaves, mut values, mut clauses) = (0usize, 0, 0, 0);
-                for (_p, _l, pf) in &parsed {
-                    nodes += pf.arena.nodes.len();
-                    leaves += pf.arena.leaves.len();
-                    values += pf.arena.leaf_values.len();
-                    clauses += pf.arena.value_clauses.len();
+                for src in parsed {
+                    nodes += src.parsed.arena.nodes.len();
+                    leaves += src.parsed.arena.leaves.len();
+                    values += src.parsed.arena.leaf_values.len();
+                    clauses += src.parsed.arena.value_clauses.len();
                 }
                 let type_instances: usize = type_index.map.values().map(|v| v.len()).sum();
                 eprintln!(

@@ -8,7 +8,6 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
 use cwtools_info::TypeIndex;
 use cwtools_info::{
     PositionElement, ReferenceHint, TypeInstance, element_at_position, info_at_position,
@@ -48,25 +47,18 @@ fn loc_diag_to_validation_error(d: &cwtools_localization::LocDiagnostic) -> Vali
 }
 
 /// Index a base-game ("vanilla") install into per-type instances, ready to merge
-/// into the workspace TypeIndex. Mirrors the CLI's `index_game_dir` / `--vanilla`:
-/// for a game root, `FileManagerConfig::default()` already covers the standard
-/// layout (common/, gfx/, events/, …). The discovered ASTs are used directly (no
-/// re-parse) because vanilla files are only indexed, never validated.
+/// into the workspace TypeIndex. Delegates to the shared driver's `index_game_dir`
+/// so the LSP and CLI discover and index vanilla the SAME way (the driver's
+/// `search_config_for` config, which is the broader, corpus-verified one). The
+/// discovered ASTs are used directly (no re-parse) because vanilla files are only
+/// indexed, never validated. Drops the per-instance file_uri; the merge slot only
+/// needs the instances.
 fn index_vanilla_dir(
     dir: &std::path::Path,
     ruleset: &RuleSet,
     table: &StringTable,
 ) -> HashMap<String, Vec<TypeInstance>> {
-    let config = FileManagerConfig {
-        root: dir.to_path_buf(),
-        ..Default::default()
-    };
-    let mut mgr = FileManager::with_string_table(config, table.clone());
-    let index = match mgr.discover_and_parse() {
-        Ok(files) => cwtools_info::index_discovered_files(files, ruleset, table, None),
-        Err(_) => TypeIndex::new(),
-    };
-    // Drop the per-instance file_uri; the merge slot only needs the instances.
+    let index = cwtools_driver::index_game_dir(dir, ruleset, table, &HashSet::new());
     index
         .map
         .into_iter()
