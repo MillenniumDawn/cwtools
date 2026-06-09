@@ -8,8 +8,6 @@ repository.workspace = true
 [dependencies]
 cwtools_parser = { workspace = true }
 cwtools_string_table = { workspace = true }
-walkdir = { workspace = true }
-globset = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
 

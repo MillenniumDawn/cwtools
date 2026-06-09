@@ -21,7 +21,6 @@ cwtools_game = { workspace = true }
 cwtools_localization = { workspace = true }
 cwtools_profiling = { workspace = true }
 clap = { workspace = true }
-anyhow = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]

@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 cwtools_parser = { workspace = true }
 cwtools_string_table = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

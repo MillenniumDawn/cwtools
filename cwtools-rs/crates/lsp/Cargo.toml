@@ -21,7 +21,6 @@ cwtools_cache = { workspace = true }
 cwtools_profiling = { workspace = true }
 tower-lsp = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }

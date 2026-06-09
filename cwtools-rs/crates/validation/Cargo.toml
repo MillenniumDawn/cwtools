@@ -6,13 +6,12 @@ license.workspace = true
 
 [dependencies]
 cwtools_error_codes = { workspace = true }
-cwtools_parser = { path = "../parser" }
-cwtools_rules = { path = "../rules" }
-cwtools_string_table = { path = "../string_table" }
-cwtools_game = { path = "../game" }
-cwtools_info = { path = "../info" }
-cwtools_localization = { path = "../localization" }
-thiserror = { workspace = true }
+cwtools_parser = { workspace = true }
+cwtools_rules = { workspace = true }
+cwtools_string_table = { workspace = true }
+cwtools_game = { workspace = true }
+cwtools_info = { workspace = true }
+cwtools_localization = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
