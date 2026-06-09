@@ -1,7 +1,15 @@
 # Architecture review: bug parking lot
 
-Functional/correctness issues noticed while reviewing structure. Not a fix list,
-not verified against a repro. Each line is a lead to chase later.
+Functional/correctness issues noticed while reviewing structure. Each line is a
+lead. Items resolved on the fix/cleanup branch are tagged **[FIXED]**; the rest
+are still open.
+
+Resolved: loc-Game "drift" (was not a bug — copies were identical, now collapsed
+to one source); both `scope_matches_required` leniency layers tightened; partial
+scope-registry backfill added (with Stellaris/HOI4 unit tests); unquoted
+REPLACE_ME/TODO_CD now caught. Still open: the info<->validation path-resolver
+fork, the `validate_quotes` semantic fork, the LSP `ruleset` Mutex->RwLock, and
+the parser `Value::Clause` walker hazard.
 
 ## Duplicated logic that can drift out of sync
 

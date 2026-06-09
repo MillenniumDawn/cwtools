@@ -1,8 +1,34 @@
 # cwtools-rs architecture review
 
 Read-only structural review of the Rust workspace. Scope: crate boundaries,
-duplication, god-modules, layering, and a low-risk refactor roadmap. No source
-was modified. Functional/correctness leads are parked in `ARCHITECTURE_BUGS.md`.
+duplication, god-modules, layering, and a low-risk refactor roadmap. Functional/
+correctness leads are parked in `ARCHITECTURE_BUGS.md`.
+
+## Status (fix/cleanup branch)
+
+The roadmap below has been executed. Each step was verified behavior-preserving
+by diffing the MD diagnostic-hash set against committed HEAD on identical inputs
+(a HEAD worktree controls for the MD mod changing on disk).
+
+- Phase 0 hygiene: unused deps dropped, validation manifest normalized.
+- Phase 1: loc-Game mapping (x3->1), modifier-key expansion (x2->1), LSP glob
+  routed through file_manager. (`Game::from_engine`, `build_modifier_keys`.)
+- Phase 2: shared `file_manager::walk_workspace_files`; LSP uses it.
+- Phase 3: `cwtools_index` extracted; `validation->info` inversion fixed.
+- Phase 4: `validation/lib.rs` split into 8 modules + `ValidationCtx` (9/11
+  too_many_arguments retired).
+- Phase 5: `cwtools_driver` (`Session`) extracted; CLI ported onto it; LSP
+  vanilla indexer unified onto it.
+- rules_converter monolith split into submodules (recommendation 5).
+- Approved behavior-changing fixes applied (see `ARCHITECTURE_BUGS.md`): all are
+  0-diff on the MD/HOI4 corpus (they tighten latent leniencies HOI4 doesn't trip)
+  and carry unit tests where the corpus can't exercise them.
+
+Still open (deferred, lower value / needs a decision): relocating
+`build_scope_registry` into `game` (recommendation 3 — the backfill fix was done
+in place instead); collapsing validation's `path_contains_segment` onto the
+shared `cwtools_index` resolver; the `localization` `validate_quotes` fork (two
+different quote rules — needs a behavior decision, not a mechanical dedup).
 
 End goal context: the Rust side is meant to replace the F# binary entirely, so
 both entry points (CLI and LSP) must drive the same core and agree on results.
