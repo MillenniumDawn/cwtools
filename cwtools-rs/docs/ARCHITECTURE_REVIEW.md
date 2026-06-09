@@ -39,13 +39,24 @@ by diffing the MD diagnostic-hash set against committed HEAD on identical inputs
   (they tighten latent leniencies HOI4 doesn't trip) and carry unit tests where
   the corpus can't exercise them.
 
-Still open — the LAST roadmap item: port the LSP's engine state onto
-`cwtools_driver::Session` (Phase 5, second half; problem 5 below). `Session` is
-batch-oriented today; the LSP's incremental paths (per-file re-parse and
-re-index, debounced revalidation, loc-index refresh) need mutation APIs on
-`Session` (update_file/remove_file) before `DocumentState` can shrink to
-transport-only fields wrapping one `Session`. Multi-day; needs the corpus guard
-plus LSP integration tests.
+Phase 5 second half — RESOLVED BY DESIGN, not by porting. The goal of the
+driver phase was "CLI and LSP drive the same core and agree on results". That
+is achieved through shared primitives rather than one shared object: every
+pipeline step is the same function on both sides (rules load
+`load_ruleset_from_dir`; discovery skip rules `FileManagerConfig` defaults +
+`glob_match`; type instances `cwtools_index::collect_type_instances`; var
+index `variable_defining_effects`/`collect_set_variable_names`; vanilla
+`cwtools_driver::index_game_dir`; modifier keys `build_modifier_keys`; loc
+`LocIndex::build_scoped`; registry `build_scope_registry_arc`; enums
+`build_enum_map`; validation `validate_prepared` via `Prepared`). The only
+LSP-side orchestration that is not `Session` is editor machinery with no CLI
+counterpart to drift against: the .cwb parse cache, open-doc skipping, async
+yields, progress UI, diagnostic publication, and incremental per-file
+re-indexing. Wrapping that in `Session` was REJECTED: the LSP's fine-grained
+`RwLock`s (per-component) are what keep did_change at ~3.5ms; a single
+lock over one `Session` would serialize hover/completion behind every
+re-index. `crates/driver/src/lib.rs` module docs record the same decision.
+The roadmap is closed.
 
 End goal context: the Rust side is meant to replace the F# binary entirely, so
 both entry points (CLI and LSP) must drive the same core and agree on results.
@@ -111,6 +122,10 @@ Layer sketch, bottom to top:
   direction.
 
 ## Top structural problems, ranked by maintenance impact
+
+(Historical: this is the original review snapshot. Line numbers and "exists
+twice/three times" claims describe the pre-refactor tree; the Status section
+above records what was done about each. Kept for the reasoning.)
 
 ### 1. No shared driver. CLI and LSP each reimplement the pipeline.
 
