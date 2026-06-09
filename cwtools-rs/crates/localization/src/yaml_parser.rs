@@ -474,8 +474,8 @@ pub fn validate_quotes(entry: &mut LocEntry) -> bool {
 
 /// Check for REPLACE_ME / TODO_CD placeholders.
 pub fn validate_replace_me(entry: &LocEntry) -> Option<String> {
-    let trimmed = entry.desc.trim();
-    if trimmed == "\"REPLACE_ME\"" || trimmed == "\"TODO_CD\"" {
+    let inner = entry.desc.trim().trim_matches('"');
+    if inner == "REPLACE_ME" || inner == "TODO_CD" {
         Some(format!(
             "CW-ReplaceMe: localisation key '{}' contains placeholder",
             entry.key

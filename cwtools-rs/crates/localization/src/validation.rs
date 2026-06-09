@@ -193,10 +193,10 @@ pub fn validate_quotes(entry: &LocEntry) -> bool {
     starts == ends
 }
 
-/// Check for `REPLACE_ME` / `TODO_CD` placeholder values.
+/// Check for `REPLACE_ME` / `TODO_CD` placeholder values, quoted or not.
 pub fn is_replace_me(entry: &LocEntry) -> bool {
-    let trimmed = entry.desc.trim();
-    trimmed == "\"REPLACE_ME\"" || trimmed == "\"TODO_CD\""
+    let inner = entry.desc.trim().trim_matches('"');
+    inner == "REPLACE_ME" || inner == "TODO_CD"
 }
 
 /// Loc references that are hardcoded engine concepts (scopes, common getters)

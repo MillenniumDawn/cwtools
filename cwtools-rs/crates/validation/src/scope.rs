@@ -139,18 +139,13 @@ pub(crate) fn scope_matches_required(
     if current == SCOPE_ANY {
         return true;
     }
-    // Current scope didn't resolve to a known name (scope tracking gap) -> be
-    // lenient rather than emit a false wrong-scope error.
-    if registry.name_of(current).starts_with("scope_") {
-        return true;
-    }
     // A requirement is satisfied if the current scope is that scope or a subscope
-    // of it (e.g. `character` satisfies a `country` requirement). Unresolvable
-    // requirement names are treated leniently.
+    // of it (e.g. `character` satisfies a `country` requirement). An unresolvable
+    // requirement name does NOT auto-satisfy.
     required.iter().any(|r| {
         registry
             .id_of(r)
-            .is_none_or(|rid| registry.is_subscope_or_eq(current, rid))
+            .is_some_and(|rid| registry.is_subscope_or_eq(current, rid))
     })
 }
 
