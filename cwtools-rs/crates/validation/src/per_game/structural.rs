@@ -106,13 +106,19 @@ fn is_empty_if(children: &[Child], ast: &ParsedFile, table: &StringTable) -> boo
                     return false;
                 }
                 // A `key = { ... }` leaf-clause: only `limit` is allowed.
-                if !table.with_string(l.key.normal, |s| s == "limit").unwrap_or(false) {
+                if !table
+                    .with_string(l.key.normal, |s| s == "limit")
+                    .unwrap_or(false)
+                {
                     return false;
                 }
             }
             Child::Node(idx) => {
                 let n = &ast.arena.nodes[*idx as usize];
-                if !table.with_string(n.key.normal, |s| s == "limit").unwrap_or(false) {
+                if !table
+                    .with_string(n.key.normal, |s| s == "limit")
+                    .unwrap_or(false)
+                {
                     return false;
                 }
             }

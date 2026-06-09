@@ -28,9 +28,10 @@ pub fn validate_stellaris(
                 let leaf = &ast.arena.leaves[*idx as usize];
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
                 if key == "event"
-                    && let Value::Clause(children) = &leaf.value {
-                        validate_event_clause(children, ast, table, file_path, errors);
-                    }
+                    && let Value::Clause(children) = &leaf.value
+                {
+                    validate_event_clause(children, ast, table, file_path, errors);
+                }
             }
             Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => {}
         }
