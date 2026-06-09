@@ -6,7 +6,7 @@
 //!   by the project variable index.
 
 use cwtools_game::constants::Game;
-use cwtools_info::TypeIndex;
+use cwtools_index::TypeIndex;
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;

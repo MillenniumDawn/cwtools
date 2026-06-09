@@ -10,7 +10,7 @@ cwtools_parser = { workspace = true }
 cwtools_rules = { workspace = true }
 cwtools_string_table = { workspace = true }
 cwtools_game = { workspace = true }
-cwtools_info = { workspace = true }
+cwtools_index = { workspace = true }
 cwtools_localization = { workspace = true }
 tracing = { workspace = true }
 

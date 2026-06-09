@@ -1,11 +1,14 @@
 [package]
-name = "cwtools_info"
+name = "cwtools_index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tracing = { workspace = true }
 cwtools_parser = { workspace = true }
+cwtools_file_manager = { workspace = true }
 cwtools_string_table = { workspace = true }
 cwtools_rules = { workspace = true }
-cwtools_index = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

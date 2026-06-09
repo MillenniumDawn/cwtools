@@ -56,7 +56,7 @@ fn validate_wrapper_grandchildren(
     scope_context: &mut Option<ScopeContext>,
     game: Option<Game>,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
 ) {
@@ -159,7 +159,7 @@ pub fn validate_ast(
     table: &StringTable,
     file_path: &str,
     game: Option<Game>,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
 ) -> Vec<ValidationError> {
     validate_ast_with_loc(
@@ -184,7 +184,7 @@ pub fn validate_ast_with_loc(
     table: &StringTable,
     file_path: &str,
     game: Option<Game>,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
 ) -> Vec<ValidationError> {
@@ -236,7 +236,7 @@ pub fn validate_ast_with_loc_prebuilt(
     table: &StringTable,
     file_path: &str,
     game: Option<Game>,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
     registry: Option<&std::sync::Arc<ScopeRegistry>>,
@@ -555,7 +555,7 @@ fn validate_with_type(
     scope_context: &mut Option<ScopeContext>,
     game: Option<Game>,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
     node_key: Option<&str>,
@@ -1345,7 +1345,7 @@ fn subtype_rules_match(
     ast: &ParsedFile,
     table: &StringTable,
     enum_map: &HashMap<&str, &EnumDefinition>,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     // A subtype with discriminators must be *positively activated* by the entity:
     // A subtype matches when its rules apply cleanly, but one whose
@@ -1532,7 +1532,7 @@ fn subtype_matches(
     table: &StringTable,
     enum_map: &HashMap<&str, &EnumDefinition>,
     node_key: Option<&str>,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     // `## type_key_filter` discriminates on the instance's own node key (e.g.
     // `shared_focus` selects subtype[shared], `joint_focus` selects subtype[joint_focus]).
@@ -1560,7 +1560,7 @@ fn typefield_value_is_instance(
     right: &NewField,
     value: &Value,
     table: &StringTable,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     let (NewField::TypeField(TypeType::Simple(tname)), Some(idx)) = (right, type_index) else {
         return false;
@@ -1651,7 +1651,7 @@ fn validate_leaf_against_rule(
     scope_context: &mut Option<ScopeContext>,
     game: Option<Game>,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
 ) {
@@ -1782,7 +1782,7 @@ fn validate_node_against_rule(
     scope_context: &mut Option<ScopeContext>,
     game: Option<Game>,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
 ) {
@@ -1897,11 +1897,11 @@ fn matching_candidates<'a, F>(
     rules: &'a [(RuleType, Options)],
     key: &str,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     matcher: F,
 ) -> Vec<&'a (RuleType, Options)>
 where
-    F: Fn(&RuleType, &str, &RuleSet, Option<&cwtools_info::TypeIndex>) -> bool,
+    F: Fn(&RuleType, &str, &RuleSet, Option<&cwtools_index::TypeIndex>) -> bool,
 {
     let all: Vec<&(RuleType, Options)> = rules
         .iter()
@@ -1961,7 +1961,7 @@ fn validate_children(
     scope_context: &mut Option<ScopeContext>,
     game: Option<Game>,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
     // Position of the block that owns `children` (its opening `key = {`). Used to
@@ -2526,7 +2526,7 @@ fn rule_matches_leaf_key(
     rule_type: &RuleType,
     key: &str,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     match rule_type {
         // Cross-kind fallback: a NodeRule can also match a leaf key (e.g. alias blocks)
@@ -2541,7 +2541,7 @@ fn rule_matches_node_key(
     rule_type: &RuleType,
     key: &str,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     match rule_type {
         // Cross-kind fallback: a LeafRule can also match a node key
@@ -2600,7 +2600,7 @@ fn looks_like_scope_command(key: &str) -> bool {
 fn is_scope_key(
     key: &str,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     looks_like_scope_command(key)
         || ruleset.scope_links.contains(key)
@@ -2619,7 +2619,7 @@ fn alias_pattern_matches(
     pattern: &str,
     key: &str,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
 ) -> Option<bool> {
     // Locate the placeholder and split into (prefix, kind, name, suffix).
     let (pre, kind, name, suf): (&str, &str, &str, &str) = if let Some(open) = pattern.find('<') {
@@ -2689,7 +2689,7 @@ fn field_matches_key(
     field: &NewField,
     key: &str,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     match field {
         // Paradox script keys (field and command names) are case-insensitive — the
@@ -2816,7 +2816,7 @@ fn validate_alias_usage(
     scope_context: &mut Option<ScopeContext>,
     game: Option<Game>,
     ruleset: &RuleSet,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
 ) {
@@ -3044,7 +3044,7 @@ fn alias_mismatch_error(
 /// agree on what counts as a modifier.
 pub fn build_modifier_keys(
     ruleset: &RuleSet,
-    type_index: &cwtools_info::TypeIndex,
+    type_index: &cwtools_index::TypeIndex,
 ) -> std::collections::HashSet<String> {
     let mut mk = std::collections::HashSet::new();
     for m in &ruleset.modifiers {
@@ -3230,7 +3230,7 @@ fn validate_leaf(
     enum_map: &HashMap<&str, &EnumDefinition>,
     errors: &mut Vec<ValidationError>,
     file_path: &str,
-    type_index: Option<&cwtools_info::TypeIndex>,
+    type_index: Option<&cwtools_index::TypeIndex>,
     scope_context: Option<&ScopeContext>,
     game: Option<Game>,
     loc_index: Option<&LocIndex>,

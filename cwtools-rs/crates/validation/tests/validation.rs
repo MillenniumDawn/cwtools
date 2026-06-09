@@ -1,4 +1,4 @@
-use cwtools_info::{SourceLocation, TypeIndex, TypeInstance};
+use cwtools_index::{SourceLocation, TypeIndex, TypeInstance};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;

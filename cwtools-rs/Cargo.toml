@@ -7,6 +7,7 @@ members = [
     "crates/file_manager",
     "crates/cache",
     "crates/rules",
+    "crates/index",
     "crates/validation",
     "crates/game",
     "crates/localization",
@@ -30,6 +31,7 @@ cwtools_parser = { path = "crates/parser" }
 cwtools_file_manager = { path = "crates/file_manager" }
 cwtools_cache = { path = "crates/cache" }
 cwtools_rules = { path = "crates/rules" }
+cwtools_index = { path = "crates/index" }
 cwtools_validation = { path = "crates/validation" }
 cwtools_game = { path = "crates/game" }
 cwtools_localization = { path = "crates/localization" }
