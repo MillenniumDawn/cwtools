@@ -116,7 +116,107 @@ pub(crate) fn build_scope_registry(ruleset: &RuleSet, game: Game) -> ScopeRegist
         }
     }
 
+    // A non-empty config can still be missing scopes/links that the game's
+    // hardcoded tables define (a partially-loaded scopes.cwt). Backfill those so
+    // they don't silently resolve to None. No-op for HOI4 (empty scope_defs);
+    // matters for games with hardcoded tables and an incomplete config.
+    backfill_hardcoded(&mut reg, game, &mut next_id);
+
     reg
+}
+
+/// Merge any hardcoded scope/link for `game` that `reg` (built from config) does
+/// not already define. Hardcoded ids live in their own space, so backfilled
+/// scopes get fresh ids in `reg`'s space and every referenced id (subscope_of,
+/// link target/valid scopes) is remapped through `hc_to_reg`.
+fn backfill_hardcoded(reg: &mut ScopeRegistry, game: Game, next_id: &mut u32) {
+    let hc = ScopeRegistry::from_hardcoded(game);
+    if hc.is_empty() {
+        return;
+    }
+
+    // Map each hardcoded id to its id in the merged registry: an existing reg id
+    // if the config already defines that scope by name, else a fresh id.
+    let mut hc_to_reg: std::collections::HashMap<ScopeId, ScopeId> =
+        std::collections::HashMap::new();
+    for (hid, hdef) in &hc.by_id {
+        let existing = std::iter::once(&hdef.name)
+            .chain(hdef.aliases.iter())
+            .find_map(|n| reg.id_of(n));
+        let rid = match existing {
+            Some(id) => id,
+            None => {
+                let id = ScopeId(*next_id);
+                *next_id += 1;
+                reg.by_name.insert(hdef.name.to_ascii_lowercase(), id);
+                for a in &hdef.aliases {
+                    reg.by_name.insert(a.to_ascii_lowercase(), id);
+                }
+                reg.by_id.insert(
+                    id,
+                    ScopeDefOwned {
+                        name: hdef.name.clone(),
+                        aliases: hdef.aliases.clone(),
+                        subscope_of: Vec::new(), // resolved below
+                    },
+                );
+                id
+            }
+        };
+        hc_to_reg.insert(*hid, rid);
+    }
+
+    let remap = |id: ScopeId| -> ScopeId {
+        if id == SCOPE_ANY || id == SCOPE_INVALID {
+            id
+        } else {
+            hc_to_reg.get(&id).copied().unwrap_or(id)
+        }
+    };
+
+    // Resolve the backfilled scopes' parents now that every id is mapped. Only
+    // touch scopes we just added (existing config scopes keep their parents).
+    for (hid, hdef) in &hc.by_id {
+        let rid = hc_to_reg[hid];
+        if hdef.subscope_of.is_empty() {
+            continue;
+        }
+        if let Some(def) = reg.by_id.get_mut(&rid)
+            && def.subscope_of.is_empty()
+        {
+            def.subscope_of = hdef.subscope_of.iter().map(|p| remap(*p)).collect();
+        }
+    }
+
+    // Backfill links/prefix-links the config didn't define, remapping their ids.
+    for (k, link) in &hc.links {
+        if reg.links.contains_key(k) {
+            continue;
+        }
+        reg.links.insert(
+            k.clone(),
+            ScopeLink {
+                valid_scopes: link.valid_scopes.iter().map(|s| remap(*s)).collect(),
+                target: link.target.map(remap),
+                is_scope_change: link.is_scope_change,
+                ignore_keys: link.ignore_keys.clone(),
+            },
+        );
+    }
+    for (p, link) in &hc.prefix_links {
+        if reg.prefix_links.iter().any(|(ep, _)| ep == p) {
+            continue;
+        }
+        reg.prefix_links.push((
+            p.clone(),
+            ScopeLink {
+                valid_scopes: link.valid_scopes.iter().map(|s| remap(*s)).collect(),
+                target: link.target.map(remap),
+                is_scope_change: link.is_scope_change,
+                ignore_keys: link.ignore_keys.clone(),
+            },
+        ));
+    }
 }
 
 pub(crate) fn scope_matches_required(
@@ -333,5 +433,53 @@ pub(crate) fn apply_replace_scopes(
             &replace.froms,
             &replace.prevs,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_scope_registry;
+    use cwtools_game::constants::Game;
+    use cwtools_rules::rules_types::{RuleSet, ScopeInput};
+
+    /// A partial config (only `Country`) for a game with hardcoded scopes must
+    /// still resolve the rest of that game's scopes via the hardcoded backfill,
+    /// instead of silently dropping them to None.
+    #[test]
+    fn partial_config_backfills_hardcoded_scopes() {
+        let mut rs = RuleSet::new();
+        rs.scope_inputs.push(ScopeInput {
+            name: "Country".to_string(),
+            aliases: vec!["country".to_string()],
+            is_subscope_of: Vec::new(),
+        });
+        let reg = build_scope_registry(&rs, Game::Stellaris);
+
+        // The config-declared scope resolves to exactly one id (not duplicated).
+        let country = reg.id_of("country").expect("country resolves");
+        assert_eq!(reg.id_of("Country"), Some(country));
+
+        // Hardcoded Stellaris scopes absent from the partial config are backfilled.
+        assert!(reg.id_of("planet").is_some(), "planet backfilled");
+        assert!(reg.id_of("ship").is_some(), "ship backfilled");
+        assert!(reg.id_of("leader").is_some(), "leader backfilled");
+        // System has several aliases; any of them must resolve to one id.
+        let system = reg.id_of("system").expect("system backfilled");
+        assert_eq!(reg.id_of("galactic_object"), Some(system));
+    }
+
+    /// HOI4 has no hardcoded scope table, so the backfill is a no-op: a config
+    /// scope resolves, an unrelated name does not get invented.
+    #[test]
+    fn hoi4_backfill_is_noop() {
+        let mut rs = RuleSet::new();
+        rs.scope_inputs.push(ScopeInput {
+            name: "Country".to_string(),
+            aliases: vec!["country".to_string()],
+            is_subscope_of: Vec::new(),
+        });
+        let reg = build_scope_registry(&rs, Game::Hoi4);
+        assert!(reg.id_of("country").is_some());
+        assert!(reg.id_of("planet").is_none(), "no hardcoded HOI4 backfill");
     }
 }
