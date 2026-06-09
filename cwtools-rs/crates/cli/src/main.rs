@@ -727,23 +727,7 @@ fn main() {
             // entries like `production_speed_<building>_factor` /
             // `local_resources_<resource>_factor` / `<ideology>_drift` are
             // expanded against the type index, one per instance.
-            let mut modifier_keys: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            for m in &ruleset.modifiers {
-                match (m.find('<'), m.find('>')) {
-                    (Some(open), Some(close)) if open < close => {
-                        let tn = &m[open + 1..close];
-                        let pre = &m[..open];
-                        let suf = &m[close + 1..];
-                        for (_uri, inst) in type_index.instances(tn) {
-                            modifier_keys.insert(format!("{}{}{}", pre, inst.name, suf));
-                        }
-                    }
-                    _ => {
-                        modifier_keys.insert(m.clone());
-                    }
-                }
-            }
+            let modifier_keys = cwtools_validation::build_modifier_keys(&ruleset, &type_index);
 
             // Load localisation: the mod directory plus the vanilla install (so
             // mod config referencing base-game loc keys doesn't false-positive).
@@ -754,16 +738,7 @@ fn main() {
                 loc_dirs.push(v.as_path());
             }
             let loc_service = cwtools_localization::LocService::from_folders(&loc_dirs);
-            let loc_game = match game_id {
-                Game::Hoi4 => cwtools_localization::Game::HOI4,
-                Game::Stellaris => cwtools_localization::Game::Stellaris,
-                Game::Eu4 => cwtools_localization::Game::EU4,
-                Game::Ck3 => cwtools_localization::Game::CK3,
-                Game::Ir => cwtools_localization::Game::IR,
-                Game::Vic3 => cwtools_localization::Game::VIC3,
-                Game::Eu5 => cwtools_localization::Game::EU5,
-                _ => cwtools_localization::Game::Generic,
-            };
+            let loc_game = cwtools_localization::Game::from_engine(Some(game_id));
             tlog!("vanilla+modifiers");
             let loc_index = cwtools_localization::LocIndex::build(&loc_service, loc_game);
             tlog!("loc-load");

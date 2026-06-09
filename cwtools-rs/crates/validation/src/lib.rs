@@ -3037,19 +3037,32 @@ fn alias_mismatch_error(
     }
 }
 
-/// Map the engine `Game` to the localization crate's `Game` enum.
-fn engine_game_to_loc_game(game: Option<Game>) -> cwtools_localization::Game {
-    use cwtools_localization::Game as LG;
-    match game {
-        Some(Game::Hoi4) => LG::HOI4,
-        Some(Game::Stellaris) => LG::Stellaris,
-        Some(Game::Eu4) => LG::EU4,
-        Some(Game::Ck3) => LG::CK3,
-        Some(Game::Ir) => LG::IR,
-        Some(Game::Vic3) => LG::VIC3,
-        Some(Game::Eu5) => LG::EU5,
-        _ => LG::Generic,
+/// Build the set of valid modifier names for `alias_name[modifier]` slots from
+/// the ruleset's `modifiers = { ... }` block. Templated entries like
+/// `production_speed_<building>_factor` / `<ideology>_drift` are expanded against
+/// the type index, one instance each. Single source of truth so the CLI and LSP
+/// agree on what counts as a modifier.
+pub fn build_modifier_keys(
+    ruleset: &RuleSet,
+    type_index: &cwtools_info::TypeIndex,
+) -> std::collections::HashSet<String> {
+    let mut mk = std::collections::HashSet::new();
+    for m in &ruleset.modifiers {
+        match (m.find('<'), m.find('>')) {
+            (Some(open), Some(close)) if open < close => {
+                let tn = &m[open + 1..close];
+                let pre = &m[..open];
+                let suf = &m[close + 1..];
+                for (_uri, inst) in type_index.instances(tn) {
+                    mk.insert(format!("{}{}{}", pre, inst.name, suf));
+                }
+            }
+            _ => {
+                mk.insert(m.clone());
+            }
+        }
     }
+    mk
 }
 
 /// Validate a `LocalisationField` leaf: that the referenced loc key exists
@@ -3142,7 +3155,7 @@ fn validate_localisation_field(
                 .and_then(|c| c.current())
                 .unwrap_or(cwtools_game::scope_engine::SCOPE_ANY);
             let data = cwtools_localization::LocScopeData {
-                game: engine_game_to_loc_game(game),
+                game: cwtools_localization::Game::from_engine(game),
                 registry: scope_context.map(|c| c.registry.clone()),
                 ..Default::default()
             };

@@ -19,52 +19,12 @@ use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{
-    ValidationError, build_enum_map, build_scope_registry_arc, validate_ast_with_loc_prebuilt,
+    ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
+    validate_ast_with_loc_prebuilt,
 };
 
 mod symbols;
 mod workspace_cache;
-
-/// Build the set of valid modifier names for `alias_name[modifier]` slots from the
-/// ruleset's `modifiers = { ... }` block. Templated entries like
-/// `production_speed_<building>_factor` / `<ideology>_drift` are expanded against
-/// the type index, one per instance. Mirrors the CLI so the extension and CLI
-/// agree on what counts as a modifier.
-fn build_modifier_keys(ruleset: &RuleSet, type_index: &TypeIndex) -> HashSet<String> {
-    let mut mk = HashSet::new();
-    for m in &ruleset.modifiers {
-        match (m.find('<'), m.find('>')) {
-            (Some(open), Some(close)) if open < close => {
-                let tn = &m[open + 1..close];
-                let pre = &m[..open];
-                let suf = &m[close + 1..];
-                for (_uri, inst) in type_index.instances(tn) {
-                    mk.insert(format!("{}{}{}", pre, inst.name, suf));
-                }
-            }
-            _ => {
-                mk.insert(m.clone());
-            }
-        }
-    }
-    mk
-}
-
-/// Map the engine `Game` to the localization crate's `Game` enum.
-fn engine_to_loc_game(game: Option<cwtools_game::constants::Game>) -> cwtools_localization::Game {
-    use cwtools_game::constants::Game as G;
-    use cwtools_localization::Game as LG;
-    match game {
-        Some(G::Hoi4) => LG::HOI4,
-        Some(G::Stellaris) => LG::Stellaris,
-        Some(G::Eu4) => LG::EU4,
-        Some(G::Ck3) => LG::CK3,
-        Some(G::Ir) => LG::IR,
-        Some(G::Vic3) => LG::VIC3,
-        Some(G::Eu5) => LG::EU5,
-        _ => LG::Generic,
-    }
-}
 
 /// Convert a loc-file diagnostic into a `ValidationError` so it shares the
 /// `validation_error_to_diagnostic` rendering path. Loc positions are 1-based;
@@ -351,41 +311,6 @@ fn extract_ignore_patterns(opts: &Value) -> (Vec<String>, Vec<String>) {
         }
     }
     (files, dirs)
-}
-
-/// Tiny glob match supporting `*` (any chars) and `?` (single char), matching
-/// the semantics of `cwtools_file_manager::glob_match`. Kept inline to avoid a
-/// new public re-export from the file_manager crate.
-fn lsp_glob_match(pattern: &str, text: &str) -> bool {
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        if suffix.is_empty() {
-            return true;
-        }
-        return text.ends_with(suffix);
-    }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return text.starts_with(prefix);
-    }
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    let (m, n) = (p.len(), t.len());
-    let mut dp = vec![vec![false; n + 1]; m + 1];
-    dp[0][0] = true;
-    for i in 1..=m {
-        if p[i - 1] == '*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-    }
-    for i in 1..=m {
-        for j in 1..=n {
-            if p[i - 1] == '*' {
-                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
-            } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1];
-            }
-        }
-    }
-    dp[m][n]
 }
 
 /// Derive the logical path (relative to mod root) from a file:// URI and the
@@ -2333,9 +2258,9 @@ impl Backend {
                             // `resources/` is a developer scratch area in many mods,
                             // not a path the game loads — don't validate it.
                             | "resources" | ".vscode"
-                        ) || extra_dir_globs
-                            .iter()
-                            .any(|pat| lsp_glob_match(pat, raw_name));
+                        ) || extra_dir_globs.iter().any(|pat| {
+                            cwtools_file_manager::file_manager::glob_match(pat, raw_name)
+                        });
                         if !skip {
                             walk_dir(&path, extensions, extra_file_globs, extra_dir_globs, out);
                         }
@@ -2360,10 +2285,9 @@ impl Backend {
                         if engine_skip {
                             continue;
                         }
-                        if extra_file_globs
-                            .iter()
-                            .any(|pat| lsp_glob_match(pat, file_name))
-                        {
+                        if extra_file_globs.iter().any(|pat| {
+                            cwtools_file_manager::file_manager::glob_match(pat, file_name)
+                        }) {
                             continue;
                         }
                         out.push(path);
@@ -2700,7 +2624,7 @@ impl Backend {
             let language = self.state.language.lock().clone();
             cwtools_game::constants::Game::from_str(&language)
         };
-        let loc_game = engine_to_loc_game(game);
+        let loc_game = cwtools_localization::Game::from_engine(game);
 
         let mut loc_dirs: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
         if let Some(v) = self.state.vanilla_dir.lock().clone() {

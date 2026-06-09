@@ -95,6 +95,26 @@ pub enum Game {
     Generic,
 }
 
+impl Game {
+    /// Map the engine `Game` (from `cwtools_game`) to this crate's loc `Game`.
+    /// The single source of truth for that mapping; CLI, LSP, and validation all
+    /// route through here so they cannot drift. Games without a loc variant
+    /// (CK2, VIC2) fall through to `Generic`, which accepts all languages.
+    pub fn from_engine(game: Option<cwtools_game::constants::Game>) -> Self {
+        use cwtools_game::constants::Game as G;
+        match game {
+            Some(G::Hoi4) => Game::HOI4,
+            Some(G::Stellaris) => Game::Stellaris,
+            Some(G::Eu4) => Game::EU4,
+            Some(G::Ck3) => Game::CK3,
+            Some(G::Ir) => Game::IR,
+            Some(G::Vic3) => Game::VIC3,
+            Some(G::Eu5) => Game::EU5,
+            _ => Game::Generic,
+        }
+    }
+}
+
 /// Returns the set of valid `l_xxx` language tokens for the given game.
 ///
 /// Mirrors the per-game `keyToLanguage` functions in `YAMLLocalisationParser.fs`
