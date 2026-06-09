@@ -1397,10 +1397,11 @@ fn validate_leaf(
             validate_localisation_field(ctx, leaf, *synced, *is_inline, scope_context, errors);
             return;
         }
-        // TypeField: check type_index when available (Item 1).
+        // TypeField: check type_index when available and the index is complete
+        // (includes vanilla). When validating a mod without vanilla data the type
+        // index only contains mod-defined instances; vanilla instances are absent,
+        // so every valid cross-reference would be a false positive.
         if let NewField::TypeField(type_type) = right {
-            // Unquote: `load_oob = "EU_frontex_basic_2017"` references the instance
-            // `EU_frontex_basic_2017`; type instances are stored unquoted.
             let raw_value = leaf_value_to_string(&leaf.value, table);
             let value_str = raw_value
                 .strip_prefix('"')
@@ -1437,14 +1438,11 @@ fn validate_leaf(
                 _ => (value_str.clone(), Vec::new()),
             };
             if let Some(idx) = type_index {
-                // Only flag if we have at least one known instance for this type.
-                // If zero instances, vanilla data probably isn't loaded — accept.
+                // Only flag when the index is complete (vanilla loaded) AND we have
+                // known instances for this type AND the reference doesn't resolve.
                 let resolved = idx.contains(type_name, &lookup_value)
                     || alt_candidates.iter().any(|c| idx.contains(type_name, c));
-                if !idx.instances(type_name).is_empty() && !resolved {
-                    // An unknown `<event>` / `<event.country_event>` reference is
-                    // F#'s CW222 (UndefinedEvent, Warning); other unknown type
-                    // refs keep the Rust-only CW500.
+                if idx.complete && !idx.instances(type_name).is_empty() && !resolved {
                     let is_event = type_name == "event" || type_name.starts_with("event.");
                     let (code, message) = if is_event {
                         let c = &error_codes::CW222_UNDEFINED_EVENT;
@@ -1756,6 +1754,11 @@ pub(crate) fn field_matches_value(
         // Bool for those values — match them up (affects every boolean rule field).
         (NewField::SpecificField(s), Value::Bool(b)) => (s == "yes" && *b) || (s == "no" && !*b),
         (NewField::SpecificField(s), Value::Int(i)) => s == &i.to_string(),
+        // In Paradox script, `key = yes` and `key = { ... }` are often
+        // interchangeable (e.g. `create_intelligence_agency = { ... }`).
+        // The parser stores blocks as Value::Clause on a Leaf — accept them
+        // when the rule expects a specific scalar.
+        (NewField::SpecificField(_), Value::Clause(_)) => true,
 
         // --- TypeField: accept string (cross-file existence is a separate pass) ---
         (NewField::TypeField(TypeType::Simple(type_name)), Value::String(t))

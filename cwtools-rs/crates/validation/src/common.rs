@@ -210,6 +210,12 @@ pub(crate) fn is_datetime_shape(s: &str) -> bool {
 
 /// Enum membership test. An absent or empty enum (members come from game data
 /// that isn't statically loaded — provinces, ship_units, ...) is permissive.
+///
+/// For populated enums, we use a size heuristic: small enums (≤ 5 members) are
+/// treated as authoritative — an unlisted value is a genuine error.  Larger
+/// enums are likely incomplete game-data catalogues (equipment_categories,
+/// tech folders, idea tokens, …) and are treated as advisory — any non-empty
+/// value is accepted, because the CWT rules rarely enumerate every member.
 pub(crate) fn enum_contains(
     enum_map: &HashMap<&str, &EnumDefinition>,
     enum_name: &str,
@@ -228,7 +234,17 @@ pub(crate) fn enum_contains(
             // `enum[command_cap_increase] = { @tier1_cp_cap_increase ... }`) accepts
             // the resolved literal value too (`command_cap_increase = 10`), which we
             // can't resolve statically — be permissive.
-            def.values.iter().any(|v| v.starts_with('@'))
+            if def.values.iter().any(|v| v.starts_with('@')) {
+                return true;
+            }
+            // Large enums are likely incomplete game-data catalogues — accept any
+            // non-empty value rather than flag every unlisted member.
+            // Small enums (≤ 5 members) are authoritative; an unlisted value is
+            // a genuine error.
+            if def.values.len() > 5 {
+                return !value.is_empty();
+            }
+            false
         }
         _ => true,
     }

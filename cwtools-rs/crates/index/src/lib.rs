@@ -178,6 +178,11 @@ pub struct TypeIndex {
     /// Project-wide set of defined variable names, for `variable_field`
     /// reference checks (CW246). Empty unless the CLI populated it.
     pub var_index: VarIndex,
+    /// Whether this index includes vanilla (base-game) definitions. When
+    /// `false`, CW500 type-reference checks are skipped to avoid false
+    /// positives on valid vanilla cross-references. The driver sets this
+    /// to `true` after merging vanilla data.
+    pub complete: bool,
 }
 
 impl TypeIndex {

@@ -193,8 +193,16 @@ impl Session {
         }
 
         // Merge a pre-generated vanilla index, if given.
+        let has_vanilla_data = vanilla.is_some() || vanilla_cache.is_some();
         if let Some(per_type) = vanilla_cache {
             type_index.merge("<vanilla-cache>", per_type);
+        }
+
+        // Mark the index as complete when vanilla data was loaded (either from a
+        // directory or a pre-generated cache).  This lets CW500 type-reference
+        // checks fire without false positives on mod-only validation.
+        if has_vanilla_data {
+            type_index.complete = true;
         }
 
         // Modifier names valid in `alias_name[modifier]` slots. Templated entries

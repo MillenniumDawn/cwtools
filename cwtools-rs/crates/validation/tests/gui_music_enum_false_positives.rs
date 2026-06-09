@@ -399,6 +399,7 @@ types = {
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let mut index = TypeIndex::new();
+    index.complete = true;
     let mut per_type: HashMap<String, Vec<TypeInstance>> = HashMap::new();
     per_type.insert(
         "spriteType".to_string(),
