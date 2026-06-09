@@ -228,7 +228,10 @@ pub struct LocEntry {
     // Parsed elements (lazy, computed on demand)
     pub refs: Vec<String>,
     pub commands: Vec<String>,
-    pub jomini_commands: Vec<JominiCommand>,
+    /// Each inner Vec is one `[...]` bracket's command chain.
+    /// `[overlord.owner.GetName]` → `vec![vec!["overlord", "owner", "GetName"]]`.
+    /// Multiple brackets produce multiple inner Vecs.
+    pub jomini_commands: Vec<Vec<JominiCommand>>,
 }
 
 /// Position in a source file.

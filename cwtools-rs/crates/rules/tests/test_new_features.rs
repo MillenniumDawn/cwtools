@@ -68,8 +68,14 @@ values = {
 
     // G: values block
     assert_eq!(ruleset.values.len(), 1);
-    assert_eq!(ruleset.values[0].0, "my_values");
-    assert_eq!(ruleset.values[0].1, vec!["alpha", "beta", "gamma"]);
+    let my_vals = ruleset
+        .values
+        .get("my_values")
+        .expect("my_values not found");
+    assert_eq!(
+        my_vals.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        vec!["alpha", "beta", "gamma"]
+    );
 
     // F: complex_enum
     assert_eq!(ruleset.complex_enums.len(), 1);

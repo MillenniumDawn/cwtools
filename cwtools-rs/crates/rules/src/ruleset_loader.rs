@@ -1,5 +1,7 @@
 use crate::post_process::post_process;
+#[cfg(test)]
 use crate::rules_converter::ast_to_ruleset;
+use crate::rules_converter::ast_to_ruleset_raw;
 use crate::rules_types::RuleSet;
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::StringTable;
@@ -31,7 +33,9 @@ pub fn merge_ruleset(dst: &mut RuleSet, src: RuleSet) {
     dst.single_aliases.extend(src.single_aliases);
     dst.complex_enums.extend(src.complex_enums);
     dst.root_rules.extend(src.root_rules);
-    dst.values.extend(src.values);
+    for (name, vals) in src.values {
+        dst.values.entry(name).or_default().extend(vals);
+    }
     dst.modifiers.extend(src.modifiers);
     dst.scope_links.extend(src.scope_links);
     dst.scope_inputs.extend(src.scope_inputs);
@@ -54,7 +58,7 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<S
         match std::fs::read_to_string(path) {
             Ok(content) => match parse_string(&content, table) {
                 Ok(parsed) => {
-                    let ruleset = ast_to_ruleset(&parsed, table);
+                    let ruleset = ast_to_ruleset_raw(&parsed, table);
                     merge_ruleset(&mut combined, ruleset);
                 }
                 Err(e) => {

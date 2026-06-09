@@ -435,9 +435,11 @@ fn substitute_params(text: &str, params: &HashMap<String, String>) -> String {
     while let Some(ch) = chars.next() {
         if ch == '$' {
             let mut param_name = String::new();
+            let mut closed = false;
             while let Some(&next_ch) = chars.peek() {
                 if next_ch == '$' {
                     chars.next(); // consume closing $
+                    closed = true;
                     break;
                 }
                 param_name.push(next_ch);
@@ -446,10 +448,13 @@ fn substitute_params(text: &str, params: &HashMap<String, String>) -> String {
             if let Some(val) = params.get(&param_name) {
                 output.push_str(val);
             } else {
-                // Unresolved param: keep original
+                // Unresolved or unterminated param: keep original without
+                // re-emitting a closing $ that wasn't in the input.
                 output.push('$');
                 output.push_str(&param_name);
-                output.push('$');
+                if closed {
+                    output.push('$');
+                }
             }
         } else {
             output.push(ch);

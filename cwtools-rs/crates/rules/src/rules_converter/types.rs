@@ -86,6 +86,7 @@ pub(crate) fn process_type_node(
             path_file: None,
             path_extension: None,
             paths_lower: Vec::new(),
+            ..Default::default()
         },
         subtypes: Vec::new(),
         type_key_filter: None,
@@ -174,31 +175,58 @@ pub(crate) fn process_type_node(
                                 def.should_be_referenced = true;
                             }
                             "skip_root_key" => {
-                                let op = l.op;
-                                let v = leaf_value_string(l, table);
-                                if v == "any" {
-                                    def.skip_root_key.push(SkipRootKey::AnyKey);
-                                } else {
-                                    let should_match = op == cwtools_parser::ast::Operator::Equals;
-                                    if def.skip_root_key.is_empty() {
-                                        def.skip_root_key.push(SkipRootKey::SpecificKey(v));
-                                    } else {
-                                        // Multiple leaves: promote to MultipleKeys
-                                        let mut all_keys: Vec<String> = Vec::new();
-                                        for existing in def.skip_root_key.drain(..) {
-                                            match existing {
-                                                SkipRootKey::SpecificKey(k) => all_keys.push(k),
-                                                SkipRootKey::MultipleKeys(mut ks, _) => {
-                                                    all_keys.append(&mut ks)
-                                                }
-                                                SkipRootKey::AnyKey => {}
+                                if let Value::Clause(block_children) = &l.value {
+                                    // Block form: skip_root_key = { A B }
+                                    // Each element is a separate nested level (F#
+                                    // RulesParser.fs:1031-1035 maps each to its own layer).
+                                    // `any` becomes AnyKey; anything else becomes SpecificKey.
+                                    for block_child in block_children {
+                                        if let Child::LeafValue(lvidx) = block_child {
+                                            let lv = &ast.arena.leaf_values[*lvidx as usize];
+                                            let v = value_to_string(&lv.value, table);
+                                            if v.is_empty() {
+                                                continue;
+                                            }
+                                            if v == "any" {
+                                                def.skip_root_key.push(SkipRootKey::AnyKey);
+                                            } else {
+                                                def.skip_root_key.push(SkipRootKey::SpecificKey(v));
                                             }
                                         }
-                                        all_keys.push(v);
-                                        def.skip_root_key.push(SkipRootKey::MultipleKeys(
-                                            all_keys,
-                                            should_match,
-                                        ));
+                                    }
+                                } else {
+                                    let op = l.op;
+                                    let v = leaf_value_string(l, table);
+                                    if v == "any" {
+                                        def.skip_root_key.push(SkipRootKey::AnyKey);
+                                    } else {
+                                        let should_match =
+                                            op == cwtools_parser::ast::Operator::Equals;
+                                        if def.skip_root_key.is_empty() {
+                                            def.skip_root_key.push(SkipRootKey::SpecificKey(v));
+                                        } else {
+                                            // Multiple leaves: promote to MultipleKeys, using
+                                            // the first entry's operator (F# parity).
+                                            let first_should_match = match &def.skip_root_key[0] {
+                                                SkipRootKey::MultipleKeys(_, sm) => *sm,
+                                                _ => should_match,
+                                            };
+                                            let mut all_keys: Vec<String> = Vec::new();
+                                            for existing in def.skip_root_key.drain(..) {
+                                                match existing {
+                                                    SkipRootKey::SpecificKey(k) => all_keys.push(k),
+                                                    SkipRootKey::MultipleKeys(mut ks, _) => {
+                                                        all_keys.append(&mut ks)
+                                                    }
+                                                    SkipRootKey::AnyKey => {}
+                                                }
+                                            }
+                                            all_keys.push(v);
+                                            def.skip_root_key.push(SkipRootKey::MultipleKeys(
+                                                all_keys,
+                                                first_should_match,
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -226,22 +254,23 @@ pub(crate) fn process_type_node(
                     } else if nk == "modifiers" {
                         modifiers_children = Some(n.children.clone());
                     } else if nk == "skip_root_key" {
-                        // Block form: skip_root_key = { A B C }
-                        let mut block_keys = Vec::new();
+                        // Block form: skip_root_key = { A B }
+                        // Each element is a separate nested level (F#
+                        // RulesParser.fs:1031-1035 maps each to its own layer).
+                        // `any` becomes AnyKey; anything else becomes SpecificKey.
                         for block_child in &n.children {
                             if let Child::LeafValue(lvidx) = block_child {
                                 let lv = &ast.arena.leaf_values[*lvidx as usize];
                                 let v = value_to_string(&lv.value, table);
-                                if !v.is_empty() {
-                                    // `any` flows through as a literal key here; any
-                                    // wildcard semantics live in the matcher.
-                                    block_keys.push(v);
+                                if v.is_empty() {
+                                    continue;
+                                }
+                                if v == "any" {
+                                    def.skip_root_key.push(SkipRootKey::AnyKey);
+                                } else {
+                                    def.skip_root_key.push(SkipRootKey::SpecificKey(v));
                                 }
                             }
-                        }
-                        if !block_keys.is_empty() {
-                            def.skip_root_key
-                                .push(SkipRootKey::MultipleKeys(block_keys, true));
                         }
                     }
                 }
@@ -249,23 +278,10 @@ pub(crate) fn process_type_node(
             }
         }
 
-        // Promote single SkipRootKey::SpecificKey to MultipleKeys if there were multiple skip_root_key leaves
-        if def.skip_root_key.len() > 1 {
-            let mut all_keys = Vec::new();
-            let mut should_match = true;
-            for existing in def.skip_root_key.drain(..) {
-                match existing {
-                    SkipRootKey::SpecificKey(k) => all_keys.push(k),
-                    SkipRootKey::MultipleKeys(mut ks, sm) => {
-                        should_match = sm;
-                        all_keys.append(&mut ks);
-                    }
-                    SkipRootKey::AnyKey => {}
-                }
-            }
-            def.skip_root_key
-                .push(SkipRootKey::MultipleKeys(all_keys, should_match));
-        }
+        // Multiple leaf skip_root_key directives are already promoted inline
+        // (above) to a single MultipleKeys entry.  The block form intentionally
+        // produces one entry per element (nested levels), so no further
+        // collapsing is needed or correct here.
 
         // Parse localisation block
         if let Some(loc_children) = localisation_children {
@@ -297,18 +313,25 @@ pub(crate) fn process_type_node(
 pub(crate) fn parse_type_key_filter_from_comments(
     comments: &[String],
 ) -> Option<(Vec<String>, bool)> {
-    if let Some(c) = comments.iter().find(|s| s.contains("type_key_filter")) {
-        let negative = c.contains("<>");
-        let has_eq = c.contains('=');
-        if !negative && !has_eq {
-            return None;
+    // Check for negated form first (`type_key_filter <> value`) — only on exactly-## lines.
+    for c in comments.iter().rev() {
+        let Some(rest) = c.strip_prefix("##") else {
+            continue;
+        };
+        if rest.starts_with('#') {
+            continue;
         }
-        let rhs = if negative {
-            let idx = c.find("<>").unwrap() + 2;
-            c[idx..].trim().to_string()
+        let rest = rest.trim_start();
+        if !rest.starts_with("type_key_filter") {
+            continue;
+        }
+        let after = rest["type_key_filter".len()..].trim_start();
+        let (rhs, negative) = if let Some(r) = after.strip_prefix("<>") {
+            (r.trim(), true)
+        } else if let Some(r) = after.strip_prefix('=') {
+            (r.trim(), false)
         } else {
-            let idx = c.find('=').unwrap() + 1;
-            c[idx..].trim().to_string()
+            continue;
         };
         let values = if rhs.starts_with('{') && rhs.ends_with('}') {
             let inner = rhs.trim_matches(|c| c == '{' || c == '}');
@@ -318,19 +341,15 @@ pub(crate) fn parse_type_key_filter_from_comments(
                 .map(|s| s.to_string())
                 .collect()
         } else {
-            vec![rhs]
+            vec![rhs.to_string()]
         };
-        Some((values, negative))
-    } else {
-        None
+        return Some((values, negative));
     }
+    None
 }
 
 fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
-    if let Some(c) = comments.iter().find(|s| s.contains("graph_related_types"))
-        && let Some(idx) = c.find('=')
-    {
-        let rhs = c[idx + 1..].trim().to_string();
+    if let Some(rhs) = find_directive(comments, "graph_related_types") {
         if rhs.starts_with('{') && rhs.ends_with('}') {
             let inner = rhs.trim_matches(|c| c == '{' || c == '}');
             return inner
@@ -338,8 +357,8 @@ fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .collect();
-        } else {
-            return vec![rhs];
+        } else if !rhs.is_empty() {
+            return vec![rhs.to_string()];
         }
     }
     Vec::new()
@@ -362,9 +381,9 @@ pub(crate) fn parse_localisation_block(
                 continue;
             }
             let value = value_to_string(&l.value, table);
-            let required = child_comments.iter().any(|s| s.contains("required"));
-            let optional = child_comments.iter().any(|s| s.contains("optional"));
-            let primary = child_comments.iter().any(|s| s.contains("primary"));
+            let required = has_directive(child_comments, "required");
+            let optional = has_directive(child_comments, "optional");
+            let primary = has_directive(child_comments, "primary");
             let replace_scopes = parse_replace_scopes_from_comments(child_comments);
 
             let loc = if let Some(dollar_idx) = value.find('$') {
@@ -414,10 +433,11 @@ pub(crate) fn parse_modifiers_block(
                 continue;
             }
             let value = value_to_string(&l.value, table);
-            let explicit = child_comments.iter().any(|s| s.contains("explicit"));
+            let explicit = has_directive(child_comments, "explicit");
+            // Documentation is the first exactly-### line (not ##, which is directives).
             let documentation = child_comments
                 .iter()
-                .find(|s| s.starts_with("##"))
+                .find(|s| s.starts_with("###"))
                 .map(|s| s.trim_start_matches('#').trim().to_string());
 
             let modifier = if let Some(dollar_idx) = value.find('$') {
@@ -443,4 +463,90 @@ pub(crate) fn parse_modifiers_block(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod skip_root_key_tests {
+    use cwtools_parser::parser::parse_string;
+    use cwtools_string_table::string_table::StringTable;
+
+    use crate::{rules_converter::ast_to_ruleset, rules_types::SkipRootKey};
+
+    fn parse_type(cwt: &str) -> Vec<SkipRootKey> {
+        let table = StringTable::new();
+        let ast = parse_string(cwt, &table).unwrap();
+        let rs = ast_to_ruleset(&ast, &table);
+        rs.types
+            .into_iter()
+            .next()
+            .map(|t| t.skip_root_key)
+            .unwrap_or_default()
+    }
+
+    // Single leaf: skip_root_key = ideas
+    #[test]
+    fn single_leaf_produces_specific_key() {
+        let srk = parse_type(
+            r#"types = { type[idea] = { path = "game/common/ideas" skip_root_key = ideas } }"#,
+        );
+        assert_eq!(srk, vec![SkipRootKey::SpecificKey("ideas".into())]);
+    }
+
+    // Single leaf: skip_root_key = any
+    #[test]
+    fn single_any_leaf_produces_any_key() {
+        let srk = parse_type(
+            r#"types = { type[idea] = { path = "game/common/ideas" skip_root_key = any } }"#,
+        );
+        assert_eq!(srk, vec![SkipRootKey::AnyKey]);
+    }
+
+    // Block form: skip_root_key = { ideas any }
+    // Must produce TWO nested levels, not one MultipleKeys.
+    #[test]
+    fn block_form_produces_nested_levels() {
+        let srk = parse_type(
+            r#"types = { type[idea] = { path = "game/common/ideas" skip_root_key = { ideas any } } }"#,
+        );
+        assert_eq!(
+            srk,
+            vec![
+                SkipRootKey::SpecificKey("ideas".into()),
+                SkipRootKey::AnyKey,
+            ],
+            "block form must produce one entry per element (nested levels)"
+        );
+    }
+
+    // Block form with two named keys: skip_root_key = { A B }
+    #[test]
+    fn block_form_two_named_keys_are_two_levels() {
+        let srk = parse_type(
+            r#"types = { type[foo] = { path = "game/x" skip_root_key = { wrapper inner } } }"#,
+        );
+        assert_eq!(
+            srk,
+            vec![
+                SkipRootKey::SpecificKey("wrapper".into()),
+                SkipRootKey::SpecificKey("inner".into()),
+            ]
+        );
+    }
+
+    // Multiple leaves: skip_root_key = A  +  skip_root_key = B  (alternatives, F# parity)
+    // Must keep MultipleKeys (alternative form, single level with two candidates).
+    #[test]
+    fn multiple_leaves_produce_multiple_keys() {
+        let srk = parse_type(
+            r#"types = { type[foo] = { path = "game/x" skip_root_key = a skip_root_key = b } }"#,
+        );
+        assert_eq!(srk.len(), 1, "multiple leaves must collapse to ONE entry");
+        match &srk[0] {
+            SkipRootKey::MultipleKeys(keys, true) => {
+                assert!(keys.contains(&"a".to_string()));
+                assert!(keys.contains(&"b".to_string()));
+            }
+            other => panic!("expected MultipleKeys, got {other:?}"),
+        }
+    }
 }

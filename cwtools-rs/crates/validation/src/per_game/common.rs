@@ -70,14 +70,16 @@ pub fn validate_common(
     let mut type_counts: HashMap<String, usize> = HashMap::new();
 
     for child in &ast.root_children {
-        let key = match child {
+        let (key, line, col) = match child {
             Child::Node(idx) => {
                 let node = &ast.arena.nodes[*idx as usize];
-                table.get_string(node.key.normal).unwrap_or_default()
+                let k = table.get_string(node.key.normal).unwrap_or_default();
+                (k, node.pos.start.line, node.pos.start.col)
             }
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-                table.get_string(leaf.key.normal).unwrap_or_default()
+                let k = table.get_string(leaf.key.normal).unwrap_or_default();
+                (k, leaf.pos.start.line, leaf.pos.start.col)
             }
             Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => continue,
         };
@@ -88,7 +90,9 @@ pub fn validate_common(
             && type_def.unique
         {
             let count = type_counts.get(&key).copied().unwrap_or(0);
-            if count > 1 {
+            // Emit exactly once, at the second occurrence, so the error anchors
+            // at the duplicate rather than at 0,0.
+            if count == 2 {
                 // CW261 (DuplicateTypeDef). F#'s message is
                 // "Key {id} of type {typename} is defined multiple times";
                 // this per-file detection keys off the type name appearing
@@ -99,8 +103,8 @@ pub fn validate_common(
                 errors.push(ValidationError {
                     message: code.format(&[&key, &key]),
                     severity: code.severity,
-                    line: 0,
-                    col: 0,
+                    line,
+                    col,
                     file: file_path.to_string(),
                     code: Some(code.id.to_string()),
                 });

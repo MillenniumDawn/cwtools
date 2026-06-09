@@ -135,18 +135,13 @@ fn build_subtype(
 }
 
 fn extract_comment_value(comments: &[String], key: &str) -> Option<String> {
-    comments
-        .iter()
-        .find(|s| s.contains(key) && s.contains('='))
-        .and_then(|s| s.find('=').map(|i| s[i + 1..].trim().to_string()))
+    find_directive(comments, key)
         .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {
-    if let Some(c) = comments.iter().find(|s| s.contains("only_if_not"))
-        && let Some(idx) = c.find('=')
-    {
-        let rhs = c[idx + 1..].trim().to_string();
+    if let Some(rhs) = find_directive(comments, "only_if_not") {
         if rhs.starts_with('{') && rhs.ends_with('}') {
             let inner = rhs.trim_matches(|c| c == '{' || c == '}');
             return inner
@@ -154,8 +149,8 @@ fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .collect();
-        } else {
-            return vec![rhs];
+        } else if !rhs.is_empty() {
+            return vec![rhs.to_string()];
         }
     }
     Vec::new()

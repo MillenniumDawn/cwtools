@@ -391,6 +391,12 @@ pub struct InfoService {
     pub all_event_targets: HashSet<String>,
     pub all_variables: HashSet<String>,
     pub all_inline_scripts: HashSet<String>,
+    /// Refcount maps so `clear_file` can remove a symbol in O(1) instead of
+    /// scanning all remaining files. Each map counts how many files define the
+    /// symbol; the symbol is removed from the public set when its count hits 0.
+    event_target_counts: HashMap<String, usize>,
+    variable_counts: HashMap<String, usize>,
+    inline_script_counts: HashMap<String, usize>,
 }
 
 impl Default for InfoService {
@@ -408,6 +414,9 @@ impl InfoService {
             all_event_targets: HashSet::new(),
             all_variables: HashSet::new(),
             all_inline_scripts: HashSet::new(),
+            event_target_counts: HashMap::new(),
+            variable_counts: HashMap::new(),
+            inline_script_counts: HashMap::new(),
         }
     }
 
@@ -449,12 +458,11 @@ impl InfoService {
         let mut info = FileInfo::default();
 
         // ── Heuristic type-name set (kept for back-compat) ────────────────────
-        let mut type_names: HashSet<String> = HashSet::new();
-        for t in &ruleset.types {
-            type_names.insert(t.name.clone());
-        }
+        // Use the pre-built type_by_name index from reindex() instead of
+        // rebuilding a HashSet per file.
+        let type_names = &ruleset.type_by_name;
         for child in &ast.root_children {
-            Self::index_child_heuristic(child, &ast.arena, table, &type_names, &mut info);
+            Self::index_child_heuristic(child, &ast.arena, table, type_names, &mut info);
         }
 
         // ── Rule-driven: type-instance index ─────────────────────────────────
@@ -489,22 +497,23 @@ impl InfoService {
             .collect();
         info.defined_variables_ns =
             collect_defined_variables_from_rules(ruleset, ast, logical_path, table, Some(at_vars));
-        // Flatten non-@-var entries back into the legacy map for compat.
+        // Flatten ALL variable entries (both @-vars and value_set names) into the
+        // legacy map so clear_file can remove them and completion stays current.
         for vars in info.defined_variables_ns.values() {
             for v in vars {
-                if v.name.starts_with('@') {
-                    info.defined_variables.insert(v.name.clone(), v.location);
-                }
+                info.defined_variables.insert(v.name.clone(), v.location);
             }
         }
 
         // saved_event_targets_detailed is populated by index_child_heuristic
         // (it detects save_event_target_as / save_global_event_target_as).
-        info.saved_event_targets = info
-            .saved_event_targets_detailed
-            .iter()
-            .map(|e| e.name.clone())
-            .collect();
+        // index_child_heuristic also inserts event_target:-prefixed keys directly
+        // into saved_event_targets; merge rather than overwrite so those survive.
+        info.saved_event_targets.extend(
+            info.saved_event_targets_detailed
+                .iter()
+                .map(|e| e.name.clone()),
+        );
 
         // ── Merge into global indexes ─────────────────────────────────────────
         for (type_name, locs) in &info.type_definitions {
@@ -513,15 +522,20 @@ impl InfoService {
                 .or_default()
                 .extend(locs.iter().map(|l| (uri.to_string(), *l)));
         }
-        self.all_event_targets
-            .extend(info.saved_event_targets.iter().cloned());
+        for et in &info.saved_event_targets {
+            *self.event_target_counts.entry(et.clone()).or_insert(0) += 1;
+            self.all_event_targets.insert(et.clone());
+        }
         for vars in info.defined_variables_ns.values() {
             for v in vars {
+                *self.variable_counts.entry(v.name.clone()).or_insert(0) += 1;
                 self.all_variables.insert(v.name.clone());
             }
         }
-        self.all_inline_scripts
-            .extend(info.inline_scripts.keys().cloned());
+        for script in info.inline_scripts.keys() {
+            *self.inline_script_counts.entry(script.clone()).or_insert(0) += 1;
+            self.all_inline_scripts.insert(script.clone());
+        }
 
         self.files.insert(uri.to_string(), info);
     }
@@ -590,32 +604,34 @@ impl InfoService {
             self.type_index.remove_file(uri);
             // Event targets
             for et in &info.saved_event_targets {
-                let still_exists = self
-                    .files
-                    .values()
-                    .any(|f| f.saved_event_targets.contains(et));
-                if !still_exists {
-                    self.all_event_targets.remove(et);
+                if let Some(count) = self.event_target_counts.get_mut(et) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.event_target_counts.remove(et);
+                        self.all_event_targets.remove(et);
+                    }
                 }
             }
-            // Variables
-            for var in info.defined_variables.keys() {
-                let still_exists = self
-                    .files
-                    .values()
-                    .any(|f| f.defined_variables.contains_key(var));
-                if !still_exists {
-                    self.all_variables.remove(var);
+            // Variables (refcount via variable_counts, keyed by name)
+            for vars in info.defined_variables_ns.values() {
+                for v in vars {
+                    if let Some(count) = self.variable_counts.get_mut(&v.name) {
+                        *count -= 1;
+                        if *count == 0 {
+                            self.variable_counts.remove(&v.name);
+                            self.all_variables.remove(&v.name);
+                        }
+                    }
                 }
             }
             // Inline scripts
             for script in info.inline_scripts.keys() {
-                let still_exists = self
-                    .files
-                    .values()
-                    .any(|f| f.inline_scripts.contains_key(script));
-                if !still_exists {
-                    self.all_inline_scripts.remove(script);
+                if let Some(count) = self.inline_script_counts.get_mut(script) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.inline_script_counts.remove(script);
+                        self.all_inline_scripts.remove(script);
+                    }
                 }
             }
         }
@@ -649,7 +665,7 @@ impl InfoService {
         child: &Child,
         arena: &Arena,
         table: &StringTable,
-        type_names: &HashSet<String>,
+        type_names: &HashMap<String, usize>,
         info: &mut FileInfo,
     ) {
         match child {
@@ -665,7 +681,7 @@ impl InfoService {
                     },
                 ));
 
-                if type_names.contains(&key) {
+                if type_names.contains_key(&key) {
                     info.type_definitions
                         .entry(key.clone())
                         .or_default()
@@ -692,7 +708,7 @@ impl InfoService {
                         },
                     ));
 
-                    if type_names.contains(&key) {
+                    if type_names.contains_key(&key) {
                         info.type_definitions.entry(key.clone()).or_default().push(
                             SourceLocation {
                                 line: leaf.pos.start.line,
@@ -815,6 +831,7 @@ mod tests {
                 path_file: None,
                 path_extension: None,
                 paths_lower: Vec::new(),
+                ..Default::default()
             },
             subtypes: Vec::new(),
             type_key_filter: None,
@@ -841,7 +858,7 @@ mod tests {
         let table = StringTable::new();
         let parsed = parse_string(source, &table).unwrap();
         let mut info = FileInfo::default();
-        let type_names = HashSet::new();
+        let type_names = HashMap::new();
         for child in &parsed.root_children {
             InfoService::index_child_heuristic(
                 child,
@@ -1100,7 +1117,9 @@ mod tests {
         let parsed = parse_string(source, &table).unwrap();
 
         let rs = RuleSet::new();
-        let vars = collect_defined_variables(&rs, &parsed, &table);
+        // collect_defined_variables was deleted (no production callers); use the
+        // rule-aware entry point which also covers the @-var path.
+        let vars = collect_defined_variables_from_rules(&rs, &parsed, "", &table, None);
         let at_vars = vars.get("@").expect("should have @-namespace vars");
         let names: Vec<&str> = at_vars.iter().map(|v| v.name.as_str()).collect();
         assert!(names.contains(&"@min_manpower"));
@@ -1118,7 +1137,13 @@ effect = {
 }";
         let table = StringTable::new();
         let parsed = parse_string(source, &table).unwrap();
-        let targets = collect_saved_event_targets(&parsed, &table);
+        // collect_saved_event_targets was deleted (no production callers); use
+        // the InfoService to exercise the same code path that production uses.
+        let mut service = InfoService::new();
+        let rs = RuleSet::new();
+        service.index_file_with_path("test.txt", &parsed, &table, &rs, "");
+        let fi = service.files.get("test.txt").expect("file indexed");
+        let targets = &fi.saved_event_targets_detailed;
 
         let names: Vec<&str> = targets.iter().map(|t| t.name.as_str()).collect();
         assert!(
@@ -1216,5 +1241,45 @@ alias[effect:set_temp_variable] = {
         );
         // The reserved `value` key must not be collected as a variable name.
         assert!(!names.contains(&"value".to_string()), "got: {:?}", names);
+    }
+
+    // ── Item 2.7 — value_set var removed from all_variables on clear_file ────
+
+    #[test]
+    fn value_set_var_cleared_on_file_clear() {
+        // Manually inject a non-@-var into a file's defined_variables and confirm
+        // that clear_file removes it from all_variables (the 2.7 inversion fix).
+        let mut svc = InfoService::new();
+        let uri = "file://test.txt";
+
+        // Simulate a file with a value_set variable "my_var" (no @ prefix).
+        let mut file_info = FileInfo::default();
+        file_info.defined_variables.insert(
+            "my_var".to_string(),
+            cwtools_index::SourceLocation { line: 1, col: 0 },
+        );
+        // Populate defined_variables_ns so that clear_file's refcount path fires.
+        file_info.defined_variables_ns.insert(
+            "@".to_string(),
+            vec![cwtools_index::DefinedVariable {
+                name: "my_var".to_string(),
+                namespace: None,
+                location: cwtools_index::SourceLocation { line: 1, col: 0 },
+            }],
+        );
+        svc.files.insert(uri.to_string(), file_info);
+        svc.all_variables.insert("my_var".to_string());
+        // Mirror the refcount that index_file_with_path would have set.
+        svc.variable_counts.insert("my_var".to_string(), 1);
+
+        // Before clear: variable must be present.
+        assert!(svc.all_variables.contains("my_var"));
+
+        // Clear the file: variable must be removed.
+        svc.clear_file(uri);
+        assert!(
+            !svc.all_variables.contains("my_var"),
+            "my_var should be gone after clear_file"
+        );
     }
 }

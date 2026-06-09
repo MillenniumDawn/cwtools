@@ -103,7 +103,7 @@ pub fn validate_loc_commands(
         validate_command_string(cmd, initial_scope, engine_game, data, &mut diags);
     }
 
-    // Validate Jomini command chains
+    // Validate Jomini command chains — each inner Vec is one bracket's chain.
     for chain in &entry.jomini_commands {
         validate_jomini_chain(chain, initial_scope, engine_game, data, &mut diags);
     }
@@ -121,8 +121,9 @@ fn game_to_engine(game: Game) -> EngineGame {
         Game::EU4 => EngineGame::Eu4,
         Game::CK3 => EngineGame::Ck3,
         Game::IR => EngineGame::Ir,
-        Game::Generic => EngineGame::Hoi4, // fallback: lenient
-        _ => EngineGame::Hoi4,
+        Game::VIC3 => EngineGame::Vic3,
+        Game::EU5 => EngineGame::Eu5,
+        Game::Generic | Game::Custom => EngineGame::Hoi4, // fallback: lenient
     }
 }
 
@@ -217,47 +218,61 @@ fn validate_command_string(
     }
 }
 
-/// Validate a Jomini command chain (from `LocEntry.jomini_commands`).
+/// Validate a Jomini command chain (one `[...]` bracket's segments).
 ///
-/// Each `JominiCommand` in the chain may itself have parameters; we validate
-/// the chain keys but skip parameter sub-chains (they're already accepted by
-/// `is_bypass_prefix`).
+/// Scope is threaded through the segments left-to-right, mirroring
+/// `validate_command_string`. This is the single scope-threading implementation
+/// for Jomini chains; the old per-segment path is replaced.
 fn validate_jomini_chain(
-    chain: &JominiCommand,
+    chain: &[JominiCommand],
     initial_scope: ScopeId,
     engine_game: EngineGame,
     data: &LocScopeData,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
-    // `JominiCommand` in commands.rs is a single command-with-params, not a
-    // chain.  The chain lives in `LocEntry.jomini_commands` which is a
-    // `Vec<JominiCommand>`.  But since we receive one JominiCommand here and
-    // the chain is called externally (the caller iterates jomini_commands),
-    // we validate the single key.
-    let seg = &chain.key;
-
-    if is_bypass_prefix(seg, data) {
+    if chain.is_empty() {
         return;
     }
-
-    let looks_terminal = is_terminal_command(seg, data);
-    if looks_terminal {
-        return; // accepted without scope check
-    }
-
+    let last_idx = chain.len() - 1;
     let mut ctx = build_loc_ctx(data, engine_game, initial_scope);
-    let result = ctx.change_scope(seg);
-    if let ScopeResult::WrongScope {
-        command,
-        current,
-        expected,
-    } = result
-    {
-        diags.push(LocCommandDiagnostic::WrongScope {
-            command,
-            current_scope: current.0,
-            expected_scopes: expected.iter().map(|s| s.0).collect(),
-        });
+
+    for (i, cmd) in chain.iter().enumerate() {
+        let seg = &cmd.key;
+        let is_last = i == last_idx;
+
+        if is_bypass_prefix(seg, data) {
+            ctx.push_scope(SCOPE_ANY);
+            continue;
+        }
+
+        let looks_terminal = is_terminal_command(seg, data);
+        if is_last && looks_terminal {
+            return; // terminal — accepted without scope check
+        }
+
+        let result = ctx.change_scope(seg);
+        match result {
+            ScopeResult::NewScope { .. } | ScopeResult::AnyScope | ScopeResult::VarFound => {}
+            ScopeResult::ValueFound if is_last => return,
+            ScopeResult::ValueFound => {}
+            ScopeResult::WrongScope {
+                command,
+                current,
+                expected,
+            } => {
+                diags.push(LocCommandDiagnostic::WrongScope {
+                    command,
+                    current_scope: current.0,
+                    expected_scopes: expected.iter().map(|s| s.0).collect(),
+                });
+                return; // short-circuit
+            }
+            ScopeResult::NotFound | ScopeResult::VarNotFound(_) => {
+                if !is_last {
+                    ctx.push_scope(SCOPE_ANY); // unknown intermediate: lenient
+                }
+            }
+        }
     }
 }
 
@@ -304,7 +319,7 @@ mod tests {
         }
     }
 
-    fn make_entry_with_jomini(jomini: Vec<JominiCommand>) -> LocEntry {
+    fn make_entry_with_jomini(jomini: Vec<Vec<JominiCommand>>) -> LocEntry {
         LocEntry {
             key: "test_key".into(),
             value: None,
@@ -447,11 +462,11 @@ mod tests {
 
     #[test]
     fn jomini_getname_accepted() {
-        // A single JominiCommand with key "GetName" — terminal, no scope change
-        let entry = make_entry_with_jomini(vec![JominiCommand {
+        // A single bracket [GetName] — one chain with one segment
+        let entry = make_entry_with_jomini(vec![vec![JominiCommand {
             key: "GetName".into(),
             params: Vec::new(),
-        }]);
+        }]]);
         let data = hoi4_data();
         let diags = validate_loc_commands(&entry, ScopeId(100), &data);
         assert!(
@@ -465,10 +480,10 @@ mod tests {
     #[test]
     fn jomini_wrong_scope_controller_from_country() {
         // `controller` is only valid from State (101), not Country (100)
-        let entry = make_entry_with_jomini(vec![JominiCommand {
+        let entry = make_entry_with_jomini(vec![vec![JominiCommand {
             key: "controller".into(),
             params: Vec::new(),
-        }]);
+        }]]);
         let data = hoi4_data();
         let diags = validate_loc_commands(&entry, ScopeId(100), &data);
         assert!(
@@ -478,6 +493,52 @@ mod tests {
         assert!(
             matches!(diags[0], LocCommandDiagnostic::WrongScope { .. }),
             "expected WrongScope, got: {:?}",
+            diags
+        );
+    }
+
+    // ── Jomini dot-chain threads scope correctly ──────────────────────────────
+
+    #[test]
+    fn jomini_chain_state_owner_getname() {
+        // [owner.GetName] from State scope: owner → Country → terminal
+        let entry = make_entry_with_jomini(vec![vec![
+            JominiCommand {
+                key: "owner".into(),
+                params: Vec::new(),
+            },
+            JominiCommand {
+                key: "GetName".into(),
+                params: Vec::new(),
+            },
+        ]]);
+        let data = hoi4_data();
+        let diags = validate_loc_commands(&entry, ScopeId(101), &data);
+        assert!(
+            diags.is_empty(),
+            "owner.GetName from State should be valid, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn jomini_chain_wrong_scope_in_middle() {
+        // [controller.GetName] from Country (100): controller is State-only
+        let entry = make_entry_with_jomini(vec![vec![
+            JominiCommand {
+                key: "controller".into(),
+                params: Vec::new(),
+            },
+            JominiCommand {
+                key: "GetName".into(),
+                params: Vec::new(),
+            },
+        ]]);
+        let data = hoi4_data();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            !diags.is_empty(),
+            "controller from Country should produce WrongScope, got: {:?}",
             diags
         );
     }

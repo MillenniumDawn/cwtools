@@ -47,11 +47,12 @@ impl ScopeRegistry {
         }
     }
 
-    /// Resolve a scope name/alias (`country`, `Special Project`, `any`) to an id.
+    /// Resolve a scope name/alias (`country`, `Special Project`, `any`, `none`) to an id.
+    /// `none` maps to `SCOPE_ANY` (F# anyScope semantics: unrestricted).
     pub fn id_of(&self, name: &str) -> Option<ScopeId> {
         let lower = name.trim().to_ascii_lowercase();
         match lower.as_str() {
-            "any" | "all" => Some(SCOPE_ANY),
+            "any" | "all" | "none" => Some(SCOPE_ANY),
             "invalid" => Some(SCOPE_INVALID),
             _ => self.by_name.get(&lower).copied(),
         }

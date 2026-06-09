@@ -64,6 +64,20 @@ pub(crate) fn precompute_comments(
 
 /// Convert a parsed .cwt AST into a RuleSet.
 pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
+    let mut ruleset = fill_ruleset(ast, table);
+    ruleset.reindex();
+    ruleset
+}
+
+/// Like `ast_to_ruleset` but skips the per-ruleset `reindex()` call.
+/// Only safe when the caller is about to merge the result into a larger
+/// `RuleSet` and will call `reindex()` on the final combined set.
+pub(crate) fn ast_to_ruleset_raw(ast: &ParsedFile, table: &StringTable) -> RuleSet {
+    // No reindex() — caller is responsible.
+    fill_ruleset(ast, table)
+}
+
+fn fill_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
     let mut ruleset = RuleSet::new();
 
     let precomputed = precompute_comments(&ast.root_children, ast, table);
@@ -134,8 +148,6 @@ pub fn ast_to_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
             _ => {}
         }
     }
-
-    ruleset.reindex();
     ruleset
 }
 

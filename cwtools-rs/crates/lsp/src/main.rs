@@ -217,6 +217,16 @@ struct DocumentState {
     /// when a doc's token set is missing, it's always included. Updated on
     /// did_open / did_change, removed on did_close.
     doc_tokens: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
+    /// Names that changed during a preempted dependent sweep. When a sweep is
+    /// aborted because a newer edit landed, the union of names it was processing
+    /// is merged here so the next sweep (triggered by the newer edit) drains and
+    /// includes them, preventing stale dependents after rapid successive edits.
+    pending_changed_names: Mutex<HashSet<String>>,
+    /// Set to `true` once the vanilla index has been loaded and merged into
+    /// `info_service.type_index`. After the merge the raw `vanilla_index` data
+    /// is dropped to eliminate double residency; this flag prevents
+    /// `ensure_vanilla_index` from re-running on subsequent workspace scans.
+    vanilla_merged: std::sync::atomic::AtomicBool,
 }
 
 struct ParsedDoc {
@@ -247,6 +257,8 @@ impl DocumentState {
             ignore_file_patterns: parking_lot::RwLock::new(Vec::new()),
             ignore_dir_patterns: parking_lot::RwLock::new(Vec::new()),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
+            pending_changed_names: Mutex::new(HashSet::new()),
+            vanilla_merged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -274,6 +286,37 @@ impl Backend {
     /// We receive it but don't act on it yet.
     async fn on_did_focus_file(&self, _params: Value) {
         // C→S: accept silently.
+    }
+
+    /// Look up the TypeRef (type_name, instance_name) under the cursor.
+    ///
+    /// Shared by goto_definition, references, prepare_rename, and rename to
+    /// avoid the same 25-line block being copy-pasted in four places.
+    fn type_ref_at_cursor(
+        &self,
+        uri: &str,
+        pos: tower_lsp::lsp_types::Position,
+        logical_path: &str,
+    ) -> Option<(String, String)> {
+        let docs = self.state.documents.lock();
+        let ruleset_guard = self.state.ruleset.lock();
+        if let (Some(doc), Some(rs)) = (docs.get(uri), ruleset_guard.as_ref())
+            && let Some(ast) = &doc.ast
+        {
+            let info = info_at_position(
+                ast,
+                pos.line + 1,
+                pos.character as u16,
+                rs,
+                logical_path,
+                &self.state.string_table,
+            );
+            return info.and_then(|i| match i.hint {
+                ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
+                _ => None,
+            });
+        }
+        None
     }
 }
 
@@ -307,21 +350,43 @@ fn extract_ignore_patterns(opts: &Value) -> (Vec<String>, Vec<String>) {
     (files, dirs)
 }
 
+/// Convert a `file://` URI string to a filesystem path string, applying
+/// percent-decoding (e.g. `%20` → space). Returns the raw URI on failure.
+fn uri_to_path_str(uri: &str) -> String {
+    if let Ok(url) = Url::parse(uri)
+        && let Ok(path) = url.to_file_path()
+        && let Some(s) = path.to_str()
+    {
+        return s.to_string();
+    }
+    // Fallback: strip scheme manually (no percent-decode, but avoids a panic).
+    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+}
+
+/// Convert a filesystem path to a `file://` URI, percent-encoding special
+/// characters. Uses the `url` crate so paths with spaces or non-ASCII round-trip
+/// correctly through `uri_to_path_str`.
+fn path_to_uri(path: &std::path::Path) -> String {
+    Url::from_file_path(path)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("file://{}", path.display()))
+}
+
 /// Derive the logical path (relative to mod root) from a file:// URI and the
 /// workspace root URI.  Falls back to the raw path if the workspace prefix
 /// cannot be stripped.
 fn logical_path_from_uri(uri: &str, workspace_uri: &Option<String>) -> String {
-    let path = uri.strip_prefix("file://").unwrap_or(uri);
+    let path = uri_to_path_str(uri);
     if let Some(ws) = workspace_uri {
-        let ws_path = ws.strip_prefix("file://").unwrap_or(ws.as_str());
+        let ws_path = uri_to_path_str(ws);
         // Strip leading slash-terminated prefix
         let prefix = ws_path.trim_end_matches('/');
         if let Some(rel) = path.strip_prefix(prefix) {
             return rel.trim_start_matches('/').to_string();
         }
     }
-    // Fallback: use just the filename portion
-    path.to_string()
+    // Fallback: use the decoded path as-is
+    path
 }
 
 /// Build a Markdown hover string from a PositionInfo + optional rule options.
@@ -1167,11 +1232,14 @@ impl LanguageServer for Backend {
             }
         }
 
-        // Store workspace URI if provided
+        // Store workspace URI: prefer workspace_folders (multi-root aware), fall
+        // back to the legacy root_uri field for clients that only send that.
         if let Some(folders) = &params.workspace_folders
             && let Some(first) = folders.first()
         {
             *self.state.workspace_uri.lock() = Some(first.uri.to_string());
+        } else if let Some(root_uri) = &params.root_uri {
+            *self.state.workspace_uri.lock() = Some(root_uri.to_string());
         }
 
         // Per-workspace ignore globs from the extension. The extension
@@ -1232,6 +1300,15 @@ impl LanguageServer for Backend {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
+                // Position encoding: we do not negotiate position_encoding here,
+                // so clients default to UTF-16 (LSP spec default). The parser
+                // counts Unicode scalar values (chars), NOT UTF-16 code units.
+                // On BMP-only files (no surrogate pairs) the counts agree; on
+                // files containing emoji or non-BMP characters, column offsets
+                // will be off by the number of astral code points on the line.
+                // TODO: negotiate utf-8 or utf-32 once tower-lsp exposes
+                // PositionEncodingKind in InitializeResult, so clients that
+                // support utf-32 get exact columns for free.
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -1315,7 +1392,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
 
-        let Some(change) = params.content_changes.into_iter().next() else {
+        // FULL-sync spec requires last-wins; use the last change in the batch.
+        let Some(change) = params.content_changes.into_iter().last() else {
             return;
         };
         let text = change.text;
@@ -1597,30 +1675,7 @@ impl LanguageServer for Backend {
 
         // First try the rule-aware lookup via info_at_position so we get a
         // TypeRef hint and can look up the actual definition location.
-        let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let info = info_at_position(
-                        ast,
-                        pos.line + 1,
-                        pos.character as u16,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    );
-                    info.and_then(|i| match i.hint {
-                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((type_name, instance_name)) = type_ref {
             // Look up in the TypeIndex
@@ -1711,30 +1766,7 @@ impl LanguageServer for Backend {
         // locations only.  Tracking every *use* of a type instance across the
         // workspace would require an additional references index that is not yet
         // built.  Full cross-file reference tracking is left as future work.
-        let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let info = info_at_position(
-                        ast,
-                        pos.line + 1,
-                        pos.character as u16,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    );
-                    info.and_then(|i| match i.hint {
-                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((type_name, instance_name)) = type_ref {
             let mut all_locs: Vec<Location> = Vec::new();
@@ -2014,33 +2046,14 @@ impl LanguageServer for Backend {
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-        let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let info = info_at_position(
-                        ast,
-                        pos.line + 1,
-                        pos.character as u16,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    );
-                    info.and_then(|i| match i.hint {
-                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((_, instance_name)) = type_ref {
-            // Return a range covering the instance name at cursor.
+            // Return a range covering the whole instance name token. The range
+            // start is computed by finding where the token begins relative to
+            // pos.character; for now we start at pos.character and extend right
+            // (the cursor is somewhere within the token).
+            // TODO: compute the true token-start position for mid-token cursors.
             let range = Range {
                 start: Position {
                     line: pos.line,
@@ -2064,30 +2077,7 @@ impl LanguageServer for Backend {
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         // Identify what's under the cursor
-        let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let info = info_at_position(
-                        ast,
-                        pos.line + 1,
-                        pos.character as u16,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    );
-                    info.and_then(|i| match i.hint {
-                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         let (type_name, instance_name) = match type_ref {
             Some(r) => r,
@@ -2096,6 +2086,12 @@ impl LanguageServer for Backend {
 
         // Collect definition + use-site locations (reuse references logic)
         let mut all_locs: Vec<(String, cwtools_info::SourceLocation, usize)> = Vec::new();
+
+        // Snapshot open URIs so we can detect closed-file appearances below.
+        let open_uris_snap: HashSet<String> = {
+            let docs = self.state.documents.lock();
+            docs.keys().cloned().collect()
+        };
 
         {
             let info = self.state.info_service.read();
@@ -2126,6 +2122,26 @@ impl LanguageServer for Backend {
 
         if all_locs.is_empty() {
             return Ok(None);
+        }
+
+        // Refuse if the symbol appears in closed files. Producing a partial
+        // WorkspaceEdit for open-only files would silently leave dangling
+        // references in closed files; better to tell the user up front.
+        let closed_file = all_locs
+            .iter()
+            .find(|(file_uri, _, _)| !open_uris_snap.contains(file_uri));
+        if let Some((file_uri, _, _)) = closed_file {
+            return Err(tower_lsp::jsonrpc::Error {
+                // -32002 = RequestFailed (LSP extension to JSON-RPC)
+                code: tower_lsp::jsonrpc::ErrorCode::ServerError(-32002),
+                message: format!(
+                    "Rename cancelled: '{}' appears in closed file {}. \
+                     Open all files that reference this symbol and retry.",
+                    instance_name, file_uri
+                )
+                .into(),
+                data: None,
+            });
         }
 
         // Build WorkspaceEdit: group text edits by file URI
@@ -2207,10 +2223,7 @@ impl Backend {
         };
 
         let root_path = match workspace_uri {
-            Some(uri) => {
-                let p = uri.strip_prefix("file://").unwrap_or(&uri);
-                std::path::PathBuf::from(p)
-            }
+            Some(ref uri) => std::path::PathBuf::from(uri_to_path_str(uri)),
             None => {
                 self.client
                     .log_message(
@@ -2309,11 +2322,29 @@ impl Backend {
         // across restarts; keeping the AST resident avoids a pass-2 re-parse
         // within a single scan.
         self.send_loading_bar(true, "Indexing workspace…").await;
+        // Snapshot the set of currently-open document URIs so both passes can
+        // skip them: open docs were already indexed by did_open/did_change and
+        // their fresher in-memory diagnostics must not be clobbered by stale
+        // disk-text validation with version=None.
+        let open_uris: HashSet<String> = {
+            let docs = self.state.documents.lock();
+            docs.keys().cloned().collect()
+        };
+
         let mut parsed_files: Vec<Option<ParsedFile>> = Vec::with_capacity(files_to_validate.len());
         let mut cache_hits = 0u64;
         let mut cache_misses = 0u64;
         for (i, file_path) in files_to_validate.iter().enumerate() {
-            let uri = format!("file://{}", file_path.display());
+            let uri = path_to_uri(file_path);
+            // Open docs are already indexed from their in-memory text; skip so
+            // we don't re-index stale disk content on top of the live version.
+            if open_uris.contains(&uri) {
+                parsed_files.push(None);
+                if i % 50 == 49 {
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
             let parsed = match std::fs::read_to_string(file_path) {
                 Ok(text) => {
                     // Try the parse cache first.
@@ -2366,16 +2397,16 @@ impl Backend {
         self.ensure_vanilla_index().await;
 
         // Merge the pre-generated vanilla index (if loaded) so base-game
-        // references resolve. Re-merge each pass after dropping the prior copy
-        // to avoid unbounded growth on re-validation.
+        // references resolve. After the merge the raw per-type data is dropped
+        // from `vanilla_index` to eliminate double residency (the type_index
+        // already owns the instances). `vanilla_merged` prevents re-running on
+        // subsequent workspace scans.
         {
-            let vanilla_guard = self.state.vanilla_index.lock();
-            if let Some(per_type) = vanilla_guard.as_ref() {
+            let per_type = self.state.vanilla_index.lock().take();
+            if let Some(per_type) = per_type {
                 let mut info_guard = self.state.info_service.write();
                 info_guard.type_index.remove_file("<vanilla-cache>");
-                info_guard
-                    .type_index
-                    .merge("<vanilla-cache>", per_type.clone());
+                info_guard.type_index.merge("<vanilla-cache>", per_type);
                 // Vanilla data is loaded, so the index now holds every base-game
                 // instance. Mark it complete so the CW500/CW222 type-reference
                 // checks fire (they're gated on `complete` to avoid false
@@ -2383,6 +2414,9 @@ impl Backend {
                 // sets this for the CLI path; the LSP merges vanilla directly and
                 // must set it here too. See rule_core.rs gate on `idx.complete`.
                 info_guard.type_index.complete = true;
+                // `vanilla_index` is now None — mark it merged so
+                // ensure_vanilla_index does not re-run on the next scan.
+                self.state.vanilla_merged.store(true, Ordering::SeqCst);
             }
         }
 
@@ -2471,9 +2505,13 @@ impl Backend {
                 .par_iter()
                 .zip(parsed_files.par_iter())
                 .filter_map(|(file_path, parsed_opt)| {
-                    // Skip files that failed to parse in pass 1.
+                    // Skip files that failed to parse in pass 1, and open docs
+                    // whose fresher in-memory diagnostics must not be overwritten.
                     let parsed = parsed_opt.as_ref()?;
-                    let uri = format!("file://{}", file_path.display());
+                    let uri = path_to_uri(file_path);
+                    if open_uris.contains(&uri) {
+                        return None;
+                    }
                     let diagnostics = match &prepared {
                         Some(prepared) => validate_parsed_with_indexes(&uri, parsed, prepared),
                         None => parsed
@@ -2524,7 +2562,7 @@ impl Backend {
         let file_list: Vec<serde_json::Value> = files_to_validate
             .iter()
             .map(|file_path| {
-                let uri = format!("file://{}", file_path.display());
+                let uri = path_to_uri(file_path);
                 let logical_path = logical_path_from_uri(&uri, &ws_uri);
                 let scope = logical_path
                     .split('/')
@@ -2625,7 +2663,7 @@ impl Backend {
         // Publish per-file loc diagnostics, but only for workspace loc files
         // (not vanilla). Group by file so each gets a complete diagnostic set.
         for (file, diags) in by_file.drain() {
-            let uri = format!("file://{}", file);
+            let uri = path_to_uri(std::path::Path::new(&file));
             if let Ok(uri_obj) = Url::parse(&uri) {
                 self.client.publish_diagnostics(uri_obj, diags, None).await;
             }
@@ -2748,12 +2786,22 @@ impl Backend {
         let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
         {
             let ast = parsed.map(Arc::new);
+            // Update tokens before taking documents lock (doc_tokens must be
+            // acquired before documents everywhere to avoid ABBA deadlock with
+            // revalidate_open_dependents, which takes doc_tokens then documents).
+            self.update_doc_tokens(&uri, ast.as_ref());
             let mut docs = self.state.documents.lock();
+            // TOCTOU guard: did_close may have arrived while parse_and_validate
+            // was running. Only store the AST if the document is still open at
+            // the same version; if it closed, the index was already cleaned up by
+            // did_close and we must not re-populate or re-publish it.
             if let Some(d) = docs.get_mut(&uri)
                 && d.version == expected_version
             {
-                self.update_doc_tokens(&uri, ast.as_ref());
                 d.ast = ast;
+            } else {
+                // Doc closed (or version changed) — discard results entirely.
+                return;
             }
         }
         if let Ok(uri_obj) = Url::parse(&uri) {
@@ -2781,10 +2829,16 @@ impl Backend {
             // dependent's diagnostic. When that happens `changed_names` is empty;
             // fall back to `None` (revalidate every dependent) so we never miss
             // one. Soundness beats scoping here.
-            let changed_names: HashSet<String> = names_before
+            let mut changed_names: HashSet<String> = names_before
                 .symmetric_difference(&names_after)
                 .cloned()
                 .collect();
+            // Drain any names accumulated from preempted prior sweeps so this
+            // sweep covers their dependents too.
+            {
+                let mut pending = self.state.pending_changed_names.lock();
+                changed_names.extend(pending.drain());
+            }
             let scope = if changed_names.is_empty() {
                 None
             } else {
@@ -2816,6 +2870,10 @@ impl Backend {
     /// over-approximation: never skip a file that might depend on the change).
     /// `None` revalidates every open dependent (used when the exact set of
     /// changed names can't be pinned down, e.g. a multiplicity-only change).
+    ///
+    /// On preemption (newer edit arrives mid-sweep), the `changed_names` are
+    /// saved to `state.pending_changed_names` so the next sweep drains and
+    /// includes them, preventing stale dependents from falling through the gap.
     async fn revalidate_open_dependents(
         &self,
         changed_uri: &str,
@@ -2864,7 +2922,10 @@ impl Backend {
         // expensive part of per-file setup, so build them ONCE for the whole
         // sweep instead of per file (which `validate_parsed` would do). No
         // await is held across the ruleset lock.
-        let to_publish: Vec<(String, i32, Vec<Diagnostic>)> = {
+        // Validate all dependents while holding ruleset, but do NOT lock
+        // documents inside this block (ABBA: request handlers take documents
+        // then ruleset; we must take ruleset then nothing-or-documents-after).
+        let validated: Vec<(String, i32, Vec<Diagnostic>)> = {
             let ruleset_guard = self.state.ruleset.lock();
             let registry = ruleset_guard
                 .as_ref()
@@ -2872,9 +2933,18 @@ impl Backend {
             let enum_map = ruleset_guard.as_ref().map(|rs| build_enum_map(rs));
             let mut out = Vec::with_capacity(others.len());
             for (uri, snapshot_version, ast) in others {
-                // Preempt: a newer edit arrived, its sweep will cover everything.
+                // Preempt: a newer edit arrived. Save our changed_names into the
+                // shared pending set so the newer sweep drains and covers them;
+                // without this, dependents of the preempted edit stay stale.
                 if self.state.edit_generation.load(Ordering::SeqCst) != generation {
                     tracing::debug!(generation, "revalidate_open_dependents superseded");
+                    if let Some(names) = changed_names {
+                        let mut pending = self.state.pending_changed_names.lock();
+                        pending.extend(names.iter().cloned());
+                    }
+                    // None means "revalidate everything" — mark with a sentinel
+                    // by draining to empty (the next sweep sees an empty pending
+                    // set and, combined with a `None` scope, covers all dependents).
                     return;
                 }
                 let diagnostics = match (ruleset_guard.as_ref(), enum_map.as_ref()) {
@@ -2889,20 +2959,23 @@ impl Backend {
                     ),
                     _ => ast.errors.iter().map(parse_error_to_diagnostic).collect(),
                 };
-                // Skip if this dependent was itself edited while we validated it —
-                // its own debounced pass owns the fresher result.
-                let still_current = {
-                    let docs = self.state.documents.lock();
-                    docs.get(&uri)
-                        .map(|d| d.version == snapshot_version)
-                        .unwrap_or(false)
-                };
-                if still_current {
-                    out.push((uri, snapshot_version, diagnostics));
-                }
+                out.push((uri, snapshot_version, diagnostics));
             }
             out
         };
+        // Now check still_current without holding ruleset (documents first is
+        // the order used by request handlers, so this is safe).
+        let to_publish: Vec<(String, i32, Vec<Diagnostic>)> = validated
+            .into_iter()
+            .filter(|(uri, snapshot_version, _)| {
+                // Skip if this dependent was itself edited while we validated it —
+                // its own debounced pass owns the fresher result.
+                let docs = self.state.documents.lock();
+                docs.get(uri.as_str())
+                    .map(|d| d.version == *snapshot_version)
+                    .unwrap_or(false)
+            })
+            .collect();
         for (uri, snapshot_version, diagnostics) in to_publish {
             if let Ok(uri_obj) = Url::parse(&uri) {
                 self.client
@@ -2922,65 +2995,28 @@ impl Backend {
 
         // Localisation files are parsed and validated as loc, not config.
         if uri.ends_with(".yml") || uri.ends_with(".yaml") || uri.ends_with(".csv") {
-            let path = uri.strip_prefix("file://").unwrap_or(uri);
-            let union = {
-                let guard = self.state.loc_index.read();
-                guard
-                    .as_ref()
-                    .map(|idx| idx.union().clone())
-                    .unwrap_or_default()
-            };
-            for d in cwtools_localization::validate_loc_file_text(text, path, &union) {
+            let path = uri_to_path_str(uri);
+            // Hold the read guard across the validate call to avoid cloning the
+            // full loc-key union (~2M Strings on Millennium Dawn).
+            let loc_guard = self.state.loc_index.read();
+            let empty_union: HashSet<String> = HashSet::new();
+            let union: &HashSet<String> = loc_guard
+                .as_ref()
+                .map(|idx| idx.union())
+                .unwrap_or(&empty_union);
+            for d in cwtools_localization::validate_loc_file_text(text, &path, union) {
                 let ve = loc_diag_to_validation_error(&d);
                 diagnostics.push(validation_error_to_diagnostic(&ve));
             }
             return (diagnostics, None);
         }
 
-        self.client
-            .log_message(MessageType::INFO, format!("[validate] parsing: {}", uri))
-            .await;
+        tracing::debug!(%uri, "[validate] parsing");
 
         match parse_string(text, &self.state.string_table) {
             Ok(parsed) => {
                 for parse_err in &parsed.errors {
-                    let diag = match parse_err {
-                        ParseError::Pos(_file, line, col, msg) => Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line: line.saturating_sub(1),
-                                    character: *col as u32,
-                                },
-                                end: Position {
-                                    line: line.saturating_sub(1),
-                                    character: *col as u32 + 1,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: None,
-                            code_description: None,
-                            source: Some("cwtools".to_string()),
-                            message: msg.clone(),
-                            related_information: None,
-                            tags: None,
-                            data: None,
-                        },
-                        ParseError::General(msg) => Diagnostic {
-                            range: Range {
-                                start: Position::default(),
-                                end: Position::default(),
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: None,
-                            code_description: None,
-                            source: Some("cwtools".to_string()),
-                            message: msg.clone(),
-                            related_information: None,
-                            tags: None,
-                            data: None,
-                        },
-                    };
-                    diagnostics.push(diag);
+                    diagnostics.push(parse_error_to_diagnostic(parse_err));
                 }
 
                 // Update symbol index
@@ -3101,11 +3137,13 @@ impl Backend {
 
     /// Lazily index the base-game install into `vanilla_index` (once). Resolves
     /// the dir from the `vanilla` init option, falling back to auto-discovery by
-    /// game. No-op if already indexed, if no dir is found, or if the ruleset
-    /// isn't loaded yet (we need it to know which type each definition is).
+    /// game. No-op if already indexed (or already merged into the type_index),
+    /// if no dir is found, or if the ruleset isn't loaded yet.
     async fn ensure_vanilla_index(&self) {
-        // Already have a vanilla index (from a cache or a prior build)? Done.
-        if self.state.vanilla_index.lock().is_some() {
+        // Already populated (or already merged into type_index and dropped)? Done.
+        if self.state.vanilla_index.lock().is_some()
+            || self.state.vanilla_merged.load(Ordering::SeqCst)
+        {
             return;
         }
         // Resolve the install dir: explicit `vanilla` option, else auto-discover.
@@ -3209,10 +3247,30 @@ impl Backend {
         // Indexing parses thousands of files; run it off the async executor.
         let table = self.state.string_table.clone();
         let index_dir = dir.clone();
-        let per_type =
+        let join_result =
             tokio::task::spawn_blocking(move || index_vanilla_dir(&index_dir, &ruleset, &table))
-                .await
-                .unwrap_or_default();
+                .await;
+        let per_type = match join_result {
+            Ok(map) => map,
+            Err(e) => {
+                // The blocking task panicked or was cancelled. Log loudly and
+                // bail without setting vanilla_merged, so that type_index stays
+                // incomplete and CW500/CW222 reference checks are suppressed
+                // (avoiding a flood of false positives against an empty base game).
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!(
+                            "Vanilla indexing task failed for {} — base-game references will not resolve. Error: {}",
+                            dir.display(),
+                            e
+                        ),
+                    )
+                    .await;
+                tracing::error!("spawn_blocking vanilla index panicked: {}", e);
+                return;
+            }
+        };
 
         let total: usize = per_type.values().map(|v| v.len()).sum();
 
@@ -3712,6 +3770,7 @@ mod tests {
                 path_file: None,
                 path_extension: None,
                 paths_lower: Vec::new(),
+                ..Default::default()
             },
             subtypes: Vec::new(),
             type_key_filter: None,
@@ -3882,6 +3941,35 @@ mod tests {
     fn test_logical_path_fallback() {
         let lp = logical_path_from_uri("file:///some/path/events/foo.txt", &None);
         assert_eq!(lp, "/some/path/events/foo.txt");
+    }
+
+    #[test]
+    fn test_uri_to_path_percent_decode() {
+        // Paths with spaces must round-trip through percent-encoding.
+        let path = std::path::Path::new("/home/user/My Mod/events/foo.txt");
+        let uri = path_to_uri(path);
+        // The URI must percent-encode the space.
+        assert!(
+            uri.contains("%20") || uri.contains("+"),
+            "expected encoded space in URI, got: {}",
+            uri
+        );
+        // Decoding must recover the original path.
+        let decoded = uri_to_path_str(&uri);
+        assert_eq!(
+            decoded,
+            path.to_str().unwrap(),
+            "round-trip failed: {}",
+            decoded
+        );
+    }
+
+    #[test]
+    fn test_logical_path_from_uri_percent_decode() {
+        // Workspace and file URIs with percent-encoded spaces.
+        let ws = Some("file:///home/user/My%20Mod".to_string());
+        let lp = logical_path_from_uri("file:///home/user/My%20Mod/events/foo.txt", &ws);
+        assert_eq!(lp, "events/foo.txt", "got: {}", lp);
     }
 
     // ── snippet generation tests ─────────────────────────────────────────────
@@ -4127,6 +4215,7 @@ mod tests {
                 path_file: None,
                 path_extension: None,
                 paths_lower: Vec::new(),
+                ..Default::default()
             },
             subtypes: Vec::new(),
             type_key_filter: None,

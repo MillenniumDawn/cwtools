@@ -5,6 +5,7 @@ use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::common::*;
@@ -24,6 +25,7 @@ use crate::subtype::subtype_matches;
 ///   - cardinality is counted over the merged rule set, not per-subtype in isolation
 ///   - a field that exists in any matching subtype is not "unexpected"
 ///   - SubtypeRule entries that don't match are silently skipped
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_with_type(
     ctx: &ValidationCtx,
     type_def: &TypeDefinition,
@@ -31,6 +33,8 @@ pub(crate) fn validate_with_type(
     inner_rules: &[(RuleType, Options)],
     scope_context: &mut Option<ScopeContext>,
     node_key: Option<&str>,
+    // Position of the entity node; used as the anchor for required-field errors.
+    node_pos: (u32, u16),
     errors: &mut Vec<ValidationError>,
 ) {
     let ast = ctx.ast;
@@ -45,7 +49,7 @@ pub(crate) fn validate_with_type(
         if let Some(sc) = scope_context.as_mut() {
             seed_root_scope(sc, type_def, None, node_key, ruleset, game);
         }
-        validate_children(ctx, children, inner_rules, scope_context, (0, 0), errors);
+        validate_children(ctx, children, inner_rules, scope_context, node_pos, errors);
         if let (Some(saved), Some(sc)) = (saved, scope_context.as_mut()) {
             sc.restore(saved);
         }
@@ -99,9 +103,11 @@ pub(crate) fn validate_with_type(
         .iter()
         .any(|(rt, _)| matches!(rt, RuleType::SubtypeRule { .. }));
 
-    let mut merged: Vec<(RuleType, Options)> = Vec::new();
+    // Use Cow to avoid cloning inner_rules when no expansion is needed.
+    let merged: Cow<'_, [(RuleType, Options)]>;
     if inner_has_subtype_rules {
-        // Path A: expand SubtypeRule entries from inner_rules
+        // Path A: expand SubtypeRule entries from inner_rules — must build owned Vec.
+        let mut v: Vec<(RuleType, Options)> = Vec::new();
         for (rule_type, opts) in inner_rules {
             match rule_type {
                 RuleType::SubtypeRule {
@@ -117,7 +123,7 @@ pub(crate) fn validate_with_type(
                         // entries, which all hit the wildcard case.  Mirror that by
                         // zeroing min so subtype fields are validated when present but
                         // never required when absent.
-                        merged.extend(st_rules.iter().map(|(rt, o)| {
+                        v.extend(st_rules.iter().map(|(rt, o)| {
                             let mut o2 = o.clone();
                             o2.min = 0;
                             (rt.clone(), o2)
@@ -125,23 +131,34 @@ pub(crate) fn validate_with_type(
                     }
                 }
                 _ => {
-                    merged.push((rule_type.clone(), opts.clone()));
+                    v.push((rule_type.clone(), opts.clone()));
                 }
             }
         }
+        merged = Cow::Owned(v);
     } else {
         // Path B: pull rules directly from the matching SubTypeDefinition entries.
-        // Base (non-subtype) rules come from inner_rules as-is.
-        merged.extend(inner_rules.iter().cloned());
-        for subtype in &type_def.subtypes {
-            if matched_subtype_names.contains(&subtype.name.as_str()) {
-                // Same min=0 treatment as Path A.
-                merged.extend(subtype.rules.iter().map(|(rt, o)| {
-                    let mut o2 = o.clone();
-                    o2.min = 0;
-                    (rt.clone(), o2)
-                }));
+        // When no subtypes add extra rules, borrow inner_rules directly.
+        let extra_rules_needed = type_def
+            .subtypes
+            .iter()
+            .any(|s| matched_subtype_names.contains(&s.name.as_str()) && !s.rules.is_empty());
+        if extra_rules_needed {
+            let mut v: Vec<(RuleType, Options)> = inner_rules.to_vec();
+            for subtype in &type_def.subtypes {
+                if matched_subtype_names.contains(&subtype.name.as_str()) {
+                    // Same min=0 treatment as Path A.
+                    v.extend(subtype.rules.iter().map(|(rt, o)| {
+                        let mut o2 = o.clone();
+                        o2.min = 0;
+                        (rt.clone(), o2)
+                    }));
+                }
             }
+            merged = Cow::Owned(v);
+        } else {
+            // Borrow inner_rules directly — no allocation needed.
+            merged = Cow::Borrowed(inner_rules);
         }
     }
 
@@ -166,7 +183,14 @@ pub(crate) fn validate_with_type(
 
     // Step 5: validate children once against the merged rule set.
     let pre_count = errors.len();
-    validate_children(ctx, children, &merged, scope_context, (0, 0), errors);
+    validate_children(
+        ctx,
+        children,
+        merged.as_ref(),
+        scope_context,
+        node_pos,
+        errors,
+    );
 
     // Item 9: warning_only — downgrade all newly-added errors to warnings (F# RuleValidationService.fs:916).
     if type_def.warning_only {
@@ -233,7 +257,17 @@ fn validate_leaf_against_rule(
     match rule_type {
         RuleType::LeafRule { left, .. } => {
             if let NewField::AliasField(category) = left {
-                validate_alias_usage(ctx, category, key, Some(leaf), None, scope_context, errors);
+                let leaf_pos = (leaf.pos.start.line, leaf.pos.start.col);
+                validate_alias_usage(
+                    ctx,
+                    category,
+                    key,
+                    Some(leaf),
+                    None,
+                    leaf_pos,
+                    scope_context,
+                    errors,
+                );
             } else {
                 validate_leaf(ctx, leaf, rule_type, scope_context.as_ref(), errors);
             }
@@ -244,7 +278,17 @@ fn validate_leaf_against_rule(
             ..
         } => {
             if let NewField::AliasField(category) = left {
-                validate_alias_usage(ctx, category, key, Some(leaf), None, scope_context, errors);
+                let leaf_pos = (leaf.pos.start.line, leaf.pos.start.col);
+                validate_alias_usage(
+                    ctx,
+                    category,
+                    key,
+                    Some(leaf),
+                    None,
+                    leaf_pos,
+                    scope_context,
+                    errors,
+                );
             } else if let Value::Clause(clause_children) = &leaf.value {
                 let saved = scope_context.as_ref().map(|sc| sc.save());
                 if let Some(sc) = scope_context.as_mut() {
@@ -261,6 +305,16 @@ fn validate_leaf_against_rule(
                 if let (Some(saved), Some(ref mut sc)) = (saved, scope_context.as_mut()) {
                     sc.restore(saved);
                 }
+            } else {
+                // NodeRule (block expected) but the value is a scalar — kind mismatch.
+                let val_str = leaf_value_to_string(&leaf.value, ctx.table);
+                errors.push(ValidationError::from_code(
+                    &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE,
+                    ctx.file_path,
+                    leaf.pos.start.line,
+                    leaf.pos.start.col,
+                    &[key, &val_str],
+                ));
             }
         }
         _ => {}
@@ -300,39 +354,67 @@ fn validate_node_against_rule(
             ],
         ));
     }
-    if let RuleType::NodeRule {
-        left,
-        rules: inner_rules,
-        ..
-    } = rule_type
-    {
-        if let NewField::AliasField(category) = left {
-            validate_alias_usage(
-                ctx,
-                category,
-                key,
-                None,
-                Some(&node.children),
-                scope_context,
-                errors,
-            );
-        } else {
-            let saved = scope_context.as_ref().map(|sc| sc.save());
-            if let Some(sc) = scope_context.as_mut() {
-                enter_block_scope(sc, key, opts, ctx.game);
-            }
-            validate_children(
-                ctx,
-                &node.children,
-                inner_rules,
-                scope_context,
-                (node.pos.start.line, node.pos.start.col),
-                errors,
-            );
-            if let (Some(saved), Some(ref mut sc)) = (saved, scope_context.as_mut()) {
-                sc.restore(saved);
+    match rule_type {
+        RuleType::NodeRule {
+            left,
+            rules: inner_rules,
+            ..
+        } => {
+            if let NewField::AliasField(category) = left {
+                let node_pos = (node.pos.start.line, node.pos.start.col);
+                validate_alias_usage(
+                    ctx,
+                    category,
+                    key,
+                    None,
+                    Some(&node.children),
+                    node_pos,
+                    scope_context,
+                    errors,
+                );
+            } else {
+                let saved = scope_context.as_ref().map(|sc| sc.save());
+                if let Some(sc) = scope_context.as_mut() {
+                    enter_block_scope(sc, key, opts, ctx.game);
+                }
+                validate_children(
+                    ctx,
+                    &node.children,
+                    inner_rules,
+                    scope_context,
+                    (node.pos.start.line, node.pos.start.col),
+                    errors,
+                );
+                if let (Some(saved), Some(ref mut sc)) = (saved, scope_context.as_mut()) {
+                    sc.restore(saved);
+                }
             }
         }
+        RuleType::LeafRule { left, .. } => {
+            if let NewField::AliasField(category) = left {
+                let node_pos = (node.pos.start.line, node.pos.start.col);
+                validate_alias_usage(
+                    ctx,
+                    category,
+                    key,
+                    None,
+                    Some(&node.children),
+                    node_pos,
+                    scope_context,
+                    errors,
+                );
+            } else {
+                // LeafRule (scalar expected) but the child is a block — kind mismatch.
+                errors.push(ValidationError::from_code(
+                    &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE,
+                    ctx.file_path,
+                    node.pos.start.line,
+                    node.pos.start.col,
+                    &[key, "{...}"],
+                ));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -387,7 +469,7 @@ where
         .filter(|(rt, _)| {
             matches!(rt,
             RuleType::LeafRule { left: NewField::SpecificField(s), .. }
-            | RuleType::NodeRule { left: NewField::SpecificField(s), .. } if s == key)
+            | RuleType::NodeRule { left: NewField::SpecificField(s), .. } if s.eq_ignore_ascii_case(key))
         })
         .copied()
         .collect();
@@ -472,14 +554,16 @@ pub(crate) fn validate_children(
                 let leaf = &ast.arena.leaves[*idx as usize];
                 // Paradox keys are case-insensitive; key the counts in lowercase so
                 // a field written `texturefile` satisfies a rule keyed `textureFile`.
-                let key = unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default())
-                    .to_lowercase();
+                let key = table
+                    .with_string(leaf.key.normal, |s| unquote_key(s).to_lowercase())
+                    .unwrap_or_default();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::Node(idx) => {
                 let node = &ast.arena.nodes[*idx as usize];
-                let key = unquote_key(&table.get_string(node.key.normal).unwrap_or_default())
-                    .to_lowercase();
+                let key = table
+                    .with_string(node.key.normal, |s| unquote_key(s).to_lowercase())
+                    .unwrap_or_default();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
             Child::LeafValue(lvidx) => {
@@ -490,7 +574,6 @@ pub(crate) fn validate_children(
                     for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
                         if matches!(rule_type, RuleType::ValueClauseRule { .. }) {
                             valueclause_counts[rule_idx] += 1;
-                            break;
                         }
                     }
                 } else {
@@ -513,7 +596,6 @@ pub(crate) fn validate_children(
                 for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
                     if matches!(rule_type, RuleType::ValueClauseRule { .. }) {
                         valueclause_counts[rule_idx] += 1;
-                        break;
                     }
                 }
             }
@@ -533,7 +615,11 @@ pub(crate) fn validate_children(
                 if candidates.is_empty() {
                     // Item 5: dynamic modifier keys — if provided and this key is a
                     // known modifier, accept silently (modifier context mechanism).
-                    let is_modifier = modifier_keys.map(|mk| mk.contains(&key)).unwrap_or(false);
+                    // The modifier set is built lowercase; compare lowercase.
+                    let key_lower = key.to_lowercase();
+                    let is_modifier = modifier_keys
+                        .map(|mk| mk.contains(key_lower.as_str()))
+                        .unwrap_or(false);
                     // CW235 (F# `ZeroModifier`): a known modifier set to 0 is a no-op
                     // (modifiers are additive). Only fires on confirmed modifiers.
                     if is_modifier && value_is_zero(&leaf.value) {
@@ -607,7 +693,10 @@ pub(crate) fn validate_children(
                     matching_candidates(rules, &key, ruleset, type_index, rule_matches_node_key);
                 if candidates.is_empty() {
                     // Item 5: dynamic modifier keys — accept known modifier block keys silently.
-                    let is_modifier = modifier_keys.map(|mk| mk.contains(&key)).unwrap_or(false);
+                    // The modifier set is built lowercase; compare lowercase.
+                    let is_modifier = modifier_keys
+                        .map(|mk| mk.contains(key.to_lowercase().as_str()))
+                        .unwrap_or(false);
                     if !is_modifier {
                         errors.push(ValidationError::from_code(
                             &error_codes::CW262_UNEXPECTED_PROPERTY_NODE,
@@ -959,7 +1048,9 @@ fn is_scope_key(
     type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     looks_like_scope_command(key)
-        || ruleset.scope_links.contains(key)
+        || ruleset
+            .scope_links
+            .contains(&key.to_ascii_lowercase() as &str)
         || type_index.is_some_and(|idx| idx.is_any_instance(key))
 }
 
@@ -1029,12 +1120,15 @@ fn alias_pattern_matches(
         }
         "enum" => match ruleset.enum_by_name.get(name) {
             Some(&idx) if !ruleset.enums[idx].values.is_empty() => {
-                ruleset.enums[idx].values.iter().any(|v| v == middle)
+                let def = &ruleset.enums[idx];
+                def.values.iter().any(|v| v.eq_ignore_ascii_case(middle))
+                    || def.values.iter().any(|v| v.starts_with('@'))
+                    || def.values.len() > 5
             }
             _ => true, // enum absent/empty (game-derived) — permissive
         },
-        "value" => match ruleset.values.iter().find(|(n, _)| n == name) {
-            Some((_, vs)) if !vs.is_empty() => vs.iter().any(|v| v == middle),
+        "value" => match ruleset.values.get(name) {
+            Some(vs) if !vs.is_empty() => vs.iter().any(|v| v == middle),
             _ => true, // value set not collected — permissive
         },
         _ => false,
@@ -1099,11 +1193,23 @@ fn field_matches_key(
         NewField::IgnoreMarkerField => true,
         NewField::ScalarField => true,
         // A rule keyed by `enum[x] = ...`: the key must be a member of enum x.
-        // If the enum isn't loaded (complex/game-derived enums), be permissive
-        // rather than flag every key as unexpected.
+        // Mirrors `enum_contains` from common.rs: case-insensitive, permissive on
+        // absent/empty enums, permissive when any member is an @-constant.
         NewField::ValueField(ValueType::Enum(enum_name)) => {
             match ruleset.enum_by_name.get(enum_name.as_str()) {
-                Some(&idx) => ruleset.enums[idx].values.iter().any(|v| v == key),
+                Some(&idx) => {
+                    let def = &ruleset.enums[idx];
+                    if def.values.is_empty() {
+                        return true;
+                    }
+                    if def.values.iter().any(|v| v.eq_ignore_ascii_case(key)) {
+                        return true;
+                    }
+                    if def.values.iter().any(|v| v.starts_with('@')) {
+                        return true;
+                    }
+                    def.values.len() > 5
+                }
                 None => true,
             }
         }
@@ -1158,12 +1264,15 @@ fn field_to_key(field: &NewField) -> Option<String> {
 /// each candidate into a throwaway buffer and accept on the first clean match;
 /// only when none match do we surface the closest (fewest-errors) candidate's
 /// errors, which is also how the `type = ...` discriminator naturally wins.
+#[allow(clippy::too_many_arguments)]
 fn validate_alias_usage(
     ctx: &ValidationCtx,
     category: &str,
     key: &str,
     leaf: Option<&cwtools_parser::ast::Leaf>,
     clause_children: Option<&[Child]>,
+    // Position to anchor diagnostics when `leaf` is None (node-form usage).
+    fallback_pos: (u32, u16),
     scope_context: &mut Option<ScopeContext>,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -1218,7 +1327,6 @@ fn validate_alias_usage(
     // chains — where a segment is genuinely unresolvable — are flagged.
     if scope_checks_enabled()
         && key.contains('.')
-        && looks_like_scope_command(key)
         && !looks_like_data_ref(key)
         && let Some(sc) = scope_context.as_ref()
     {
@@ -1230,7 +1338,7 @@ fn validate_alias_usage(
             let code = &error_codes::CW248_INVALID_SCOPE_COMMAND;
             let (line, col) = leaf
                 .map(|l| (l.pos.start.line, l.pos.start.col))
-                .unwrap_or((0, 0));
+                .unwrap_or(fallback_pos);
             errors.push(ValidationError::from_code(
                 code,
                 file_path,
@@ -1266,6 +1374,7 @@ fn validate_alias_usage(
                 .iter()
                 .flat_map(|(_, o)| o.required_scopes.iter().cloned())
                 .collect();
+            expected.sort_unstable();
             expected.dedup();
             let code = match category {
                 "trigger" => &error_codes::CW104_INCORRECT_TRIGGER_SCOPE,
@@ -1274,7 +1383,7 @@ fn validate_alias_usage(
             };
             let (line, col) = leaf
                 .map(|l| (l.pos.start.line, l.pos.start.col))
-                .unwrap_or((0, 0));
+                .unwrap_or(fallback_pos);
             errors.push(ValidationError::from_code(
                 code,
                 file_path,
@@ -1296,7 +1405,7 @@ fn validate_alias_usage(
                     // Scalar-valued overload but the usage is a block — not a match.
                     let (line, col) = leaf
                         .map(|l| (l.pos.start.line, l.pos.start.col))
-                        .unwrap_or((0, 0));
+                        .unwrap_or(fallback_pos);
                     temp.push(alias_mismatch_error(
                         file_path, category, "{...}", line, col,
                     ));
@@ -1320,7 +1429,7 @@ fn validate_alias_usage(
                         alias_inner,
                         scope_context,
                         leaf.map(|l| (l.pos.start.line, l.pos.start.col))
-                            .unwrap_or((0, 0)),
+                            .unwrap_or(fallback_pos),
                         &mut temp,
                     );
                     if let (Some(saved), Some(sc)) = (saved, scope_context.as_mut()) {
@@ -1336,7 +1445,7 @@ fn validate_alias_usage(
                                 l.pos.start.col,
                             )
                         })
-                        .unwrap_or_else(|| (String::new(), 0, 0));
+                        .unwrap_or_else(|| (String::new(), fallback_pos.0, fallback_pos.1));
                     temp.push(alias_mismatch_error(file_path, category, &value, line, col));
                 }
             }
@@ -1653,14 +1762,14 @@ pub(crate) fn field_matches_value(
 
         // --- Int with range enforcement (item 4) ---
         (NewField::ValueField(ValueType::Int { min, max }), Value::Int(v)) => {
-            let v_i = *v as i32;
-            v_i >= *min && v_i <= *max
+            let v_i64 = *v;
+            v_i64 >= i64::from(*min) && v_i64 <= i64::from(*max)
         }
         (NewField::ValueField(ValueType::Int { min, max }), Value::String(t))
         | (NewField::ValueField(ValueType::Int { min, max }), Value::QString(t)) => {
             let text = match_text(table, t);
-            if let Ok(v) = text.parse::<i32>() {
-                v >= *min && v <= *max
+            if let Ok(v) = text.parse::<i64>() {
+                v >= i64::from(*min) && v <= i64::from(*max)
             } else {
                 false
             }
@@ -1745,15 +1854,16 @@ pub(crate) fn field_matches_value(
         // --- Scalar: accept anything ---
         (NewField::ScalarField, _) => true,
 
-        // --- SpecificField: exact string match ---
+        // --- SpecificField: case-insensitive string match ---
         (NewField::SpecificField(s), Value::String(t))
         | (NewField::SpecificField(s), Value::QString(t)) => table
-            .with_string(t.normal, |text| unquote_key(text) == *s)
+            .with_string(t.normal, |text| unquote_key(text).eq_ignore_ascii_case(s))
             .unwrap_or(false),
         // A `= yes` / `= no` rule literal is a SpecificField, but the parser emits
         // Bool for those values — match them up (affects every boolean rule field).
         (NewField::SpecificField(s), Value::Bool(b)) => (s == "yes" && *b) || (s == "no" && !*b),
         (NewField::SpecificField(s), Value::Int(i)) => s == &i.to_string(),
+        (NewField::SpecificField(s), Value::Float(f)) => s == &f.to_string(),
         // In Paradox script, `key = yes` and `key = { ... }` are often
         // interchangeable (e.g. `create_intelligence_agency = { ... }`).
         // The parser stores blocks as Value::Clause on a Leaf — accept them

@@ -5,16 +5,27 @@ use cwtools_rules::rules_types::*;
 
 use crate::common::path_contains_segment;
 
-/// Check if this type says its root key should be skipped (children are the real entries).
+/// Check if `key` is a level-1 skip_root_key wrapper for this type.
 ///
-/// Delegates to the indexer's matcher so indexing and validation never disagree
-/// on which root keys to skip (the matcher is case-insensitive and honours the
-/// `should_match` negation flag).
+/// Only the FIRST entry of the stack is tested: each element in
+/// `skip_root_key` is a distinct nesting level (block form `{ A B }`
+/// produces `[SpecificKey("A"), AnyKey]` — the first entry is the root
+/// wrapper, the rest are deeper levels).  Using `.any()` over the whole
+/// Vec would incorrectly treat every key as a wrapper for types that have
+/// `[SpecificKey("ideas"), AnyKey]`.
 pub(crate) fn should_skip_root_key(key: &str, type_def: &TypeDefinition) -> bool {
     type_def
         .skip_root_key
-        .iter()
-        .any(|sk| cwtools_index::skip_root_key_matches(sk, key))
+        .first()
+        .is_some_and(|sk| cwtools_index::skip_root_key_matches(sk, key))
+}
+
+/// Return the remaining skip levels after the first one has been consumed
+/// (i.e. the tail of the skip stack).  Empty when there is at most one level.
+pub(crate) fn skip_root_key_tail(
+    type_def: &TypeDefinition,
+) -> &[cwtools_rules::rules_types::SkipRootKey] {
+    type_def.skip_root_key.get(1..).unwrap_or(&[])
 }
 
 /// Look up both the TypeDefinition and the actual validation rules for a given type name.
@@ -29,17 +40,18 @@ pub(crate) fn find_type_and_rules<'a>(
 
 /// True if `t` has no `path_extension` constraint, or `file_path` satisfies it.
 pub(crate) fn type_extension_matches(file_path: &str, t: &TypeDefinition) -> bool {
-    match &t.path_options.path_extension {
+    match &t.path_options.path_ext_lower {
         None => true,
         Some(ext) => {
-            let ext = ext.to_lowercase();
-            let ext = ext.strip_prefix('.').unwrap_or(&ext);
             if ext.is_empty() {
                 return true;
             }
             let path_lower = file_path.to_lowercase();
             let basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
-            basename.rsplit('.').next().is_some_and(|e| e == ext)
+            basename
+                .rsplit('.')
+                .next()
+                .is_some_and(|e| e == ext.as_str())
         }
     }
 }
@@ -63,9 +75,13 @@ pub(crate) fn find_type_and_rules_for_file<'a>(
         if type_extension_matches(file_path, td) {
             return by_name;
         }
+        // Extension mismatch: try the path-aware lookup first.
         if let Some(t) = find_type_by_path_and_key(file_path, Some(name), ruleset) {
             return Some((t, find_rules_by_name(&t.name, ruleset)));
         }
+        // No path match either: the by-name hit was for a different extension;
+        // returning it would validate the wrong rule body.
+        return None;
     }
     by_name
 }
@@ -75,13 +91,11 @@ pub(crate) fn find_rules_by_name<'a>(
     name: &str,
     ruleset: &'a RuleSet,
 ) -> &'a [(RuleType, Options)] {
-    for rr in &ruleset.root_rules {
-        if let RootRule::TypeRule(rule_name, (rule, _opts)) = rr
-            && rule_name == name
-            && let RuleType::NodeRule { rules, .. } = rule
-        {
-            return rules.as_slice();
-        }
+    if let Some(&i) = ruleset.type_rules_idx.get(name)
+        && let RootRule::TypeRule(_, (rule, _)) = &ruleset.root_rules[i]
+        && let RuleType::NodeRule { rules, .. } = rule
+    {
+        return rules.as_slice();
     }
     &[]
 }
@@ -89,14 +103,12 @@ pub(crate) fn find_rules_by_name<'a>(
 /// The `Options` of a type's root rule (carries `## replace_scope` / `## push_scope`
 /// that seed the instance's scope, e.g. the state-history `state` object).
 pub(crate) fn find_type_rule_opts<'a>(name: &str, ruleset: &'a RuleSet) -> Option<&'a Options> {
-    for rr in &ruleset.root_rules {
-        if let RootRule::TypeRule(rule_name, (_rule, opts)) = rr
-            && rule_name == name
-        {
-            return Some(opts);
-        }
+    let i = *ruleset.type_rules_idx.get(name)?;
+    if let RootRule::TypeRule(_, (_, opts)) = &ruleset.root_rules[i] {
+        Some(opts)
+    } else {
+        None
     }
-    None
 }
 
 /// Find a type whose path_options match the given file path.
@@ -135,20 +147,21 @@ pub(crate) fn find_type_by_path_and_key<'a>(
     for t in &ruleset.types {
         // path_file pins the type to one specific filename (e.g. several types
         // share path "map" but only airports.txt is the `airports` type).
-        if let Some(pf) = &t.path_options.path_file
-            && basename != pf.to_lowercase()
+        if let Some(pf) = &t.path_options.path_file_lower
+            && basename != pf.as_str()
         {
             continue;
         }
         // path_extension restricts the type to files with a given extension
         // (e.g. sound types require `.asset`, so a `.txt` combat-sounds file must
         // NOT match them). Treat the extension as a hard filter.
-        if let Some(ext) = &t.path_options.path_extension {
-            let ext = ext.to_lowercase();
-            let ext = ext.strip_prefix('.').unwrap_or(&ext);
-            if basename.rsplit('.').next().is_none_or(|e| e != ext) {
-                continue;
-            }
+        if let Some(ext) = &t.path_options.path_ext_lower
+            && basename
+                .rsplit('.')
+                .next()
+                .is_none_or(|e| e != ext.as_str())
+        {
+            continue;
         }
         // `## type_key_filter` gates a NON-wrapper type to nodes whose own key
         // satisfies the filter: a top-level `animation = { ... }` node is only an
@@ -168,15 +181,14 @@ pub(crate) fn find_type_by_path_and_key<'a>(
             }
             _ => 0,
         };
-        for p in &t.path_options.paths {
-            let p_lower = p.to_lowercase();
+        for p_lower in &t.path_options.paths_lower {
             // path_strict: the file must be DIRECTLY in this directory (so
             // `path_strict` type[unit] at common/units does NOT swallow files in
             // common/units/names/). Otherwise it may be in a subdirectory.
             let matches = if t.path_options.path_strict {
                 dir == p_lower || dir.ends_with(&format!("/{}", p_lower))
             } else {
-                path_contains_segment(dir, &p_lower)
+                path_contains_segment(dir, p_lower)
             };
             // A path_file match is more specific than any bare directory match.
             // A skip_root_key match for the current root key gets a large bonus
@@ -218,24 +230,24 @@ pub(crate) fn type_path_matches(file_path: &str, t: &TypeDefinition) -> bool {
         .strip_suffix(basename)
         .unwrap_or(&path_lower)
         .trim_end_matches('/');
-    if let Some(pf) = &t.path_options.path_file
-        && basename != pf.to_lowercase()
+    if let Some(pf) = &t.path_options.path_file_lower
+        && basename != pf.as_str()
     {
         return false;
     }
-    if let Some(ext) = &t.path_options.path_extension {
-        let ext = ext.to_lowercase();
-        let ext = ext.strip_prefix('.').unwrap_or(&ext);
-        if basename.rsplit('.').next().is_none_or(|e| e != ext) {
-            return false;
-        }
+    if let Some(ext) = &t.path_options.path_ext_lower
+        && basename
+            .rsplit('.')
+            .next()
+            .is_none_or(|e| e != ext.as_str())
+    {
+        return false;
     }
-    t.path_options.paths.iter().any(|p| {
-        let p_lower = p.to_lowercase();
+    t.path_options.paths_lower.iter().any(|p_lower| {
         if t.path_options.path_strict {
             dir == p_lower || dir.ends_with(&format!("/{}", p_lower))
         } else {
-            path_contains_segment(dir, &p_lower)
+            path_contains_segment(dir, p_lower)
         }
     })
 }

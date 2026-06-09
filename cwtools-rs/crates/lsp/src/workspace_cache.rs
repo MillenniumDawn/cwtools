@@ -141,8 +141,12 @@ fn write_settings_sig(dir: &Path, sig: u64) {
 
 /// Validate (and update) the settings signature. Returns `true` if the cache is
 /// still valid; `false` if the directory was cleared and must be rebuilt.
+///
+/// Also sweeps sibling `parse-cache/<fp>/` directories that don't match the
+/// current fingerprint so old workspaces don't accumulate forever on disk.
 pub fn validate_or_clear(cache_dir: &Path, fingerprint: u64) -> bool {
     let dir = workspace_cache_dir(cache_dir, fingerprint);
+    sweep_orphan_dirs(cache_dir, fingerprint);
     match read_settings_sig(&dir) {
         Some(stored) if stored == fingerprint => {
             // Valid cache: evict stale-content `.cwb` entries if the dir has
@@ -156,6 +160,30 @@ pub fn validate_or_clear(cache_dir: &Path, fingerprint: u64) -> bool {
             let _ = fs::create_dir_all(&dir);
             write_settings_sig(&dir, fingerprint);
             false
+        }
+    }
+}
+
+/// Remove any `parse-cache/<old-fp>/` sibling directories whose fingerprint
+/// hex name differs from `current_fingerprint`. This prevents old per-workspace
+/// directories from accumulating on disk across ruleset/workspace-root changes.
+fn sweep_orphan_dirs(cache_dir: &Path, current_fingerprint: u64) {
+    let parse_cache_root = cache_dir.join("parse-cache");
+    let current_hex = format!("{:016x}", current_fingerprint);
+    let Ok(rd) = fs::read_dir(&parse_cache_root) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name != current_hex)
+        {
+            let _ = fs::remove_dir_all(&path);
         }
     }
 }

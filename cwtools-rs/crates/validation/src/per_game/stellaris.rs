@@ -19,7 +19,14 @@ pub fn validate_stellaris(
                 let node = &ast.arena.nodes[*idx as usize];
                 let key = table.get_string(node.key.normal).unwrap_or_default();
                 match key.as_str() {
-                    "event" => validate_event(node, ast, table, file_path, errors),
+                    k if k.ends_with("_event") || k == "event" => validate_event(
+                        &node.children,
+                        node.pos.start.line,
+                        ast,
+                        table,
+                        file_path,
+                        errors,
+                    ),
                     "ship_size" => validate_ship_size(node, ast, table, file_path, errors),
                     "technology" => validate_technology(node, ast, table, file_path, errors),
                     _ => {}
@@ -28,10 +35,10 @@ pub fn validate_stellaris(
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                if key == "event"
+                if (key.ends_with("_event") || key == "event")
                     && let Value::Clause(children) = &leaf.value
                 {
-                    validate_event_clause(children, ast, table, file_path, errors);
+                    validate_event(children, leaf.pos.start.line, ast, table, file_path, errors);
                 }
             }
             Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => {}
@@ -171,83 +178,11 @@ fn walk_if_else(
 
 // ── Event Validation ───────────────────────────────────
 
+/// Validate a Stellaris event body (children of `*_event = { ... }` or inline clause).
+/// `event_line` is the line of the event key for anchoring the CW107 diagnostic.
 fn validate_event(
-    node: &cwtools_parser::ast::Node,
-    ast: &ParsedFile,
-    table: &StringTable,
-    file_path: &str,
-    errors: &mut Vec<ValidationError>,
-) {
-    let has_mtth = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "mean_time_to_happen"));
-    let has_trig = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "is_triggered_only"));
-    let has_once = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "fire_only_once"));
-    let has_base = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "base"));
-    let has_always_no = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table));
-
-    if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
-        errors.push(ValidationError {
-            message: "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
-            severity: ErrorSeverity::Information,
-            line: node.pos.start.line,
-            col: node.pos.start.col,
-            file: file_path.to_string(),
-            code: Some(error_codes::CW107_EVENT_EVERY_TICK.id.to_string()),
-        });
-    }
-
-    // Check pre-triggers: must be in event's direct children, not inside trigger block
-    let pre_triggers = [
-        "has_owner",
-        "is_homeworld",
-        "original_owner",
-        "is_ai",
-        "has_ground_combat",
-        "is_capital",
-        "is_occupied_flag",
-    ];
-    for child in &node.children {
-        let key = match child {
-            Child::Leaf(idx) => table
-                .get_string(ast.arena.leaves[*idx as usize].key.normal)
-                .unwrap_or_default(),
-            Child::Node(idx) => table
-                .get_string(ast.arena.nodes[*idx as usize].key.normal)
-                .unwrap_or_default(),
-            _ => continue,
-        };
-        if pre_triggers.contains(&key.as_str()) {
-            errors.push(ValidationError {
-                message: format!(
-                    "Pre-trigger '{}' should be inside a 'trigger' block, not at event root",
-                    key
-                ),
-                severity: ErrorSeverity::Warning,
-                line: child_line(child, ast),
-                col: 0,
-                file: file_path.to_string(),
-                code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id.to_string()),
-            });
-        }
-    }
-}
-
-fn validate_event_clause(
     children: &[Child],
+    event_line: u32,
     ast: &ParsedFile,
     table: &StringTable,
     file_path: &str,
@@ -268,16 +203,67 @@ fn validate_event_clause(
         .any(|c| child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table));
 
     if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
-        // Find the event leaf's position
-        let line = children.first().map(|c| child_line(c, ast)).unwrap_or(0);
         errors.push(ValidationError {
             message: "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
             severity: ErrorSeverity::Information,
-            line,
+            line: event_line,
             col: 0,
             file: file_path.to_string(),
             code: Some(error_codes::CW107_EVENT_EVERY_TICK.id.to_string()),
         });
+    }
+
+    // CW301: pre-triggers found inside the trigger block should be moved to event
+    // root for performance. Mirrors F# STLValidation.fs `validatePreTriggers` which
+    // checks trigger block leaves, not event root leaves.
+    const PRE_TRIGGERS: &[&str] = &[
+        "has_owner",
+        "is_homeworld",
+        "original_owner",
+        "is_ai",
+        "has_ground_combat",
+        "is_capital",
+        "is_occupied_flag",
+    ];
+    for child in children {
+        if !child_key_eq(child, ast, table, "trigger") {
+            continue;
+        }
+        let trigger_children = match child {
+            Child::Node(idx) => &ast.arena.nodes[*idx as usize].children,
+            Child::Leaf(idx) => {
+                if let Value::Clause(c) = &ast.arena.leaves[*idx as usize].value {
+                    c.as_slice()
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        for tc in trigger_children {
+            let key = match tc {
+                Child::Leaf(idx) => table
+                    .get_string(ast.arena.leaves[*idx as usize].key.normal)
+                    .unwrap_or_default(),
+                Child::Node(idx) => table
+                    .get_string(ast.arena.nodes[*idx as usize].key.normal)
+                    .unwrap_or_default(),
+                _ => continue,
+            };
+            if PRE_TRIGGERS.contains(&key.as_str()) {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Trigger '{}' can be a pre-trigger at event root for better performance",
+                        key
+                    ),
+                    severity: ErrorSeverity::Information,
+                    line: child_line(tc, ast),
+                    col: 0,
+                    file: file_path.to_string(),
+                    code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id.to_string()),
+                });
+            }
+        }
     }
 }
 

@@ -91,7 +91,10 @@ pub(crate) fn subtype_rules_match(
                     Child::Leaf(idx) => {
                         let leaf = &ast.arena.leaves[*idx as usize];
                         if table
-                            .with_string(leaf.key.normal, |s| s == *k)
+                            .with_string(leaf.key.normal, |s| {
+                                crate::common::unquote_key(s)
+                                    .eq_ignore_ascii_case(crate::common::unquote_key(k))
+                            })
                             .unwrap_or(false)
                         {
                             match &leaf.value {
@@ -105,7 +108,10 @@ pub(crate) fn subtype_rules_match(
                     Child::Node(idx) => {
                         let node = &ast.arena.nodes[*idx as usize];
                         if table
-                            .with_string(node.key.normal, |s| s == *k)
+                            .with_string(node.key.normal, |s| {
+                                crate::common::unquote_key(s)
+                                    .eq_ignore_ascii_case(crate::common::unquote_key(k))
+                            })
                             .unwrap_or(false)
                         {
                             (true, None, Some(node.children.as_slice()))

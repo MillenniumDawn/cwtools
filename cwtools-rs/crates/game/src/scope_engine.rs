@@ -286,13 +286,22 @@ impl ScopeContext {
     /// * Game-specific named links looked up in `scope_links`.
     pub fn change_scope(&mut self, key: &str) -> ScopeResult {
         // Strip leading `hidden:` prefix (F# Scopes.fs:148-149).
-        let key = if key.to_ascii_lowercase().starts_with("hidden:") {
+        // Compute lowercase once for the hidden: check and reuse below.
+        let lower_full = key.to_ascii_lowercase();
+        let key = if lower_full.starts_with("hidden:") {
             &key[7..]
         } else {
             key
         };
 
-        let lower = key.to_ascii_lowercase();
+        // Reuse the already-computed lowercase when the key wasn't trimmed.
+        let lower_owned;
+        let lower: &str = if lower_full.len() == key.len() {
+            &lower_full
+        } else {
+            lower_owned = key.to_ascii_lowercase();
+            &lower_owned
+        };
 
         // Config-driven prefix links (`var:`, `sp:`, `mio:`, `event_target:`, …).
         // A scope-changing prefix (`sp:` → special_project) pushes its target; a
@@ -329,7 +338,7 @@ impl ScopeContext {
             return self.change_scope_dotted(key);
         }
 
-        self.resolve_single(key)
+        self.resolve_single_with_lower(key, lower)
     }
 
     /// Fold a dotted key like `owner.capital.controller` left-to-right.
@@ -361,15 +370,18 @@ impl ScopeContext {
 
     /// Resolve a single (non-dotted) key.
     fn resolve_single(&mut self, key: &str) -> ScopeResult {
-        let lower = key.to_ascii_lowercase();
+        let lower_owned = key.to_ascii_lowercase();
+        self.resolve_single_with_lower(key, &lower_owned)
+    }
 
+    fn resolve_single_with_lower(&mut self, key: &str, lower: &str) -> ScopeResult {
         // Variable / scripted prefix
         if lower.starts_with('@') {
             self.scopes.push(SCOPE_ANY);
             return ScopeResult::VarFound;
         }
 
-        match lower.as_str() {
+        match lower {
             // ── this / self ──────────────────────────────────────────────
             "this" | "self" => {
                 let cur = self.scopes.last().copied().unwrap_or(self.root);
@@ -447,35 +459,43 @@ impl ScopeContext {
             _ => {}
         }
 
-        // Game-specific named link lookup
-        let link_opt = self.registry.links.get(&lower).cloned();
-        if let Some(link) = link_opt {
+        // Game-specific named link lookup — borrow rather than clone the whole
+        // ScopeLink struct; only clone the sub-Vecs we actually need.
+        if let Some(link) = self.registry.links.get(lower) {
             let current = self.scopes.last().copied().unwrap_or(self.root);
 
-            // ANY scope always passes
+            // ANY scope always passes; also check config-driven subscope
+            // relations (e.g. character is_subscope_of country) via the
+            // registry. The previous `s.as_scope().is_of_scope(current)` was
+            // backwards (it tested "is the required scope a subscope of
+            // current?" instead of "is current a subscope of required?") and
+            // used the hardcoded table instead of the registry.
             let valid = current == SCOPE_ANY
                 || link.valid_scopes.is_empty()
-                || link.valid_scopes.iter().any(|s| {
-                    *s == SCOPE_ANY || *s == current || s.as_scope().is_of_scope(current.as_scope())
-                });
+                || link
+                    .valid_scopes
+                    .iter()
+                    .any(|s| self.registry.is_subscope_or_eq(current, *s));
 
             if valid {
                 if link.is_scope_change {
                     let target = link.target.unwrap_or(SCOPE_ANY);
+                    let ignore_keys = link.ignore_keys.clone();
                     self.scopes.push(target);
                     return ScopeResult::NewScope {
                         scope: target,
-                        ignore_keys: link.ignore_keys.clone(),
+                        ignore_keys,
                     };
                 } else {
                     // Value-only trigger
                     return ScopeResult::ValueFound;
                 }
             } else {
+                let expected = link.valid_scopes.clone();
                 return ScopeResult::WrongScope {
                     command: key.to_string(),
                     current,
-                    expected: link.valid_scopes.clone(),
+                    expected,
                 };
             }
         }
@@ -1802,24 +1822,7 @@ fn load_eu5_links(_links: &mut HashMap<String, ScopeLink>) {
     // No game-specific scope data yet — EU5 uses only the generic THIS/ROOT/etc.
 }
 
-// ── validate_scope_field (kept for compat) ────────────────────────────────────
-
-/// Convenience: validate that a `scope[X]` field annotation matches `context`.
-/// Returns true when the current scope satisfies the requirement.
-pub fn validate_scope_field(context: &ScopeContext, field: &str) -> bool {
-    let cur = context.current().unwrap_or(SCOPE_ANY);
-    if cur == SCOPE_ANY {
-        return true;
-    }
-    // field is something like "country" or "province"
-    let lower = field.to_ascii_lowercase();
-    context
-        .registry
-        .links
-        .get(&lower)
-        .map(|l| l.valid_scopes.contains(&cur) || l.valid_scopes.is_empty())
-        .unwrap_or(true) // unknown field → lenient
-}
+// validate_scope_field deleted: no callers and the implementation was incorrect.
 
 #[cfg(test)]
 mod tests {

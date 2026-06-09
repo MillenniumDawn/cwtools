@@ -249,13 +249,20 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
 
         let position = Position::new(name, i + 1, 1); // 1-based line numbers
 
+        // Compute the column offset of `desc`'s start within the full line.
+        // The key + colon + version + optional space are all ASCII, so byte
+        // offset == char offset for that prefix.
+        let leading_ws = line.len() - trimmed.len();
+        // desc starts at (trimmed.len() - desc.len()) bytes into trimmed.
+        let desc_col_offset = leading_ws + (trimmed.len() - desc.len());
+
         // Check for chars outside the allowed loc-value Unicode ranges.
         // Mirrors F# parser `desc` production which stops at the first
         // char where `isLocValueChar` returns false, then records the
         // position of that char as `errorRange`.
         let error_range = find_invalid_loc_char(desc).map(|byte_off| {
-            // Work out which column the bad char is at (1-based)
-            let col = desc[..byte_off].chars().count() + 1;
+            // Column within desc (0-based) + prefix offset gives the line column.
+            let col = desc_col_offset + desc[..byte_off].chars().count() + 1;
             Position::new(name, i + 1, col)
         });
 
@@ -275,7 +282,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
                 _ => None,
             })
             .collect();
-        let jomini_commands: Vec<crate::commands::JominiCommand> = elements
+        let jomini_commands: Vec<Vec<crate::commands::JominiCommand>> = elements
             .iter()
             .filter_map(|e| match e {
                 crate::loc_string::LocElement::JominiCommand(cmds) => Some(
@@ -299,7 +306,6 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
                 ),
                 _ => None,
             })
-            .flatten()
             .collect();
 
         entries.push(LocEntry {

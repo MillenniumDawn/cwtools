@@ -167,13 +167,17 @@ pub(crate) fn child_key_matches(
         Child::Leaf(idx) => {
             let leaf = &ast.arena.leaves[*idx as usize];
             table
-                .with_string(leaf.key.normal, |s| s == filter_key)
+                .with_string(leaf.key.normal, |s| {
+                    unquote_key(s).eq_ignore_ascii_case(unquote_key(filter_key))
+                })
                 .unwrap_or(false)
         }
         Child::Node(idx) => {
             let node = &ast.arena.nodes[*idx as usize];
             table
-                .with_string(node.key.normal, |s| s == filter_key)
+                .with_string(node.key.normal, |s| {
+                    unquote_key(s).eq_ignore_ascii_case(unquote_key(filter_key))
+                })
                 .unwrap_or(false)
         }
         _ => false,
@@ -194,18 +198,29 @@ pub(crate) fn looks_like_data_ref(key: &str) -> bool {
 
 /// Check that a string has the YYYY.MM.DD shape for a CW date field.
 pub(crate) fn is_date_shape(s: &str) -> bool {
-    // Accept YYYY.MM.DD or YYYY.M.D — split by '.' and check 3 numeric parts
+    // Exactly YYYY.MM.DD — three numeric parts separated by dots.
     let parts: Vec<&str> = s.splitn(4, '.').collect();
-    parts.len() >= 3
+    parts.len() == 3
         && parts[0].parse::<i32>().is_ok()
         && parts[1].parse::<u32>().is_ok()
         && parts[2].parse::<u32>().is_ok()
 }
 
-/// Check that a string has the YYYY.MM.DD.HH shape for a CW datetime field.
+/// Check that a string has the YYYY.MM.DD or YYYY.MM.DD.HH shape for a CW
+/// datetime field. Mirrors F# `IsValidDateTime` which accepts both 3 and 4
+/// dot-separated numeric parts (3-part dates are valid for datetime fields).
 pub(crate) fn is_datetime_shape(s: &str) -> bool {
-    // Allow 3 or 4 dot-separated numeric parts
-    is_date_shape(s)
+    let parts: Vec<&str> = s.splitn(5, '.').collect();
+    match parts.len() {
+        3 => is_date_shape(s),
+        4 => {
+            parts[0].parse::<i32>().is_ok()
+                && parts[1].parse::<u32>().is_ok()
+                && parts[2].parse::<u32>().is_ok()
+                && parts[3].parse::<u32>().is_ok()
+        }
+        _ => false,
+    }
 }
 
 /// Enum membership test. An absent or empty enum (members come from game data

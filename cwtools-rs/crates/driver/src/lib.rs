@@ -34,15 +34,15 @@ use cwtools_index::{
     variable_defining_effects,
 };
 use cwtools_localization::{Lang, LocDiagnostic, LocIndex, LocService};
-use cwtools_parser::ast::ParsedFile;
+use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::{EnumDefinition, RuleSet};
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{
-    Prepared, ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
-    validate_prepared,
+    ErrorSeverity, Prepared, ValidationError, build_enum_map, build_modifier_keys,
+    build_scope_registry_arc, validate_prepared,
 };
 
 /// A parsed workspace/mod file: its on-disk path, mod-relative logical path, and AST.
@@ -146,7 +146,13 @@ impl Session {
                 .extend(ignore_dirs.iter().cloned());
         }
         let mut manager = FileManager::with_string_table(fm_config, rules_table.clone());
-        let files = manager.discover_and_parse().unwrap_or_default();
+        let (files, discovery_failed) = match manager.discover_and_parse() {
+            Ok(f) => (f, false),
+            Err(e) => {
+                eprintln!("error: discovery failed for {}: {}", directory.display(), e);
+                (Vec::new(), true)
+            }
+        };
 
         // Take ownership of each parsed AST once. The TypeIndex build and the
         // validation pass both borrow this set, so nothing is parsed twice.
@@ -158,7 +164,7 @@ impl Session {
                 parsed: ParsedFile {
                     arena: f.arena,
                     root_children: f.root_children,
-                    errors: vec![],
+                    errors: f.errors,
                 },
             })
             .collect();
@@ -245,14 +251,19 @@ impl Session {
             registry,
             directory,
         }
-        .with_parsed_cache(parsed)
+        .with_parsed_cache(parsed, discovery_failed)
     }
 
     /// Attach the parsed mod-file set the batch path validates over.
-    fn with_parsed_cache(self, parsed: Vec<ParsedSource>) -> SessionWithFiles {
+    fn with_parsed_cache(
+        self,
+        parsed: Vec<ParsedSource>,
+        discovery_failed: bool,
+    ) -> SessionWithFiles {
         SessionWithFiles {
             session: self,
             parsed,
+            discovery_failed,
         }
     }
 
@@ -338,6 +349,9 @@ impl Session {
 pub struct SessionWithFiles {
     session: Session,
     parsed: Vec<ParsedSource>,
+    /// True when the initial `discover_and_parse` failed; callers should treat
+    /// this as a hard error (log already printed) and exit nonzero.
+    pub discovery_failed: bool,
 }
 
 impl std::ops::Deref for SessionWithFiles {
@@ -360,7 +374,8 @@ impl SessionWithFiles {
             .par_iter()
             .map(|src| {
                 let file_str = src.path.to_str().unwrap_or("").to_string();
-                let errors = validate_prepared(&src.parsed, &file_str, &prepared);
+                let mut errors = parse_errors_to_validation(&src.parsed.errors, &file_str);
+                errors.extend(validate_prepared(&src.parsed, &file_str, &prepared));
                 (src.path.clone(), errors)
             })
             .collect()
@@ -370,6 +385,28 @@ impl SessionWithFiles {
     pub fn parsed_files(&self) -> &[ParsedSource] {
         &self.parsed
     }
+}
+
+/// Convert parse errors from a partially-parsed file into `ValidationError`s so
+/// they appear in the CLI report (and count toward the exit-1 threshold).
+fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<ValidationError> {
+    errors
+        .iter()
+        .map(|e| {
+            let (line, col, msg) = match e {
+                ParseError::Pos(_, l, c, m) => (*l, *c, m.clone()),
+                ParseError::General(m) => (0, 0, m.clone()),
+            };
+            ValidationError {
+                message: msg,
+                severity: ErrorSeverity::Error,
+                line,
+                col,
+                file: file_path.to_string(),
+                code: None,
+            }
+        })
+        .collect()
 }
 
 /// Build a `TypeIndex` from every script file under `dir` (a base-game install).
@@ -504,10 +541,19 @@ fn load_rules(
             ruleset
         }
         RulesInput::File(file) => {
-            let rules_str = std::fs::read_to_string(file).unwrap_or_default();
+            let rules_str = match std::fs::read_to_string(file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: could not read rules {}: {}", file.display(), e);
+                    return RuleSet::new();
+                }
+            };
             match parse_string(&rules_str, table) {
                 Ok(parsed) => ast_to_ruleset(&parsed, table),
-                Err(_) => RuleSet::new(),
+                Err(e) => {
+                    eprintln!("error: could not parse rules {}: {}", file.display(), e);
+                    RuleSet::new()
+                }
             }
         }
     }

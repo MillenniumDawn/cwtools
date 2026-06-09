@@ -294,6 +294,7 @@ mod tests {
                 path_file: None,
                 path_extension: None,
                 paths_lower: vec![],
+                ..Default::default()
             },
             subtypes: vec![],
             type_key_filter: None,

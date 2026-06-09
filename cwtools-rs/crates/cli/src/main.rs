@@ -189,6 +189,27 @@ fn load_rules(rules_path: &std::path::Path, table: &StringTable) -> RuleSet {
     }
 }
 
+/// Print a compact summary of a loaded RuleSet. Shared by the Parse-on-directory
+/// and Rules subcommands (previously copy-pasted between them).
+fn print_ruleset_summary(ruleset: &cwtools_rules::rules_types::RuleSet) {
+    println!("  Types:         {}", ruleset.types.len());
+    for t in &ruleset.types {
+        println!(
+            "    - {} (path: {:?}, subtypes: {})",
+            t.name,
+            t.path_options.paths,
+            t.subtypes.len()
+        );
+    }
+    println!("  Enums:         {}", ruleset.enums.len());
+    for e in &ruleset.enums {
+        println!("    - {} ({} values)", e.key, e.values.len());
+    }
+    println!("  Aliases:       {}", ruleset.aliases.len());
+    println!("  SingleAliases: {}", ruleset.single_aliases.len());
+    println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
+}
+
 /// Locate the F# CWToolsCLI.dll: the CWTOOLS_FSHARP_CLI env var wins, otherwise
 /// try a couple of conventional build-output paths relative to the cwd.
 fn locate_fsharp_cli() -> Option<PathBuf> {
@@ -289,22 +310,7 @@ fn main() {
                     eprintln!("warn: {}", err);
                 }
                 println!("Parsed rule directory: {}", file.display());
-                println!("  Types:         {}", ruleset.types.len());
-                for t in &ruleset.types {
-                    println!(
-                        "    - {} (path: {:?}, subtypes: {})",
-                        t.name,
-                        t.path_options.paths,
-                        t.subtypes.len()
-                    );
-                }
-                println!("  Enums:         {}", ruleset.enums.len());
-                for e in &ruleset.enums {
-                    println!("    - {} ({} values)", e.key, e.values.len());
-                }
-                println!("  Aliases:       {}", ruleset.aliases.len());
-                println!("  SingleAliases: {}", ruleset.single_aliases.len());
-                println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
+                print_ruleset_summary(&ruleset);
             } else {
                 let mut manager = FileManager::new(FileManagerConfig::default());
                 match manager.parse_single_file(&file) {
@@ -406,22 +412,7 @@ fn main() {
                 format!("rules file: {}", file.display())
             };
             println!("Parsed {}", label);
-            println!("  Types:         {}", ruleset.types.len());
-            for t in &ruleset.types {
-                println!(
-                    "    - {} (path: {:?}, subtypes: {})",
-                    t.name,
-                    t.path_options.paths,
-                    t.subtypes.len()
-                );
-            }
-            println!("  Enums:         {}", ruleset.enums.len());
-            for e in &ruleset.enums {
-                println!("    - {} ({} values)", e.key, e.values.len());
-            }
-            println!("  Aliases:       {}", ruleset.aliases.len());
-            println!("  SingleAliases: {}", ruleset.single_aliases.len());
-            println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
+            print_ruleset_summary(&ruleset);
         }
         Commands::Validate {
             game,
@@ -470,9 +461,11 @@ fn main() {
 
             // Load a pre-generated vanilla index, if given (faster than --vanilla;
             // resolves base-game references without re-parsing the install).
+            // Fingerprint comparison happens after the session is loaded (needs
+            // the ruleset); stale caches are detected there and re-generated.
             let vanilla_cache_index = vanilla_cache.as_ref().and_then(|cache_path| {
                 match vanilla_cache::load(cache_path) {
-                    Ok((cache_game, _fingerprint, per_type)) => {
+                    Ok((cache_game, cached_fp, per_type)) => {
                         if cache_game != game {
                             eprintln!(
                                 "  warn: vanilla cache was built for game '{}', validating '{}'",
@@ -481,11 +474,12 @@ fn main() {
                         }
                         let total: usize = per_type.values().map(|v| v.len()).sum();
                         eprintln!(
-                            "  Loaded {} base-game instances from cache {}",
+                            "  Loaded {} base-game instances from cache {} (fp: {})",
                             total,
-                            cache_path.display()
+                            cache_path.display(),
+                            cached_fp,
                         );
-                        Some(per_type)
+                        Some((cached_fp, per_type))
                     }
                     Err(e) => {
                         eprintln!(
@@ -497,6 +491,10 @@ fn main() {
                     }
                 }
             });
+            let (cached_fingerprint, vanilla_cache_index) = match vanilla_cache_index {
+                Some((fp, idx)) => (Some(fp), Some(idx)),
+                None => (None, None),
+            };
 
             // Build the whole engine pipeline through the shared driver: parse
             // rules, discover/parse mod files, build the type/var/vanilla indexes,
@@ -521,6 +519,33 @@ fn main() {
                 ruleset.aliases.len()
             );
             eprintln!("  Discovered {} files", session.parsed_files().len());
+
+            // Vanilla-cache freshness check. If both --vanilla-cache and --vanilla
+            // are given we can compute the combined fingerprint (game version +
+            // ruleset shape) and detect staleness.
+            if let (Some(cache_path), Some(fp_loaded), Some(vanilla_dir)) =
+                (&vanilla_cache, &cached_fingerprint, &vanilla)
+            {
+                let fp_live = vanilla_cache::combined_fingerprint(vanilla_dir, ruleset);
+                if *fp_loaded != fp_live {
+                    eprintln!(
+                        "  warn: vanilla cache is stale (cached: {}, live: {}); rebuilding",
+                        fp_loaded, fp_live
+                    );
+                    let rules_table = session.string_table();
+                    let var_effects = cwtools_info::variable_defining_effects(ruleset);
+                    let index = index_game_dir(vanilla_dir, ruleset, rules_table, &var_effects);
+                    match vanilla_cache::save(&index, &game, &fp_live, cache_path) {
+                        Ok(n) => eprintln!("  Rebuilt vanilla cache with {} instances", n),
+                        Err(e) => eprintln!(
+                            "  warn: could not write rebuilt cache {}: {}",
+                            cache_path.display(),
+                            e
+                        ),
+                    }
+                }
+            }
+
             tlog!("load");
 
             // Load the ignore-hash baseline, if given.
@@ -573,7 +598,16 @@ fn main() {
 
             // Loc-file checks (CW225/CW234/CW259/CW268/CW275). Resolve refs
             // against the full mod+vanilla union but only report mod-path files.
-            let dir_prefix = directory.to_string_lossy().to_string();
+            // Ensure the prefix has a trailing separator so `/mods/MD` doesn't
+            // accidentally match `/mods/MD-assets`.
+            let dir_prefix = {
+                let s = directory.to_string_lossy();
+                if s.ends_with(std::path::MAIN_SEPARATOR) {
+                    s.into_owned()
+                } else {
+                    format!("{}{}", s, std::path::MAIN_SEPARATOR)
+                }
+            };
             for d in session.loc_project_diagnostics() {
                 if !d.file.starts_with(&dir_prefix) {
                     continue;
@@ -716,10 +750,11 @@ fn main() {
                 }
             }
 
-            match &output_file {
+            let write_failed = match &output_file {
                 Some(p) => {
                     if let Err(e) = std::fs::write(p, &out) {
                         eprintln!("Error writing report {}: {}", p.display(), e);
+                        true
                     } else {
                         println!(
                             "Wrote {} report ({} errors, {} warnings) to {}",
@@ -728,10 +763,14 @@ fn main() {
                             total_warnings,
                             p.display()
                         );
+                        false
                     }
                 }
-                None => print!("{}", out),
-            }
+                None => {
+                    print!("{}", out);
+                    false
+                }
+            };
 
             // Write the surviving hashes for use as a future baseline.
             if let Some(p) = &output_hashes {
@@ -749,7 +788,7 @@ fn main() {
                 }
             }
 
-            if total_errors > 0 {
+            if total_errors > 0 || session.discovery_failed || write_failed {
                 std::process::exit(1);
             }
         }

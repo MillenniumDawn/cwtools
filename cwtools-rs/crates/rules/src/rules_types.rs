@@ -8,7 +8,8 @@ pub struct RuleSet {
     pub complex_enums: Vec<ComplexEnumDef>,
     pub root_rules: Vec<RootRule>,
     /// Parsed `values = { value[name] = { ... } }` blocks (item G).
-    pub values: Vec<(String, Vec<String>)>,
+    /// Keyed by name; sets from multiple .cwt files are unioned at merge.
+    pub values: std::collections::HashMap<String, Vec<String>>,
     /// Names from a top-level `modifiers = { name = category ... }` block. These
     /// are the valid keys for `alias_name[modifier]` slots (modifier contexts).
     pub modifiers: Vec<String>,
@@ -38,6 +39,10 @@ pub struct RuleSet {
     /// Lookup index over `enums`, built by `reindex()`. Maps an enum key to its
     /// index in `enums` for O(1) lookups.
     pub enum_by_name: std::collections::HashMap<String, usize>,
+    /// Lookup index over `root_rules`, built by `reindex()`. Maps a type-rule
+    /// name to its index in `root_rules`, so `find_rules_by_name` is O(1)
+    /// instead of a linear scan per root child.
+    pub type_rules_idx: std::collections::HashMap<String, usize>,
 }
 
 /// A scope definition parsed from `scopes.cwt` (`Country = { aliases = { country } }`).
@@ -94,7 +99,7 @@ impl RuleSet {
             enums: Vec::new(),
             complex_enums: Vec::new(),
             root_rules: Vec::new(),
-            values: Vec::new(),
+            values: std::collections::HashMap::new(),
             modifiers: Vec::new(),
             scope_links: std::collections::HashSet::new(),
             scope_inputs: Vec::new(),
@@ -103,6 +108,7 @@ impl RuleSet {
             alias_categories: std::collections::HashMap::new(),
             type_by_name: std::collections::HashMap::new(),
             enum_by_name: std::collections::HashMap::new(),
+            type_rules_idx: std::collections::HashMap::new(),
         }
     }
 
@@ -139,6 +145,15 @@ impl RuleSet {
                 .iter()
                 .map(|p| p.replace('\\', "/").trim_matches('/').to_lowercase())
                 .collect();
+            td.path_options.path_file_lower = td
+                .path_options
+                .path_file
+                .as_deref()
+                .map(|s| s.to_lowercase());
+            td.path_options.path_ext_lower = td.path_options.path_extension.as_deref().map(|s| {
+                let s = s.to_lowercase();
+                s.strip_prefix('.').map(|t| t.to_string()).unwrap_or(s)
+            });
         }
         for ce in &mut self.complex_enums {
             ce.path_options.paths_lower = ce
@@ -147,6 +162,15 @@ impl RuleSet {
                 .iter()
                 .map(|p| p.replace('\\', "/").trim_matches('/').to_lowercase())
                 .collect();
+            ce.path_options.path_file_lower = ce
+                .path_options
+                .path_file
+                .as_deref()
+                .map(|s| s.to_lowercase());
+            ce.path_options.path_ext_lower = ce.path_options.path_extension.as_deref().map(|s| {
+                let s = s.to_lowercase();
+                s.strip_prefix('.').map(|t| t.to_string()).unwrap_or(s)
+            });
         }
         self.type_by_name.clear();
         for (i, td) in self.types.iter().enumerate() {
@@ -155,6 +179,14 @@ impl RuleSet {
         self.enum_by_name.clear();
         for (i, e) in self.enums.iter().enumerate() {
             self.enum_by_name.insert(e.key.clone(), i);
+        }
+        self.type_rules_idx.clear();
+        for (i, rr) in self.root_rules.iter().enumerate() {
+            if let RootRule::TypeRule(name, _) = rr {
+                // First writer wins — mirrors find_rules_by_name returning the
+                // first TypeRule with a given name.
+                self.type_rules_idx.entry(name.clone()).or_insert(i);
+            }
         }
     }
 }
@@ -179,7 +211,7 @@ pub struct TypeDefinition {
     pub modifiers: Vec<TypeModifier>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct PathOptions {
     pub paths: Vec<String>,
     pub path_strict: bool,
@@ -187,6 +219,10 @@ pub struct PathOptions {
     pub path_extension: Option<String>,
     /// Pre-computed lowercased path patterns, built by `RuleSet::reindex()`.
     pub paths_lower: Vec<String>,
+    /// Pre-computed lowercased `path_file`, built by `RuleSet::reindex()`.
+    pub path_file_lower: Option<String>,
+    /// Pre-computed lowercased `path_extension` with leading `.` stripped, built by `RuleSet::reindex()`.
+    pub path_ext_lower: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,6 +281,7 @@ pub struct ReplaceScopes {
 /// A rule is a (RuleType, Options) pair.
 pub type NewRule = (RuleType, Options);
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuleType {
     NodeRule {
@@ -268,6 +305,7 @@ pub enum RuleType {
     },
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum NewField {
     ValueField(ValueType),
@@ -287,7 +325,7 @@ pub enum NewField {
     AliasValueKeysField(String),
     AliasField(String),
     SingleAliasField(String),
-    SingleAliasClauseField(String, String),
+    // SingleAliasClauseField removed: never constructed by the converter.
     SubtypeField(String, bool, Vec<NewRule>),
     VariableSetField(String),
     VariableGetField(String),
@@ -308,7 +346,7 @@ pub enum NewField {
         max: f64,
     },
     MarkerField(Marker),
-    JominiGuiField,
+    // JominiGuiField removed: never constructed.
     IgnoreMarkerField,
     IgnoreField(Box<NewField>),
 }
@@ -357,9 +395,8 @@ pub struct Options {
     pub required_scopes: Vec<String>,
     pub comparison: bool,
     pub reference_details: Option<(bool, String)>,
-    pub key_required_quotes: bool,
-    pub value_required_quotes: bool,
-    pub type_hint: Option<(String, bool)>,
+    // key_required_quotes, value_required_quotes, type_hint removed:
+    // always default-valued, no readers (quoted-key enforcement unimplemented).
     pub error_if_only_match: Option<String>,
 }
 
@@ -377,9 +414,6 @@ impl Default for Options {
             required_scopes: Vec::new(),
             comparison: false,
             reference_details: None,
-            key_required_quotes: false,
-            value_required_quotes: false,
-            type_hint: None,
             error_if_only_match: None,
         }
     }
@@ -432,6 +466,7 @@ pub enum ComplexEnumNameTreeEntry {
 }
 
 /// Root-level rule from a .cwt file.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum RootRule {
     AliasRule(String, NewRule),

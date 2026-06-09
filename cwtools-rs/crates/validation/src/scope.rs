@@ -74,7 +74,7 @@ pub(crate) fn build_scope_registry(ruleset: &RuleSet, game: Game) -> ScopeRegist
         let valid: Vec<ScopeId> = li
             .input_scopes
             .iter()
-            .filter_map(|n| reg.id_of(n))
+            .map(|n| reg.id_of(n).unwrap_or(SCOPE_ANY))
             .collect();
         let link = ScopeLink {
             valid_scopes: valid,
@@ -97,8 +97,8 @@ pub(crate) fn build_scope_registry(ruleset: &RuleSet, game: Game) -> ScopeRegist
         .by_id
         .iter()
         .flat_map(|(id, def)| {
-            def.aliases
-                .iter()
+            std::iter::once(&def.name)
+                .chain(def.aliases.iter())
                 .filter(|a| a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
                 .map(move |a| (a.to_ascii_lowercase(), *id))
         })

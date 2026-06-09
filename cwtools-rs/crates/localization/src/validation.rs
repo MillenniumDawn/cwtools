@@ -118,25 +118,9 @@ pub fn validate_loc_file(
                 kind: LocErrorKind::ReplaceMe,
             });
         }
-
-        // ---- Invalid loc commands ----
-        for cmd in &entry.commands {
-            if cmd.contains("event_target:") && !is_known_event_target(cmd, all_keys) {
-                // Allow event_target references that aren't in key set
-                // F# has an actual check; for now we warn rather than error
-            }
-        }
     }
 
     errors
-}
-
-fn is_known_event_target(cmd: &str, all_keys: &HashSet<String>) -> bool {
-    if let Some(target) = cmd.strip_prefix("event_target:") {
-        all_keys.contains(target)
-    } else {
-        true
-    }
 }
 
 /// Validate invalid characters.

@@ -62,7 +62,7 @@ pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Aren
         assert_eq!(idx as usize, arena.comments.len() - 1);
     }
 
-    let root = children_from_cached(&cached.root_children, string_table, &mut arena);
+    let root = children_from_cached(&cached.root_children);
     (arena, root)
 }
 
@@ -112,11 +112,7 @@ fn children_to_cached(children: &[Child]) -> Vec<CachedChild> {
         .collect()
 }
 
-fn children_from_cached(
-    children: &[CachedChild],
-    _table: &StringTable,
-    _arena: &mut Arena,
-) -> Vec<Child> {
+fn children_from_cached(children: &[CachedChild]) -> Vec<Child> {
     children
         .iter()
         .map(|c| match c {
@@ -154,7 +150,7 @@ fn cached_node_to_node(n: &CachedNode, table: &StringTable) -> Node {
             .value_prefix
             .as_ref()
             .map(|s| str_to_string_token(s, table)),
-        children: children_from_cached(&n.children, table, &mut Arena::new()),
+        children: children_from_cached(&n.children),
         pos: cached_to_range(n.start_line, n.start_col, n.end_line, n.end_col),
     }
 }
@@ -222,7 +218,7 @@ fn cached_value_clause_to_value_clause(vc: &CachedValueClause, table: &StringTab
             .iter()
             .map(|k| str_to_string_token(k, table))
             .collect(),
-        children: children_from_cached(&vc.children, table, &mut Arena::new()),
+        children: children_from_cached(&vc.children),
         pos: cached_to_range(vc.start_line, vc.start_col, vc.end_line, vc.end_col),
     }
 }
@@ -263,9 +259,7 @@ fn cached_value_to_value(v: &CachedValue, table: &StringTable) -> Value {
         CachedValue::Float(f) => Value::Float(*f),
         CachedValue::Int(i) => Value::Int(*i),
         CachedValue::Bool(b) => Value::Bool(*b),
-        CachedValue::Clause(children) => {
-            Value::Clause(children_from_cached(children, table, &mut Arena::new()))
-        }
+        CachedValue::Clause(children) => Value::Clause(children_from_cached(children)),
     }
 }
 

@@ -26,7 +26,10 @@ pub fn post_process(ruleset: &mut RuleSet) {
 /// expanded.
 fn replace_single_aliases(ruleset: &mut RuleSet) {
     // First expand any single_alias refs inside single_alias bodies themselves
-    // (up to 10 rounds, same as F#).
+    // (up to 10 rounds, same as F#). Track remaining unresolved reference count
+    // to detect self-referential cycles: if a round makes no progress (count
+    // doesn't decrease), bail rather than growing the rule tree exponentially.
+    let mut prev_unresolved = usize::MAX;
     for _ in 0..10 {
         let map: Vec<(String, NewRule)> = ruleset.single_aliases.clone();
         let mut changed = false;
@@ -36,6 +39,15 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
         if !changed {
             break;
         }
+        let unresolved = count_single_alias_refs(&ruleset.single_aliases);
+        if unresolved >= prev_unresolved {
+            tracing::warn!(
+                unresolved,
+                "single_alias expansion cycle detected — bailing to avoid exponential growth"
+            );
+            break;
+        }
+        prev_unresolved = unresolved;
     }
 
     // Now expand all root_rules and aliases
@@ -84,19 +96,7 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)], chang
         }
         return;
     }
-    if let RuleType::LeafValueRule {
-        right: NewField::SingleAliasClauseField(_, name),
-    } = &rule.0
-    {
-        let name = name.clone();
-        if let Some(resolved) = lookup_single_alias(&name, map) {
-            if let RuleType::NodeRule { rules: ar, .. } = resolved.0 {
-                rule.0 = RuleType::ValueClauseRule { rules: ar };
-            }
-            *changed = true;
-        }
-        return;
-    }
+    // SingleAliasClauseField removed (variant deleted; was never constructed).
     match &mut rule.0 {
         RuleType::NodeRule { rules, .. } => {
             inline_rules_list(rules, map, changed);
@@ -119,9 +119,6 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)], change
             r.0,
             RuleType::LeafRule {
                 right: NewField::SingleAliasField(..),
-                ..
-            } | RuleType::LeafValueRule {
-                right: NewField::SingleAliasClauseField(..),
                 ..
             }
         )
@@ -173,26 +170,6 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)], change
                     rules.push(rule);
                 }
             }
-            // LeafValueRule whose right is a SingleAliasClauseField
-            RuleType::LeafValueRule {
-                right: NewField::SingleAliasClauseField(_, name),
-            } => {
-                let name = name.clone();
-                let opts = rule.1.clone();
-                if let Some(resolved) = lookup_single_alias(&name, map) {
-                    *changed = true;
-                    match resolved.0 {
-                        RuleType::NodeRule { rules: ar, .. } => {
-                            rules.push((RuleType::ValueClauseRule { rules: ar }, opts));
-                        }
-                        other => {
-                            rules.push((other, opts));
-                        }
-                    }
-                } else {
-                    rules.push(rule);
-                }
-            }
             // Recurse into nested rule containers
             RuleType::NodeRule { .. } => {
                 inline_single_alias_rule(&mut rule, map, changed);
@@ -215,6 +192,25 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)], change
 
 fn lookup_single_alias(name: &str, map: &[(String, NewRule)]) -> Option<NewRule> {
     map.iter().find(|(n, _)| n == name).map(|(_, r)| r.clone())
+}
+
+/// Count the total number of `SingleAliasField` / `SingleAliasClauseField` leaf
+/// references remaining in the single_aliases bodies. Used for cycle detection:
+/// if a fixpoint round didn't reduce this count, expansion has stalled.
+fn count_single_alias_refs(single_aliases: &[(String, NewRule)]) -> usize {
+    fn count_rule(rule: &NewRule) -> usize {
+        match &rule.0 {
+            RuleType::LeafRule {
+                right: NewField::SingleAliasField(_),
+                ..
+            } => 1,
+            RuleType::NodeRule { rules, .. }
+            | RuleType::ValueClauseRule { rules }
+            | RuleType::SubtypeRule { rules, .. } => rules.iter().map(count_rule).sum(),
+            _ => 0,
+        }
+    }
+    single_aliases.iter().map(|(_, r)| count_rule(r)).sum()
 }
 
 /// Extract the `left` field from a `LeafRule` variant.

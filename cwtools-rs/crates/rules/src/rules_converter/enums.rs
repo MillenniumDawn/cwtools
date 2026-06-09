@@ -113,7 +113,7 @@ pub(crate) fn extract_values_from_children(
                     Vec::new()
                 }
             };
-            ruleset.values.push((value_name, vals));
+            ruleset.values.entry(value_name).or_default().extend(vals);
         }
     }
 }
@@ -251,6 +251,7 @@ pub(crate) fn process_complex_enum_from_children(
             path_file,
             path_extension,
             paths_lower: Vec::new(),
+            ..Default::default()
         },
         name_tree: name_tree.unwrap_or(ComplexEnumNameTree::Empty),
         start_from_root,

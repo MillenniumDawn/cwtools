@@ -294,7 +294,10 @@ fn dir_contains_segment(haystack: &str, needle: &str) -> bool {
         if left_ok && right_ok {
             return true;
         }
-        start = abs + 1;
+        // Advance by the char width at `abs` to avoid splitting a multi-byte
+        // UTF-8 sequence (paths are ASCII-dominated but latent on non-Latin dirs).
+        let char_width = haystack[abs..].chars().next().map_or(1, char::len_utf8);
+        start = abs + char_width;
         if start >= haystack.len() {
             break;
         }
@@ -306,13 +309,52 @@ fn dir_contains_segment(haystack: &str, needle: &str) -> bool {
 /// by `path_options`. The directory must equal the pattern when `path_strict`,
 /// else contain it as a path segment (so base-game content nested under
 /// `dlc/<id>/…` is indexed by the same type that validates it).
+///
+/// Also enforces `path_file` (exact filename match) and `path_extension` (extension
+/// match), mirroring the validator's `find_type_by_path_and_key` behaviour.
 pub fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
+    // Normalise separators and split into directory and filename.
+    let norm = logical_path.replace('\\', "/");
+    let basename = norm.rsplit('/').next().unwrap_or(&norm);
+    let basename_lower = basename.to_lowercase();
+
+    // path_file: exact filename constraint (precomputed by reindex when available).
+    if let Some(pf_lower) = &opts.path_file_lower {
+        if basename_lower != *pf_lower {
+            return false;
+        }
+    } else if let Some(pf) = &opts.path_file
+        && basename_lower != pf.to_lowercase()
+    {
+        return false;
+    }
+
+    // path_extension: file extension constraint (precomputed by reindex when available).
+    let check_ext = |ext: &str| {
+        if !ext.is_empty() {
+            let has_ext = basename_lower.rsplit('.').next().is_some_and(|e| e == ext);
+            if !has_ext {
+                return false;
+            }
+        }
+        true
+    };
+    if let Some(ext) = &opts.path_ext_lower {
+        if !check_ext(ext) {
+            return false;
+        }
+    } else if let Some(ext) = &opts.path_extension {
+        let ext = ext.to_lowercase();
+        let ext = ext.strip_prefix('.').unwrap_or(&ext);
+        if !check_ext(ext) {
+            return false;
+        }
+    }
+
     if opts.paths.is_empty() {
         return true;
     }
 
-    // Normalise separators and split into directory and filename.
-    let norm = logical_path.replace('\\', "/");
     let dir = match norm.rfind('/') {
         Some(idx) => &norm[..idx],
         None => "",
@@ -576,85 +618,9 @@ pub struct DefinedVariable {
     pub location: SourceLocation,
 }
 
-/// Collect variable definitions from a file, using the ruleset's `values` table
-/// for value_set namespaces and also collecting `@var` at-prefix variables.
-///
-/// Returns a map from `namespace` (or `"@"` for at-vars) → list of names.
-pub fn collect_defined_variables(
-    ruleset: &RuleSet,
-    file: &ParsedFile,
-    table: &StringTable,
-) -> HashMap<String, Vec<DefinedVariable>> {
-    let mut result: HashMap<String, Vec<DefinedVariable>> = HashMap::new();
-
-    // Build a set of known value_set namespaces from the ruleset values table.
-    let value_set_namespaces: HashSet<&str> =
-        ruleset.values.iter().map(|(ns, _)| ns.as_str()).collect();
-
-    collect_vars_recursive(
-        &file.root_children,
-        &file.arena,
-        table,
-        ruleset,
-        &value_set_namespaces,
-        &mut result,
-    );
-
-    result
-}
-
-// `ruleset` / `value_set_namespaces` are threaded for the rule-aware value_set
-// collection that this @-prefix pass doesn't yet implement; kept so the
-// signature is ready and the caller's API stays stable.
-#[allow(clippy::only_used_in_recursion)]
-fn collect_vars_recursive(
-    children: &[Child],
-    arena: &Arena,
-    table: &StringTable,
-    ruleset: &RuleSet,
-    value_set_namespaces: &HashSet<&str>,
-    out: &mut HashMap<String, Vec<DefinedVariable>>,
-) {
-    for child in children {
-        match child {
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-
-                // @var = value  (classic at-prefix variable)
-                if key.starts_with('@') {
-                    out.entry("@".to_string())
-                        .or_default()
-                        .push(DefinedVariable {
-                            name: key.clone(),
-                            namespace: None,
-                            location: SourceLocation {
-                                line: leaf.pos.start.line,
-                                col: leaf.pos.start.col,
-                            },
-                        });
-                }
-
-                // Recurse into clause values
-                if let Value::Clause(ch) = &leaf.value {
-                    collect_vars_recursive(ch, arena, table, ruleset, value_set_namespaces, out);
-                }
-            }
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                collect_vars_recursive(
-                    &node.children,
-                    arena,
-                    table,
-                    ruleset,
-                    value_set_namespaces,
-                    out,
-                );
-            }
-            _ => {}
-        }
-    }
-}
+// (collect_defined_variables and collect_vars_recursive deleted: no production
+//  callers; collect_defined_variables_from_rules is the production entry point,
+//  and collect_at_vars covers the @-prefix path without the duplicate walk.)
 
 /// Collect variables using full rule-tree walking.
 /// For each leaf where the rule field is `VariableSetField(ns)`, record the
@@ -770,11 +736,13 @@ fn scan_node_for_varset(
                 let val = leaf_value_string(&leaf.value, table);
                 for (rule_type, _opts) in rules {
                     match rule_type {
+                        // left = VariableSetField: the leaf's key IS the defined
+                        // variable name. Only applies when the rule's left is a
+                        // pure variable-set field (no specific key to match against).
                         RuleType::LeafRule {
                             left: NewField::VariableSetField(ns),
                             ..
                         } => {
-                            // Key is the defined name
                             out.entry(ns.clone()).or_default().push(DefinedVariable {
                                 name: key.clone(),
                                 namespace: Some(ns.clone()),
@@ -784,29 +752,46 @@ fn scan_node_for_varset(
                                 },
                             });
                         }
+                        // right = VariableSetField: the leaf's VALUE is the defined
+                        // variable name, but only when the leaf's key matches the
+                        // rule's expected key (SpecificField). Without this guard
+                        // every leaf in the block was incorrectly recorded.
                         RuleType::LeafRule {
+                            left: NewField::SpecificField(expected_key),
                             right: NewField::VariableSetField(ns),
-                            ..
+                        } if !val.is_empty() && key.eq_ignore_ascii_case(expected_key) => {
+                            out.entry(ns.clone()).or_default().push(DefinedVariable {
+                                name: val.clone(),
+                                namespace: Some(ns.clone()),
+                                location: SourceLocation {
+                                    line: leaf.pos.start.line,
+                                    col: leaf.pos.start.col,
+                                },
+                            });
                         }
-                            // Value is the defined name
-                            if !val.is_empty() => {
-                                out.entry(ns.clone()).or_default().push(DefinedVariable {
-                                    name: val.clone(),
-                                    namespace: Some(ns.clone()),
-                                    location: SourceLocation {
-                                        line: leaf.pos.start.line,
-                                        col: leaf.pos.start.col,
-                                    },
-                                });
-                            }
                         _ => {}
                     }
                 }
             }
             Child::Node(ni) => {
-                // recurse
+                let child_node = &arena.nodes[*ni as usize];
+                let child_key = table.get_string(child_node.key.normal).unwrap_or_default();
                 for (rule_type, _) in rules {
-                    if let RuleType::NodeRule { rules: inner, .. } = rule_type {
+                    if let RuleType::NodeRule {
+                        left: NewField::SpecificField(expected_key),
+                        rules: inner,
+                        ..
+                    } = rule_type
+                    {
+                        // Only recurse when the child's key matches the rule's
+                        // expected key. Previously ALL NodeRules were applied to
+                        // every child node, recording junk variable names.
+                        if child_key.eq_ignore_ascii_case(expected_key) {
+                            scan_node_for_varset(*ni as usize, arena, table, inner, out);
+                        }
+                    } else if let RuleType::NodeRule { rules: inner, .. } = rule_type {
+                        // Non-SpecificField node rule (e.g. alias or scalar key):
+                        // recurse unconditionally as before.
                         scan_node_for_varset(*ni as usize, arena, table, inner, out);
                     }
                 }
@@ -893,7 +878,7 @@ pub fn collect_set_variable_names(
             };
             if !matches!(
                 key.to_ascii_lowercase().as_str(),
-                "value" | "tooltip" | "var" | "variable" | "amount"
+                "value" | "tooltip" | "var" | "variable" | "amount" | "which"
             ) {
                 out.push(key);
             }
@@ -984,51 +969,5 @@ pub struct SavedEventTarget {
     pub is_global: bool,
 }
 
-/// Collect `save_event_target_as` / `save_global_event_target_as` from a file.
-pub fn collect_saved_event_targets(
-    file: &ParsedFile,
-    table: &StringTable,
-) -> Vec<SavedEventTarget> {
-    let mut out = Vec::new();
-    collect_event_targets_rec(&file.root_children, &file.arena, table, &mut out);
-    out
-}
-
-fn collect_event_targets_rec(
-    children: &[Child],
-    arena: &Arena,
-    table: &StringTable,
-    out: &mut Vec<SavedEventTarget>,
-) {
-    for child in children {
-        match child {
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                let val = leaf_value_string(&leaf.value, table);
-
-                if (key == "save_event_target_as" || key == "save_global_event_target_as")
-                    && !val.is_empty()
-                {
-                    out.push(SavedEventTarget {
-                        name: val,
-                        location: SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        },
-                        is_global: key == "save_global_event_target_as",
-                    });
-                }
-
-                if let Value::Clause(ch) = &leaf.value {
-                    collect_event_targets_rec(ch, arena, table, out);
-                }
-            }
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                collect_event_targets_rec(&node.children, arena, table, out);
-            }
-            _ => {}
-        }
-    }
-}
+// collect_saved_event_targets and collect_event_targets_rec deleted:
+// no production callers.

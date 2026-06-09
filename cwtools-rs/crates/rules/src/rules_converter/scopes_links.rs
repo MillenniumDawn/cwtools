@@ -184,7 +184,7 @@ pub(crate) fn extract_links(
                     .get_string(ast.arena.leaves[*lidx as usize].key.normal)
                     .unwrap_or_default();
                 if !n.is_empty() {
-                    ruleset.scope_links.insert(n);
+                    ruleset.scope_links.insert(n.to_ascii_lowercase());
                 }
             }
             continue;
@@ -194,7 +194,7 @@ pub(crate) fn extract_links(
             continue;
         }
         let prefix = child_scalar(body, ast, table, "prefix");
-        ruleset.scope_links.insert(name.clone());
+        ruleset.scope_links.insert(name.to_ascii_lowercase());
         ruleset.link_inputs.push(LinkInput {
             output_scope: child_scalar(body, ast, table, "output_scope"),
             input_scopes: child_scope_list(body, ast, table, "input_scopes"),

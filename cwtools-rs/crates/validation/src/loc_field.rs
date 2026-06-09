@@ -27,11 +27,11 @@ pub fn build_modifier_keys(
                 let pre = &m[..open];
                 let suf = &m[close + 1..];
                 for (_uri, inst) in type_index.instances(tn) {
-                    mk.insert(format!("{}{}{}", pre, inst.name, suf));
+                    mk.insert(format!("{}{}{}", pre, inst.name, suf).to_lowercase());
                 }
             }
             _ => {
-                mk.insert(m.clone());
+                mk.insert(m.to_lowercase());
             }
         }
     }
@@ -134,6 +134,7 @@ pub(crate) fn validate_localisation_field(
         for diag in cwtools_localization::validate_loc_commands(entry, initial, &data) {
             push_loc_command_diagnostic(
                 &diag,
+                key_raw,
                 leaf,
                 file_path,
                 scope_context.map(|c| c.registry.as_ref()),
@@ -147,6 +148,7 @@ pub(crate) fn validate_localisation_field(
 /// `ValidationError` with the matching F# numeric code.
 fn push_loc_command_diagnostic(
     diag: &cwtools_localization::LocCommandDiagnostic,
+    loc_key: &str,
     leaf: &cwtools_parser::ast::Leaf,
     file_path: &str,
     registry: Option<&ScopeRegistry>,
@@ -178,10 +180,7 @@ fn push_loc_command_diagnostic(
         }
         D::ChainEndsInScope { command } => {
             let code = &error_codes::CW266_LOC_COMMAND_NOT_IN_DATA_TYPE;
-            (
-                code,
-                code.format(&[command.as_str(), command.as_str(), "scope"]),
-            )
+            (code, code.format(&[loc_key, command.as_str(), "scope"]))
         }
     };
     errors.push(ValidationError {
