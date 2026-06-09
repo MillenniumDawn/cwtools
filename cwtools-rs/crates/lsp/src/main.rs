@@ -155,11 +155,28 @@ impl tower_lsp::lsp_types::notification::Notification for UpdateFileList {
 }
 
 /// Server state.
+///
+/// LOCK ORDER: when holding more than one guard, acquire in field-declaration
+/// order — `documents` -> `ruleset` -> `scope_registry` -> `info_service` ->
+/// `modifier_keys` -> `loc_index`. Most sites snapshot-and-drop
+/// (`.lock().clone()`) instead of co-holding; the only places two
+/// ruleset-family guards are co-held are `set_ruleset` (writer) and the
+/// single-file validate (reader), both `ruleset` -> `scope_registry`. Never
+/// acquire an earlier lock while holding a later one.
 struct DocumentState {
     /// file URI -> parsed document
     documents: Mutex<HashMap<String, ParsedDoc>>,
-    /// loaded .cwt ruleset
-    ruleset: Mutex<Option<RuleSet>>,
+    /// loaded .cwt ruleset. `RwLock` so the many readers (hover, completion,
+    /// validation, the cross-file sweep) share the guard and don't serialize
+    /// behind a debounced validate; only the rare ruleset load/reload takes
+    /// `write()`.
+    ruleset: parking_lot::RwLock<Option<RuleSet>>,
+    /// Scope/link registry built from `ruleset` (config-driven scopes.cwt +
+    /// links.cwt). Cached here because `build_scope_registry` is the expensive
+    /// part of per-file validation setup and depends only on the loaded ruleset,
+    /// which changes rarely. Rebuilt at the ruleset write site, so it always
+    /// matches the ruleset it was derived from. `None` until the first load.
+    scope_registry: parking_lot::RwLock<Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>>,
     /// shared string table
     string_table: StringTable,
     /// game language from init options
@@ -241,7 +258,8 @@ impl DocumentState {
     fn new() -> Self {
         Self {
             documents: Mutex::new(HashMap::new()),
-            ruleset: Mutex::new(None),
+            ruleset: parking_lot::RwLock::new(None),
+            scope_registry: parking_lot::RwLock::new(None),
             string_table: StringTable::new(),
             language: Mutex::new("paradox".to_string()),
             symbol_index: Mutex::new(symbols::SymbolIndex::new()),
@@ -299,7 +317,7 @@ impl Backend {
         logical_path: &str,
     ) -> Option<(String, String)> {
         let docs = self.state.documents.lock();
-        let ruleset_guard = self.state.ruleset.lock();
+        let ruleset_guard = self.state.ruleset.read();
         if let (Some(doc), Some(rs)) = (docs.get(uri), ruleset_guard.as_ref())
             && let Some(ast) = &doc.ast
         {
@@ -313,6 +331,35 @@ impl Backend {
             );
             return info.and_then(|i| match i.hint {
                 ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
+                _ => None,
+            });
+        }
+        None
+    }
+
+    /// The variable name read at the cursor, if it resolves to a
+    /// `value[variable]` field. Used by goto-definition on a variable read.
+    fn var_ref_at_cursor(
+        &self,
+        uri: &str,
+        pos: tower_lsp::lsp_types::Position,
+        logical_path: &str,
+    ) -> Option<String> {
+        let docs = self.state.documents.lock();
+        let ruleset_guard = self.state.ruleset.read();
+        if let (Some(doc), Some(rs)) = (docs.get(uri), ruleset_guard.as_ref())
+            && let Some(ast) = &doc.ast
+        {
+            let info = info_at_position(
+                ast,
+                pos.line + 1,
+                pos.character as u16,
+                rs,
+                logical_path,
+                &self.state.string_table,
+            );
+            return info.and_then(|i| match i.hint {
+                ReferenceHint::Variable { name, .. } => Some(name),
                 _ => None,
             });
         }
@@ -397,8 +444,7 @@ fn build_hover_markdown(
 ) -> String {
     // Try to find a matching rule's description and scope info for the element key.
     let (rule_desc, rule_scopes) = match (ruleset, element) {
-        (Some(rules), PositionElement::Leaf { key, .. })
-        | (Some(rules), PositionElement::Node { key }) => find_rule_description(rules, key),
+        (Some(rules), PositionElement::Leaf { key, .. }) => find_rule_description(rules, key),
         _ => (None, Vec::new()),
     };
 
@@ -427,12 +473,15 @@ fn build_hover_markdown(
         ReferenceHint::ScopeName { name } => {
             parts.push(format!("**Scope** — `{}`", name));
         }
+        ReferenceHint::Variable { name, namespace } => {
+            parts.push(format!(
+                "**Variable** — `{}` (namespace `{}`)",
+                name, namespace
+            ));
+        }
         ReferenceHint::Unknown => {
             // Fall back to the raw element description
             match element {
-                PositionElement::Node { key } => {
-                    parts.push(format!("**Node** — `{}`", key));
-                }
                 PositionElement::Leaf { key, value } => {
                     parts.push(format!("**Field** — `{} = {}`", key, value));
                 }
@@ -513,33 +562,18 @@ fn collect_enclosing_path(
     use cwtools_parser::ast::{Child, Value};
 
     for child in children {
-        match child {
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                if pos_in_range_simple(target, &node.pos) {
-                    let key = table.get_string(node.key.normal).unwrap_or_default();
-                    path.push(key);
-                    if collect_enclosing_path(&node.children, arena, target, table, path) {
-                        return true;
-                    }
-                    // cursor is in this node but not a child — we're done
+        if let Child::Leaf(idx) = child {
+            let leaf = &arena.leaves[*idx as usize];
+            if let Value::Clause(ch) = &leaf.value
+                && pos_in_range_simple(target, &leaf.pos)
+            {
+                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                path.push(key);
+                if collect_enclosing_path(ch, arena, target, table, path) {
                     return true;
                 }
+                return true;
             }
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                if let Value::Clause(ch) = &leaf.value
-                    && pos_in_range_simple(target, &leaf.pos)
-                {
-                    let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                    path.push(key);
-                    if collect_enclosing_path(ch, arena, target, table, path) {
-                        return true;
-                    }
-                    return true;
-                }
-            }
-            _ => {}
         }
     }
     false
@@ -1216,7 +1250,7 @@ impl LanguageServer for Backend {
                             ),
                         )
                         .await;
-                    *self.state.ruleset.lock() = Some(combined_ruleset);
+                    self.set_ruleset(combined_ruleset);
                     // Rebuild modifier_keys now that the ruleset is loaded.
                     // The type index is empty at this point; it will be rebuilt
                     // again after validate_entire_workspace with the full index.
@@ -1291,7 +1325,7 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["getFileTypes".to_string()],
+                    commands: vec!["getFileTypes".to_string(), "exportProfilingLog".to_string()],
                     work_done_progress_options: Default::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
@@ -1474,20 +1508,24 @@ impl LanguageServer for Backend {
             .to_string();
         let pos = params.text_document_position_params.position;
 
-        let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri)
-            && let Some(ast) = &doc.ast
-        {
+        // Snapshot the AST (a cheap `Arc` clone) and drop the documents guard
+        // before taking ruleset, so hover never co-holds documents + ruleset and
+        // its documents window stays tiny.
+        let ast = {
+            let docs = self.state.documents.lock();
+            docs.get(&uri).and_then(|d| d.ast.clone())
+        };
+        if let Some(ast) = ast {
             let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
             let lsp_col = pos.character as u16;
 
             let ws_uri = self.state.workspace_uri.lock().clone();
             let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-            let ruleset_guard = self.state.ruleset.lock();
+            let ruleset_guard = self.state.ruleset.read();
             let pos_info = if let Some(rs) = ruleset_guard.as_ref() {
                 info_at_position(
-                    ast,
+                    &ast,
                     lsp_line,
                     lsp_col,
                     rs,
@@ -1501,8 +1539,25 @@ impl LanguageServer for Backend {
             drop(ruleset_guard);
 
             if let Some(info) = pos_info {
-                let ruleset_guard2 = self.state.ruleset.lock();
-                let md = build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
+                let ruleset_guard2 = self.state.ruleset.read();
+                let mut md =
+                    build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
+                drop(ruleset_guard2);
+                // For a variable read, append the known assigned value(s) so the
+                // user sees what it resolves to without chasing the definition.
+                if let ReferenceHint::Variable { name, .. } = &info.hint {
+                    let info_guard = self.state.info_service.read();
+                    let (values, more) = info_guard.variable_values(name, 5);
+                    if !values.is_empty() {
+                        let joined = values
+                            .iter()
+                            .map(|v| format!("`{}`", v))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let suffix = if more { ", +more" } else { "" };
+                        md.push_str(&format!("\n\nSet to: {}{}", joined, suffix));
+                    }
+                }
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1514,15 +1569,12 @@ impl LanguageServer for Backend {
 
             // Fallback: no-rule position finder
             if let Some(element) = element_at_position(
-                ast,
+                &ast,
                 pos.line + 1,
                 pos.character as u16,
                 &self.state.string_table,
             ) {
                 let contents = match element {
-                    PositionElement::Node { key } => {
-                        format!("**Node**: `{}`", key)
-                    }
                     PositionElement::Leaf { key, value } => {
                         format!("**Field**: `{} = {}`", key, value)
                     }
@@ -1572,7 +1624,7 @@ impl LanguageServer for Backend {
 
         let context_items: Vec<CompletionItem> = {
             let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
+            let ruleset_guard = self.state.ruleset.read();
             let info_guard = self.state.info_service.read();
 
             if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
@@ -1600,12 +1652,20 @@ impl LanguageServer for Backend {
         }
 
         // Fallback: flat global list (original behavior) when context-aware
-        // matching produced nothing (no rules loaded, unrecognised path, etc.)
+        // matching produced nothing (no rules loaded, unrecognised path, or a
+        // context `descend_rules` can't reach, e.g. inside an alias-driven block
+        // like `check_variable = { … }`). On a large mod the workspace has tens
+        // of thousands of variables/targets/keys, so cap the dump and flag the
+        // result `is_incomplete` — the client re-requests as the user narrows.
+        const FALLBACK_CAP: usize = 2000;
         let mut items = Vec::new();
 
-        let ruleset = self.state.ruleset.lock();
+        let ruleset = self.state.ruleset.read();
         if let Some(rules) = ruleset.as_ref() {
             for t in &rules.types {
+                if items.len() >= FALLBACK_CAP {
+                    break;
+                }
                 items.push(CompletionItem {
                     label: t.name.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
@@ -1614,6 +1674,9 @@ impl LanguageServer for Backend {
                 });
             }
             for e in &rules.enums {
+                if items.len() >= FALLBACK_CAP {
+                    break;
+                }
                 items.push(CompletionItem {
                     label: e.key.clone(),
                     kind: Some(CompletionItemKind::ENUM),
@@ -1626,6 +1689,9 @@ impl LanguageServer for Backend {
 
         let info = self.state.info_service.read();
         for var in &info.all_variables {
+            if items.len() >= FALLBACK_CAP {
+                break;
+            }
             items.push(CompletionItem {
                 label: var.clone(),
                 kind: Some(CompletionItemKind::CONSTANT),
@@ -1634,6 +1700,9 @@ impl LanguageServer for Backend {
             });
         }
         for et in &info.all_event_targets {
+            if items.len() >= FALLBACK_CAP {
+                break;
+            }
             items.push(CompletionItem {
                 label: format!("event_target:{}", et),
                 kind: Some(CompletionItemKind::VARIABLE),
@@ -1642,7 +1711,13 @@ impl LanguageServer for Backend {
             });
         }
         for (file_uri, file_info) in &info.files {
+            if items.len() >= FALLBACK_CAP {
+                break;
+            }
             for (key, _loc) in &file_info.top_level_keys {
+                if items.len() >= FALLBACK_CAP {
+                    break;
+                }
                 items.push(CompletionItem {
                     label: key.clone(),
                     kind: Some(CompletionItemKind::KEYWORD),
@@ -1655,7 +1730,11 @@ impl LanguageServer for Backend {
         if items.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(CompletionResponse::Array(items)))
+            let is_incomplete = items.len() >= FALLBACK_CAP;
+            Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete,
+                items,
+            })))
         }
     }
 
@@ -1706,6 +1785,34 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Variable read: jump to where the variable is set.
+        if let Some(var_name) = self.var_ref_at_cursor(&uri, pos, &logical_path) {
+            let info = self.state.info_service.read();
+            let defs = info.find_variable_definitions(&var_name);
+            let locations: Vec<Location> = defs
+                .iter()
+                .map(|(file_uri, loc)| Location {
+                    uri: parse_uri(
+                        file_uri,
+                        &params.text_document_position_params.text_document.uri,
+                    ),
+                    range: Range {
+                        start: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: loc.col as u32,
+                        },
+                        end: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: loc.col as u32 + var_name.len() as u32,
+                        },
+                    },
+                })
+                .collect();
+            if !locations.is_empty() {
+                return Ok(Some(GotoDefinitionResponse::Array(locations)));
+            }
+        }
+
         // Fallback: heuristic symbol-based lookup
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri)
@@ -1718,7 +1825,6 @@ impl LanguageServer for Backend {
             )
         {
             let symbol = match &element {
-                PositionElement::Node { key } => key.clone(),
                 PositionElement::Leaf { key, .. } => key.clone(),
                 PositionElement::LeafValue { value } => value.clone(),
             };
@@ -1800,7 +1906,7 @@ impl LanguageServer for Backend {
             // 2. Use-sites: scan all docs for TypeField leaves with the same value.
             {
                 let docs = self.state.documents.lock();
-                let ruleset_guard = self.state.ruleset.lock();
+                let ruleset_guard = self.state.ruleset.read();
                 let ws_uri = self.state.workspace_uri.lock().clone();
                 if let Some(rs) = ruleset_guard.as_ref() {
                     let use_sites = scan_use_sites(
@@ -1849,7 +1955,6 @@ impl LanguageServer for Backend {
             )
         {
             let symbol = match &element {
-                PositionElement::Node { key } => key.clone(),
                 PositionElement::Leaf { key, .. } => key.clone(),
                 PositionElement::LeafValue { value } => value.clone(),
             };
@@ -2103,7 +2208,7 @@ impl LanguageServer for Backend {
 
         {
             let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
+            let ruleset_guard = self.state.ruleset.read();
             let ws_uri2 = self.state.workspace_uri.lock().clone();
             if let Some(rs) = ruleset_guard.as_ref() {
                 let use_sites = scan_use_sites(
@@ -2185,6 +2290,9 @@ impl LanguageServer for Backend {
                 }
                 Ok(Some(Value::Array(vec![])))
             }
+            "exportProfilingLog" => Ok(Some(Value::String(
+                cwtools_profiling::export_profiling_log(),
+            ))),
             _ => Ok(None),
         }
     }
@@ -2280,7 +2388,7 @@ impl Backend {
             match cache_dir {
                 Some(cd) => {
                     let language = self.state.language.lock().clone();
-                    let ruleset_snap = self.state.ruleset.lock().clone();
+                    let ruleset_snap = self.state.ruleset.read().clone();
                     let fp = match ruleset_snap {
                         Some(ref rs) => {
                             workspace_cache::settings_fingerprint(&language, rs, &root_path)
@@ -2462,12 +2570,12 @@ impl Backend {
         // (which borrows the ruleset) stays valid across the parallel section
         // without holding the ruleset mutex across rayon work.
         let scan_ruleset: Option<Arc<RuleSet>> = {
-            let ruleset_guard = self.state.ruleset.lock();
+            let ruleset_guard = self.state.ruleset.read();
             ruleset_guard.as_ref().map(|rs| Arc::new(rs.clone()))
         };
-        let scan_registry = scan_ruleset
-            .as_ref()
-            .map(|rs| build_scope_registry_arc(rs, scan_game));
+        // The scope registry is cached (built once at ruleset load); snapshot the
+        // `Arc` for the batch instead of rebuilding it for the whole scan.
+        let scan_registry = self.state.scope_registry.read().clone();
 
         // Validate every file in parallel, then publish serially. The
         // CPU-bound validation runs under a single shared `info_service` /
@@ -2480,7 +2588,7 @@ impl Backend {
             let loc_guard = self.state.loc_index.read();
             let type_index = &info_guard.type_index;
             let loc_index = loc_guard.as_ref();
-            let registry = scan_registry.as_ref().and_then(|r| r.as_ref());
+            let registry = scan_registry.as_ref();
             // Build enum_map once for the batch; it borrows `scan_ruleset`,
             // which is owned for the whole parallel section above.
             let enum_map = scan_ruleset.as_ref().map(|rs| build_enum_map(rs));
@@ -2711,7 +2819,7 @@ impl Backend {
         }
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(uri, &ws_uri);
-        let ruleset_guard = self.state.ruleset.lock();
+        let ruleset_guard = self.state.ruleset.read();
         let mut info = self.state.info_service.write();
         info.clear_file(uri);
         if let Some(ruleset) = ruleset_guard.as_ref() {
@@ -2917,19 +3025,17 @@ impl Backend {
             let language = self.state.language.lock().clone();
             cwtools_game::constants::Game::from_str(&language)
         };
-        // Validate every dependent synchronously, then publish. The scope
-        // registry + enum_map depend only on (ruleset, game) and are the
-        // expensive part of per-file setup, so build them ONCE for the whole
-        // sweep instead of per file (which `validate_parsed` would do). No
-        // await is held across the ruleset lock.
-        // Validate all dependents while holding ruleset, but do NOT lock
+        // The scope registry is cached (built once at ruleset load), so snapshot
+        // the `Arc` here instead of rebuilding it per sweep.
+        let registry = self.state.scope_registry.read().clone();
+        // Validate every dependent synchronously, then publish. The enum_map
+        // borrows the ruleset, so build it ONCE for the whole sweep (cheap, but
+        // pointless to repeat per file). No await is held across the ruleset lock.
+        // Validate all dependents while holding ruleset (read), but do NOT lock
         // documents inside this block (ABBA: request handlers take documents
         // then ruleset; we must take ruleset then nothing-or-documents-after).
         let validated: Vec<(String, i32, Vec<Diagnostic>)> = {
-            let ruleset_guard = self.state.ruleset.lock();
-            let registry = ruleset_guard
-                .as_ref()
-                .map(|rs| build_scope_registry_arc(rs, game));
+            let ruleset_guard = self.state.ruleset.read();
             let enum_map = ruleset_guard.as_ref().map(|rs| build_enum_map(rs));
             let mut out = Vec::with_capacity(others.len());
             for (uri, snapshot_version, ast) in others {
@@ -2954,7 +3060,7 @@ impl Backend {
                         &modifier_keys,
                         ruleset,
                         game,
-                        registry.as_ref().and_then(|r| r.as_ref()),
+                        registry.as_ref(),
                         enum_map,
                     ),
                     _ => ast.errors.iter().map(parse_error_to_diagnostic).collect(),
@@ -3032,7 +3138,7 @@ impl Backend {
 
                 // Update info service
                 {
-                    let ruleset_guard = self.state.ruleset.lock();
+                    let ruleset_guard = self.state.ruleset.read();
                     let mut info = self.state.info_service.write();
                     info.clear_file(uri);
                     if let Some(ruleset) = ruleset_guard.as_ref() {
@@ -3048,7 +3154,7 @@ impl Backend {
 
                 // Validation
                 let (errors, log_msg) = {
-                    let ruleset_guard = self.state.ruleset.lock();
+                    let ruleset_guard = self.state.ruleset.read();
                     if let Some(ruleset) = ruleset_guard.as_ref() {
                         let language = self.state.language.lock().clone();
                         let game = cwtools_game::constants::Game::from_str(&language);
@@ -3058,9 +3164,10 @@ impl Backend {
                         let type_index = &info_guard.type_index;
                         let modifier_keys = self.state.modifier_keys.read();
                         let loc_guard = self.state.loc_index.read();
-                        // Single-file path: build the per-run shared state once
-                        // for this one file.
-                        let registry = build_scope_registry_arc(ruleset, game);
+                        // Single-file path: the scope registry is cached (built
+                        // once at ruleset load); the enum_map borrows the ruleset
+                        // and is cheap, so build it inline.
+                        let registry = self.state.scope_registry.read().clone();
                         let enum_map = build_enum_map(ruleset);
                         let mut errs = validate_prepared(
                             &parsed,
@@ -3124,9 +3231,30 @@ impl Backend {
         }
     }
 
+    /// Install a freshly-loaded ruleset and rebuild the cached scope registry to
+    /// match it. The registry depends only on `(ruleset, game)`; building it here
+    /// (once per load) keeps it out of the per-file validation hot path. Holds
+    /// `ruleset.write()` across the `scope_registry.write()` so the two never
+    /// disagree; no other site takes both ruleset and scope_registry.
+    fn set_ruleset(&self, ruleset: RuleSet) {
+        let game = {
+            let language = self.state.language.lock().clone();
+            cwtools_game::constants::Game::from_str(&language)
+        };
+        let mut guard = self.state.ruleset.write();
+        let registry = build_scope_registry_arc(&ruleset, game);
+        *self.state.scope_registry.write() = registry;
+        // Cache the variable-defining effects so per-file indexing can collect
+        // value_set[variable] names (and values) for the CW246 / VariableGetField
+        // checks and for hover/goto.
+        let var_effects = cwtools_info::variable_defining_effects(&ruleset);
+        self.state.info_service.write().set_var_effects(var_effects);
+        *guard = Some(ruleset);
+    }
+
     /// Rebuild the cached modifier-key set from the current ruleset and type index.
     fn rebuild_modifier_keys(&self) {
-        let ruleset_guard = self.state.ruleset.lock();
+        let ruleset_guard = self.state.ruleset.read();
         let info_guard = self.state.info_service.read();
         let keys = match ruleset_guard.as_ref() {
             Some(rs) => build_modifier_keys(rs, &info_guard.type_index),
@@ -3165,7 +3293,7 @@ impl Backend {
         // ruleset shape) and to map definitions to their types when rebuilding.
         // Clone it out in its own statement so the parking_lot guard is dropped
         // before the `match` (guards aren't Send and the None arm awaits below).
-        let ruleset_opt = self.state.ruleset.lock().clone();
+        let ruleset_opt = self.state.ruleset.read().clone();
         let ruleset = match ruleset_opt {
             Some(rs) => rs,
             None => {
@@ -3466,10 +3594,6 @@ fn scan_ast_for_type_ref(
                     scan_ast_for_type_ref(ch, arena, search, out);
                 }
             }
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                scan_ast_for_type_ref(&node.children, arena, search, out);
-            }
             Child::LeafValue(idx) => {
                 let lv = &arena.leaf_values[*idx as usize];
                 let val = match &lv.value {
@@ -3560,15 +3684,6 @@ fn collect_doc_tokens(ast: &ParsedFile, table: &StringTable) -> HashSet<String> 
         push(leaf.key.lower, &mut tokens);
         if let Value::String(t) | Value::QString(t) = &leaf.value {
             push(t.lower, &mut tokens);
-        }
-    }
-    for node in &arena.nodes {
-        push(node.key.lower, &mut tokens);
-        if let Some(p) = &node.key_prefix {
-            push(p.lower, &mut tokens);
-        }
-        if let Some(p) = &node.value_prefix {
-            push(p.lower, &mut tokens);
         }
     }
     for lv in &arena.leaf_values {

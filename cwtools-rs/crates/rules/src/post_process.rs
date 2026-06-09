@@ -228,6 +228,10 @@ fn extract_leaf_left(rt: &RuleType) -> NewField {
 /// Expand `LeafRule(l, MarkerField(ColourField))` into a `NodeRule` with a
 /// single `LeafValueRule(Float(-256..256))` at cardinality 3..3.
 /// Also expand `IrCountryTag` into parallel enum + variable rules.
+/// Expand `colour_field` markers into a colour block rule (float -256..256,
+/// exactly 3 values). Distinct from the inline `colour[rgb]`/`colour[hsv]` RHS
+/// syntax handled at conversion time in `rules_converter::build_colour_rules`
+/// (different ranges by design, not a duplicate).
 fn replace_colour_field(ruleset: &mut RuleSet) {
     for root in ruleset.root_rules.iter_mut() {
         match root {

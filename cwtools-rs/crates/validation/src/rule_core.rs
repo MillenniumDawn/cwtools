@@ -321,103 +321,6 @@ fn validate_leaf_against_rule(
     }
 }
 
-/// As `validate_leaf_against_rule` but for a parser `Node` child.
-fn validate_node_against_rule(
-    ctx: &ValidationCtx,
-    node: &cwtools_parser::ast::Node,
-    key: &str,
-    rule_type: &RuleType,
-    opts: &Options,
-    scope_context: &mut Option<ScopeContext>,
-    errors: &mut Vec<ValidationError>,
-) {
-    // `key = ignore_field`: the block is accepted unvalidated.
-    if rule_left_is_ignore(rule_type) {
-        return;
-    }
-    if let Some(sc) = scope_context.as_ref()
-        && let Some(current) = sc.current()
-        && !opts.required_scopes.is_empty()
-        && !scope_matches_required(current, sc.registry.as_ref(), &opts.required_scopes)
-    {
-        // F# `ConfigRulesRuleWrongScope` (CW247); see the leaf site above.
-        let code = &error_codes::CW247_RULE_WRONG_SCOPE;
-        errors.push(ValidationError::from_code(
-            code,
-            ctx.file_path,
-            node.pos.start.line,
-            node.pos.start.col,
-            &[
-                key,
-                &get_scope_name(current, sc.registry.as_ref()),
-                &opts.required_scopes.join(" or "),
-            ],
-        ));
-    }
-    match rule_type {
-        RuleType::NodeRule {
-            left,
-            rules: inner_rules,
-            ..
-        } => {
-            if let NewField::AliasField(category) = left {
-                let node_pos = (node.pos.start.line, node.pos.start.col);
-                validate_alias_usage(
-                    ctx,
-                    category,
-                    key,
-                    None,
-                    Some(&node.children),
-                    node_pos,
-                    scope_context,
-                    errors,
-                );
-            } else {
-                let saved = scope_context.as_ref().map(|sc| sc.save());
-                if let Some(sc) = scope_context.as_mut() {
-                    enter_block_scope(sc, key, opts, ctx.game);
-                }
-                validate_children(
-                    ctx,
-                    &node.children,
-                    inner_rules,
-                    scope_context,
-                    (node.pos.start.line, node.pos.start.col),
-                    errors,
-                );
-                if let (Some(saved), Some(ref mut sc)) = (saved, scope_context.as_mut()) {
-                    sc.restore(saved);
-                }
-            }
-        }
-        RuleType::LeafRule { left, .. } => {
-            if let NewField::AliasField(category) = left {
-                let node_pos = (node.pos.start.line, node.pos.start.col);
-                validate_alias_usage(
-                    ctx,
-                    category,
-                    key,
-                    None,
-                    Some(&node.children),
-                    node_pos,
-                    scope_context,
-                    errors,
-                );
-            } else {
-                // LeafRule (scalar expected) but the child is a block — kind mismatch.
-                errors.push(ValidationError::from_code(
-                    &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE,
-                    ctx.file_path,
-                    node.pos.start.line,
-                    node.pos.start.col,
-                    &[key, "{...}"],
-                ));
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Run several candidate rules for one overloaded key as a disjunction: accept on
 /// the first clean match, otherwise surface the fewest-errors candidate. With a
 /// single candidate this is just a direct validation.
@@ -559,13 +462,6 @@ pub(crate) fn validate_children(
                     .unwrap_or_default();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
-            Child::Node(idx) => {
-                let node = &ast.arena.nodes[*idx as usize];
-                let key = table
-                    .with_string(node.key.normal, |s| unquote_key(s).to_lowercase())
-                    .unwrap_or_default();
-                *key_counts.entry(key).or_insert(0) += 1;
-            }
             Child::LeafValue(lvidx) => {
                 let lv = &ast.arena.leaf_values[*lvidx as usize];
                 // An anonymous `{ ... }` block parses as a clause-valued LeafValue;
@@ -685,47 +581,6 @@ pub(crate) fn validate_children(
                     );
                 }
             }
-            Child::Node(idx) => {
-                let node = &ast.arena.nodes[*idx as usize];
-                let key =
-                    unquote_key(&table.get_string(node.key.normal).unwrap_or_default()).to_string();
-                let candidates =
-                    matching_candidates(rules, &key, ruleset, type_index, rule_matches_node_key);
-                if candidates.is_empty() {
-                    // Item 5: dynamic modifier keys — accept known modifier block keys silently.
-                    // The modifier set is built lowercase; compare lowercase.
-                    let is_modifier = modifier_keys
-                        .map(|mk| mk.contains(key.to_lowercase().as_str()))
-                        .unwrap_or(false);
-                    if !is_modifier {
-                        errors.push(ValidationError::from_code(
-                            &error_codes::CW262_UNEXPECTED_PROPERTY_NODE,
-                            file_path,
-                            node.pos.start.line,
-                            node.pos.start.col,
-                            &[&format!("Unexpected block '{}'", key)],
-                        ));
-                    }
-                } else {
-                    let n = candidates.len();
-                    pick_best_candidate(
-                        |i, out| {
-                            let (rt, opts) = candidates[i];
-                            validate_node_against_rule(
-                                ctx,
-                                node,
-                                &key,
-                                rt,
-                                opts,
-                                scope_context,
-                                out,
-                            );
-                        },
-                        errors,
-                        n,
-                    );
-                }
-            }
             // Item 5: LeafValue validation
             Child::LeafValue(lvidx) => {
                 let lv = &ast.arena.leaf_values[*lvidx as usize];
@@ -762,6 +617,20 @@ pub(crate) fn validate_children(
                         if let RuleType::LeafValueRule { right } = rule_type
                             && field_matches_value(right, &lv.value, table, enum_map)
                         {
+                            // VariableGetField bare read: validate against the
+                            // project-wide variable index (CW246), mirroring the
+                            // Leaf path and F# checkVariableGetFieldNE.
+                            if let NewField::VariableGetField(_) = right {
+                                let raw = leaf_value_to_string(&lv.value, table);
+                                check_variable_get(
+                                    &raw,
+                                    type_index,
+                                    file_path,
+                                    lv.pos.start.line,
+                                    lv.pos.start.col,
+                                    errors,
+                                );
+                            }
                             matched = true;
                             break;
                         }
@@ -976,21 +845,6 @@ fn rule_matches_leaf_key(
     match rule_type {
         // Cross-kind fallback: a NodeRule can also match a leaf key (e.g. alias blocks)
         RuleType::LeafRule { left, .. } | RuleType::NodeRule { left, .. } => {
-            field_matches_key(left, key, ruleset, type_index)
-        }
-        _ => false,
-    }
-}
-
-fn rule_matches_node_key(
-    rule_type: &RuleType,
-    key: &str,
-    ruleset: &RuleSet,
-    type_index: Option<&cwtools_index::TypeIndex>,
-) -> bool {
-    match rule_type {
-        // Cross-kind fallback: a LeafRule can also match a node key
-        RuleType::NodeRule { left, .. } | RuleType::LeafRule { left, .. } => {
             field_matches_key(left, key, ruleset, type_index)
         }
         _ => false,
@@ -1487,6 +1341,51 @@ fn alias_mismatch_error(
     }
 }
 
+/// Check a `value[variable]` (VariableGetField) read against the project-wide
+/// variable index. Emits CW246 when the value names a variable that was never
+/// set. Mirrors F# `checkVariableGetField`: bypasses @-vars, inline math, and
+/// loc embeds (those resolve dynamically), and only fires when the index is
+/// populated AND the variable checks are enabled.
+fn check_variable_get(
+    raw: &str,
+    type_index: Option<&cwtools_index::TypeIndex>,
+    file_path: &str,
+    line: u32,
+    col: u16,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !var_checks_enabled() {
+        return;
+    }
+    let v = raw.trim_matches('"').trim();
+    // Dynamic / non-variable forms that resolve at runtime are accepted.
+    if v.is_empty()
+        || v.starts_with('@')
+        || v.starts_with('[')
+        || v.contains("$$")
+        || v.contains(':')
+    {
+        return;
+    }
+    // Strip a `?`/`^` default-value selector before the lookup.
+    let core = v.split(['?', '^']).next().unwrap_or(v).trim();
+    if core.is_empty() {
+        return;
+    }
+    if let Some(idx) = type_index
+        && !idx.var_index.is_empty()
+        && !idx.var_index.contains(core)
+    {
+        errors.push(ValidationError::from_code(
+            &error_codes::CW246_UNSET_VARIABLE,
+            file_path,
+            line,
+            col,
+            &[core],
+        ));
+    }
+}
+
 fn validate_leaf(
     ctx: &ValidationCtx,
     leaf: &cwtools_parser::ast::Leaf,
@@ -1700,6 +1599,23 @@ fn validate_leaf(
                     }
                 }
             }
+            return;
+        }
+
+        // VariableGetField (rules `value[variable]`): a bare read of a defined
+        // variable. Mirrors F# `checkVariableGetField` — the value must name a
+        // variable that was set somewhere. Gated like CW246 (needs a complete
+        // variable index) so empty-index setups don't false-positive.
+        if let NewField::VariableGetField(_) = right {
+            let raw = leaf_value_to_string(&leaf.value, table);
+            check_variable_get(
+                &raw,
+                type_index,
+                file_path,
+                leaf.pos.start.line,
+                leaf.pos.start.col,
+                errors,
+            );
             return;
         }
 

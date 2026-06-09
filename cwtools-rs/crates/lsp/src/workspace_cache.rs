@@ -22,7 +22,8 @@ use cwtools_string_table::string_table::StringTable;
 /// to a stable FNV-1a. The version is folded into the fingerprint, so old
 /// SipHash-keyed cache directories no longer match and are treated as a miss
 /// (one-time cold rebuild).
-const CACHE_VERSION: u32 = 2;
+/// v3: dropped `CachedNode`/`CachedChild::Node` from the `CachedFile` layout.
+const CACHE_VERSION: u32 = 3;
 
 // ── Fingerprinting ──────────────────────────────────────────────────────────
 

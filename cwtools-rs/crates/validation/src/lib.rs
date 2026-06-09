@@ -55,14 +55,6 @@ fn validate_wrapper_grandchildren(
     for grandchild in grandchildren {
         // Pull the grandchild's key, body, and position uniformly for Node and Leaf-clause.
         let (gc_key, gc_children, gc_pos): (String, &[Child], (u32, u16)) = match grandchild {
-            Child::Node(gc_idx) => {
-                let gc_node = &ast.arena.nodes[*gc_idx as usize];
-                (
-                    table.get_string(gc_node.key.normal).unwrap_or_default(),
-                    gc_node.children.as_slice(),
-                    (gc_node.pos.start.line, gc_node.pos.start.col),
-                )
-            }
             Child::Leaf(gc_idx) => {
                 let gc_leaf = &ast.arena.leaves[*gc_idx as usize];
                 let pos = (gc_leaf.pos.start.line, gc_leaf.pos.start.col);
@@ -354,13 +346,6 @@ pub fn validate_prepared(
     for child in &ast.root_children {
         // 1. Try exact root key match (e.g. ai_strategy_plan = { ... })
         let exact_match = match child {
-            Child::Node(node_idx) => {
-                let node = &ast.arena.nodes[*node_idx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
-                let pos = (node.pos.start.line, node.pos.start.col);
-                find_type_and_rules_for_file(&key, file_path, ruleset)
-                    .map(|(td, rules)| (key.clone(), td, node.children.as_slice(), rules, pos))
-            }
             Child::Leaf(leaf_idx) => {
                 let leaf = &ast.arena.leaves[*leaf_idx as usize];
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
@@ -431,9 +416,6 @@ pub fn validate_prepared(
         // relationship (e.g. `pdxmesh { skip_root_key = objectTypes }` should
         // win over `light { path = gfx/entities }` for an objectTypes node).
         let child_root_key = match child {
-            Child::Node(node_idx) => table
-                .get_string(ast.arena.nodes[*node_idx as usize].key.normal)
-                .unwrap_or_default(),
             Child::Leaf(leaf_idx) => table
                 .get_string(ast.arena.leaves[*leaf_idx as usize].key.normal)
                 .unwrap_or_default(),
@@ -462,7 +444,6 @@ pub fn validate_prepared(
             // its children are the content, not a wrapper layer to skip.
             if should_skip_root_key(&child_root_key, type_def) {
                 let grandchildren: &[Child] = match child {
-                    Child::Node(node_idx) => &ast.arena.nodes[*node_idx as usize].children,
                     Child::Leaf(leaf_idx) => {
                         let leaf = &ast.arena.leaves[*leaf_idx as usize];
                         if let Value::Clause(ref ch) = leaf.value {
@@ -497,36 +478,20 @@ pub fn validate_prepared(
             }
 
             // No skip_root_key — validate the root node itself normally
-            match child {
-                Child::Node(node_idx) => {
-                    let node = &ast.arena.nodes[*node_idx as usize];
+            if let Child::Leaf(leaf_idx) = child {
+                let leaf = &ast.arena.leaves[*leaf_idx as usize];
+                if let Value::Clause(children) = &leaf.value {
                     validate_with_type(
                         &ctx,
                         type_def,
-                        node.children.as_slice(),
+                        children.as_slice(),
                         inner_rules,
                         &mut scope_context,
                         Some(&child_root_key),
-                        (node.pos.start.line, node.pos.start.col),
+                        (leaf.pos.start.line, leaf.pos.start.col),
                         &mut errors,
                     );
                 }
-                Child::Leaf(leaf_idx) => {
-                    let leaf = &ast.arena.leaves[*leaf_idx as usize];
-                    if let Value::Clause(children) = &leaf.value {
-                        validate_with_type(
-                            &ctx,
-                            type_def,
-                            children.as_slice(),
-                            inner_rules,
-                            &mut scope_context,
-                            Some(&child_root_key),
-                            (leaf.pos.start.line, leaf.pos.start.col),
-                            &mut errors,
-                        );
-                    }
-                }
-                _ => {}
             }
         }
     }

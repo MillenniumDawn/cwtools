@@ -45,34 +45,11 @@ pub struct RuleSet {
     pub type_rules_idx: std::collections::HashMap<String, usize>,
 }
 
-/// A scope definition parsed from `scopes.cwt` (`Country = { aliases = { country } }`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScopeInput {
-    /// The formal scope name (the block key), e.g. `Country`, `Special Project`.
-    pub name: String,
-    /// Alternative names (`aliases = { country }`); the first is the canonical short form.
-    pub aliases: Vec<String>,
-    /// Parent scopes (`is_subscope_of = { country }`), for hierarchical matching.
-    pub is_subscope_of: Vec<String>,
-}
-
-/// A scope/event-target link parsed from `links.cwt`. Mirrors the fields the F#
-/// engine reads (`UtilityParser.parseLink`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct LinkInput {
-    /// Link name / key (e.g. `owner`, `state`, `var`).
-    pub name: String,
-    /// Resulting scope name (`output_scope = country`); `None` = any.
-    pub output_scope: Option<String>,
-    /// Scopes the link is valid in (`input_scopes`); empty = any.
-    pub input_scopes: Vec<String>,
-    /// Data prefix for parameterised links (`prefix = var:` / `sp:` / `event_target:`).
-    pub prefix: Option<String>,
-    /// `from_data = yes` — the link takes a data argument (state id, tag, value, …).
-    pub from_data: bool,
-    /// `data_source` entries (`<state>`, `enum[country_tags]`, `value[variable]`), may repeat.
-    pub data_source: Vec<String>,
-}
+/// Scope/link config inputs (`scopes.cwt` / `links.cwt`). The types live in the
+/// game crate next to `ScopeRegistry::from_config` (the scope graph's single
+/// source of truth); re-exported here because the converter produces them and
+/// `RuleSet` carries them.
+pub use cwtools_game::scope_registry::{LinkInput, ScopeInput};
 
 /// Per-category alias index entry (see `RuleSet::alias_categories`).
 #[derive(Debug, Clone, PartialEq, Default)]

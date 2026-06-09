@@ -30,19 +30,11 @@ impl Block<'_> {
     }
 }
 
-/// Normalise a `key = { ... }` child (Node or Leaf-with-Clause) into a [`Block`].
-/// Returns `None` for leaves whose value isn't a clause, and for comments / bare
-/// values.
+/// Normalise a `key = { ... }` child (a Leaf with a Clause value) into a
+/// [`Block`]. Returns `None` for leaves whose value isn't a clause, and for
+/// comments / bare values.
 pub(crate) fn as_block<'a>(child: &Child, ast: &'a ParsedFile) -> Option<Block<'a>> {
     match child {
-        Child::Node(idx) => {
-            let n = &ast.arena.nodes[*idx as usize];
-            Some(Block {
-                key: n.key.normal,
-                children: &n.children,
-                range: n.pos,
-            })
-        }
         Child::Leaf(idx) => {
             let l = &ast.arena.leaves[*idx as usize];
             if let Value::Clause(children) = &l.value {
@@ -71,11 +63,6 @@ pub fn validate_common(
 
     for child in &ast.root_children {
         let (key, line, col) = match child {
-            Child::Node(idx) => {
-                let node = &ast.arena.nodes[*idx as usize];
-                let k = table.get_string(node.key.normal).unwrap_or_default();
-                (k, node.pos.start.line, node.pos.start.col)
-            }
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
                 let k = table.get_string(leaf.key.normal).unwrap_or_default();

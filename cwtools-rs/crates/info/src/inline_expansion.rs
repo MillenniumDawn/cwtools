@@ -3,7 +3,7 @@
 // and obscures the recursion.
 #![allow(clippy::too_many_arguments)]
 
-use cwtools_parser::ast::{Arena, Child, Leaf, Node, ParsedFile, Value};
+use cwtools_parser::ast::{Arena, Child, Leaf, ParsedFile, Value};
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
 use std::collections::HashMap;
@@ -291,30 +291,6 @@ fn clone_and_expand_child_r(
             let new_idx = dst_arena.leaves.len() as u32;
             dst_arena.leaves.push(new_leaf);
             Ok(Child::Leaf(new_idx))
-        }
-        Child::Node(idx) => {
-            let node = &src_arena.nodes[*idx as usize];
-            let new_key = clone_tokens(&node.key, src_table, dst_table, params);
-            let new_children = clone_and_expand_children(
-                &node.children,
-                src_arena,
-                src_table,
-                dst_arena,
-                dst_table,
-                params,
-                registry,
-                call_stack,
-            )?;
-            let new_node = Node {
-                key: new_key,
-                children: new_children,
-                pos: node.pos,
-                key_prefix: None,
-                value_prefix: None,
-            };
-            let new_idx = dst_arena.nodes.len() as u32;
-            dst_arena.nodes.push(new_node);
-            Ok(Child::Node(new_idx))
         }
         Child::Comment(idx) => {
             let c = &src_arena.comments[*idx as usize];

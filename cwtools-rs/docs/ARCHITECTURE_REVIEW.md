@@ -1,8 +1,9 @@
 # cwtools-rs architecture review
 
 Read-only structural review of the Rust workspace. Scope: crate boundaries,
-duplication, god-modules, layering, and a low-risk refactor roadmap. Functional/
-correctness leads are parked in `ARCHITECTURE_BUGS.md`.
+duplication, god-modules, layering, and a low-risk refactor roadmap. The
+functional/correctness leads were parked in `ARCHITECTURE_BUGS.md`; every item
+there was fixed and the file deleted (2026-06-09).
 
 ## Status (fix/cleanup branch)
 
@@ -15,20 +16,36 @@ by diffing the MD diagnostic-hash set against committed HEAD on identical inputs
   routed through file_manager. (`Game::from_engine`, `build_modifier_keys`.)
 - Phase 2: shared `file_manager::walk_workspace_files`; LSP uses it.
 - Phase 3: `cwtools_index` extracted; `validation->info` inversion fixed.
-- Phase 4: `validation/lib.rs` split into 8 modules + `ValidationCtx` (9/11
-  too_many_arguments retired).
-- Phase 5: `cwtools_driver` (`Session`) extracted; CLI ported onto it; LSP
-  vanilla indexer unified onto it.
-- rules_converter monolith split into submodules (recommendation 5).
-- Approved behavior-changing fixes applied (see `ARCHITECTURE_BUGS.md`): all are
-  0-diff on the MD/HOI4 corpus (they tighten latent leniencies HOI4 doesn't trip)
-  and carry unit tests where the corpus can't exercise them.
+- Phase 4: `validation/lib.rs` split into 8 modules + `ValidationCtx`.
+- Phase 4.5: `ScopeRegistry::from_config` moved into `game` (with
+  `ScopeInput`/`LinkInput`; `rules` re-exports them). One scope-graph source.
+- Phase 5 (half): `cwtools_driver` (`Session`) extracted; CLI ported onto it;
+  LSP vanilla indexer unified onto it.
+- rules_converter monolith split into submodules (recommendation 5). The colour
+  logic in `rules_converter::build_colour_rules` vs `post_process` turned out to
+  be two DIFFERENT .cwt constructs (inline `colour[rgb|hsv]` vs the
+  `colour_field` marker, different ranges by design) — cross-referenced in
+  comments, not merged.
+- Path resolver collapsed onto `cwtools_index` (`path_contains_segment` +
+  `dir_matches_pattern`), shared by indexer and validator.
+- The dual clause representation is GONE: `Child::Node`/`Node`/`Arena.nodes`
+  deleted from the AST and cache format (cache versions bumped). A keyed clause
+  is exactly one shape, `Leaf` + `Value::Clause`; `Arena::keyed_clause` is the
+  normalized accessor. The audit that motivated this found the live parser
+  never produced `Node` — every Node-only walker was dead code, four of which
+  were real bugs (symbol index, value_set collection, Stellaris `always = no`,
+  subtype localisation/modifiers loading) and are fixed.
+- Approved behavior-changing fixes applied: all 0-diff on the MD/HOI4 corpus
+  (they tighten latent leniencies HOI4 doesn't trip) and carry unit tests where
+  the corpus can't exercise them.
 
-Still open (deferred, lower value / needs a decision): relocating
-`build_scope_registry` into `game` (recommendation 3 — the backfill fix was done
-in place instead); collapsing validation's `path_contains_segment` onto the
-shared `cwtools_index` resolver; the `localization` `validate_quotes` fork (two
-different quote rules — needs a behavior decision, not a mechanical dedup).
+Still open — the LAST roadmap item: port the LSP's engine state onto
+`cwtools_driver::Session` (Phase 5, second half; problem 5 below). `Session` is
+batch-oriented today; the LSP's incremental paths (per-file re-parse and
+re-index, debounced revalidation, loc-index refresh) need mutation APIs on
+`Session` (update_file/remove_file) before `DocumentState` can shrink to
+transport-only fields wrapping one `Session`. Multi-day; needs the corpus guard
+plus LSP integration tests.
 
 End goal context: the Rust side is meant to replace the F# binary entirely, so
 both entry points (CLI and LSP) must drive the same core and agree on results.
@@ -115,7 +132,7 @@ Concrete duplication this produces:
 - Glob matching in two (`file_manager::glob_match` vs `lsp::lsp_glob_match`).
 
 Impact: every behavior change (a new check, a new game, a new ignore rule) has to be
-made twice and the two copies drift (see `ARCHITECTURE_BUGS.md`). This is the single
+made twice and the two copies drift (see the deleted `ARCHITECTURE_BUGS.md`, all fixed). This is the single
 biggest barrier to "delete the F# binary": the Rust CLI and LSP don't even agree
 with each other yet.
 
@@ -163,8 +180,8 @@ The stronger argument for the extraction is correctness, not purity: `info` and
 `find_type_by_path_and_key`/`type_path_matches`/`should_skip_root_key`). The
 `info/src/lib.rs:270-277` comment concedes they MUST stay in sync so a file is indexed
 by the same type that validates it. Pulling these resolvers down into the shared index
-crate so both sides call one copy removes a phantom-diagnostic drift hazard (see
-`ARCHITECTURE_BUGS.md`).
+crate so both sides call one copy removes a phantom-diagnostic drift hazard
+(done; see Status).
 
 ### 4. Three rules/game monoliths: `rules_converter.rs` (2322), `scope_engine.rs` (2142), `post_process.rs` (801).
 
@@ -190,7 +207,7 @@ per-game link tables (`load_stellaris_links:557`, `load_eu4_links:917`,
 `load_ck2_links:1082`, `load_ck3_links:1290`, `load_vic2_links:1482`,
 `load_ir_links:1596`) that `ScopeRegistry::from_hardcoded` (`scope_registry.rs:92-111`)
 consumes. It is the hardcoded half of the scope-graph dual source of truth (see
-problem 3-adjacent note and `ARCHITECTURE_BUGS.md`): HOI4's scope/link knowledge lives
+problem 3-adjacent note): HOI4's scope/link knowledge lives
 in `.cwt` config, every other game's lives hardcoded here.
 
 ### 5. `lsp/main.rs` is 4295 LOC mixing transport, driver, and feature logic.
@@ -210,7 +227,7 @@ one concrete fix is making the read-mostly `ruleset` a `RwLock` instead of `Mute
 
 ## Duplication / dead-code findings
 
-Duplication is itemized in problems 1, 2, 4 above and in `ARCHITECTURE_BUGS.md`.
+Duplication is itemized in problems 1, 2, 4 above (all collapsed; see Status).
 Summary of the concrete copies to collapse:
 
 - Game->loc-Game mapping x3 (identical today, no live drift, but no shared source).

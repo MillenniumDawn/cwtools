@@ -317,7 +317,6 @@ fn main() {
                     Ok(parsed) => {
                         println!("Parsed: {}", file.display());
                         println!("  Logical path:  {}", parsed.logical_path);
-                        println!("  Nodes:         {}", parsed.arena.nodes.len());
                         println!("  Leaves:        {}", parsed.arena.leaves.len());
                         println!("  Values:        {}", parsed.arena.leaf_values.len());
                         println!("  Clauses:       {}", parsed.arena.value_clauses.len());
@@ -343,10 +342,9 @@ fn main() {
                     );
                     for f in files {
                         println!(
-                            "  {} [{}] — nodes: {}, leaves: {}",
+                            "  {} [{}] — leaves: {}",
                             f.logical_path,
                             f.path.display(),
-                            f.arena.nodes.len(),
                             f.arena.leaves.len()
                         );
                     }
@@ -391,7 +389,6 @@ fn main() {
                 let table = StringTable::new();
                 let (arena, root) = cwtools_cache::convert::cached_to_arena(&loaded, &table);
                 println!("Deserialized from {}", input.display());
-                println!("  Nodes:    {}", arena.nodes.len());
                 println!("  Leaves:   {}", arena.leaves.len());
                 println!("  Values:   {}", arena.leaf_values.len());
                 println!("  Clauses:  {}", arena.value_clauses.len());
@@ -674,17 +671,15 @@ fn main() {
                     mib(st.map_key_bytes),
                     mib(st.metadata_bytes),
                 );
-                let (mut nodes, mut leaves, mut values, mut clauses) = (0usize, 0, 0, 0);
+                let (mut leaves, mut values, mut clauses) = (0usize, 0, 0);
                 for src in parsed {
-                    nodes += src.parsed.arena.nodes.len();
                     leaves += src.parsed.arena.leaves.len();
                     values += src.parsed.arena.leaf_values.len();
                     clauses += src.parsed.arena.value_clauses.len();
                 }
                 let type_instances: usize = type_index.map.values().map(|v| v.len()).sum();
                 eprintln!(
-                    "  [profile]   arenas: {} nodes, {} leaves, {} values, {} clauses across {} files",
-                    nodes,
+                    "  [profile]   arenas: {} leaves, {} values, {} clauses across {} files",
                     leaves,
                     values,
                     clauses,

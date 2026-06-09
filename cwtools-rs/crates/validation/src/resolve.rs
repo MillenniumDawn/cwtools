@@ -1,9 +1,8 @@
 //! Type/path resolution: pick which `TypeDefinition` (and its rules) a root key
 //! or file path resolves to.
 
+use cwtools_index::dir_matches_pattern;
 use cwtools_rules::rules_types::*;
-
-use crate::common::path_contains_segment;
 
 /// Check if `key` is a level-1 skip_root_key wrapper for this type.
 ///
@@ -185,11 +184,7 @@ pub(crate) fn find_type_by_path_and_key<'a>(
             // path_strict: the file must be DIRECTLY in this directory (so
             // `path_strict` type[unit] at common/units does NOT swallow files in
             // common/units/names/). Otherwise it may be in a subdirectory.
-            let matches = if t.path_options.path_strict {
-                dir == p_lower || dir.ends_with(&format!("/{}", p_lower))
-            } else {
-                path_contains_segment(dir, p_lower)
-            };
+            let matches = dir_matches_pattern(dir, p_lower, t.path_options.path_strict);
             // A path_file match is more specific than any bare directory match.
             // A skip_root_key match for the current root key gets a large bonus
             // so that e.g. `type[pdxmesh] { skip_root_key = objectTypes }` beats
@@ -243,13 +238,10 @@ pub(crate) fn type_path_matches(file_path: &str, t: &TypeDefinition) -> bool {
     {
         return false;
     }
-    t.path_options.paths_lower.iter().any(|p_lower| {
-        if t.path_options.path_strict {
-            dir == p_lower || dir.ends_with(&format!("/{}", p_lower))
-        } else {
-            path_contains_segment(dir, p_lower)
-        }
-    })
+    t.path_options
+        .paths_lower
+        .iter()
+        .any(|p_lower| dir_matches_pattern(dir, p_lower, t.path_options.path_strict))
 }
 
 /// Resolve which type a `skip_root_key` wrapper's grandchild belongs to, by the

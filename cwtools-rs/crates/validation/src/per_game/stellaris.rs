@@ -14,34 +14,24 @@ pub fn validate_stellaris(
     errors: &mut Vec<ValidationError>,
 ) {
     for child in &ast.root_children {
-        match child {
-            Child::Node(idx) => {
-                let node = &ast.arena.nodes[*idx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
-                match key.as_str() {
-                    k if k.ends_with("_event") || k == "event" => validate_event(
-                        &node.children,
-                        node.pos.start.line,
-                        ast,
-                        table,
-                        file_path,
-                        errors,
-                    ),
-                    "ship_size" => validate_ship_size(node, ast, table, file_path, errors),
-                    "technology" => validate_technology(node, ast, table, file_path, errors),
-                    _ => {}
-                }
-            }
-            Child::Leaf(idx) => {
-                let leaf = &ast.arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                if (key.ends_with("_event") || key == "event")
-                    && let Value::Clause(children) = &leaf.value
-                {
-                    validate_event(children, leaf.pos.start.line, ast, table, file_path, errors);
-                }
-            }
-            Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => {}
+        // as_block normalizes the two keyed-clause shapes (live-parse Leaf+Clause
+        // and legacy-cache Node), so dispatch fires for both.
+        let Some(block) = as_block(child, ast) else {
+            continue;
+        };
+        let key = block.key_string(table);
+        match key.as_str() {
+            k if k.ends_with("_event") || k == "event" => validate_event(
+                block.children,
+                block.range.start.line,
+                ast,
+                table,
+                file_path,
+                errors,
+            ),
+            "ship_size" => validate_ship_size(block.children, ast, table, file_path, errors),
+            "technology" => validate_technology(block.children, ast, table, file_path, errors),
+            _ => {}
         }
     }
 
@@ -61,11 +51,6 @@ fn child_keys(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<
     children
         .iter()
         .filter_map(|c| match c {
-            Child::Node(idx) => Some(
-                table
-                    .get_string(ast.arena.nodes[*idx as usize].key.normal)
-                    .unwrap_or_default(),
-            ),
             Child::Leaf(idx) => Some(
                 table
                     .get_string(ast.arena.leaves[*idx as usize].key.normal)
@@ -230,7 +215,6 @@ fn validate_event(
             continue;
         }
         let trigger_children = match child {
-            Child::Node(idx) => &ast.arena.nodes[*idx as usize].children,
             Child::Leaf(idx) => {
                 if let Value::Clause(c) = &ast.arena.leaves[*idx as usize].value {
                     c.as_slice()
@@ -244,9 +228,6 @@ fn validate_event(
             let key = match tc {
                 Child::Leaf(idx) => table
                     .get_string(ast.arena.leaves[*idx as usize].key.normal)
-                    .unwrap_or_default(),
-                Child::Node(idx) => table
-                    .get_string(ast.arena.nodes[*idx as usize].key.normal)
                     .unwrap_or_default(),
                 _ => continue,
             };
@@ -270,7 +251,7 @@ fn validate_event(
 // ── Ship Size Validation ───────────────────────────────
 
 fn validate_ship_size(
-    _node: &cwtools_parser::ast::Node,
+    _children: &[Child],
     _ast: &ParsedFile,
     _table: &StringTable,
     _file_path: &str,
@@ -282,7 +263,7 @@ fn validate_ship_size(
 // ── Technology Validation ──────────────────────────────
 
 fn validate_technology(
-    _node: &cwtools_parser::ast::Node,
+    _children: &[Child],
     _ast: &ParsedFile,
     _table: &StringTable,
     _file_path: &str,
@@ -299,10 +280,6 @@ fn child_key_eq(child: &Child, ast: &ParsedFile, table: &StringTable, expected: 
             let leaf = &ast.arena.leaves[*idx as usize];
             table.get_string(leaf.key.normal).unwrap_or_default() == expected
         }
-        Child::Node(idx) => {
-            let node = &ast.arena.nodes[*idx as usize];
-            table.get_string(node.key.normal).unwrap_or_default() == expected
-        }
         _ => false,
     }
 }
@@ -310,21 +287,19 @@ fn child_key_eq(child: &Child, ast: &ParsedFile, table: &StringTable, expected: 
 fn child_line(child: &Child, ast: &ParsedFile) -> u32 {
     match child {
         Child::Leaf(idx) => ast.arena.leaves[*idx as usize].pos.start.line,
-        Child::Node(idx) => ast.arena.nodes[*idx as usize].pos.start.line,
         _ => 0,
     }
 }
 
 fn child_has_always_no(child: &Child, ast: &ParsedFile, table: &StringTable) -> bool {
-    match child {
-        Child::Node(idx) => {
-            let node = &ast.arena.nodes[*idx as usize];
-            node.children.iter().any(|c| {
-                child_key_eq(c, ast, table, "always") && child_is_bool(c, ast, table, false)
-            })
-        }
-        _ => false,
-    }
+    // `trigger = { always = no }` is a Leaf+Clause from the live parser (a Node
+    // only from legacy cache shapes); as_block normalizes both.
+    as_block(child, ast).is_some_and(|block| {
+        block
+            .children
+            .iter()
+            .any(|c| child_key_eq(c, ast, table, "always") && child_is_bool(c, ast, table, false))
+    })
 }
 
 fn child_is_bool(child: &Child, ast: &ParsedFile, table: &StringTable, expected: bool) -> bool {
@@ -373,34 +348,15 @@ pub fn check_key_and_desc(
     };
 
     for child in &ast.root_children {
-        match child {
-            Child::Node(idx) => {
-                let node = &ast.arena.nodes[*idx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
-                if !node_key_filter.is_empty() && !node_key_filter.contains(&key.as_str()) {
-                    continue;
-                }
-                // The node key itself is the type instance name.
-                let instance_name = key.clone();
-                check_loc_key_pair(
-                    &instance_name,
-                    node.pos.start.line,
-                    loc_keys,
-                    file_path,
-                    errors,
-                );
+        if let Child::Leaf(idx) = child {
+            let leaf = &ast.arena.leaves[*idx as usize];
+            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            if !node_key_filter.is_empty() && !node_key_filter.contains(&key.as_str()) {
+                continue;
             }
-            Child::Leaf(idx) => {
-                let leaf = &ast.arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                if !node_key_filter.is_empty() && !node_key_filter.contains(&key.as_str()) {
-                    continue;
-                }
-                if let Value::Clause(_) = &leaf.value {
-                    check_loc_key_pair(&key, leaf.pos.start.line, loc_keys, file_path, errors);
-                }
+            if let Value::Clause(_) = &leaf.value {
+                check_loc_key_pair(&key, leaf.pos.start.line, loc_keys, file_path, errors);
             }
-            _ => {}
         }
     }
 }

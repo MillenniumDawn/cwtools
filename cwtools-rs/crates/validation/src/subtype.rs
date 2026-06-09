@@ -105,20 +105,6 @@ pub(crate) fn subtype_rules_match(
                             (false, None, None)
                         }
                     }
-                    Child::Node(idx) => {
-                        let node = &ast.arena.nodes[*idx as usize];
-                        if table
-                            .with_string(node.key.normal, |s| {
-                                crate::common::unquote_key(s)
-                                    .eq_ignore_ascii_case(crate::common::unquote_key(k))
-                            })
-                            .unwrap_or(false)
-                        {
-                            (true, None, Some(node.children.as_slice()))
-                        } else {
-                            (false, None, None)
-                        }
-                    }
                     _ => (false, None, None),
                 };
             if !matches_key {

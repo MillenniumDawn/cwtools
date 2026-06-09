@@ -38,35 +38,55 @@ impl SymbolIndex {
     }
 
     fn index_child(&mut self, uri: &str, child: &Child, arena: &Arena, table: &StringTable) {
-        match child {
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
-                // Heuristic: top-level nodes in game files are often definitions
-                if self.looks_like_definition(&key) {
-                    self.reverse
-                        .entry(uri.to_string())
-                        .or_default()
-                        .insert(key.clone());
-                    self.definitions
-                        .entry(key.clone())
-                        .or_default()
-                        .push(SymbolLocation {
-                            uri: uri.to_string(),
-                            line: node.pos.start.line,
-                            col: node.pos.start.col,
-                        });
-                }
-                for c in &node.children {
-                    self.index_child(uri, c, arena, table);
-                }
+        // A keyed clause (`key = { ... }`) is a Leaf+Clause from the live parser
+        // (a Node only from legacy cache shapes); keyed_clause normalizes both so
+        // definitions are recorded and the subtree is walked for either shape.
+        if let Some(kc) = arena.keyed_clause(child) {
+            let key = table.get_string(kc.key.normal).unwrap_or_default();
+            // Heuristic: nodes keyed like plain identifiers are often definitions
+            if self.looks_like_definition(&key) {
+                self.reverse
+                    .entry(uri.to_string())
+                    .or_default()
+                    .insert(key.clone());
+                self.definitions
+                    .entry(key.clone())
+                    .or_default()
+                    .push(SymbolLocation {
+                        uri: uri.to_string(),
+                        line: kc.pos.start.line,
+                        col: kc.pos.start.col,
+                    });
             }
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                // Check if key references a known type: <type> syntax
-                if key.starts_with('<') && key.ends_with('>') {
-                    let inner = &key[1..key.len() - 1];
+            for c in kc.children {
+                self.index_child(uri, c, arena, table);
+            }
+            return;
+        }
+        if let Child::Leaf(idx) = child {
+            let leaf = &arena.leaves[*idx as usize];
+            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            // Check if key references a known type: <type> syntax
+            if key.starts_with('<') && key.ends_with('>') {
+                let inner = &key[1..key.len() - 1];
+                self.reverse
+                    .entry(uri.to_string())
+                    .or_default()
+                    .insert(inner.to_string());
+                self.references
+                    .entry(inner.to_string())
+                    .or_default()
+                    .push(SymbolLocation {
+                        uri: uri.to_string(),
+                        line: leaf.pos.start.line,
+                        col: leaf.pos.start.col,
+                    });
+            }
+            // Check value for type references
+            if let Value::String(t) | Value::QString(t) = &leaf.value {
+                let value = table.get_string(t.normal).unwrap_or_default();
+                if value.starts_with('<') && value.ends_with('>') {
+                    let inner = &value[1..value.len() - 1];
                     self.reverse
                         .entry(uri.to_string())
                         .or_default()
@@ -80,26 +100,7 @@ impl SymbolIndex {
                             col: leaf.pos.start.col,
                         });
                 }
-                // Check value for type references
-                if let Value::String(t) | Value::QString(t) = &leaf.value {
-                    let value = table.get_string(t.normal).unwrap_or_default();
-                    if value.starts_with('<') && value.ends_with('>') {
-                        let inner = &value[1..value.len() - 1];
-                        self.reverse
-                            .entry(uri.to_string())
-                            .or_default()
-                            .insert(inner.to_string());
-                        self.references.entry(inner.to_string()).or_default().push(
-                            SymbolLocation {
-                                uri: uri.to_string(),
-                                line: leaf.pos.start.line,
-                                col: leaf.pos.start.col,
-                            },
-                        );
-                    }
-                }
             }
-            _ => {}
         }
     }
 
@@ -190,5 +191,29 @@ mod tests {
 
         // Clearing a URI that was never indexed is a no-op (not a panic)
         idx.clear_document("file:///never_seen.txt");
+    }
+
+    /// The live parser stores `key = { ... }` as a Leaf with a Clause value (not
+    /// a Node), so definitions must be recorded — and the subtree walked — for
+    /// that shape too.
+    #[test]
+    fn test_leaf_clause_definitions_indexed() {
+        let table = StringTable::new();
+        let src = "my_focus = {\n cost = 10\n nested = { other_field = <my_type> }\n}\n";
+        let parsed = parse_string(src, &table).expect("parse");
+
+        let mut idx = SymbolIndex::new();
+        idx.index_document("file:///b.txt", &parsed, &table);
+
+        assert!(
+            idx.definitions.contains_key("my_focus"),
+            "top-level Leaf+Clause should be recorded as a definition, got: {:?}",
+            idx.definitions.keys().collect::<Vec<_>>()
+        );
+        // The walk must descend through nested clauses to find references.
+        assert!(
+            idx.references.contains_key("my_type"),
+            "reference inside a nested clause should be indexed"
+        );
     }
 }

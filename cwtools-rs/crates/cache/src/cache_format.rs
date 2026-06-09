@@ -5,7 +5,6 @@
 #[rkyv(derive(Debug))]
 pub struct CachedFile {
     pub root_children: Vec<CachedChild>,
-    pub nodes: Vec<CachedNode>,
     pub leaves: Vec<CachedLeaf>,
     pub leaf_values: Vec<CachedLeafValue>,
     pub value_clauses: Vec<CachedValueClause>,
@@ -16,24 +15,10 @@ pub struct CachedFile {
 #[rkyv(derive(Debug))]
 #[repr(u8)]
 pub enum CachedChild {
-    Node(u32),
     Leaf(u32),
     LeafValue(u32),
     ValueClause(u32),
     Comment(u32),
-}
-
-#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(derive(Debug))]
-pub struct CachedNode {
-    pub key: String,
-    pub key_prefix: Option<String>,
-    pub value_prefix: Option<String>,
-    pub children: Vec<CachedChild>,
-    pub start_line: u32,
-    pub start_col: u16,
-    pub end_line: u32,
-    pub end_col: u16,
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

@@ -12,61 +12,18 @@ pub(crate) fn extract_types_from_children(
     let precomputed = precompute_comments(children, ast, table);
     for (idx, tchild) in children.iter().enumerate() {
         let comments = &precomputed[idx];
-        let (key, is_leaf) = match tchild {
-            Child::Leaf(lidx) => {
-                let leaf = &ast.arena.leaves[*lidx as usize];
-                (table.get_string(leaf.key.normal).unwrap_or_default(), true)
-            }
-            Child::Node(nidx) => {
-                let node = &ast.arena.nodes[*nidx as usize];
-                (table.get_string(node.key.normal).unwrap_or_default(), false)
-            }
-            _ => continue,
+        let Child::Leaf(lidx) = tchild else {
+            continue;
         };
+        let leaf = &ast.arena.leaves[*lidx as usize];
+        let key = table.get_string(leaf.key.normal).unwrap_or_default();
         if key.starts_with("type[")
             && let Some(typename) = extract_bracket_content(&key, "type")
         {
-            let typedef = if is_leaf {
-                if let Child::Leaf(lidx) = tchild {
-                    process_type_node(
-                        typename,
-                        &ast.arena.leaves[*lidx as usize],
-                        ast,
-                        table,
-                        ruleset,
-                        comments,
-                    )
-                } else {
-                    continue;
-                }
-            } else {
-                if let Child::Node(nidx) = tchild {
-                    let node = &ast.arena.nodes[*nidx as usize];
-                    process_type_node_from_node(typename, node, ast, table, ruleset, comments)
-                } else {
-                    continue;
-                }
-            };
+            let typedef = process_type_node(typename, leaf, ast, table, ruleset, comments);
             ruleset.types.push(typedef);
         }
     }
-}
-
-pub(crate) fn process_type_node_from_node(
-    name: String,
-    node: &cwtools_parser::ast::Node,
-    ast: &ParsedFile,
-    table: &StringTable,
-    ruleset: &mut RuleSet,
-    comments: &[String],
-) -> TypeDefinition {
-    let synthetic_leaf = cwtools_parser::ast::Leaf {
-        key: node.key,
-        value: Value::Clause(node.children.clone()),
-        op: cwtools_parser::ast::Operator::Equals,
-        pos: node.pos,
-    };
-    process_type_node(name, &synthetic_leaf, ast, table, ruleset, comments)
 }
 
 pub(crate) fn process_type_node(
@@ -114,167 +71,123 @@ pub(crate) fn process_type_node(
         let precomputed = precompute_comments(children, ast, table);
         for (cidx, child) in children.iter().enumerate() {
             let child_comments = &precomputed[cidx];
-            match child {
-                Child::Leaf(lidx) => {
-                    let l = &ast.arena.leaves[*lidx as usize];
-                    let k = table.get_string(l.key.normal).unwrap_or_default();
-                    if k.starts_with("subtype[") {
-                        if let Some(st_name) = extract_bracket_content(&k, "subtype") {
-                            let st = process_subtype_node_from_leaf(
-                                st_name,
-                                l,
-                                ast,
-                                table,
-                                ruleset,
-                                child_comments,
-                            );
-                            def.subtypes.push(st);
-                        }
-                    } else if k == "localisation" || k == "modifiers" {
-                        if let Value::Clause(clause_ch) = &l.value {
-                            if k == "localisation" {
-                                localisation_children = Some(clause_ch.clone());
-                            } else {
-                                modifiers_children = Some(clause_ch.clone());
-                            }
-                        }
-                    } else {
-                        match k.as_str() {
-                            "path" => {
-                                let v = clean_path(&leaf_value_string(l, table));
-                                def.path_options.paths.push(v);
-                            }
-                            "path_strict" if leaf_value_string(l, table) == "yes" => {
-                                def.path_options.path_strict = true;
-                            }
-                            "path_file" => {
-                                def.path_options.path_file = Some(leaf_value_string(l, table));
-                            }
-                            "path_extension" => {
-                                def.path_options.path_extension = Some(leaf_value_string(l, table));
-                            }
-                            "name_field" => {
-                                def.name_field = Some(leaf_value_string(l, table));
-                            }
-                            "type_per_file" if leaf_value_string(l, table) == "yes" => {
-                                def.type_per_file = true;
-                            }
-                            "starts_with" => {
-                                def.starts_with = Some(leaf_value_string(l, table));
-                            }
-                            "type_key_prefix" => {
-                                def.key_prefix = Some(leaf_value_string(l, table));
-                            }
-                            "severity" if leaf_value_string(l, table) == "warning" => {
-                                def.warning_only = true;
-                            }
-                            "unique" if leaf_value_string(l, table) == "yes" => {
-                                def.unique = true;
-                            }
-                            "should_be_used" if leaf_value_string(l, table) == "yes" => {
-                                def.should_be_referenced = true;
-                            }
-                            "skip_root_key" => {
-                                if let Value::Clause(block_children) = &l.value {
-                                    // Block form: skip_root_key = { A B }
-                                    // Each element is a separate nested level (F#
-                                    // RulesParser.fs:1031-1035 maps each to its own layer).
-                                    // `any` becomes AnyKey; anything else becomes SpecificKey.
-                                    for block_child in block_children {
-                                        if let Child::LeafValue(lvidx) = block_child {
-                                            let lv = &ast.arena.leaf_values[*lvidx as usize];
-                                            let v = value_to_string(&lv.value, table);
-                                            if v.is_empty() {
-                                                continue;
-                                            }
-                                            if v == "any" {
-                                                def.skip_root_key.push(SkipRootKey::AnyKey);
-                                            } else {
-                                                def.skip_root_key.push(SkipRootKey::SpecificKey(v));
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    let op = l.op;
-                                    let v = leaf_value_string(l, table);
-                                    if v == "any" {
-                                        def.skip_root_key.push(SkipRootKey::AnyKey);
-                                    } else {
-                                        let should_match =
-                                            op == cwtools_parser::ast::Operator::Equals;
-                                        if def.skip_root_key.is_empty() {
-                                            def.skip_root_key.push(SkipRootKey::SpecificKey(v));
-                                        } else {
-                                            // Multiple leaves: promote to MultipleKeys, using
-                                            // the first entry's operator (F# parity).
-                                            let first_should_match = match &def.skip_root_key[0] {
-                                                SkipRootKey::MultipleKeys(_, sm) => *sm,
-                                                _ => should_match,
-                                            };
-                                            let mut all_keys: Vec<String> = Vec::new();
-                                            for existing in def.skip_root_key.drain(..) {
-                                                match existing {
-                                                    SkipRootKey::SpecificKey(k) => all_keys.push(k),
-                                                    SkipRootKey::MultipleKeys(mut ks, _) => {
-                                                        all_keys.append(&mut ks)
-                                                    }
-                                                    SkipRootKey::AnyKey => {}
-                                                }
-                                            }
-                                            all_keys.push(v);
-                                            def.skip_root_key.push(SkipRootKey::MultipleKeys(
-                                                all_keys,
-                                                first_should_match,
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
+            if let Child::Leaf(lidx) = child {
+                let l = &ast.arena.leaves[*lidx as usize];
+                let k = table.get_string(l.key.normal).unwrap_or_default();
+                if k.starts_with("subtype[") {
+                    if let Some(st_name) = extract_bracket_content(&k, "subtype") {
+                        let st = process_subtype_node_from_leaf(
+                            st_name,
+                            l,
+                            ast,
+                            table,
+                            ruleset,
+                            child_comments,
+                        );
+                        def.subtypes.push(st);
+                    }
+                } else if k == "localisation" || k == "modifiers" {
+                    if let Value::Clause(clause_ch) = &l.value {
+                        if k == "localisation" {
+                            localisation_children = Some(clause_ch.clone());
+                        } else {
+                            modifiers_children = Some(clause_ch.clone());
                         }
                     }
-                }
-                Child::Node(nidx) => {
-                    let n = &ast.arena.nodes[*nidx as usize];
-                    let nk = table.get_string(n.key.normal).unwrap_or_default();
-                    if nk.starts_with("subtype[") {
-                        if let Some(st_name) = extract_bracket_content(&nk, "subtype") {
-                            let st = process_subtype_node(
-                                st_name,
-                                n,
-                                ast,
-                                table,
-                                ruleset,
-                                child_comments,
-                            );
-                            def.subtypes.push(st);
+                } else {
+                    match k.as_str() {
+                        "path" => {
+                            let v = clean_path(&leaf_value_string(l, table));
+                            def.path_options.paths.push(v);
                         }
-                    } else if nk == "localisation" {
-                        localisation_children = Some(n.children.clone());
-                    } else if nk == "modifiers" {
-                        modifiers_children = Some(n.children.clone());
-                    } else if nk == "skip_root_key" {
-                        // Block form: skip_root_key = { A B }
-                        // Each element is a separate nested level (F#
-                        // RulesParser.fs:1031-1035 maps each to its own layer).
-                        // `any` becomes AnyKey; anything else becomes SpecificKey.
-                        for block_child in &n.children {
-                            if let Child::LeafValue(lvidx) = block_child {
-                                let lv = &ast.arena.leaf_values[*lvidx as usize];
-                                let v = value_to_string(&lv.value, table);
-                                if v.is_empty() {
-                                    continue;
+                        "path_strict" if leaf_value_string(l, table) == "yes" => {
+                            def.path_options.path_strict = true;
+                        }
+                        "path_file" => {
+                            def.path_options.path_file = Some(leaf_value_string(l, table));
+                        }
+                        "path_extension" => {
+                            def.path_options.path_extension = Some(leaf_value_string(l, table));
+                        }
+                        "name_field" => {
+                            def.name_field = Some(leaf_value_string(l, table));
+                        }
+                        "type_per_file" if leaf_value_string(l, table) == "yes" => {
+                            def.type_per_file = true;
+                        }
+                        "starts_with" => {
+                            def.starts_with = Some(leaf_value_string(l, table));
+                        }
+                        "type_key_prefix" => {
+                            def.key_prefix = Some(leaf_value_string(l, table));
+                        }
+                        "severity" if leaf_value_string(l, table) == "warning" => {
+                            def.warning_only = true;
+                        }
+                        "unique" if leaf_value_string(l, table) == "yes" => {
+                            def.unique = true;
+                        }
+                        "should_be_used" if leaf_value_string(l, table) == "yes" => {
+                            def.should_be_referenced = true;
+                        }
+                        "skip_root_key" => {
+                            if let Value::Clause(block_children) = &l.value {
+                                // Block form: skip_root_key = { A B }
+                                // Each element is a separate nested level (F#
+                                // RulesParser.fs:1031-1035 maps each to its own layer).
+                                // `any` becomes AnyKey; anything else becomes SpecificKey.
+                                for block_child in block_children {
+                                    if let Child::LeafValue(lvidx) = block_child {
+                                        let lv = &ast.arena.leaf_values[*lvidx as usize];
+                                        let v = value_to_string(&lv.value, table);
+                                        if v.is_empty() {
+                                            continue;
+                                        }
+                                        if v == "any" {
+                                            def.skip_root_key.push(SkipRootKey::AnyKey);
+                                        } else {
+                                            def.skip_root_key.push(SkipRootKey::SpecificKey(v));
+                                        }
+                                    }
                                 }
+                            } else {
+                                let op = l.op;
+                                let v = leaf_value_string(l, table);
                                 if v == "any" {
                                     def.skip_root_key.push(SkipRootKey::AnyKey);
                                 } else {
-                                    def.skip_root_key.push(SkipRootKey::SpecificKey(v));
+                                    let should_match = op == cwtools_parser::ast::Operator::Equals;
+                                    if def.skip_root_key.is_empty() {
+                                        def.skip_root_key.push(SkipRootKey::SpecificKey(v));
+                                    } else {
+                                        // Multiple leaves: promote to MultipleKeys, using
+                                        // the first entry's operator (F# parity).
+                                        let first_should_match = match &def.skip_root_key[0] {
+                                            SkipRootKey::MultipleKeys(_, sm) => *sm,
+                                            _ => should_match,
+                                        };
+                                        let mut all_keys: Vec<String> = Vec::new();
+                                        for existing in def.skip_root_key.drain(..) {
+                                            match existing {
+                                                SkipRootKey::SpecificKey(k) => all_keys.push(k),
+                                                SkipRootKey::MultipleKeys(mut ks, _) => {
+                                                    all_keys.append(&mut ks)
+                                                }
+                                                SkipRootKey::AnyKey => {}
+                                            }
+                                        }
+                                        all_keys.push(v);
+                                        def.skip_root_key.push(SkipRootKey::MultipleKeys(
+                                            all_keys,
+                                            first_should_match,
+                                        ));
+                                    }
                                 }
                             }
                         }
+                        _ => {}
                     }
                 }
-                _ => {}
             }
         }
 
@@ -376,7 +289,8 @@ pub(crate) fn parse_localisation_block(
         if let Child::Leaf(lidx) = child {
             let l = &ast.arena.leaves[*lidx as usize];
             let key = table.get_string(l.key.normal).unwrap_or_default();
-            // Skip subtype[] sub-blocks (they are Node children)
+            // Skip subtype[] sub-blocks (Leaf+Clause children, handled by
+            // parse_subtype_localisation)
             if key.starts_with("subtype[") {
                 continue;
             }

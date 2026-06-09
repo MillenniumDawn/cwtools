@@ -27,7 +27,9 @@ const MAGIC: &[u8; 4] = b"CWB\x00";
 /// silently misread.
 ///
 /// v1: initial versioned format (adds magic+version header to the raw zstd).
-const FORMAT_VERSION: u8 = 1;
+/// v2: dropped `CachedNode`/`CachedChild::Node` (the AST has one clause
+///     representation, `Leaf` + `Value::Clause`; nothing ever wrote Nodes).
+const FORMAT_VERSION: u8 = 2;
 
 /// Serialize a `CachedFile` to a `.cwb` file (zstd-compressed rkyv).
 ///

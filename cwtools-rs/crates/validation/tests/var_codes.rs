@@ -25,6 +25,7 @@ foo = {
     add = int_variable_field
     prec = variable_field_32
     ref = variable_field
+    get = value[variable]
 }
 "#;
 
@@ -97,4 +98,16 @@ fn numeric_value_is_never_cw246() {
 fn at_variable_is_never_cw246() {
     let c = codes("foo = { ref = @my_const }", &["something_else"]);
     assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn variable_get_field_defined_is_clean() {
+    let c = codes("foo = { get = my_var }", &["my_var"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn variable_get_field_undefined_is_cw246() {
+    let c = codes("foo = { get = mystery }", &["something_else"]);
+    assert!(c.contains(&"CW246".to_string()), "got: {:?}", c);
 }

@@ -109,30 +109,10 @@ pub(crate) fn value_is_zero(value: &Value) -> bool {
     }
 }
 
-/// Returns true only when `needle` appears in `haystack` as a whole sequence of
-/// path segments (bounded by '/' or start/end on both sides). Both inputs must
-/// already be lowercased and use '/' separators (clean_path normalizes these).
-/// This prevents `events` from matching `.../my_events_backup/x.txt`.
-pub(crate) fn path_contains_segment(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    let mut start = 0;
-    while let Some(pos) = haystack[start..].find(needle) {
-        let abs = start + pos;
-        let left_ok = abs == 0 || haystack.as_bytes().get(abs - 1) == Some(&b'/');
-        let right = abs + needle.len();
-        let right_ok = right == haystack.len() || haystack.as_bytes().get(right) == Some(&b'/');
-        if left_ok && right_ok {
-            return true;
-        }
-        start = abs + 1;
-        if start >= haystack.len() {
-            break;
-        }
-    }
-    false
-}
+/// Whole-segment path containment (prevents `events` from matching
+/// `.../my_events_backup/x.txt`). One shared implementation with the indexer so
+/// a file is indexed by the same type that validates it.
+pub(crate) use cwtools_index::path_contains_segment;
 
 /// Start (line, col) of a child node, for locating block-level diagnostics.
 pub(crate) fn child_start_pos(child: &Child, ast: &ParsedFile) -> Option<(u32, u16)> {
@@ -140,10 +120,6 @@ pub(crate) fn child_start_pos(child: &Child, ast: &ParsedFile) -> Option<(u32, u
         Child::Leaf(i) => {
             let l = &ast.arena.leaves[*i as usize];
             Some((l.pos.start.line, l.pos.start.col))
-        }
-        Child::Node(i) => {
-            let n = &ast.arena.nodes[*i as usize];
-            Some((n.pos.start.line, n.pos.start.col))
         }
         Child::LeafValue(i) => {
             let lv = &ast.arena.leaf_values[*i as usize];
@@ -168,14 +144,6 @@ pub(crate) fn child_key_matches(
             let leaf = &ast.arena.leaves[*idx as usize];
             table
                 .with_string(leaf.key.normal, |s| {
-                    unquote_key(s).eq_ignore_ascii_case(unquote_key(filter_key))
-                })
-                .unwrap_or(false)
-        }
-        Child::Node(idx) => {
-            let node = &ast.arena.nodes[*idx as usize];
-            table
-                .with_string(node.key.normal, |s| {
                     unquote_key(s).eq_ignore_ascii_case(unquote_key(filter_key))
                 })
                 .unwrap_or(false)

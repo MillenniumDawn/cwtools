@@ -10,13 +10,14 @@ pub(crate) fn parse_subtype_localisation(
 ) -> Vec<(String, Vec<TypeLocalisation>)> {
     let mut out = Vec::new();
     for child in children {
-        if let Child::Node(nidx) = child {
-            let n = &ast.arena.nodes[*nidx as usize];
-            let nk = table.get_string(n.key.normal).unwrap_or_default();
+        // keyed_clause: `subtype[x] = { ... }` is a Leaf+Clause from the live
+        // parser (rules are never cache-loaded, so a Node-only match never fires).
+        if let Some(kc) = ast.arena.keyed_clause(child) {
+            let nk = table.get_string(kc.key.normal).unwrap_or_default();
             if nk.starts_with("subtype[")
                 && let Some(st_name) = extract_bracket_content(&nk, "subtype")
             {
-                let locs = parse_localisation_block(&n.children, ast, table);
+                let locs = parse_localisation_block(kc.children, ast, table);
                 out.push((st_name, locs));
             }
         }
@@ -31,29 +32,17 @@ pub(crate) fn parse_subtype_modifiers(
 ) -> Vec<(String, Vec<TypeModifier>)> {
     let mut out = Vec::new();
     for child in children {
-        if let Child::Node(nidx) = child {
-            let n = &ast.arena.nodes[*nidx as usize];
-            let nk = table.get_string(n.key.normal).unwrap_or_default();
+        if let Some(kc) = ast.arena.keyed_clause(child) {
+            let nk = table.get_string(kc.key.normal).unwrap_or_default();
             if nk.starts_with("subtype[")
                 && let Some(st_name) = extract_bracket_content(&nk, "subtype")
             {
-                let mods = parse_modifiers_block(&n.children, ast, table);
+                let mods = parse_modifiers_block(kc.children, ast, table);
                 out.push((st_name, mods));
             }
         }
     }
     out
-}
-
-pub(crate) fn process_subtype_node(
-    name: String,
-    node: &cwtools_parser::ast::Node,
-    ast: &ParsedFile,
-    table: &StringTable,
-    ruleset: &mut RuleSet,
-    comments: &[String],
-) -> SubTypeDefinition {
-    build_subtype(name, &node.children, ast, table, ruleset, comments)
 }
 
 pub(crate) fn process_subtype_node_from_leaf(

@@ -35,6 +35,8 @@ pub enum ReferenceHint {
     FileRef { path: String },
     /// The value is a scope name.
     ScopeName { name: String },
+    /// The value is a read of a defined script variable (`value[variable]`).
+    Variable { name: String, namespace: String },
     /// Classification was not possible with current rule depth.
     Unknown,
 }
@@ -50,9 +52,7 @@ pub struct PositionInfo {
 /// Which kind of AST element is at the cursor.
 #[derive(Debug, Clone)]
 pub enum PositionElement {
-    /// A `key = { … }` node; cursor is on the key.
-    Node { key: String },
-    /// A `key = value` leaf.
+    /// A `key = value` leaf (a `key = { … }` clause reports an empty value).
     Leaf { key: String, value: String },
     /// A bare value inside a clause (no key).
     LeafValue { value: String },
@@ -78,18 +78,6 @@ fn find_element_in_children(
 ) -> Option<PositionElement> {
     for child in children {
         match child {
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                if pos_in_range(target, &node.pos) {
-                    if let Some(inner) =
-                        find_element_in_children(&node.children, arena, target, table)
-                    {
-                        return Some(inner);
-                    }
-                    let key = table.get_string(node.key.normal).unwrap_or_default();
-                    return Some(PositionElement::Node { key });
-                }
-            }
             Child::Leaf(idx) => {
                 let leaf = &arena.leaves[*idx as usize];
                 if pos_in_range(target, &leaf.pos) {
@@ -170,32 +158,6 @@ fn find_pos_in_children(
 ) -> Option<PositionInfo> {
     for child in children {
         match child {
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                if pos_in_range(target, &node.pos) {
-                    // Try children first (deeper match wins)
-                    if let Some(inner) = find_pos_in_children(
-                        &node.children,
-                        arena,
-                        target,
-                        table,
-                        ruleset,
-                        logical_path,
-                    ) {
-                        return Some(inner);
-                    }
-                    // Cursor is on the node key itself
-                    let key = table.get_string(node.key.normal).unwrap_or_default();
-                    return Some(PositionInfo {
-                        location: SourceLocation {
-                            line: node.pos.start.line,
-                            col: node.pos.start.col,
-                        },
-                        element: PositionElement::Node { key: key.clone() },
-                        hint: classify_node_key(&key, ruleset, logical_path),
-                    });
-                }
-            }
             Child::Leaf(idx) => {
                 let leaf = &arena.leaves[*idx as usize];
                 if pos_in_range(target, &leaf.pos) {
@@ -242,22 +204,6 @@ fn find_pos_in_children(
         }
     }
     None
-}
-
-/// Best-effort: classify a node key using path-matched type definitions.
-fn classify_node_key(key: &str, ruleset: &RuleSet, logical_path: &str) -> ReferenceHint {
-    for td in &ruleset.types {
-        if !check_path_dir(&td.path_options, logical_path) {
-            continue;
-        }
-        if type_key_filter_matches(td, key) {
-            return ReferenceHint::TypeRef {
-                type_name: td.name.clone(),
-                value: key.to_string(),
-            };
-        }
-    }
-    ReferenceHint::Unknown
 }
 
 /// Best-effort: classify a leaf value using ruleset root_rules.
@@ -332,6 +278,12 @@ fn classify_leaf_value(
                             path: value.to_string(),
                         };
                     }
+                    NewField::VariableGetField(ns) => {
+                        return ReferenceHint::Variable {
+                            name: value.to_string(),
+                            namespace: ns.clone(),
+                        };
+                    }
                     _ => {}
                 }
             }
@@ -397,6 +349,12 @@ pub struct InfoService {
     event_target_counts: HashMap<String, usize>,
     variable_counts: HashMap<String, usize>,
     inline_script_counts: HashMap<String, usize>,
+    /// Effect/trigger names that DEFINE a `value_set[variable]` (e.g.
+    /// `set_variable`). Cached so per-file indexing can scan `set_variable`
+    /// blocks for defined names (and their values) without recomputing it from
+    /// the ruleset each time. Set by [`InfoService::set_var_effects`] at ruleset
+    /// load; empty until then, which leaves the variable index untouched.
+    var_effects: HashSet<String>,
 }
 
 impl Default for InfoService {
@@ -417,7 +375,16 @@ impl InfoService {
             event_target_counts: HashMap::new(),
             variable_counts: HashMap::new(),
             inline_script_counts: HashMap::new(),
+            var_effects: HashSet::new(),
         }
+    }
+
+    /// Cache the set of variable-defining effects (from
+    /// [`cwtools_index::variable_defining_effects`]). The LSP calls this once at
+    /// ruleset load so per-file indexing can populate the variable index that the
+    /// CW246/VariableGetField checks consult.
+    pub fn set_var_effects(&mut self, effects: HashSet<String>) {
+        self.var_effects = effects;
     }
 
     /// One-line size summary for profiling (counts only, not bytes).
@@ -493,10 +460,25 @@ impl InfoService {
                 name: name.clone(),
                 namespace: None,
                 location: *loc,
+                value: None,
             })
             .collect();
         info.defined_variables_ns =
             collect_defined_variables_from_rules(ruleset, ast, logical_path, table, Some(at_vars));
+        // value_set[variable] definitions made through `set_variable`-family
+        // effects live inside `alias[effect]` expansions the rule-tree walk above
+        // never reaches, so collect them directly (with values, for hover) and
+        // merge into the "variable" namespace.
+        if !self.var_effects.is_empty() {
+            let mut set_vars: Vec<DefinedVariable> = Vec::new();
+            collect_set_variable_defs(ast, table, &self.var_effects, &mut set_vars);
+            if !set_vars.is_empty() {
+                info.defined_variables_ns
+                    .entry("variable".to_string())
+                    .or_default()
+                    .extend(set_vars);
+            }
+        }
         // Flatten ALL variable entries (both @-vars and value_set names) into the
         // legacy map so clear_file can remove them and completion stays current.
         for vars in info.defined_variables_ns.values() {
@@ -526,10 +508,16 @@ impl InfoService {
             *self.event_target_counts.entry(et.clone()).or_insert(0) += 1;
             self.all_event_targets.insert(et.clone());
         }
-        for vars in info.defined_variables_ns.values() {
+        for (ns, vars) in &info.defined_variables_ns {
             for v in vars {
                 *self.variable_counts.entry(v.name.clone()).or_insert(0) += 1;
                 self.all_variables.insert(v.name.clone());
+                // Feed value_set[variable] names into the project-wide var index
+                // that CW246 / VariableGetField consult. @-vars are excluded:
+                // reads bypass them, and they'd pollute the unset-variable check.
+                if ns != "@" {
+                    self.type_index.var_index.add_name(&v.name);
+                }
             }
         }
         for script in info.inline_scripts.keys() {
@@ -613,7 +601,7 @@ impl InfoService {
                 }
             }
             // Variables (refcount via variable_counts, keyed by name)
-            for vars in info.defined_variables_ns.values() {
+            for (ns, vars) in &info.defined_variables_ns {
                 for v in vars {
                     if let Some(count) = self.variable_counts.get_mut(&v.name) {
                         *count -= 1;
@@ -621,6 +609,9 @@ impl InfoService {
                             self.variable_counts.remove(&v.name);
                             self.all_variables.remove(&v.name);
                         }
+                    }
+                    if ns != "@" {
+                        self.type_index.var_index.remove_name(&v.name);
                     }
                 }
             }
@@ -640,6 +631,50 @@ impl InfoService {
     /// Find all heuristic definitions of a given symbol name.
     pub fn find_definitions(&self, name: &str) -> Option<&Vec<(String, SourceLocation)>> {
         self.all_type_defs.get(name)
+    }
+
+    /// Find every definition site of a script variable named `name`
+    /// (case-insensitive), across all files. Used by goto-definition on a
+    /// `value[variable]` read. Returns `(file_uri, location)` pairs.
+    pub fn find_variable_definitions(&self, name: &str) -> Vec<(String, SourceLocation)> {
+        let mut out = Vec::new();
+        for (uri, fi) in &self.files {
+            for vars in fi.defined_variables_ns.values() {
+                for v in vars {
+                    if v.name.eq_ignore_ascii_case(name) {
+                        out.push((uri.clone(), v.location));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The distinct known values a variable named `name` is assigned across the
+    /// workspace, in first-seen order. Used to render variable hover. `limit`
+    /// caps the returned set; the returned `bool` is `true` when more existed.
+    pub fn variable_values(&self, name: &str, limit: usize) -> (Vec<String>, bool) {
+        let mut values: Vec<String> = Vec::new();
+        let mut truncated = false;
+        for fi in self.files.values() {
+            for vars in fi.defined_variables_ns.values() {
+                for v in vars {
+                    if !v.name.eq_ignore_ascii_case(name) {
+                        continue;
+                    }
+                    if let Some(val) = &v.value
+                        && !values.iter().any(|x| x == val)
+                    {
+                        if values.len() >= limit {
+                            truncated = true;
+                        } else {
+                            values.push(val.clone());
+                        }
+                    }
+                }
+            }
+        }
+        (values, truncated)
     }
 
     /// Find all references to a given symbol name across all files.
@@ -668,16 +703,16 @@ impl InfoService {
         type_names: &HashMap<String, usize>,
         info: &mut FileInfo,
     ) {
-        match child {
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
+        if let Child::Leaf(idx) = child {
+            let leaf = &arena.leaves[*idx as usize];
+            let key = table.get_string(leaf.key.normal).unwrap_or_default();
 
+            if let Value::Clause(_) = &leaf.value {
                 info.top_level_keys.push((
                     key.clone(),
                     SourceLocation {
-                        line: node.pos.start.line,
-                        col: node.pos.start.col,
+                        line: leaf.pos.start.line,
+                        col: leaf.pos.start.col,
                     },
                 ));
 
@@ -686,125 +721,97 @@ impl InfoService {
                         .entry(key.clone())
                         .or_default()
                         .push(SourceLocation {
-                            line: node.pos.start.line,
-                            col: node.pos.start.col,
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
                         });
                 }
+            }
 
-                for c in &node.children {
+            let value_str = leaf_value_string(&leaf.value, table);
+
+            if key.starts_with('@') {
+                info.defined_variables.insert(
+                    key.clone(),
+                    SourceLocation {
+                        line: leaf.pos.start.line,
+                        col: leaf.pos.start.col,
+                    },
+                );
+            }
+
+            if value_str.starts_with('<') && value_str.ends_with('>') {
+                let inner = &value_str[1..value_str.len() - 1];
+                info.type_references
+                    .entry(inner.to_string())
+                    .or_default()
+                    .push(SourceLocation {
+                        line: leaf.pos.start.line,
+                        col: leaf.pos.start.col,
+                    });
+            }
+
+            if let Value::Clause(children) = &leaf.value {
+                for c in children {
                     Self::index_child_heuristic(c, arena, table, type_names, info);
                 }
             }
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
 
-                if let Value::Clause(_) = &leaf.value {
-                    info.top_level_keys.push((
-                        key.clone(),
-                        SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        },
-                    ));
-
-                    if type_names.contains_key(&key) {
-                        info.type_definitions.entry(key.clone()).or_default().push(
-                            SourceLocation {
-                                line: leaf.pos.start.line,
-                                col: leaf.pos.start.col,
-                            },
-                        );
-                    }
+            if key.starts_with("event_target:") {
+                let target = key.strip_prefix("event_target:").unwrap_or("");
+                if !target.is_empty() {
+                    info.saved_event_targets.insert(target.to_string());
                 }
+            }
 
-                let value_str = leaf_value_string(&leaf.value, table);
+            if (key == "save_event_target_as" || key == "save_global_event_target_as")
+                && !value_str.is_empty()
+            {
+                info.saved_event_targets_detailed.push(SavedEventTarget {
+                    name: value_str.clone(),
+                    location: SourceLocation {
+                        line: leaf.pos.start.line,
+                        col: leaf.pos.start.col,
+                    },
+                    is_global: key == "save_global_event_target_as",
+                });
+            }
 
-                if key.starts_with('@') {
-                    info.defined_variables.insert(
-                        key.clone(),
-                        SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        },
-                    );
-                }
-
-                if value_str.starts_with('<') && value_str.ends_with('>') {
-                    let inner = &value_str[1..value_str.len() - 1];
-                    info.type_references
-                        .entry(inner.to_string())
-                        .or_default()
-                        .push(SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        });
-                }
-
-                if let Value::Clause(children) = &leaf.value {
-                    for c in children {
-                        Self::index_child_heuristic(c, arena, table, type_names, info);
-                    }
-                }
-
-                if key.starts_with("event_target:") {
-                    let target = key.strip_prefix("event_target:").unwrap_or("");
-                    if !target.is_empty() {
-                        info.saved_event_targets.insert(target.to_string());
-                    }
-                }
-
-                if (key == "save_event_target_as" || key == "save_global_event_target_as")
-                    && !value_str.is_empty()
-                {
-                    info.saved_event_targets_detailed.push(SavedEventTarget {
-                        name: value_str.clone(),
-                        location: SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        },
-                        is_global: key == "save_global_event_target_as",
-                    });
-                }
-
-                if key == "inline_script"
-                    && let Value::Clause(children) = &leaf.value
-                {
-                    for c in children {
-                        if let Child::Leaf(script_idx) = c {
-                            let script_leaf = &arena.leaves[*script_idx as usize];
-                            let script_key =
-                                table.get_string(script_leaf.key.normal).unwrap_or_default();
-                            if script_key == "script" {
-                                let script_name = leaf_value_string(&script_leaf.value, table);
-                                if !script_name.is_empty() {
-                                    info.inline_scripts.insert(
-                                        script_name,
-                                        SourceLocation {
-                                            line: script_leaf.pos.start.line,
-                                            col: script_leaf.pos.start.col,
-                                        },
-                                    );
-                                }
+            if key == "inline_script"
+                && let Value::Clause(children) = &leaf.value
+            {
+                for c in children {
+                    if let Child::Leaf(script_idx) = c {
+                        let script_leaf = &arena.leaves[*script_idx as usize];
+                        let script_key =
+                            table.get_string(script_leaf.key.normal).unwrap_or_default();
+                        if script_key == "script" {
+                            let script_name = leaf_value_string(&script_leaf.value, table);
+                            if !script_name.is_empty() {
+                                info.inline_scripts.insert(
+                                    script_name,
+                                    SourceLocation {
+                                        line: script_leaf.pos.start.line,
+                                        col: script_leaf.pos.start.col,
+                                    },
+                                );
                             }
                         }
                     }
                 }
-
-                if key == "effect" || key.ends_with("_effect") {
-                    info.effect_blocks.push(SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    });
-                }
-                if key == "trigger" || key.ends_with("_trigger") {
-                    info.trigger_blocks.push(SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    });
-                }
             }
-            _ => {}
+
+            if key == "effect" || key.ends_with("_effect") {
+                info.effect_blocks.push(SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                });
+            }
+            if key == "trigger" || key.ends_with("_trigger") {
+                info.trigger_blocks.push(SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                });
+            }
         }
     }
 }
@@ -1243,6 +1250,43 @@ alias[effect:set_temp_variable] = {
         assert!(!names.contains(&"value".to_string()), "got: {:?}", names);
     }
 
+    /// `collect_set_variable_defs` captures the assigned value for both the
+    /// explicit (`var = X value = N`) and shorthand (`X = N`) forms.
+    #[test]
+    fn test_collect_set_variable_defs_values() {
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        const RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:set_variable] = {
+    var = value_set[variable]
+    value = int_variable_field
+}
+alias[effect:set_temp_variable] = {
+    value_set[variable] = int_variable_field
+}
+"#;
+        let table = StringTable::new();
+        let ruleset = ast_to_ruleset(&parse_string(RULES, &table).unwrap(), &table);
+        let effects = variable_defining_effects(&ruleset);
+
+        let script = "foo = { set_variable = { var = my_explicit value = 3 } set_temp_variable = { my_shorthand = 5 } }";
+        let parsed = parse_string(script, &table).unwrap();
+        let mut defs = Vec::new();
+        collect_set_variable_defs(&parsed, &table, &effects, &mut defs);
+
+        let explicit = defs
+            .iter()
+            .find(|d| d.name == "my_explicit")
+            .expect("my_explicit");
+        assert_eq!(explicit.value.as_deref(), Some("3"));
+        let shorthand = defs
+            .iter()
+            .find(|d| d.name == "my_shorthand")
+            .expect("my_shorthand");
+        assert_eq!(shorthand.value.as_deref(), Some("5"));
+    }
+
     // ── Item 2.7 — value_set var removed from all_variables on clear_file ────
 
     #[test]
@@ -1265,6 +1309,7 @@ alias[effect:set_temp_variable] = {
                 name: "my_var".to_string(),
                 namespace: None,
                 location: cwtools_index::SourceLocation { line: 1, col: 0 },
+                value: None,
             }],
         );
         svc.files.insert(uri.to_string(), file_info);

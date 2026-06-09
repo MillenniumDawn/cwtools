@@ -71,15 +71,6 @@ fn is_empty_if(children: &[Child], ast: &ParsedFile, table: &StringTable) -> boo
                     return false;
                 }
             }
-            Child::Node(idx) => {
-                let n = &ast.arena.nodes[*idx as usize];
-                if !table
-                    .with_string(n.key.normal, |s| s == "limit")
-                    .unwrap_or(false)
-                {
-                    return false;
-                }
-            }
             Child::LeafValue(_) | Child::ValueClause(_) => return false,
             Child::Comment(_) => {}
         }

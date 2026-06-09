@@ -84,119 +84,47 @@ fn fill_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
     for (idx, child) in ast.root_children.iter().enumerate() {
         let comments = &precomputed[idx];
 
-        match child {
-            Child::Node(nidx) => {
-                let node = &ast.arena.nodes[*nidx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
-                match key.as_str() {
-                    "types" => {
-                        extract_types_from_children(&node.children, ast, table, &mut ruleset)
-                    }
-                    "enums" => {
-                        extract_enums_from_children(&node.children, ast, table, &mut ruleset)
-                    }
-                    "values" => {
-                        extract_values_from_children(&node.children, ast, table, &mut ruleset)
-                    }
-                    "modifiers" => extract_modifier_names(&node.children, ast, table, &mut ruleset),
-                    "links" => extract_links(&node.children, ast, table, &mut ruleset),
-                    "scopes" => extract_scope_defs(&node.children, ast, table, &mut ruleset),
-                    _ => {
-                        process_root_node(key, node, ast, table, comments, &mut ruleset);
+        if let Child::Leaf(lidx) = child {
+            let leaf = &ast.arena.leaves[*lidx as usize];
+            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            match key.as_str() {
+                "types" => {
+                    if let Value::Clause(children) = &leaf.value {
+                        extract_types_from_children(children, ast, table, &mut ruleset);
                     }
                 }
-            }
-            Child::Leaf(lidx) => {
-                let leaf = &ast.arena.leaves[*lidx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                match key.as_str() {
-                    "types" => {
-                        if let Value::Clause(children) = &leaf.value {
-                            extract_types_from_children(children, ast, table, &mut ruleset);
-                        }
-                    }
-                    "enums" => {
-                        if let Value::Clause(children) = &leaf.value {
-                            extract_enums_from_children(children, ast, table, &mut ruleset);
-                        }
-                    }
-                    "values" => {
-                        if let Value::Clause(children) = &leaf.value {
-                            extract_values_from_children(children, ast, table, &mut ruleset);
-                        }
-                    }
-                    "modifiers" => {
-                        if let Value::Clause(children) = &leaf.value {
-                            extract_modifier_names(children, ast, table, &mut ruleset);
-                        }
-                    }
-                    "links" => {
-                        if let Value::Clause(children) = &leaf.value {
-                            extract_links(children, ast, table, &mut ruleset);
-                        }
-                    }
-                    "scopes" => {
-                        if let Value::Clause(children) = &leaf.value {
-                            extract_scope_defs(children, ast, table, &mut ruleset);
-                        }
-                    }
-                    _ => {
-                        process_root_leaf(key, leaf, ast, table, comments, &mut ruleset);
+                "enums" => {
+                    if let Value::Clause(children) = &leaf.value {
+                        extract_enums_from_children(children, ast, table, &mut ruleset);
                     }
                 }
+                "values" => {
+                    if let Value::Clause(children) = &leaf.value {
+                        extract_values_from_children(children, ast, table, &mut ruleset);
+                    }
+                }
+                "modifiers" => {
+                    if let Value::Clause(children) = &leaf.value {
+                        extract_modifier_names(children, ast, table, &mut ruleset);
+                    }
+                }
+                "links" => {
+                    if let Value::Clause(children) = &leaf.value {
+                        extract_links(children, ast, table, &mut ruleset);
+                    }
+                }
+                "scopes" => {
+                    if let Value::Clause(children) = &leaf.value {
+                        extract_scope_defs(children, ast, table, &mut ruleset);
+                    }
+                }
+                _ => {
+                    process_root_leaf(key, leaf, ast, table, comments, &mut ruleset);
+                }
             }
-            _ => {}
         }
     }
     ruleset
-}
-
-fn process_root_node(
-    key: String,
-    node: &cwtools_parser::ast::Node,
-    ast: &ParsedFile,
-    table: &StringTable,
-    comments: &[String],
-    ruleset: &mut RuleSet,
-) {
-    if key.starts_with("alias[") {
-        if let Some((category, _alias_name)) = get_alias_settings(&key, "alias") {
-            let full_name = format!("{}:{}", category, _alias_name);
-            let rule = node_to_noderule(node, ast, table, ruleset);
-            let opts = options_from_comments(comments, false);
-            ruleset.aliases.push((
-                full_name,
-                (
-                    RuleType::NodeRule {
-                        left: NewField::AliasField(category),
-                        rules: rule,
-                    },
-                    opts,
-                ),
-            ));
-        }
-    } else if key.starts_with("single_alias[") {
-        if let Some(alias_name) = get_setting_from_string(&key, "single_alias") {
-            let rule = node_to_noderule(node, ast, table, ruleset);
-            let opts = options_from_comments(comments, false);
-            ruleset.single_aliases.push((
-                alias_name.clone(),
-                (
-                    RuleType::NodeRule {
-                        left: NewField::SingleAliasField(alias_name),
-                        rules: rule,
-                    },
-                    opts,
-                ),
-            ));
-        }
-    } else {
-        let rule = build_rule_from_node(node, ast, table, ruleset);
-        let opts = options_from_comments(comments, false);
-        ruleset
-            .root_rules
-            .push(RootRule::TypeRule(key, (rule, opts)));
-    }
 }
 
 fn process_root_leaf(
@@ -233,19 +161,6 @@ fn leaf_is_eqeq(leaf: &cwtools_parser::ast::Leaf) -> bool {
     leaf.op == cwtools_parser::ast::Operator::EqualEqual
 }
 
-fn build_rule_from_node(
-    node: &cwtools_parser::ast::Node,
-    ast: &ParsedFile,
-    table: &StringTable,
-    ruleset: &mut RuleSet,
-) -> RuleType {
-    let inner = node_to_noderule(node, ast, table, ruleset);
-    RuleType::NodeRule {
-        left: NewField::SpecificField(table.get_string(node.key.normal).unwrap_or_default()),
-        rules: inner,
-    }
-}
-
 fn leaf_to_rule(
     leaf: &cwtools_parser::ast::Leaf,
     ast: &ParsedFile,
@@ -269,15 +184,6 @@ fn leaf_to_rule(
             RuleType::LeafRule { left, right }
         }
     }
-}
-
-fn node_to_noderule(
-    node: &cwtools_parser::ast::Node,
-    ast: &ParsedFile,
-    table: &StringTable,
-    ruleset: &mut RuleSet,
-) -> Vec<NewRule> {
-    children_to_rules(&node.children, ast, table, ruleset)
 }
 
 // `ruleset` is threaded so nested rules can register types/enums as the engine
@@ -350,41 +256,6 @@ pub(crate) fn children_to_rules(
                 };
                 rules.push((rule, opts));
             }
-            Child::Node(nidx) => {
-                let node = &ast.arena.nodes[*nidx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
-
-                if key.starts_with("subtype[") {
-                    if let Some(st_name) = extract_bracket_content(&key, "subtype") {
-                        let positive = !st_name.starts_with('!');
-                        let name = if positive {
-                            st_name
-                        } else {
-                            st_name[1..].to_string()
-                        };
-                        let inner = children_to_rules(&node.children, ast, table, ruleset);
-                        rules.push((
-                            RuleType::SubtypeRule {
-                                name,
-                                positive,
-                                rules: inner,
-                            },
-                            options_from_comments(comments, false),
-                        ));
-                    }
-                    continue;
-                }
-
-                let opts = options_from_comments(comments, false);
-                let inner = children_to_rules(&node.children, ast, table, ruleset);
-                rules.push((
-                    RuleType::NodeRule {
-                        left: field_from_string(&key),
-                        rules: inner,
-                    },
-                    opts,
-                ));
-            }
             Child::LeafValue(lvidx) => {
                 let lv = &ast.arena.leaf_values[*lvidx as usize];
                 if let Value::Clause(clause_ch) = &lv.value {
@@ -413,7 +284,11 @@ pub(crate) fn children_to_rules(
     rules
 }
 
-/// Build colour sub-rules for colour[rgb] / colour[hsv] inline expansion.
+/// Build colour sub-rules for the inline `colour[rgb]` / `colour[hsv]` RHS
+/// syntax (int 0-255 / float 0-2, 3-4 values). Distinct from the
+/// `colour_field` MARKER expanded in `post_process::expand_colour_rule`
+/// (float -256..256, exactly 3) — two different .cwt constructs with
+/// deliberately different ranges, not a duplicate.
 fn build_colour_rules(colour_spec: &str) -> Vec<NewRule> {
     let inner = if colour_spec.starts_with("colour[") && colour_spec.ends_with(']') {
         &colour_spec[7..colour_spec.len() - 1]

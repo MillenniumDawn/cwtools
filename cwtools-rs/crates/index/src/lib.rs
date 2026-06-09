@@ -110,7 +110,10 @@ impl FileIndex {
 /// `morale@GER` both resolve to `morale`. Empty unless the CLI populated it.
 #[derive(Debug, Default)]
 pub struct VarIndex {
-    names: HashSet<String>,
+    /// Normalized variable name → how many definitions carry it. A refcount so the
+    /// LSP can drop a name on `clear_file` only when its last definition goes,
+    /// while the bulk CLI path (which never removes) just keeps incrementing.
+    names: HashMap<String, usize>,
 }
 
 impl VarIndex {
@@ -141,19 +144,34 @@ impl VarIndex {
     pub fn add_name(&mut self, raw: &str) {
         let n = Self::normalize(raw);
         if !n.is_empty() {
-            self.names.insert(n);
+            *self.names.entry(n).or_insert(0) += 1;
+        }
+    }
+
+    /// Drop one definition of a name; removes the entry when its refcount hits 0.
+    /// Used by the LSP's per-file `clear_file` so re-indexing a file refreshes its
+    /// variables instead of leaking the old set.
+    pub fn remove_name(&mut self, raw: &str) {
+        let n = Self::normalize(raw);
+        if let Some(count) = self.names.get_mut(&n) {
+            *count -= 1;
+            if *count == 0 {
+                self.names.remove(&n);
+            }
         }
     }
 
     /// Whether a raw reference resolves to a known defined variable.
     pub fn contains(&self, raw: &str) -> bool {
-        self.names.contains(&Self::normalize(raw))
+        self.names.contains_key(&Self::normalize(raw))
     }
 
     /// Fold another index's names into this one (e.g. base-game variables into
     /// the mod's index).
     pub fn merge(&mut self, other: &VarIndex) {
-        self.names.extend(other.names.iter().cloned());
+        for (name, count) in &other.names {
+            *self.names.entry(name.clone()).or_insert(0) += count;
+        }
     }
 }
 
@@ -275,13 +293,15 @@ impl TypeIndex {
 
 // ── Path matching ─────────────────────────────────────────────────────────────
 
-/// True if `pat` occurs in `dir` as a whole path segment (or run of segments),
-/// e.g. `gfx/models` is contained in `dlc/dlc022/gfx/models/units`. Mirrors the
-/// validation side (`find_type_by_path_and_key` → `path_contains_segment`) so a
-/// file is INDEXED by the same type that VALIDATES it. A bare `starts_with` would
-/// miss base-game content nested under `dlc/<id>/…`, leaving its instances
-/// unindexed while the referencing files still validate (false CW500s).
-fn dir_contains_segment(haystack: &str, needle: &str) -> bool {
+/// True if `needle` occurs in `haystack` as a whole path segment (or run of
+/// segments), e.g. `gfx/models` is contained in `dlc/dlc022/gfx/models/units`.
+/// Both inputs must already be lowercased and use '/' separators. This is THE
+/// segment scan for both the indexer and the validator
+/// (`cwtools_validation::resolve` imports it), so a file is INDEXED by the same
+/// type that VALIDATES it. A bare `starts_with` would miss base-game content
+/// nested under `dlc/<id>/…`, leaving its instances unindexed while the
+/// referencing files still validate (false CW500s).
+pub fn path_contains_segment(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
@@ -303,6 +323,24 @@ fn dir_contains_segment(haystack: &str, needle: &str) -> bool {
         }
     }
     false
+}
+
+/// The one per-pattern directory test shared by the indexer (`check_path_dir`)
+/// and the validator (`find_type_by_path_and_key` / `type_path_matches`).
+/// `path_strict` means the file sits DIRECTLY in the pattern directory: the dir
+/// must equal the pattern or end with `/<pattern>` (so base-game content nested
+/// under `dlc/<id>/…` still matches). Non-strict allows the pattern anywhere as
+/// a whole segment run. Both inputs must be lowercased, '/'-separated, with no
+/// trailing slash.
+pub fn dir_matches_pattern(dir_lower: &str, pat_lower: &str, strict: bool) -> bool {
+    if strict {
+        dir_lower == pat_lower
+            || (dir_lower.len() > pat_lower.len()
+                && dir_lower.ends_with(pat_lower)
+                && dir_lower.as_bytes()[dir_lower.len() - pat_lower.len() - 1] == b'/')
+    } else {
+        path_contains_segment(dir_lower, pat_lower)
+    }
 }
 
 /// Returns true when `logical_path` (e.g. `"events/my_events.txt"`) is covered
@@ -367,11 +405,7 @@ pub fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
             let pat = p.replace('\\', "/");
             let pat = pat.trim_matches('/');
             let pat_lower = pat.to_lowercase();
-            if opts.path_strict {
-                if dir_lower == pat_lower {
-                    return true;
-                }
-            } else if dir_contains_segment(&dir_lower, &pat_lower) {
+            if dir_matches_pattern(&dir_lower, &pat_lower, opts.path_strict) {
                 return true;
             }
         }
@@ -379,11 +413,7 @@ pub fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
     }
 
     for pat_lower in &opts.paths_lower {
-        if opts.path_strict {
-            if dir_lower == *pat_lower {
-                return true;
-            }
-        } else if dir_contains_segment(&dir_lower, pat_lower) {
+        if dir_matches_pattern(&dir_lower, pat_lower, opts.path_strict) {
             return true;
         }
     }
@@ -463,7 +493,7 @@ fn instance_name_from_children(
 }
 
 /// Recurse through skip_root_key layers, then collect matching instances.
-/// `child` is a single top-level child (can be Node or Leaf-with-Clause).
+/// `child` is a single top-level child (must be a keyed clause).
 fn collect_skip_root_child(
     td: &TypeDefinition,
     skip_stack: &[SkipRootKey],
@@ -472,28 +502,12 @@ fn collect_skip_root_child(
     table: &StringTable,
     out: &mut Vec<TypeInstance>,
 ) {
-    // Extract key, children-slice, and position from either Node or Leaf(Clause)
-    let (key, clause_children, start_line, start_col): (String, &[Child], u32, u16) = match child {
-        Child::Node(ni) => {
-            let node = &arena.nodes[*ni as usize];
-            let k = table.get_string(node.key.normal).unwrap_or_default();
-            (
-                k,
-                node.children.as_slice(),
-                node.pos.start.line,
-                node.pos.start.col,
-            )
-        }
-        Child::Leaf(li) => {
-            let leaf = &arena.leaves[*li as usize];
-            let k = table.get_string(leaf.key.normal).unwrap_or_default();
-            match &leaf.value {
-                Value::Clause(ch) => (k, ch.as_slice(), leaf.pos.start.line, leaf.pos.start.col),
-                _ => return, // not a clause leaf — skip
-            }
-        }
-        _ => return,
+    let Some(kc) = arena.keyed_clause(child) else {
+        return; // not a keyed clause — skip
     };
+    let key = table.get_string(kc.key.normal).unwrap_or_default();
+    let (clause_children, start_line, start_col) =
+        (kc.children, kc.pos.start.line, kc.pos.start.col);
 
     match skip_stack {
         [] => {
@@ -616,6 +630,10 @@ pub struct DefinedVariable {
     pub name: String,
     pub namespace: Option<String>, // value_set namespace, if any
     pub location: SourceLocation,
+    /// The value assigned at this definition site, when the rule shape provides
+    /// one (`set_variable = { var = x value = 5 }` or shorthand
+    /// `set_variable = { x = 5 }`). `None` when no value is statically known.
+    pub value: Option<String>,
 }
 
 // (collect_defined_variables and collect_vars_recursive deleted: no production
@@ -661,11 +679,13 @@ pub fn collect_defined_variables_from_rules(
                     continue;
                 }
                 if let RuleType::NodeRule { rules, .. } = rule_type {
-                    // Scan all file children against these rules
+                    // Scan each root instance's children against these rules.
+                    // Root instances are Leaf+Clause from the live parser (Node
+                    // only from legacy cache shapes); keyed_clause handles both.
                     for child in &file.root_children {
-                        if let Child::Node(ni) = child {
-                            scan_node_for_varset(
-                                *ni as usize,
+                        if let Some(kc) = file.arena.keyed_clause(child) {
+                            scan_children_for_varset(
+                                kc.children,
                                 &file.arena,
                                 table,
                                 rules,
@@ -688,37 +708,54 @@ fn collect_at_vars(
     out: &mut HashMap<String, Vec<DefinedVariable>>,
 ) {
     for child in children {
-        match child {
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                if key.starts_with('@') {
-                    out.entry("@".to_string())
-                        .or_default()
-                        .push(DefinedVariable {
-                            name: key.clone(),
-                            namespace: None,
-                            location: SourceLocation {
-                                line: leaf.pos.start.line,
-                                col: leaf.pos.start.col,
-                            },
-                        });
-                }
-                if let Value::Clause(ch) = &leaf.value {
-                    collect_at_vars(ch, arena, table, out);
-                }
+        if let Child::Leaf(idx) = child {
+            let leaf = &arena.leaves[*idx as usize];
+            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            if key.starts_with('@') {
+                let value = leaf_value_string(&leaf.value, table);
+                out.entry("@".to_string())
+                    .or_default()
+                    .push(DefinedVariable {
+                        name: key.clone(),
+                        namespace: None,
+                        location: SourceLocation {
+                            line: leaf.pos.start.line,
+                            col: leaf.pos.start.col,
+                        },
+                        value: (!value.is_empty()).then_some(value),
+                    });
             }
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                collect_at_vars(&node.children, arena, table, out);
+            if let Value::Clause(ch) = &leaf.value {
+                collect_at_vars(ch, arena, table, out);
             }
-            _ => {}
         }
     }
 }
 
-fn scan_node_for_varset(
-    node_idx: usize,
+/// The value of a `value`/`amount`/`add` child leaf in `children`, used to
+/// recover the assigned value for the explicit `var = X / value = Y` form.
+fn sibling_value_in_children(
+    children: &[Child],
+    arena: &Arena,
+    table: &StringTable,
+) -> Option<String> {
+    for child in children {
+        if let Child::Leaf(li) = child {
+            let leaf = &arena.leaves[*li as usize];
+            let k = table.get_string(leaf.key.normal).unwrap_or_default();
+            if matches!(k.to_ascii_lowercase().as_str(), "value" | "amount" | "add") {
+                let v = leaf_value_string(&leaf.value, table);
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn scan_children_for_varset(
+    children: &[Child],
     arena: &Arena,
     table: &StringTable,
     rules: &[(
@@ -727,8 +764,54 @@ fn scan_node_for_varset(
     )],
     out: &mut HashMap<String, Vec<DefinedVariable>>,
 ) {
-    let node = &arena.nodes[node_idx];
-    for child in &node.children {
+    // For the explicit `var = value_set[variable] / value = variable_field` form
+    // the assigned value lives in a sibling `value` leaf of the same block. Find
+    // it once so the var-defining leaf can record it.
+    let sibling_value = sibling_value_in_children(children, arena, table);
+    for child in children {
+        // A keyed clause (`key = { ... }`) is a Leaf+Clause from the live parser
+        // (a Node only from legacy cache shapes); both take the NodeRule path.
+        if let Some(kc) = arena.keyed_clause(child) {
+            let child_key = table.get_string(kc.key.normal).unwrap_or_default();
+            for (rule_type, _) in rules {
+                // NodeRule(VariableSetField): the clause's key IS the defined
+                // variable name (F# InfoService fNode).
+                if let RuleType::NodeRule {
+                    left: NewField::VariableSetField(ns),
+                    ..
+                } = rule_type
+                {
+                    if !child_key.is_empty() {
+                        out.entry(ns.clone()).or_default().push(DefinedVariable {
+                            name: child_key.clone(),
+                            namespace: Some(ns.clone()),
+                            location: SourceLocation {
+                                line: kc.pos.start.line,
+                                col: kc.pos.start.col,
+                            },
+                            value: None,
+                        });
+                    }
+                } else if let RuleType::NodeRule {
+                    left: NewField::SpecificField(expected_key),
+                    rules: inner,
+                    ..
+                } = rule_type
+                {
+                    // Only recurse when the child's key matches the rule's
+                    // expected key. Previously ALL NodeRules were applied to
+                    // every child node, recording junk variable names.
+                    if child_key.eq_ignore_ascii_case(expected_key) {
+                        scan_children_for_varset(kc.children, arena, table, inner, out);
+                    }
+                } else if let RuleType::NodeRule { rules: inner, .. } = rule_type {
+                    // Non-SpecificField node rule (e.g. alias or scalar key):
+                    // recurse unconditionally as before.
+                    scan_children_for_varset(kc.children, arena, table, inner, out);
+                }
+            }
+            continue;
+        }
         match child {
             Child::Leaf(li) => {
                 let leaf = &arena.leaves[*li as usize];
@@ -737,8 +820,10 @@ fn scan_node_for_varset(
                 for (rule_type, _opts) in rules {
                     match rule_type {
                         // left = VariableSetField: the leaf's key IS the defined
-                        // variable name. Only applies when the rule's left is a
-                        // pure variable-set field (no specific key to match against).
+                        // variable name, and its RHS is the assigned value
+                        // (shorthand `set_variable = { my_var = 5 }`). Only applies
+                        // when the rule's left is a pure variable-set field (no
+                        // specific key to match against).
                         RuleType::LeafRule {
                             left: NewField::VariableSetField(ns),
                             ..
@@ -750,12 +835,13 @@ fn scan_node_for_varset(
                                     line: leaf.pos.start.line,
                                     col: leaf.pos.start.col,
                                 },
+                                value: (!val.is_empty()).then(|| val.clone()),
                             });
                         }
                         // right = VariableSetField: the leaf's VALUE is the defined
-                        // variable name, but only when the leaf's key matches the
-                        // rule's expected key (SpecificField). Without this guard
-                        // every leaf in the block was incorrectly recorded.
+                        // variable name (explicit `var = my_var`), but only when the
+                        // leaf's key matches the rule's expected key (SpecificField).
+                        // The assigned value comes from the sibling `value` leaf.
                         RuleType::LeafRule {
                             left: NewField::SpecificField(expected_key),
                             right: NewField::VariableSetField(ns),
@@ -767,32 +853,34 @@ fn scan_node_for_varset(
                                     line: leaf.pos.start.line,
                                     col: leaf.pos.start.col,
                                 },
+                                value: sibling_value.clone(),
                             });
                         }
                         _ => {}
                     }
                 }
             }
-            Child::Node(ni) => {
-                let child_node = &arena.nodes[*ni as usize];
-                let child_key = table.get_string(child_node.key.normal).unwrap_or_default();
-                for (rule_type, _) in rules {
-                    if let RuleType::NodeRule {
-                        left: NewField::SpecificField(expected_key),
-                        rules: inner,
-                        ..
-                    } = rule_type
-                    {
-                        // Only recurse when the child's key matches the rule's
-                        // expected key. Previously ALL NodeRules were applied to
-                        // every child node, recording junk variable names.
-                        if child_key.eq_ignore_ascii_case(expected_key) {
-                            scan_node_for_varset(*ni as usize, arena, table, inner, out);
+            // LeafValueRule(VariableSetField): a bare value inside a block is the
+            // defined variable name (F# InfoService fLeafValue).
+            Child::LeafValue(lvi) => {
+                let lv = &arena.leaf_values[*lvi as usize];
+                let val = leaf_value_string(&lv.value, table);
+                if !val.is_empty() {
+                    for (rule_type, _opts) in rules {
+                        if let RuleType::LeafValueRule {
+                            right: NewField::VariableSetField(ns),
+                        } = rule_type
+                        {
+                            out.entry(ns.clone()).or_default().push(DefinedVariable {
+                                name: val.clone(),
+                                namespace: Some(ns.clone()),
+                                location: SourceLocation {
+                                    line: lv.pos.start.line,
+                                    col: lv.pos.start.col,
+                                },
+                                value: None,
+                            });
                         }
-                    } else if let RuleType::NodeRule { rules: inner, .. } = rule_type {
-                        // Non-SpecificField node rule (e.g. alias or scalar key):
-                        // recurse unconditionally as before.
-                        scan_node_for_varset(*ni as usize, arena, table, inner, out);
                     }
                 }
             }
@@ -846,9 +934,40 @@ pub fn collect_set_variable_names(
     effects: &HashSet<String>,
     out: &mut Vec<String>,
 ) {
-    fn extract(children: &[Child], arena: &Arena, table: &StringTable, out: &mut Vec<String>) {
-        // Explicit form: a `var`/`variable` child holds the name as its value.
+    let mut defs = Vec::new();
+    collect_set_variable_defs(file, table, effects, &mut defs);
+    out.extend(defs.into_iter().map(|d| d.name));
+}
+
+/// Like [`collect_set_variable_names`] but keeps each definition's source
+/// location and, where the block provides one, its assigned value (the `value`
+/// child for the explicit form, or the RHS for the shorthand form). Used by the
+/// LSP so hover/goto can point at a variable's definition and show its value.
+pub fn collect_set_variable_defs(
+    file: &ParsedFile,
+    table: &StringTable,
+    effects: &HashSet<String>,
+    out: &mut Vec<DefinedVariable>,
+) {
+    fn def(name: String, value: Option<String>, line: u32, col: u16) -> DefinedVariable {
+        DefinedVariable {
+            name,
+            namespace: Some("variable".to_string()),
+            location: SourceLocation { line, col },
+            value,
+        }
+    }
+
+    fn extract(
+        children: &[Child],
+        arena: &Arena,
+        table: &StringTable,
+        out: &mut Vec<DefinedVariable>,
+    ) {
+        // Explicit form: a `var`/`variable` child holds the name as its value;
+        // the assigned value (if any) is the sibling `value`/`amount`/`add` leaf.
         let mut explicit = false;
+        let sibling_value = sibling_value_in_children(children, arena, table);
         for child in children {
             if let Child::Leaf(li) = child {
                 let leaf = &arena.leaves[*li as usize];
@@ -856,7 +975,12 @@ pub fn collect_set_variable_names(
                 if key.eq_ignore_ascii_case("var") || key.eq_ignore_ascii_case("variable") {
                     let v = leaf_value_string(&leaf.value, table);
                     if !v.is_empty() {
-                        out.push(v);
+                        out.push(def(
+                            v,
+                            sibling_value.clone(),
+                            leaf.pos.start.line,
+                            leaf.pos.start.col,
+                        ));
                     }
                     explicit = true;
                 }
@@ -865,22 +989,28 @@ pub fn collect_set_variable_names(
         if explicit {
             return;
         }
-        // Shorthand form: the inner assignment key is the variable name.
+        // Shorthand form: the inner assignment key is the variable name and its
+        // RHS (if a leaf) is the assigned value.
         for child in children {
-            let key = match child {
-                Child::Leaf(li) => table
-                    .get_string(arena.leaves[*li as usize].key.normal)
-                    .unwrap_or_default(),
-                Child::Node(ni) => table
-                    .get_string(arena.nodes[*ni as usize].key.normal)
-                    .unwrap_or_default(),
+            let (key, value, line, col) = match child {
+                Child::Leaf(li) => {
+                    let leaf = &arena.leaves[*li as usize];
+                    let k = table.get_string(leaf.key.normal).unwrap_or_default();
+                    let v = leaf_value_string(&leaf.value, table);
+                    (
+                        k,
+                        (!v.is_empty()).then_some(v),
+                        leaf.pos.start.line,
+                        leaf.pos.start.col,
+                    )
+                }
                 _ => continue,
             };
             if !matches!(
                 key.to_ascii_lowercase().as_str(),
                 "value" | "tooltip" | "var" | "variable" | "amount" | "which"
             ) {
-                out.push(key);
+                out.push(def(key, value, line, col));
             }
         }
     }
@@ -890,29 +1020,18 @@ pub fn collect_set_variable_names(
         arena: &Arena,
         table: &StringTable,
         effects: &HashSet<String>,
-        out: &mut Vec<String>,
+        out: &mut Vec<DefinedVariable>,
     ) {
         for child in children {
-            match child {
-                Child::Leaf(li) => {
-                    let leaf = &arena.leaves[*li as usize];
-                    if let Value::Clause(ch) = &leaf.value {
-                        let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                        if effects.contains(&key.to_ascii_lowercase()) {
-                            extract(ch, arena, table, out);
-                        }
-                        walk(ch, arena, table, effects, out);
-                    }
-                }
-                Child::Node(ni) => {
-                    let node = &arena.nodes[*ni as usize];
-                    let key = table.get_string(node.key.normal).unwrap_or_default();
+            if let Child::Leaf(li) = child {
+                let leaf = &arena.leaves[*li as usize];
+                if let Value::Clause(ch) = &leaf.value {
+                    let key = table.get_string(leaf.key.normal).unwrap_or_default();
                     if effects.contains(&key.to_ascii_lowercase()) {
-                        extract(&node.children, arena, table, out);
+                        extract(ch, arena, table, out);
                     }
-                    walk(&node.children, arena, table, effects, out);
+                    walk(ch, arena, table, effects, out);
                 }
-                _ => {}
             }
         }
     }

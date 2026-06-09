@@ -12,49 +12,29 @@ pub(crate) fn extract_modifier_names(
     ruleset: &mut RuleSet,
 ) {
     for child in children {
-        let name = match child {
-            Child::Leaf(lidx) => table
-                .get_string(ast.arena.leaves[*lidx as usize].key.normal)
-                .unwrap_or_default(),
-            Child::Node(nidx) => table
-                .get_string(ast.arena.nodes[*nidx as usize].key.normal)
-                .unwrap_or_default(),
-            _ => continue,
+        let Child::Leaf(lidx) = child else {
+            continue;
         };
+        let name = table
+            .get_string(ast.arena.leaves[*lidx as usize].key.normal)
+            .unwrap_or_default();
         if !name.is_empty() {
             ruleset.modifiers.push(name);
         }
     }
 }
 
-/// The `(key, body-children)` of a `key = { ... }` config entry, stored by this
-/// parser as either a `Node` or a `Leaf` with a `Clause` value. Key is unquoted.
+/// The `(key, body-children)` of a `key = { ... }` config entry. Key is unquoted.
 fn entry_body<'a>(
     child: &Child,
     ast: &'a ParsedFile,
     table: &StringTable,
 ) -> Option<(String, &'a [Child])> {
-    match child {
-        Child::Node(nidx) => {
-            let n = &ast.arena.nodes[*nidx as usize];
-            Some((
-                table.get_string(n.key.normal).unwrap_or_default(),
-                n.children.as_slice(),
-            ))
-        }
-        Child::Leaf(lidx) => {
-            let l = &ast.arena.leaves[*lidx as usize];
-            if let Value::Clause(ch) = &l.value {
-                Some((
-                    table.get_string(l.key.normal).unwrap_or_default(),
-                    ch.as_slice(),
-                ))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+    let kc = ast.arena.keyed_clause(child)?;
+    Some((
+        table.get_string(kc.key.normal).unwrap_or_default(),
+        kc.children,
+    ))
 }
 
 /// Bare values inside a child `key = { a b c }` clause (e.g. `aliases`, `input_scopes`).
@@ -65,20 +45,11 @@ fn child_clause_values(
     key: &str,
 ) -> Vec<String> {
     for child in children {
-        match child {
-            Child::Leaf(lidx) => {
-                let l = &ast.arena.leaves[*lidx as usize];
-                if table.get_string(l.key.normal).unwrap_or_default() == key {
-                    return collect_leaf_values_from_clause(&l.value, ast, table);
-                }
+        if let Child::Leaf(lidx) = child {
+            let l = &ast.arena.leaves[*lidx as usize];
+            if table.get_string(l.key.normal).unwrap_or_default() == key {
+                return collect_leaf_values_from_clause(&l.value, ast, table);
             }
-            Child::Node(nidx) => {
-                let n = &ast.arena.nodes[*nidx as usize];
-                if table.get_string(n.key.normal).unwrap_or_default() == key {
-                    return collect_leaf_values_from_children(&n.children, ast, table);
-                }
-            }
-            _ => {}
         }
     }
     Vec::new()
