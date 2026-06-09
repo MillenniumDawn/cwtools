@@ -8,7 +8,6 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use cwtools_info::TypeIndex;
 use cwtools_info::{
     PositionElement, ReferenceHint, TypeInstance, element_at_position, info_at_position,
 };
@@ -2436,6 +2435,20 @@ impl Backend {
             // Build enum_map once for the batch; it borrows `scan_ruleset`,
             // which is owned for the whole parallel section above.
             let enum_map = scan_ruleset.as_ref().map(|rs| build_enum_map(rs));
+            // One Prepared for the whole batch (None if the ruleset isn't loaded).
+            // It is Copy + all-borrows, so it is shared freely across rayon threads.
+            let prepared = scan_ruleset.as_ref().zip(enum_map.as_ref()).map(
+                |(ruleset, enum_map)| Prepared {
+                    ruleset,
+                    table: &self.state.string_table,
+                    game: scan_game,
+                    type_index: Some(type_index),
+                    modifier_keys: Some(&modifier_keys_snap),
+                    loc_index,
+                    registry,
+                    enum_map,
+                },
+            );
 
             files_to_validate
                 .par_iter()
@@ -2444,24 +2457,9 @@ impl Backend {
                     // Skip files that failed to parse in pass 1.
                     let parsed = parsed_opt.as_ref()?;
                     let uri = format!("file://{}", file_path.display());
-                    let diagnostics = match (scan_ruleset.as_ref(), enum_map.as_ref()) {
-                        (Some(ruleset), Some(enum_map)) => validate_parsed_with_indexes(
-                            &uri,
-                            parsed,
-                            &modifier_keys_snap,
-                            ruleset,
-                            scan_game,
-                            registry,
-                            enum_map,
-                            type_index,
-                            loc_index,
-                            &self.state.string_table,
-                        ),
-                        _ => parsed
-                            .errors
-                            .iter()
-                            .map(parse_error_to_diagnostic)
-                            .collect(),
+                    let diagnostics = match &prepared {
+                        Some(prepared) => validate_parsed_with_indexes(&uri, parsed, prepared),
+                        None => parsed.errors.iter().map(parse_error_to_diagnostic).collect(),
                     };
                     Some((uri, diagnostics))
                 })
@@ -2720,14 +2718,16 @@ impl Backend {
         validate_parsed_with_indexes(
             uri,
             parsed,
-            modifier_keys,
-            ruleset,
-            game,
-            registry,
-            enum_map,
-            &info_guard.type_index,
-            loc_guard.as_ref(),
-            &self.state.string_table,
+            &Prepared {
+                ruleset,
+                table: &self.state.string_table,
+                game,
+                type_index: Some(&info_guard.type_index),
+                modifier_keys: Some(modifier_keys),
+                loc_index: loc_guard.as_ref(),
+                registry,
+                enum_map,
+            },
         )
     }
 
@@ -3326,12 +3326,14 @@ fn scan_use_sites(
         scan_ast_for_type_ref(
             &ast.root_children,
             &ast.arena,
-            type_name,
-            instance_name,
-            file_uri,
-            ruleset,
-            &logical_path,
-            string_table,
+            &TypeRefSearch {
+                type_name,
+                instance_name,
+                file_uri,
+                ruleset,
+                logical_path: &logical_path,
+                table: string_table,
+            },
             &mut results,
         );
     }
@@ -3341,19 +3343,33 @@ fn scan_use_sites(
 
 /// Recursively walk children and record leaves whose value classifies as a
 /// TypeRef for the specified type+name.
-#[allow(clippy::too_many_arguments)]
+/// What [`scan_ast_for_type_ref`] is looking for: the reference target plus the
+/// rules/table/path needed to classify a candidate. Invariant across the walk of
+/// one file, so it is threaded by reference through the recursion.
+struct TypeRefSearch<'a> {
+    type_name: &'a str,
+    instance_name: &'a str,
+    file_uri: &'a str,
+    ruleset: &'a RuleSet,
+    logical_path: &'a str,
+    table: &'a StringTable,
+}
+
 fn scan_ast_for_type_ref(
     children: &[cwtools_parser::ast::Child],
     arena: &cwtools_parser::ast::Arena,
-    type_name: &str,
-    instance_name: &str,
-    file_uri: &str,
-    ruleset: &RuleSet,
-    logical_path: &str,
-    table: &cwtools_string_table::string_table::StringTable,
+    search: &TypeRefSearch,
     out: &mut Vec<(String, cwtools_info::SourceLocation)>,
 ) {
     use cwtools_parser::ast::{Child, Value};
+    let &TypeRefSearch {
+        type_name,
+        instance_name,
+        file_uri,
+        ruleset,
+        logical_path,
+        table,
+    } = search;
 
     for child in children {
         match child {
@@ -3380,32 +3396,12 @@ fn scan_ast_for_type_ref(
                 }
                 // Recurse into clause values
                 if let Value::Clause(ch) = &leaf.value {
-                    scan_ast_for_type_ref(
-                        ch,
-                        arena,
-                        type_name,
-                        instance_name,
-                        file_uri,
-                        ruleset,
-                        logical_path,
-                        table,
-                        out,
-                    );
+                    scan_ast_for_type_ref(ch, arena, search, out);
                 }
             }
             Child::Node(idx) => {
                 let node = &arena.nodes[*idx as usize];
-                scan_ast_for_type_ref(
-                    &node.children,
-                    arena,
-                    type_name,
-                    instance_name,
-                    file_uri,
-                    ruleset,
-                    logical_path,
-                    table,
-                    out,
-                );
+                scan_ast_for_type_ref(&node.children, arena, search, out);
             }
             Child::LeafValue(idx) => {
                 let lv = &arena.leaf_values[*idx as usize];
@@ -3518,43 +3514,21 @@ fn collect_doc_tokens(ast: &ParsedFile, table: &StringTable) -> HashSet<String> 
     tokens
 }
 
-/// Validate one already-parsed file against caller-supplied indexes, returning
-/// LSP diagnostics. The `type_index` / `loc_index` references are passed in (not
-/// re-locked here) so the full-workspace pass can take a single read guard and
-/// share it across rayon threads — `&TypeIndex` / `&LocIndex` are `Sync`. This
-/// is the lock-free core of [`Backend::validate_parsed_prebuilt`].
-#[allow(clippy::too_many_arguments)]
+/// Validate one already-parsed file against a caller-supplied [`Prepared`],
+/// returning LSP diagnostics. The prebuilt state is passed in (not re-locked
+/// here) so the full-workspace pass can take its read guards once and share the
+/// `Prepared` across rayon threads — it is `Copy` and all-borrows, so `Sync`.
 fn validate_parsed_with_indexes(
     uri: &str,
     parsed: &ParsedFile,
-    modifier_keys: &std::collections::HashSet<String>,
-    ruleset: &RuleSet,
-    game: Option<cwtools_game::constants::Game>,
-    registry: Option<&std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
-    enum_map: &std::collections::HashMap<&str, &cwtools_rules::rules_types::EnumDefinition>,
-    type_index: &TypeIndex,
-    loc_index: Option<&cwtools_localization::LocIndex>,
-    string_table: &StringTable,
+    prepared: &Prepared,
 ) -> Vec<Diagnostic> {
     let mut diagnostics: Vec<Diagnostic> = parsed
         .errors
         .iter()
         .map(parse_error_to_diagnostic)
         .collect();
-    let mut errs = validate_prepared(
-        parsed,
-        uri,
-        &Prepared {
-            ruleset,
-            table: string_table,
-            game,
-            type_index: Some(type_index),
-            modifier_keys: Some(modifier_keys),
-            loc_index,
-            registry,
-            enum_map,
-        },
-    );
+    let mut errs = validate_prepared(parsed, uri, prepared);
     const MAX_ERRORS: usize = 100;
     let total = errs.len();
     if total > MAX_ERRORS {
