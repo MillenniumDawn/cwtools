@@ -1,5 +1,0 @@
-##Test events to be overwritten
-namespace = test
-country_event = {
-    set = test_var
-}

@@ -14,12 +14,6 @@ use cwtools_info::vanilla_cache;
 #[command(name = "cwtools")]
 #[command(about = "CWTools CLI — Paradox mod tooling")]
 struct Cli {
-    /// Engine to run: "rust" (default, this binary) or "fsharp" (delegates to the
-    /// original CWToolsCLI.dll via `dotnet`). The F# engine currently supports
-    /// only the `validate` subcommand. Locate the dll via the CWTOOLS_FSHARP_CLI
-    /// env var (path to CWToolsCLI.dll).
-    #[arg(long, global = true, default_value = "rust")]
-    engine: String,
     #[command(subcommand)]
     command: Commands,
 }
@@ -210,95 +204,11 @@ fn print_ruleset_summary(ruleset: &cwtools_rules::rules_types::RuleSet) {
     println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
 }
 
-/// Locate the F# CWToolsCLI.dll: the CWTOOLS_FSHARP_CLI env var wins, otherwise
-/// try a couple of conventional build-output paths relative to the cwd.
-fn locate_fsharp_cli() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CWTOOLS_FSHARP_CLI") {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
-        }
-        eprintln!(
-            "warn: CWTOOLS_FSHARP_CLI is set but not a file: {}",
-            pb.display()
-        );
-    }
-    for c in [
-        "../artifacts/bin/CWToolsCLI/release/CWToolsCLI.dll",
-        "../artifacts/bin/CWToolsCLI/debug/CWToolsCLI.dll",
-        "artifacts/bin/CWToolsCLI/release/CWToolsCLI.dll",
-    ] {
-        let pb = PathBuf::from(c);
-        if pb.is_file() {
-            return Some(pb);
-        }
-    }
-    None
-}
-
-/// Delegate to the original F# engine (CWToolsCLI.dll over `dotnet`). Only the
-/// `validate` subcommand is supported; everything else is rust-only.
-fn run_fsharp_engine(command: &Commands) -> ! {
-    match command {
-        Commands::Validate {
-            game,
-            directory,
-            rules,
-            ..
-        } => {
-            let dll = locate_fsharp_cli().unwrap_or_else(|| {
-                eprintln!(
-                    "F# engine: CWToolsCLI.dll not found. Set CWTOOLS_FSHARP_CLI to its path, \
-                     or build it with `dotnet build CWToolsCLI/CWToolsCLI.fsproj -c Release`."
-                );
-                std::process::exit(1);
-            });
-            eprintln!("Delegating to F# engine: {}", dll.display());
-            let status = std::process::Command::new("dotnet")
-                .arg(&dll)
-                .arg("--game")
-                .arg(game)
-                .arg("--directory")
-                .arg(directory)
-                .arg("--rulespath")
-                .arg(rules)
-                .arg("validate")
-                .arg("all")
-                .status();
-            match status {
-                Ok(s) => std::process::exit(s.code().unwrap_or(1)),
-                Err(e) => {
-                    eprintln!(
-                        "F# engine: failed to launch `dotnet`: {e}. Is the .NET runtime installed and on PATH?"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        }
-        _ => {
-            eprintln!(
-                "The F# engine (--engine fsharp) only supports the `validate` subcommand. \
-                 Use --engine rust (the default) for other commands."
-            );
-            std::process::exit(2);
-        }
-    }
-}
-
 fn main() {
     // Quiet by default; set RUST_LOG or CWTOOLS_PROFILE to turn on logging /
     // profiling. See PROFILING.md and `cwtools_profiling`.
     cwtools_profiling::init_tracing();
     let cli = Cli::parse();
-
-    match cli.engine.as_str() {
-        "rust" => {}
-        "fsharp" => run_fsharp_engine(&cli.command),
-        other => {
-            eprintln!("Unknown engine '{other}'. Valid values: rust, fsharp.");
-            std::process::exit(2);
-        }
-    }
 
     match cli.command {
         Commands::Parse { file } => {

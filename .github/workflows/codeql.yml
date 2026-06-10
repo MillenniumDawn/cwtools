@@ -25,13 +25,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # F# is not a CodeQL language. C# (CSharpHelpers) and Rust (cwtools-rs)
-        # are, and the GitHub Actions pack covers the workflow files.
+        # Rust (cwtools-rs) and the GitHub Actions pack cover the workflow files.
         include:
           - language: actions
             paths: .github/workflows
-          - language: csharp
-            paths: CSharpHelpers
           - language: rust
             paths: cwtools-rs
     steps:

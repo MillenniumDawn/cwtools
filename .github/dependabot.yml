@@ -20,19 +20,6 @@ updates:
           - "minor"
           - "patch"
 
-  # F# / .NET: centralised package versions live in Directory.Packages.props,
-  # so the manifest lookup points at the repo root.
-  - package-ecosystem: "nuget"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "06:00"
-    open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
-      - "fsharp"
-
   # Keep GitHub Actions pinned to recent versions.
   - package-ecosystem: "github-actions"
     directory: "/"

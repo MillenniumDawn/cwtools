@@ -2,15 +2,6 @@ name: Release
 
 on:
   workflow_dispatch:
-    inputs:
-      username:
-        description: GitHub username of the person triggering the release
-        default: "tboby"
-        required: true
-      email:
-        description: Email of the person triggering the release
-        default: "th.boby@gmail.com"
-        required: true
 
 concurrency:
   group: release-${{ github.ref }}
@@ -20,53 +11,11 @@ permissions:
   contents: write
 
 env:
-  DOTNET_NOLOGO: "true"
-  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
   CARGO_TERM_COLOR: always
 
 jobs:
   # -------------------------------------------------------------------------
-  # F# / .NET: existing manual release path (NuGet + GitHub release).
-  # -------------------------------------------------------------------------
-  release-fs:
-    name: F# NuGet + GitHub release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref }}
-          fetch-depth: 0
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 9.0.x
-      - name: Cache NuGet packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/paket.dependencies', '**/*.fsproj', 'Directory.Packages.props', '.config/dotnet-tools.json') }}
-          restore-keys: ${{ runner.os }}-nuget-
-      - name: Set chmod
-        run: chmod +x ./build.sh
-      - name: Test and Pack
-        run: /bin/sh ./build.sh PackTools
-      - name: Upload NuGet packages artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cwtools-nugets
-          path: pkg/
-      - name: Publish Release
-        env:
-          github-user: ${{ github.event.inputs.username }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NUGET_TOKEN: ${{ secrets.NUGET_TOKEN }}
-          user-email: ${{ github.event.inputs.email }}
-        run: dotnet run --project build -- -t ReleaseGitHub
-
-  # -------------------------------------------------------------------------
-  # Rust: build release binaries for the major targets and upload as
-  # workflow run artifacts (the F# GitHub release above also attaches
-  # these manually if/when the project ships a combined release).
+  # Rust
   # -------------------------------------------------------------------------
   release-rs:
     name: Rust release binaries

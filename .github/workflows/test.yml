@@ -17,56 +17,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  DOTNET_NOLOGO: "true"
-  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
   RUST_BACKTRACE: "1"
 
 jobs:
   # -------------------------------------------------------------------------
-  # F# / .NET side
-  # -------------------------------------------------------------------------
-  lint-fs:
-    name: F# format check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 9.0.x
-      - name: Cache NuGet packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/paket.dependencies', '**/*.fsproj', 'Directory.Packages.props', '.config/dotnet-tools.json') }}
-          restore-keys: ${{ runner.os }}-nuget-
-      - name: Restore local tools (fake, fantomas)
-        run: dotnet tool restore
-      - name: Check formatting (fantomas)
-        run: dotnet run --project build -- -t CheckFormat
-
-  test-fs:
-    name: F# build & test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 9.0.x
-      - name: Cache NuGet packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/paket.dependencies', '**/*.fsproj', 'Directory.Packages.props', '.config/dotnet-tools.json') }}
-          restore-keys: ${{ runner.os }}-nuget-
-      - name: Restore local tools (fake, fantomas)
-        run: dotnet tool restore
-      - name: Build + test
-        run: /bin/sh ./build.sh Test
-
-  # -------------------------------------------------------------------------
-  # Rust side
+  # Rust
   # -------------------------------------------------------------------------
   lint-rs:
     name: Rust format / clippy / unused-deps

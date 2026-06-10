@@ -41,7 +41,7 @@ nested = {
 fn roundtrip_real_file() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../artifacts/bin/CWToolsTests/debug/testfiles/performancetest2/common/static_modifiers/cc_colony_events_static_modifiers.txt"
+        "/../../testfiles/performancetest2/common/static_modifiers/cc_colony_events_static_modifiers.txt"
     );
     let input = std::fs::read_to_string(path).unwrap();
     let table = StringTable::new();
@@ -72,7 +72,7 @@ fn roundtrip_real_file() {
 fn roundtrip_all_performancetest_files() {
     let test_dir = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../artifacts/bin/CWToolsTests/debug/testfiles/performancetest2/"
+        "/../../testfiles/performancetest2/"
     );
 
     let config = FileManagerConfig {

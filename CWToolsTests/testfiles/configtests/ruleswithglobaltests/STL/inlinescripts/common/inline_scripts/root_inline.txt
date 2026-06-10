@@ -1,4 +1,0 @@
-country_event = {
-    not_event = yes
-}
-

@@ -1,5 +1,0 @@
-country_event = {
-    #error
-    not_event = no
-}
-

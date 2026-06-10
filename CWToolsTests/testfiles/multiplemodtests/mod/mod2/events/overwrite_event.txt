@@ -1,7 +1,0 @@
-##No error
-namespace = test
-country_event = {
-    is_triggered_only = yes
-    #error
-    test = not_set
-}
