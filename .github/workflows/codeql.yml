@@ -33,7 +33,7 @@ jobs:
             paths: cwtools-rs
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # Full history is required for accurate security scanning.
           fetch-depth: 0
