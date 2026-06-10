@@ -150,7 +150,7 @@ fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
 
 /// Validate every loaded loc file and return normalized diagnostics.
 pub fn validate_loc_project(service: &LocService, game: Game) -> Vec<LocDiagnostic> {
-    validate_loc_project_scoped(service, game, None)
+    validate_loc_project_scoped(service, game, None, &HashSet::new())
 }
 
 /// As [`validate_loc_project`], but only emit per-file diagnostics for files
@@ -158,10 +158,16 @@ pub fn validate_loc_project(service: &LocService, game: Game) -> Vec<LocDiagnost
 /// are always validated (they may be malformed). Every file still contributes to
 /// the key `union`, so `$ref$` existence resolves against all loaded languages.
 /// `langs = None` validates every file (the previous behavior).
+///
+/// `extra_valid_refs` are additional lowercased names a `$ref$` may resolve to
+/// besides loc keys — game-definition registries the engine resolves in loc
+/// context (modifiers, ideas). A ref matching one of these is treated as
+/// defined, suppressing CW225. Pass `&HashSet::new()` for none.
 pub fn validate_loc_project_scoped(
     service: &LocService,
     _game: Game,
     langs: Option<&[Lang]>,
+    extra_valid_refs: &HashSet<String>,
 ) -> Vec<LocDiagnostic> {
     // Union of keys across all languages, to resolve `$ref$` existence.
     // Borrowed from the service's single owned copy — no second copy of any loc
@@ -225,7 +231,7 @@ pub fn validate_loc_project_scoped(
                 });
             }
 
-            for err in validate_loc_file(file, union_ref, HARDCODED_LOC) {
+            for err in validate_loc_file(file, union_ref, extra_valid_refs, HARDCODED_LOC) {
                 out.push(LocDiagnostic {
                     file: path.clone(),
                     line: err.line,
@@ -247,6 +253,7 @@ pub fn validate_loc_file_text(
     text: &str,
     path: &str,
     union: &HashSet<String>,
+    extra_valid_refs: &HashSet<String>,
 ) -> Vec<LocDiagnostic> {
     let Ok(file) = parse_loc_text(text, path) else {
         return Vec::new();
@@ -271,7 +278,7 @@ pub fn validate_loc_file_text(
         });
     }
 
-    for err in validate_loc_file(&file, union, HARDCODED_LOC) {
+    for err in validate_loc_file(&file, union, extra_valid_refs, HARDCODED_LOC) {
         out.push(LocDiagnostic {
             file: path.to_string(),
             line: err.line,

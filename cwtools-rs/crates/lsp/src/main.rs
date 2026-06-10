@@ -2739,6 +2739,17 @@ impl Backend {
         // it alive while we also hold the lowercased key set in LocIndex
         // pushes peak RSS by hundreds of MiB for no reason. After the block
         // closes only LocIndex (keys) and the diagnostic map survive.
+        // Names a `$ref$` may resolve to besides loc keys: `$modifier$` / `$idea$`
+        // embeds resolve against those registries (mirrors the CLI/driver path).
+        let extra_valid_refs: HashSet<String> = {
+            let mut extra = self.state.modifier_keys.read().clone();
+            let info = self.state.info_service.read();
+            for (_uri, inst) in info.type_index.instances("idea") {
+                extra.insert(inst.name.to_lowercase());
+            }
+            extra
+        };
+
         let root_str = root_path.to_string_lossy().to_string();
         let (loc_index, mut by_file) = {
             let service = cwtools_localization::LocService::from_folders(&dir_refs);
@@ -2752,6 +2763,7 @@ impl Backend {
                 &service,
                 loc_game,
                 loc_languages.as_deref(),
+                &extra_valid_refs,
             ) {
                 if !d.file.starts_with(&root_str) {
                     continue;
@@ -3100,6 +3112,17 @@ impl Backend {
         // Localisation files are parsed and validated as loc, not config.
         if uri.ends_with(".yml") || uri.ends_with(".yaml") || uri.ends_with(".csv") {
             let path = uri_to_path_str(uri);
+            // Names a `$ref$` may resolve to besides loc keys (`$modifier$` /
+            // `$idea$` embeds). Built before the loc_index guard to honour the
+            // info_service -> loc_index lock order.
+            let extra_valid_refs: HashSet<String> = {
+                let mut extra = self.state.modifier_keys.read().clone();
+                let info = self.state.info_service.read();
+                for (_uri, inst) in info.type_index.instances("idea") {
+                    extra.insert(inst.name.to_lowercase());
+                }
+                extra
+            };
             // Hold the read guard across the validate call to avoid cloning the
             // full loc-key union (~2M Strings on Millennium Dawn).
             let loc_guard = self.state.loc_index.read();
@@ -3108,7 +3131,8 @@ impl Backend {
                 .as_ref()
                 .map(|idx| idx.union())
                 .unwrap_or(&empty_union);
-            for d in cwtools_localization::validate_loc_file_text(text, &path, union) {
+            for d in cwtools_localization::validate_loc_file_text(text, &path, union, &extra_valid_refs)
+            {
                 let ve = loc_diag_to_validation_error(&d);
                 diagnostics.push(validation_error_to_diagnostic(&ve));
             }

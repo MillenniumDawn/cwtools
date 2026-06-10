@@ -43,11 +43,15 @@ pub struct LocValidationError {
 ///
 /// * `file` – the parsed loc file (`yaml_parser::parse_loc_text` result)
 /// * `all_keys` – union of keys across ALL languages (to validate `$ref$`)
+/// * `extra_valid_refs` – lowercased names a `$ref$` may resolve to besides loc
+///   keys: game-definition registries the engine resolves in loc context
+///   (modifiers, ideas). A ref matching one is treated as defined.
 ///
 /// Returns list of validation errors.
 pub fn validate_loc_file(
     file: &LocFile,
     all_keys: &HashSet<String>,
+    extra_valid_refs: &HashSet<String>,
     hardcoded_localisation: &[impl AsRef<str>],
 ) -> Vec<LocValidationError> {
     let mut errors = Vec::new();
@@ -83,6 +87,10 @@ pub fn validate_loc_file(
                         kind: LocErrorKind::RecursiveLocRef,
                     });
                 }
+            } else if extra_valid_refs.contains(&lowercase) {
+                // Resolves to a modifier/idea (HOI4 `$modifier$` / `$idea$` embed),
+                // not a loc key. Defined for the engine — no CW225, and no
+                // recursion check (it isn't a loc self-reference).
             } else {
                 // Not defined – check F# rule: if the ref contains lowercase
                 // letters but is not all-lowercase, it's "maybe a compound",
@@ -216,7 +224,7 @@ mod tests {
         let text = "l_english:\n key1: \"Hello $undefined_key$\"\n";
         let file = parse_loc_text(text, "test.yml").unwrap();
         let keys: HashSet<String> = HashSet::new();
-        let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].key, "key1");
@@ -234,7 +242,7 @@ mod tests {
         let file = parse_loc_text(text, "test.yml").unwrap();
         let mut keys = HashSet::new();
         keys.insert("key1".to_string());
-        let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, LocErrorKind::RecursiveLocRef);
@@ -246,7 +254,7 @@ mod tests {
         let file = parse_loc_text(text, "test.yml").unwrap();
         let mut keys = HashSet::new();
         keys.insert("key2".to_string());
-        let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
 
         assert!(errors.is_empty(), "valid ref should not error");
     }
@@ -257,7 +265,7 @@ mod tests {
         let file = parse_loc_text(text, "test.yml").unwrap();
         let keys: HashSet<String> = HashSet::new();
 
-        let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].kind, LocErrorKind::ReplaceMe);
@@ -268,7 +276,7 @@ mod tests {
         let text = "l_english:\n key1: \"Hello $Player$\"\n";
         let file = parse_loc_text(text, "test.yml").unwrap();
         let keys: HashSet<String> = HashSet::new();
-        let errors = validate_loc_file(&file, &keys, &["Player"]);
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &["Player"]);
 
         assert!(errors.is_empty(), "hardcoded ref should not error");
     }
@@ -287,7 +295,7 @@ mod tests {
         );
 
         let keys: HashSet<String> = HashSet::new();
-        let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
 
         let inv_char_errors: Vec<_> = errors
             .iter()
@@ -312,7 +320,7 @@ mod tests {
         );
 
         let keys: HashSet<String> = HashSet::new();
-        let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
         let inv_char_errors: Vec<_> = errors
             .iter()
             .filter(|e| e.kind == LocErrorKind::LocInvalidChars)
@@ -332,7 +340,7 @@ mod tests {
         let file = parse_loc_text(text, "test.yml").unwrap();
         let mut keys = HashSet::new();
         keys.insert("key1".to_string()); // stored lowercased in union
-        let errors = validate_loc_file(&file, &keys, &Vec::<String>::new());
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
 
         let recursive: Vec<_> = errors
             .iter()
