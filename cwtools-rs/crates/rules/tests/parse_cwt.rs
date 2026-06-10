@@ -58,7 +58,7 @@ enums = {
 fn test_parse_real_cwt() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../CWToolsTests/testfiles/configtests/config/test.cwt"
+        "/../../testfiles/configtests/test.cwt"
     );
     let input = std::fs::read_to_string(path).unwrap();
     let table = StringTable::new();
@@ -81,7 +81,7 @@ fn test_parse_real_cwt() {
 fn test_parse_stellaris_ethics() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../CWToolsTests/testfiles/stellarisconfig/config/common/ethics.cwt"
+        "/../../testfiles/stellarisconfig/ethics.cwt"
     );
     let input = std::fs::read_to_string(path).unwrap();
     let table = StringTable::new();

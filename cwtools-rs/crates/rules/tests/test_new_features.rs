@@ -68,8 +68,14 @@ values = {
 
     // G: values block
     assert_eq!(ruleset.values.len(), 1);
-    assert_eq!(ruleset.values[0].0, "my_values");
-    assert_eq!(ruleset.values[0].1, vec!["alpha", "beta", "gamma"]);
+    let my_vals = ruleset
+        .values
+        .get("my_values")
+        .expect("my_values not found");
+    assert_eq!(
+        my_vals.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        vec!["alpha", "beta", "gamma"]
+    );
 
     // F: complex_enum
     assert_eq!(ruleset.complex_enums.len(), 1);
@@ -99,73 +105,74 @@ values = {
 
     // B: cardinality parsing
     if let Some((_name, (rule, _opts))) = ruleset.aliases.first()
-        && let RuleType::NodeRule { rules, .. } = rule {
-            // name: 1..1 strict
-            let (_, name_opts) = &rules[0];
-            assert_eq!(name_opts.min, 1);
-            assert_eq!(name_opts.max, 1);
-            assert!(name_opts.strict_min);
+        && let RuleType::NodeRule { rules, .. } = rule
+    {
+        // name: 1..1 strict
+        let (_, name_opts) = &rules[0];
+        assert_eq!(name_opts.min, 1);
+        assert_eq!(name_opts.max, 1);
+        assert!(name_opts.strict_min);
 
-            // count: int_value_field
-            let (count_rule, _) = &rules[1];
-            if let RuleType::LeafRule { right, .. } = count_rule {
-                assert!(matches!(
-                    right,
-                    NewField::ValueScopeMarkerField { is_int: true, .. }
-                ));
-            }
-
-            // pct: ##cardinality= (no space) + percentage_field
-            let (_, pct_opts) = &rules[3];
-            assert_eq!(pct_opts.min, 0);
-            assert_eq!(pct_opts.max, 1);
-            let (pct_rule, _) = &rules[3];
-            if let RuleType::LeafRule { right, .. } = pct_rule {
-                assert!(matches!(right, NewField::ValueField(ValueType::Percent)));
-            }
-
-            // filepath[gfx,dds]
-            let (fp_rule, _) = &rules[5];
-            if let RuleType::LeafRule { right, .. } = fp_rule {
-                assert!(matches!(
-                    right,
-                    NewField::FilepathField {
-                        prefix: Some(_),
-                        extension: Some(_)
-                    }
-                ));
-            }
-
-            // scope[country]
-            let (sc_rule, _) = &rules[6];
-            if let RuleType::LeafRule { right, .. } = sc_rule {
-                assert!(matches!(right, NewField::ScopeField(_)));
-            }
-
-            // variable_field
-            let (vf_rule, _) = &rules[7];
-            if let RuleType::LeafRule { right, .. } = vf_rule {
-                assert!(matches!(
-                    right,
-                    NewField::VariableField {
-                        is_int: false,
-                        is_32bit: false,
-                        ..
-                    }
-                ));
-            }
-
-            // int_variable_field
-            let (ivf_rule, _) = &rules[8];
-            if let RuleType::LeafRule { right, .. } = ivf_rule {
-                assert!(matches!(
-                    right,
-                    NewField::VariableField {
-                        is_int: true,
-                        is_32bit: false,
-                        ..
-                    }
-                ));
-            }
+        // count: int_value_field
+        let (count_rule, _) = &rules[1];
+        if let RuleType::LeafRule { right, .. } = count_rule {
+            assert!(matches!(
+                right,
+                NewField::ValueScopeMarkerField { is_int: true, .. }
+            ));
         }
+
+        // pct: ##cardinality= (no space) + percentage_field
+        let (_, pct_opts) = &rules[3];
+        assert_eq!(pct_opts.min, 0);
+        assert_eq!(pct_opts.max, 1);
+        let (pct_rule, _) = &rules[3];
+        if let RuleType::LeafRule { right, .. } = pct_rule {
+            assert!(matches!(right, NewField::ValueField(ValueType::Percent)));
+        }
+
+        // filepath[gfx,dds]
+        let (fp_rule, _) = &rules[5];
+        if let RuleType::LeafRule { right, .. } = fp_rule {
+            assert!(matches!(
+                right,
+                NewField::FilepathField {
+                    prefix: Some(_),
+                    extension: Some(_)
+                }
+            ));
+        }
+
+        // scope[country]
+        let (sc_rule, _) = &rules[6];
+        if let RuleType::LeafRule { right, .. } = sc_rule {
+            assert!(matches!(right, NewField::ScopeField(_)));
+        }
+
+        // variable_field
+        let (vf_rule, _) = &rules[7];
+        if let RuleType::LeafRule { right, .. } = vf_rule {
+            assert!(matches!(
+                right,
+                NewField::VariableField {
+                    is_int: false,
+                    is_32bit: false,
+                    ..
+                }
+            ));
+        }
+
+        // int_variable_field
+        let (ivf_rule, _) = &rules[8];
+        if let RuleType::LeafRule { right, .. } = ivf_rule {
+            assert!(matches!(
+                right,
+                NewField::VariableField {
+                    is_int: true,
+                    is_32bit: false,
+                    ..
+                }
+            ));
+        }
+    }
 }

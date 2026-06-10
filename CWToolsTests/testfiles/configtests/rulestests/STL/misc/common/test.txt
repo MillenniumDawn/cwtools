@@ -1,9 +1,0 @@
-first = {
-    a
-    b
-}
-
-second = {
-    c
-    d
-}

@@ -1,5 +1,0 @@
-subtype = no
-#error
-test = {
-
-}

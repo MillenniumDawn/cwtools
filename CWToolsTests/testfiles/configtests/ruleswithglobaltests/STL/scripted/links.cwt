@@ -1,8 +1,0 @@
-﻿links = {
-	script_value = {
-		from_data = yes
-		type = value
-        prefix = value:
-        data_source = <script_value>
-	}
-}

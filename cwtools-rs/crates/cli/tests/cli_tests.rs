@@ -84,7 +84,7 @@ fn test_parse_single_file() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Parsed"))
-        .stdout(predicate::str::contains("Nodes"))
+        .stdout(predicate::str::contains("Leaves"))
         .stdout(predicate::str::contains("Leaves"));
 }
 
@@ -184,7 +184,7 @@ fn test_serialize_and_deserialize_roundtrip() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Deserialized"))
-        .stdout(predicate::str::contains("Nodes"));
+        .stdout(predicate::str::contains("Leaves"));
 }
 
 #[test]

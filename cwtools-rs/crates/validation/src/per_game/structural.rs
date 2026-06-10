@@ -9,13 +9,11 @@
 //! parser has no such classification, so the walk instead keys off the reserved
 //! logic keywords (`NOT`/`AND`/`OR`/`NOR`/`if`/`else_if`), which only appear in
 //! trigger/effect script — running it file-wide matches F# in practice.
-//!
-//! Note: this parser stores `key = { ... }` as a `Node` OR as a `Leaf` whose
-//! value is a `Clause`, so [`as_block`] normalises both.
 
+use super::common::as_block;
 use crate::{ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
-use cwtools_string_table::string_table::{StringId, StringTable};
+use cwtools_string_table::string_table::StringTable;
 
 /// The implicit boolean context a node sits in, mirroring F#'s `BoolState`.
 #[derive(Clone, Copy, PartialEq)]
@@ -43,49 +41,6 @@ impl BoolKeyword {
     }
 }
 
-/// A `key = { ... }` block, normalised from either a `Node` or a `Leaf`-with-`Clause`.
-/// The key is kept as a `StringId` so the per-block keyword checks compare the
-/// borrowed text (via [`StringTable::with_string`]) without an owned `String`.
-struct Block<'a> {
-    key: StringId,
-    children: &'a [Child],
-    range: SourceRange,
-}
-
-impl Block<'_> {
-    /// True if the block's key equals `kw` exactly (case-sensitive, matching the
-    /// reserved keyword spellings `NOT`/`AND`/`OR`/`if`/...).
-    fn key_is(&self, table: &StringTable, kw: &str) -> bool {
-        table.with_string(self.key, |s| s == kw).unwrap_or(false)
-    }
-}
-
-fn as_block<'a>(child: &Child, ast: &'a ParsedFile) -> Option<Block<'a>> {
-    match child {
-        Child::Node(idx) => {
-            let n = &ast.arena.nodes[*idx as usize];
-            Some(Block {
-                key: n.key.normal,
-                children: &n.children,
-                range: n.pos,
-            })
-        }
-        Child::Leaf(idx) => {
-            let l = &ast.arena.leaves[*idx as usize];
-            if let Value::Clause(children) = &l.value {
-                Some(Block {
-                    key: l.key.normal,
-                    children,
-                    range: l.pos,
-                })
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 /// Number of children that are not comments.
 fn non_comment_count(children: &[Child]) -> usize {
     children
@@ -106,13 +61,10 @@ fn is_empty_if(children: &[Child], ast: &ParsedFile, table: &StringTable) -> boo
                     return false;
                 }
                 // A `key = { ... }` leaf-clause: only `limit` is allowed.
-                if !table.with_string(l.key.normal, |s| s == "limit").unwrap_or(false) {
-                    return false;
-                }
-            }
-            Child::Node(idx) => {
-                let n = &ast.arena.nodes[*idx as usize];
-                if !table.with_string(n.key.normal, |s| s == "limit").unwrap_or(false) {
+                if !table
+                    .with_string(l.key.normal, |s| s == "limit")
+                    .unwrap_or(false)
+                {
                     return false;
                 }
             }

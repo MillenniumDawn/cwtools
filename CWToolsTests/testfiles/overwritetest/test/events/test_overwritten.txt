@@ -1,7 +1,0 @@
-##Test embedded file was overwritten
-namespace = test
-country_event = {
-    #error
-    test = test_var
-    is_triggered_only = yes
-}

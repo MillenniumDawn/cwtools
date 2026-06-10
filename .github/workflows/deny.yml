@@ -1,0 +1,43 @@
+name: cargo-deny
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  schedule:
+    # Weekly run to catch newly-published advisories against the lockfile.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: deny-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cwtools-rs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            cwtools-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('cwtools-rs/Cargo.lock', 'cwtools-rs/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Install cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Run cargo-deny
+        run: cargo deny check

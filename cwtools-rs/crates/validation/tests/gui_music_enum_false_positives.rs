@@ -2,7 +2,7 @@
 //! Dawn mod: enum case-sensitivity, top-level GUI widgets validated against the
 //! wrong type, `.asset` music routing, and soft (`~`) cardinality minimums.
 
-use cwtools_info::{SourceLocation, TypeIndex, TypeInstance};
+use cwtools_index::{SourceLocation, TypeIndex, TypeInstance};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
@@ -399,6 +399,7 @@ types = {
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let mut index = TypeIndex::new();
+    index.complete = true;
     let mut per_type: HashMap<String, Vec<TypeInstance>> = HashMap::new();
     per_type.insert(
         "spriteType".to_string(),

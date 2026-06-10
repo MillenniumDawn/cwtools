@@ -58,9 +58,7 @@ pub fn validate_loc_file(
 
     for entry in &file.entries {
         // ---- Invalid characters ----
-        // Return value (position) is reserved for future diagnostics; the call
-        // pushes into `errors` for its side effect.
-        let _ = validate_invalid_chars(entry, &mut errors);
+        validate_invalid_chars(entry, &mut errors);
 
         // ---- Quote balancing ----
         if !validate_quotes(entry) {
@@ -118,25 +116,9 @@ pub fn validate_loc_file(
                 kind: LocErrorKind::ReplaceMe,
             });
         }
-
-        // ---- Invalid loc commands ----
-        for cmd in &entry.commands {
-            if cmd.contains("event_target:") && !is_known_event_target(cmd, all_keys) {
-                // Allow event_target references that aren't in key set
-                // F# has an actual check; for now we warn rather than error
-            }
-        }
     }
 
     errors
-}
-
-fn is_known_event_target(cmd: &str, all_keys: &HashSet<String>) -> bool {
-    if let Some(target) = cmd.strip_prefix("event_target:") {
-        all_keys.contains(target)
-    } else {
-        true
-    }
 }
 
 /// Validate invalid characters.
@@ -144,10 +126,7 @@ fn is_known_event_target(cmd: &str, all_keys: &HashSet<String>) -> bool {
 /// If `entry.error_range` is set (populated by the parser when a char outside
 /// the `isLocValueChar` ranges was found), push a `CW-LocInvalidChars` error.
 /// Mirrors F# `validateInvalidChars` (LocalisationString.fs:124-127).
-pub fn validate_invalid_chars(
-    entry: &LocEntry,
-    errors: &mut Vec<LocValidationError>,
-) -> Option<()> {
+pub fn validate_invalid_chars(entry: &LocEntry, errors: &mut Vec<LocValidationError>) {
     if let Some(range) = &entry.error_range {
         errors.push(LocValidationError {
             line: range.line,
@@ -155,9 +134,6 @@ pub fn validate_invalid_chars(
             key: entry.key.clone(),
             kind: LocErrorKind::LocInvalidChars,
         });
-        Some(())
-    } else {
-        None
     }
 }
 
@@ -193,10 +169,10 @@ pub fn validate_quotes(entry: &LocEntry) -> bool {
     starts == ends
 }
 
-/// Check for `REPLACE_ME` / `TODO_CD` placeholder values.
+/// Check for `REPLACE_ME` / `TODO_CD` placeholder values, quoted or not.
 pub fn is_replace_me(entry: &LocEntry) -> bool {
-    let trimmed = entry.desc.trim();
-    trimmed == "\"REPLACE_ME\"" || trimmed == "\"TODO_CD\""
+    let inner = entry.desc.trim().trim_matches('"');
+    inner == "REPLACE_ME" || inner == "TODO_CD"
 }
 
 /// Loc references that are hardcoded engine concepts (scopes, common getters)
@@ -229,17 +205,6 @@ pub const HARDCODED_LOC: &[&str] = &[
     "Date",
     "GetDate",
 ];
-
-/// Build a map of all keys across a set of loc files.
-pub fn build_key_union(files: &[LocFile]) -> HashSet<String> {
-    let mut set = HashSet::new();
-    for file in files {
-        for e in &file.entries {
-            set.insert(e.key.to_lowercase());
-        }
-    }
-    set
-}
 
 #[cfg(test)]
 mod tests {

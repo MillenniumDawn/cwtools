@@ -1,3 +1,4 @@
+use super::common::as_block;
 use crate::{ErrorSeverity, ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::RuleSet;
@@ -13,26 +14,22 @@ pub fn validate_stellaris(
     errors: &mut Vec<ValidationError>,
 ) {
     for child in &ast.root_children {
-        match child {
-            Child::Node(idx) => {
-                let node = &ast.arena.nodes[*idx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
-                match key.as_str() {
-                    "event" => validate_event(node, ast, table, file_path, errors),
-                    "ship_size" => validate_ship_size(node, ast, table, file_path, errors),
-                    "technology" => validate_technology(node, ast, table, file_path, errors),
-                    _ => {}
-                }
-            }
-            Child::Leaf(idx) => {
-                let leaf = &ast.arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                if key == "event"
-                    && let Value::Clause(children) = &leaf.value {
-                        validate_event_clause(children, ast, table, file_path, errors);
-                    }
-            }
-            Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => {}
+        let Some(block) = as_block(child, ast) else {
+            continue;
+        };
+        let key = block.key_string(table);
+        match key.as_str() {
+            k if k.ends_with("_event") || k == "event" => validate_event(
+                block.children,
+                block.range.start.line,
+                ast,
+                table,
+                file_path,
+                errors,
+            ),
+            "ship_size" => validate_ship_size(block.children, ast, table, file_path, errors),
+            "technology" => validate_technology(block.children, ast, table, file_path, errors),
+            _ => {}
         }
     }
 
@@ -47,49 +44,11 @@ pub fn validate_stellaris(
 // (CW253). F# scopes these to classified effect blocks; this walk keys off the
 // node names instead, which only appear in effect script.
 
-/// The `(key, children)` of a `key = { ... }` block (Node or Leaf-with-Clause).
-fn block_of<'a>(
-    child: &Child,
-    ast: &'a ParsedFile,
-    table: &StringTable,
-) -> Option<(String, &'a [Child], u32, u16)> {
-    match child {
-        Child::Node(idx) => {
-            let n = &ast.arena.nodes[*idx as usize];
-            Some((
-                table.get_string(n.key.normal).unwrap_or_default(),
-                &n.children,
-                n.pos.start.line,
-                n.pos.start.col,
-            ))
-        }
-        Child::Leaf(idx) => {
-            let l = &ast.arena.leaves[*idx as usize];
-            if let Value::Clause(children) = &l.value {
-                Some((
-                    table.get_string(l.key.normal).unwrap_or_default(),
-                    children,
-                    l.pos.start.line,
-                    l.pos.start.col,
-                ))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Keys of a block's direct children (Node + Leaf), in order.
+/// Keys of a block's direct keyed children, in order.
 fn child_keys(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<String> {
     children
         .iter()
         .filter_map(|c| match c {
-            Child::Node(idx) => Some(
-                table
-                    .get_string(ast.arena.nodes[*idx as usize].key.normal)
-                    .unwrap_or_default(),
-            ),
             Child::Leaf(idx) => Some(
                 table
                     .get_string(ast.arena.leaves[*idx as usize].key.normal)
@@ -108,9 +67,13 @@ fn walk_if_else(
     errors: &mut Vec<ValidationError>,
 ) {
     for child in children {
-        let Some((key, block_children, line, col)) = block_of(child, ast, table) else {
+        let Some(block) = as_block(child, ast) else {
             continue;
         };
+        let key = block.key_string(table);
+        let block_children = block.children;
+        let line = block.range.start.line;
+        let col = block.range.start.col;
 
         // CW253 — deprecated set_empire_name / set_planet_name.
         if key == "set_empire_name" || key == "set_planet_name" {
@@ -198,83 +161,11 @@ fn walk_if_else(
 
 // ── Event Validation ───────────────────────────────────
 
+/// Validate a Stellaris event body (children of `*_event = { ... }` or inline clause).
+/// `event_line` is the line of the event key for anchoring the CW107 diagnostic.
 fn validate_event(
-    node: &cwtools_parser::ast::Node,
-    ast: &ParsedFile,
-    table: &StringTable,
-    file_path: &str,
-    errors: &mut Vec<ValidationError>,
-) {
-    let has_mtth = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "mean_time_to_happen"));
-    let has_trig = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "is_triggered_only"));
-    let has_once = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "fire_only_once"));
-    let has_base = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "base"));
-    let has_always_no = node
-        .children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table));
-
-    if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
-        errors.push(ValidationError {
-            message: "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
-            severity: ErrorSeverity::Information,
-            line: node.pos.start.line,
-            col: node.pos.start.col,
-            file: file_path.to_string(),
-            code: Some(error_codes::CW107_EVENT_EVERY_TICK.id.to_string()),
-        });
-    }
-
-    // Check pre-triggers: must be in event's direct children, not inside trigger block
-    let pre_triggers = [
-        "has_owner",
-        "is_homeworld",
-        "original_owner",
-        "is_ai",
-        "has_ground_combat",
-        "is_capital",
-        "is_occupied_flag",
-    ];
-    for child in &node.children {
-        let key = match child {
-            Child::Leaf(idx) => table
-                .get_string(ast.arena.leaves[*idx as usize].key.normal)
-                .unwrap_or_default(),
-            Child::Node(idx) => table
-                .get_string(ast.arena.nodes[*idx as usize].key.normal)
-                .unwrap_or_default(),
-            _ => continue,
-        };
-        if pre_triggers.contains(&key.as_str()) {
-            errors.push(ValidationError {
-                message: format!(
-                    "Pre-trigger '{}' should be inside a 'trigger' block, not at event root",
-                    key
-                ),
-                severity: ErrorSeverity::Warning,
-                line: child_line(child, ast),
-                col: 0,
-                file: file_path.to_string(),
-                code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id.to_string()),
-            });
-        }
-    }
-}
-
-fn validate_event_clause(
     children: &[Child],
+    event_line: u32,
     ast: &ParsedFile,
     table: &StringTable,
     file_path: &str,
@@ -295,23 +186,70 @@ fn validate_event_clause(
         .any(|c| child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table));
 
     if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
-        // Find the event leaf's position
-        let line = children.first().map(|c| child_line(c, ast)).unwrap_or(0);
         errors.push(ValidationError {
             message: "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
             severity: ErrorSeverity::Information,
-            line,
+            line: event_line,
             col: 0,
             file: file_path.to_string(),
             code: Some(error_codes::CW107_EVENT_EVERY_TICK.id.to_string()),
         });
+    }
+
+    // CW301: pre-triggers found inside the trigger block should be moved to event
+    // root for performance. Mirrors F# STLValidation.fs `validatePreTriggers` which
+    // checks trigger block leaves, not event root leaves.
+    const PRE_TRIGGERS: &[&str] = &[
+        "has_owner",
+        "is_homeworld",
+        "original_owner",
+        "is_ai",
+        "has_ground_combat",
+        "is_capital",
+        "is_occupied_flag",
+    ];
+    for child in children {
+        if !child_key_eq(child, ast, table, "trigger") {
+            continue;
+        }
+        let trigger_children = match child {
+            Child::Leaf(idx) => {
+                if let Value::Clause(c) = &ast.arena.leaves[*idx as usize].value {
+                    c.as_slice()
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        };
+        for tc in trigger_children {
+            let key = match tc {
+                Child::Leaf(idx) => table
+                    .get_string(ast.arena.leaves[*idx as usize].key.normal)
+                    .unwrap_or_default(),
+                _ => continue,
+            };
+            if PRE_TRIGGERS.contains(&key.as_str()) {
+                errors.push(ValidationError {
+                    message: format!(
+                        "Trigger '{}' can be a pre-trigger at event root for better performance",
+                        key
+                    ),
+                    severity: ErrorSeverity::Information,
+                    line: child_line(tc, ast),
+                    col: 0,
+                    file: file_path.to_string(),
+                    code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id.to_string()),
+                });
+            }
+        }
     }
 }
 
 // ── Ship Size Validation ───────────────────────────────
 
 fn validate_ship_size(
-    _node: &cwtools_parser::ast::Node,
+    _children: &[Child],
     _ast: &ParsedFile,
     _table: &StringTable,
     _file_path: &str,
@@ -323,7 +261,7 @@ fn validate_ship_size(
 // ── Technology Validation ──────────────────────────────
 
 fn validate_technology(
-    _node: &cwtools_parser::ast::Node,
+    _children: &[Child],
     _ast: &ParsedFile,
     _table: &StringTable,
     _file_path: &str,
@@ -340,10 +278,6 @@ fn child_key_eq(child: &Child, ast: &ParsedFile, table: &StringTable, expected: 
             let leaf = &ast.arena.leaves[*idx as usize];
             table.get_string(leaf.key.normal).unwrap_or_default() == expected
         }
-        Child::Node(idx) => {
-            let node = &ast.arena.nodes[*idx as usize];
-            table.get_string(node.key.normal).unwrap_or_default() == expected
-        }
         _ => false,
     }
 }
@@ -351,21 +285,17 @@ fn child_key_eq(child: &Child, ast: &ParsedFile, table: &StringTable, expected: 
 fn child_line(child: &Child, ast: &ParsedFile) -> u32 {
     match child {
         Child::Leaf(idx) => ast.arena.leaves[*idx as usize].pos.start.line,
-        Child::Node(idx) => ast.arena.nodes[*idx as usize].pos.start.line,
         _ => 0,
     }
 }
 
 fn child_has_always_no(child: &Child, ast: &ParsedFile, table: &StringTable) -> bool {
-    match child {
-        Child::Node(idx) => {
-            let node = &ast.arena.nodes[*idx as usize];
-            node.children.iter().any(|c| {
-                child_key_eq(c, ast, table, "always") && child_is_bool(c, ast, table, false)
-            })
-        }
-        _ => false,
-    }
+    as_block(child, ast).is_some_and(|block| {
+        block
+            .children
+            .iter()
+            .any(|c| child_key_eq(c, ast, table, "always") && child_is_bool(c, ast, table, false))
+    })
 }
 
 fn child_is_bool(child: &Child, ast: &ParsedFile, table: &StringTable, expected: bool) -> bool {
@@ -414,34 +344,15 @@ pub fn check_key_and_desc(
     };
 
     for child in &ast.root_children {
-        match child {
-            Child::Node(idx) => {
-                let node = &ast.arena.nodes[*idx as usize];
-                let key = table.get_string(node.key.normal).unwrap_or_default();
-                if !node_key_filter.is_empty() && !node_key_filter.contains(&key.as_str()) {
-                    continue;
-                }
-                // The node key itself is the type instance name.
-                let instance_name = key.clone();
-                check_loc_key_pair(
-                    &instance_name,
-                    node.pos.start.line,
-                    loc_keys,
-                    file_path,
-                    errors,
-                );
+        if let Child::Leaf(idx) = child {
+            let leaf = &ast.arena.leaves[*idx as usize];
+            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            if !node_key_filter.is_empty() && !node_key_filter.contains(&key.as_str()) {
+                continue;
             }
-            Child::Leaf(idx) => {
-                let leaf = &ast.arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                if !node_key_filter.is_empty() && !node_key_filter.contains(&key.as_str()) {
-                    continue;
-                }
-                if let Value::Clause(_) = &leaf.value {
-                    check_loc_key_pair(&key, leaf.pos.start.line, loc_keys, file_path, errors);
-                }
+            if let Value::Clause(_) = &leaf.value {
+                check_loc_key_pair(&key, leaf.pos.start.line, loc_keys, file_path, errors);
             }
-            _ => {}
         }
     }
 }
@@ -486,10 +397,13 @@ fn check_loc_key_pair(
 /// localisation keys.  Requires loc_keys; no-op if None.
 /// valPolicies follows the same pattern.
 ///
-/// Note: Full `valTechLocs`/`valPolicies` porting depends on localisation-key
-/// plumbing not yet available at this call site.  The mechanism is in place;
-/// call `check_key_and_desc` with the appropriate `node_key_filter` from the
-/// CLI/LSP layer once loc keys are available.
+/// Not yet wired into [`run_game_validators`]. The loc-key plumbing it cited as
+/// missing IS now available (the dispatcher takes a `ValidationCtx` carrying
+/// `loc_index`), so the only remaining gap is the entry matching: F# operated on
+/// the rules engine's *classified* tech/policy nodes, whereas `check_key_and_desc`
+/// matches a literal root key. Stellaris tech entries are keyed by tech name (not
+/// wrapped in a `technology` node), so the filter below needs porting to a
+/// path/type-driven match (and a Stellaris corpus to verify) before this fires.
 pub fn validate_stellaris_loc(
     ast: &ParsedFile,
     table: &StringTable,

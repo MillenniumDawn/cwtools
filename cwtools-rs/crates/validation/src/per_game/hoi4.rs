@@ -9,8 +9,9 @@
 //! `trigger = { always = no }`, see CW107), so only fields whose default is
 //! known are listed.
 
+use super::common::as_block;
 use crate::{ValidationError, error_codes};
-use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
+use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_string_table::string_table::StringTable;
 
 /// Fields whose body `{ always = <bool> }` matches the game default, keyed by
@@ -20,40 +21,6 @@ const REDUNDANT_DEFAULT_FIELDS: &[(&str, bool)] = &[
     // therefore redundant and can be deleted.
     ("allowed_civil_war", false),
 ];
-
-/// A `key = { ... }` block, normalised from a `Node` or a `Leaf`-with-`Clause`
-/// (the parser stores either form depending on context).
-struct Block<'a> {
-    key: String,
-    children: &'a [Child],
-    range: SourceRange,
-}
-
-fn as_block<'a>(child: &Child, ast: &'a ParsedFile, table: &StringTable) -> Option<Block<'a>> {
-    match child {
-        Child::Node(idx) => {
-            let n = &ast.arena.nodes[*idx as usize];
-            Some(Block {
-                key: table.get_string(n.key.normal).unwrap_or_default(),
-                children: &n.children,
-                range: n.pos,
-            })
-        }
-        Child::Leaf(idx) => {
-            let l = &ast.arena.leaves[*idx as usize];
-            if let Value::Clause(children) = &l.value {
-                Some(Block {
-                    key: table.get_string(l.key.normal).unwrap_or_default(),
-                    children,
-                    range: l.pos,
-                })
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
 
 /// If the block's only non-comment child is `always = <bool>`, return that bool;
 /// otherwise `None` (anything else means the block does real work).
@@ -86,23 +53,25 @@ fn walk(
     errors: &mut Vec<ValidationError>,
 ) {
     for child in children {
-        let Some(block) = as_block(child, ast, table) else {
+        let Some(block) = as_block(child, ast) else {
             continue;
         };
+        let key = block.key_string(table);
 
         if let Some((_, default)) = REDUNDANT_DEFAULT_FIELDS
             .iter()
-            .find(|(k, _)| *k == block.key.as_str())
-            && sole_always_value(block.children, ast, table) == Some(*default) {
-                errors.push(ValidationError {
-                    message: error_codes::CW280_REDUNDANT_DEFAULT_FIELD.format(&[&block.key]),
-                    severity: error_codes::CW280_REDUNDANT_DEFAULT_FIELD.severity,
-                    line: block.range.start.line,
-                    col: block.range.start.col,
-                    file: file_path.to_string(),
-                    code: Some(error_codes::CW280_REDUNDANT_DEFAULT_FIELD.id.to_string()),
-                });
-            }
+            .find(|(k, _)| *k == key.as_str())
+            && sole_always_value(block.children, ast, table) == Some(*default)
+        {
+            errors.push(ValidationError {
+                message: error_codes::CW280_REDUNDANT_DEFAULT_FIELD.format(&[&key]),
+                severity: error_codes::CW280_REDUNDANT_DEFAULT_FIELD.severity,
+                line: block.range.start.line,
+                col: block.range.start.col,
+                file: file_path.to_string(),
+                code: Some(error_codes::CW280_REDUNDANT_DEFAULT_FIELD.id.to_string()),
+            });
+        }
 
         walk(block.children, ast, table, file_path, errors);
     }

@@ -8,8 +8,6 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
-use cwtools_info::TypeIndex;
 use cwtools_info::{
     PositionElement, ReferenceHint, TypeInstance, element_at_position, info_at_position,
 };
@@ -19,52 +17,12 @@ use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{
-    ValidationError, build_enum_map, build_scope_registry_arc, validate_ast_with_loc_prebuilt,
+    Prepared, ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
+    validate_prepared,
 };
 
 mod symbols;
 mod workspace_cache;
-
-/// Build the set of valid modifier names for `alias_name[modifier]` slots from the
-/// ruleset's `modifiers = { ... }` block. Templated entries like
-/// `production_speed_<building>_factor` / `<ideology>_drift` are expanded against
-/// the type index, one per instance. Mirrors the CLI so the extension and CLI
-/// agree on what counts as a modifier.
-fn build_modifier_keys(ruleset: &RuleSet, type_index: &TypeIndex) -> HashSet<String> {
-    let mut mk = HashSet::new();
-    for m in &ruleset.modifiers {
-        match (m.find('<'), m.find('>')) {
-            (Some(open), Some(close)) if open < close => {
-                let tn = &m[open + 1..close];
-                let pre = &m[..open];
-                let suf = &m[close + 1..];
-                for (_uri, inst) in type_index.instances(tn) {
-                    mk.insert(format!("{}{}{}", pre, inst.name, suf));
-                }
-            }
-            _ => {
-                mk.insert(m.clone());
-            }
-        }
-    }
-    mk
-}
-
-/// Map the engine `Game` to the localization crate's `Game` enum.
-fn engine_to_loc_game(game: Option<cwtools_game::constants::Game>) -> cwtools_localization::Game {
-    use cwtools_game::constants::Game as G;
-    use cwtools_localization::Game as LG;
-    match game {
-        Some(G::Hoi4) => LG::HOI4,
-        Some(G::Stellaris) => LG::Stellaris,
-        Some(G::Eu4) => LG::EU4,
-        Some(G::Ck3) => LG::CK3,
-        Some(G::Ir) => LG::IR,
-        Some(G::Vic3) => LG::VIC3,
-        Some(G::Eu5) => LG::EU5,
-        _ => LG::Generic,
-    }
-}
 
 /// Convert a loc-file diagnostic into a `ValidationError` so it shares the
 /// `validation_error_to_diagnostic` rendering path. Loc positions are 1-based;
@@ -88,25 +46,18 @@ fn loc_diag_to_validation_error(d: &cwtools_localization::LocDiagnostic) -> Vali
 }
 
 /// Index a base-game ("vanilla") install into per-type instances, ready to merge
-/// into the workspace TypeIndex. Mirrors the CLI's `index_game_dir` / `--vanilla`:
-/// for a game root, `FileManagerConfig::default()` already covers the standard
-/// layout (common/, gfx/, events/, …). The discovered ASTs are used directly (no
-/// re-parse) because vanilla files are only indexed, never validated.
+/// into the workspace TypeIndex. Delegates to the shared driver's `index_game_dir`
+/// so the LSP and CLI discover and index vanilla the SAME way (the driver's
+/// `search_config_for` config, which is the broader, corpus-verified one). The
+/// discovered ASTs are used directly (no re-parse) because vanilla files are only
+/// indexed, never validated. Drops the per-instance file_uri; the merge slot only
+/// needs the instances.
 fn index_vanilla_dir(
     dir: &std::path::Path,
     ruleset: &RuleSet,
     table: &StringTable,
 ) -> HashMap<String, Vec<TypeInstance>> {
-    let config = FileManagerConfig {
-        root: dir.to_path_buf(),
-        ..Default::default()
-    };
-    let mut mgr = FileManager::with_string_table(config, table.clone());
-    let index = match mgr.discover_and_parse() {
-        Ok(files) => cwtools_info::index_discovered_files(files, ruleset, table, None),
-        Err(_) => TypeIndex::new(),
-    };
-    // Drop the per-instance file_uri; the merge slot only needs the instances.
+    let index = cwtools_driver::index_game_dir(dir, ruleset, table, &HashSet::new());
     index
         .map
         .into_iter()
@@ -121,25 +72,28 @@ fn index_vanilla_dir(
 fn default_cache_dir() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
     if let Ok(x) = std::env::var("XDG_CACHE_HOME")
-        && !x.is_empty() {
-            return Some(PathBuf::from(x).join("cwtools"));
-        }
+        && !x.is_empty()
+    {
+        return Some(PathBuf::from(x).join("cwtools"));
+    }
     if let Ok(la) = std::env::var("LOCALAPPDATA")
-        && !la.is_empty() {
-            return Some(PathBuf::from(la).join("cwtools"));
-        }
+        && !la.is_empty()
+    {
+        return Some(PathBuf::from(la).join("cwtools"));
+    }
     if let Ok(home) = std::env::var("HOME")
-        && !home.is_empty() {
-            let home = PathBuf::from(home);
-            #[cfg(target_os = "macos")]
-            {
-                return Some(home.join("Library/Caches/cwtools"));
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                return Some(home.join(".cache/cwtools"));
-            }
+        && !home.is_empty()
+    {
+        let home = PathBuf::from(home);
+        #[cfg(target_os = "macos")]
+        {
+            return Some(home.join("Library/Caches/cwtools"));
         }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Some(home.join(".cache/cwtools"));
+        }
+    }
     Some(std::env::temp_dir().join("cwtools"))
 }
 
@@ -201,11 +155,28 @@ impl tower_lsp::lsp_types::notification::Notification for UpdateFileList {
 }
 
 /// Server state.
+///
+/// LOCK ORDER: when holding more than one guard, acquire in field-declaration
+/// order — `documents` -> `ruleset` -> `scope_registry` -> `info_service` ->
+/// `modifier_keys` -> `loc_index`. Most sites snapshot-and-drop
+/// (`.lock().clone()`) instead of co-holding; the only places two
+/// ruleset-family guards are co-held are `set_ruleset` (writer) and the
+/// single-file validate (reader), both `ruleset` -> `scope_registry`. Never
+/// acquire an earlier lock while holding a later one.
 struct DocumentState {
     /// file URI -> parsed document
     documents: Mutex<HashMap<String, ParsedDoc>>,
-    /// loaded .cwt ruleset
-    ruleset: Mutex<Option<RuleSet>>,
+    /// loaded .cwt ruleset. `RwLock` so the many readers (hover, completion,
+    /// validation, the cross-file sweep) share the guard and don't serialize
+    /// behind a debounced validate; only the rare ruleset load/reload takes
+    /// `write()`.
+    ruleset: parking_lot::RwLock<Option<RuleSet>>,
+    /// Scope/link registry built from `ruleset` (config-driven scopes.cwt +
+    /// links.cwt). Cached here because `build_scope_registry` is the expensive
+    /// part of per-file validation setup and depends only on the loaded ruleset,
+    /// which changes rarely. Rebuilt at the ruleset write site, so it always
+    /// matches the ruleset it was derived from. `None` until the first load.
+    scope_registry: parking_lot::RwLock<Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>>,
     /// shared string table
     string_table: StringTable,
     /// game language from init options
@@ -263,6 +234,16 @@ struct DocumentState {
     /// when a doc's token set is missing, it's always included. Updated on
     /// did_open / did_change, removed on did_close.
     doc_tokens: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
+    /// Names that changed during a preempted dependent sweep. When a sweep is
+    /// aborted because a newer edit landed, the union of names it was processing
+    /// is merged here so the next sweep (triggered by the newer edit) drains and
+    /// includes them, preventing stale dependents after rapid successive edits.
+    pending_changed_names: Mutex<HashSet<String>>,
+    /// Set to `true` once the vanilla index has been loaded and merged into
+    /// `info_service.type_index`. After the merge the raw `vanilla_index` data
+    /// is dropped to eliminate double residency; this flag prevents
+    /// `ensure_vanilla_index` from re-running on subsequent workspace scans.
+    vanilla_merged: std::sync::atomic::AtomicBool,
 }
 
 struct ParsedDoc {
@@ -277,7 +258,8 @@ impl DocumentState {
     fn new() -> Self {
         Self {
             documents: Mutex::new(HashMap::new()),
-            ruleset: Mutex::new(None),
+            ruleset: parking_lot::RwLock::new(None),
+            scope_registry: parking_lot::RwLock::new(None),
             string_table: StringTable::new(),
             language: Mutex::new("paradox".to_string()),
             symbol_index: Mutex::new(symbols::SymbolIndex::new()),
@@ -293,6 +275,8 @@ impl DocumentState {
             ignore_file_patterns: parking_lot::RwLock::new(Vec::new()),
             ignore_dir_patterns: parking_lot::RwLock::new(Vec::new()),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
+            pending_changed_names: Mutex::new(HashSet::new()),
+            vanilla_merged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -320,6 +304,66 @@ impl Backend {
     /// We receive it but don't act on it yet.
     async fn on_did_focus_file(&self, _params: Value) {
         // C→S: accept silently.
+    }
+
+    /// Look up the TypeRef (type_name, instance_name) under the cursor.
+    ///
+    /// Shared by goto_definition, references, prepare_rename, and rename to
+    /// avoid the same 25-line block being copy-pasted in four places.
+    fn type_ref_at_cursor(
+        &self,
+        uri: &str,
+        pos: tower_lsp::lsp_types::Position,
+        logical_path: &str,
+    ) -> Option<(String, String)> {
+        let docs = self.state.documents.lock();
+        let ruleset_guard = self.state.ruleset.read();
+        if let (Some(doc), Some(rs)) = (docs.get(uri), ruleset_guard.as_ref())
+            && let Some(ast) = &doc.ast
+        {
+            let info = info_at_position(
+                ast,
+                pos.line + 1,
+                pos.character as u16,
+                rs,
+                logical_path,
+                &self.state.string_table,
+            );
+            return info.and_then(|i| match i.hint {
+                ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
+                _ => None,
+            });
+        }
+        None
+    }
+
+    /// The variable name read at the cursor, if it resolves to a
+    /// `value[variable]` field. Used by goto-definition on a variable read.
+    fn var_ref_at_cursor(
+        &self,
+        uri: &str,
+        pos: tower_lsp::lsp_types::Position,
+        logical_path: &str,
+    ) -> Option<String> {
+        let docs = self.state.documents.lock();
+        let ruleset_guard = self.state.ruleset.read();
+        if let (Some(doc), Some(rs)) = (docs.get(uri), ruleset_guard.as_ref())
+            && let Some(ast) = &doc.ast
+        {
+            let info = info_at_position(
+                ast,
+                pos.line + 1,
+                pos.character as u16,
+                rs,
+                logical_path,
+                &self.state.string_table,
+            );
+            return info.and_then(|i| match i.hint {
+                ReferenceHint::Variable { name, .. } => Some(name),
+                _ => None,
+            });
+        }
+        None
     }
 }
 
@@ -353,56 +397,43 @@ fn extract_ignore_patterns(opts: &Value) -> (Vec<String>, Vec<String>) {
     (files, dirs)
 }
 
-/// Tiny glob match supporting `*` (any chars) and `?` (single char), matching
-/// the semantics of `cwtools_file_manager::glob_match`. Kept inline to avoid a
-/// new public re-export from the file_manager crate.
-fn lsp_glob_match(pattern: &str, text: &str) -> bool {
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        if suffix.is_empty() {
-            return true;
-        }
-        return text.ends_with(suffix);
+/// Convert a `file://` URI string to a filesystem path string, applying
+/// percent-decoding (e.g. `%20` → space). Returns the raw URI on failure.
+fn uri_to_path_str(uri: &str) -> String {
+    if let Ok(url) = Url::parse(uri)
+        && let Ok(path) = url.to_file_path()
+        && let Some(s) = path.to_str()
+    {
+        return s.to_string();
     }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return text.starts_with(prefix);
-    }
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    let (m, n) = (p.len(), t.len());
-    let mut dp = vec![vec![false; n + 1]; m + 1];
-    dp[0][0] = true;
-    for i in 1..=m {
-        if p[i - 1] == '*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-    }
-    for i in 1..=m {
-        for j in 1..=n {
-            if p[i - 1] == '*' {
-                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
-            } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1];
-            }
-        }
-    }
-    dp[m][n]
+    // Fallback: strip scheme manually (no percent-decode, but avoids a panic).
+    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+}
+
+/// Convert a filesystem path to a `file://` URI, percent-encoding special
+/// characters. Uses the `url` crate so paths with spaces or non-ASCII round-trip
+/// correctly through `uri_to_path_str`.
+fn path_to_uri(path: &std::path::Path) -> String {
+    Url::from_file_path(path)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("file://{}", path.display()))
 }
 
 /// Derive the logical path (relative to mod root) from a file:// URI and the
 /// workspace root URI.  Falls back to the raw path if the workspace prefix
 /// cannot be stripped.
 fn logical_path_from_uri(uri: &str, workspace_uri: &Option<String>) -> String {
-    let path = uri.strip_prefix("file://").unwrap_or(uri);
+    let path = uri_to_path_str(uri);
     if let Some(ws) = workspace_uri {
-        let ws_path = ws.strip_prefix("file://").unwrap_or(ws.as_str());
+        let ws_path = uri_to_path_str(ws);
         // Strip leading slash-terminated prefix
         let prefix = ws_path.trim_end_matches('/');
         if let Some(rel) = path.strip_prefix(prefix) {
             return rel.trim_start_matches('/').to_string();
         }
     }
-    // Fallback: use just the filename portion
-    path.to_string()
+    // Fallback: use the decoded path as-is
+    path
 }
 
 /// Build a Markdown hover string from a PositionInfo + optional rule options.
@@ -413,8 +444,7 @@ fn build_hover_markdown(
 ) -> String {
     // Try to find a matching rule's description and scope info for the element key.
     let (rule_desc, rule_scopes) = match (ruleset, element) {
-        (Some(rules), PositionElement::Leaf { key, .. })
-        | (Some(rules), PositionElement::Node { key }) => find_rule_description(rules, key),
+        (Some(rules), PositionElement::Leaf { key, .. }) => find_rule_description(rules, key),
         _ => (None, Vec::new()),
     };
 
@@ -443,12 +473,15 @@ fn build_hover_markdown(
         ReferenceHint::ScopeName { name } => {
             parts.push(format!("**Scope** — `{}`", name));
         }
+        ReferenceHint::Variable { name, namespace } => {
+            parts.push(format!(
+                "**Variable** — `{}` (namespace `{}`)",
+                name, namespace
+            ));
+        }
         ReferenceHint::Unknown => {
             // Fall back to the raw element description
             match element {
-                PositionElement::Node { key } => {
-                    parts.push(format!("**Node** — `{}`", key));
-                }
                 PositionElement::Leaf { key, value } => {
                     parts.push(format!("**Field** — `{} = {}`", key, value));
                 }
@@ -494,10 +527,9 @@ fn find_rule_description(rules: &RuleSet, key: &str) -> (Option<String>, Vec<Str
                 | RuleType::NodeRule {
                     left: NewField::SpecificField(k),
                     ..
+                } if k.eq_ignore_ascii_case(key) => {
+                    return (opts.description.clone(), opts.required_scopes.clone());
                 }
-                    if k.eq_ignore_ascii_case(key) => {
-                        return (opts.description.clone(), opts.required_scopes.clone());
-                    }
                 _ => {}
             }
         }
@@ -530,32 +562,18 @@ fn collect_enclosing_path(
     use cwtools_parser::ast::{Child, Value};
 
     for child in children {
-        match child {
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                if pos_in_range_simple(target, &node.pos) {
-                    let key = table.get_string(node.key.normal).unwrap_or_default();
-                    path.push(key);
-                    if collect_enclosing_path(&node.children, arena, target, table, path) {
-                        return true;
-                    }
-                    // cursor is in this node but not a child — we're done
-                    return true;
-                }
+        if let Child::Leaf(idx) = child {
+            let leaf = &arena.leaves[*idx as usize];
+            if let Value::Clause(ch) = &leaf.value
+                && pos_in_range_simple(target, &leaf.pos)
+            {
+                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                path.push(key);
+                // Descend (extending `path`) but stop at this branch regardless:
+                // the first enclosing clause that contains the cursor wins.
+                collect_enclosing_path(ch, arena, target, table, path);
+                return true;
             }
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                if let Value::Clause(ch) = &leaf.value
-                    && pos_in_range_simple(target, &leaf.pos) {
-                        let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                        path.push(key);
-                        if collect_enclosing_path(ch, arena, target, table, path) {
-                            return true;
-                        }
-                        return true;
-                    }
-            }
-            _ => {}
         }
     }
     false
@@ -598,9 +616,7 @@ fn rules_for_context<'a>(
         return None;
     }
 
-    // Find a TypeRule whose corresponding TypeDef covers logical_path and
-    // whose top-level key matches key_path[0].
-    let _top_key = &key_path[0];
+    // Find a TypeRule whose corresponding TypeDef covers logical_path.
     for root_rule in &ruleset.root_rules {
         let (type_name, (rule_type, _)) = match root_rule {
             RootRule::TypeRule(n, r) => (n, r),
@@ -667,10 +683,9 @@ fn descend_rules<'a>(
                 left: NewField::AliasValueKeysField(k),
                 rules: inner,
                 ..
+            } if k.eq_ignore_ascii_case(next_key) => {
+                return descend_rules(inner, &remaining[1..]);
             }
-                if k.eq_ignore_ascii_case(next_key) => {
-                    return descend_rules(inner, &remaining[1..]);
-                }
             _ => {}
         }
     }
@@ -987,9 +1002,10 @@ fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<CompletionIt
         // Add subtype typeKeyField alternatives.
         for st in &td.subtypes {
             if let Some(tkf) = &st.type_key_field
-                && !openers.contains(tkf) {
-                    openers.push(tkf.clone());
-                }
+                && !openers.contains(tkf)
+            {
+                openers.push(tkf.clone());
+            }
         }
 
         // Find the TypeRule for this type to get child rules for snippet body.
@@ -1036,7 +1052,9 @@ fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<CompletionIt
 fn loc_completions(info: &cwtools_info::InfoService, language: &str) -> Vec<CompletionItem> {
     // Collect all top-level keys from all files as potential loc keys
     let mut items: Vec<CompletionItem> = info
-        .files.values().flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
+        .files
+        .values()
+        .flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .map(|k| CompletionItem {
@@ -1230,7 +1248,7 @@ impl LanguageServer for Backend {
                             ),
                         )
                         .await;
-                    *self.state.ruleset.lock() = Some(combined_ruleset);
+                    self.set_ruleset(combined_ruleset);
                     // Rebuild modifier_keys now that the ruleset is loaded.
                     // The type index is empty at this point; it will be rebuilt
                     // again after validate_entire_workspace with the full index.
@@ -1246,11 +1264,15 @@ impl LanguageServer for Backend {
             }
         }
 
-        // Store workspace URI if provided
+        // Store workspace URI: prefer workspace_folders (multi-root aware), fall
+        // back to the legacy root_uri field for clients that only send that.
         if let Some(folders) = &params.workspace_folders
-            && let Some(first) = folders.first() {
-                *self.state.workspace_uri.lock() = Some(first.uri.to_string());
-            }
+            && let Some(first) = folders.first()
+        {
+            *self.state.workspace_uri.lock() = Some(first.uri.to_string());
+        } else if let Some(root_uri) = &params.root_uri {
+            *self.state.workspace_uri.lock() = Some(root_uri.to_string());
+        }
 
         // Per-workspace ignore globs from the extension. The extension
         // forwards `cwtools.ignore.filePatterns` and `cwtools.ignore.directories`
@@ -1301,7 +1323,7 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["getFileTypes".to_string()],
+                    commands: vec!["getFileTypes".to_string(), "exportProfilingLog".to_string()],
                     work_done_progress_options: Default::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
@@ -1310,6 +1332,15 @@ impl LanguageServer for Backend {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
+                // Position encoding: we do not negotiate position_encoding here,
+                // so clients default to UTF-16 (LSP spec default). The parser
+                // counts Unicode scalar values (chars), NOT UTF-16 code units.
+                // On BMP-only files (no surrogate pairs) the counts agree; on
+                // files containing emoji or non-BMP characters, column offsets
+                // will be off by the number of astral code points on the line.
+                // TODO: negotiate utf-8 or utf-32 once tower-lsp exposes
+                // PositionEncodingKind in InitializeResult, so clients that
+                // support utf-32 get exact columns for free.
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -1393,7 +1424,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
 
-        let Some(change) = params.content_changes.into_iter().next() else {
+        // FULL-sync spec requires last-wins; use the last change in the batch.
+        let Some(change) = params.content_changes.into_iter().last() else {
             return;
         };
         let text = change.text;
@@ -1474,71 +1506,89 @@ impl LanguageServer for Backend {
             .to_string();
         let pos = params.text_document_position_params.position;
 
-        let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri)
-            && let Some(ast) = &doc.ast {
-                let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
-                let lsp_col = pos.character as u16;
+        // Snapshot the AST (a cheap `Arc` clone) and drop the documents guard
+        // before taking ruleset, so hover never co-holds documents + ruleset and
+        // its documents window stays tiny.
+        let ast = {
+            let docs = self.state.documents.lock();
+            docs.get(&uri).and_then(|d| d.ast.clone())
+        };
+        if let Some(ast) = ast {
+            let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
+            let lsp_col = pos.character as u16;
 
-                let ws_uri = self.state.workspace_uri.lock().clone();
-                let logical_path = logical_path_from_uri(&uri, &ws_uri);
+            let ws_uri = self.state.workspace_uri.lock().clone();
+            let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-                let ruleset_guard = self.state.ruleset.lock();
-                let pos_info = if let Some(rs) = ruleset_guard.as_ref() {
-                    info_at_position(
-                        ast,
-                        lsp_line,
-                        lsp_col,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    )
-                } else {
-                    // No rules: fall back to position-only lookup
-                    None
-                };
-                drop(ruleset_guard);
-
-                if let Some(info) = pos_info {
-                    let ruleset_guard2 = self.state.ruleset.lock();
-                    let md =
-                        build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: md,
-                        }),
-                        range: None,
-                    }));
-                }
-
-                // Fallback: no-rule position finder
-                if let Some(element) = element_at_position(
-                    ast,
-                    pos.line + 1,
-                    pos.character as u16,
+            let ruleset_guard = self.state.ruleset.read();
+            let pos_info = if let Some(rs) = ruleset_guard.as_ref() {
+                info_at_position(
+                    &ast,
+                    lsp_line,
+                    lsp_col,
+                    rs,
+                    &logical_path,
                     &self.state.string_table,
-                ) {
-                    let contents = match element {
-                        PositionElement::Node { key } => {
-                            format!("**Node**: `{}`", key)
-                        }
-                        PositionElement::Leaf { key, value } => {
-                            format!("**Field**: `{} = {}`", key, value)
-                        }
-                        PositionElement::LeafValue { value } => {
-                            format!("**Value**: `{}`", value)
-                        }
-                    };
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: contents,
-                        }),
-                        range: None,
-                    }));
+                )
+            } else {
+                // No rules: fall back to position-only lookup
+                None
+            };
+            drop(ruleset_guard);
+
+            if let Some(info) = pos_info {
+                let ruleset_guard2 = self.state.ruleset.read();
+                let mut md =
+                    build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
+                drop(ruleset_guard2);
+                // For a variable read, append the known assigned value(s) so the
+                // user sees what it resolves to without chasing the definition.
+                if let ReferenceHint::Variable { name, .. } = &info.hint {
+                    let info_guard = self.state.info_service.read();
+                    let (values, more) = info_guard.variable_values(name, 5);
+                    if !values.is_empty() {
+                        let joined = values
+                            .iter()
+                            .map(|v| format!("`{}`", v))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let suffix = if more { ", +more" } else { "" };
+                        md.push_str(&format!("\n\nSet to: {}{}", joined, suffix));
+                    }
                 }
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: md,
+                    }),
+                    range: None,
+                }));
             }
+
+            // Fallback: no-rule position finder
+            if let Some(element) = element_at_position(
+                &ast,
+                pos.line + 1,
+                pos.character as u16,
+                &self.state.string_table,
+            ) {
+                let contents = match element {
+                    PositionElement::Leaf { key, value } => {
+                        format!("**Field**: `{} = {}`", key, value)
+                    }
+                    PositionElement::LeafValue { value } => {
+                        format!("**Value**: `{}`", value)
+                    }
+                };
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: contents,
+                    }),
+                    range: None,
+                }));
+            }
+        }
         Ok(None)
     }
 
@@ -1572,7 +1622,7 @@ impl LanguageServer for Backend {
 
         let context_items: Vec<CompletionItem> = {
             let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
+            let ruleset_guard = self.state.ruleset.read();
             let info_guard = self.state.info_service.read();
 
             if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
@@ -1600,12 +1650,20 @@ impl LanguageServer for Backend {
         }
 
         // Fallback: flat global list (original behavior) when context-aware
-        // matching produced nothing (no rules loaded, unrecognised path, etc.)
+        // matching produced nothing (no rules loaded, unrecognised path, or a
+        // context `descend_rules` can't reach, e.g. inside an alias-driven block
+        // like `check_variable = { … }`). On a large mod the workspace has tens
+        // of thousands of variables/targets/keys, so cap the dump and flag the
+        // result `is_incomplete` — the client re-requests as the user narrows.
+        const FALLBACK_CAP: usize = 2000;
         let mut items = Vec::new();
 
-        let ruleset = self.state.ruleset.lock();
+        let ruleset = self.state.ruleset.read();
         if let Some(rules) = ruleset.as_ref() {
             for t in &rules.types {
+                if items.len() >= FALLBACK_CAP {
+                    break;
+                }
                 items.push(CompletionItem {
                     label: t.name.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
@@ -1614,6 +1672,9 @@ impl LanguageServer for Backend {
                 });
             }
             for e in &rules.enums {
+                if items.len() >= FALLBACK_CAP {
+                    break;
+                }
                 items.push(CompletionItem {
                     label: e.key.clone(),
                     kind: Some(CompletionItemKind::ENUM),
@@ -1626,6 +1687,9 @@ impl LanguageServer for Backend {
 
         let info = self.state.info_service.read();
         for var in &info.all_variables {
+            if items.len() >= FALLBACK_CAP {
+                break;
+            }
             items.push(CompletionItem {
                 label: var.clone(),
                 kind: Some(CompletionItemKind::CONSTANT),
@@ -1634,6 +1698,9 @@ impl LanguageServer for Backend {
             });
         }
         for et in &info.all_event_targets {
+            if items.len() >= FALLBACK_CAP {
+                break;
+            }
             items.push(CompletionItem {
                 label: format!("event_target:{}", et),
                 kind: Some(CompletionItemKind::VARIABLE),
@@ -1642,7 +1709,13 @@ impl LanguageServer for Backend {
             });
         }
         for (file_uri, file_info) in &info.files {
+            if items.len() >= FALLBACK_CAP {
+                break;
+            }
             for (key, _loc) in &file_info.top_level_keys {
+                if items.len() >= FALLBACK_CAP {
+                    break;
+                }
                 items.push(CompletionItem {
                     label: key.clone(),
                     kind: Some(CompletionItemKind::KEYWORD),
@@ -1655,7 +1728,11 @@ impl LanguageServer for Backend {
         if items.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(CompletionResponse::Array(items)))
+            let is_incomplete = items.len() >= FALLBACK_CAP;
+            Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete,
+                items,
+            })))
         }
     }
 
@@ -1675,30 +1752,7 @@ impl LanguageServer for Backend {
 
         // First try the rule-aware lookup via info_at_position so we get a
         // TypeRef hint and can look up the actual definition location.
-        let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let info = info_at_position(
-                        ast,
-                        pos.line + 1,
-                        pos.character as u16,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    );
-                    info.and_then(|i| match i.hint {
-                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((type_name, instance_name)) = type_ref {
             // Look up in the TypeIndex
@@ -1729,48 +1783,76 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Variable read: jump to where the variable is set.
+        if let Some(var_name) = self.var_ref_at_cursor(&uri, pos, &logical_path) {
+            let info = self.state.info_service.read();
+            let defs = info.find_variable_definitions(&var_name);
+            let locations: Vec<Location> = defs
+                .iter()
+                .map(|(file_uri, loc)| Location {
+                    uri: parse_uri(
+                        file_uri,
+                        &params.text_document_position_params.text_document.uri,
+                    ),
+                    range: Range {
+                        start: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: loc.col as u32,
+                        },
+                        end: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: loc.col as u32 + var_name.len() as u32,
+                        },
+                    },
+                })
+                .collect();
+            if !locations.is_empty() {
+                return Ok(Some(GotoDefinitionResponse::Array(locations)));
+            }
+        }
+
         // Fallback: heuristic symbol-based lookup
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri)
             && let Some(ast) = &doc.ast
-                && let Some(element) = element_at_position(
-                    ast,
-                    pos.line + 1,
-                    pos.character as u16,
-                    &self.state.string_table,
-                ) {
-                    let symbol = match &element {
-                        PositionElement::Node { key } => key.clone(),
-                        PositionElement::Leaf { key, .. } => key.clone(),
-                        PositionElement::LeafValue { value } => value.clone(),
-                    };
-                    drop(docs);
-                    let info = self.state.info_service.read();
-                    if let Some(defs) = info.find_definitions(&symbol) {
-                        let locations: Vec<Location> = defs
-                            .iter()
-                            .map(|(file_uri, loc)| Location {
-                                uri: parse_uri(
-                                    file_uri,
-                                    &params.text_document_position_params.text_document.uri,
-                                ),
-                                range: Range {
-                                    start: Position {
-                                        line: loc.line.saturating_sub(1),
-                                        character: loc.col as u32,
-                                    },
-                                    end: Position {
-                                        line: loc.line.saturating_sub(1),
-                                        character: (loc.col + symbol.len() as u16) as u32,
-                                    },
-                                },
-                            })
-                            .collect();
-                        if !locations.is_empty() {
-                            return Ok(Some(GotoDefinitionResponse::Array(locations)));
-                        }
-                    }
+            && let Some(element) = element_at_position(
+                ast,
+                pos.line + 1,
+                pos.character as u16,
+                &self.state.string_table,
+            )
+        {
+            let symbol = match &element {
+                PositionElement::Leaf { key, .. } => key.clone(),
+                PositionElement::LeafValue { value } => value.clone(),
+            };
+            drop(docs);
+            let info = self.state.info_service.read();
+            if let Some(defs) = info.find_definitions(&symbol) {
+                let locations: Vec<Location> = defs
+                    .iter()
+                    .map(|(file_uri, loc)| Location {
+                        uri: parse_uri(
+                            file_uri,
+                            &params.text_document_position_params.text_document.uri,
+                        ),
+                        range: Range {
+                            start: Position {
+                                line: loc.line.saturating_sub(1),
+                                character: loc.col as u32,
+                            },
+                            end: Position {
+                                line: loc.line.saturating_sub(1),
+                                character: (loc.col + symbol.len() as u16) as u32,
+                            },
+                        },
+                    })
+                    .collect();
+                if !locations.is_empty() {
+                    return Ok(Some(GotoDefinitionResponse::Array(locations)));
                 }
+            }
+        }
         Ok(None)
     }
 
@@ -1788,30 +1870,7 @@ impl LanguageServer for Backend {
         // locations only.  Tracking every *use* of a type instance across the
         // workspace would require an additional references index that is not yet
         // built.  Full cross-file reference tracking is left as future work.
-        let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let info = info_at_position(
-                        ast,
-                        pos.line + 1,
-                        pos.character as u16,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    );
-                    info.and_then(|i| match i.hint {
-                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((type_name, instance_name)) = type_ref {
             let mut all_locs: Vec<Location> = Vec::new();
@@ -1845,7 +1904,7 @@ impl LanguageServer for Backend {
             // 2. Use-sites: scan all docs for TypeField leaves with the same value.
             {
                 let docs = self.state.documents.lock();
-                let ruleset_guard = self.state.ruleset.lock();
+                let ruleset_guard = self.state.ruleset.read();
                 let ws_uri = self.state.workspace_uri.lock().clone();
                 if let Some(rs) = ruleset_guard.as_ref() {
                     let use_sites = scan_use_sites(
@@ -1886,78 +1945,72 @@ impl LanguageServer for Backend {
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri)
             && let Some(ast) = &doc.ast
-                && let Some(element) = element_at_position(
-                    ast,
-                    pos.line + 1,
-                    pos.character as u16,
-                    &self.state.string_table,
-                ) {
-                    let symbol = match &element {
-                        PositionElement::Node { key } => key.clone(),
-                        PositionElement::Leaf { key, .. } => key.clone(),
-                        PositionElement::LeafValue { value } => value.clone(),
-                    };
-                    drop(docs);
-                    let info = self.state.info_service.read();
-                    let mut all_locs = Vec::new();
-                    if let Some(defs) = info.find_definitions(&symbol) {
-                        all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
-                            uri: parse_uri(
-                                file_uri,
-                                &params.text_document_position.text_document.uri,
-                            ),
-                            range: Range {
-                                start: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: loc.col as u32,
-                                },
-                                end: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: (loc.col + symbol.len() as u16) as u32,
-                                },
-                            },
-                        }));
-                    }
-                    if let Some(refs) = info.find_references(&symbol) {
-                        all_locs.extend(refs.iter().map(|(file_uri, loc)| Location {
-                            uri: parse_uri(
-                                file_uri,
-                                &params.text_document_position.text_document.uri,
-                            ),
-                            range: Range {
-                                start: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: loc.col as u32,
-                                },
-                                end: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: (loc.col + symbol.len() as u16) as u32,
-                                },
-                            },
-                        }));
-                    }
-                    let index = self.state.symbol_index.lock();
-                    if let Some(locs) = index.find_references(&symbol) {
-                        all_locs.extend(locs.iter().map(|l| Location {
-                            uri: l.uri.parse().unwrap_or_else(|_| {
-                                params.text_document_position.text_document.uri.clone()
-                            }),
-                            range: Range {
-                                start: Position {
-                                    line: l.line.saturating_sub(1),
-                                    character: l.col as u32,
-                                },
-                                end: Position {
-                                    line: l.line.saturating_sub(1),
-                                    character: (l.col + symbol.len() as u16) as u32,
-                                },
-                            },
-                        }));
-                    }
-                    if !all_locs.is_empty() {
-                        return Ok(Some(all_locs));
-                    }
-                }
+            && let Some(element) = element_at_position(
+                ast,
+                pos.line + 1,
+                pos.character as u16,
+                &self.state.string_table,
+            )
+        {
+            let symbol = match &element {
+                PositionElement::Leaf { key, .. } => key.clone(),
+                PositionElement::LeafValue { value } => value.clone(),
+            };
+            drop(docs);
+            let info = self.state.info_service.read();
+            let mut all_locs = Vec::new();
+            if let Some(defs) = info.find_definitions(&symbol) {
+                all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
+                    uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
+                    range: Range {
+                        start: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: loc.col as u32,
+                        },
+                        end: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: (loc.col + symbol.len() as u16) as u32,
+                        },
+                    },
+                }));
+            }
+            if let Some(refs) = info.find_references(&symbol) {
+                all_locs.extend(refs.iter().map(|(file_uri, loc)| Location {
+                    uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
+                    range: Range {
+                        start: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: loc.col as u32,
+                        },
+                        end: Position {
+                            line: loc.line.saturating_sub(1),
+                            character: (loc.col + symbol.len() as u16) as u32,
+                        },
+                    },
+                }));
+            }
+            let index = self.state.symbol_index.lock();
+            if let Some(locs) = index.find_references(&symbol) {
+                all_locs.extend(locs.iter().map(|l| Location {
+                    uri: l.uri.parse().unwrap_or_else(|_| {
+                        params.text_document_position.text_document.uri.clone()
+                    }),
+                    range: Range {
+                        start: Position {
+                            line: l.line.saturating_sub(1),
+                            character: l.col as u32,
+                        },
+                        end: Position {
+                            line: l.line.saturating_sub(1),
+                            character: (l.col + symbol.len() as u16) as u32,
+                        },
+                    },
+                }));
+            }
+            if !all_locs.is_empty() {
+                return Ok(Some(all_locs));
+            }
+        }
         Ok(None)
     }
 
@@ -2096,33 +2149,14 @@ impl LanguageServer for Backend {
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-        let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let info = info_at_position(
-                        ast,
-                        pos.line + 1,
-                        pos.character as u16,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    );
-                    info.and_then(|i| match i.hint {
-                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((_, instance_name)) = type_ref {
-            // Return a range covering the instance name at cursor.
+            // Return a range covering the whole instance name token. The range
+            // start is computed by finding where the token begins relative to
+            // pos.character; for now we start at pos.character and extend right
+            // (the cursor is somewhere within the token).
+            // TODO: compute the true token-start position for mid-token cursors.
             let range = Range {
                 start: Position {
                     line: pos.line,
@@ -2146,30 +2180,7 @@ impl LanguageServer for Backend {
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         // Identify what's under the cursor
-        let type_ref: Option<(String, String)> = {
-            let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let info = info_at_position(
-                        ast,
-                        pos.line + 1,
-                        pos.character as u16,
-                        rs,
-                        &logical_path,
-                        &self.state.string_table,
-                    );
-                    info.and_then(|i| match i.hint {
-                        ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         let (type_name, instance_name) = match type_ref {
             Some(r) => r,
@@ -2178,6 +2189,12 @@ impl LanguageServer for Backend {
 
         // Collect definition + use-site locations (reuse references logic)
         let mut all_locs: Vec<(String, cwtools_info::SourceLocation, usize)> = Vec::new();
+
+        // Snapshot open URIs so we can detect closed-file appearances below.
+        let open_uris_snap: HashSet<String> = {
+            let docs = self.state.documents.lock();
+            docs.keys().cloned().collect()
+        };
 
         {
             let info = self.state.info_service.read();
@@ -2189,7 +2206,7 @@ impl LanguageServer for Backend {
 
         {
             let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.lock();
+            let ruleset_guard = self.state.ruleset.read();
             let ws_uri2 = self.state.workspace_uri.lock().clone();
             if let Some(rs) = ruleset_guard.as_ref() {
                 let use_sites = scan_use_sites(
@@ -2208,6 +2225,26 @@ impl LanguageServer for Backend {
 
         if all_locs.is_empty() {
             return Ok(None);
+        }
+
+        // Refuse if the symbol appears in closed files. Producing a partial
+        // WorkspaceEdit for open-only files would silently leave dangling
+        // references in closed files; better to tell the user up front.
+        let closed_file = all_locs
+            .iter()
+            .find(|(file_uri, _, _)| !open_uris_snap.contains(file_uri));
+        if let Some((file_uri, _, _)) = closed_file {
+            return Err(tower_lsp::jsonrpc::Error {
+                // -32002 = RequestFailed (LSP extension to JSON-RPC)
+                code: tower_lsp::jsonrpc::ErrorCode::ServerError(-32002),
+                message: format!(
+                    "Rename cancelled: '{}' appears in closed file {}. \
+                     Open all files that reference this symbol and retry.",
+                    instance_name, file_uri
+                )
+                .into(),
+                data: None,
+            });
         }
 
         // Build WorkspaceEdit: group text edits by file URI
@@ -2251,6 +2288,9 @@ impl LanguageServer for Backend {
                 }
                 Ok(Some(Value::Array(vec![])))
             }
+            "exportProfilingLog" => Ok(Some(Value::String(
+                cwtools_profiling::export_profiling_log(),
+            ))),
             _ => Ok(None),
         }
     }
@@ -2289,10 +2329,7 @@ impl Backend {
         };
 
         let root_path = match workspace_uri {
-            Some(uri) => {
-                let p = uri.strip_prefix("file://").unwrap_or(&uri);
-                std::path::PathBuf::from(p)
-            }
+            Some(ref uri) => std::path::PathBuf::from(uri_to_path_str(uri)),
             None => {
                 self.client
                     .log_message(
@@ -2313,70 +2350,14 @@ impl Backend {
         let extra_file_globs = self.state.ignore_file_patterns.read().clone();
         let extra_dir_globs = self.state.ignore_dir_patterns.read().clone();
 
-        let mut files_to_validate = Vec::new();
-        fn walk_dir(
-            path: &std::path::Path,
-            extensions: &[&str],
-            extra_file_globs: &[String],
-            extra_dir_globs: &[String],
-            out: &mut Vec<std::path::PathBuf>,
-        ) {
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let raw_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        let lower_name = raw_name.to_lowercase();
-                        let skip = matches!(
-                            lower_name.as_str(),
-                            ".git" | "node_modules" | "out" | "dist" | "target" | "bin" | "obj"
-                            // `resources/` is a developer scratch area in many mods,
-                            // not a path the game loads — don't validate it.
-                            | "resources" | ".vscode"
-                        ) || extra_dir_globs
-                            .iter()
-                            .any(|pat| lsp_glob_match(pat, raw_name));
-                        if !skip {
-                            walk_dir(&path, extensions, extra_file_globs, extra_dir_globs, out);
-                        }
-                    } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if !extensions.contains(&ext) {
-                            continue;
-                        }
-                        // Engine baseline for free-form text files. These are
-                        // NOT in the user globs (which only extend), so
-                        // Changelog.txt / README.* / LICENSE.* / *.md always
-                        // get skipped here even if the user sends an empty
-                        // `ignoreFilePatterns` list.
-                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        let engine_skip = matches!(
-                            file_name,
-                            "Changelog.txt"
-                                | "README.txt"
-                                | "LICENSE.txt"
-                                | "README.md"
-                                | "LICENSE.md"
-                        ) || file_name.to_ascii_lowercase().ends_with(".md");
-                        if engine_skip {
-                            continue;
-                        }
-                        if extra_file_globs
-                            .iter()
-                            .any(|pat| lsp_glob_match(pat, file_name))
-                        {
-                            continue;
-                        }
-                        out.push(path);
-                    }
-                }
-            }
-        }
-        walk_dir(
+        // Whole-tree discovery shares file_manager's skip/exclude config so the
+        // LSP and CLI agree on what to skip (engine/IDE dirs, free-form text).
+        // The user-configured globs extend that baseline.
+        let files_to_validate = cwtools_file_manager::file_manager::walk_workspace_files(
             &root_path,
             &extensions,
             &extra_file_globs,
             &extra_dir_globs,
-            &mut files_to_validate,
         );
 
         if files_to_validate.is_empty() {
@@ -2405,7 +2386,7 @@ impl Backend {
             match cache_dir {
                 Some(cd) => {
                     let language = self.state.language.lock().clone();
-                    let ruleset_snap = self.state.ruleset.lock().clone();
+                    let ruleset_snap = self.state.ruleset.read().clone();
                     let fp = match ruleset_snap {
                         Some(ref rs) => {
                             workspace_cache::settings_fingerprint(&language, rs, &root_path)
@@ -2447,11 +2428,29 @@ impl Backend {
         // across restarts; keeping the AST resident avoids a pass-2 re-parse
         // within a single scan.
         self.send_loading_bar(true, "Indexing workspace…").await;
+        // Snapshot the set of currently-open document URIs so both passes can
+        // skip them: open docs were already indexed by did_open/did_change and
+        // their fresher in-memory diagnostics must not be clobbered by stale
+        // disk-text validation with version=None.
+        let open_uris: HashSet<String> = {
+            let docs = self.state.documents.lock();
+            docs.keys().cloned().collect()
+        };
+
         let mut parsed_files: Vec<Option<ParsedFile>> = Vec::with_capacity(files_to_validate.len());
         let mut cache_hits = 0u64;
         let mut cache_misses = 0u64;
         for (i, file_path) in files_to_validate.iter().enumerate() {
-            let uri = format!("file://{}", file_path.display());
+            let uri = path_to_uri(file_path);
+            // Open docs are already indexed from their in-memory text; skip so
+            // we don't re-index stale disk content on top of the live version.
+            if open_uris.contains(&uri) {
+                parsed_files.push(None);
+                if i % 50 == 49 {
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
             let parsed = match std::fs::read_to_string(file_path) {
                 Ok(text) => {
                     // Try the parse cache first.
@@ -2465,7 +2464,13 @@ impl Backend {
                     } else if let Some(parsed) = self.index_document(&uri, &text).await {
                         // Cache miss — parse + index, then persist for next scan.
                         if let Some((ref cd, fp)) = cache_info {
-                            workspace_cache::store(cd, fp, &text, &parsed, &self.state.string_table);
+                            workspace_cache::store(
+                                cd,
+                                fp,
+                                &text,
+                                &parsed,
+                                &self.state.string_table,
+                            );
                         }
                         cache_misses += 1;
                         Some(parsed)
@@ -2498,16 +2503,26 @@ impl Backend {
         self.ensure_vanilla_index().await;
 
         // Merge the pre-generated vanilla index (if loaded) so base-game
-        // references resolve. Re-merge each pass after dropping the prior copy
-        // to avoid unbounded growth on re-validation.
+        // references resolve. After the merge the raw per-type data is dropped
+        // from `vanilla_index` to eliminate double residency (the type_index
+        // already owns the instances). `vanilla_merged` prevents re-running on
+        // subsequent workspace scans.
         {
-            let vanilla_guard = self.state.vanilla_index.lock();
-            if let Some(per_type) = vanilla_guard.as_ref() {
+            let per_type = self.state.vanilla_index.lock().take();
+            if let Some(per_type) = per_type {
                 let mut info_guard = self.state.info_service.write();
                 info_guard.type_index.remove_file("<vanilla-cache>");
-                info_guard
-                    .type_index
-                    .merge("<vanilla-cache>", per_type.clone());
+                info_guard.type_index.merge("<vanilla-cache>", per_type);
+                // Vanilla data is loaded, so the index now holds every base-game
+                // instance. Mark it complete so the CW500/CW222 type-reference
+                // checks fire (they're gated on `complete` to avoid false
+                // positives during mod-only validation). The driver's Session
+                // sets this for the CLI path; the LSP merges vanilla directly and
+                // must set it here too. See rule_core.rs gate on `idx.complete`.
+                info_guard.type_index.complete = true;
+                // `vanilla_index` is now None — mark it merged so
+                // ensure_vanilla_index does not re-run on the next scan.
+                self.state.vanilla_merged.store(true, Ordering::SeqCst);
             }
         }
 
@@ -2553,12 +2568,12 @@ impl Backend {
         // (which borrows the ruleset) stays valid across the parallel section
         // without holding the ruleset mutex across rayon work.
         let scan_ruleset: Option<Arc<RuleSet>> = {
-            let ruleset_guard = self.state.ruleset.lock();
+            let ruleset_guard = self.state.ruleset.read();
             ruleset_guard.as_ref().map(|rs| Arc::new(rs.clone()))
         };
-        let scan_registry = scan_ruleset
-            .as_ref()
-            .map(|rs| build_scope_registry_arc(rs, scan_game));
+        // The scope registry is cached (built once at ruleset load); snapshot the
+        // `Arc` for the batch instead of rebuilding it for the whole scan.
+        let scan_registry = self.state.scope_registry.read().clone();
 
         // Validate every file in parallel, then publish serially. The
         // CPU-bound validation runs under a single shared `info_service` /
@@ -2571,32 +2586,41 @@ impl Backend {
             let loc_guard = self.state.loc_index.read();
             let type_index = &info_guard.type_index;
             let loc_index = loc_guard.as_ref();
-            let registry = scan_registry.as_ref().and_then(|r| r.as_ref());
+            let registry = scan_registry.as_ref();
             // Build enum_map once for the batch; it borrows `scan_ruleset`,
             // which is owned for the whole parallel section above.
             let enum_map = scan_ruleset.as_ref().map(|rs| build_enum_map(rs));
+            // One Prepared for the whole batch (None if the ruleset isn't loaded).
+            // It is Copy + all-borrows, so it is shared freely across rayon threads.
+            let prepared =
+                scan_ruleset
+                    .as_ref()
+                    .zip(enum_map.as_ref())
+                    .map(|(ruleset, enum_map)| Prepared {
+                        ruleset,
+                        table: &self.state.string_table,
+                        game: scan_game,
+                        type_index: Some(type_index),
+                        modifier_keys: Some(&modifier_keys_snap),
+                        loc_index,
+                        registry,
+                        enum_map,
+                    });
 
             files_to_validate
                 .par_iter()
                 .zip(parsed_files.par_iter())
                 .filter_map(|(file_path, parsed_opt)| {
-                    // Skip files that failed to parse in pass 1.
+                    // Skip files that failed to parse in pass 1, and open docs
+                    // whose fresher in-memory diagnostics must not be overwritten.
                     let parsed = parsed_opt.as_ref()?;
-                    let uri = format!("file://{}", file_path.display());
-                    let diagnostics = match (scan_ruleset.as_ref(), enum_map.as_ref()) {
-                        (Some(ruleset), Some(enum_map)) => validate_parsed_with_indexes(
-                            &uri,
-                            parsed,
-                            &modifier_keys_snap,
-                            ruleset,
-                            scan_game,
-                            registry,
-                            enum_map,
-                            type_index,
-                            loc_index,
-                            &self.state.string_table,
-                        ),
-                        _ => parsed
+                    let uri = path_to_uri(file_path);
+                    if open_uris.contains(&uri) {
+                        return None;
+                    }
+                    let diagnostics = match &prepared {
+                        Some(prepared) => validate_parsed_with_indexes(&uri, parsed, prepared),
+                        None => parsed
                             .errors
                             .iter()
                             .map(parse_error_to_diagnostic)
@@ -2644,7 +2668,7 @@ impl Backend {
         let file_list: Vec<serde_json::Value> = files_to_validate
             .iter()
             .map(|file_path| {
-                let uri = format!("file://{}", file_path.display());
+                let uri = path_to_uri(file_path);
                 let logical_path = logical_path_from_uri(&uri, &ws_uri);
                 let scope = logical_path
                     .split('/')
@@ -2700,7 +2724,7 @@ impl Backend {
             let language = self.state.language.lock().clone();
             cwtools_game::constants::Game::from_str(&language)
         };
-        let loc_game = engine_to_loc_game(game);
+        let loc_game = cwtools_localization::Game::from_engine(game);
 
         let mut loc_dirs: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
         if let Some(v) = self.state.vanilla_dir.lock().clone() {
@@ -2745,7 +2769,7 @@ impl Backend {
         // Publish per-file loc diagnostics, but only for workspace loc files
         // (not vanilla). Group by file so each gets a complete diagnostic set.
         for (file, diags) in by_file.drain() {
-            let uri = format!("file://{}", file);
+            let uri = path_to_uri(std::path::Path::new(&file));
             if let Ok(uri_obj) = Url::parse(&uri) {
                 self.client.publish_diagnostics(uri_obj, diags, None).await;
             }
@@ -2771,7 +2795,10 @@ impl Backend {
         let mut tokens = self.state.doc_tokens.write();
         match ast {
             Some(ast) => {
-                tokens.insert(uri.to_string(), collect_doc_tokens(ast, &self.state.string_table));
+                tokens.insert(
+                    uri.to_string(),
+                    collect_doc_tokens(ast, &self.state.string_table),
+                );
             }
             None => {
                 tokens.remove(uri);
@@ -2790,7 +2817,7 @@ impl Backend {
         }
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(uri, &ws_uri);
-        let ruleset_guard = self.state.ruleset.lock();
+        let ruleset_guard = self.state.ruleset.read();
         let mut info = self.state.info_service.write();
         info.clear_file(uri);
         if let Some(ruleset) = ruleset_guard.as_ref() {
@@ -2805,44 +2832,9 @@ impl Backend {
     }
 
     /// Validate an already-parsed document against the (already-built) workspace
-    /// index, using a precomputed modifier-key set. No parsing, no re-indexing,
-    /// no per-file logging — this is the hot path for a full-workspace scan.
-    fn validate_parsed(
-        &self,
-        uri: &str,
-        parsed: &ParsedFile,
-        modifier_keys: &std::collections::HashSet<String>,
-    ) -> Vec<Diagnostic> {
-        let ruleset_guard = self.state.ruleset.lock();
-        let Some(ruleset) = ruleset_guard.as_ref() else {
-            // No ruleset: only the parse errors apply.
-            return parsed
-                .errors
-                .iter()
-                .map(parse_error_to_diagnostic)
-                .collect();
-        };
-        let language = self.state.language.lock().clone();
-        let game = cwtools_game::constants::Game::from_str(&language);
-        // Build the per-run shared state for this single file. Multi-file callers
-        // (the workspace scan) should build these ONCE and call
-        // `validate_parsed_prebuilt` to avoid rebuilding per file.
-        let registry = build_scope_registry_arc(ruleset, game);
-        let enum_map = build_enum_map(ruleset);
-        self.validate_parsed_prebuilt(
-            uri,
-            parsed,
-            modifier_keys,
-            ruleset,
-            game,
-            registry.as_ref(),
-            &enum_map,
-        )
-    }
-
-    /// As [`validate_parsed`], but with the ruleset already locked and the
-    /// per-run scope registry / enum_map prebuilt by the caller. The
-    /// full-workspace scan builds those ONCE outside its loop and reuses them.
+    /// index, with the ruleset already locked and the per-run scope registry /
+    /// enum_map prebuilt by the caller. Multi-file callers (the workspace scan,
+    /// the dependent sweep) build those ONCE outside their loop and reuse them.
     #[allow(clippy::too_many_arguments)]
     fn validate_parsed_prebuilt(
         &self,
@@ -2859,14 +2851,16 @@ impl Backend {
         validate_parsed_with_indexes(
             uri,
             parsed,
-            modifier_keys,
-            ruleset,
-            game,
-            registry,
-            enum_map,
-            &info_guard.type_index,
-            loc_guard.as_ref(),
-            &self.state.string_table,
+            &Prepared {
+                ruleset,
+                table: &self.state.string_table,
+                game,
+                type_index: Some(&info_guard.type_index),
+                modifier_keys: Some(modifier_keys),
+                loc_index: loc_guard.as_ref(),
+                registry,
+                enum_map,
+            },
         )
     }
 
@@ -2898,12 +2892,23 @@ impl Backend {
         let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
         {
             let ast = parsed.map(Arc::new);
+            // Update tokens before taking documents lock (doc_tokens must be
+            // acquired before documents everywhere to avoid ABBA deadlock with
+            // revalidate_open_dependents, which takes doc_tokens then documents).
+            self.update_doc_tokens(&uri, ast.as_ref());
             let mut docs = self.state.documents.lock();
+            // TOCTOU guard: did_close may have arrived while parse_and_validate
+            // was running. Only store the AST if the document is still open at
+            // the same version; if it closed, the index was already cleaned up by
+            // did_close and we must not re-populate or re-publish it.
             if let Some(d) = docs.get_mut(&uri)
-                && d.version == expected_version {
-                    self.update_doc_tokens(&uri, ast.as_ref());
-                    d.ast = ast;
-                }
+                && d.version == expected_version
+            {
+                d.ast = ast;
+            } else {
+                // Doc closed (or version changed) — discard results entirely.
+                return;
+            }
         }
         if let Ok(uri_obj) = Url::parse(&uri) {
             self.client
@@ -2930,10 +2935,16 @@ impl Backend {
             // dependent's diagnostic. When that happens `changed_names` is empty;
             // fall back to `None` (revalidate every dependent) so we never miss
             // one. Soundness beats scoping here.
-            let changed_names: HashSet<String> = names_before
+            let mut changed_names: HashSet<String> = names_before
                 .symmetric_difference(&names_after)
                 .cloned()
                 .collect();
+            // Drain any names accumulated from preempted prior sweeps so this
+            // sweep covers their dependents too.
+            {
+                let mut pending = self.state.pending_changed_names.lock();
+                changed_names.extend(pending.drain());
+            }
             let scope = if changed_names.is_empty() {
                 None
             } else {
@@ -2965,6 +2976,10 @@ impl Backend {
     /// over-approximation: never skip a file that might depend on the change).
     /// `None` revalidates every open dependent (used when the exact set of
     /// changed names can't be pinned down, e.g. a multiplicity-only change).
+    ///
+    /// On preemption (newer edit arrives mid-sweep), the `changed_names` are
+    /// saved to `state.pending_changed_names` so the next sweep drains and
+    /// includes them, preventing stale dependents from falling through the gap.
     async fn revalidate_open_dependents(
         &self,
         changed_uri: &str,
@@ -3004,27 +3019,73 @@ impl Backend {
             generation,
             "revalidate_open_dependents"
         );
-        for (uri, snapshot_version, ast) in others {
-            // Preempt: a newer edit arrived, its sweep will cover everything.
-            if self.state.edit_generation.load(Ordering::SeqCst) != generation {
-                tracing::debug!(generation, "revalidate_open_dependents superseded");
-                return;
-            }
-            let diagnostics = self.validate_parsed(&uri, &ast, &modifier_keys);
-            // Skip if this dependent was itself edited while we validated it —
-            // its own debounced pass owns the fresher result.
-            let still_current = {
-                let docs = self.state.documents.lock();
-                docs.get(&uri)
-                    .map(|d| d.version == snapshot_version)
-                    .unwrap_or(false)
-            };
-            if still_current
-                && let Ok(uri_obj) = Url::parse(&uri) {
-                    self.client
-                        .publish_diagnostics(uri_obj, diagnostics, Some(snapshot_version))
-                        .await;
+        let game = {
+            let language = self.state.language.lock().clone();
+            cwtools_game::constants::Game::from_str(&language)
+        };
+        // The scope registry is cached (built once at ruleset load), so snapshot
+        // the `Arc` here instead of rebuilding it per sweep.
+        let registry = self.state.scope_registry.read().clone();
+        // Validate every dependent synchronously, then publish. The enum_map
+        // borrows the ruleset, so build it ONCE for the whole sweep (cheap, but
+        // pointless to repeat per file). No await is held across the ruleset lock.
+        // Validate all dependents while holding ruleset (read), but do NOT lock
+        // documents inside this block (ABBA: request handlers take documents
+        // then ruleset; we must take ruleset then nothing-or-documents-after).
+        let validated: Vec<(String, i32, Vec<Diagnostic>)> = {
+            let ruleset_guard = self.state.ruleset.read();
+            let enum_map = ruleset_guard.as_ref().map(|rs| build_enum_map(rs));
+            let mut out = Vec::with_capacity(others.len());
+            for (uri, snapshot_version, ast) in others {
+                // Preempt: a newer edit arrived. Save our changed_names into the
+                // shared pending set so the newer sweep drains and covers them;
+                // without this, dependents of the preempted edit stay stale.
+                if self.state.edit_generation.load(Ordering::SeqCst) != generation {
+                    tracing::debug!(generation, "revalidate_open_dependents superseded");
+                    if let Some(names) = changed_names {
+                        let mut pending = self.state.pending_changed_names.lock();
+                        pending.extend(names.iter().cloned());
+                    }
+                    // None means "revalidate everything" — mark with a sentinel
+                    // by draining to empty (the next sweep sees an empty pending
+                    // set and, combined with a `None` scope, covers all dependents).
+                    return;
                 }
+                let diagnostics = match (ruleset_guard.as_ref(), enum_map.as_ref()) {
+                    (Some(ruleset), Some(enum_map)) => self.validate_parsed_prebuilt(
+                        &uri,
+                        &ast,
+                        &modifier_keys,
+                        ruleset,
+                        game,
+                        registry.as_ref(),
+                        enum_map,
+                    ),
+                    _ => ast.errors.iter().map(parse_error_to_diagnostic).collect(),
+                };
+                out.push((uri, snapshot_version, diagnostics));
+            }
+            out
+        };
+        // Now check still_current without holding ruleset (documents first is
+        // the order used by request handlers, so this is safe).
+        let to_publish: Vec<(String, i32, Vec<Diagnostic>)> = validated
+            .into_iter()
+            .filter(|(uri, snapshot_version, _)| {
+                // Skip if this dependent was itself edited while we validated it —
+                // its own debounced pass owns the fresher result.
+                let docs = self.state.documents.lock();
+                docs.get(uri.as_str())
+                    .map(|d| d.version == *snapshot_version)
+                    .unwrap_or(false)
+            })
+            .collect();
+        for (uri, snapshot_version, diagnostics) in to_publish {
+            if let Ok(uri_obj) = Url::parse(&uri) {
+                self.client
+                    .publish_diagnostics(uri_obj, diagnostics, Some(snapshot_version))
+                    .await;
+            }
         }
     }
 
@@ -3038,65 +3099,28 @@ impl Backend {
 
         // Localisation files are parsed and validated as loc, not config.
         if uri.ends_with(".yml") || uri.ends_with(".yaml") || uri.ends_with(".csv") {
-            let path = uri.strip_prefix("file://").unwrap_or(uri);
-            let union = {
-                let guard = self.state.loc_index.read();
-                guard
-                    .as_ref()
-                    .map(|idx| idx.union().clone())
-                    .unwrap_or_default()
-            };
-            for d in cwtools_localization::validate_loc_file_text(text, path, &union) {
+            let path = uri_to_path_str(uri);
+            // Hold the read guard across the validate call to avoid cloning the
+            // full loc-key union (~2M Strings on Millennium Dawn).
+            let loc_guard = self.state.loc_index.read();
+            let empty_union: HashSet<String> = HashSet::new();
+            let union: &HashSet<String> = loc_guard
+                .as_ref()
+                .map(|idx| idx.union())
+                .unwrap_or(&empty_union);
+            for d in cwtools_localization::validate_loc_file_text(text, &path, union) {
                 let ve = loc_diag_to_validation_error(&d);
                 diagnostics.push(validation_error_to_diagnostic(&ve));
             }
             return (diagnostics, None);
         }
 
-        self.client
-            .log_message(MessageType::INFO, format!("[validate] parsing: {}", uri))
-            .await;
+        tracing::debug!(%uri, "[validate] parsing");
 
         match parse_string(text, &self.state.string_table) {
             Ok(parsed) => {
                 for parse_err in &parsed.errors {
-                    let diag = match parse_err {
-                        ParseError::Pos(_file, line, col, msg) => Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line: line.saturating_sub(1),
-                                    character: *col as u32,
-                                },
-                                end: Position {
-                                    line: line.saturating_sub(1),
-                                    character: *col as u32 + 1,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: None,
-                            code_description: None,
-                            source: Some("cwtools".to_string()),
-                            message: msg.clone(),
-                            related_information: None,
-                            tags: None,
-                            data: None,
-                        },
-                        ParseError::General(msg) => Diagnostic {
-                            range: Range {
-                                start: Position::default(),
-                                end: Position::default(),
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: None,
-                            code_description: None,
-                            source: Some("cwtools".to_string()),
-                            message: msg.clone(),
-                            related_information: None,
-                            tags: None,
-                            data: None,
-                        },
-                    };
-                    diagnostics.push(diag);
+                    diagnostics.push(parse_error_to_diagnostic(parse_err));
                 }
 
                 // Update symbol index
@@ -3112,7 +3136,7 @@ impl Backend {
 
                 // Update info service
                 {
-                    let ruleset_guard = self.state.ruleset.lock();
+                    let ruleset_guard = self.state.ruleset.read();
                     let mut info = self.state.info_service.write();
                     info.clear_file(uri);
                     if let Some(ruleset) = ruleset_guard.as_ref() {
@@ -3128,7 +3152,7 @@ impl Backend {
 
                 // Validation
                 let (errors, log_msg) = {
-                    let ruleset_guard = self.state.ruleset.lock();
+                    let ruleset_guard = self.state.ruleset.read();
                     if let Some(ruleset) = ruleset_guard.as_ref() {
                         let language = self.state.language.lock().clone();
                         let game = cwtools_game::constants::Game::from_str(&language);
@@ -3138,42 +3162,30 @@ impl Backend {
                         let type_index = &info_guard.type_index;
                         let modifier_keys = self.state.modifier_keys.read();
                         let loc_guard = self.state.loc_index.read();
-                        // Single-file path: build the per-run shared state once
-                        // for this one file.
-                        let registry = build_scope_registry_arc(ruleset, game);
+                        // Single-file path: the scope registry is cached (built
+                        // once at ruleset load); the enum_map borrows the ruleset
+                        // and is cheap, so build it inline.
+                        let registry = self.state.scope_registry.read().clone();
                         let enum_map = build_enum_map(ruleset);
-                        let mut errs = validate_ast_with_loc_prebuilt(
+                        let mut errs = validate_prepared(
                             &parsed,
-                            ruleset,
-                            &self.state.string_table,
                             uri,
-                            game,
-                            Some(type_index),
-                            Some(&*modifier_keys),
-                            loc_guard.as_ref(),
-                            registry.as_ref(),
-                            &enum_map,
+                            &Prepared {
+                                ruleset,
+                                table: &self.state.string_table,
+                                game,
+                                type_index: Some(type_index),
+                                modifier_keys: Some(&*modifier_keys),
+                                loc_index: loc_guard.as_ref(),
+                                registry: registry.as_ref(),
+                                enum_map: &enum_map,
+                            },
                         );
                         drop(loc_guard);
                         drop(modifier_keys);
                         drop(info_guard);
                         let elapsed = start.elapsed();
-                        const MAX_ERRORS: usize = 100;
-                        let total = errs.len();
-                        if total > MAX_ERRORS {
-                            errs.truncate(MAX_ERRORS);
-                            errs.push(cwtools_validation::ValidationError {
-                                message: format!(
-                                    "... {} additional errors truncated",
-                                    total - MAX_ERRORS
-                                ),
-                                severity: cwtools_validation::ErrorSeverity::Information,
-                                line: 0,
-                                col: 0,
-                                file: uri.to_string(),
-                                code: None,
-                            });
-                        }
+                        let total = truncate_validation_errors(&mut errs, uri);
                         let msg = format!(
                             "[validate] {} errors in {:?} ({} types, {} enums, {} aliases)",
                             total,
@@ -3217,9 +3229,30 @@ impl Backend {
         }
     }
 
+    /// Install a freshly-loaded ruleset and rebuild the cached scope registry to
+    /// match it. The registry depends only on `(ruleset, game)`; building it here
+    /// (once per load) keeps it out of the per-file validation hot path. Holds
+    /// `ruleset.write()` across the `scope_registry.write()` so the two never
+    /// disagree; no other site takes both ruleset and scope_registry.
+    fn set_ruleset(&self, ruleset: RuleSet) {
+        let game = {
+            let language = self.state.language.lock().clone();
+            cwtools_game::constants::Game::from_str(&language)
+        };
+        let mut guard = self.state.ruleset.write();
+        let registry = build_scope_registry_arc(&ruleset, game);
+        *self.state.scope_registry.write() = registry;
+        // Cache the variable-defining effects so per-file indexing can collect
+        // value_set[variable] names (and values) for the CW246 / VariableGetField
+        // checks and for hover/goto.
+        let var_effects = cwtools_info::variable_defining_effects(&ruleset);
+        self.state.info_service.write().set_var_effects(var_effects);
+        *guard = Some(ruleset);
+    }
+
     /// Rebuild the cached modifier-key set from the current ruleset and type index.
     fn rebuild_modifier_keys(&self) {
-        let ruleset_guard = self.state.ruleset.lock();
+        let ruleset_guard = self.state.ruleset.read();
         let info_guard = self.state.info_service.read();
         let keys = match ruleset_guard.as_ref() {
             Some(rs) => build_modifier_keys(rs, &info_guard.type_index),
@@ -3230,11 +3263,13 @@ impl Backend {
 
     /// Lazily index the base-game install into `vanilla_index` (once). Resolves
     /// the dir from the `vanilla` init option, falling back to auto-discovery by
-    /// game. No-op if already indexed, if no dir is found, or if the ruleset
-    /// isn't loaded yet (we need it to know which type each definition is).
+    /// game. No-op if already indexed (or already merged into the type_index),
+    /// if no dir is found, or if the ruleset isn't loaded yet.
     async fn ensure_vanilla_index(&self) {
-        // Already have a vanilla index (from a cache or a prior build)? Done.
-        if self.state.vanilla_index.lock().is_some() {
+        // Already populated (or already merged into type_index and dropped)? Done.
+        if self.state.vanilla_index.lock().is_some()
+            || self.state.vanilla_merged.load(Ordering::SeqCst)
+        {
             return;
         }
         // Resolve the install dir: explicit `vanilla` option, else auto-discover.
@@ -3256,7 +3291,7 @@ impl Backend {
         // ruleset shape) and to map definitions to their types when rebuilding.
         // Clone it out in its own statement so the parking_lot guard is dropped
         // before the `match` (guards aren't Send and the None arm awaits below).
-        let ruleset_opt = self.state.ruleset.lock().clone();
+        let ruleset_opt = self.state.ruleset.read().clone();
         let ruleset = match ruleset_opt {
             Some(rs) => rs,
             None => {
@@ -3280,47 +3315,48 @@ impl Backend {
 
         // Try a fresh cache first — skip parsing the whole base game entirely.
         if let Some(cp) = &cache_path
-            && cp.exists() {
-                match cwtools_info::vanilla_cache::load(cp) {
-                    Ok((cache_game, cache_fp, per_type))
-                        if cache_game == game && cache_fp == fingerprint =>
-                    {
-                        let total: usize = per_type.values().map(|v| v.len()).sum();
-                        *self.state.vanilla_index.lock() = Some(per_type);
-                        self.client
-                            .log_message(
-                                MessageType::INFO,
-                                format!(
-                                    "Loaded {} base-game instances from cache {} ({})",
-                                    total,
-                                    cp.display(),
-                                    fingerprint
-                                ),
-                            )
-                            .await;
-                        return;
-                    }
-                    Ok((_, cache_fp, _)) => {
-                        self.client
-                            .log_message(
-                                MessageType::INFO,
-                                format!(
-                                    "Vanilla cache stale (cached {}, install {}); rebuilding",
-                                    cache_fp, fingerprint
-                                ),
-                            )
-                            .await;
-                    }
-                    Err(e) => {
-                        self.client
-                            .log_message(
-                                MessageType::WARNING,
-                                format!("Could not load vanilla cache {}: {}", cp.display(), e),
-                            )
-                            .await;
-                    }
+            && cp.exists()
+        {
+            match cwtools_info::vanilla_cache::load(cp) {
+                Ok((cache_game, cache_fp, per_type))
+                    if cache_game == game && cache_fp == fingerprint =>
+                {
+                    let total: usize = per_type.values().map(|v| v.len()).sum();
+                    *self.state.vanilla_index.lock() = Some(per_type);
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "Loaded {} base-game instances from cache {} ({})",
+                                total,
+                                cp.display(),
+                                fingerprint
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+                Ok((_, cache_fp, _)) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "Vanilla cache stale (cached {}, install {}); rebuilding",
+                                cache_fp, fingerprint
+                            ),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("Could not load vanilla cache {}: {}", cp.display(), e),
+                        )
+                        .await;
                 }
             }
+        }
 
         self.send_loading_bar(true, "Indexing base game…").await;
         self.client
@@ -3337,10 +3373,30 @@ impl Backend {
         // Indexing parses thousands of files; run it off the async executor.
         let table = self.state.string_table.clone();
         let index_dir = dir.clone();
-        let per_type =
+        let join_result =
             tokio::task::spawn_blocking(move || index_vanilla_dir(&index_dir, &ruleset, &table))
-                .await
-                .unwrap_or_default();
+                .await;
+        let per_type = match join_result {
+            Ok(map) => map,
+            Err(e) => {
+                // The blocking task panicked or was cancelled. Log loudly and
+                // bail without setting vanilla_merged, so that type_index stays
+                // incomplete and CW500/CW222 reference checks are suppressed
+                // (avoiding a flood of false positives against an empty base game).
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!(
+                            "Vanilla indexing task failed for {} — base-game references will not resolve. Error: {}",
+                            dir.display(),
+                            e
+                        ),
+                    )
+                    .await;
+                tracing::error!("spawn_blocking vanilla index panicked: {}", e);
+                return;
+            }
+        };
 
         let total: usize = per_type.values().map(|v| v.len()).sum();
 
@@ -3463,12 +3519,14 @@ fn scan_use_sites(
         scan_ast_for_type_ref(
             &ast.root_children,
             &ast.arena,
-            type_name,
-            instance_name,
-            file_uri,
-            ruleset,
-            &logical_path,
-            string_table,
+            &TypeRefSearch {
+                type_name,
+                instance_name,
+                file_uri,
+                ruleset,
+                logical_path: &logical_path,
+                table: string_table,
+            },
             &mut results,
         );
     }
@@ -3478,87 +3536,56 @@ fn scan_use_sites(
 
 /// Recursively walk children and record leaves whose value classifies as a
 /// TypeRef for the specified type+name.
-#[allow(clippy::too_many_arguments)]
+/// What [`scan_ast_for_type_ref`] is looking for: the reference target plus the
+/// rules/table/path needed to classify a candidate. Invariant across the walk of
+/// one file, so it is threaded by reference through the recursion.
+struct TypeRefSearch<'a> {
+    type_name: &'a str,
+    instance_name: &'a str,
+    file_uri: &'a str,
+    ruleset: &'a RuleSet,
+    logical_path: &'a str,
+    table: &'a StringTable,
+}
+
 fn scan_ast_for_type_ref(
     children: &[cwtools_parser::ast::Child],
     arena: &cwtools_parser::ast::Arena,
-    type_name: &str,
-    instance_name: &str,
-    file_uri: &str,
-    ruleset: &RuleSet,
-    logical_path: &str,
-    table: &cwtools_string_table::string_table::StringTable,
+    search: &TypeRefSearch,
     out: &mut Vec<(String, cwtools_info::SourceLocation)>,
 ) {
     use cwtools_parser::ast::{Child, Value};
+    let &TypeRefSearch {
+        type_name,
+        instance_name,
+        file_uri,
+        ruleset,
+        logical_path,
+        table,
+    } = search;
 
+    // Only keyed leaves are classified; LeafValue type refs would need
+    // parent-context classification, which this shallow walk doesn't do.
     for child in children {
-        match child {
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                let val = match &leaf.value {
-                    Value::String(t) | Value::QString(t) => {
-                        table.get_string(t.normal).unwrap_or_default()
-                    }
-                    _ => String::new(),
-                };
-                if val == instance_name {
-                    // Check if this leaf's rule context is TypeField(type_name)
-                    if is_type_ref_leaf(ruleset, &key, type_name, logical_path) {
-                        out.push((
-                            file_uri.to_string(),
-                            cwtools_info::SourceLocation {
-                                line: leaf.pos.start.line,
-                                col: leaf.pos.start.col,
-                            },
-                        ));
-                    }
-                }
-                // Recurse into clause values
-                if let Value::Clause(ch) = &leaf.value {
-                    scan_ast_for_type_ref(
-                        ch,
-                        arena,
-                        type_name,
-                        instance_name,
-                        file_uri,
-                        ruleset,
-                        logical_path,
-                        table,
-                        out,
-                    );
-                }
-            }
-            Child::Node(idx) => {
-                let node = &arena.nodes[*idx as usize];
-                scan_ast_for_type_ref(
-                    &node.children,
-                    arena,
-                    type_name,
-                    instance_name,
-                    file_uri,
-                    ruleset,
-                    logical_path,
-                    table,
-                    out,
-                );
-            }
-            Child::LeafValue(idx) => {
-                let lv = &arena.leaf_values[*idx as usize];
-                let val = match &lv.value {
-                    cwtools_parser::ast::Value::String(t)
-                    | cwtools_parser::ast::Value::QString(t) => {
-                        table.get_string(t.normal).unwrap_or_default()
-                    }
-                    _ => String::new(),
-                };
-                if val == instance_name {
-                    // LeafValue type refs: classified via parent context — best effort skip for now.
-                    let _ = (type_name, logical_path, ruleset);
-                }
-            }
-            _ => {}
+        let Child::Leaf(idx) = child else { continue };
+        let leaf = &arena.leaves[*idx as usize];
+        let key = table.get_string(leaf.key.normal).unwrap_or_default();
+        let val = match &leaf.value {
+            Value::String(t) | Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if val == instance_name && is_type_ref_leaf(ruleset, &key, type_name, logical_path) {
+            out.push((
+                file_uri.to_string(),
+                cwtools_info::SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                },
+            ));
+        }
+        // Recurse into clause values
+        if let Value::Clause(ch) = &leaf.value {
+            scan_ast_for_type_ref(ch, arena, search, out);
         }
     }
 }
@@ -3582,12 +3609,13 @@ fn is_type_ref_leaf(
         // For TypeRules, check path filter
         if let RootRule::TypeRule(..) = root_rule
             && let Some(name) = rule_type_name
-                && let Some(&idx) = ruleset.type_by_name.get(name) {
-                    let td = &ruleset.types[idx];
-                    if !cwtools_info_path_check(&td.path_options, logical_path) {
-                        continue;
-                    }
-                }
+            && let Some(&idx) = ruleset.type_by_name.get(name)
+        {
+            let td = &ruleset.types[idx];
+            if !cwtools_info_path_check(&td.path_options, logical_path) {
+                continue;
+            }
+        }
 
         let rules = match rule_type {
             RuleType::NodeRule { rules, .. } => rules.as_slice(),
@@ -3599,9 +3627,11 @@ fn is_type_ref_leaf(
                 left: NewField::SpecificField(k),
                 right: NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)),
             } = inner
-                && k.eq_ignore_ascii_case(leaf_key) && t == type_name {
-                    return true;
-                }
+                && k.eq_ignore_ascii_case(leaf_key)
+                && t == type_name
+            {
+                return true;
+            }
         }
     }
     false
@@ -3633,15 +3663,6 @@ fn collect_doc_tokens(ast: &ParsedFile, table: &StringTable) -> HashSet<String> 
             push(t.lower, &mut tokens);
         }
     }
-    for node in &arena.nodes {
-        push(node.key.lower, &mut tokens);
-        if let Some(p) = &node.key_prefix {
-            push(p.lower, &mut tokens);
-        }
-        if let Some(p) = &node.value_prefix {
-            push(p.lower, &mut tokens);
-        }
-    }
     for lv in &arena.leaf_values {
         if let Value::String(t) | Value::QString(t) = &lv.value {
             push(t.lower, &mut tokens);
@@ -3655,47 +3676,29 @@ fn collect_doc_tokens(ast: &ParsedFile, table: &StringTable) -> HashSet<String> 
     tokens
 }
 
-/// Validate one already-parsed file against caller-supplied indexes, returning
-/// LSP diagnostics. The `type_index` / `loc_index` references are passed in (not
-/// re-locked here) so the full-workspace pass can take a single read guard and
-/// share it across rayon threads — `&TypeIndex` / `&LocIndex` are `Sync`. This
-/// is the lock-free core of [`Backend::validate_parsed_prebuilt`].
-#[allow(clippy::too_many_arguments)]
-fn validate_parsed_with_indexes(
+/// Validate one already-parsed file against a caller-supplied [`Prepared`],
+/// returning LSP diagnostics. The prebuilt state is passed in (not re-locked
+/// here) so the full-workspace pass can take its read guards once and share the
+/// `Prepared` across rayon threads — it is `Copy` and all-borrows, so `Sync`.
+/// Per-file diagnostic cap. Beyond this, a file's errors are truncated with a
+/// summary marker so one broken file can't flood the editor.
+const MAX_FILE_ERRORS: usize = 100;
+
+/// Cap a file's validation errors at [`MAX_FILE_ERRORS`], appending a summary
+/// marker for the remainder. Returns the pre-truncation total (for logging).
+/// Shared by the batch and single-file paths so the cap stays consistent.
+fn truncate_validation_errors(
+    errs: &mut Vec<cwtools_validation::ValidationError>,
     uri: &str,
-    parsed: &ParsedFile,
-    modifier_keys: &std::collections::HashSet<String>,
-    ruleset: &RuleSet,
-    game: Option<cwtools_game::constants::Game>,
-    registry: Option<&std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
-    enum_map: &std::collections::HashMap<&str, &cwtools_rules::rules_types::EnumDefinition>,
-    type_index: &TypeIndex,
-    loc_index: Option<&cwtools_localization::LocIndex>,
-    string_table: &StringTable,
-) -> Vec<Diagnostic> {
-    let mut diagnostics: Vec<Diagnostic> = parsed
-        .errors
-        .iter()
-        .map(parse_error_to_diagnostic)
-        .collect();
-    let mut errs = validate_ast_with_loc_prebuilt(
-        parsed,
-        ruleset,
-        string_table,
-        uri,
-        game,
-        Some(type_index),
-        Some(modifier_keys),
-        loc_index,
-        registry,
-        enum_map,
-    );
-    const MAX_ERRORS: usize = 100;
+) -> usize {
     let total = errs.len();
-    if total > MAX_ERRORS {
-        errs.truncate(MAX_ERRORS);
+    if total > MAX_FILE_ERRORS {
+        errs.truncate(MAX_FILE_ERRORS);
         errs.push(cwtools_validation::ValidationError {
-            message: format!("... {} additional errors truncated", total - MAX_ERRORS),
+            message: format!(
+                "... {} additional errors truncated",
+                total - MAX_FILE_ERRORS
+            ),
             severity: cwtools_validation::ErrorSeverity::Information,
             line: 0,
             col: 0,
@@ -3703,6 +3706,21 @@ fn validate_parsed_with_indexes(
             code: None,
         });
     }
+    total
+}
+
+fn validate_parsed_with_indexes(
+    uri: &str,
+    parsed: &ParsedFile,
+    prepared: &Prepared,
+) -> Vec<Diagnostic> {
+    let mut diagnostics: Vec<Diagnostic> = parsed
+        .errors
+        .iter()
+        .map(parse_error_to_diagnostic)
+        .collect();
+    let mut errs = validate_prepared(parsed, uri, prepared);
+    truncate_validation_errors(&mut errs, uri);
     for err in &errs {
         diagnostics.push(validation_error_to_diagnostic(err));
     }
@@ -3844,6 +3862,7 @@ mod tests {
                 path_file: None,
                 path_extension: None,
                 paths_lower: Vec::new(),
+                ..Default::default()
             },
             subtypes: Vec::new(),
             type_key_filter: None,
@@ -3935,9 +3954,10 @@ mod tests {
         // Add a description to the "kind" leaf rule
         if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
             rs.root_rules.first_mut()
-            && let Some((_, opts)) = rules.first_mut() {
-                opts.description = Some("The kind of this thing".to_string());
-            }
+            && let Some((_, opts)) = rules.first_mut()
+        {
+            opts.description = Some("The kind of this thing".to_string());
+        }
 
         let md = build_hover_markdown(
             &PositionElement::Leaf {
@@ -4013,6 +4033,35 @@ mod tests {
     fn test_logical_path_fallback() {
         let lp = logical_path_from_uri("file:///some/path/events/foo.txt", &None);
         assert_eq!(lp, "/some/path/events/foo.txt");
+    }
+
+    #[test]
+    fn test_uri_to_path_percent_decode() {
+        // Paths with spaces must round-trip through percent-encoding.
+        let path = std::path::Path::new("/home/user/My Mod/events/foo.txt");
+        let uri = path_to_uri(path);
+        // The URI must percent-encode the space.
+        assert!(
+            uri.contains("%20") || uri.contains("+"),
+            "expected encoded space in URI, got: {}",
+            uri
+        );
+        // Decoding must recover the original path.
+        let decoded = uri_to_path_str(&uri);
+        assert_eq!(
+            decoded,
+            path.to_str().unwrap(),
+            "round-trip failed: {}",
+            decoded
+        );
+    }
+
+    #[test]
+    fn test_logical_path_from_uri_percent_decode() {
+        // Workspace and file URIs with percent-encoded spaces.
+        let ws = Some("file:///home/user/My%20Mod".to_string());
+        let lp = logical_path_from_uri("file:///home/user/My%20Mod/events/foo.txt", &ws);
+        assert_eq!(lp, "events/foo.txt", "got: {}", lp);
     }
 
     // ── snippet generation tests ─────────────────────────────────────────────
@@ -4258,6 +4307,7 @@ mod tests {
                 path_file: None,
                 path_extension: None,
                 paths_lower: Vec::new(),
+                ..Default::default()
             },
             subtypes: Vec::new(),
             type_key_filter: None,

@@ -13,7 +13,7 @@
 //! * `key: "this is "also" valid"` → desc = `"this is "also" valid"`
 //! * `key: "a" #comment` → desc = `"a" #comment`
 
-use crate::commands::{Lang, LocEntry, LocFile, Position, key_to_language};
+use crate::commands::{Lang, LocEntry, LocFile, LocParseError, Position, key_to_language};
 use crate::loc_string::parse_loc_elements;
 
 // ---- UTF-8 BOM check -------------------------------------------------------
@@ -203,6 +203,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     i += 1;
 
     let mut entries = Vec::new();
+    let mut parse_errors: Vec<LocParseError> = Vec::new();
 
     // 3.  Entry lines: key:value"desc text"
     //      key:123 "desc text"       (with version)
@@ -219,8 +220,14 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
 
         let colon_pos = trimmed.find(':');
         if colon_pos.is_none() {
+            // Malformed line: no colon separator. Record a CW001 parse error and
+            // continue recovering (lenient parser; mirrors F# `Failure` path).
+            parse_errors.push(LocParseError {
+                line: i + 1,
+                message: format!("unexpected content (no ':' separator): {:?}", trimmed),
+            });
             i += 1;
-            continue; // malformed line, skip (parser tolerance)
+            continue;
         }
         let colon_pos = colon_pos.unwrap();
         let key = trimmed[..colon_pos].trim_end();
@@ -249,13 +256,20 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
 
         let position = Position::new(name, i + 1, 1); // 1-based line numbers
 
+        // Compute the column offset of `desc`'s start within the full line.
+        // The key + colon + version + optional space are all ASCII, so byte
+        // offset == char offset for that prefix.
+        let leading_ws = line.len() - trimmed.len();
+        // desc starts at (trimmed.len() - desc.len()) bytes into trimmed.
+        let desc_col_offset = leading_ws + (trimmed.len() - desc.len());
+
         // Check for chars outside the allowed loc-value Unicode ranges.
         // Mirrors F# parser `desc` production which stops at the first
         // char where `isLocValueChar` returns false, then records the
         // position of that char as `errorRange`.
         let error_range = find_invalid_loc_char(desc).map(|byte_off| {
-            // Work out which column the bad char is at (1-based)
-            let col = desc[..byte_off].chars().count() + 1;
+            // Column within desc (0-based) + prefix offset gives the line column.
+            let col = desc_col_offset + desc[..byte_off].chars().count() + 1;
             Position::new(name, i + 1, col)
         });
 
@@ -275,7 +289,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
                 _ => None,
             })
             .collect();
-        let jomini_commands: Vec<crate::commands::JominiCommand> = elements
+        let jomini_commands: Vec<Vec<crate::commands::JominiCommand>> = elements
             .iter()
             .filter_map(|e| match e {
                 crate::loc_string::LocElement::JominiCommand(cmds) => Some(
@@ -299,7 +313,6 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
                 ),
                 _ => None,
             })
-            .flatten()
             .collect();
 
         entries.push(LocEntry {
@@ -352,6 +365,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         lang,
         entries,
         file_diagnostics,
+        parse_errors,
         // Unknown here; set by the disk-reading path (`LocService`) where the
         // raw bytes are available.
         encoding: None,
@@ -421,68 +435,6 @@ pub fn find_invalid_loc_char(desc: &str) -> Option<usize> {
         }
     }
     None
-}
-
-/// Quote / imbalanced-quote validation (mirrors F# `validateQuotes`).
-///
-/// Returns `true` if the entry passes validation (no CW-quote-error).
-/// Populates `entry.error_range` and returns `false` on failure.
-pub fn validate_quotes(entry: &mut LocEntry) -> bool {
-    let trimmed = entry.desc.trim();
-
-    // 1.  Find last double-quote in trimmed desc
-    let last_quote = trimmed.rfind('"');
-
-    // 2.  Find first '#' after that last quote
-    let first_hash_after_quote = last_quote
-        .and_then(|q| trimmed[q..].find('#').map(|h| q + h))
-        .or_else(|| {
-            // no last quote → look for first '#' overall
-            trimmed.find('#')
-        });
-
-    // 3.  Truncate at the first '#' after last quote (if any)
-    let mut effective = match (first_hash_after_quote, last_quote) {
-        (Some(h), Some(q)) if h > q => &trimmed[..h],
-        _ => trimmed,
-    };
-
-    // Edge: HOI4 allows quoted text like:
-    //   "...text" #comment   → effective = "...text"  (trim stops at #)
-    // The Trim() would have already removed leading/trailing spaces.
-    // We strip trailing spaces after hash truncation.
-    effective = effective.trim_end();
-
-    // 4.  HOI4 "cursed" behaviour:  if the desc contains quotes but
-    //     doesn't START with a quote and doesn't END with a quote,
-    //     we DON'T generate a quote error.
-    let starts = effective.starts_with('"');
-    let ends = effective.ends_with('"');
-
-    if starts && ends {
-        // fully quoted → fine (CW doesn't complain)
-        true
-    } else if !starts && !ends {
-        // no quotes at all → fine
-        true
-    } else {
-        // starts XOR ends → imbalanced quotes
-        entry.error_range = Some(entry.position.clone());
-        false
-    }
-}
-
-/// Check for REPLACE_ME / TODO_CD placeholders.
-pub fn validate_replace_me(entry: &LocEntry) -> Option<String> {
-    let trimmed = entry.desc.trim();
-    if trimmed == "\"REPLACE_ME\"" || trimmed == "\"TODO_CD\"" {
-        Some(format!(
-            "CW-ReplaceMe: localisation key '{}' contains placeholder",
-            entry.key
-        ))
-    } else {
-        None
-    }
 }
 
 /* ======================================================================== */
@@ -574,29 +526,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_cursed_quotes() {
-        let text = "l_english:\n loc_key1: \"this is valid loc\"\n loc_key2: \"this is \"also\" valid loc\"\n loc_key6: \"this is invalid loc\n loc_key7: this is invalid loc\"\n";
-
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
-
-        // Valid: balanced quotes
-        assert!(validate_quotes(&mut file.entries[0]), "loc1 should pass");
-        assert!(file.entries[0].error_range.is_none());
-
-        // Valid: balanced quotes (embedded quotes are inside)
-        assert!(validate_quotes(&mut file.entries[1]), "loc2 should pass");
-        assert!(file.entries[1].error_range.is_none());
-
-        // Invalid: opening quote but no closing
-        let ok = validate_quotes(&mut file.entries[2]);
-        assert!(!ok, "loc6 should fail (missing closing quote)");
-
-        // Invalid: closing quote but no opening
-        let ok = validate_quotes(&mut file.entries[3]);
-        assert!(!ok, "loc7 should fail (missing opening quote)");
-    }
-
-    #[test]
     fn test_version_number() {
         let text = "l_english:\n key:0 \"desc\" \n";
         let file = parse_loc_text(text, "test.yml").unwrap();
@@ -610,17 +539,13 @@ mod tests {
         let file = parse_loc_text(text, "test.yml").unwrap();
         // `#comment` is part of desc (per F# parser)
         assert_eq!(file.entries[0].desc, "\"a\"#comment");
-
-        let mut entry = file.entries[0].clone();
-        assert!(validate_quotes(&mut entry), "hash truncation test");
     }
 
     #[test]
     fn test_loc_key11_complex() {
         let text = "l_english:\n loc_key11: \"this is valid loc\" #but this is also valid and read as part of the string due to quote after\n";
-        let mut file = parse_loc_text(text, "test.yml").unwrap();
+        let file = parse_loc_text(text, "test.yml").unwrap();
         assert_eq!(file.entries[0].key, "loc_key11");
-        assert!(validate_quotes(&mut file.entries[0]), "loc11 should pass");
     }
 
     #[test]

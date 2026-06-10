@@ -1,4 +1,4 @@
-use cwtools_info::{SourceLocation, TypeIndex, TypeInstance};
+use cwtools_index::{SourceLocation, TypeIndex, TypeInstance};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
@@ -225,6 +225,7 @@ event = {
         }],
     );
     idx.merge("file://tech.txt", map);
+    idx.complete = true;
 
     // Valid reference: no error
     let parsed_v = parse_string(script_valid, &table).unwrap();
@@ -738,6 +739,7 @@ widget = {
         }],
     );
     idx.merge("game/interface/sprites.gfx", map);
+    idx.complete = true;
 
     // .gui file referencing the known sprite — should be clean
     let gui_valid = r#"

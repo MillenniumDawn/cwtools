@@ -1,3 +1,0 @@
-can_destroy_planet_with_TEST_PK = {
-
-}

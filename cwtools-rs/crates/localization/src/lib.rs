@@ -24,14 +24,10 @@ pub use pipeline::{
 };
 pub use scope_validation::{LocCommandDiagnostic, LocScopeData, validate_loc_commands};
 pub use service::*;
-// validation and yaml_parser both define validate_quotes / validate_replace_me;
-// export explicitly.
 pub use validation::{
-    HARDCODED_LOC, LocErrorKind, LocValidationError, build_key_union, validate_invalid_chars,
-    validate_loc_file,
+    HARDCODED_LOC, LocErrorKind, LocValidationError, validate_invalid_chars, validate_loc_file,
 };
 pub use yaml_parser::{
     LangHeaderDiagnostic, MissingBomDiagnostic, check_loc_file_lang, check_utf8_bom,
-    find_invalid_loc_char, is_loc_value_char, lang_from_filename, parse_loc_text, validate_quotes,
-    validate_replace_me,
+    find_invalid_loc_char, is_loc_value_char, lang_from_filename, parse_loc_text,
 };

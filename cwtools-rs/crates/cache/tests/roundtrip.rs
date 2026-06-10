@@ -30,7 +30,6 @@ nested = {
     let (arena2, root2) = convert::cached_to_arena(&loaded, &table2);
 
     // Verify structure counts match
-    assert_eq!(arena2.nodes.len(), parsed.arena.nodes.len());
     assert_eq!(arena2.leaves.len(), parsed.arena.leaves.len());
     assert_eq!(arena2.leaf_values.len(), parsed.arena.leaf_values.len());
     assert_eq!(arena2.value_clauses.len(), parsed.arena.value_clauses.len());
@@ -42,7 +41,7 @@ nested = {
 fn roundtrip_real_file() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../artifacts/bin/CWToolsTests/debug/testfiles/performancetest2/common/static_modifiers/cc_colony_events_static_modifiers.txt"
+        "/../../testfiles/performancetest2/common/static_modifiers/cc_colony_events_static_modifiers.txt"
     );
     let input = std::fs::read_to_string(path).unwrap();
     let table = StringTable::new();
@@ -56,7 +55,6 @@ fn roundtrip_real_file() {
     let table2 = StringTable::new();
     let (arena2, root2) = convert::cached_to_arena(&loaded, &table2);
 
-    assert_eq!(arena2.nodes.len(), parsed.arena.nodes.len());
     assert_eq!(arena2.leaves.len(), parsed.arena.leaves.len());
     assert_eq!(root2.len(), parsed.root_children.len());
 
@@ -74,7 +72,7 @@ fn roundtrip_real_file() {
 fn roundtrip_all_performancetest_files() {
     let test_dir = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../artifacts/bin/CWToolsTests/debug/testfiles/performancetest2/"
+        "/../../testfiles/performancetest2/"
     );
 
     let config = FileManagerConfig {
@@ -101,12 +99,6 @@ fn roundtrip_all_performancetest_files() {
         let (arena2, root2) = convert::cached_to_arena(&loaded, &table2);
 
         // Verify counts match
-        assert_eq!(
-            arena2.nodes.len(),
-            parsed.arena.nodes.len(),
-            "Node count mismatch for {}",
-            parsed.path.display()
-        );
         assert_eq!(
             arena2.leaves.len(),
             parsed.arena.leaves.len(),

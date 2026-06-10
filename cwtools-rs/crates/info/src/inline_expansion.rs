@@ -3,7 +3,7 @@
 // and obscures the recursion.
 #![allow(clippy::too_many_arguments)]
 
-use cwtools_parser::ast::{Arena, Child, Leaf, Node, ParsedFile, Value};
+use cwtools_parser::ast::{Arena, Child, Leaf, ParsedFile, Value};
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
 use std::collections::HashMap;
@@ -292,30 +292,6 @@ fn clone_and_expand_child_r(
             dst_arena.leaves.push(new_leaf);
             Ok(Child::Leaf(new_idx))
         }
-        Child::Node(idx) => {
-            let node = &src_arena.nodes[*idx as usize];
-            let new_key = clone_tokens(&node.key, src_table, dst_table, params);
-            let new_children = clone_and_expand_children(
-                &node.children,
-                src_arena,
-                src_table,
-                dst_arena,
-                dst_table,
-                params,
-                registry,
-                call_stack,
-            )?;
-            let new_node = Node {
-                key: new_key,
-                children: new_children,
-                pos: node.pos,
-                key_prefix: None,
-                value_prefix: None,
-            };
-            let new_idx = dst_arena.nodes.len() as u32;
-            dst_arena.nodes.push(new_node);
-            Ok(Child::Node(new_idx))
-        }
         Child::Comment(idx) => {
             let c = &src_arena.comments[*idx as usize];
             let new_comment = cwtools_parser::ast::Comment {
@@ -435,9 +411,11 @@ fn substitute_params(text: &str, params: &HashMap<String, String>) -> String {
     while let Some(ch) = chars.next() {
         if ch == '$' {
             let mut param_name = String::new();
+            let mut closed = false;
             while let Some(&next_ch) = chars.peek() {
                 if next_ch == '$' {
                     chars.next(); // consume closing $
+                    closed = true;
                     break;
                 }
                 param_name.push(next_ch);
@@ -446,10 +424,13 @@ fn substitute_params(text: &str, params: &HashMap<String, String>) -> String {
             if let Some(val) = params.get(&param_name) {
                 output.push_str(val);
             } else {
-                // Unresolved param: keep original
+                // Unresolved or unterminated param: keep original without
+                // re-emitting a closing $ that wasn't in the input.
                 output.push('$');
                 output.push_str(&param_name);
-                output.push('$');
+                if closed {
+                    output.push('$');
+                }
             }
         } else {
             output.push(ch);

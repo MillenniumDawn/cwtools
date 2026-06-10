@@ -6,7 +6,7 @@
 //!   by the project variable index.
 
 use cwtools_game::constants::Game;
-use cwtools_info::TypeIndex;
+use cwtools_index::TypeIndex;
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
@@ -25,6 +25,7 @@ foo = {
     add = int_variable_field
     prec = variable_field_32
     ref = variable_field
+    get = value[variable]
 }
 "#;
 
@@ -97,4 +98,16 @@ fn numeric_value_is_never_cw246() {
 fn at_variable_is_never_cw246() {
     let c = codes("foo = { ref = @my_const }", &["something_else"]);
     assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn variable_get_field_defined_is_clean() {
+    let c = codes("foo = { get = my_var }", &["my_var"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn variable_get_field_undefined_is_cw246() {
+    let c = codes("foo = { get = mystery }", &["something_else"]);
+    assert!(c.contains(&"CW246".to_string()), "got: {:?}", c);
 }

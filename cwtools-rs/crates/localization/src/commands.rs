@@ -95,6 +95,26 @@ pub enum Game {
     Generic,
 }
 
+impl Game {
+    /// Map the engine `Game` (from `cwtools_game`) to this crate's loc `Game`.
+    /// The single source of truth for that mapping; CLI, LSP, and validation all
+    /// route through here so they cannot drift. Games without a loc variant
+    /// (CK2, VIC2) fall through to `Generic`, which accepts all languages.
+    pub fn from_engine(game: Option<cwtools_game::constants::Game>) -> Self {
+        use cwtools_game::constants::Game as G;
+        match game {
+            Some(G::Hoi4) => Game::HOI4,
+            Some(G::Stellaris) => Game::Stellaris,
+            Some(G::Eu4) => Game::EU4,
+            Some(G::Ck3) => Game::CK3,
+            Some(G::Ir) => Game::IR,
+            Some(G::Vic3) => Game::VIC3,
+            Some(G::Eu5) => Game::EU5,
+            _ => Game::Generic,
+        }
+    }
+}
+
 /// Returns the set of valid `l_xxx` language tokens for the given game.
 ///
 /// Mirrors the per-game `keyToLanguage` functions in `YAMLLocalisationParser.fs`
@@ -208,7 +228,10 @@ pub struct LocEntry {
     // Parsed elements (lazy, computed on demand)
     pub refs: Vec<String>,
     pub commands: Vec<String>,
-    pub jomini_commands: Vec<JominiCommand>,
+    /// Each inner Vec is one `[...]` bracket's command chain.
+    /// `[overlord.owner.GetName]` → `vec![vec!["overlord", "owner", "GetName"]]`.
+    /// Multiple brackets produce multiple inner Vecs.
+    pub jomini_commands: Vec<Vec<JominiCommand>>,
 }
 
 /// Position in a source file.
@@ -243,6 +266,18 @@ pub enum JominiParam {
     Commands(Vec<String>),
 }
 
+/// A line-level parse failure recorded during lenient recovery.
+///
+/// The parser skips malformed lines rather than aborting; each skip
+/// produces one of these so the pipeline can emit CW001.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocParseError {
+    /// 1-based line number where the malformed line was found.
+    pub line: usize,
+    /// Human-readable description of the problem.
+    pub message: String,
+}
+
 /// A parsed localization file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocFile {
@@ -254,6 +289,9 @@ pub struct LocFile {
     /// File-level diagnostics (BOM, header/filename mismatches, etc.).
     /// Empty when there are no issues.
     pub file_diagnostics: Vec<String>,
+    /// Line-level parse errors collected during lenient recovery (CW001).
+    /// Empty for well-formed files.
+    pub parse_errors: Vec<LocParseError>,
     /// On-disk encoding, when the file was read from disk (used to enforce the
     /// UTF-8-BOM rule, CW254). `None` when built from already-decoded text
     /// (LSP single-file edits, tests) where the original bytes aren't available.

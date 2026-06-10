@@ -2,9 +2,7 @@ use crate::ast::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
 use std::str::Chars;
 
-#[allow(dead_code)]
 struct Parser<'a> {
-    input: &'a str,
     chars: Chars<'a>,
     line: u32,
     col: u16,
@@ -16,7 +14,6 @@ struct Parser<'a> {
 impl<'a> Parser<'a> {
     fn new(input: &'a str, table: &'a StringTable) -> Self {
         Self {
-            input,
             chars: input.chars(),
             line: 1,
             col: 0,
@@ -47,6 +44,25 @@ impl<'a> Parser<'a> {
 
     fn peek(&self) -> Option<char> {
         self.chars.clone().next()
+    }
+
+    /// Peek at the second character without consuming anything.
+    fn peek2(&self) -> Option<char> {
+        let mut it = self.chars.clone();
+        it.next();
+        it.next()
+    }
+
+    /// Collect up to `N` upcoming chars into a stack-allocated buffer without
+    /// advancing the iterator. Returns the actual number of chars written.
+    fn peek_n<const N: usize>(&self) -> ([char; N], usize) {
+        let mut buf = ['\0'; N];
+        let mut count = 0;
+        for c in self.chars.clone().take(N) {
+            buf[count] = c;
+            count += 1;
+        }
+        (buf, count)
     }
 
     fn skip_whitespace(&mut self) {
@@ -82,22 +98,18 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_operator(&mut self) -> Option<Operator> {
-        let ahead: String = self.chars.clone().take(2).collect();
-        let op = match ahead.as_str() {
-            "<=" => Some(Operator::LessThanOrEqual),
-            ">=" => Some(Operator::GreaterThanOrEqual),
-            "!=" => Some(Operator::NotEqual),
-            "==" => Some(Operator::EqualEqual),
-            "?=" => Some(Operator::QuestionEqual),
-            _ => {
-                let c = self.peek()?;
-                match c {
-                    '=' => Some(Operator::Equals),
-                    '>' => Some(Operator::GreaterThan),
-                    '<' => Some(Operator::LessThan),
-                    _ => None,
-                }
-            }
+        let c1 = self.peek()?;
+        let c2 = self.peek2();
+        let op = match (c1, c2) {
+            ('<', Some('=')) => Some(Operator::LessThanOrEqual),
+            ('>', Some('=')) => Some(Operator::GreaterThanOrEqual),
+            ('!', Some('=')) => Some(Operator::NotEqual),
+            ('=', Some('=')) => Some(Operator::EqualEqual),
+            ('?', Some('=')) => Some(Operator::QuestionEqual),
+            ('=', _) => Some(Operator::Equals),
+            ('>', _) => Some(Operator::GreaterThan),
+            ('<', _) => Some(Operator::LessThan),
+            _ => None,
         };
 
         if let Some(ref o) = op {
@@ -114,7 +126,8 @@ impl<'a> Parser<'a> {
         if self.peek() == Some('"') {
             // Quoted key — same escape rules as quoted values (F# SharedParsers.fs:183-186).
             self.advance();
-            let mut s = String::new();
+            // Build with surrounding quotes directly to avoid a format!("\"{}\"", s) copy.
+            let mut s = String::from('"');
             while let Some(c) = self.peek() {
                 if c == '\\' {
                     self.advance(); // consume '\'
@@ -140,8 +153,9 @@ impl<'a> Parser<'a> {
                 s.push(c);
                 self.advance();
             }
+            s.push('"');
             self.skip_whitespace();
-            Some(self.table.intern(&format!("\"{}\"", s)))
+            Some(self.table.intern(&s))
         } else {
             let mut s = String::new();
             while let Some(c) = self.peek() {
@@ -197,15 +211,18 @@ impl<'a> Parser<'a> {
         }
 
         if self.peek() == Some('"') {
+            let quote_start = self.pos();
             self.advance();
-            let mut s = String::new();
+            // Build with surrounding quotes directly to avoid a format!("\"{}\"", s) copy.
+            let mut s = String::from('"');
+            let mut closed = false;
             while let Some(c) = self.peek() {
-                if leafvalue && c == '\n' {
-                    // A leafvalue quoted string never spans lines. This bounds the
-                    // interior-quote heuristic: if it mis-judged a `"` as interior
-                    // (e.g. a name followed by Unicode smart quotes `“ ”`, which the
-                    // lexer sees as bare content), the damage stays on one line and
-                    // cannot swallow following statements / break file structure.
+                if c == '\n' {
+                    // Never span lines in a quoted string. For a key-RHS string
+                    // (`a = “oops`) this is an unclosed quote; for a leafvalue
+                    // the interior-quote heuristic stays single-line already
+                    // (this matches the prior `leafvalue && c == '\n'` behavior
+                    // and extends it to key-RHS, fixing spec item 3.5).
                     break;
                 }
                 if c == '\\' {
@@ -233,6 +250,7 @@ impl<'a> Parser<'a> {
                         // Key-RHS quoted string: `"` always closes (strict). Keeps
                         // one-line `a = "x" b = "y"` as separate statements.
                         self.advance();
+                        closed = true;
                         break;
                     }
                     // Decide: real terminator or interior literal quote. Paradox
@@ -279,35 +297,56 @@ impl<'a> Parser<'a> {
                 s.push(c);
                 self.advance();
             }
+            if !leafvalue && !closed {
+                self.errors.push(ParseError::Pos(
+                    "".to_string(),
+                    quote_start.line,
+                    quote_start.col,
+                    format!(
+                        "unclosed quoted string starting at line {}",
+                        quote_start.line
+                    ),
+                ));
+            }
+            s.push('"');
             self.skip_whitespace();
-            let tokens = self.table.intern(&format!("\"{}\"", s));
+            let tokens = self.table.intern(&s);
             return Some(Value::QString(tokens));
         }
 
         // Peek ahead for numbers / booleans / rgb / hsv / metaprogramming
-        let ahead: String = self.chars.clone().take(64).collect();
-        let trimmed = ahead.trim();
-
         // rgb / hsv detection.
         // Determine the candidate keyword ("rgb", "rgb360", "hsv", "hsv360") and
         // only proceed when the char after the keyword is absent or non-alphanumeric,
         // so that identifiers like `rgbx` or `rgb3foo` are excluded.
         // We save state and restore it if parse_rgb/parse_hsv returns None, so a
         // bare `rgb` token that isn't followed by `{` doesn't get consumed and lost.
-        let is_rgb = trimmed.starts_with("rgb") || trimmed.starts_with("RGB");
-        let is_hsv = trimmed.starts_with("hsv") || trimmed.starts_with("HSV");
+        // Peek 7 chars (max needed: "rgb360" + one char after) without allocating.
+        let (peek7, peek7_len) = self.peek_n::<7>();
+        let is_rgb = peek7_len >= 3
+            && peek7[0].eq_ignore_ascii_case(&'r')
+            && peek7[1].eq_ignore_ascii_case(&'g')
+            && peek7[2].eq_ignore_ascii_case(&'b');
+        let is_hsv = peek7_len >= 3
+            && peek7[0].eq_ignore_ascii_case(&'h')
+            && peek7[1].eq_ignore_ascii_case(&'s')
+            && peek7[2].eq_ignore_ascii_case(&'v');
         if is_rgb {
-            // Determine keyword length: "rgb360" (6) or "rgb" (3)
-            let kw_len = if trimmed[3..].starts_with("360") {
+            let kw_len = if peek7_len >= 6 && peek7[3] == '3' && peek7[4] == '6' && peek7[5] == '0'
+            {
                 6
             } else {
                 3
             };
-            let after = trimmed.as_bytes().get(kw_len).map(|&b| b as char);
+            let after = if peek7_len > kw_len {
+                Some(peek7[kw_len])
+            } else {
+                None
+            };
             if after.is_none_or(|c| !c.is_alphanumeric()) {
                 let saved = self.pos();
                 let saved_chars = self.chars.clone();
-                if let Some(v) = self.parse_rgb() {
+                if let Some(v) = self.parse_color_clause() {
                     return Some(v);
                 }
                 self.chars = saved_chars;
@@ -316,16 +355,21 @@ impl<'a> Parser<'a> {
             }
         }
         if is_hsv {
-            let kw_len = if trimmed[3..].starts_with("360") {
+            let kw_len = if peek7_len >= 6 && peek7[3] == '3' && peek7[4] == '6' && peek7[5] == '0'
+            {
                 6
             } else {
                 3
             };
-            let after = trimmed.as_bytes().get(kw_len).map(|&b| b as char);
+            let after = if peek7_len > kw_len {
+                Some(peek7[kw_len])
+            } else {
+                None
+            };
             if after.is_none_or(|c| !c.is_alphanumeric()) {
                 let saved = self.pos();
                 let saved_chars = self.chars.clone();
-                if let Some(v) = self.parse_hsv() {
+                if let Some(v) = self.parse_color_clause() {
                     return Some(v);
                 }
                 self.chars = saved_chars;
@@ -333,7 +377,7 @@ impl<'a> Parser<'a> {
                 self.col = saved.col;
             }
         }
-        if trimmed.starts_with("yes") {
+        if peek7_len >= 3 && peek7[0] == 'y' && peek7[1] == 'e' && peek7[2] == 's' {
             let saved = self.pos();
             let saved_chars = self.chars.clone();
             for _ in 0..3 {
@@ -353,7 +397,7 @@ impl<'a> Parser<'a> {
             self.line = saved.line;
             self.col = saved.col;
         }
-        if trimmed.starts_with("no") {
+        if peek7_len >= 2 && peek7[0] == 'n' && peek7[1] == 'o' {
             let saved = self.pos();
             let saved_chars = self.chars.clone();
             for _ in 0..2 {
@@ -375,7 +419,7 @@ impl<'a> Parser<'a> {
         }
         // F# metaprogramming prefix is "@\[" (at, backslash, open-bracket).
         // SharedParsers.fs:244 uses pstring "@\\[" which is the 3-char literal @\[.
-        if trimmed.starts_with("@\\[") {
+        if peek7_len >= 3 && peek7[0] == '@' && peek7[1] == '\\' && peek7[2] == '[' {
             return self.parse_metaprogramming();
         }
 
@@ -542,18 +586,19 @@ impl<'a> Parser<'a> {
             // No operator — check for shorthand `key { ... }`
             self.skip_whitespace();
             if let Some('{') = self.peek()
-                && let Some(value) = self.parse_clause() {
-                    let end = self.pos();
-                    let leaf = Leaf {
-                        key,
-                        value,
-                        op: Operator::Equals,
-                        pos: SourceRange { start: saved, end },
-                    };
-                    let idx = self.arena.push_leaf(leaf);
-                    out.push(Child::Leaf(idx));
-                    return;
-                }
+                && let Some(value) = self.parse_clause()
+            {
+                let end = self.pos();
+                let leaf = Leaf {
+                    key,
+                    value,
+                    op: Operator::Equals,
+                    pos: SourceRange { start: saved, end },
+                };
+                let idx = self.arena.push_leaf(leaf);
+                out.push(Child::Leaf(idx));
+                return;
+            }
             // Not a key=value or shorthand; restore and try leaf-value
             self.chars = saved_chars;
             self.line = saved.line;
@@ -576,45 +621,24 @@ impl<'a> Parser<'a> {
         self.advance();
     }
 
-    fn parse_rgb(&mut self) -> Option<Value> {
-        // "rgb" is already peeked and matched in parse_value before this is called.
-        // Consume "rgb" or "RGB" and optional "360".
+    /// Parse a color clause after its keyword (`rgb`/`hsv`, already peeked and
+    /// matched in `parse_value`). Consumes the 3-char keyword, an optional `360`
+    /// suffix, an optional `=`, then the `{ ... }` clause.
+    fn parse_color_clause(&mut self) -> Option<Value> {
         for _ in 0..3 {
             self.advance();
         }
         self.skip_whitespace();
-        if let Some('3') = self.peek() {
-            let ahead: String = self.chars.clone().take(3).collect();
-            if ahead == "360" {
+        if self.peek() == Some('3') {
+            let (p3, _) = self.peek_n::<3>();
+            if p3 == ['3', '6', '0'] {
                 self.advance();
                 self.advance();
                 self.advance();
                 self.skip_whitespace();
             }
         }
-        // Support `rgb = { ... }` by skipping optional '='
-        if self.peek() == Some('=') {
-            self.advance();
-            self.skip_whitespace();
-        }
-        self.parse_clause()
-    }
-
-    fn parse_hsv(&mut self) -> Option<Value> {
-        for _ in 0..3 {
-            self.advance();
-        }
-        self.skip_whitespace();
-        if let Some('3') = self.peek() {
-            let ahead: String = self.chars.clone().take(3).collect();
-            if ahead == "360" {
-                self.advance();
-                self.advance();
-                self.advance();
-                self.skip_whitespace();
-            }
-        }
-        // Support `hsv = { ... }` by skipping optional '='
+        // Support `rgb = { ... }` / `hsv = { ... }` by skipping optional '='.
         if self.peek() == Some('=') {
             self.advance();
             self.skip_whitespace();
@@ -745,7 +769,7 @@ mod tests {
     fn parse_real_file() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../artifacts/bin/CWToolsTests/debug/testfiles/performancetest2/common/static_modifiers/cc_colony_events_static_modifiers.txt"
+            "/../../testfiles/performancetest2/common/static_modifiers/cc_colony_events_static_modifiers.txt"
         );
         let input = std::fs::read_to_string(path).unwrap();
         let table = StringTable::new();
@@ -1055,5 +1079,37 @@ mod tests {
             }
             v => panic!("expected String, got {:?}", v),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Unclosed key-RHS quoted string must push a parse error and
+    // stop at the newline rather than swallowing subsequent statements.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unclosed_key_rhs_quote_produces_error() {
+        let table = StringTable::new();
+        // a = "oops has no closing " before the newline.
+        // b = 1 must still parse as a separate statement.
+        let result = parse_string("a = \"oops\nb = 1", &table).unwrap();
+        assert!(
+            !result.errors.is_empty(),
+            "expected a parse error for the unclosed quoted string"
+        );
+        assert_eq!(
+            result.root_children.len(),
+            2,
+            "both statements must be present even after an unclosed quote"
+        );
+    }
+
+    #[test]
+    fn unclosed_key_rhs_quote_at_eof_produces_error() {
+        let table = StringTable::new();
+        let result = parse_string("a = \"unterminated", &table).unwrap();
+        assert!(
+            !result.errors.is_empty(),
+            "expected a parse error for an unclosed string at EOF"
+        );
     }
 }

@@ -6,6 +6,7 @@
 //! Mirrors F# `LocalisationManager.fs`.
 
 use crate::commands::{Lang, LocFile};
+use crate::csv_parser::parse_csv_loc_per_lang;
 use crate::yaml_parser::parse_loc_text;
 use cwtools_file_manager::{FileEncoding, read_text_with_encoding};
 
@@ -37,24 +38,53 @@ impl LocService {
         // Parsing is independent per file; run it in parallel, preserving input
         // order (`par_iter` over the indexed Vec) so first-seen-wins semantics
         // and diagnostics order are unchanged.
-        let results: Vec<Result<LocFile, (String, String)>> = files
+        //
+        // CSV files (CK2/VIC2) are routed through csv_parser; everything else
+        // goes through parse_loc_text (YAML).
+        let results: Vec<Result<Vec<LocFile>, (String, String)>> = files
             .into_par_iter()
-            .map(
-                |(path, text, encoding)| match parse_loc_text(&text, &path) {
-                    Ok(mut file) => {
-                        file.encoding = encoding;
-                        Ok(file)
+            .map(|(path, text, encoding)| {
+                if path.ends_with(".csv") {
+                    // CSV: produce one LocFile per language present in the file.
+                    let entries_by_lang = parse_csv_loc_per_lang(&text, &path, None);
+                    // Group by lang
+                    let mut by_lang: std::collections::HashMap<
+                        Lang,
+                        Vec<crate::commands::LocEntry>,
+                    > = std::collections::HashMap::new();
+                    for (_key, lang, entry) in entries_by_lang {
+                        by_lang.entry(lang).or_default().push(entry);
                     }
-                    Err(e) => Err((path, e)),
-                },
-            )
+                    let loc_files: Vec<LocFile> = by_lang
+                        .into_iter()
+                        .map(|(lang, entries)| LocFile {
+                            path: path.clone(),
+                            language_prefix: lang.to_string(),
+                            lang: Some(lang),
+                            entries,
+                            file_diagnostics: Vec::new(),
+                            parse_errors: Vec::new(),
+                            encoding,
+                        })
+                        .collect();
+                    Ok(loc_files)
+                } else {
+                    match parse_loc_text(&text, &path) {
+                        Ok(mut file) => {
+                            file.encoding = encoding;
+                            Ok(vec![file])
+                        }
+                        Err(e) => Err((path, e)),
+                    }
+                }
+            })
             .collect();
 
-        let mut parsed: Vec<LocFile> = Vec::with_capacity(results.len());
+        let mut parsed: Vec<LocFile> = Vec::new();
         let mut errors: Vec<(String, String)> = Vec::new();
         for r in results {
             match r {
-                Ok(f) => parsed.push(f),
+                Ok(files) => parsed.extend(files),
                 Err(e) => errors.push(e),
             }
         }
@@ -96,9 +126,10 @@ impl LocService {
         let mut langs: Vec<Lang> = Vec::new();
         for f in &self.files {
             if let Some(l) = f.lang
-                && !langs.contains(&l) {
-                    langs.push(l);
-                }
+                && !langs.contains(&l)
+            {
+                langs.push(l);
+            }
         }
         langs
     }
@@ -141,11 +172,19 @@ fn walk_folder_inner(folder: &std::path::Path, in_loc: bool) -> Vec<WalkedFile> 
                 Some("yml") | Some("csv")
             )
         {
-            let (text, enc) = match read_text_with_encoding(&path) {
-                Ok((t, e)) => (t, Some(e)),
-                Err(_) => (String::new(), None),
-            };
-            files.push((path.to_string_lossy().to_string(), text, enc));
+            match read_text_with_encoding(&path) {
+                Ok((text, enc)) => {
+                    files.push((path.to_string_lossy().to_string(), text, Some(enc)));
+                }
+                Err(e) => {
+                    // Propagate IO errors as a failed entry so callers can report them.
+                    files.push((
+                        path.to_string_lossy().to_string(),
+                        format!("IO error: {}", e),
+                        None,
+                    ));
+                }
+            }
         }
     }
 

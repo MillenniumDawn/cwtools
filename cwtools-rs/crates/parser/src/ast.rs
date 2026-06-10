@@ -48,7 +48,6 @@ pub struct SourceRange {
 }
 
 // Arena indices
-pub type NodeIdx = u32;
 pub type LeafIdx = u32;
 pub type LeafValueIdx = u32;
 pub type ValueClauseIdx = u32;
@@ -64,9 +63,11 @@ pub enum Value {
     Clause(Vec<Child>),
 }
 
+/// AST child reference. A keyed clause (`key = { ... }`) is a [`Leaf`] whose
+/// value is [`Value::Clause`] — there is ONE clause representation (see
+/// [`Arena::keyed_clause`]); the parser produces nothing else.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Child {
-    Node(NodeIdx),
     Leaf(LeafIdx),
     LeafValue(LeafValueIdx),
     ValueClause(ValueClauseIdx),
@@ -78,14 +79,6 @@ pub struct Leaf {
     pub value: Value,
     pub op: Operator,
     pub pos: SourceRange,
-}
-
-pub struct Node {
-    pub key: StringTokens,
-    pub children: Vec<Child>,
-    pub pos: SourceRange,
-    pub key_prefix: Option<StringTokens>,
-    pub value_prefix: Option<StringTokens>,
 }
 
 pub struct LeafValue {
@@ -105,7 +98,6 @@ pub struct Comment {
 }
 
 pub struct Arena {
-    pub nodes: Vec<Node>,
     pub leaves: Vec<Leaf>,
     pub leaf_values: Vec<LeafValue>,
     pub value_clauses: Vec<ValueClause>,
@@ -121,18 +113,11 @@ impl Default for Arena {
 impl Arena {
     pub fn new() -> Self {
         Self {
-            nodes: Vec::new(),
             leaves: Vec::new(),
             leaf_values: Vec::new(),
             value_clauses: Vec::new(),
             comments: Vec::new(),
         }
-    }
-
-    pub fn push_node(&mut self, node: Node) -> NodeIdx {
-        let idx = self.nodes.len() as u32;
-        self.nodes.push(node);
-        idx
     }
 
     pub fn push_leaf(&mut self, leaf: Leaf) -> LeafIdx {
@@ -157,6 +142,35 @@ impl Arena {
         let idx = self.comments.len() as u32;
         self.comments.push(comment);
         idx
+    }
+}
+
+/// View of a keyed clause (`key = { ... }`): a [`Leaf`] whose value is
+/// [`Value::Clause`]. Prefer [`Arena::keyed_clause`] over matching by hand.
+pub struct KeyedClause<'a> {
+    pub key: StringTokens,
+    pub children: &'a [Child],
+    pub pos: SourceRange,
+}
+
+impl Arena {
+    /// The keyed-clause view of `child`; `None` for anything that isn't a
+    /// `Leaf` with a `Value::Clause` value.
+    pub fn keyed_clause<'a>(&'a self, child: &Child) -> Option<KeyedClause<'a>> {
+        match child {
+            Child::Leaf(i) => {
+                let l = &self.leaves[*i as usize];
+                match &l.value {
+                    Value::Clause(ch) => Some(KeyedClause {
+                        key: l.key,
+                        children: ch,
+                        pos: l.pos,
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 }
 

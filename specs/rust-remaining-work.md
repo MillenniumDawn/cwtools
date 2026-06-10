@@ -30,19 +30,16 @@ at 13,336 errors / 37,996 warnings):
 
 ## 2. Ground truth and conventions
 
-- F# is itself noisy on MD: ~80K diagnostics with the cwtools-hoi4-config
-  (37,838 CW240, 21,984 CW100, ...). Rust is ~51K, already below it. Measure each
-  change against a fresh F# run, not the stale "~5K" memory figure: build the F#
-  CLI once (`dotnet build CWToolsCLI/CWToolsCLI.fsproj -c Release`), run it and
-  `target/release/cwtools validate` on the same MD subtree with
-  `--rulespath /mnt/Linux/github-projects/cwtools-hoi4-config/Config`, and diff.
+- F# was itself noisy on MD: ~80K diagnostics with the cwtools-hoi4-config
+  (37,838 CW240, 21,984 CW100, ...). Rust is ~51K, already below it. The F#
+  source tree has been removed from this repo; to reproduce an F# baseline,
+  check out a pre-removal commit (or upstream cwtools/cwtools) and
+  `dotnet build CWToolsCLI/CWToolsCLI.fsproj -c Release`. Day to day, measure
+  changes against a fresh Rust run on the same MD subtree instead.
   Run full-mod validations sequentially, never in parallel.
 - Goal is to aim BELOW F# (low noise), so prefer fixes that remove false
   positives over additions that introduce them.
-- Do NOT run global `cargo fmt`: the baseline has ~541 hunks of rustfmt drift, so
-  a global format buries every feature diff. Hand-format only changed lines.
-- The lsp crate has ~22 pre-existing clippy warnings; the baseline is not
-  clippy-clean. Don't add new warnings; don't chase the old ones blanket-style.
+- The workspace is rustfmt- and clippy-clean (`-D warnings`); keep it that way.
 - Per CLAUDE.md: no em-dashes, terse prose, no Claude attribution in commits.
 
 ## 3. Remaining items, by value

@@ -17,12 +17,11 @@ cwtools_cache = { workspace = true }
 cwtools_rules = { workspace = true }
 cwtools_validation = { workspace = true }
 cwtools_info = { workspace = true }
+cwtools_driver = { workspace = true }
 cwtools_game = { workspace = true }
 cwtools_localization = { workspace = true }
 cwtools_profiling = { workspace = true }
 clap = { workspace = true }
-anyhow = { workspace = true }
-rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

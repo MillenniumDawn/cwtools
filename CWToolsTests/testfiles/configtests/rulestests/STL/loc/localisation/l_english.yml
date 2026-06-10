@@ -1,9 +1,0 @@
-﻿l_english:
- my_ship:0 "test_required"
- my_ship_desc:0 "test_required"
- my_ship_required:0 "test_required"
- my_ship_sub:0 "test_required"
- my_ship_sub_desc:0 "test_required"
- my_ship_sub_required:0 "test_required"
-
- my_ship_desc:0 "[Root.ruler.GetDesc]"

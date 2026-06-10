@@ -1,4 +1,4 @@
-use cwtools_parser::ast::{Arena, Child};
+use cwtools_parser::ast::{Arena, Child, ParseError};
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::StringTable;
 use std::path::{Path, PathBuf};
@@ -123,7 +123,7 @@ pub fn classify_extension(path: &Path) -> FileKind {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "txt" | "gui" | "gfx" | "asset" => FileKind::Script,
+        "txt" | "gui" | "gfx" | "asset" | "sfx" | "map" => FileKind::Script,
         "yml" | "yaml" | "csv" => FileKind::Localisation,
         _ => FileKind::Resource,
     }
@@ -147,6 +147,8 @@ pub struct ParsedFile {
     pub logical_path: String,
     pub arena: Arena,
     pub root_children: Vec<Child>,
+    /// Non-fatal parse errors (file was partially parsed; validate what survived).
+    pub errors: Vec<ParseError>,
 }
 
 /// Paradox `.mod` descriptor fields.
@@ -297,6 +299,7 @@ impl FileManager {
                         logical_path,
                         arena: parsed.arena,
                         root_children: parsed.root_children,
+                        errors: parsed.errors,
                     }),
                     Err(e) => {
                         // Non-fatal: skip files that fail to parse and continue
@@ -340,7 +343,9 @@ impl FileManager {
                 {
                     continue;
                 }
-                self.collect_paths(&path, out)?;
+                if let Err(e) = self.collect_paths(&path, out) {
+                    eprintln!("warn: skipping {}: {}", path.display(), e);
+                }
                 continue;
             }
 
@@ -378,9 +383,10 @@ impl FileManager {
             // Size guard
             if self.config.max_file_size > 0
                 && let Ok(meta) = path.metadata()
-                    && meta.len() > self.config.max_file_size {
-                        continue;
-                    }
+                && meta.len() > self.config.max_file_size
+            {
+                continue;
+            }
 
             // Compute logical path relative to root
             let logical_path = compute_logical_path(&path, &self.config.root);
@@ -398,6 +404,7 @@ impl FileManager {
                 logical_path,
                 arena: parsed.arena,
                 root_children: parsed.root_children,
+                errors: parsed.errors,
             }),
             Err(e) => Err(FileError::Parse(format!("{}: {}", path.display(), e))),
         }
@@ -436,7 +443,9 @@ pub fn compute_logical_path(path: &Path, root: &Path) -> String {
 /// Mirrors F# FileManager.fs:91-125: extracts `name`, `path`, and
 /// `replace_path` entries.
 pub fn parse_mod_descriptor(path: &Path) -> Result<ModDescriptor, FileError> {
-    let content = read_text(path)?;
+    let raw = read_text(path)?;
+    // Strip UTF-8 BOM (U+FEFF) so the first key isn't parsed as "\u{FEFF}name".
+    let content = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
     let mut name = String::new();
     let mut mod_path = None;
     let mut replace_paths = Vec::new();
@@ -505,20 +514,21 @@ pub fn expand_multiple_mods(workspace: &Path) -> Vec<ResolvedMod> {
                 .map(|e| e.eq_ignore_ascii_case("mod"))
                 .unwrap_or(false)
                 && let Ok(desc) = parse_mod_descriptor(&path)
-                    && let Some(mod_path) = &desc.path {
-                        // `path` can be relative (to the workspace) or absolute
-                        let root = if std::path::Path::new(mod_path).is_absolute() {
-                            PathBuf::from(mod_path)
-                        } else {
-                            workspace.join(mod_path)
-                        };
-                        if root.is_dir() {
-                            out.push(ResolvedMod {
-                                descriptor: desc,
-                                root,
-                            });
-                        }
-                    }
+                && let Some(mod_path) = &desc.path
+            {
+                // `path` can be relative (to the workspace) or absolute
+                let root = if std::path::Path::new(mod_path).is_absolute() {
+                    PathBuf::from(mod_path)
+                } else {
+                    workspace.join(mod_path)
+                };
+                if root.is_dir() {
+                    out.push(ResolvedMod {
+                        descriptor: desc,
+                        root,
+                    });
+                }
+            }
         }
     }
 
@@ -579,12 +589,15 @@ pub fn discover_files_multi_mod(
     for (i, m) in mods.iter().enumerate().rev() {
         let mod_priority = i + 1;
         for rp in &m.descriptor.replace_paths {
-            let prefix = rp.trim_matches('/').to_string();
+            // Normalize: backslash → slash (Windows-authored .mod files), trim
+            // leading/trailing slashes, then lowercase for case-insensitive match.
+            let prefix_lower = rp.replace('\\', "/").trim_matches('/').to_ascii_lowercase();
             best.retain(|logical, (_path, file_prio)| {
                 // If the file's logical path is under this replace_path and
                 // comes from a lower-priority source → suppress it.
-                let under_prefix =
-                    logical == &prefix || logical.starts_with(&format!("{}/", prefix));
+                let logical_lower = logical.to_ascii_lowercase();
+                let under_prefix = logical_lower == prefix_lower
+                    || logical_lower.starts_with(&format!("{}/", prefix_lower));
                 if under_prefix && *file_prio < mod_priority {
                     return false;
                 }
@@ -621,6 +634,90 @@ fn collect_files_recursive(
             let entry = out.entry(logical).or_insert((path.clone(), priority));
             if priority > entry.1 {
                 *entry = (path, priority);
+            }
+        }
+    }
+}
+
+/// Recursively collect every file under `root` whose extension is in
+/// `extensions`, skipping engine/IDE directories and free-form text files.
+///
+/// This is the whole-tree walker used by the LSP full-workspace pass. The skip
+/// lists (directories and free-form filenames) come from
+/// `FileManagerConfig::default()` so they are defined in exactly one place and
+/// stay consistent with the CLI's `discover_and_parse`. `extra_file_globs` and
+/// `extra_dir_globs` layer on top of those defaults (they extend, never
+/// replace, the engine baseline). Traversal order follows `read_dir` and is not
+/// sorted; callers that need determinism should sort the result.
+pub fn walk_workspace_files(
+    root: &Path,
+    extensions: &[&str],
+    extra_file_globs: &[String],
+    extra_dir_globs: &[String],
+) -> Vec<PathBuf> {
+    let cfg = FileManagerConfig::default();
+    let mut out = Vec::new();
+    walk_workspace_inner(
+        root,
+        extensions,
+        &cfg,
+        extra_file_globs,
+        extra_dir_globs,
+        &mut out,
+    );
+    out
+}
+
+fn walk_workspace_inner(
+    dir: &Path,
+    extensions: &[&str],
+    cfg: &FileManagerConfig,
+    extra_file_globs: &[String],
+    extra_dir_globs: &[String],
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let skip = cfg
+                .exclude_dirs
+                .iter()
+                .any(|ex| name.eq_ignore_ascii_case(ex))
+                || cfg
+                    .exclude_dir_patterns
+                    .iter()
+                    .any(|pat| glob_match(pat, name))
+                || extra_dir_globs.iter().any(|pat| glob_match(pat, name));
+            if !skip {
+                walk_workspace_inner(
+                    &path,
+                    extensions,
+                    cfg,
+                    extra_file_globs,
+                    extra_dir_globs,
+                    out,
+                );
+            }
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if !extensions.contains(&ext) {
+                continue;
+            }
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Engine baseline (Changelog.txt, README.*, LICENSE.*, *.md) lives in
+            // the default config's exclude_patterns; user globs extend it.
+            let skip = cfg
+                .exclude_patterns
+                .iter()
+                .any(|pat| glob_match(pat, file_name))
+                || extra_file_globs
+                    .iter()
+                    .any(|pat| glob_match(pat, file_name));
+            if !skip {
+                out.push(path);
             }
         }
     }
@@ -694,12 +791,16 @@ pub fn classify_directory(dir: &Path) -> DirectoryType {
 /// - `?` single-char wildcard
 /// - Directory-name plain equality
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    // Fast path for *.ext
-    if let Some(suffix) = pattern.strip_prefix('*') {
+    // Fast path for *.ext — only valid when the remainder has no further wildcards.
+    if let Some(suffix) = pattern.strip_prefix('*')
+        && !suffix.contains(['*', '?'])
+    {
         return text.ends_with(suffix);
     }
-    // Fast path for prefix*
-    if let Some(prefix) = pattern.strip_suffix('*') {
+    // Fast path for prefix* — only valid when the prefix has no wildcards.
+    if let Some(prefix) = pattern.strip_suffix('*')
+        && !prefix.contains(['*', '?'])
+    {
         return text.starts_with(prefix);
     }
     // General: treat * as "any chars", ? as "any single char"
@@ -747,6 +848,18 @@ mod tests {
         assert!(!glob_match("foo*", "barfoo"));
         assert!(glob_match("f?o.txt", "foo.txt"));
         assert!(!glob_match("f?o.txt", "fooo.txt"));
+    }
+
+    #[test]
+    fn glob_match_multi_wildcard() {
+        // *foo* must not take the *.ext fast path and treat "foo*" as a literal suffix.
+        assert!(glob_match("*foo*", "barfoobar"));
+        assert!(glob_match("*foo*", "foo"));
+        assert!(glob_match("*foo*", "xfoox"));
+        assert!(!glob_match("*foo*", "bar"));
+        // prefix* fast path must not trigger when the prefix itself contains ?.
+        assert!(glob_match("fo?*", "foobar"));
+        assert!(!glob_match("fo?*", "fo")); // needs at least one char after "fo"
     }
 
     #[test]

@@ -109,6 +109,16 @@ impl StringTable {
     /// * If the lower‑cased form has never been seen, two consecutive IDs are
     ///   allocated: `normal` (exact text) and `lower` (lower‑cased text).
     pub fn intern(&self, s: &str) -> StringTokens {
+        // Reserved slot-0: the empty string maps to id 0 without consuming a
+        // fresh id. All other strings start from id 1 (next_id initialised to 1).
+        if s.is_empty() {
+            return StringTokens {
+                lower: StringId(0),
+                normal: StringId(0),
+                quoted: false,
+            };
+        }
+
         // Fast path: exact string already interned. This is the overwhelming
         // common case while parsing many files (identifiers repeat constantly),
         // and it takes a shared read lock so parse threads don't serialize on it.
@@ -119,7 +129,9 @@ impl StringTable {
             }
         }
 
-        let quoted = s.starts_with('"') && s.ends_with('"');
+        // A lone `"` satisfies both starts_with and ends_with (same character),
+        // so require at least 2 chars for the quoted detection.
+        let quoted = s.len() >= 2 && s.starts_with('"') && s.ends_with('"');
         let lower_key = s.to_lowercase();
 
         let mut inner = self.inner.write();

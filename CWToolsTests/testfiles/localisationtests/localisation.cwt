@@ -1,4 +1,0 @@
-localisation_commands = {
-    GetName = any
-    GetName2 = { any }
-}

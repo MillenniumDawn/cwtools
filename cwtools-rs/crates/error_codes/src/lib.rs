@@ -46,6 +46,17 @@ impl ErrorCode {
 
 // ── Error Code Catalog ─────────────────────────────────
 
+/// Localisation file parse error.
+///
+/// F# emits this from `validateLocalisationSyntax` when `YAMLLocalisationParser`
+/// returns `Failure(msg, pos, _)`. The Rust parser is lenient (recovers
+/// line-by-line), so this fires at the recovery point for each malformed line.
+pub const CW001_PARSE_ERROR: ErrorCode = ErrorCode {
+    id: "CW001",
+    severity: ErrorSeverity::Error,
+    message_template: "Localisation file parse error: {}",
+};
+
 /// Mixed key/values and values block (missing equals sign).
 pub const CW002_MIXED_BLOCK: ErrorCode = ErrorCode {
     id: "CW002",
@@ -650,19 +661,4 @@ pub const CW239_UNUSED_TYPE: ErrorCode = ErrorCode {
     message_template: "{} of type {} is not used anywhere, but is expected to be",
 };
 
-/// Generate a hash from error code + location + parameters.
-pub fn error_code_hash(
-    code: &ErrorCode,
-    file: &str,
-    line: u32,
-    params: &[impl AsRef<str>],
-) -> String {
-    let sev = match code.severity {
-        ErrorSeverity::Error => "error",
-        ErrorSeverity::Warning => "warning",
-        ErrorSeverity::Information => "information",
-        ErrorSeverity::Hint => "hint",
-    };
-    let msg = code.format(params);
-    format!("{}|{}|{}|{}", sev, file, line, msg)
-}
+// error_code_hash deleted: no callers, and it wasn't actually a hash.
