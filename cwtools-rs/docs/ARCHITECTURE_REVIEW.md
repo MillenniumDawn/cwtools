@@ -58,68 +58,50 @@ lock over one `Session` would serialize hover/completion behind every
 re-index. `crates/driver/src/lib.rs` module docs record the same decision.
 The roadmap is closed.
 
-End goal context: the Rust side is meant to replace the F# binary entirely, so
-both entry points (CLI and LSP) must drive the same core and agree on results.
-Today they each reimplement the driver, which is the central problem below.
+End goal context: the Rust side replaced the F# binary entirely. The F# source
+tree has been removed. Both entry points (CLI and LSP) drive the same core
+through `cwtools_driver` and agree on results.
 
 ## Current architecture
 
-13 crates, edition 2024, resolver 3. Layering is mostly clean at the bottom and
-tangled at the top.
-
-```
-                         cli            lsp          (entry points / surfaces)
-                        /  | \         / | \
-        +--------------+   |  +---+---+  |  +-------------------+
-        |                  |      |      |                      |
-   validation -----------> info   |  localization          profiling
-     |   |  \              |  \    |     |   \
-     |   |   +--> info     |   rules     |    game
-     |   |   +--> localization  |        |     |
-     |   +------> game ---------+--------+-----+
-     |   +------> rules
-     |   +------> error_codes
-     |
-   rules --> parser --> string_table
-   file_manager --> parser, string_table
-   cache --> parser, string_table
-   game --> string_table   (unused dep, see machete)
-```
+15 crates, edition 2024, resolver 3. Layering is clean throughout.
 
 Layer sketch, bottom to top:
 
 - L0 leaf: `string_table`, `error_codes`, `profiling`.
-- L1 parse/io: `parser` (-> string_table), `file_manager` (-> parser),
-  `cache` (-> parser).
-- L2 rules: `rules` (-> parser). The `.cwt` ruleset model and converter.
-- L3 domain: `game` (scopes, constants), `localization` (-> game, file_manager),
-  `info` (-> rules, file_manager). These are siblings but cross-reference.
-- L4 engine: `validation` (-> rules, game, info, localization, error_codes).
-- L5 surfaces: `cli` and `lsp`, each depending on nearly everything.
+- L1 parse/io: `parser` (→ string_table), `file_manager` (→ parser, string_table),
+  `cache` (→ parser, string_table, file_manager).
+- L2 rules: `rules` (→ parser, string_table). The `.cwt` ruleset model and converter.
+- L3 domain: `game` (scopes, constants), `localization` (→ error_codes, game,
+  file_manager), `index` (→ parser, file_manager, string_table, rules).
+- L4 engine: `validation` (→ error_codes, rules, game, index, localization),
+  `info` (→ rules, index). Siblings: `validation` is the rule-vs-AST engine;
+  `info` is editor features (hover, goto-definition, completions).
+- L4.5 pipeline: `driver` (→ file_manager, rules, validation, index, game,
+  localization). Owns the "load rules → discover → index → validate" sequence
+  used by both CLI and LSP.
+- L5 surfaces: `cli` and `lsp`, each wrapping driver + info + cache.
 
 ### What works well
 
 - The bottom three layers are clean. `parser`/`string_table`/`cache`/`file_manager`
   have tight, single-purpose APIs and no upward dependencies. `parser` is an arena
   AST (`crates/parser/src/ast.rs`) with index-based `Child` references, the right shape
-  for a hot path and for serialization (`cache`). Caveat: the arena is HYBRID, not
-  pure — clause children are stored inline as `Vec<Child>` in `Node`/`ValueClause`/
-  `ParsedFile`, AND a leaf-valued clause (`key = { .. }`) lands in a SECOND inline form,
-  `Value::Clause(Vec<Child>)` (`ast.rs:64`, built at `parser.rs:492`). Every recursive
-  walker must therefore handle clause children two ways; there are 71 `Value::Clause`
-  match sites and `info/src/lib.rs:439` already normalizes the two by hand. A single
-  clause-children accessor (or folding leaf-clauses into `Node` at parse time) would
-  remove a whole class of "handled Node but forgot Leaf-clause" walker bugs.
+  for a hot path and for serialization (`cache`). A keyed clause (`key = { ... }`) is
+  exactly one shape: a `Leaf` whose value is `Value::Clause(Vec<Child>)`. The
+  `Arena::keyed_clause` accessor is the single normalized entry point; the earlier
+  HYBRID dual representation (`Child::Node` / `Node`) was removed in the refactor
+  (four walker bugs hiding in dead `Child::Node` branches were found and fixed in the
+  process).
 - `error_codes` is a real catalog: `ValidationError::from_code`
   (`crates/validation/src/lib.rs:31`) pulls severity + template from one place, so
   call sites don't restate the code->severity mapping. Good seam.
-- The validation engine already separates "build per-run shared state once" from
-  "validate one file": `build_enum_map` / `build_scope_registry_arc` /
-  `validate_ast_with_loc_prebuilt` (`crates/validation/src/lib.rs:214-244`). That is
-  exactly the seam a shared driver needs; it just isn't used by a shared driver yet.
+- The validation engine separates "build per-run shared state once" from "validate
+  one file": `build_enum_map` / `build_scope_registry_arc` / `validate_prepared`
+  (`crates/validation/src/lib.rs`). `cwtools_driver` consumes this seam, so both
+  CLI and LSP go through identical preparation.
 - The scope engine is config-driven off `scopes.cwt` + `links.cwt` via
-  `ScopeRegistry` (`crates/game/src/scope_registry.rs`), not hardcoded tables. Good
-  direction.
+  `ScopeRegistry` (`crates/game/src/scope_registry.rs`), not hardcoded tables.
 
 ## Top structural problems, ranked by maintenance impact
 

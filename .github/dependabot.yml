@@ -31,3 +31,10 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    groups:
+      # Bundle patch and minor action updates to reduce PR noise.
+      patch-and-minor:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"

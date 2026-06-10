@@ -15,15 +15,15 @@ With `RUST_LOG=info` the subscriber prints a span-close line for every
 instrumented hot path, with its busy/idle time. The instrumented paths today:
 
 - `parse_string` (parser) — one span per file parsed
-- `collect_type_instances` (info) — one span per file indexed
+- `collect_type_instances` (index) — one span per file indexed
 - `post_process` (rules) — the single ruleset post-processing pass
-- `validate_ast` (validation) — one span per file validated
+- `validate_ast_with_loc` / `validate_prepared` (validation) — one span per file validated
 
 Filter to a single crate to cut noise:
 
 ```plaintext
 RUST_LOG=cwtools_validation=info cargo run --release -p cwtools_cli -- validate ...
-RUST_LOG=cwtools_info=info,cwtools_rules=info cargo run --release -p cwtools_cli -- validate ...
+RUST_LOG=cwtools_index=info,cwtools_rules=info cargo run --release -p cwtools_cli -- validate ...
 ```
 
 (Diagnostics go to stdout; the trace output goes to stderr, so redirect with
@@ -38,7 +38,7 @@ args aren't formatted), and make sure the crate has `tracing` in its
 
 ## What to look for
 
-- A `parse_string` or `validate_ast` span that dominates total time points at a
+- A `parse_string` or `validate_ast_with_loc` span that dominates total time points at a
   pathological file (huge or deeply nested).
 - `post_process` time scales with ruleset size; it runs once, so a large number
   there is a one-off cost, not per-file.
@@ -49,8 +49,8 @@ args aren't formatted), and make sure the crate has `tracing` in its
 
 The LSP workspace walk consults three lists, layered in this order:
 
-1. **Engine baseline (always on)**: toolchain junk (`node_modules`, `bin`,
-   `obj`, `target`, `dist`, `out`, `.git`, `.idea`, `.vscode`, `resources`)
+1. **Engine baseline (always on)**: toolchain junk (`.git`, `target`, `.vs`, `node_modules`, `bin`,
+   `obj`, `out`, `dist`, `.idea`, `.vscode`, `resources`)
    and free-form text files (`Changelog.txt`, `README.txt`, `LICENSE.txt`,
    `README.md`, `LICENSE.md`, `*.md`). These are hard-coded and cannot be
    disabled per-workspace — they exist because matching them otherwise
