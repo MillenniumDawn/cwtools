@@ -3131,7 +3131,8 @@ impl Backend {
                 .as_ref()
                 .map(|idx| idx.union())
                 .unwrap_or(&empty_union);
-            for d in cwtools_localization::validate_loc_file_text(text, &path, union, &extra_valid_refs)
+            for d in
+                cwtools_localization::validate_loc_file_text(text, &path, union, &extra_valid_refs)
             {
                 let ve = loc_diag_to_validation_error(&d);
                 diagnostics.push(validation_error_to_diagnostic(&ve));

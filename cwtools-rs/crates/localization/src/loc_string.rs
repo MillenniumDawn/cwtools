@@ -441,7 +441,11 @@ mod tests {
         // Two adjacent constructs (as in MD loc) used to let the second `$` close
         // the first, yielding a bogus Ref("[?...mandatory_funding").
         let s = "$[?united_nations_esco_mandatory_funding|-3]\n$[?united_nations_esco_optional_funding|-3]";
-        assert!(refs(s).is_empty(), "no bogus ref: {:?}", parse_loc_elements(s));
+        assert!(
+            refs(s).is_empty(),
+            "no bogus ref: {:?}",
+            parse_loc_elements(s)
+        );
         // The bracket still parses as a command.
         assert!(parse_loc_elements(s).iter().any(|e| matches!(e, LocElement::Command(c) if c.starts_with("?united_nations_esco_mandatory"))));
     }
