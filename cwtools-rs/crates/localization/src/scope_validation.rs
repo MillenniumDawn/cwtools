@@ -34,6 +34,15 @@ pub enum LocCommandDiagnostic {
         /// Full command string that ended without a getter.
         command: String,
     },
+    /// The command was not found in the scope registry at all.
+    ///
+    /// Mirrors F# `LocNotFound` / CW226 `InvalidLocCommand`.
+    /// Only emitted when a scope registry is present (config-driven mode);
+    /// without one the validator remains fully lenient to avoid false positives.
+    NotFound {
+        /// The unrecognised command segment.
+        command: String,
+    },
 }
 
 /// Per-game static data needed for loc-command validation.
@@ -203,13 +212,17 @@ fn validate_command_string(
                 // Unknown command.  If it's the final segment and we have no
                 // terminal-commands list, accept it (lenient); if we have a
                 // non-empty list and it didn't match, warn.
-                if is_last {
-                    if !data.terminal_commands.is_empty() && !looks_terminal {
-                        diags.push(LocCommandDiagnostic::ChainEndsInScope {
-                            command: cmd.to_string(),
-                        });
-                    }
-                } else {
+                // NOTE: CW226 (NotFound) is NOT emitted here because this path
+                // handles legacy `[command]` strings (single-segment, no dots).
+                // F# only fires CW226 from validateJominiLocalisationCommandsBase,
+                // not from validateLocalisationCommandsBase. Legacy commands like
+                // `[var_name|fmt]` or `[2%%Y]` are valid HOI4 loc syntax and are
+                // not scope links, so we remain lenient here.
+                if is_last && !data.terminal_commands.is_empty() && !looks_terminal {
+                    diags.push(LocCommandDiagnostic::ChainEndsInScope {
+                        command: cmd.to_string(),
+                    });
+                } else if !is_last {
                     // Unknown intermediate — push ANY and continue leniently.
                     ctx.push_scope(SCOPE_ANY);
                 }
@@ -235,6 +248,15 @@ fn validate_jomini_chain(
     }
     let last_idx = chain.len() - 1;
     let mut ctx = build_loc_ctx(data, engine_game, initial_scope);
+    // Suppress CW226 when the chain has more than one segment. For chains like
+    // [THIS.scripted_var] or [ROOT.var_name], the scope engine resolves the
+    // intermediate (THIS/ROOT → NewScope) but the final segment is a scripted
+    // variable or localisation reference that the Rust engine doesn't index.
+    // F#'s HOI4 validator had the full scripted-variable registry; without it
+    // we can only be confident about single-segment Jomini calls like [Func()].
+    // Unknown intermediates (e.g. country-tag scopes like PAL) also poison the
+    // chain, which is tracked below.
+    let mut had_lenient_intermediate = chain.len() > 1;
 
     for (i, cmd) in chain.iter().enumerate() {
         let seg = &cmd.key;
@@ -242,6 +264,9 @@ fn validate_jomini_chain(
 
         if is_bypass_prefix(seg, data) {
             ctx.push_scope(SCOPE_ANY);
+            if !is_last {
+                had_lenient_intermediate = true;
+            }
             continue;
         }
 
@@ -252,7 +277,12 @@ fn validate_jomini_chain(
 
         let result = ctx.change_scope(seg);
         match result {
-            ScopeResult::NewScope { .. } | ScopeResult::AnyScope | ScopeResult::VarFound => {}
+            ScopeResult::AnyScope => {
+                if !is_last {
+                    had_lenient_intermediate = true;
+                }
+            }
+            ScopeResult::NewScope { .. } | ScopeResult::VarFound => {}
             ScopeResult::ValueFound if is_last => return,
             ScopeResult::ValueFound => {}
             ScopeResult::WrongScope {
@@ -268,8 +298,16 @@ fn validate_jomini_chain(
                 return; // short-circuit
             }
             ScopeResult::NotFound | ScopeResult::VarNotFound(_) => {
-                if !is_last {
+                if is_last && data.registry.is_some() && !looks_terminal && !had_lenient_intermediate
+                {
+                    // Registry present, chain resolved cleanly up to this point,
+                    // final command is unknown: CW226 (mirrors F# `LocNotFound`).
+                    diags.push(LocCommandDiagnostic::NotFound {
+                        command: seg.to_string(),
+                    });
+                } else if !is_last {
                     ctx.push_scope(SCOPE_ANY); // unknown intermediate: lenient
+                    had_lenient_intermediate = true;
                 }
             }
         }
@@ -539,6 +577,70 @@ mod tests {
         assert!(
             !diags.is_empty(),
             "controller from Country should produce WrongScope, got: {:?}",
+            diags
+        );
+    }
+
+    // ── CW226: unknown final command when registry is present ─────────────────
+
+    #[test]
+    fn unknown_final_command_with_registry_emits_not_found() {
+        // `totally_unknown` is not a scope link, not a getter (no "Get" prefix),
+        // not in the terminal-commands list, and we have a registry.
+        // Mirrors F# `LocNotFound` → CW226.
+        let entry = make_entry_with_jomini(vec![vec![JominiCommand {
+            key: "totally_unknown".into(),
+            params: Vec::new(),
+        }]]);
+        let data = hoi4_data();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected one NotFound diagnostic: {:?}",
+            diags
+        );
+        assert!(
+            matches!(diags[0], LocCommandDiagnostic::NotFound { .. }),
+            "expected NotFound, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn unknown_final_command_without_registry_is_lenient() {
+        // No registry → fully lenient, no CW226.
+        let entry = make_entry_with_jomini(vec![vec![JominiCommand {
+            key: "totally_unknown".into(),
+            params: Vec::new(),
+        }]]);
+        let data = LocScopeData {
+            game: Game::HOI4,
+            terminal_commands: Vec::new(),
+            question_mark_variable: true,
+            parameter_variables: true,
+            registry: None, // no registry
+        };
+        let diags = validate_loc_commands(&entry, ScopeId(0), &data);
+        assert!(
+            diags.is_empty(),
+            "without registry, unknown command should be accepted: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn get_prefixed_command_not_flagged_as_not_found() {
+        // `GetSomethingCustom` starts with "Get" — treated as terminal, not CW226.
+        let entry = make_entry_with_jomini(vec![vec![JominiCommand {
+            key: "GetSomethingCustom".into(),
+            params: Vec::new(),
+        }]]);
+        let data = hoi4_data();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "Get-prefixed command should be accepted as terminal: {:?}",
             diags
         );
     }

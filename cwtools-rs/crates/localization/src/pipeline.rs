@@ -2,7 +2,7 @@
 //!
 //! Runs the scope-independent loc-entry checks (`validate_loc_file`) over every
 //! loaded loc file and normalizes the results to the F# numeric error codes
-//! (CW225/CW234/CW259/CW268/CW275), plus the per-file name/header checks
+//! (CW001/CW225/CW234/CW259/CW268/CW275), plus the per-file name/header checks
 //! (CW254/CW255/CW256/CW257). Scope-dependent command checks
 //! (CW226/CW260/CW266) run at the config reference site, not here, because they
 //! need the scope of the referencing field.
@@ -213,6 +213,18 @@ pub fn validate_loc_project_scoped(
                 });
             }
 
+            // CW001: line-level parse errors collected during lenient recovery.
+            for pe in &file.parse_errors {
+                out.push(LocDiagnostic {
+                    file: path.clone(),
+                    line: pe.line,
+                    col: 1,
+                    code: cwtools_error_codes::CW001_PARSE_ERROR.id,
+                    severity: LocSeverity::Error,
+                    message: cwtools_error_codes::CW001_PARSE_ERROR.format(&[pe.message.as_str()]),
+                });
+            }
+
             for err in validate_loc_file(file, union_ref, HARDCODED_LOC) {
                 out.push(LocDiagnostic {
                     file: path.clone(),
@@ -245,6 +257,18 @@ pub fn validate_loc_file_text(
     // CW255/256/257: file name vs language header.
     if let Some(d) = lang_header_diagnostic(&file) {
         out.push(d);
+    }
+
+    // CW001: line-level parse errors from lenient recovery.
+    for pe in &file.parse_errors {
+        out.push(LocDiagnostic {
+            file: path.to_string(),
+            line: pe.line,
+            col: 1,
+            code: cwtools_error_codes::CW001_PARSE_ERROR.id,
+            severity: LocSeverity::Error,
+            message: cwtools_error_codes::CW001_PARSE_ERROR.format(&[pe.message.as_str()]),
+        });
     }
 
     for err in validate_loc_file(&file, union, HARDCODED_LOC) {
@@ -407,6 +431,43 @@ mod tests {
             validate_loc_project(&svc, Game::HOI4)
                 .iter()
                 .all(|d| d.code != "CW254")
+        );
+    }
+
+    #[test]
+    fn malformed_line_emits_cw001_and_rest_parses() {
+        // A line with no ':' separator triggers CW001 at the recovery point.
+        // The surrounding valid entries must still parse (parser remains lenient).
+        let text = "l_english:\n good_key: \"valid\"\nthis line has no colon at all\n another_key: \"also valid\"\n";
+        let svc = service_from(&[("a_l_english.yml", text)]);
+        let diags = validate_loc_project(&svc, Game::HOI4);
+
+        let cw001: Vec<_> = diags.iter().filter(|d| d.code == "CW001").collect();
+        assert_eq!(
+            cw001.len(),
+            1,
+            "exactly one CW001 for one bad line: {:?}",
+            diags
+        );
+        assert_eq!(cw001[0].severity, LocSeverity::Error);
+        assert_eq!(cw001[0].line, 3, "bad line is line 3");
+
+        // The good entries still parse — no spurious CW225/CW100 from the bad line.
+        assert!(
+            diags.iter().all(|d| d.code != "CW225"),
+            "no CW225 from recovered parse: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn well_formed_file_no_cw001() {
+        let svc = service_from(&[("a_l_english.yml", "l_english:\n key1: \"hi\"\n")]);
+        assert!(
+            validate_loc_project(&svc, Game::HOI4)
+                .iter()
+                .all(|d| d.code != "CW001"),
+            "well-formed file must not emit CW001"
         );
     }
 }

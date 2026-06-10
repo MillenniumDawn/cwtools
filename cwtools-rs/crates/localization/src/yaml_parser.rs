@@ -13,7 +13,7 @@
 //! * `key: "this is "also" valid"` → desc = `"this is "also" valid"`
 //! * `key: "a" #comment` → desc = `"a" #comment`
 
-use crate::commands::{Lang, LocEntry, LocFile, Position, key_to_language};
+use crate::commands::{Lang, LocEntry, LocFile, LocParseError, Position, key_to_language};
 use crate::loc_string::parse_loc_elements;
 
 // ---- UTF-8 BOM check -------------------------------------------------------
@@ -203,6 +203,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     i += 1;
 
     let mut entries = Vec::new();
+    let mut parse_errors: Vec<LocParseError> = Vec::new();
 
     // 3.  Entry lines: key:value"desc text"
     //      key:123 "desc text"       (with version)
@@ -219,8 +220,14 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
 
         let colon_pos = trimmed.find(':');
         if colon_pos.is_none() {
+            // Malformed line: no colon separator. Record a CW001 parse error and
+            // continue recovering (lenient parser; mirrors F# `Failure` path).
+            parse_errors.push(LocParseError {
+                line: i + 1,
+                message: format!("unexpected content (no ':' separator): {:?}", trimmed),
+            });
             i += 1;
-            continue; // malformed line, skip (parser tolerance)
+            continue;
         }
         let colon_pos = colon_pos.unwrap();
         let key = trimmed[..colon_pos].trim_end();
@@ -358,6 +365,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         lang,
         entries,
         file_diagnostics,
+        parse_errors,
         // Unknown here; set by the disk-reading path (`LocService`) where the
         // raw bytes are available.
         encoding: None,

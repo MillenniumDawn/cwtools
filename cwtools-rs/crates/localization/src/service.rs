@@ -63,6 +63,7 @@ impl LocService {
                             lang: Some(lang),
                             entries,
                             file_diagnostics: Vec::new(),
+                            parse_errors: Vec::new(),
                             encoding,
                         })
                         .collect();

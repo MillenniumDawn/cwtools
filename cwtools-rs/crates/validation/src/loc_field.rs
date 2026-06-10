@@ -182,6 +182,10 @@ fn push_loc_command_diagnostic(
             let code = &error_codes::CW266_LOC_COMMAND_NOT_IN_DATA_TYPE;
             (code, code.format(&[loc_key, command.as_str(), "scope"]))
         }
+        D::NotFound { command } => {
+            let code = &error_codes::CW226_INVALID_LOC_COMMAND;
+            (code, code.format(&[loc_key, command.as_str()]))
+        }
     };
     errors.push(ValidationError {
         message,

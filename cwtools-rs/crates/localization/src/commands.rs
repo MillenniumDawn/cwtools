@@ -266,6 +266,18 @@ pub enum JominiParam {
     Commands(Vec<String>),
 }
 
+/// A line-level parse failure recorded during lenient recovery.
+///
+/// The parser skips malformed lines rather than aborting; each skip
+/// produces one of these so the pipeline can emit CW001.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocParseError {
+    /// 1-based line number where the malformed line was found.
+    pub line: usize,
+    /// Human-readable description of the problem.
+    pub message: String,
+}
+
 /// A parsed localization file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocFile {
@@ -277,6 +289,9 @@ pub struct LocFile {
     /// File-level diagnostics (BOM, header/filename mismatches, etc.).
     /// Empty when there are no issues.
     pub file_diagnostics: Vec<String>,
+    /// Line-level parse errors collected during lenient recovery (CW001).
+    /// Empty for well-formed files.
+    pub parse_errors: Vec<LocParseError>,
     /// On-disk encoding, when the file was read from disk (used to enforce the
     /// UTF-8-BOM rule, CW254). `None` when built from already-decoded text
     /// (LSP single-file edits, tests) where the original bytes aren't available.

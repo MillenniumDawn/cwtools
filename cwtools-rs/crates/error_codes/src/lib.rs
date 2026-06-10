@@ -46,6 +46,17 @@ impl ErrorCode {
 
 // ── Error Code Catalog ─────────────────────────────────
 
+/// Localisation file parse error.
+///
+/// F# emits this from `validateLocalisationSyntax` when `YAMLLocalisationParser`
+/// returns `Failure(msg, pos, _)`. The Rust parser is lenient (recovers
+/// line-by-line), so this fires at the recovery point for each malformed line.
+pub const CW001_PARSE_ERROR: ErrorCode = ErrorCode {
+    id: "CW001",
+    severity: ErrorSeverity::Error,
+    message_template: "Localisation file parse error: {}",
+};
+
 /// Mixed key/values and values block (missing equals sign).
 pub const CW002_MIXED_BLOCK: ErrorCode = ErrorCode {
     id: "CW002",

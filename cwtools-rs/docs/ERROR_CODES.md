@@ -27,6 +27,14 @@ Codes with no emission site in either engine were removed from both; see
 
 ---
 
+## CW001 -- Localisation parse error
+
+| ID | Severity | Message | Meaning | Status |
+|---|---|---|---|---|
+| CW001 | Error | Localisation file parse error: {} | A line in a `.yml` loc file could not be parsed (no `:` separator). The parser recovers and continues; one diagnostic per bad line. Mirrors F# `validateLocalisationSyntax` / `YAMLLocalisationParser` `Failure` path. | Emitted |
+
+---
+
 ## CW002 -- Core parser
 
 | ID | Severity | Message | Meaning | Status |
@@ -78,7 +86,7 @@ Codes with no emission site in either engine were removed from both; see
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | CW225 | Error | Localisation key "{}" references "{}" which doesn't exist in {} | A loc string's `$KEY$` reference points to a key that has no definition. | Emitted |
-| CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command]` references a scope/data command that isn't valid. | Defined, not wired (the loc-command path emits the more specific CW260/CW266) |
+| CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). Multi-segment chains like `[THIS.var]` are lenient (scripted variables not indexed). Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted |
 
 ### CW227-CW233 -- Section/component/mesh/entity (Stellaris-specific)
 
