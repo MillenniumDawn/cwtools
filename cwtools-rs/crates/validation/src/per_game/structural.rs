@@ -12,6 +12,7 @@
 
 use super::common::as_block;
 use crate::{ValidationError, error_codes};
+use cwtools_game::constants::Game;
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
 use cwtools_string_table::string_table::StringTable;
 
@@ -92,12 +93,14 @@ fn push(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk(
     children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
     file_path: &str,
     parent: BoolState,
+    cw223_msg: &str,
     errors: &mut Vec<ValidationError>,
 ) {
     for child in children {
@@ -105,14 +108,13 @@ fn walk(
             continue;
         };
 
-        // CW223 — NOT with more than one child.
+        // CW223 — NOT with more than one child. The remediation differs by game
+        // (HOI4 has no NOR/NAND triggers), so the message is chosen by the caller.
         if block.key_is(table, "NOT") && non_comment_count(block.children) > 1 {
             push(
                 errors,
                 &error_codes::CW223_INCORRECT_NOT_USAGE,
-                error_codes::CW223_INCORRECT_NOT_USAGE
-                    .message_template
-                    .to_string(),
+                cw223_msg.to_string(),
                 block.range,
                 file_path,
             );
@@ -164,7 +166,15 @@ fn walk(
             _ => BoolState::And,
         };
 
-        walk(block.children, ast, table, file_path, state, errors);
+        walk(
+            block.children,
+            ast,
+            table,
+            file_path,
+            state,
+            cw223_msg,
+            errors,
+        );
     }
 }
 
@@ -173,14 +183,21 @@ pub fn validate_structural(
     ast: &ParsedFile,
     table: &StringTable,
     file_path: &str,
+    game: Game,
     errors: &mut Vec<ValidationError>,
 ) {
+    // HOI4 has no NOR/NAND triggers, so the default CW223 advice is invalid there.
+    let cw223_msg = match game {
+        Game::Hoi4 => error_codes::CW223_INCORRECT_NOT_USAGE_HOI4_MSG,
+        _ => error_codes::CW223_INCORRECT_NOT_USAGE.message_template,
+    };
     walk(
         &ast.root_children,
         ast,
         table,
         file_path,
         BoolState::And,
+        cw223_msg,
         errors,
     );
 }

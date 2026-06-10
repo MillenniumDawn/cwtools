@@ -26,7 +26,7 @@ pub(crate) fn run_game_validators(ctx: &ValidationCtx, game: Game) -> Vec<Valida
     common::validate_common(ast, ruleset, table, file_path, &mut errors);
 
     // Cross-game structural hints (empty if, NOT misuse, redundant booleans).
-    structural::validate_structural(ast, table, file_path, &mut errors);
+    structural::validate_structural(ast, table, file_path, game, &mut errors);
 
     match game {
         Game::Stellaris => {
