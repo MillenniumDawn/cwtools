@@ -2,9 +2,7 @@ use crate::ast::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
 use std::str::Chars;
 
-#[allow(dead_code)]
 struct Parser<'a> {
-    input: &'a str,
     chars: Chars<'a>,
     line: u32,
     col: u16,
@@ -16,7 +14,6 @@ struct Parser<'a> {
 impl<'a> Parser<'a> {
     fn new(input: &'a str, table: &'a StringTable) -> Self {
         Self {
-            input,
             chars: input.chars(),
             line: 1,
             col: 0,
@@ -349,7 +346,7 @@ impl<'a> Parser<'a> {
             if after.is_none_or(|c| !c.is_alphanumeric()) {
                 let saved = self.pos();
                 let saved_chars = self.chars.clone();
-                if let Some(v) = self.parse_rgb() {
+                if let Some(v) = self.parse_color_clause() {
                     return Some(v);
                 }
                 self.chars = saved_chars;
@@ -372,7 +369,7 @@ impl<'a> Parser<'a> {
             if after.is_none_or(|c| !c.is_alphanumeric()) {
                 let saved = self.pos();
                 let saved_chars = self.chars.clone();
-                if let Some(v) = self.parse_hsv() {
+                if let Some(v) = self.parse_color_clause() {
                     return Some(v);
                 }
                 self.chars = saved_chars;
@@ -624,9 +621,10 @@ impl<'a> Parser<'a> {
         self.advance();
     }
 
-    fn parse_rgb(&mut self) -> Option<Value> {
-        // "rgb" is already peeked and matched in parse_value before this is called.
-        // Consume "rgb" or "RGB" and optional "360".
+    /// Parse a color clause after its keyword (`rgb`/`hsv`, already peeked and
+    /// matched in `parse_value`). Consumes the 3-char keyword, an optional `360`
+    /// suffix, an optional `=`, then the `{ ... }` clause.
+    fn parse_color_clause(&mut self) -> Option<Value> {
         for _ in 0..3 {
             self.advance();
         }
@@ -640,29 +638,7 @@ impl<'a> Parser<'a> {
                 self.skip_whitespace();
             }
         }
-        // Support `rgb = { ... }` by skipping optional '='
-        if self.peek() == Some('=') {
-            self.advance();
-            self.skip_whitespace();
-        }
-        self.parse_clause()
-    }
-
-    fn parse_hsv(&mut self) -> Option<Value> {
-        for _ in 0..3 {
-            self.advance();
-        }
-        self.skip_whitespace();
-        if self.peek() == Some('3') {
-            let (p3, _) = self.peek_n::<3>();
-            if p3 == ['3', '6', '0'] {
-                self.advance();
-                self.advance();
-                self.advance();
-                self.skip_whitespace();
-            }
-        }
-        // Support `hsv = { ... }` by skipping optional '='
+        // Support `rgb = { ... }` / `hsv = { ... }` by skipping optional '='.
         if self.peek() == Some('=') {
             self.advance();
             self.skip_whitespace();

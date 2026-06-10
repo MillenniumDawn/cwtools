@@ -14,8 +14,6 @@ pub fn validate_stellaris(
     errors: &mut Vec<ValidationError>,
 ) {
     for child in &ast.root_children {
-        // as_block normalizes the two keyed-clause shapes (live-parse Leaf+Clause
-        // and legacy-cache Node), so dispatch fires for both.
         let Some(block) = as_block(child, ast) else {
             continue;
         };
@@ -46,7 +44,7 @@ pub fn validate_stellaris(
 // (CW253). F# scopes these to classified effect blocks; this walk keys off the
 // node names instead, which only appear in effect script.
 
-/// Keys of a block's direct children (Node + Leaf), in order.
+/// Keys of a block's direct keyed children, in order.
 fn child_keys(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<String> {
     children
         .iter()
@@ -292,8 +290,6 @@ fn child_line(child: &Child, ast: &ParsedFile) -> u32 {
 }
 
 fn child_has_always_no(child: &Child, ast: &ParsedFile, table: &StringTable) -> bool {
-    // `trigger = { always = no }` is a Leaf+Clause from the live parser (a Node
-    // only from legacy cache shapes); as_block normalizes both.
     as_block(child, ast).is_some_and(|block| {
         block
             .children

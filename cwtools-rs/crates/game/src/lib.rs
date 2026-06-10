@@ -11,6 +11,6 @@ pub use docs_parser::{
     modifier_definitions_from_docs, parse_data_type_dump, parse_jomini_effects,
     parse_jomini_triggers, parse_legacy_docs, parse_modifier_log, parse_setup_log,
 };
-pub use scope::{Scope, ScopeContext, ScopeDef, ScopeResult};
+pub use scope::{Scope, ScopeDef};
 pub use scope_engine::{SCOPE_ANY, SCOPE_INVALID, ScopeId, ScopeLink};
 pub use scope_registry::{ScopeDefOwned, ScopeRegistry};

@@ -31,7 +31,6 @@ use rule_core::validate_with_type;
 use scope::build_scope_registry;
 
 /// Iterate grandchildren of a skip_root_key wrapper and validate each one uniformly.
-/// Both the Node-root and Leaf-root shapes delegate here so behaviour is identical.
 ///
 /// `skip_tail` is the remaining skip-stack after the level that led here was
 /// consumed.  When non-empty each grandchild that matches the next level is
@@ -53,7 +52,6 @@ fn validate_wrapper_grandchildren(
     let file_path = ctx.file_path;
     let ruleset = ctx.ruleset;
     for grandchild in grandchildren {
-        // Pull the grandchild's key, body, and position uniformly for Node and Leaf-clause.
         let (gc_key, gc_children, gc_pos): (String, &[Child], (u32, u16)) = match grandchild {
             Child::Leaf(gc_idx) => {
                 let gc_leaf = &ast.arena.leaves[*gc_idx as usize];

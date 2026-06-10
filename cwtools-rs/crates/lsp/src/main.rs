@@ -569,9 +569,9 @@ fn collect_enclosing_path(
             {
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
                 path.push(key);
-                if collect_enclosing_path(ch, arena, target, table, path) {
-                    return true;
-                }
+                // Descend (extending `path`) but stop at this branch regardless:
+                // the first enclosing clause that contains the cursor wins.
+                collect_enclosing_path(ch, arena, target, table, path);
                 return true;
             }
         }
@@ -616,9 +616,7 @@ fn rules_for_context<'a>(
         return None;
     }
 
-    // Find a TypeRule whose corresponding TypeDef covers logical_path and
-    // whose top-level key matches key_path[0].
-    let _top_key = &key_path[0];
+    // Find a TypeRule whose corresponding TypeDef covers logical_path.
     for root_rule in &ruleset.root_rules {
         let (type_name, (rule_type, _)) = match root_rule {
             RootRule::TypeRule(n, r) => (n, r),
@@ -3566,49 +3564,28 @@ fn scan_ast_for_type_ref(
         table,
     } = search;
 
+    // Only keyed leaves are classified; LeafValue type refs would need
+    // parent-context classification, which this shallow walk doesn't do.
     for child in children {
-        match child {
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                let val = match &leaf.value {
-                    Value::String(t) | Value::QString(t) => {
-                        table.get_string(t.normal).unwrap_or_default()
-                    }
-                    _ => String::new(),
-                };
-                if val == instance_name {
-                    // Check if this leaf's rule context is TypeField(type_name)
-                    if is_type_ref_leaf(ruleset, &key, type_name, logical_path) {
-                        out.push((
-                            file_uri.to_string(),
-                            cwtools_info::SourceLocation {
-                                line: leaf.pos.start.line,
-                                col: leaf.pos.start.col,
-                            },
-                        ));
-                    }
-                }
-                // Recurse into clause values
-                if let Value::Clause(ch) = &leaf.value {
-                    scan_ast_for_type_ref(ch, arena, search, out);
-                }
-            }
-            Child::LeafValue(idx) => {
-                let lv = &arena.leaf_values[*idx as usize];
-                let val = match &lv.value {
-                    cwtools_parser::ast::Value::String(t)
-                    | cwtools_parser::ast::Value::QString(t) => {
-                        table.get_string(t.normal).unwrap_or_default()
-                    }
-                    _ => String::new(),
-                };
-                if val == instance_name {
-                    // LeafValue type refs: classified via parent context — best effort skip for now.
-                    let _ = (type_name, logical_path, ruleset);
-                }
-            }
-            _ => {}
+        let Child::Leaf(idx) = child else { continue };
+        let leaf = &arena.leaves[*idx as usize];
+        let key = table.get_string(leaf.key.normal).unwrap_or_default();
+        let val = match &leaf.value {
+            Value::String(t) | Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if val == instance_name && is_type_ref_leaf(ruleset, &key, type_name, logical_path) {
+            out.push((
+                file_uri.to_string(),
+                cwtools_info::SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                },
+            ));
+        }
+        // Recurse into clause values
+        if let Value::Clause(ch) = &leaf.value {
+            scan_ast_for_type_ref(ch, arena, search, out);
         }
     }
 }

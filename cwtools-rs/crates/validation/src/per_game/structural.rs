@@ -9,9 +9,6 @@
 //! parser has no such classification, so the walk instead keys off the reserved
 //! logic keywords (`NOT`/`AND`/`OR`/`NOR`/`if`/`else_if`), which only appear in
 //! trigger/effect script — running it file-wide matches F# in practice.
-//!
-//! Note: this parser stores `key = { ... }` as a `Node` OR as a `Leaf` whose
-//! value is a `Clause`, so [`as_block`] normalises both.
 
 use super::common::as_block;
 use crate::{ValidationError, error_codes};

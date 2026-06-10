@@ -438,7 +438,7 @@ pub fn skip_root_key_matches(srk: &SkipRootKey, key: &str) -> bool {
 
 // ── type_key_filter helper ────────────────────────────────────────────────────
 
-pub fn type_key_filter_matches(td: &TypeDefinition, key: &str) -> bool {
+fn type_key_filter_matches(td: &TypeDefinition, key: &str) -> bool {
     match &td.type_key_filter {
         None => true,
         Some((keys, negate)) => {
@@ -537,7 +537,6 @@ fn collect_skip_root_child(
     }
 }
 
-/// Collect all type instances defined in `file` for the given `logical_path`.
 /// Hash one exported symbol's identity, with separators so distinct parts can't
 /// run together (`a|bc` vs `ab|c`).
 pub fn mix_export_symbol(parts: &[&str]) -> u64 {
@@ -564,9 +563,9 @@ pub fn hash_instance_exports(per_type: &HashMap<String, Vec<TypeInstance>>) -> u
     acc
 }
 
-///
-/// Returns a map from type name → list of instances found in this file.
-/// Collect type instances from AST nodes, applying skip_root_key navigation.
+/// Collect all type instances defined in `file` for the given `logical_path`,
+/// applying skip_root_key navigation. Returns a map from type name to the list
+/// of instances found in this file.
 #[tracing::instrument(skip_all)]
 pub fn collect_type_instances(
     ruleset: &RuleSet,
@@ -599,7 +598,7 @@ pub fn collect_type_instances(
                 location: SourceLocation { line: 1, col: 0 },
             });
         } else {
-            // Walk top-level children of the file (both Node and Leaf-with-Clause)
+            // Walk the file's top-level keyed clauses.
             for child in &file.root_children {
                 collect_skip_root_child(
                     td,
@@ -680,8 +679,6 @@ pub fn collect_defined_variables_from_rules(
                 }
                 if let RuleType::NodeRule { rules, .. } = rule_type {
                     // Scan each root instance's children against these rules.
-                    // Root instances are Leaf+Clause from the live parser (Node
-                    // only from legacy cache shapes); keyed_clause handles both.
                     for child in &file.root_children {
                         if let Some(kc) = file.arena.keyed_clause(child) {
                             scan_children_for_varset(
@@ -769,8 +766,7 @@ fn scan_children_for_varset(
     // it once so the var-defining leaf can record it.
     let sibling_value = sibling_value_in_children(children, arena, table);
     for child in children {
-        // A keyed clause (`key = { ... }`) is a Leaf+Clause from the live parser
-        // (a Node only from legacy cache shapes); both take the NodeRule path.
+        // A keyed clause (`key = { ... }`) takes the NodeRule path.
         if let Some(kc) = arena.keyed_clause(child) {
             let child_key = table.get_string(kc.key.normal).unwrap_or_default();
             for (rule_type, _) in rules {

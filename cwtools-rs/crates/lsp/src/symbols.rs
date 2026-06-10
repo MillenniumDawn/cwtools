@@ -38,9 +38,8 @@ impl SymbolIndex {
     }
 
     fn index_child(&mut self, uri: &str, child: &Child, arena: &Arena, table: &StringTable) {
-        // A keyed clause (`key = { ... }`) is a Leaf+Clause from the live parser
-        // (a Node only from legacy cache shapes); keyed_clause normalizes both so
-        // definitions are recorded and the subtree is walked for either shape.
+        // A keyed clause (`key = { ... }`) is a Leaf whose value is a Clause;
+        // record it as a definition and walk its subtree.
         if let Some(kc) = arena.keyed_clause(child) {
             let key = table.get_string(kc.key.normal).unwrap_or_default();
             // Heuristic: nodes keyed like plain identifiers are often definitions
@@ -112,11 +111,6 @@ impl SymbolIndex {
             && !key.starts_with("enums")
             && !key.starts_with("#")
             && !key.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub fn find_definitions(&self, name: &str) -> Option<&Vec<SymbolLocation>> {
-        self.definitions.get(name)
     }
 
     pub fn find_references(&self, name: &str) -> Option<&Vec<SymbolLocation>> {
@@ -193,9 +187,8 @@ mod tests {
         idx.clear_document("file:///never_seen.txt");
     }
 
-    /// The live parser stores `key = { ... }` as a Leaf with a Clause value (not
-    /// a Node), so definitions must be recorded — and the subtree walked — for
-    /// that shape too.
+    /// The parser stores `key = { ... }` as a Leaf with a Clause value, so
+    /// definitions must be recorded (and the subtree walked) for that shape.
     #[test]
     fn test_leaf_clause_definitions_indexed() {
         let table = StringTable::new();

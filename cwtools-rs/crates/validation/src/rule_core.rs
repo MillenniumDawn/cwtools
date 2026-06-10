@@ -249,7 +249,7 @@ fn validate_leaf_against_rule(
             leaf.pos.start.col,
             &[
                 key,
-                &get_scope_name(current, sc.registry.as_ref()),
+                &sc.registry.name_of(current),
                 &opts.required_scopes.join(" or "),
             ],
         ));
@@ -1257,9 +1257,7 @@ fn validate_alias_usage(
                     validate_leaf(ctx, leaf, rule_type, scope_context.as_ref(), &mut temp);
                 } else {
                     // Scalar-valued overload but the usage is a block — not a match.
-                    let (line, col) = leaf
-                        .map(|l| (l.pos.start.line, l.pos.start.col))
-                        .unwrap_or(fallback_pos);
+                    let (line, col) = fallback_pos;
                     temp.push(alias_mismatch_error(
                         file_path, category, "{...}", line, col,
                     ));

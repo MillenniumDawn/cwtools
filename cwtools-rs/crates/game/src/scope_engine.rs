@@ -1,5 +1,4 @@
 use crate::constants::Game;
-use crate::scope::Scope;
 use std::collections::HashMap;
 
 /// Opaque scope id — a thin newtype over the same u32 used by `Scope`.
@@ -7,29 +6,6 @@ use std::collections::HashMap;
 /// pulling the full `Scope` symbol, matching the original public API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScopeId(pub u32);
-
-impl ScopeId {
-    /// Wrap a raw u32.
-    pub const fn of(id: u32) -> Self {
-        ScopeId(id)
-    }
-    /// Convert to the canonical `Scope` type used in constants / scope-defs.
-    pub fn as_scope(self) -> Scope {
-        Scope(self.0)
-    }
-}
-
-impl From<Scope> for ScopeId {
-    fn from(s: Scope) -> Self {
-        ScopeId(s.0)
-    }
-}
-
-impl From<ScopeId> for Scope {
-    fn from(s: ScopeId) -> Self {
-        Scope(s.0)
-    }
-}
 
 /// ANY scope sentinel — matches any scope check.
 pub const SCOPE_ANY: ScopeId = ScopeId(0);
@@ -133,14 +109,6 @@ impl ScopeContext {
         )
     }
 
-    /// Create a context with an empty registry (no links; lenient).
-    pub fn new_generic(root: ScopeId) -> Self {
-        Self::from_registry(
-            std::sync::Arc::new(crate::scope_registry::ScopeRegistry::default()),
-            root,
-        )
-    }
-
     /// Create a context backed by a prebuilt (config-driven) registry.
     pub fn from_registry(
         registry: std::sync::Arc<crate::scope_registry::ScopeRegistry>,
@@ -174,16 +142,6 @@ impl ScopeContext {
         self.scopes.push(scope);
     }
 
-    /// Pop the most-recent scope.  Will not pop below the root entry.
-    pub fn pop_scope(&mut self) -> Option<ScopeId> {
-        if self.scopes.len() > 1 {
-            self.scopes.pop()
-        } else {
-            None
-        }
-    }
-
-    /// Return the PREV scope (one below current), or current if there is none.
     /// Apply N `prev` hops to a scope list, returning the resulting list.
     fn pop_n(scopes: &[ScopeId], n: usize) -> Vec<ScopeId> {
         let mut v = scopes.to_vec();
@@ -466,10 +424,7 @@ impl ScopeContext {
 
             // ANY scope always passes; also check config-driven subscope
             // relations (e.g. character is_subscope_of country) via the
-            // registry. The previous `s.as_scope().is_of_scope(current)` was
-            // backwards (it tested "is the required scope a subscope of
-            // current?" instead of "is current a subscope of required?") and
-            // used the hardcoded table instead of the registry.
+            // registry: "is current a subscope of the required scope?".
             let valid = current == SCOPE_ANY
                 || link.valid_scopes.is_empty()
                 || link

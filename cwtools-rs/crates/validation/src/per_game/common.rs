@@ -4,13 +4,10 @@ use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 use cwtools_string_table::string_table::{StringId, StringTable};
 use std::collections::HashMap;
 
-/// A `key = { ... }` block, normalised from either a `Node` or a
-/// `Leaf`-with-`Clause` (the parser stores either form depending on context).
-/// Centralises the `Value::Clause` normalisation every per-game structural
-/// walker needs — see `docs/ARCHITECTURE_BUGS.md` on the Leaf→Clause hazard
-/// (a walker that handles `Node.children` but forgets the leaf-clause case
-/// silently skips a subtree). The key is kept as a `StringId` so callers that
-/// only compare it avoid an owned `String`.
+/// A `key = { ... }` block (a `Leaf` whose value is a `Clause`), normalised so
+/// the per-game structural walkers share one `Value::Clause` extraction. The key
+/// is kept as a `StringId` so callers that only compare it avoid an owned
+/// `String`.
 pub(crate) struct Block<'a> {
     pub key: StringId,
     pub children: &'a [Child],

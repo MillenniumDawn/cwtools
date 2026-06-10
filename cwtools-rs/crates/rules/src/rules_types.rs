@@ -303,7 +303,6 @@ pub enum NewField {
     AliasField(String),
     SingleAliasField(String),
     // SingleAliasClauseField removed: never constructed by the converter.
-    SubtypeField(String, bool, Vec<NewRule>),
     VariableSetField(String),
     VariableGetField(String),
     VariableField {

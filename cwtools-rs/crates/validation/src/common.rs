@@ -1,8 +1,7 @@
 //! Shared leaf helpers and the [`ValidationError`] type used across the
 //! validation submodules.
 
-use cwtools_game::scope_engine::{ScopeContext, ScopeId};
-use cwtools_game::scope_registry::ScopeRegistry;
+use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
@@ -42,10 +41,6 @@ impl ValidationError {
             code: Some(code.id.to_string()),
         }
     }
-}
-
-pub(crate) fn get_scope_name(scope: ScopeId, registry: &ScopeRegistry) -> String {
-    registry.name_of(scope)
 }
 
 /// Number of significant decimal places in a numeric string; trailing zeros do

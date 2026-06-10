@@ -488,10 +488,7 @@ fn main() {
                     }
                 }
             });
-            let (cached_fingerprint, vanilla_cache_index) = match vanilla_cache_index {
-                Some((fp, idx)) => (Some(fp), Some(idx)),
-                None => (None, None),
-            };
+            let (cached_fingerprint, vanilla_cache_index) = vanilla_cache_index.unzip();
 
             // Build the whole engine pipeline through the shared driver: parse
             // rules, discover/parse mod files, build the type/var/vanilla indexes,
@@ -842,7 +839,7 @@ fn main() {
             let diags = validate_loc_project(&service, cwtools_localization::Game::Generic);
 
             // Surface parse failures too.
-            let parse_errors: Vec<(String, String)> = service.errors().to_vec();
+            let parse_errors = service.errors();
 
             let mut by_file: std::collections::BTreeMap<String, Vec<_>> =
                 std::collections::BTreeMap::new();
@@ -855,7 +852,7 @@ fn main() {
                     println!("    [line {}] {}: {}", d.line, d.code, d.message);
                 }
             }
-            for (p, e) in &parse_errors {
+            for (p, e) in parse_errors {
                 println!("\n  {} — PARSE ERROR: {}", p, e);
             }
 

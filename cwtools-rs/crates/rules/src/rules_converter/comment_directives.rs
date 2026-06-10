@@ -161,21 +161,7 @@ pub(crate) fn parse_replace_scopes_from_comments(comments: &[String]) -> Option<
     let rhs = find_directive(comments, "replace_scopes")
         .or_else(|| find_directive(comments, "replace_scope"))?;
 
-    // Reconstruct as "replace_scope = <rhs>" so the existing parser below still works.
-    let reconstructed = format!("replace_scope = {}", rhs);
-    let line = &reconstructed;
-
-    // Hand-parse key=value pairs from the comment text
-    // Strip leading # chars to get the content
-    let content = line.trim_start_matches('#').trim();
-
-    // Find replace_scope(s) = { ... } or replace_scope(s) = bare_value
-    let rs_start = content.find("replace_scope").unwrap_or(0);
-    let after_rs = &content[rs_start..];
-
-    let eq_idx = after_rs.find('=')?;
-    let rhs = after_rs[eq_idx + 1..].trim();
-
+    // `rhs` is either `{ key = value ... }` or a bare value. Parse the inner pairs.
     let pairs_str = if rhs.starts_with('{') {
         let close = rhs.find('}')?;
         &rhs[1..close]
