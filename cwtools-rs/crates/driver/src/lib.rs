@@ -295,11 +295,24 @@ impl Session {
     /// scoped to this session's loc languages. Resolves references against the full
     /// mod+vanilla union; the caller filters to mod-path files.
     pub fn loc_project_diagnostics(&self) -> Vec<LocDiagnostic> {
+        let extra = self.loc_extra_valid_refs();
         cwtools_localization::validate_loc_project_scoped(
             &self.loc_service,
             self.loc_game,
             self.loc_languages.as_deref(),
+            &extra,
         )
+    }
+
+    /// Names a loc `$ref$` may resolve to besides loc keys: the engine resolves
+    /// `$modifier$` and `$idea$` embeds against those registries. Lowercased to
+    /// match the loc union's case-insensitive lookup.
+    pub fn loc_extra_valid_refs(&self) -> HashSet<String> {
+        let mut extra = self.modifier_keys.clone();
+        for (_uri, inst) in self.type_index.instances("idea") {
+            extra.insert(inst.name.to_lowercase());
+        }
+        extra
     }
 
     /// The mod/workspace root this session was loaded for.

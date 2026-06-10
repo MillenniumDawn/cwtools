@@ -298,7 +298,10 @@ fn validate_jomini_chain(
                 return; // short-circuit
             }
             ScopeResult::NotFound | ScopeResult::VarNotFound(_) => {
-                if is_last && data.registry.is_some() && !looks_terminal && !had_lenient_intermediate
+                if is_last
+                    && data.registry.is_some()
+                    && !looks_terminal
+                    && !had_lenient_intermediate
                 {
                     // Registry present, chain resolved cleanly up to this point,
                     // final command is unknown: CW226 (mirrors F# `LocNotFound`).

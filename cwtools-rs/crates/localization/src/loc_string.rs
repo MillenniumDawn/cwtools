@@ -129,6 +129,14 @@ fn parse_ref(s: &str, start: usize) -> Option<(LocElement, usize)> {
 
     let key = &s[content_start..key_end];
 
+    // A literal `$` (e.g. a currency sign) followed by non-identifier text is
+    // not a ref. Loc keys, modifier names and idea names are all `[A-Za-z0-9_.]`,
+    // so reject anything else: `$[?var|-3]`, `$§Y[?VAR|0]§!`, `$5 today$`.
+    // The caller then treats the `$` as literal text.
+    if !is_loc_ref_key(key) {
+        return None;
+    }
+
     if bytes[key_end] == b'|' {
         // Skip colour suffix up to and including the closing '$'
         let after_pipe = key_end + 1;
@@ -141,6 +149,17 @@ fn parse_ref(s: &str, start: usize) -> Option<(LocElement, usize)> {
         // bytes[key_end] == b'$' — consume it
         Some((LocElement::Ref(key.to_string()), key_end + 1))
     }
+}
+
+/// Whether `key` is a plausible `$ref$` name: non-empty and made only of
+/// loc-key identifier characters (`[A-Za-z0-9_.]`). Loc keys, modifier names
+/// and idea names all fit this; literal-`$` constructs (currency, colour codes,
+/// `[?...]` brackets) do not.
+fn is_loc_ref_key(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
 }
 
 /// Parse a `[...]` block starting at `s[start]` where `s.as_bytes()[start] == b'['`.
@@ -404,5 +423,58 @@ mod tests {
         assert_eq!(elems[0], LocElement::Chars("Hello ".to_string()));
         assert_eq!(elems[1], LocElement::Ref("NAME".to_string()));
         assert_eq!(elems[2], LocElement::Chars(" world".to_string()));
+    }
+
+    fn refs(s: &str) -> Vec<String> {
+        parse_loc_elements(s)
+            .into_iter()
+            .filter_map(|e| match e {
+                LocElement::Ref(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_currency_dollar_before_bracket_is_literal() {
+        // `$[?var|-3]` — the `$` is a literal currency sign, the `[?..]` a command.
+        // Two adjacent constructs (as in MD loc) used to let the second `$` close
+        // the first, yielding a bogus Ref("[?...mandatory_funding").
+        let s = "$[?united_nations_esco_mandatory_funding|-3]\n$[?united_nations_esco_optional_funding|-3]";
+        assert!(
+            refs(s).is_empty(),
+            "no bogus ref: {:?}",
+            parse_loc_elements(s)
+        );
+        // The bracket still parses as a command.
+        assert!(parse_loc_elements(s).iter().any(|e| matches!(e, LocElement::Command(c) if c.starts_with("?united_nations_esco_mandatory"))));
+    }
+
+    #[test]
+    fn test_colour_code_prefix_not_a_ref() {
+        // `$§Y[?GDPVAR|0]§!` — colour-code + bracket after a literal `$`. Must not
+        // yield a Ref (the all-caps body would otherwise dodge the lowercase heuristic).
+        let s = "$§Y[?GDPVAR|0]§!$x$";
+        assert!(
+            !refs(s).iter().any(|r| r.contains('[') || r.contains('§')),
+            "no bogus ref with bracket/colour chars: {:?}",
+            refs(s)
+        );
+    }
+
+    #[test]
+    fn test_stray_currency_dollars_not_refs() {
+        assert!(refs("$5 and $10").is_empty(), "{:?}", refs("$5 and $10"));
+        assert!(refs("costs 100$ total").is_empty());
+    }
+
+    #[test]
+    fn test_legit_refs_still_parse() {
+        assert_eq!(refs("$MY_KEY$"), vec!["MY_KEY".to_string()]);
+        assert_eq!(refs("$MY_KEY|Y$"), vec!["MY_KEY".to_string()]);
+        assert_eq!(
+            refs("$military_industrial_organization_funds_gain$"),
+            vec!["military_industrial_organization_funds_gain".to_string()]
+        );
     }
 }

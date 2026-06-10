@@ -421,11 +421,19 @@ pub const CW121_EMPTY_IF: ErrorCode = ErrorCode {
 };
 
 /// A `NOT` block with more than one child. F# `IncorrectNotUsage`.
+///
+/// The default message suits games with `NOR`/`NAND` triggers (Stellaris, EU4).
+/// HOI4 has neither — use [`CW223_INCORRECT_NOT_USAGE_HOI4_MSG`] there.
 pub const CW223_INCORRECT_NOT_USAGE: ErrorCode = ErrorCode {
     id: "CW223",
     severity: ErrorSeverity::Information,
     message_template: "Do not use NOT with multiple children, replace this with either NOR or NAND to avoid ambiguity",
 };
+
+/// CW223 message for HOI4, where `NOR`/`NAND` are not valid triggers. `NOT` with
+/// multiple children is well-defined (logical NOR); the only ambiguity is for
+/// readers, so the fix is to make the intent explicit with `OR`/`AND`.
+pub const CW223_INCORRECT_NOT_USAGE_HOI4_MSG: &str = "NOT with multiple children acts as NOR (true only if every child is false). Make intent explicit: NOT = { OR = { ... } } for NOR, or NOT = { AND = { ... } } for NAND.";
 
 /// A boolean operator nested directly inside the same operator (`AND` in `AND`,
 /// `OR` in `OR`). F# `UnnecessaryBoolean`. Arg is the operator name.

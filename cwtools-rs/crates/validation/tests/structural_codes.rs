@@ -48,6 +48,43 @@ foo = {
 }
 
 #[test]
+fn cw223_message_is_game_specific() {
+    // HOI4 has no NOR/NAND triggers, so its message must not advise them.
+    let table = StringTable::new();
+    let parsed_cwt = parse_string("", &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let script = "foo = { NOT = { a = 1\n b = 2 } }";
+    let parsed = parse_string(script, &table).unwrap();
+
+    let msg = |game| {
+        validate_ast(
+            &parsed,
+            &ruleset,
+            &table,
+            "test.txt",
+            Some(game),
+            None,
+            None,
+        )
+        .into_iter()
+        .find(|e| e.code.as_deref() == Some("CW223"))
+        .map(|e| e.message)
+        .unwrap_or_default()
+    };
+
+    let hoi4 = msg(Game::Hoi4);
+    assert!(hoi4.contains("acts as NOR"), "hoi4 msg: {hoi4}");
+    assert!(
+        !hoi4.contains("NAND to avoid"),
+        "hoi4 must not keep old text: {hoi4}"
+    );
+
+    // Stellaris keeps the NOR/NAND wording (those are valid triggers there).
+    let stel = msg(Game::Stellaris);
+    assert!(stel.contains("NOR or NAND"), "stellaris msg: {stel}");
+}
+
+#[test]
 fn not_with_single_child_is_clean() {
     let c = codes(
         Game::Hoi4,
