@@ -102,7 +102,7 @@ jobs:
       - name: cargo build --release
         run: cargo build --workspace --release
       - name: Upload release binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cwtools-rs-release-linux
           path: |
