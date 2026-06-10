@@ -40,6 +40,19 @@ pub fn merge_ruleset(dst: &mut RuleSet, src: RuleSet) {
     dst.scope_links.extend(src.scope_links);
     dst.scope_inputs.extend(src.scope_inputs);
     dst.link_inputs.extend(src.link_inputs);
+    dst.folders.extend(src.folders);
+}
+
+/// Parse a `folders.cwt`: one folder name per line, `#` comments and blank
+/// lines skipped. Not Paradox-script syntax, so it bypasses the rules
+/// converter entirely.
+fn parse_folders_list(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect()
 }
 
 /// Walk `dir` for `*.cwt` files, parse each with `table`, convert via
@@ -56,6 +69,13 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<S
 
     for path in &cwt_files {
         match std::fs::read_to_string(path) {
+            Ok(content)
+                if path
+                    .file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("folders.cwt")) =>
+            {
+                combined.folders.extend(parse_folders_list(&content));
+            }
             Ok(content) => match parse_string(&content, table) {
                 Ok(parsed) => {
                     let ruleset = ast_to_ruleset_raw(&parsed, table);

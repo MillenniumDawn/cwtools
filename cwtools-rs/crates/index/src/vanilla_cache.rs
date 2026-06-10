@@ -134,6 +134,13 @@ pub fn ruleset_shape_hash(ruleset: &RuleSet) -> String {
         })
         .collect();
     parts.sort();
+    // The config's folders.cwt scopes which subdirectories get indexed, so a
+    // folder-list change must invalidate the cache like any type-shape change.
+    if !ruleset.folders.is_empty() {
+        let mut folders = ruleset.folders.clone();
+        folders.sort();
+        parts.push(format!("folders={}", folders.join(",")));
+    }
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for p in &parts {
         h = fnv1a(p.as_bytes(), h);

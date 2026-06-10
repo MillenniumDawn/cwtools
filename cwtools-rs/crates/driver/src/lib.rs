@@ -135,6 +135,7 @@ impl Session {
         // Discover + parse mod files using the SAME string table. Layer the
         // user-supplied ignore globs on top of the engine defaults.
         let mut fm_config = search_config_for(&directory);
+        apply_config_folders(&mut fm_config, &ruleset.folders);
         if !ignore_files.is_empty() {
             fm_config
                 .exclude_patterns
@@ -421,13 +422,29 @@ pub fn index_game_dir(
     table: &StringTable,
     var_effects: &HashSet<String>,
 ) -> TypeIndex {
-    let config = search_config_for(dir);
+    let mut config = search_config_for(dir);
+    apply_config_folders(&mut config, &ruleset.folders);
     let mut mgr = FileManager::with_string_table(config, table.clone());
     let files = match mgr.discover_and_parse() {
         Ok(f) => f,
         Err(_) => return TypeIndex::new(),
     };
     index_discovered_files(files, ruleset, table, Some(var_effects))
+}
+
+/// Override the engine's built-in folder list with the config's `folders.cwt`
+/// when the ruleset ships one and the target looks like a game/mod root (it
+/// contains at least one of the listed folders). This wins over the leaf-dir
+/// heuristic in `search_config_for`: a mod root with loose .txt files at the
+/// top level (Changelog.txt etc.) would otherwise be scanned whole-tree,
+/// pulling in non-script dirs the config never asks for.
+fn apply_config_folders(config: &mut FileManagerConfig, folders: &[String]) {
+    if folders.is_empty() {
+        return;
+    }
+    if folders.iter().any(|f| config.root.join(f).is_dir()) {
+        config.include_dirs = folders.to_vec();
+    }
 }
 
 /// Decide whether to search a directory directly (as a leaf directory containing

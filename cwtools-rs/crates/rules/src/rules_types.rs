@@ -26,6 +26,11 @@ pub struct RuleSet {
     /// Full link definitions from `links = { name = { ... } }` (links.cwt), with
     /// every field the scope engine needs (output/input scopes, prefix, from_data).
     pub link_inputs: Vec<LinkInput>,
+    /// Top-level script folder names from `folders.cwt` (one per line). Drives
+    /// which subdirectories of a mod/vanilla root are discovered; empty when the
+    /// config ships no folders.cwt (discovery then falls back to the engine's
+    /// built-in folder list).
+    pub folders: Vec<String>,
     /// Lookup index over `aliases`, built by `reindex()`. Maps a full alias name
     /// (`"cat:key"`) to the indices of every matching overload, so alias
     /// resolution is O(1) instead of a linear scan over all aliases per key.
@@ -81,6 +86,7 @@ impl RuleSet {
             scope_links: std::collections::HashSet::new(),
             scope_inputs: Vec::new(),
             link_inputs: Vec::new(),
+            folders: Vec::new(),
             alias_exact: std::collections::HashMap::new(),
             alias_categories: std::collections::HashMap::new(),
             type_by_name: std::collections::HashMap::new(),
