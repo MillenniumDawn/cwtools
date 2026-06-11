@@ -528,6 +528,30 @@ fn leaf_context(
     }
 }
 
+/// The alias category (`trigger`, `effect`, `modifier`, …) that `key` resolves
+/// through within `child_rules`, if any. Editor hovers use it as the header
+/// ("trigger" vs "effect") for a usage like `has_completed_focus`.
+pub fn alias_category_for_key(
+    ruleset: &RuleSet,
+    type_index: Option<&cwtools_index::TypeIndex>,
+    child_rules: &[(RuleType, Options)],
+    key: &str,
+) -> Option<String> {
+    let candidates =
+        matching_candidates(child_rules, key, ruleset, type_index, rule_matches_leaf_key);
+    candidates.iter().find_map(|(rt, _)| match rt {
+        RuleType::LeafRule {
+            left: NewField::AliasField(cat),
+            ..
+        }
+        | RuleType::NodeRule {
+            left: NewField::AliasField(cat),
+            ..
+        } => Some(cat.clone()),
+        _ => None,
+    })
+}
+
 /// The matched rules for `key` within a block whose rules are `child_rules`.
 /// Alias-keyed matches are expanded to their alias overloads (so
 /// `has_completed_focus` resolves through `alias[trigger:...]` to its

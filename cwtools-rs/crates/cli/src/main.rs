@@ -443,8 +443,7 @@ fn main() {
                     let rules_table = session.string_table();
                     let var_effects = cwtools_info::variable_defining_effects(ruleset);
                     let index = index_game_dir(vanilla_dir, ruleset, rules_table, &var_effects);
-                    let aux =
-                        cwtools_driver::build_vanilla_cache_aux(vanilla_dir, &index.var_index);
+                    let aux = cwtools_driver::build_vanilla_cache_aux(vanilla_dir, &index);
                     match vanilla_cache::save(&index, &game, &fp_live, cache_path, aux) {
                         Ok(n) => eprintln!("  Rebuilt vanilla cache with {} instances", n),
                         Err(e) => eprintln!(
@@ -724,7 +723,7 @@ fn main() {
             let index = index_game_dir(&vanilla, &ruleset, &rules_table, &var_effects);
             // Loc keys + file paths + variable names ride along so a cache hit
             // also skips the loc walk and file-index walk over the install.
-            let aux = cwtools_driver::build_vanilla_cache_aux(&vanilla, &index.var_index);
+            let aux = cwtools_driver::build_vanilla_cache_aux(&vanilla, &index);
             // Combined fingerprint = game version + ruleset shape, so a cache
             // built against one rules set is treated as stale by another (the
             // cached instances are extracted by the rules; a rules change can

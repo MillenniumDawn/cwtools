@@ -165,30 +165,45 @@ fn build_name_tree(
 ) -> ComplexEnumNameTree {
     let mut entries = Vec::new();
     for child in children {
-        if let Child::Leaf(lidx) = child {
-            let l = &ast.arena.leaves[*lidx as usize];
-            let k = table.get_string(l.key.normal).unwrap_or_default();
-            // Leaf with Clause value = nested node in CWT
-            if let Value::Clause(sub_ch) = &l.value {
-                let sub = build_name_tree(sub_ch, ast, table);
-                entries.push(ComplexEnumNameTreeEntry::Node {
-                    key: k,
-                    children: sub,
-                });
-            } else {
-                let v = leaf_value_string(l, table);
-                if v == "enum_name" || v == "this" {
-                    entries.push(ComplexEnumNameTreeEntry::Leaf {
+        match child {
+            Child::Leaf(lidx) => {
+                let l = &ast.arena.leaves[*lidx as usize];
+                let k = table.get_string(l.key.normal).unwrap_or_default();
+                // Leaf with Clause value = nested node in CWT
+                if let Value::Clause(sub_ch) = &l.value {
+                    let sub = build_name_tree(sub_ch, ast, table);
+                    entries.push(ComplexEnumNameTreeEntry::Node {
                         key: k,
-                        is_name: true,
+                        children: sub,
                     });
                 } else {
-                    entries.push(ComplexEnumNameTreeEntry::Leaf {
-                        key: k,
-                        is_name: false,
-                    });
+                    let v = leaf_value_string(l, table);
+                    if v == "enum_name" || v == "this" {
+                        entries.push(ComplexEnumNameTreeEntry::Leaf {
+                            key: k,
+                            is_name: true,
+                        });
+                    } else {
+                        entries.push(ComplexEnumNameTreeEntry::Leaf {
+                            key: k,
+                            is_name: false,
+                        });
+                    }
                 }
             }
+            // A bare `enum_name` value (`stats = { enum_name }`): every bare
+            // value at this level of the target file is an enum member.
+            Child::LeafValue(lvidx) => {
+                let lv = &ast.arena.leaf_values[*lvidx as usize];
+                if let Value::String(t) | Value::QString(t) = &lv.value
+                    && table
+                        .with_string(t.normal, |s| s == "enum_name" || s == "this")
+                        .unwrap_or(false)
+                {
+                    entries.push(ComplexEnumNameTreeEntry::BareName);
+                }
+            }
+            _ => {}
         }
     }
     ComplexEnumNameTree::Entries(entries)

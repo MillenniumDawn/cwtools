@@ -456,13 +456,13 @@ fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<Val
 }
 
 /// Walk a vanilla install for the cache's aux payload: per-language loc keys
-/// and the file-path set (CW113), plus the variable names from an
-/// already-built vanilla index. Shared by the CLI `cache-vanilla` command, the
-/// CLI stale-rebuild path, and the LSP's cache writer so every cache carries
-/// the full payload.
+/// and the file-path set (CW113), plus the variable names and dynamic values
+/// (complex-enum + value_set members) from an already-built vanilla index.
+/// Shared by the CLI `cache-vanilla` command, the CLI stale-rebuild path, and
+/// the LSP's cache writer so every cache carries the full payload.
 pub fn build_vanilla_cache_aux(
     vanilla_dir: &Path,
-    var_index: &cwtools_index::VarIndex,
+    index: &TypeIndex,
 ) -> cwtools_index::vanilla_cache::VanillaCacheAux {
     let loc_service = LocService::from_folders(&[vanilla_dir]);
     let loc_keys = cwtools_localization::loc_index::per_language_keys(&loc_service);
@@ -471,7 +471,9 @@ pub fn build_vanilla_cache_aux(
     cwtools_index::vanilla_cache::VanillaCacheAux {
         loc_keys,
         file_paths: file_index.paths().cloned().collect(),
-        var_names: var_index.names().cloned().collect(),
+        var_names: index.var_index.names().cloned().collect(),
+        complex_enum_values: index.complex_enum_values.export(),
+        value_set_values: index.value_set_values.export(),
     }
 }
 

@@ -65,7 +65,7 @@ fn index_vanilla_dir(
 ) {
     let var_effects = cwtools_info::variable_defining_effects(ruleset);
     let index = cwtools_driver::index_game_dir(dir, ruleset, table, &var_effects);
-    let aux = cwtools_driver::build_vanilla_cache_aux(dir, &index.var_index);
+    let aux = cwtools_driver::build_vanilla_cache_aux(dir, &index);
     let per_type = index
         .map
         .into_iter()
@@ -323,7 +323,8 @@ impl Backend {
 
     /// Resolve the leaf under the cursor with the position resolver and
     /// classify it: the AST element, a [`ReferenceHint`] derived from the
-    /// matched rule's right-hand side, and the matched rule's description +
+    /// matched rule's right-hand side, the alias category the key resolves
+    /// through (trigger/effect/…), and the matched rule's description +
     /// required scopes (for hover).
     ///
     /// Shared by hover, goto_definition, references, prepare_rename, and
@@ -334,7 +335,7 @@ impl Backend {
         uri: &str,
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
-    ) -> Option<(PositionElement, ReferenceHint, Option<String>, Vec<String>)> {
+    ) -> Option<RuleCursorInfo> {
         let language = self.state.language.lock().clone();
         // Lock order: documents -> ruleset -> scope_registry -> info_service
         // -> modifier_keys (field-declaration order, see DocumentState).
@@ -392,7 +393,23 @@ impl Backend {
                 hint = hint_from_rule_right(rule_type, &leaf.value);
             }
         }
-        Some((element, hint, description, scopes))
+        let category = if leaf.key.is_empty() {
+            None
+        } else {
+            cwtools_validation::position::alias_category_for_key(
+                rs,
+                Some(&info_guard.type_index),
+                &rctx.child_rules,
+                &leaf.key,
+            )
+        };
+        Some(RuleCursorInfo {
+            element,
+            hint,
+            category,
+            description,
+            required_scopes: scopes,
+        })
     }
 
     /// Look up the TypeRef (type_name, instance_name) under the cursor.
@@ -406,9 +423,10 @@ impl Backend {
         logical_path: &str,
     ) -> Option<(String, String)> {
         match self.rule_info_at_cursor(uri, pos, logical_path) {
-            Some((_, ReferenceHint::TypeRef { type_name, value }, _, _)) => {
-                Some((type_name, value))
-            }
+            Some(RuleCursorInfo {
+                hint: ReferenceHint::TypeRef { type_name, value },
+                ..
+            }) => Some((type_name, value)),
             _ => None,
         }
     }
@@ -422,10 +440,25 @@ impl Backend {
         logical_path: &str,
     ) -> Option<String> {
         match self.rule_info_at_cursor(uri, pos, logical_path) {
-            Some((_, ReferenceHint::Variable { name, .. }, _, _)) => Some(name),
+            Some(RuleCursorInfo {
+                hint: ReferenceHint::Variable { name, .. },
+                ..
+            }) => Some(name),
             _ => None,
         }
     }
+}
+
+/// What `rule_info_at_cursor` resolves for the leaf under the cursor.
+struct RuleCursorInfo {
+    element: PositionElement,
+    hint: ReferenceHint,
+    /// Alias category the key resolves through (`trigger`, `effect`, …), for
+    /// the hover header.
+    category: Option<String>,
+    /// The matched rule's `###` description.
+    description: Option<String>,
+    required_scopes: Vec<String>,
 }
 
 /// Map a matched leaf rule's right-hand field to a [`ReferenceHint`] for the
@@ -550,14 +583,28 @@ fn logical_path_from_uri(uri: &str, workspace_uri: &Option<String>) -> String {
 }
 
 /// Build a Markdown hover string from the classified element + the matched
-/// rule's description and required scopes (from `rule_info_at_cursor`).
+/// rule's category, description, and required scopes (from
+/// `rule_info_at_cursor`).
 fn build_hover_markdown(
     element: &PositionElement,
     hint: &ReferenceHint,
+    category: Option<&str>,
     rule_desc: Option<&str>,
     rule_scopes: &[String],
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
+
+    // Header: which alias category the key resolves through, so a trigger
+    // reads as a trigger and an effect as an effect at a glance.
+    if let (Some(cat), PositionElement::Leaf { key, .. }) = (category, element) {
+        let label = match cat {
+            "trigger" => "Trigger",
+            "effect" => "Effect",
+            "modifier" => "Modifier",
+            other => other,
+        };
+        parts.push(format!("**{}** `{}`", label, key));
+    }
 
     // Primary classification
     match hint {
@@ -749,11 +796,74 @@ fn completions_from_rules(
                     ..Default::default()
                 });
             }
+            // An enum-keyed field: every member of the enum is a valid key here
+            // (e.g. MIO `equipment_bonus = { enum[equipment_stat] = variable_field }`).
+            RuleType::LeafRule {
+                left: NewField::ValueField(ValueType::Enum(e)),
+                right,
+            } => {
+                let snippet_value = match right {
+                    NewField::ValueField(ValueType::Bool) => "${1|yes,no|}".to_string(),
+                    _ => "${1}".to_string(),
+                };
+                for v in all_enum_values(ruleset, info, e) {
+                    items.push(CompletionItem {
+                        label: v.clone(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: Some(format!("enum {}", e)),
+                        insert_text: Some(format!("{} = {}", v, snippet_value)),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
+            }
+            RuleType::NodeRule {
+                left: NewField::ValueField(ValueType::Enum(e)),
+                ..
+            } => {
+                for v in all_enum_values(ruleset, info, e) {
+                    items.push(CompletionItem {
+                        label: v.clone(),
+                        kind: Some(CompletionItemKind::STRUCT),
+                        detail: Some(format!("enum {}", e)),
+                        insert_text: Some(format!("{} = {{\n\t$0\n}}", v)),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
+            }
+            // A typed key: every instance of the type is a valid key here
+            // (e.g. `equipment_type = { <equipment_group> }` blocks, or
+            // `<equipment> = { ... }` entries).
+            RuleType::LeafRule {
+                left: NewField::TypeField(TypeType::Simple(t)),
+                right: NewField::AliasField(_) | NewField::ValueField(_) | NewField::ScalarField,
+            }
+            | RuleType::NodeRule {
+                left: NewField::TypeField(TypeType::Simple(t)),
+                ..
+            } => {
+                let is_node = matches!(rule_type, RuleType::NodeRule { .. });
+                for (_, inst) in info.type_index.instances(t) {
+                    items.push(CompletionItem {
+                        label: inst.name.clone(),
+                        kind: Some(CompletionItemKind::STRUCT),
+                        detail: Some(format!("{} instance", t)),
+                        insert_text: Some(if is_node {
+                            format!("{} = {{\n\t$0\n}}", inst.name)
+                        } else {
+                            format!("{} = ${{1}}", inst.name)
+                        }),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
+            }
             // An enum value at the leaf level
             RuleType::LeafValueRule {
                 right: NewField::ValueField(ValueType::Enum(e)),
             } => {
-                for v in enum_values_for(ruleset, e) {
+                for v in all_enum_values(ruleset, info, e) {
                     items.push(CompletionItem {
                         label: v,
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
@@ -791,16 +901,36 @@ fn completions_from_rules(
                 left: NewField::AliasField(cat),
                 ..
             } => {
-                // Emit the keys of all alias:<cat> entries
-                for (alias_name, _) in &ruleset.aliases {
-                    if let Some(k) = alias_name.strip_prefix(&format!("{}:", cat)) {
-                        items.push(CompletionItem {
-                            label: k.to_string(),
-                            kind: Some(CompletionItemKind::KEYWORD),
-                            detail: Some(format!("alias {}", cat)),
-                            ..Default::default()
-                        });
+                // Emit the keys of all alias:<cat> entries, labelled with the
+                // category (trigger/effect/…) and carrying the alias's ###
+                // docs. Overloads collapse onto one item (first description wins).
+                let prefix = format!("{}:", cat);
+                let mut seen: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for (alias_name, (_, opts)) in &ruleset.aliases {
+                    let Some(k) = alias_name.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    if k == "scope_field" {
+                        continue;
                     }
+                    if let Some(&idx) = seen.get(k) {
+                        let item: &mut CompletionItem = &mut items[idx];
+                        if item.documentation.is_none()
+                            && let Some(d) = &opts.description
+                        {
+                            item.documentation = Some(Documentation::String(d.clone()));
+                        }
+                        continue;
+                    }
+                    seen.insert(k, items.len());
+                    items.push(CompletionItem {
+                        label: k.to_string(),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        detail: Some(cat.to_string()),
+                        documentation: opts.description.clone().map(Documentation::String),
+                        ..Default::default()
+                    });
                 }
                 // The `modifier` category has no alias entries — modifiers live
                 // in the expanded modifier-key set (modifiers.cwt + templated
@@ -859,6 +989,27 @@ fn enum_values_for(ruleset: &RuleSet, enum_name: &str) -> Vec<String> {
         return ruleset.enums[idx].values.clone();
     }
     Vec::new()
+}
+
+/// Enum members from the static definition AND the collected complex-enum
+/// values (equipment_stat, country_tags, idea_name, … extracted from game
+/// files). The completion-item paths use this; snippet placeholders stick to
+/// the static list (dynamic enums are too large for inline choices).
+fn all_enum_values(
+    ruleset: &RuleSet,
+    info: &cwtools_info::InfoService,
+    enum_name: &str,
+) -> Vec<String> {
+    let mut vals = enum_values_for(ruleset, enum_name);
+    vals.extend(
+        info.type_index
+            .complex_enum_values
+            .values(enum_name)
+            .cloned(),
+    );
+    vals.sort_unstable();
+    vals.dedup();
+    vals
 }
 
 /// Completion items for a leaf VALUE position: enumerate what the matched
@@ -920,7 +1071,7 @@ fn value_completions(
                 }
             }
             NewField::ValueField(ValueType::Enum(e)) => {
-                for v in enum_values_for(ruleset, e) {
+                for v in all_enum_values(ruleset, info, e) {
                     push(
                         v,
                         CompletionItemKind::ENUM_MEMBER,
@@ -969,7 +1120,14 @@ fn value_completions(
                 let source: Vec<String> = match ns.as_str() {
                     "event_target" => info.all_event_targets.iter().cloned().collect(),
                     "variable" => info.all_variables.iter().cloned().collect(),
-                    other => ruleset.values.get(other).cloned().unwrap_or_default(),
+                    // Flags/tokens/…: config-declared values plus the members
+                    // collected from mod+vanilla effects (set_country_flag etc.).
+                    other => {
+                        let mut vals: Vec<String> =
+                            ruleset.values.get(other).cloned().unwrap_or_default();
+                        vals.extend(info.type_index.value_set_values.values(other).cloned());
+                        vals
+                    }
                 };
                 for v in source {
                     push(
@@ -1272,6 +1430,10 @@ impl LanguageServer for Backend {
                         if !data.loc_keys.is_empty() {
                             *self.state.vanilla_loc_keys.lock() = Some(data.loc_keys);
                         }
+                        self.merge_vanilla_dynamic_values(
+                            data.complex_enum_values,
+                            data.value_set_values,
+                        );
                         self.client
                             .log_message(
                                 MessageType::INFO,
@@ -1419,7 +1581,12 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["getFileTypes".to_string(), "exportProfilingLog".to_string()],
+                    commands: vec![
+                        "getFileTypes".to_string(),
+                        "exportProfilingLog".to_string(),
+                        "cacheVanilla".to_string(),
+                        "clearAllCaches".to_string(),
+                    ],
                     work_done_progress_options: Default::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
@@ -1613,10 +1780,21 @@ impl LanguageServer for Backend {
             let ws_uri = self.state.workspace_uri.lock().clone();
             let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-            if let Some((element, hint, desc, scopes)) =
-                self.rule_info_at_cursor(&uri, pos, &logical_path)
+            if let Some(RuleCursorInfo {
+                element,
+                hint,
+                category,
+                description: desc,
+                required_scopes: scopes,
+            }) = self.rule_info_at_cursor(&uri, pos, &logical_path)
             {
-                let mut md = build_hover_markdown(&element, &hint, desc.as_deref(), &scopes);
+                let mut md = build_hover_markdown(
+                    &element,
+                    &hint,
+                    category.as_deref(),
+                    desc.as_deref(),
+                    &scopes,
+                );
                 // For a variable read, append the known assigned value(s) so the
                 // user sees what it resolves to without chasing the definition.
                 if let ReferenceHint::Variable { name, .. } = &hint {
@@ -2413,6 +2591,45 @@ impl LanguageServer for Backend {
             "exportProfilingLog" => Ok(Some(Value::String(
                 cwtools_profiling::export_profiling_log(),
             ))),
+            // Re-index the base-game install and re-write the vanilla cache,
+            // even when a fresh-looking cache exists.
+            "cacheVanilla" => {
+                self.state.vanilla_merged.store(false, Ordering::SeqCst);
+                *self.state.vanilla_index.lock() = None;
+                *self.state.vanilla_loc_keys.lock() = None;
+                self.ensure_vanilla_index(true).await;
+                self.merge_pending_vanilla_index();
+                self.rebuild_modifier_keys();
+                Ok(Some(Value::String("Vanilla cache rebuilt.".to_string())))
+            }
+            // Purge every on-disk cache (parse cache + vanilla caches), drop the
+            // in-memory vanilla state, and re-scan the workspace from scratch.
+            "clearAllCaches" => {
+                let dir = self
+                    .state
+                    .cache_dir
+                    .lock()
+                    .clone()
+                    .or_else(default_cache_dir);
+                if let Some(dir) = &dir {
+                    let _ = std::fs::remove_dir_all(dir.join("parse-cache"));
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for e in entries.flatten() {
+                            let name = e.file_name();
+                            if name.to_string_lossy().starts_with("vanilla-") {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
+                self.state.vanilla_merged.store(false, Ordering::SeqCst);
+                *self.state.vanilla_index.lock() = None;
+                *self.state.vanilla_loc_keys.lock() = None;
+                self.validate_entire_workspace().await;
+                Ok(Some(Value::String(
+                    "Caches cleared; workspace re-indexed.".to_string(),
+                )))
+            }
             _ => Ok(None),
         }
     }
@@ -2420,6 +2637,54 @@ impl LanguageServer for Backend {
 
 impl Backend {
     // ── Custom notification helpers ───────────────────────────────────────────
+
+    /// Merge vanilla dynamic values (complex-enum + value_set members, from the
+    /// vanilla cache or a live index) into the workspace type index so
+    /// completion offers them. Keyed under one synthetic file so a re-merge
+    /// replaces the previous contribution.
+    fn merge_vanilla_dynamic_values(
+        &self,
+        complex_enums: Vec<(String, Vec<String>)>,
+        value_sets: Vec<(String, Vec<String>)>,
+    ) {
+        if complex_enums.is_empty() && value_sets.is_empty() {
+            return;
+        }
+        let mut info = self.state.info_service.write();
+        // NOT "<vanilla-cache>": the workspace scan's instance merge calls
+        // remove_file("<vanilla-cache>") before re-merging, which would wipe
+        // these as a side effect.
+        info.type_index
+            .complex_enum_values
+            .merge_file("<vanilla-dynamic>", complex_enums.into_iter().collect());
+        info.type_index
+            .value_set_values
+            .merge_file("<vanilla-dynamic>", value_sets.into_iter().collect());
+    }
+
+    /// Merge a pending `vanilla_index` (from the cache or a live index) into
+    /// the workspace type index. After the merge the raw per-type data is
+    /// dropped from `vanilla_index` to eliminate double residency (the
+    /// type_index already owns the instances). `vanilla_merged` prevents
+    /// `ensure_vanilla_index` re-running on subsequent workspace scans.
+    fn merge_pending_vanilla_index(&self) {
+        let per_type = self.state.vanilla_index.lock().take();
+        if let Some(per_type) = per_type {
+            let mut info_guard = self.state.info_service.write();
+            info_guard.type_index.remove_file("<vanilla-cache>");
+            info_guard.type_index.merge("<vanilla-cache>", per_type);
+            // Vanilla data is loaded, so the index now holds every base-game
+            // instance. Mark it complete so the CW500/CW222 type-reference
+            // checks fire (they're gated on `complete` to avoid false
+            // positives during mod-only validation). The driver's Session
+            // sets this for the CLI path; the LSP merges vanilla directly and
+            // must set it here too. See rule_core.rs gate on `idx.complete`.
+            info_guard.type_index.complete = true;
+            // `vanilla_index` is now None — mark it merged so
+            // ensure_vanilla_index does not re-run on the next scan.
+            self.state.vanilla_merged.store(true, Ordering::SeqCst);
+        }
+    }
 
     /// Send the `loadingBar` server→client notification so the VS Code extension
     /// status bar reflects background indexing/validation work.
@@ -2622,31 +2887,11 @@ impl Backend {
 
         // Build the base-game index from a `vanilla` dir (or auto-discovery) if
         // we have one and haven't indexed it yet. Populates `vanilla_index`.
-        self.ensure_vanilla_index().await;
+        self.ensure_vanilla_index(false).await;
 
         // Merge the pre-generated vanilla index (if loaded) so base-game
-        // references resolve. After the merge the raw per-type data is dropped
-        // from `vanilla_index` to eliminate double residency (the type_index
-        // already owns the instances). `vanilla_merged` prevents re-running on
-        // subsequent workspace scans.
-        {
-            let per_type = self.state.vanilla_index.lock().take();
-            if let Some(per_type) = per_type {
-                let mut info_guard = self.state.info_service.write();
-                info_guard.type_index.remove_file("<vanilla-cache>");
-                info_guard.type_index.merge("<vanilla-cache>", per_type);
-                // Vanilla data is loaded, so the index now holds every base-game
-                // instance. Mark it complete so the CW500/CW222 type-reference
-                // checks fire (they're gated on `complete` to avoid false
-                // positives during mod-only validation). The driver's Session
-                // sets this for the CLI path; the LSP merges vanilla directly and
-                // must set it here too. See rule_core.rs gate on `idx.complete`.
-                info_guard.type_index.complete = true;
-                // `vanilla_index` is now None — mark it merged so
-                // ensure_vanilla_index does not re-run on the next scan.
-                self.state.vanilla_merged.store(true, Ordering::SeqCst);
-            }
-        }
+        // references resolve.
+        self.merge_pending_vanilla_index();
 
         // Rebuild the cached modifier-key set now that the type index is
         // complete (templated modifiers like production_speed_<building>_factor
@@ -3434,10 +3679,15 @@ impl Backend {
     /// the dir from the `vanilla` init option, falling back to auto-discovery by
     /// game. No-op if already indexed (or already merged into the type_index),
     /// if no dir is found, or if the ruleset isn't loaded yet.
-    async fn ensure_vanilla_index(&self) {
+    ///
+    /// `force_rebuild` skips the cache-load fast path (and the already-indexed
+    /// check) so the install is re-indexed and the cache re-written — the
+    /// `cacheVanilla` command.
+    async fn ensure_vanilla_index(&self, force_rebuild: bool) {
         // Already populated (or already merged into type_index and dropped)? Done.
-        if self.state.vanilla_index.lock().is_some()
-            || self.state.vanilla_merged.load(Ordering::SeqCst)
+        if !force_rebuild
+            && (self.state.vanilla_index.lock().is_some()
+                || self.state.vanilla_merged.load(Ordering::SeqCst))
         {
             return;
         }
@@ -3483,7 +3733,8 @@ impl Backend {
         let cache_path = self.vanilla_cache_path(&game, &fingerprint);
 
         // Try a fresh cache first — skip parsing the whole base game entirely.
-        if let Some(cp) = &cache_path
+        if !force_rebuild
+            && let Some(cp) = &cache_path
             && cp.exists()
         {
             match cwtools_info::vanilla_cache::load(cp) {
@@ -3495,6 +3746,10 @@ impl Backend {
                     if !data.loc_keys.is_empty() {
                         *self.state.vanilla_loc_keys.lock() = Some(data.loc_keys);
                     }
+                    self.merge_vanilla_dynamic_values(
+                        data.complex_enum_values,
+                        data.value_set_values,
+                    );
                     self.client
                         .log_message(
                             MessageType::INFO,
@@ -3572,10 +3827,15 @@ impl Backend {
 
         let total: usize = per_type.values().map(|v| v.len()).sum();
 
-        // The freshly-extracted loc keys feed this session's loc rebuild too.
+        // The freshly-extracted loc keys and dynamic values feed this session
+        // directly too (not just the persisted cache).
         if !aux.loc_keys.is_empty() {
             *self.state.vanilla_loc_keys.lock() = Some(aux.loc_keys.clone());
         }
+        self.merge_vanilla_dynamic_values(
+            aux.complex_enum_values.clone(),
+            aux.value_set_values.clone(),
+        );
 
         // Persist for next startup so the base game isn't re-parsed every time.
         if let Some(cp) = &cache_path {
@@ -3641,7 +3901,7 @@ impl Backend {
                 })
                 .collect()
         };
-        Some(base.join(format!("vanilla-{}-{}.json", safe(game), safe(fingerprint))))
+        Some(base.join(format!("vanilla-{}-{}.cwv", safe(game), safe(fingerprint))))
     }
 
     async fn determine_file_types(&self, uri: &str) -> Vec<String> {
@@ -4094,6 +4354,7 @@ mod tests {
                 value: "my_ethos".to_string(),
             },
             None,
+            None,
             &[],
         );
         assert!(md.contains("Type reference"), "got: {}", md);
@@ -4113,6 +4374,7 @@ mod tests {
                 value: "alpha".to_string(),
             },
             None,
+            None,
             &[],
         );
         assert!(md.contains("Enum value"), "got: {}", md);
@@ -4128,6 +4390,7 @@ mod tests {
                 value: "bar".to_string(),
             },
             &ReferenceHint::Unknown,
+            None,
             None,
             &[],
         );
@@ -4145,6 +4408,7 @@ mod tests {
                 enum_name: "my_enum".to_string(),
                 value: "alpha".to_string(),
             },
+            None,
             Some("The kind of this thing"),
             &["country".to_string()],
         );

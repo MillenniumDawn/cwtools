@@ -249,6 +249,21 @@ impl InfoService {
             Self::index_child_heuristic(child, &ast.arena, table, type_names, &mut info);
         }
 
+        // ── Dynamic value collection (completion-only) ────────────────────────
+        self.type_index.complex_enum_values.merge_file(
+            uri,
+            cwtools_index::dynamic_values::collect_complex_enum_values(
+                ruleset,
+                ast,
+                logical_path,
+                table,
+            ),
+        );
+        self.type_index.value_set_values.merge_file(
+            uri,
+            cwtools_index::dynamic_values::collect_value_set_members(ruleset, ast, table),
+        );
+
         // ── Rule-driven: type-instance index ─────────────────────────────────
         // Move the instances straight into the cross-file index. We don't keep a
         // second per-file copy on `FileInfo` (that doubled ~190K instances on

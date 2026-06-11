@@ -35,7 +35,8 @@ const MAGIC: &[u8; 4] = b"CWV\x00";
 // v4 switches the on-disk format from JSON to magic+version-framed zstd(rkyv)
 // and adds loc keys, file paths, and variable names. Older JSON files fail the
 // magic check and are treated as a cache miss (rebuilt).
-const CACHE_VERSION: u8 = 4;
+// v5 adds complex-enum members and value_set members (completion data).
+const CACHE_VERSION: u8 = 5;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CachedInstance {
@@ -65,6 +66,10 @@ struct VanillaCacheFile {
     file_paths: Vec<String>,
     /// Script-variable names defined in vanilla (`VarIndex` form).
     var_names: Vec<String>,
+    /// Complex-enum members extracted from vanilla files (enum name -> values).
+    complex_enum_values: Vec<(String, Vec<String>)>,
+    /// `value_set[...]` members written by vanilla files (namespace -> values).
+    value_set_values: Vec<(String, Vec<String>)>,
 }
 
 /// The non-instance half of the cache payload. Built by whoever walks the
@@ -78,6 +83,10 @@ pub struct VanillaCacheAux {
     pub file_paths: Vec<String>,
     /// script-variable names
     pub var_names: Vec<String>,
+    /// complex-enum members (enum name -> values)
+    pub complex_enum_values: Vec<(String, Vec<String>)>,
+    /// `value_set[...]` members (namespace -> values)
+    pub value_set_values: Vec<(String, Vec<String>)>,
 }
 
 /// Everything a loaded cache provides, ready to merge into a session.
@@ -90,6 +99,10 @@ pub struct VanillaCacheData {
     pub file_paths: Vec<String>,
     /// script-variable names
     pub var_names: Vec<String>,
+    /// complex-enum members (enum name -> values)
+    pub complex_enum_values: Vec<(String, Vec<String>)>,
+    /// `value_set[...]` members (namespace -> values)
+    pub value_set_values: Vec<(String, Vec<String>)>,
 }
 
 /// A stable fingerprint of a base-game install, used to invalidate the cache
@@ -218,6 +231,8 @@ fn write_cache(
         loc_keys: aux.loc_keys,
         file_paths: aux.file_paths,
         var_names: aux.var_names,
+        complex_enum_values: aux.complex_enum_values,
+        value_set_values: aux.value_set_values,
     };
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache).map_err(std::io::Error::other)?;
     let compressed = zstd::encode_all(&bytes[..], ZSTD_LEVEL)?;
@@ -320,6 +335,8 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
             loc_keys: cache.loc_keys,
             file_paths: cache.file_paths,
             var_names: cache.var_names,
+            complex_enum_values: cache.complex_enum_values,
+            value_set_values: cache.value_set_values,
         },
     ))
 }
@@ -353,6 +370,8 @@ mod tests {
             loc_keys: vec![("english".into(), vec!["key_a".into(), "key_b".into()])],
             file_paths: vec!["gfx/interface/icon.dds".into()],
             var_names: vec!["my_var".into()],
+            complex_enum_values: vec![("equipment_stat".into(), vec!["build_cost_ic".into()])],
+            value_set_values: vec![("country_flag".into(), vec!["my_flag".into()])],
         };
         assert_eq!(save(&idx, "hoi4", "v1.16.4", &path, aux).unwrap(), 2);
 
@@ -364,6 +383,8 @@ mod tests {
         assert_eq!(loaded.loc_keys[0].0, "english");
         assert_eq!(loaded.file_paths, vec!["gfx/interface/icon.dds"]);
         assert_eq!(loaded.var_names, vec!["my_var"]);
+        assert_eq!(loaded.complex_enum_values[0].0, "equipment_stat");
+        assert_eq!(loaded.value_set_values[0].0, "country_flag");
 
         let mut idx2 = TypeIndex::new();
         idx2.merge("<vanilla-cache>", loaded.per_type);
