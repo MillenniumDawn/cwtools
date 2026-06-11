@@ -79,8 +79,10 @@ pub struct SessionConfig<'a> {
     pub directory: PathBuf,
     /// Base-game install indexed for reference resolution (never validated).
     pub vanilla: Option<PathBuf>,
-    /// Pre-generated vanilla type instances to merge (from a `--vanilla-cache`).
-    pub vanilla_cache: Option<HashMap<String, Vec<cwtools_index::TypeInstance>>>,
+    /// Pre-generated vanilla data to merge (from a `--vanilla-cache`). When
+    /// present the `vanilla` dir is NOT walked — type instances, loc keys, file
+    /// paths, and variable names all come from the cache.
+    pub vanilla_cache: Option<cwtools_index::vanilla_cache::VanillaCacheData>,
     /// Extra filename globs to skip during discovery (on top of engine defaults).
     pub ignore_files: &'a [String],
     /// Extra directory globs to skip during discovery.
@@ -109,6 +111,9 @@ pub struct Session {
     loc_languages: Option<Vec<Lang>>,
     registry: Option<Arc<ScopeRegistry>>,
     directory: PathBuf,
+    /// True when vanilla loc keys came from a cache rather than the loc_service
+    /// walk — loc `$ref$` resolution must then consult the loc_index union too.
+    vanilla_loc_cached: bool,
 }
 
 impl Session {
@@ -189,10 +194,24 @@ impl Session {
             }
         }
 
-        // Index the base-game install, if given. Vanilla files populate the type
-        // index (so a mod can reference base-game content without "not a known
-        // instance" errors) but are never validated themselves.
-        if let Some(vanilla_dir) = &vanilla {
+        // Vanilla data: from a pre-generated cache when given (skips walking the
+        // install entirely — types, loc keys, file paths, and variables all come
+        // from the cache), otherwise by indexing the install. Vanilla files
+        // populate the indexes (so a mod can reference base-game content without
+        // "not a known instance" errors) but are never validated themselves.
+        let has_vanilla_data = vanilla.is_some() || vanilla_cache.is_some();
+        let mut cached_loc_keys: Option<Vec<(String, Vec<String>)>> = None;
+        if let Some(cache) = vanilla_cache {
+            type_index.merge("<vanilla-cache>", cache.per_type);
+            for n in &cache.var_names {
+                type_index.var_index.add_name(n);
+            }
+            // File index (mod + cached vanilla paths) for `filepath` checks
+            // (CW113), same coverage as a live vanilla walk.
+            type_index.file_index.add_root(&directory);
+            type_index.file_index.add_paths(cache.file_paths);
+            cached_loc_keys = Some(cache.loc_keys);
+        } else if let Some(vanilla_dir) = &vanilla {
             let vanilla_index = index_game_dir(vanilla_dir, &ruleset, &rules_table, &var_effects);
             type_index.var_index.merge(&vanilla_index.var_index);
             for (type_name, entries) in vanilla_index.map {
@@ -208,12 +227,6 @@ impl Session {
             type_index.file_index.add_root(vanilla_dir);
         }
 
-        // Merge a pre-generated vanilla index, if given.
-        let has_vanilla_data = vanilla.is_some() || vanilla_cache.is_some();
-        if let Some(per_type) = vanilla_cache {
-            type_index.merge("<vanilla-cache>", per_type);
-        }
-
         // Mark the index as complete when vanilla data was loaded (either from a
         // directory or a pre-generated cache).  This lets CW500 type-reference
         // checks fire without false positives on mod-only validation.
@@ -227,14 +240,26 @@ impl Session {
 
         // Loc: mod directory plus the vanilla install (so config referencing
         // base-game loc keys doesn't false-positive). Only mod-path loc files are
-        // reported by the caller.
+        // reported by the caller. With a vanilla cache, the cached key sets stand
+        // in for walking the install's loc files.
         let mut loc_dirs: Vec<&Path> = vec![directory.as_path()];
-        if let Some(v) = &vanilla {
+        if cached_loc_keys.is_none()
+            && let Some(v) = &vanilla
+        {
             loc_dirs.push(v.as_path());
         }
         let loc_service = LocService::from_folders(&loc_dirs);
         let loc_game = cwtools_localization::Game::from_engine(Some(game));
-        let loc_index = LocIndex::build_scoped(&loc_service, loc_game, loc_languages.as_deref());
+        let mut loc_index =
+            LocIndex::build_scoped(&loc_service, loc_game, loc_languages.as_deref());
+        let vanilla_loc_cached = cached_loc_keys.is_some();
+        if let Some(keys) = cached_loc_keys {
+            let typed: Vec<(Lang, Vec<String>)> = keys
+                .into_iter()
+                .filter_map(|(name, ks)| Lang::from_name(&name).map(|l| (l, ks)))
+                .collect();
+            loc_index.merge_cached_keys(typed, loc_languages.as_deref());
+        }
 
         // Per-run scope registry, shared (cheaply cloned) across every file.
         let registry = build_scope_registry_arc(&ruleset, Some(game));
@@ -251,6 +276,7 @@ impl Session {
             loc_languages,
             registry,
             directory,
+            vanilla_loc_cached,
         }
         .with_parsed_cache(parsed, discovery_failed)
     }
@@ -306,11 +332,17 @@ impl Session {
 
     /// Names a loc `$ref$` may resolve to besides loc keys: the engine resolves
     /// `$modifier$` and `$idea$` embeds against those registries. Lowercased to
-    /// match the loc union's case-insensitive lookup.
+    /// match the loc union's case-insensitive lookup. With a vanilla cache the
+    /// loc_service holds no vanilla keys, so the loc_index union (which has the
+    /// cached keys merged in) joins the set — otherwise mod loc referencing a
+    /// base-game key would flag CW225.
     pub fn loc_extra_valid_refs(&self) -> HashSet<String> {
         let mut extra = self.modifier_keys.clone();
         for (_uri, inst) in self.type_index.instances("idea") {
             extra.insert(inst.name.to_lowercase());
+        }
+        if self.vanilla_loc_cached {
+            extra.extend(self.loc_index.union().iter().cloned());
         }
         extra
     }
@@ -421,6 +453,26 @@ fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<Val
             }
         })
         .collect()
+}
+
+/// Walk a vanilla install for the cache's aux payload: per-language loc keys
+/// and the file-path set (CW113), plus the variable names from an
+/// already-built vanilla index. Shared by the CLI `cache-vanilla` command, the
+/// CLI stale-rebuild path, and the LSP's cache writer so every cache carries
+/// the full payload.
+pub fn build_vanilla_cache_aux(
+    vanilla_dir: &Path,
+    var_index: &cwtools_index::VarIndex,
+) -> cwtools_index::vanilla_cache::VanillaCacheAux {
+    let loc_service = LocService::from_folders(&[vanilla_dir]);
+    let loc_keys = cwtools_localization::loc_index::per_language_keys(&loc_service);
+    let mut file_index = cwtools_index::FileIndex::new();
+    file_index.add_root(vanilla_dir);
+    cwtools_index::vanilla_cache::VanillaCacheAux {
+        loc_keys,
+        file_paths: file_index.paths().cloned().collect(),
+        var_names: var_index.names().cloned().collect(),
+    }
 }
 
 /// Build a `TypeIndex` from every script file under `dir` (a base-game install).

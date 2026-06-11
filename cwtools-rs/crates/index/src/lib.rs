@@ -101,6 +101,16 @@ impl FileIndex {
             .to_ascii_lowercase();
         self.files.contains(&norm)
     }
+
+    /// Add already-normalized relative paths (the vanilla-cache restore path).
+    pub fn add_paths<I: IntoIterator<Item = String>>(&mut self, paths: I) {
+        self.files.extend(paths);
+    }
+
+    /// The normalized relative paths, for persisting to the vanilla cache.
+    pub fn paths(&self) -> impl Iterator<Item = &String> {
+        self.files.iter()
+    }
 }
 
 /// Project-wide set of defined script-variable names (every `value_set[...]`
@@ -172,6 +182,11 @@ impl VarIndex {
         for (name, count) in &other.names {
             *self.names.entry(name.clone()).or_insert(0) += count;
         }
+    }
+
+    /// The normalized defined names, for persisting to the vanilla cache.
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.names.keys()
     }
 }
 

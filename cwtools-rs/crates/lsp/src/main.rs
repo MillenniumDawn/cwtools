@@ -8,14 +8,13 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use cwtools_info::{
-    PositionElement, ReferenceHint, TypeInstance, element_at_position, info_at_position,
-};
+use cwtools_info::{PositionElement, ReferenceHint, TypeInstance, element_at_position};
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType, ValueType};
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
+use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 use cwtools_validation::{
     Prepared, ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
     validate_prepared,
@@ -52,17 +51,27 @@ fn loc_diag_to_validation_error(d: &cwtools_localization::LocDiagnostic) -> Vali
 /// discovered ASTs are used directly (no re-parse) because vanilla files are only
 /// indexed, never validated. Drops the per-instance file_uri; the merge slot only
 /// needs the instances.
+///
+/// Also returns the cache aux payload (loc keys, file paths, variable names) so
+/// a cache written by the LSP is as complete as one from the CLI's
+/// `cache-vanilla`.
 fn index_vanilla_dir(
     dir: &std::path::Path,
     ruleset: &RuleSet,
     table: &StringTable,
-) -> HashMap<String, Vec<TypeInstance>> {
-    let index = cwtools_driver::index_game_dir(dir, ruleset, table, &HashSet::new());
-    index
+) -> (
+    HashMap<String, Vec<TypeInstance>>,
+    cwtools_info::vanilla_cache::VanillaCacheAux,
+) {
+    let var_effects = cwtools_info::variable_defining_effects(ruleset);
+    let index = cwtools_driver::index_game_dir(dir, ruleset, table, &var_effects);
+    let aux = cwtools_driver::build_vanilla_cache_aux(dir, &index.var_index);
+    let per_type = index
         .map
         .into_iter()
         .map(|(k, v)| (k, v.into_iter().map(|(_, inst)| inst).collect()))
-        .collect()
+        .collect();
+    (per_type, aux)
 }
 
 /// Best-effort discovery of a base-game install for `game`, checking the usual
@@ -197,6 +206,11 @@ struct DocumentState {
     /// base-game install dir (from the `vanilla` init option, or auto-discovered).
     /// Indexed lazily into `vanilla_index` on the first full-workspace scan.
     vanilla_dir: Mutex<Option<std::path::PathBuf>>,
+    /// Vanilla loc keys per language (display name -> lowercased keys), from the
+    /// vanilla cache or extracted when rebuilding it. When set, the loc rebuild
+    /// skips walking the install's loc files and merges these instead.
+    #[allow(clippy::type_complexity)]
+    vanilla_loc_keys: Mutex<Option<Vec<(String, Vec<String>)>>>,
     /// cached modifier-key set; rebuilt after ruleset load and after each full
     /// workspace scan when the type index is complete.
     modifier_keys: parking_lot::RwLock<HashSet<String>>,
@@ -267,6 +281,7 @@ impl DocumentState {
             workspace_uri: Mutex::new(None),
             vanilla_index: Mutex::new(None),
             vanilla_dir: Mutex::new(None),
+            vanilla_loc_keys: Mutex::new(None),
             modifier_keys: parking_lot::RwLock::new(HashSet::new()),
             loc_index: parking_lot::RwLock::new(None),
             loc_languages: Mutex::new(None),
@@ -306,6 +321,80 @@ impl Backend {
         // C→S: accept silently.
     }
 
+    /// Resolve the leaf under the cursor with the position resolver and
+    /// classify it: the AST element, a [`ReferenceHint`] derived from the
+    /// matched rule's right-hand side, and the matched rule's description +
+    /// required scopes (for hover).
+    ///
+    /// Shared by hover, goto_definition, references, prepare_rename, and
+    /// rename. Returns `None` when the cursor isn't on a leaf inside a known
+    /// entity — callers fall back to `element_at_position`.
+    fn rule_info_at_cursor(
+        &self,
+        uri: &str,
+        pos: tower_lsp::lsp_types::Position,
+        logical_path: &str,
+    ) -> Option<(PositionElement, ReferenceHint, Option<String>, Vec<String>)> {
+        let language = self.state.language.lock().clone();
+        // Lock order: documents -> ruleset -> scope_registry -> info_service
+        // -> modifier_keys (field-declaration order, see DocumentState).
+        let docs = self.state.documents.lock();
+        let ruleset_guard = self.state.ruleset.read();
+        let registry_guard = self.state.scope_registry.read();
+        let info_guard = self.state.info_service.read();
+        let modifier_guard = self.state.modifier_keys.read();
+        let doc = docs.get(uri)?;
+        let rs = ruleset_guard.as_ref()?;
+        let ast = doc.ast.as_ref()?;
+
+        let enum_map = build_enum_map(rs);
+        let prepared = Prepared {
+            ruleset: rs,
+            table: &self.state.string_table,
+            game: cwtools_game::constants::Game::from_str(&language),
+            type_index: Some(&info_guard.type_index),
+            modifier_keys: Some(&modifier_guard),
+            loc_index: None,
+            registry: registry_guard.as_ref(),
+            enum_map: &enum_map,
+        };
+        let rctx = rules_at_pos(
+            ast,
+            logical_path,
+            &prepared,
+            pos.line + 1,
+            pos.character as u16,
+        )?;
+        let leaf = rctx.leaf?;
+
+        let element = if leaf.key.is_empty() {
+            PositionElement::LeafValue {
+                value: leaf.value.clone(),
+            }
+        } else {
+            PositionElement::Leaf {
+                key: leaf.key.clone(),
+                value: leaf.value.clone(),
+            }
+        };
+
+        let mut hint = ReferenceHint::Unknown;
+        let mut description: Option<String> = None;
+        let mut scopes: Vec<String> = Vec::new();
+        for (rule_type, opts) in &rctx.value_rules {
+            if description.is_none() && opts.description.is_some() {
+                description = opts.description.clone();
+            }
+            if scopes.is_empty() && !opts.required_scopes.is_empty() {
+                scopes = opts.required_scopes.clone();
+            }
+            if matches!(hint, ReferenceHint::Unknown) {
+                hint = hint_from_rule_right(rule_type, &leaf.value);
+            }
+        }
+        Some((element, hint, description, scopes))
+    }
+
     /// Look up the TypeRef (type_name, instance_name) under the cursor.
     ///
     /// Shared by goto_definition, references, prepare_rename, and rename to
@@ -316,25 +405,12 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
     ) -> Option<(String, String)> {
-        let docs = self.state.documents.lock();
-        let ruleset_guard = self.state.ruleset.read();
-        if let (Some(doc), Some(rs)) = (docs.get(uri), ruleset_guard.as_ref())
-            && let Some(ast) = &doc.ast
-        {
-            let info = info_at_position(
-                ast,
-                pos.line + 1,
-                pos.character as u16,
-                rs,
-                logical_path,
-                &self.state.string_table,
-            );
-            return info.and_then(|i| match i.hint {
-                ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                _ => None,
-            });
+        match self.rule_info_at_cursor(uri, pos, logical_path) {
+            Some((_, ReferenceHint::TypeRef { type_name, value }, _, _)) => {
+                Some((type_name, value))
+            }
+            _ => None,
         }
-        None
     }
 
     /// The variable name read at the cursor, if it resolves to a
@@ -345,25 +421,62 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
     ) -> Option<String> {
-        let docs = self.state.documents.lock();
-        let ruleset_guard = self.state.ruleset.read();
-        if let (Some(doc), Some(rs)) = (docs.get(uri), ruleset_guard.as_ref())
-            && let Some(ast) = &doc.ast
-        {
-            let info = info_at_position(
-                ast,
-                pos.line + 1,
-                pos.character as u16,
-                rs,
-                logical_path,
-                &self.state.string_table,
-            );
-            return info.and_then(|i| match i.hint {
-                ReferenceHint::Variable { name, .. } => Some(name),
-                _ => None,
-            });
+        match self.rule_info_at_cursor(uri, pos, logical_path) {
+            Some((_, ReferenceHint::Variable { name, .. }, _, _)) => Some(name),
+            _ => None,
         }
-        None
+    }
+}
+
+/// Map a matched leaf rule's right-hand field to a [`ReferenceHint`] for the
+/// leaf's value (the same classification `info_at_position` used to do at
+/// depth 0-1, now fed by the full position resolver).
+fn hint_from_rule_right(rule_type: &RuleType, value: &str) -> ReferenceHint {
+    let right = match rule_type {
+        RuleType::LeafRule { right, .. } => right,
+        RuleType::LeafValueRule { right } => right,
+        _ => return ReferenceHint::Unknown,
+    };
+    match right {
+        NewField::TypeField(TypeType::Simple(t)) => ReferenceHint::TypeRef {
+            type_name: t.clone(),
+            value: value.to_string(),
+        },
+        // `modifier:production_speed_<building>_factor` style: strip the
+        // literal affixes so the instance name is what's looked up.
+        NewField::TypeField(TypeType::Complex {
+            prefix,
+            name,
+            suffix,
+        }) => {
+            let inner = value
+                .strip_prefix(prefix.as_str())
+                .unwrap_or(value)
+                .strip_suffix(suffix.as_str())
+                .unwrap_or(value);
+            ReferenceHint::TypeRef {
+                type_name: name.clone(),
+                value: inner.to_string(),
+            }
+        }
+        NewField::ValueField(ValueType::Enum(e)) => ReferenceHint::EnumRef {
+            enum_name: e.clone(),
+            value: value.to_string(),
+        },
+        NewField::LocalisationField { .. } => ReferenceHint::LocRef {
+            key: value.to_string(),
+        },
+        NewField::FilepathField { .. } => ReferenceHint::FileRef {
+            path: value.to_string(),
+        },
+        NewField::VariableGetField(ns) => ReferenceHint::Variable {
+            name: value.to_string(),
+            namespace: ns.clone(),
+        },
+        NewField::ScopeField(_) => ReferenceHint::ScopeName {
+            name: value.to_string(),
+        },
+        _ => ReferenceHint::Unknown,
     }
 }
 
@@ -436,18 +549,14 @@ fn logical_path_from_uri(uri: &str, workspace_uri: &Option<String>) -> String {
     path
 }
 
-/// Build a Markdown hover string from a PositionInfo + optional rule options.
+/// Build a Markdown hover string from the classified element + the matched
+/// rule's description and required scopes (from `rule_info_at_cursor`).
 fn build_hover_markdown(
     element: &PositionElement,
     hint: &ReferenceHint,
-    ruleset: Option<&RuleSet>,
+    rule_desc: Option<&str>,
+    rule_scopes: &[String],
 ) -> String {
-    // Try to find a matching rule's description and scope info for the element key.
-    let (rule_desc, rule_scopes) = match (ruleset, element) {
-        (Some(rules), PositionElement::Leaf { key, .. }) => find_rule_description(rules, key),
-        _ => (None, Vec::new()),
-    };
-
     let mut parts: Vec<String> = Vec::new();
 
     // Primary classification
@@ -493,7 +602,7 @@ fn build_hover_markdown(
     }
 
     // Append rule description if found
-    if let Some(desc) = &rule_desc {
+    if let Some(desc) = rule_desc {
         parts.push(format!("\n{}", desc));
     }
 
@@ -505,191 +614,28 @@ fn build_hover_markdown(
     parts.join("\n\n")
 }
 
-/// Walk root_rules for a leaf rule whose left field matches `key` and return
-/// the Options.description (and required_scopes) if found.
-fn find_rule_description(rules: &RuleSet, key: &str) -> (Option<String>, Vec<String>) {
-    for root_rule in &rules.root_rules {
-        let (_, (rule_type, _)) = match root_rule {
-            RootRule::TypeRule(n, r) => (n, r),
-            RootRule::AliasRule(n, r) => (n, r),
-            RootRule::SingleAliasRule(n, r) => (n, r),
-        };
-        let child_rules = match rule_type {
-            RuleType::NodeRule { rules, .. } => rules.as_slice(),
-            _ => continue,
-        };
-        for (inner_type, opts) in child_rules {
-            match inner_type {
-                RuleType::LeafRule {
-                    left: NewField::SpecificField(k),
-                    ..
-                }
-                | RuleType::NodeRule {
-                    left: NewField::SpecificField(k),
-                    ..
-                } if k.eq_ignore_ascii_case(key) => {
-                    return (opts.description.clone(), opts.required_scopes.clone());
-                }
-                _ => {}
-            }
-        }
-    }
-    (None, Vec::new())
-}
-
 // ── Completion context helpers ────────────────────────────────────────────────
 
-/// Walk the AST to find the cursor's enclosing node key path.
-/// Returns the list of ancestor node keys from outermost to innermost.
-///
-/// Limitation: this is a linear scan; aliases and deeply nested rules are not
-/// fully resolved.  When context can't be determined we fall back to the flat
-/// global list.
-fn enclosing_key_path(ast: &ParsedFile, line: u32, col: u16, table: &StringTable) -> Vec<String> {
-    let target = cwtools_parser::ast::SourcePos { line, col };
-    let mut path = Vec::new();
-    collect_enclosing_path(&ast.root_children, &ast.arena, &target, table, &mut path);
-    path
-}
-
-fn collect_enclosing_path(
-    children: &[cwtools_parser::ast::Child],
-    arena: &cwtools_parser::ast::Arena,
-    target: &cwtools_parser::ast::SourcePos,
-    table: &StringTable,
-    path: &mut Vec<String>,
-) -> bool {
-    use cwtools_parser::ast::{Child, Value};
-
-    for child in children {
-        if let Child::Leaf(idx) = child {
-            let leaf = &arena.leaves[*idx as usize];
-            if let Value::Clause(ch) = &leaf.value
-                && pos_in_range_simple(target, &leaf.pos)
-            {
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                path.push(key);
-                // Descend (extending `path`) but stop at this branch regardless:
-                // the first enclosing clause that contains the cursor wins.
-                collect_enclosing_path(ch, arena, target, table, path);
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn pos_in_range_simple(
-    pos: &cwtools_parser::ast::SourcePos,
-    range: &cwtools_parser::ast::SourceRange,
-) -> bool {
-    let s = &range.start;
-    let e = &range.end;
-    if pos.line < s.line || pos.line > e.line {
-        return false;
-    }
-    if pos.line == s.line && pos.col < s.col {
-        return false;
-    }
-    if pos.line == e.line && pos.col > e.col {
-        return false;
-    }
-    true
-}
-
-/// Given an enclosing key path and a ruleset, find the applicable child rules.
-///
-/// Walks root_rules: for the outermost key (the type block) it finds a
-/// TypeRule whose name matches a type definition that covers `logical_path`;
-/// then descends the rule tree following the remaining path elements.
-///
-/// Returns the slice of child (RuleType, Options) pairs that apply at the
-/// cursor's level, or None when no match is found.
-fn rules_for_context<'a>(
-    ruleset: &'a RuleSet,
-    key_path: &[String],
-    logical_path: &str,
-) -> Option<&'a [(RuleType, cwtools_rules::rules_types::Options)]> {
-    if key_path.is_empty() {
-        // Top-level context: return all rules from all type rules for this path
-        // (no single slice, caller handles)
+/// When the line prefix before the cursor reads `key =` (value not typed yet,
+/// so the last good parse has no leaf there), return the key so value
+/// completions can still resolve. `line0`/`char0` are LSP 0-based.
+fn line_value_key(text: &str, line0: u32, char0: u32) -> Option<String> {
+    let line = text.lines().nth(line0 as usize)?;
+    let n = line.len().min(char0 as usize);
+    let n = (0..=n).rev().find(|&i| line.is_char_boundary(i))?;
+    let upto = &line[..n];
+    let trimmed = upto.trim_end();
+    let rest = trimmed
+        .strip_suffix(['=', '<', '>'])?
+        .trim_end_matches(['=', '<', '>', '!', '?'])
+        .trim_end();
+    let key = rest
+        .rsplit(|c: char| c.is_whitespace() || c == '{')
+        .next()?;
+    if key.is_empty() || key.contains('}') || key.contains('"') {
         return None;
     }
-
-    // Find a TypeRule whose corresponding TypeDef covers logical_path.
-    for root_rule in &ruleset.root_rules {
-        let (type_name, (rule_type, _)) = match root_rule {
-            RootRule::TypeRule(n, r) => (n, r),
-            _ => continue,
-        };
-        if let Some(&idx) = ruleset.type_by_name.get(type_name) {
-            let td = &ruleset.types[idx];
-            // Check path
-            if !cwtools_info_path_check(&td.path_options, logical_path) {
-                continue;
-            }
-            // Check the key matches (type_key_filter or starts_with)
-            // We check the top-level key against the type's skip_root_key stack.
-            // Simple case: no skip_root_key, so key_path[0] IS the instance.
-            // With skip_root_key we'd need to look for key_path[1] etc.; skip for now.
-            // For path[1..] we descend into the NodeRule's child rules.
-            if let RuleType::NodeRule { rules, .. } = rule_type {
-                // If there's only one level, return these rules directly
-                if key_path.len() == 1 {
-                    return Some(rules);
-                }
-                // Descend further into nested rules
-                return descend_rules(rules, &key_path[1..]);
-            }
-        }
-    }
-
-    // Also try alias rules (the cursor might be inside an alias block)
-    for root_rule in &ruleset.root_rules {
-        let (_, (rule_type, _)) = match root_rule {
-            RootRule::AliasRule(n, r) => (n, r),
-            RootRule::SingleAliasRule(n, r) => (n, r),
-            _ => continue,
-        };
-        if let RuleType::NodeRule { rules, .. } = rule_type {
-            if key_path.len() == 1 {
-                return Some(rules);
-            }
-            if let Some(slice) = descend_rules(rules, &key_path[1..]) {
-                return Some(slice);
-            }
-        }
-    }
-
-    None
-}
-
-fn descend_rules<'a>(
-    rules: &'a [(RuleType, cwtools_rules::rules_types::Options)],
-    remaining: &[String],
-) -> Option<&'a [(RuleType, cwtools_rules::rules_types::Options)]> {
-    if remaining.is_empty() {
-        return Some(rules);
-    }
-    let next_key = &remaining[0];
-    for (rule_type, _) in rules {
-        match rule_type {
-            RuleType::NodeRule {
-                left: NewField::SpecificField(k),
-                rules: inner,
-                ..
-            }
-            | RuleType::NodeRule {
-                left: NewField::AliasValueKeysField(k),
-                rules: inner,
-                ..
-            } if k.eq_ignore_ascii_case(next_key) => {
-                return descend_rules(inner, &remaining[1..]);
-            }
-            _ => {}
-        }
-    }
-    None
+    Some(key.to_string())
 }
 
 /// Thin wrapper around the info crate's path check (avoids re-exporting it).
@@ -733,17 +679,14 @@ fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
 }
 
 /// Build context-aware completion items from the child rules at the cursor's
-/// position.
-///
-/// Limitation: AliasField expansion is not fully recursive (that requires
-/// following the alias chain, which can be large).  TypeField completions use
-/// the TypeIndex from the InfoService.  ScopeField completions are placeholder
-/// scope names.
+/// position (the rules come from `position::rules_at_pos`, which resolves
+/// aliases, typed keys, and subtypes the same way validation does).
 fn completions_from_rules(
     rules: &[(RuleType, cwtools_rules::rules_types::Options)],
     ruleset: &RuleSet,
     info: &cwtools_info::InfoService,
     language: &str,
+    modifier_keys: &HashSet<String>,
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
 
@@ -859,6 +802,20 @@ fn completions_from_rules(
                         });
                     }
                 }
+                // The `modifier` category has no alias entries — modifiers live
+                // in the expanded modifier-key set (modifiers.cwt + templated
+                // names like production_speed_<building>_factor). This is the
+                // MIO `equipment_bonus` / idea `modifier` block case.
+                if cat == "modifier" {
+                    for m in modifier_keys {
+                        items.push(CompletionItem {
+                            label: m.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some("modifier".to_string()),
+                            ..Default::default()
+                        });
+                    }
+                }
             }
             // Scope names
             RuleType::LeafRule {
@@ -902,6 +859,142 @@ fn enum_values_for(ruleset: &RuleSet, enum_name: &str) -> Vec<String> {
         return ruleset.enums[idx].values.clone();
     }
     Vec::new()
+}
+
+/// Completion items for a leaf VALUE position: enumerate what the matched
+/// rules' right-hand sides accept. `value_rules` comes from
+/// `position::rules_at_pos` (alias usages already expanded to their overloads,
+/// so `has_completed_focus = |` arrives here as a `TypeField("focus")` rule).
+fn value_completions(
+    value_rules: &[(RuleType, cwtools_rules::rules_types::Options)],
+    ruleset: &RuleSet,
+    info: &cwtools_info::InfoService,
+    registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
+    language: &str,
+) -> Vec<CompletionItem> {
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |label: String,
+                    kind: CompletionItemKind,
+                    detail: String,
+                    items: &mut Vec<CompletionItem>| {
+        if seen.insert(label.clone()) {
+            items.push(CompletionItem {
+                label,
+                kind: Some(kind),
+                detail: Some(detail),
+                ..Default::default()
+            });
+        }
+    };
+
+    for (rule_type, _opts) in value_rules {
+        let right = match rule_type {
+            RuleType::LeafRule { right, .. } => right,
+            RuleType::LeafValueRule { right } => right,
+            _ => continue,
+        };
+        match right {
+            NewField::TypeField(TypeType::Simple(t)) => {
+                for (_, inst) in info.type_index.instances(t) {
+                    push(
+                        inst.name.clone(),
+                        CompletionItemKind::REFERENCE,
+                        format!("{} instance", t),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::TypeField(TypeType::Complex {
+                prefix,
+                name,
+                suffix,
+            }) => {
+                for (_, inst) in info.type_index.instances(name) {
+                    push(
+                        format!("{}{}{}", prefix, inst.name, suffix),
+                        CompletionItemKind::REFERENCE,
+                        format!("{} instance", name),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::ValueField(ValueType::Enum(e)) => {
+                for v in enum_values_for(ruleset, e) {
+                    push(
+                        v,
+                        CompletionItemKind::ENUM_MEMBER,
+                        format!("enum {}", e),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::ValueField(ValueType::Bool) => {
+                for v in ["yes", "no"] {
+                    push(
+                        v.to_string(),
+                        CompletionItemKind::KEYWORD,
+                        "bool".to_string(),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::ScopeField(_)
+            | NewField::ValueScopeField { .. }
+            | NewField::ValueScopeMarkerField { .. } => {
+                // Config-driven link names (owner, capital_scope, …) when a
+                // registry is loaded; static keyword list as the floor.
+                if let Some(reg) = registry {
+                    for link in reg.links.keys() {
+                        push(
+                            link.clone(),
+                            CompletionItemKind::VALUE,
+                            "scope link".to_string(),
+                            &mut items,
+                        );
+                    }
+                }
+                for scope in scope_names_for_game(language) {
+                    push(
+                        scope.to_string(),
+                        CompletionItemKind::VALUE,
+                        "scope".to_string(),
+                        &mut items,
+                    );
+                }
+            }
+            // `value[x]` reads: known event targets / variables / collected set
+            // members.
+            NewField::VariableGetField(ns) | NewField::VariableSetField(ns) => {
+                let source: Vec<String> = match ns.as_str() {
+                    "event_target" => info.all_event_targets.iter().cloned().collect(),
+                    "variable" => info.all_variables.iter().cloned().collect(),
+                    other => ruleset.values.get(other).cloned().unwrap_or_default(),
+                };
+                for v in source {
+                    push(
+                        v,
+                        CompletionItemKind::CONSTANT,
+                        format!("value[{}]", ns),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::VariableField { .. } => {
+                for v in &info.all_variables {
+                    push(
+                        v.clone(),
+                        CompletionItemKind::CONSTANT,
+                        "variable".to_string(),
+                        &mut items,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    items
 }
 
 /// Build an LSP snippet body for a NodeRule, pre-populating required child fields
@@ -1173,9 +1266,12 @@ impl LanguageServer for Backend {
             // validate_entire_workspace.
             if let Some(vc) = opts.get("vanillaCache").and_then(|v| v.as_str()) {
                 match cwtools_info::vanilla_cache::load(std::path::Path::new(vc)) {
-                    Ok((game, _fingerprint, per_type)) => {
-                        let total: usize = per_type.values().map(|v| v.len()).sum();
-                        *self.state.vanilla_index.lock() = Some(per_type);
+                    Ok((game, _fingerprint, data)) => {
+                        let total: usize = data.per_type.values().map(|v| v.len()).sum();
+                        *self.state.vanilla_index.lock() = Some(data.per_type);
+                        if !data.loc_keys.is_empty() {
+                            *self.state.vanilla_loc_keys.lock() = Some(data.loc_keys);
+                        }
                         self.client
                             .log_message(
                                 MessageType::INFO,
@@ -1514,36 +1610,16 @@ impl LanguageServer for Backend {
             docs.get(&uri).and_then(|d| d.ast.clone())
         };
         if let Some(ast) = ast {
-            let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
-            let lsp_col = pos.character as u16;
-
             let ws_uri = self.state.workspace_uri.lock().clone();
             let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-            let ruleset_guard = self.state.ruleset.read();
-            let pos_info = if let Some(rs) = ruleset_guard.as_ref() {
-                info_at_position(
-                    &ast,
-                    lsp_line,
-                    lsp_col,
-                    rs,
-                    &logical_path,
-                    &self.state.string_table,
-                )
-            } else {
-                // No rules: fall back to position-only lookup
-                None
-            };
-            drop(ruleset_guard);
-
-            if let Some(info) = pos_info {
-                let ruleset_guard2 = self.state.ruleset.read();
-                let mut md =
-                    build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
-                drop(ruleset_guard2);
+            if let Some((element, hint, desc, scopes)) =
+                self.rule_info_at_cursor(&uri, pos, &logical_path)
+            {
+                let mut md = build_hover_markdown(&element, &hint, desc.as_deref(), &scopes);
                 // For a variable read, append the known assigned value(s) so the
                 // user sees what it resolves to without chasing the definition.
-                if let ReferenceHint::Variable { name, .. } = &info.hint {
+                if let ReferenceHint::Variable { name, .. } = &hint {
                     let info_guard = self.state.info_service.read();
                     let (values, more) = info_guard.variable_values(name, 5);
                     if !values.is_empty() {
@@ -1599,14 +1675,9 @@ impl LanguageServer for Backend {
         let lsp_line = pos.line + 1;
         let lsp_col = pos.character as u16;
 
-        // Try context-aware completions first.
-        //
-        // Limitations:
-        //  - Alias expansion is one level deep only (full recursive alias
-        //    expansion would require following chains, which can be large).
-        //  - ScopeField values are a static per-game list; full dynamic scope
-        //    resolution is not implemented.
-        //  - Deeply nested nodes inside aliases or subtypes may not match.
+        // Try context-aware completions first: resolve the rules at the cursor
+        // with the validation engine's own descent (aliases, typed keys,
+        // subtypes, skip_root_key — see cwtools_validation::position).
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
         let language = self.state.language.lock().clone();
@@ -1620,33 +1691,84 @@ impl LanguageServer for Backend {
             }
         }
 
-        let context_items: Vec<CompletionItem> = {
+        // `Some(items)` = the rule context resolved (items may still be empty:
+        // an unknown block where suggestions from any other level would be
+        // wrong). `None` = no doc/ruleset/AST — fall through to the flat list.
+        let context_items: Option<Vec<CompletionItem>> = {
+            // Lock order: documents -> ruleset -> scope_registry -> info_service
+            // -> modifier_keys (field-declaration order, see DocumentState).
             let docs = self.state.documents.lock();
             let ruleset_guard = self.state.ruleset.read();
+            let registry_guard = self.state.scope_registry.read();
             let info_guard = self.state.info_service.read();
+            let modifier_guard = self.state.modifier_keys.read();
 
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let key_path =
-                        enclosing_key_path(ast, lsp_line, lsp_col, &self.state.string_table);
-                    if key_path.is_empty() {
-                        // Top level — offer root-type snippets for this file's path.
-                        root_type_snippets(rs, &logical_path)
-                    } else if let Some(rules) = rules_for_context(rs, &key_path, &logical_path) {
-                        completions_from_rules(rules, rs, &info_guard, &language)
-                    } else {
-                        Vec::new()
+            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref())
+                && let Some(ast) = &doc.ast
+            {
+                let enum_map = build_enum_map(rs);
+                let game = cwtools_game::constants::Game::from_str(&language);
+                let prepared = Prepared {
+                    ruleset: rs,
+                    table: &self.state.string_table,
+                    game,
+                    type_index: Some(&info_guard.type_index),
+                    modifier_keys: Some(&modifier_guard),
+                    loc_index: None,
+                    registry: registry_guard.as_ref(),
+                    enum_map: &enum_map,
+                };
+                match rules_at_pos(ast, &logical_path, &prepared, lsp_line, lsp_col) {
+                    // Outside any known entity — offer root-type snippets.
+                    None => Some(root_type_snippets(rs, &logical_path)),
+                    Some(rctx) => {
+                        let items = if rctx.leaf.as_ref().is_some_and(|l| l.in_value) {
+                            value_completions(
+                                &rctx.value_rules,
+                                rs,
+                                &info_guard,
+                                registry_guard.as_deref(),
+                                &language,
+                            )
+                        } else if let Some(key) = line_value_key(&doc.text, pos.line, pos.character)
+                        {
+                            // Mid-edit `key = |`: the last good parse has no such
+                            // leaf yet; resolve the value rules from the live line.
+                            let vr = value_rules_for_key(
+                                rs,
+                                Some(&info_guard.type_index),
+                                &rctx.child_rules,
+                                &key,
+                            );
+                            value_completions(
+                                &vr,
+                                rs,
+                                &info_guard,
+                                registry_guard.as_deref(),
+                                &language,
+                            )
+                        } else {
+                            completions_from_rules(
+                                &rctx.child_rules,
+                                rs,
+                                &info_guard,
+                                &language,
+                                &modifier_guard,
+                            )
+                        };
+                        Some(items)
                     }
-                } else {
-                    Vec::new()
                 }
             } else {
-                Vec::new()
+                None
             }
         };
 
-        if !context_items.is_empty() {
-            return Ok(Some(CompletionResponse::Array(context_items)));
+        if let Some(items) = context_items {
+            if items.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(CompletionResponse::Array(items)));
         }
 
         // Fallback: flat global list (original behavior) when context-aware
@@ -1750,7 +1872,7 @@ impl LanguageServer for Backend {
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-        // First try the rule-aware lookup via info_at_position so we get a
+        // First try the rule-aware lookup via the position resolver so we get a
         // TypeRef hint and can look up the actual definition location.
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
@@ -2726,8 +2848,13 @@ impl Backend {
         };
         let loc_game = cwtools_localization::Game::from_engine(game);
 
+        // Cached vanilla loc keys (from the vanilla cache) stand in for walking
+        // the install's loc files — only the workspace is walked then.
+        let cached_vanilla_loc = self.state.vanilla_loc_keys.lock().clone();
         let mut loc_dirs: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
-        if let Some(v) = self.state.vanilla_dir.lock().clone() {
+        if cached_vanilla_loc.is_none()
+            && let Some(v) = self.state.vanilla_dir.lock().clone()
+        {
             loc_dirs.push(v);
         }
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
@@ -2741,11 +2868,19 @@ impl Backend {
         // closes only LocIndex (keys) and the diagnostic map survive.
         // Names a `$ref$` may resolve to besides loc keys: `$modifier$` / `$idea$`
         // embeds resolve against those registries (mirrors the CLI/driver path).
+        // With cached vanilla loc keys, the service holds no vanilla keys, so
+        // they join this set too — otherwise mod loc referencing a base-game key
+        // would flag CW225.
         let extra_valid_refs: HashSet<String> = {
             let mut extra = self.state.modifier_keys.read().clone();
             let info = self.state.info_service.read();
             for (_uri, inst) in info.type_index.instances("idea") {
                 extra.insert(inst.name.to_lowercase());
+            }
+            if let Some(cached) = &cached_vanilla_loc {
+                for (_, keys) in cached {
+                    extra.extend(keys.iter().cloned());
+                }
             }
             extra
         };
@@ -2753,11 +2888,20 @@ impl Backend {
         let root_str = root_path.to_string_lossy().to_string();
         let (loc_index, mut by_file) = {
             let service = cwtools_localization::LocService::from_folders(&dir_refs);
-            let idx = cwtools_localization::LocIndex::build_scoped(
+            let mut idx = cwtools_localization::LocIndex::build_scoped(
                 &service,
                 loc_game,
                 loc_languages.as_deref(),
             );
+            if let Some(cached) = cached_vanilla_loc {
+                let typed: Vec<(cwtools_localization::Lang, Vec<String>)> = cached
+                    .into_iter()
+                    .filter_map(|(name, ks)| {
+                        cwtools_localization::Lang::from_name(&name).map(|l| (l, ks))
+                    })
+                    .collect();
+                idx.merge_cached_keys(typed, loc_languages.as_deref());
+            }
             let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
             for d in cwtools_localization::validate_loc_project_scoped(
                 &service,
@@ -3343,11 +3487,14 @@ impl Backend {
             && cp.exists()
         {
             match cwtools_info::vanilla_cache::load(cp) {
-                Ok((cache_game, cache_fp, per_type))
+                Ok((cache_game, cache_fp, data))
                     if cache_game == game && cache_fp == fingerprint =>
                 {
-                    let total: usize = per_type.values().map(|v| v.len()).sum();
-                    *self.state.vanilla_index.lock() = Some(per_type);
+                    let total: usize = data.per_type.values().map(|v| v.len()).sum();
+                    *self.state.vanilla_index.lock() = Some(data.per_type);
+                    if !data.loc_keys.is_empty() {
+                        *self.state.vanilla_loc_keys.lock() = Some(data.loc_keys);
+                    }
                     self.client
                         .log_message(
                             MessageType::INFO,
@@ -3401,8 +3548,8 @@ impl Backend {
         let join_result =
             tokio::task::spawn_blocking(move || index_vanilla_dir(&index_dir, &ruleset, &table))
                 .await;
-        let per_type = match join_result {
-            Ok(map) => map,
+        let (per_type, aux) = match join_result {
+            Ok(result) => result,
             Err(e) => {
                 // The blocking task panicked or was cancelled. Log loudly and
                 // bail without setting vanilla_merged, so that type_index stays
@@ -3425,9 +3572,20 @@ impl Backend {
 
         let total: usize = per_type.values().map(|v| v.len()).sum();
 
+        // The freshly-extracted loc keys feed this session's loc rebuild too.
+        if !aux.loc_keys.is_empty() {
+            *self.state.vanilla_loc_keys.lock() = Some(aux.loc_keys.clone());
+        }
+
         // Persist for next startup so the base game isn't re-parsed every time.
         if let Some(cp) = &cache_path {
-            match cwtools_info::vanilla_cache::save_per_type(&per_type, &game, &fingerprint, cp) {
+            match cwtools_info::vanilla_cache::save_per_type(
+                &per_type,
+                &game,
+                &fingerprint,
+                cp,
+                aux,
+            ) {
                 Ok(n) => {
                     self.client
                         .log_message(
@@ -3519,8 +3677,8 @@ impl Backend {
 /// Returns a list of (file_uri, SourceLocation) use-sites.
 ///
 /// Implementation: walks every leaf in every indexed file's AST.  For each
-/// leaf, we call `info_at_position` to classify it.  If it comes back as a
-/// TypeRef for the right type+name, we record the location.
+/// leaf whose value equals the target name, `is_type_ref_leaf` classifies the
+/// key against the ruleset; matches are recorded as use-sites.
 ///
 /// This is O(files × leaves) but runs only on demand (find-references / rename)
 /// so is acceptable for mod-sized workspaces.
@@ -3936,6 +4094,7 @@ mod tests {
                 value: "my_ethos".to_string(),
             },
             None,
+            &[],
         );
         assert!(md.contains("Type reference"), "got: {}", md);
         assert!(md.contains("my_ethos"), "got: {}", md);
@@ -3954,6 +4113,7 @@ mod tests {
                 value: "alpha".to_string(),
             },
             None,
+            &[],
         );
         assert!(md.contains("Enum value"), "got: {}", md);
         assert!(md.contains("alpha"), "got: {}", md);
@@ -3969,21 +4129,13 @@ mod tests {
             },
             &ReferenceHint::Unknown,
             None,
+            &[],
         );
         assert!(md.contains("foo") && md.contains("bar"), "got: {}", md);
     }
 
     #[test]
     fn test_hover_with_rule_description() {
-        let mut rs = bool_enum_ruleset();
-        // Add a description to the "kind" leaf rule
-        if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
-            rs.root_rules.first_mut()
-            && let Some((_, opts)) = rules.first_mut()
-        {
-            opts.description = Some("The kind of this thing".to_string());
-        }
-
         let md = build_hover_markdown(
             &PositionElement::Leaf {
                 key: "kind".to_string(),
@@ -3993,9 +4145,11 @@ mod tests {
                 enum_name: "my_enum".to_string(),
                 value: "alpha".to_string(),
             },
-            Some(&rs),
+            Some("The kind of this thing"),
+            &["country".to_string()],
         );
         assert!(md.contains("The kind of this thing"), "got: {}", md);
+        assert!(md.contains("Required scopes"), "got: {}", md);
     }
 
     // ── completion context tests ─────────────────────────────────────────────
@@ -4014,7 +4168,7 @@ mod tests {
             panic!("expected TypeRule");
         };
 
-        let items = completions_from_rules(rules, &rs, &info, "stellaris");
+        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new());
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");
@@ -4037,14 +4191,18 @@ mod tests {
     }
 
     #[test]
-    fn test_enclosing_key_path() {
-        let table = StringTable::new();
-        let source = "country_event = {\n  id = foo\n}\n";
-        let parsed = parse_string(source, &table).unwrap();
-
-        // Line 2 (1-based), somewhere in the id leaf
-        let path = enclosing_key_path(&parsed, 2, 5, &table);
-        assert_eq!(path, vec!["country_event"], "got: {:?}", path);
+    fn test_line_value_key() {
+        let text = "decision = {\n    has_completed_focus = \n}\n";
+        // Cursor right after `= ` on line 1 (0-based), char 26.
+        assert_eq!(
+            line_value_key(text, 1, 26).as_deref(),
+            Some("has_completed_focus")
+        );
+        // Cursor on the key itself — no `=` before it.
+        assert_eq!(line_value_key(text, 1, 10), None);
+        // Comparison operators count too.
+        let text2 = "block = {\n    num > \n}\n";
+        assert_eq!(line_value_key(text2, 1, 10).as_deref(), Some("num"));
     }
 
     #[test]
@@ -4356,7 +4514,7 @@ mod tests {
         std::fs::write(foos.join("a.txt"), "foo_one = { }\nfoo_two = { }\n").unwrap();
 
         let table = StringTable::new();
-        let per_type = index_vanilla_dir(&root, &rs, &table);
+        let (per_type, _aux) = index_vanilla_dir(&root, &rs, &table);
 
         let names: Vec<&str> = per_type
             .get("foo")
