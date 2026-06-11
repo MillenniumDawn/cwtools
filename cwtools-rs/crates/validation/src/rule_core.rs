@@ -37,12 +37,8 @@ pub(crate) fn validate_with_type(
     node_pos: (u32, u16),
     errors: &mut Vec<ValidationError>,
 ) {
-    let ast = ctx.ast;
-    let enum_map = ctx.enum_map;
-    let table = ctx.table;
     let game = ctx.game;
     let ruleset = ctx.ruleset;
-    let type_index = ctx.type_index;
     if type_def.subtypes.is_empty() {
         let pre_count = errors.len();
         let saved = scope_context.as_ref().map(|sc| sc.save());
@@ -64,6 +60,71 @@ pub(crate) fn validate_with_type(
         return;
     }
 
+    let (merged, matched_subtype_names, push_scope) =
+        merged_rules_for_type(ctx, type_def, children, inner_rules, node_key);
+
+    // Step 3: if no subtypes matched and there are no base rules, there's nothing to validate.
+    // This handles the case where a type is defined purely via subtypes: a script object that
+    // doesn't match any subtype discriminator is silently accepted.
+    if matched_subtype_names.is_empty() && merged.is_empty() {
+        return;
+    }
+
+    let saved = scope_context.as_ref().map(|sc| sc.save());
+    if let Some(sc) = scope_context.as_mut() {
+        seed_root_scope(sc, type_def, push_scope, node_key, ruleset, game);
+    }
+
+    // Step 5: validate children once against the merged rule set.
+    let pre_count = errors.len();
+    validate_children(
+        ctx,
+        children,
+        merged.as_ref(),
+        scope_context,
+        node_pos,
+        errors,
+    );
+
+    // Item 9: warning_only — downgrade all newly-added errors to warnings (F# RuleValidationService.fs:916).
+    if type_def.warning_only {
+        for err in errors[pre_count..].iter_mut() {
+            if err.severity == ErrorSeverity::Error {
+                err.severity = ErrorSeverity::Warning;
+            }
+        }
+    }
+
+    if let (Some(saved), Some(sc)) = (saved, scope_context.as_mut()) {
+        sc.restore(saved);
+    }
+}
+
+/// `(merged rules, matched subtype names, push_scope)` — see [`merged_rules_for_type`].
+pub(crate) type MergedTypeRules<'a> = (
+    Cow<'a, [(RuleType, Options)]>,
+    Vec<&'a str>,
+    Option<&'a str>,
+);
+
+/// Resolve the effective rule set for an entity of `type_def`: determine which
+/// subtypes match the children, merge their rules with the base rules, and pick
+/// the subtype push_scope. Shared between validation (above) and the
+/// position resolver (`crate::position`) so the two can't drift.
+///
+/// Returns `(merged rules, matched subtype names, push_scope)`. With no
+/// subtypes this is just `(inner_rules, [], None)`.
+pub(crate) fn merged_rules_for_type<'a>(
+    ctx: &ValidationCtx,
+    type_def: &'a TypeDefinition,
+    children: &[Child],
+    inner_rules: &'a [(RuleType, Options)],
+    node_key: Option<&str>,
+) -> MergedTypeRules<'a> {
+    if type_def.subtypes.is_empty() {
+        return (Cow::Borrowed(inner_rules), Vec::new(), None);
+    }
+
     // Step 1: determine which subtypes match.
     // A subtype matches when:
     //   (a) type_key_field is None, OR the children contain a field whose key equals type_key_field
@@ -73,7 +134,13 @@ pub(crate) fn validate_with_type(
     let mut matched_subtype_names: Vec<&str> = Vec::new();
     for subtype in &type_def.subtypes {
         if subtype_matches(
-            subtype, children, ast, table, enum_map, node_key, type_index,
+            subtype,
+            children,
+            ctx.ast,
+            ctx.table,
+            ctx.enum_map,
+            node_key,
+            ctx.type_index,
         ) {
             matched_subtype_names.push(subtype.name.as_str());
         }
@@ -162,13 +229,6 @@ pub(crate) fn validate_with_type(
         }
     }
 
-    // Step 3: if no subtypes matched and there are no base rules, there's nothing to validate.
-    // This handles the case where a type is defined purely via subtypes: a script object that
-    // doesn't match any subtype discriminator is silently accepted.
-    if matched_subtype_names.is_empty() && merged.is_empty() {
-        return;
-    }
-
     // Step 4: pick push_scope from the first matching subtype that has one.
     let push_scope: Option<&str> = type_def
         .subtypes
@@ -176,34 +236,7 @@ pub(crate) fn validate_with_type(
         .filter(|s| matched_subtype_names.contains(&s.name.as_str()))
         .find_map(|s| s.push_scope.as_deref());
 
-    let saved = scope_context.as_ref().map(|sc| sc.save());
-    if let Some(sc) = scope_context.as_mut() {
-        seed_root_scope(sc, type_def, push_scope, node_key, ruleset, game);
-    }
-
-    // Step 5: validate children once against the merged rule set.
-    let pre_count = errors.len();
-    validate_children(
-        ctx,
-        children,
-        merged.as_ref(),
-        scope_context,
-        node_pos,
-        errors,
-    );
-
-    // Item 9: warning_only — downgrade all newly-added errors to warnings (F# RuleValidationService.fs:916).
-    if type_def.warning_only {
-        for err in errors[pre_count..].iter_mut() {
-            if err.severity == ErrorSeverity::Error {
-                err.severity = ErrorSeverity::Warning;
-            }
-        }
-    }
-
-    if let (Some(saved), Some(sc)) = (saved, scope_context.as_mut()) {
-        sc.restore(saved);
-    }
+    (merged, matched_subtype_names, push_scope)
 }
 
 /// True when a rule's left-hand field is `IgnoreField` (`key = ignore_field`),
@@ -353,7 +386,7 @@ where
 /// `SpecificField` equal to `key`, ONLY those are returned — a specific rule
 /// (e.g. `milestones = { ... }`) wins over catch-all rules (`enum[x] = ...`,
 /// `<type> = ...`, `alias_name[...]`) that match the same key permissively.
-fn matching_candidates<'a, F>(
+pub(crate) fn matching_candidates<'a, F>(
     rules: &'a [(RuleType, Options)],
     key: &str,
     ruleset: &RuleSet,
@@ -391,7 +424,9 @@ where
 /// branch is accepted, mirroring F#'s "a field in any matching subtype is not
 /// unexpected". This is permissive across non-active branches, which is the safe
 /// direction (no false-positive "Unexpected field").
-fn flatten_nested_subtype_rules(rules: &[(RuleType, Options)]) -> Vec<(RuleType, Options)> {
+pub(crate) fn flatten_nested_subtype_rules(
+    rules: &[(RuleType, Options)],
+) -> Vec<(RuleType, Options)> {
     let mut out: Vec<(RuleType, Options)> = Vec::with_capacity(rules.len());
     for (rt, opts) in rules {
         // Both positive and negative (`subtype[!x]`) branches contribute fields by
@@ -836,7 +871,7 @@ pub(crate) fn validate_children(
     }
 }
 
-fn rule_matches_leaf_key(
+pub(crate) fn rule_matches_leaf_key(
     rule_type: &RuleType,
     key: &str,
     ruleset: &RuleSet,
@@ -989,7 +1024,7 @@ fn alias_pattern_matches(
     })
 }
 
-fn field_matches_key(
+pub(crate) fn field_matches_key(
     field: &NewField,
     key: &str,
     ruleset: &RuleSet,
@@ -1108,32 +1143,19 @@ fn field_to_key(field: &NewField) -> Option<String> {
     }
 }
 
-/// Validate an aliased usage (`alias_name[cat] = ...`) against EVERY overload
-/// declared as `alias[cat:key]`.
+/// Gather every alias overload `alias[cat:key]` that the usage `key` resolves
+/// to: exact name, lowercase retry, `<type>`/`value[..]`/`enum[..]` patterns,
+/// and the category's `scope_field` entry for scope-switching keys.
 ///
-/// CWT lets the same alias name be defined many times (e.g. two
-/// `alias[trigger:original_tag]` — one `scope[country]`, one `enum[country_tags]`
-/// — or ~40 `alias[ai_strategy_rule:ai_strategy]` blocks keyed by `type`). A usage
-/// is valid if it matches ANY overload (F# cwtools semantics). We therefore try
-/// each candidate into a throwaway buffer and accept on the first clean match;
-/// only when none match do we surface the closest (fewest-errors) candidate's
-/// errors, which is also how the `type = ...` discriminator naturally wins.
-#[allow(clippy::too_many_arguments)]
-fn validate_alias_usage(
-    ctx: &ValidationCtx,
+/// Shared between alias validation (below) and the position resolver
+/// (`crate::position`) so completion/hover resolve aliases exactly like the
+/// validator does.
+pub(crate) fn alias_overloads<'a>(
+    ruleset: &'a RuleSet,
+    type_index: Option<&cwtools_index::TypeIndex>,
     category: &str,
     key: &str,
-    leaf: Option<&cwtools_parser::ast::Leaf>,
-    clause_children: Option<&[Child]>,
-    // Position to anchor diagnostics when `leaf` is None (node-form usage).
-    fallback_pos: (u32, u16),
-    scope_context: &mut Option<ScopeContext>,
-    errors: &mut Vec<ValidationError>,
-) {
-    let table = ctx.table;
-    let file_path = ctx.file_path;
-    let ruleset = ctx.ruleset;
-    let type_index = ctx.type_index;
+) -> Vec<&'a (RuleType, Options)> {
     // Gather candidate overloads via the precomputed alias index (O(1) exact +
     // O(patterns)) rather than scanning every alias.
     let alias_key = format!("{}:{}", category, key);
@@ -1169,6 +1191,35 @@ fn validate_alias_usage(
             overloads.push(&ruleset.aliases[sf_idx].1);
         }
     }
+    overloads
+}
+
+/// Validate an aliased usage (`alias_name[cat] = ...`) against EVERY overload
+/// declared as `alias[cat:key]`.
+///
+/// CWT lets the same alias name be defined many times (e.g. two
+/// `alias[trigger:original_tag]` — one `scope[country]`, one `enum[country_tags]`
+/// — or ~40 `alias[ai_strategy_rule:ai_strategy]` blocks keyed by `type`). A usage
+/// is valid if it matches ANY overload (F# cwtools semantics). We therefore try
+/// each candidate into a throwaway buffer and accept on the first clean match;
+/// only when none match do we surface the closest (fewest-errors) candidate's
+/// errors, which is also how the `type = ...` discriminator naturally wins.
+#[allow(clippy::too_many_arguments)]
+fn validate_alias_usage(
+    ctx: &ValidationCtx,
+    category: &str,
+    key: &str,
+    leaf: Option<&cwtools_parser::ast::Leaf>,
+    clause_children: Option<&[Child]>,
+    // Position to anchor diagnostics when `leaf` is None (node-form usage).
+    fallback_pos: (u32, u16),
+    scope_context: &mut Option<ScopeContext>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let table = ctx.table;
+    let file_path = ctx.file_path;
+    let ruleset = ctx.ruleset;
+    let overloads = alias_overloads(ruleset, ctx.type_index, category, key);
     if overloads.is_empty() {
         // Category unloaded or no such alias key — accept silently, matching the
         // permissive key-match in field_matches_key.
