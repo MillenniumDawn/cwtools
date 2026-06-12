@@ -13,7 +13,6 @@ use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::{NewField, RuleSet, RuleType, TypeType, ValueType};
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::position::rules_at_pos;
-use cwtools_validation::{Prepared, build_enum_map, checks_from_env};
 
 mod completion;
 mod config;
@@ -77,10 +76,13 @@ pub(crate) struct Config {
     /// from `ignoreDirectories` in `initializationOptions` and
     /// `workspace/didChangeConfiguration`.
     pub(crate) ignore_dir_patterns: Vec<String>,
+    pub(crate) scope_checks: bool,
+    pub(crate) var_checks: bool,
 }
 
 impl Config {
     fn new() -> Self {
+        let (scope_checks, var_checks) = cwtools_validation::checks_from_env();
         Self {
             language: "paradox".to_string(),
             workspace_uri: None,
@@ -89,6 +91,8 @@ impl Config {
             loc_languages: None,
             ignore_file_patterns: Vec::new(),
             ignore_dir_patterns: Vec::new(),
+            scope_checks,
+            var_checks,
         }
     }
 
@@ -273,7 +277,10 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
     ) -> Option<RuleCursorInfo> {
-        let game = self.state.config.read().game();
+        let (game, scope_checks, var_checks) = {
+            let cfg = self.state.config.read();
+            (cfg.game(), cfg.scope_checks, cfg.var_checks)
+        };
         // Lock order: documents -> rules -> info_service (see DocumentState).
         let docs = self.state.documents.lock();
         let rules_guard = self.state.rules.read();
@@ -282,20 +289,17 @@ impl Backend {
         let rs = rules_guard.ruleset.as_ref()?;
         let ast = doc.ast.as_ref()?;
 
-        let enum_map = build_enum_map(rs);
-        let (scope_checks, var_checks) = checks_from_env();
-        let prepared = Prepared {
-            ruleset: rs,
-            table: &self.state.string_table,
+        let prepared = crate::validate::make_prepared(
+            rs,
+            &self.state.string_table,
             game,
-            type_index: Some(&info_guard.type_index),
-            modifier_keys: Some(&rules_guard.modifier_keys),
-            loc_index: None,
-            registry: rules_guard.scope_registry.as_ref(),
-            enum_map: &enum_map,
+            &info_guard.type_index,
+            &rules_guard.modifier_keys,
+            None,
+            rules_guard.scope_registry.as_ref(),
             scope_checks,
             var_checks,
-        };
+        );
         let rctx = rules_at_pos(
             ast,
             logical_path,

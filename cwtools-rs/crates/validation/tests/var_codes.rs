@@ -10,7 +10,7 @@ use cwtools_index::TypeIndex;
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::{Prepared, build_enum_map, build_scope_registry_arc, validate_prepared};
+use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
 
 const RULES: &str = r#"
 types = { type[foo] = { path = "game/common/foo" } }
@@ -31,7 +31,6 @@ fn codes(script: &str, vars: &[&str]) -> Vec<String> {
     for v in vars {
         idx.var_index.add_name(v);
     }
-    let enum_map = build_enum_map(&ruleset);
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(
         &parsed,
@@ -44,7 +43,6 @@ fn codes(script: &str, vars: &[&str]) -> Vec<String> {
             modifier_keys: None,
             loc_index: None,
             registry: registry.as_ref(),
-            enum_map: &enum_map,
             scope_checks: true,
             var_checks: true,
         },

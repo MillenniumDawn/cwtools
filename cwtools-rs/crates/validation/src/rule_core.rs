@@ -7,7 +7,6 @@ use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 use crate::common::*;
 use crate::ctx::ValidationCtx;
@@ -139,7 +138,7 @@ pub(crate) fn merged_rules_for_type<'a>(
             children,
             ctx.ast,
             ctx.table,
-            ctx.enum_map,
+            ctx.ruleset,
             node_key,
             ctx.type_index,
         ) {
@@ -457,7 +456,6 @@ pub(crate) fn validate_children(
     errors: &mut Vec<ValidationError>,
 ) {
     let ast = ctx.ast;
-    let enum_map = ctx.enum_map;
     let table = ctx.table;
     let file_path = ctx.file_path;
     let ruleset = ctx.ruleset;
@@ -518,7 +516,7 @@ pub(crate) fn validate_children(
                     // producing a spurious "appears 0 time(s)" cardinality error.
                     for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
                         if let RuleType::LeafValueRule { right } = rule_type
-                            && field_matches_value(right, &lv.value, table, enum_map)
+                            && field_matches_value(right, &lv.value, table, ruleset)
                         {
                             leafvalue_counts[rule_idx] += 1;
                         }
@@ -656,7 +654,7 @@ pub(crate) fn validate_children(
                     let mut matched = false;
                     for (rule_type, _opts) in rules {
                         if let RuleType::LeafValueRule { right } = rule_type
-                            && field_matches_value(right, &lv.value, table, enum_map)
+                            && field_matches_value(right, &lv.value, table, ruleset)
                         {
                             // VariableGetField bare read: validate against the
                             // project-wide variable index (CW246), mirroring the
@@ -1416,7 +1414,6 @@ fn validate_leaf(
     errors: &mut Vec<ValidationError>,
 ) {
     let table = ctx.table;
-    let enum_map = ctx.enum_map;
     let file_path = ctx.file_path;
     let type_index = ctx.type_index;
     if let RuleType::LeafRule { right, .. } = rule_type {
@@ -1654,7 +1651,7 @@ fn validate_leaf(
             validate_scope_target(ctx, &value, expected, leaf, file_path, errors);
         }
 
-        if !field_matches_value(right, &leaf.value, table, enum_map) {
+        if !field_matches_value(right, &leaf.value, table, ctx.ruleset) {
             let expected = field_to_description(right);
             let actual = leaf_value_to_string(&leaf.value, table);
             let key = table
@@ -1678,7 +1675,7 @@ pub(crate) fn field_matches_value(
     field: &NewField,
     value: &Value,
     table: &StringTable,
-    enum_map: &HashMap<&str, &EnumDefinition>,
+    ruleset: &RuleSet,
 ) -> bool {
     // Item 2: VALUE-VALIDATOR BYPASSES (F# FieldValidators.fs:82-83, 836-839).
     // Before any type-specific checks, accept scripted variables (@...), localisation
@@ -1747,13 +1744,13 @@ pub(crate) fn field_matches_value(
         // (e.g. province ids) are compared by their string form.
         (NewField::ValueField(ValueType::Enum(enum_name)), Value::String(t))
         | (NewField::ValueField(ValueType::Enum(enum_name)), Value::QString(t)) => {
-            with_match_text(table, t, |text| enum_contains(enum_map, enum_name, text))
+            with_match_text(table, t, |text| enum_contains(ruleset, enum_name, text))
         }
         (NewField::ValueField(ValueType::Enum(enum_name)), Value::Int(i)) => {
-            enum_contains(enum_map, enum_name, &i.to_string())
+            enum_contains(ruleset, enum_name, &i.to_string())
         }
         (NewField::ValueField(ValueType::Enum(enum_name)), Value::Float(f)) => {
-            enum_contains(enum_map, enum_name, &f.to_string())
+            enum_contains(ruleset, enum_name, &f.to_string())
         }
 
         // --- Percent (item 3): value ends with '%' or is a number ---

@@ -5,7 +5,7 @@ use cwtools_localization::LocIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub mod error_codes;
 pub mod per_game;
@@ -196,10 +196,9 @@ pub fn validate_ast_with_loc(
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
 ) -> Vec<ValidationError> {
-    // Single-file/test entry point: build the per-run shared state (enum_map +
-    // scope registry) here and delegate. Hot multi-file callers should instead
+    // Single-file/test entry point: build the per-run shared state (scope
+    // registry) here and delegate. Hot multi-file callers should instead
     // build a `Prepared` ONCE outside their loop and call `validate_prepared`.
-    let enum_map = build_enum_map(ruleset);
     let registry = build_scope_registry_arc(ruleset, game);
     let (scope_checks, var_checks) = checks_from_env();
     validate_prepared(
@@ -213,19 +212,16 @@ pub fn validate_ast_with_loc(
             modifier_keys,
             loc_index,
             registry: registry.as_ref(),
-            enum_map: &enum_map,
             scope_checks,
             var_checks,
         },
     )
 }
 
-/// Build the `enum name -> definition` lookup used throughout validation. It
-/// borrows from `ruleset`, so the caller must keep `ruleset` alive for the
-/// returned map's lifetime. Cheap to call but pointless to repeat per file, so
-/// hot multi-file loops build it once and reuse it.
-pub fn build_enum_map(ruleset: &RuleSet) -> HashMap<&str, &EnumDefinition> {
-    ruleset.enums.iter().map(|e| (e.key.as_str(), e)).collect()
+/// Look up an enum definition by name directly from the ruleset.
+pub fn enum_def<'a>(ruleset: &'a RuleSet, name: &str) -> Option<&'a EnumDefinition> {
+    let idx = *ruleset.enum_by_name.get(name)?;
+    ruleset.enums.get(idx)
 }
 
 /// Build the config-driven scope/link registry once, wrapped in an `Arc` so it
@@ -263,7 +259,6 @@ pub struct Prepared<'a> {
     pub modifier_keys: Option<&'a HashSet<String>>,
     pub loc_index: Option<&'a LocIndex>,
     pub registry: Option<&'a std::sync::Arc<ScopeRegistry>>,
-    pub enum_map: &'a HashMap<&'a str, &'a EnumDefinition>,
     pub scope_checks: bool,
     pub var_checks: bool,
 }
@@ -320,7 +315,6 @@ pub fn validate_prepared(
         modifier_keys,
         loc_index,
         registry,
-        enum_map,
         scope_checks,
         var_checks,
     } = *prepared;
@@ -332,7 +326,6 @@ pub fn validate_prepared(
         ast,
         ruleset,
         table,
-        enum_map,
         file_path,
         game,
         type_index,

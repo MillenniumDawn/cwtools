@@ -6,7 +6,6 @@ use tower_lsp::lsp_types::*;
 use cwtools_info::InfoService;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType, ValueType};
 use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
-use cwtools_validation::{Prepared, build_enum_map, checks_from_env};
 
 use crate::Backend;
 use crate::paths::{line_value_key, logical_path_from_uri};
@@ -25,9 +24,14 @@ impl Backend {
         // Try context-aware completions first: resolve the rules at the cursor
         // with the validation engine's own descent (aliases, typed keys,
         // subtypes, skip_root_key — see cwtools_validation::position).
-        let (ws_uri, language) = {
+        let (ws_uri, language, scope_checks, var_checks) = {
             let cfg = self.state.config.read();
-            (cfg.workspace_uri.clone(), cfg.language.clone())
+            (
+                cfg.workspace_uri.clone(),
+                cfg.language.clone(),
+                cfg.scope_checks,
+                cfg.var_checks,
+            )
         };
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
@@ -57,21 +61,18 @@ impl Backend {
             if let (Some(doc), Some(rs)) = (docs.get(&uri), rules_guard.ruleset.as_ref())
                 && let Some(ast) = &doc.ast
             {
-                let enum_map = build_enum_map(rs);
                 let game = cwtools_game::constants::Game::from_str(&language);
-                let (scope_checks, var_checks) = checks_from_env();
-                let prepared = Prepared {
-                    ruleset: rs,
-                    table: &self.state.string_table,
+                let prepared = crate::validate::make_prepared(
+                    rs,
+                    &self.state.string_table,
                     game,
-                    type_index: Some(&info_guard.type_index),
-                    modifier_keys: Some(&rules_guard.modifier_keys),
-                    loc_index: None,
-                    registry: rules_guard.scope_registry.as_ref(),
-                    enum_map: &enum_map,
+                    &info_guard.type_index,
+                    &rules_guard.modifier_keys,
+                    None,
+                    rules_guard.scope_registry.as_ref(),
                     scope_checks,
                     var_checks,
-                };
+                );
                 match rules_at_pos(ast, &logical_path, &prepared, lsp_line, lsp_col) {
                     // Outside any known entity — offer root-type snippets.
                     None => Some(root_type_snippets(rs, &logical_path)),

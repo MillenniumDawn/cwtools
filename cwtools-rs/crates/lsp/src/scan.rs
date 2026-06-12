@@ -5,15 +5,15 @@ use std::sync::atomic::Ordering;
 use tower_lsp::lsp_types::*;
 
 use cwtools_rules::rules_types::RuleSet;
-use cwtools_validation::{Prepared, build_enum_map, build_modifier_keys, checks_from_env};
+use cwtools_validation::build_modifier_keys;
 
 use crate::paths::{
     default_cache_dir, discover_vanilla_dir, logical_path_from_uri, path_to_uri, strip_loc_quotes,
     uri_to_path_str,
 };
 use crate::validate::{
-    loc_diag_to_validation_error, parse_error_to_diagnostic, validate_parsed_with_indexes,
-    validation_error_to_diagnostic,
+    loc_diag_to_validation_error, make_prepared, parse_error_to_diagnostic,
+    validate_parsed_with_indexes, validation_error_to_diagnostic,
 };
 use crate::workspace_cache;
 use crate::{Backend, LoadingBar, UpdateFileList};
@@ -379,6 +379,10 @@ impl Backend {
         // `loc_index` read guard (both `&...` references are `Sync`), with no
         // async and no client calls inside the rayon section. Publishing is
         // async and stays out of the parallel block.
+        let (scope_checks, var_checks) = {
+            let cfg = self.state.config.read();
+            (cfg.scope_checks, cfg.var_checks)
+        };
         use rayon::prelude::*;
         let results: Vec<(String, Vec<Diagnostic>)> = {
             let info_guard = self.state.info_service.read();
@@ -386,28 +390,21 @@ impl Backend {
             let type_index = &info_guard.type_index;
             let loc_index = loc_guard.as_ref();
             let registry = scan_registry.as_ref();
-            // Build enum_map once for the batch; it borrows `scan_ruleset`,
-            // which is owned for the whole parallel section above.
-            let enum_map = scan_ruleset.as_ref().map(|rs| build_enum_map(rs));
-            let (scope_checks, var_checks) = checks_from_env();
             // One Prepared for the whole batch (None if the ruleset isn't loaded).
             // It is Copy + all-borrows, so it is shared freely across rayon threads.
-            let prepared =
-                scan_ruleset
-                    .as_ref()
-                    .zip(enum_map.as_ref())
-                    .map(|(ruleset, enum_map)| Prepared {
-                        ruleset,
-                        table: &self.state.string_table,
-                        game: scan_game,
-                        type_index: Some(type_index),
-                        modifier_keys: Some(&modifier_keys_snap),
-                        loc_index,
-                        registry,
-                        enum_map,
-                        scope_checks,
-                        var_checks,
-                    });
+            let prepared = scan_ruleset.as_ref().map(|ruleset| {
+                make_prepared(
+                    ruleset,
+                    &self.state.string_table,
+                    scan_game,
+                    type_index,
+                    &modifier_keys_snap,
+                    loc_index,
+                    registry,
+                    scope_checks,
+                    var_checks,
+                )
+            });
 
             files_to_validate
                 .par_iter()

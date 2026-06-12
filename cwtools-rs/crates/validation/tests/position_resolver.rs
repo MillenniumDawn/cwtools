@@ -10,7 +10,7 @@ use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::position::{RuleContext, rules_at_pos};
-use cwtools_validation::{Prepared, build_enum_map, build_scope_registry_arc};
+use cwtools_validation::{Prepared, build_scope_registry_arc};
 
 /// Position of `marker`'s first char in `script`: 1-based line, 0-based col
 /// (the parser/LSP convention).
@@ -52,7 +52,6 @@ fn resolve(
     let parsed_cwt = parse_string(cwt, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let parsed = parse_string(script, &table).unwrap();
-    let enum_map = build_enum_map(&ruleset);
     let registry = build_scope_registry_arc(&ruleset, None);
     let prepared = Prepared {
         ruleset: &ruleset,
@@ -62,7 +61,6 @@ fn resolve(
         modifier_keys: None,
         loc_index: None,
         registry: registry.as_ref(),
-        enum_map: &enum_map,
         scope_checks: true,
         var_checks: false,
     };
@@ -406,7 +404,6 @@ alias[trigger:always] = bool
     let parsed_cwt = parse_string(cwt, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let parsed = parse_string(&script, &table).unwrap();
-    let enum_map = build_enum_map(&ruleset);
     let prepared = Prepared {
         ruleset: &ruleset,
         table: &table,
@@ -415,7 +412,6 @@ alias[trigger:always] = bool
         modifier_keys: None,
         loc_index: None,
         registry: None,
-        enum_map: &enum_map,
         scope_checks: true,
         var_checks: false,
     };

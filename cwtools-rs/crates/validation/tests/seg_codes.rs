@@ -8,7 +8,7 @@ use cwtools_game::constants::Game;
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::{Prepared, build_enum_map, build_scope_registry_arc, validate_prepared};
+use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
 use std::collections::HashSet;
 
 fn codes_hoi4(cwt: &str, script: &str) -> Vec<String> {
@@ -16,7 +16,6 @@ fn codes_hoi4(cwt: &str, script: &str) -> Vec<String> {
     let parsed_cwt = parse_string(cwt, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let parsed = parse_string(script, &table).unwrap();
-    let enum_map = build_enum_map(&ruleset);
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(
         &parsed,
@@ -29,7 +28,6 @@ fn codes_hoi4(cwt: &str, script: &str) -> Vec<String> {
             modifier_keys: None,
             loc_index: None,
             registry: registry.as_ref(),
-            enum_map: &enum_map,
             scope_checks: true,
             var_checks: false,
         },
@@ -183,7 +181,6 @@ foo = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let enum_map = build_enum_map(&ruleset);
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(
         &parsed,
@@ -196,7 +193,6 @@ foo = {
             modifier_keys: Some(&modifiers),
             loc_index: None,
             registry: registry.as_ref(),
-            enum_map: &enum_map,
             scope_checks: true,
             var_checks: false,
         },
@@ -226,7 +222,6 @@ foo = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let enum_map = build_enum_map(&ruleset);
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(
         &parsed,
@@ -239,7 +234,6 @@ foo = {
             modifier_keys: Some(&modifiers),
             loc_index: None,
             registry: registry.as_ref(),
-            enum_map: &enum_map,
             scope_checks: true,
             var_checks: false,
         },

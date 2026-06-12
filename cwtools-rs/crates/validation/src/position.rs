@@ -93,7 +93,6 @@ pub fn rules_at_pos(
         ast,
         ruleset,
         table,
-        enum_map: prepared.enum_map,
         file_path,
         game: prepared.game,
         type_index: prepared.type_index,

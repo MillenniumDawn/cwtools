@@ -6,12 +6,35 @@ use tower_lsp::lsp_types::*;
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::RuleSet;
-use cwtools_validation::{
-    Prepared, ValidationError, build_enum_map, checks_from_env, validate_prepared,
-};
+use cwtools_validation::{Prepared, ValidationError, validate_prepared};
 
 use crate::Backend;
 use crate::paths::{logical_path_from_uri, uri_to_path_str};
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_prepared<'a>(
+    ruleset: &'a cwtools_rules::rules_types::RuleSet,
+    table: &'a cwtools_string_table::string_table::StringTable,
+    game: Option<cwtools_game::constants::Game>,
+    type_index: &'a cwtools_info::TypeIndex,
+    modifier_keys: &'a std::collections::HashSet<String>,
+    loc_index: Option<&'a cwtools_localization::LocIndex>,
+    registry: Option<&'a std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
+    scope_checks: bool,
+    var_checks: bool,
+) -> Prepared<'a> {
+    Prepared {
+        ruleset,
+        table,
+        game,
+        type_index: Some(type_index),
+        modifier_keys: Some(modifier_keys),
+        loc_index,
+        registry,
+        scope_checks,
+        var_checks,
+    }
+}
 
 /// Per-file diagnostic cap. Beyond this, a file's errors are truncated with a
 /// summary marker so one broken file can't flood the editor.
@@ -247,10 +270,9 @@ impl Backend {
     }
 
     /// Validate an already-parsed document against the (already-built) workspace
-    /// index, with the ruleset already locked and the per-run scope registry /
-    /// enum_map prebuilt by the caller. Multi-file callers (the workspace scan,
-    /// the dependent sweep) build those ONCE outside their loop and reuse them.
-    #[allow(clippy::too_many_arguments)]
+    /// index, with the ruleset already locked and the per-run scope registry
+    /// prebuilt by the caller. Multi-file callers (the workspace scan, the
+    /// dependent sweep) build those ONCE outside their loop and reuse them.
     pub(crate) fn validate_parsed_prebuilt(
         &self,
         uri: &str,
@@ -259,27 +281,25 @@ impl Backend {
         ruleset: &RuleSet,
         game: Option<cwtools_game::constants::Game>,
         registry: Option<&std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
-        enum_map: &std::collections::HashMap<&str, &cwtools_rules::rules_types::EnumDefinition>,
     ) -> Vec<Diagnostic> {
         let info_guard = self.state.info_service.read();
         let loc_guard = self.state.loc_index.read();
-        let (scope_checks, var_checks) = checks_from_env();
-        validate_parsed_with_indexes(
-            uri,
-            parsed,
-            &Prepared {
-                ruleset,
-                table: &self.state.string_table,
-                game,
-                type_index: Some(&info_guard.type_index),
-                modifier_keys: Some(modifier_keys),
-                loc_index: loc_guard.as_ref(),
-                registry,
-                enum_map,
-                scope_checks,
-                var_checks,
-            },
-        )
+        let (scope_checks, var_checks) = {
+            let cfg = self.state.config.read();
+            (cfg.scope_checks, cfg.var_checks)
+        };
+        let prepared = make_prepared(
+            ruleset,
+            &self.state.string_table,
+            game,
+            &info_guard.type_index,
+            modifier_keys,
+            loc_guard.as_ref(),
+            registry,
+            scope_checks,
+            var_checks,
+        );
+        validate_parsed_with_indexes(uri, parsed, &prepared)
     }
 
     /// Parse and validate a single document.
@@ -443,16 +463,14 @@ impl Backend {
             "revalidate_open_dependents"
         );
         let game = self.state.config.read().game();
-        // Validate every dependent synchronously, then publish. The enum_map
-        // borrows the ruleset, so build it ONCE for the whole sweep (cheap, but
-        // pointless to repeat per file). No await is held across the rules lock.
-        // The single `rules` read guard covers the ruleset, the cached scope
-        // registry, and the modifier-key set (none change during the sweep). Do
-        // NOT lock documents inside this block (ABBA: request handlers take
-        // documents then rules; we must take rules then nothing-or-documents-after).
+        // Validate every dependent synchronously, then publish. No await is held
+        // across the rules lock. The single `rules` read guard covers the ruleset,
+        // the cached scope registry, and the modifier-key set (none change during
+        // the sweep). Do NOT lock documents inside this block (ABBA: request
+        // handlers take documents then rules; we must take rules then
+        // nothing-or-documents-after).
         let validated: Vec<(String, i32, Vec<Diagnostic>)> = {
             let rules_guard = self.state.rules.read();
-            let enum_map = rules_guard.ruleset.as_ref().map(|rs| build_enum_map(rs));
             let mut out = Vec::with_capacity(others.len());
             for (uri, snapshot_version, ast) in others {
                 // Preempt: a newer edit arrived. Save our changed_names into the
@@ -469,17 +487,16 @@ impl Backend {
                     // set and, combined with a `None` scope, covers all dependents).
                     return;
                 }
-                let diagnostics = match (rules_guard.ruleset.as_ref(), enum_map.as_ref()) {
-                    (Some(ruleset), Some(enum_map)) => self.validate_parsed_prebuilt(
+                let diagnostics = match rules_guard.ruleset.as_ref() {
+                    Some(ruleset) => self.validate_parsed_prebuilt(
                         &uri,
                         &ast,
                         &rules_guard.modifier_keys,
                         ruleset,
                         game,
                         rules_guard.scope_registry.as_ref(),
-                        enum_map,
                     ),
-                    _ => ast.errors.iter().map(parse_error_to_diagnostic).collect(),
+                    None => ast.errors.iter().map(parse_error_to_diagnostic).collect(),
                 };
                 out.push((uri, snapshot_version, diagnostics));
             }
@@ -593,26 +610,23 @@ impl Backend {
                         let type_index = &info_guard.type_index;
                         let loc_guard = self.state.loc_index.read();
                         // Single-file path: the scope registry is cached (built
-                        // once at ruleset load); the enum_map borrows the ruleset
-                        // and is cheap, so build it inline.
-                        let enum_map = build_enum_map(ruleset);
-                        let (scope_checks, var_checks) = checks_from_env();
-                        let mut errs = validate_prepared(
-                            &parsed,
-                            uri,
-                            &Prepared {
-                                ruleset,
-                                table: &self.state.string_table,
-                                game,
-                                type_index: Some(type_index),
-                                modifier_keys: Some(&rules_guard.modifier_keys),
-                                loc_index: loc_guard.as_ref(),
-                                registry: rules_guard.scope_registry.as_ref(),
-                                enum_map: &enum_map,
-                                scope_checks,
-                                var_checks,
-                            },
+                        // once at ruleset load).
+                        let (scope_checks, var_checks) = {
+                            let cfg = self.state.config.read();
+                            (cfg.scope_checks, cfg.var_checks)
+                        };
+                        let prepared = make_prepared(
+                            ruleset,
+                            &self.state.string_table,
+                            game,
+                            type_index,
+                            &rules_guard.modifier_keys,
+                            loc_guard.as_ref(),
+                            rules_guard.scope_registry.as_ref(),
+                            scope_checks,
+                            var_checks,
                         );
+                        let mut errs = validate_prepared(&parsed, uri, &prepared);
                         drop(loc_guard);
                         drop(info_guard);
                         let elapsed = start.elapsed();

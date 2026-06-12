@@ -5,7 +5,6 @@ use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
-use std::collections::HashMap;
 
 use cwtools_error_codes::ErrorCode;
 pub use cwtools_error_codes::ErrorSeverity;
@@ -174,11 +173,11 @@ pub(crate) fn is_datetime_shape(s: &str) -> bool {
 /// tech folders, idea tokens, …) and are treated as advisory — any non-empty
 /// value is accepted, because the CWT rules rarely enumerate every member.
 pub(crate) fn enum_contains(
-    enum_map: &HashMap<&str, &EnumDefinition>,
+    ruleset: &cwtools_rules::rules_types::RuleSet,
     enum_name: &str,
     value: &str,
 ) -> bool {
-    match enum_map.get(enum_name) {
+    match crate::enum_def(ruleset, enum_name) {
         Some(def) if !def.values.is_empty() => {
             // Enum membership is case-insensitive (F# lowercases both the enum
             // values and the checked key — FieldValidators.fs `getLowerKey` +
