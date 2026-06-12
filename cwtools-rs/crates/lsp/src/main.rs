@@ -217,6 +217,12 @@ struct DocumentState {
     /// loc-key index (workspace + vanilla) for CW100/CW122 on config files and
     /// for scope-aware loc-command checks. Rebuilt on each full workspace scan.
     loc_index: parking_lot::RwLock<Option<cwtools_localization::LocIndex>>,
+    /// Display text per loc key (lowercased) → list of (language, display text).
+    /// Built from the LocService during workspace scan so hover can show
+    /// localisation without re-reading loc files. Outer quotes are stripped
+    /// from the desc for cleaner display.
+    #[allow(clippy::type_complexity)]
+    loc_text: parking_lot::RwLock<HashMap<String, Vec<(cwtools_localization::Lang, String)>>>,
     /// languages to validate loc against, from the `localisationLanguages` init
     /// option. `None` = all languages with data (the default). When set, the
     /// missing-translation check and per-file loc checks are scoped to these,
@@ -284,6 +290,7 @@ impl DocumentState {
             vanilla_loc_keys: Mutex::new(None),
             modifier_keys: parking_lot::RwLock::new(HashSet::new()),
             loc_index: parking_lot::RwLock::new(None),
+            loc_text: parking_lot::RwLock::new(HashMap::new()),
             loc_languages: Mutex::new(None),
             cache_dir: Mutex::new(None),
             edit_generation: AtomicU64::new(0),
@@ -659,6 +666,34 @@ fn build_hover_markdown(
     }
 
     parts.join("\n\n")
+}
+
+/// Strip matching outer double quotes from a loc desc string for hover display.
+/// `"Hello"` → `Hello`, `Hello` → `Hello`, `""` → `` (empty).
+fn strip_loc_quotes(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Human-readable language name for hover display.
+fn lang_display_name(lang: cwtools_localization::Lang) -> &'static str {
+    match lang {
+        cwtools_localization::Lang::English => "English",
+        cwtools_localization::Lang::French => "French",
+        cwtools_localization::Lang::German => "German",
+        cwtools_localization::Lang::Spanish => "Spanish",
+        cwtools_localization::Lang::Russian => "Russian",
+        cwtools_localization::Lang::Polish => "Polish",
+        cwtools_localization::Lang::BrazPor => "Brazilian Portuguese",
+        cwtools_localization::Lang::SimpChinese => "Chinese",
+        cwtools_localization::Lang::Japanese => "Japanese",
+        cwtools_localization::Lang::Korean => "Korean",
+        cwtools_localization::Lang::Turkish => "Turkish",
+        cwtools_localization::Lang::Default => "Default",
+    }
 }
 
 // ── Completion context helpers ────────────────────────────────────────────────
@@ -1114,8 +1149,10 @@ fn value_completions(
                     );
                 }
             }
-            // `value[x]` reads: known event targets / variables / collected set
-            // members.
+            // `value[x]` reads and writes both offer the already-collected set
+            // members. A write (`set_country_flag = |`) names a new member, so the
+            // list is a "did you mean an existing one" hint rather than a closed
+            // set; reads (`value[x]`) want exactly these. Same source either way.
             NewField::VariableGetField(ns) | NewField::VariableSetField(ns) => {
                 let source: Vec<String> = match ns.as_str() {
                     "event_target" => info.all_event_targets.iter().cloned().collect(),
@@ -1622,9 +1659,17 @@ impl LanguageServer for Backend {
         // handshake returns promptly.
         let client = self.client.clone();
         let state = self.state.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let backend = Backend { client, state };
             backend.validate_entire_workspace().await;
+        });
+        // Log if the workspace scan panics — without this, a panic is silently
+        // swallowed (the JoinHandle is dropped) and the server runs in a
+        // degraded state with no diagnostics.
+        tokio::spawn(async move {
+            if let Err(e) = handle.await {
+                tracing::error!("validate_entire_workspace panicked: {}", e);
+            }
         });
     }
 
@@ -1810,6 +1855,22 @@ impl LanguageServer for Backend {
                         md.push_str(&format!("\n\nSet to: {}{}", joined, suffix));
                     }
                 }
+                // Append localisation translations if the hovered value is a
+                // known loc key (most common for entity names in scripts).
+                {
+                    let lookup = match &element {
+                        PositionElement::Leaf { value, .. } => value.as_str(),
+                        PositionElement::LeafValue { value } => value.as_str(),
+                    };
+                    let loc_guard = self.state.loc_text.read();
+                    let lower = lookup.to_lowercase();
+                    if let Some(translations) = loc_guard.get(&lower) {
+                        md.push_str("\n\n**Localisation**:");
+                        for (lang, text) in translations {
+                            md.push_str(&format!("\n- {}: {}", lang_display_name(*lang), text));
+                        }
+                    }
+                }
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1826,7 +1887,7 @@ impl LanguageServer for Backend {
                 pos.character as u16,
                 &self.state.string_table,
             ) {
-                let contents = match element {
+                let mut contents = match &element {
                     PositionElement::Leaf { key, value } => {
                         format!("**Field**: `{} = {}`", key, value)
                     }
@@ -1834,6 +1895,25 @@ impl LanguageServer for Backend {
                         format!("**Value**: `{}`", value)
                     }
                 };
+                // Append localisation translations for the hovered value
+                {
+                    let lookup = match &element {
+                        PositionElement::Leaf { value, .. } => value.as_str(),
+                        PositionElement::LeafValue { value } => value.as_str(),
+                    };
+                    let loc_guard = self.state.loc_text.read();
+                    let lower = lookup.to_lowercase();
+                    if let Some(translations) = loc_guard.get(&lower) {
+                        contents.push_str("\n\n**Localisation**:");
+                        for (lang, text) in translations {
+                            contents.push_str(&format!(
+                                "\n- {}: {}",
+                                lang_display_name(*lang),
+                                text
+                            ));
+                        }
+                    }
+                }
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -2600,6 +2680,10 @@ impl LanguageServer for Backend {
                 self.ensure_vanilla_index(true).await;
                 self.merge_pending_vanilla_index();
                 self.rebuild_modifier_keys();
+                // ensure_vanilla_index turns the loading bar on but, unlike a full
+                // workspace scan, this command never reaches the code that turns it
+                // off; do it here so the status bar doesn't spin forever.
+                self.send_loading_bar(false, "").await;
                 Ok(Some(Value::String("Vanilla cache rebuilt.".to_string())))
             }
             // Purge every on-disk cache (parse cache + vanilla caches), drop the
@@ -2612,15 +2696,18 @@ impl LanguageServer for Backend {
                     .clone()
                     .or_else(default_cache_dir);
                 if let Some(dir) = &dir {
-                    let _ = std::fs::remove_dir_all(dir.join("parse-cache"));
-                    if let Ok(entries) = std::fs::read_dir(dir) {
-                        for e in entries.flatten() {
-                            let name = e.file_name();
-                            if name.to_string_lossy().starts_with("vanilla-") {
-                                let _ = std::fs::remove_file(e.path());
+                    let dir = dir.clone();
+                    tokio::task::block_in_place(|| {
+                        let _ = std::fs::remove_dir_all(dir.join("parse-cache"));
+                        if let Ok(entries) = std::fs::read_dir(&dir) {
+                            for e in entries.flatten() {
+                                let name = e.file_name();
+                                if name.to_string_lossy().starts_with("vanilla-") {
+                                    let _ = std::fs::remove_file(e.path());
+                                }
                             }
                         }
-                    }
+                    });
                 }
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
@@ -2740,12 +2827,14 @@ impl Backend {
         // Whole-tree discovery shares file_manager's skip/exclude config so the
         // LSP and CLI agree on what to skip (engine/IDE dirs, free-form text).
         // The user-configured globs extend that baseline.
-        let files_to_validate = cwtools_file_manager::file_manager::walk_workspace_files(
-            &root_path,
-            &extensions,
-            &extra_file_globs,
-            &extra_dir_globs,
-        );
+        let files_to_validate = tokio::task::block_in_place(|| {
+            cwtools_file_manager::file_manager::walk_workspace_files(
+                &root_path,
+                &extensions,
+                &extra_file_globs,
+                &extra_dir_globs,
+            )
+        });
 
         if files_to_validate.is_empty() {
             self.client
@@ -2827,53 +2916,50 @@ impl Backend {
         let mut parsed_files: Vec<Option<ParsedFile>> = Vec::with_capacity(files_to_validate.len());
         let mut cache_hits = 0u64;
         let mut cache_misses = 0u64;
-        for (i, file_path) in files_to_validate.iter().enumerate() {
-            let uri = path_to_uri(file_path);
-            // Open docs are already indexed from their in-memory text; skip so
-            // we don't re-index stale disk content on top of the live version.
-            if open_uris.contains(&uri) {
-                parsed_files.push(None);
-                if i % 50 == 49 {
-                    tokio::task::yield_now().await;
+        // block_in_place tells tokio this thread is about to do synchronous
+        // blocking I/O; the runtime shifts its remaining tasks to other workers
+        // so the LSP request loop is not starved.
+        tokio::task::block_in_place(|| {
+            for file_path in &files_to_validate {
+                let uri = path_to_uri(file_path);
+                // Open docs are already indexed from their in-memory text; skip so
+                // we don't re-index stale disk content on top of the live version.
+                if open_uris.contains(&uri) {
+                    parsed_files.push(None);
+                    continue;
                 }
-                continue;
-            }
-            let parsed = match std::fs::read_to_string(file_path) {
-                Ok(text) => {
-                    // Try the parse cache first.
-                    if let Some((ref cd, fp)) = cache_info
-                        && let Some(parsed) =
-                            workspace_cache::load(cd, fp, &text, &self.state.string_table)
-                    {
-                        self.index_parsed_file(&uri, &parsed);
-                        cache_hits += 1;
-                        Some(parsed)
-                    } else if let Some(parsed) = self.index_document(&uri, &text).await {
-                        // Cache miss — parse + index, then persist for next scan.
-                        if let Some((ref cd, fp)) = cache_info {
-                            workspace_cache::store(
-                                cd,
-                                fp,
-                                &text,
-                                &parsed,
-                                &self.state.string_table,
-                            );
+                let parsed = match std::fs::read_to_string(file_path) {
+                    Ok(text) => {
+                        // Try the parse cache first.
+                        if let Some((ref cd, fp)) = cache_info
+                            && let Some(parsed) =
+                                workspace_cache::load(cd, fp, &text, &self.state.string_table)
+                        {
+                            self.index_parsed_file(&uri, &parsed);
+                            cache_hits += 1;
+                            Some(parsed)
+                        } else if let Some(parsed) = self.index_document_sync(&uri, &text) {
+                            // Cache miss — parse + index, then persist for next scan.
+                            if let Some((ref cd, fp)) = cache_info {
+                                workspace_cache::store(
+                                    cd,
+                                    fp,
+                                    &text,
+                                    &parsed,
+                                    &self.state.string_table,
+                                );
+                            }
+                            cache_misses += 1;
+                            Some(parsed)
+                        } else {
+                            None
                         }
-                        cache_misses += 1;
-                        Some(parsed)
-                    } else {
-                        None
                     }
-                }
-                Err(_) => None,
-            };
-            parsed_files.push(parsed);
-            // Yield every 50 files so LSP requests (hover, completion) can
-            // interleave with the workspace scan.
-            if i % 50 == 49 {
-                tokio::task::yield_now().await;
+                    Err(_) => None,
+                };
+                parsed_files.push(parsed);
             }
-        }
+        });
 
         self.client
             .log_message(
@@ -3131,7 +3217,9 @@ impl Backend {
         };
 
         let root_str = root_path.to_string_lossy().to_string();
-        let (loc_index, mut by_file) = {
+        // block_in_place: the loc service reads and parses hundreds of loc files
+        // from disk — synchronous I/O that must not starve the async executor.
+        let (loc_index, mut by_file, loc_text_map) = tokio::task::block_in_place(|| {
             let service = cwtools_localization::LocService::from_folders(&dir_refs);
             let mut idx = cwtools_localization::LocIndex::build_scoped(
                 &service,
@@ -3163,9 +3251,23 @@ impl Backend {
                     .or_default()
                     .push(validation_error_to_diagnostic(&ve));
             }
-            (idx, by_file)
-        };
+            // Extract per-key display text for hover before dropping the service.
+            let mut lt: HashMap<String, Vec<(cwtools_localization::Lang, String)>> = HashMap::new();
+            for file in service.files() {
+                let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
+                for entry in &file.entries {
+                    let display = strip_loc_quotes(&entry.desc);
+                    if !display.is_empty() {
+                        lt.entry(entry.key.to_lowercase())
+                            .or_default()
+                            .push((lang, display.to_string()));
+                    }
+                }
+            }
+            (idx, by_file, lt)
+        });
         *self.state.loc_index.write() = Some(loc_index);
+        *self.state.loc_text.write() = loc_text_map;
 
         // Publish per-file loc diagnostics, but only for workspace loc files
         // (not vanilla). Group by file so each gets a complete diagnostic set.
@@ -3183,7 +3285,10 @@ impl Backend {
     /// file so cross-file references (scripted triggers/effects, type instances,
     /// templated modifiers) resolve before ANY file is validated. Without this,
     /// a file validated early can't see definitions that live in later files.
-    async fn index_document(&self, uri: &str, text: &str) -> Option<ParsedFile> {
+    ///
+    /// This is synchronous — the original async wrapper was removed because the
+    /// body never `.await`s and `block_in_place` callers need a sync variant.
+    fn index_document_sync(&self, uri: &str, text: &str) -> Option<ParsedFile> {
         let parsed = parse_string(text, &self.state.string_table).ok()?;
         self.index_parsed_file(uri, &parsed);
         Some(parsed)
@@ -4229,6 +4334,26 @@ fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnostic {
 }
 
 fn main() {
+    // Handle --help / --version before entering the LSP serve loop so the
+    // binary prints useful output instead of silently blocking on stdin.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        eprintln!("cwtools-server {}", env!("CARGO_PKG_VERSION"));
+        eprintln!();
+        eprintln!("CWTools language server for Paradox game scripts.");
+        eprintln!("Communicates over stdin/stdout using the Language Server Protocol.");
+        eprintln!();
+        eprintln!("USAGE:");
+        eprintln!("    cwtools-server              Start the LSP server (default)");
+        eprintln!("    cwtools-server --help       Show this help");
+        eprintln!("    cwtools-server --version    Show version");
+        std::process::exit(0);
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("cwtools-server {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     // Logs/profiling go to stderr (stdout is the LSP JSON-RPC channel). Quiet
     // unless RUST_LOG or CWTOOLS_PROFILE is set. See PROFILING.md.
     cwtools_profiling::init_tracing();
@@ -4248,6 +4373,7 @@ fn main() {
             .custom_method("didFocusFile", Backend::on_did_focus_file)
             .finish();
             Server::new(stdin, stdout, socket).serve(service).await;
+            tracing::info!("LSP server shut down (stdin closed)");
         });
 }
 

@@ -72,7 +72,8 @@ fn pos_in_range(line: u32, col: u16, range: &SourceRange) -> bool {
     true
 }
 
-/// Resolve the rules applicable at `(line, col)` (1-based parser coordinates).
+/// Resolve the rules applicable at `(line, col)` (parser coordinates: `line` is
+/// 1-based, `col` is 0-based).
 ///
 /// Returns `None` when the position is outside any known entity — at the file
 /// top level, in a file no type covers, or under an index-only type with no
@@ -142,8 +143,10 @@ pub fn rules_at_pos(
     };
     let root_key = table.get_string(leaf.key.normal).unwrap_or_default();
     // Cursor on the root key itself (`my_focus| = { ... }`): top-level context,
-    // not inside the entity.
-    if line == leaf.pos.start.line && (col as usize) <= leaf.pos.start.col as usize + root_key.len()
+    // not inside the entity. Columns are char counts (see parser), so measure the
+    // key in chars, not bytes.
+    if line == leaf.pos.start.line
+        && (col as usize) <= leaf.pos.start.col as usize + root_key.chars().count()
     {
         return None;
     }
@@ -244,7 +247,7 @@ fn descend_wrapper(
         let gc_key = ctx.table.get_string(gc_leaf.key.normal).unwrap_or_default();
         // Cursor on the instance key itself: treat as outside the entity.
         if line == gc_leaf.pos.start.line
-            && (col as usize) <= gc_leaf.pos.start.col as usize + gc_key.len()
+            && (col as usize) <= gc_leaf.pos.start.col as usize + gc_key.chars().count()
         {
             return None;
         }
@@ -355,10 +358,12 @@ fn descend(
                 if !pos_in_range(line, col, &leaf.pos) {
                     continue;
                 }
-                let key = unquote_key(&ctx.table.get_string(leaf.key.normal).unwrap_or_default())
-                    .to_string();
+                let raw_key = ctx.table.get_string(leaf.key.normal).unwrap_or_default();
+                let key = unquote_key(&raw_key).to_string();
+                // on_key spans the source key (quotes included), measured in chars
+                // since columns are char counts; `key` is unquoted and may be shorter.
                 let on_key = line == leaf.pos.start.line
-                    && (col as usize) <= leaf.pos.start.col as usize + key.len();
+                    && (col as usize) <= leaf.pos.start.col as usize + raw_key.chars().count();
 
                 if let Value::Clause(clause_children) = &leaf.value {
                     if on_key {

@@ -210,6 +210,16 @@ impl Session {
             // (CW113), same coverage as a live vanilla walk.
             type_index.file_index.add_root(&directory);
             type_index.file_index.add_paths(cache.file_paths);
+            // Dynamic values (complex-enum / value_set members) collected from the
+            // vanilla walk; without this a cache hit silently drops them.
+            type_index.complex_enum_values.merge_file(
+                "<vanilla-cache>",
+                cache.complex_enum_values.into_iter().collect(),
+            );
+            type_index.value_set_values.merge_file(
+                "<vanilla-cache>",
+                cache.value_set_values.into_iter().collect(),
+            );
             cached_loc_keys = Some(cache.loc_keys);
         } else if let Some(vanilla_dir) = &vanilla {
             let vanilla_index = index_game_dir(vanilla_dir, &ruleset, &rules_table, &var_effects);

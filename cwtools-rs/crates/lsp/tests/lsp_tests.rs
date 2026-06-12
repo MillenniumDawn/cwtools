@@ -71,7 +71,7 @@ fn jsonrpc_notification(method: &str, params: serde_json::Value) -> String {
     .to_string()
 }
 
-// ── Help ─────────────────────────────────────────────────────────────────────
+// ── Help / Version ───────────────────────────────────────────────────────────
 
 #[test]
 fn test_lsp_help_exits_zero() {
@@ -79,7 +79,19 @@ fn test_lsp_help_exits_zero() {
         .unwrap()
         .arg("--help")
         .assert()
-        .success();
+        .success()
+        .stderr(predicates::str::contains("cwtools-server"))
+        .stderr(predicates::str::contains("Language Server Protocol"));
+}
+
+#[test]
+fn test_lsp_version_exits_zero() {
+    assert_cmd::Command::cargo_bin("cwtools-server")
+        .unwrap()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("cwtools-server"));
 }
 
 // ── Initialize handshake ─────────────────────────────────────────────────────
@@ -601,5 +613,118 @@ fn test_completion_country_flags_for_has_country_flag() {
         labels.iter().any(|l| l == "my_war_flag"),
         "collected country flags should be offered, got: {:?}",
         labels
+    );
+}
+
+// ── Hover: localisation display ──────────────────────────────────────────────
+
+#[test]
+fn test_hover_shows_localisation() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), DYNAMIC_RULES).unwrap();
+
+    // Create a loc file (needs UTF-8 BOM and l_english header).
+    let loc_dir = ws.path().join("localisation");
+    std::fs::create_dir_all(&loc_dir).unwrap();
+    let mut loc_content: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    loc_content.extend_from_slice(b"l_english:\n");
+    loc_content.extend_from_slice(b" my_idea:0 \"My Awesome Idea\"\n");
+    std::fs::write(loc_dir.join("test_l_english.yml"), &loc_content).unwrap();
+
+    // Script file that references the loc key as a value.
+    let script_text = "my_country = {\n    name = my_idea\n}\n";
+    let script_path = "common/countries/test.txt";
+    let p = ws.path().join(script_path);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, script_text).unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    // initialize
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    // initialized — triggers the background workspace scan that rebuilds loc_text
+    let body = jsonrpc_notification("initialized", serde_json::json!({}));
+    write_frame(&mut child, &body).unwrap();
+
+    // didOpen the script file
+    let doc_uri = format!("file://{}", p.display());
+    let body = jsonrpc_notification(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": doc_uri,
+                "languageId": "hoi4",
+                "version": 1,
+                "text": script_text,
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+
+    // Poll hover until loc_text is populated (workspace scan completes).
+    let mut hover_value = String::new();
+    for attempt in 0..30 {
+        // Drain any pending notifications before sending the request.
+        // read_response only returns messages with an `id`, so we need to
+        // send the hover request first, then read.
+        let hover_req = jsonrpc_request(
+            2 + attempt,
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "position": { "line": 1, "character": 14 },
+            }),
+        );
+        write_frame(&mut child, &hover_req).unwrap();
+        let resp_str = read_response(&mut reader).expect("no hover response");
+        let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+        hover_value = resp["result"]["contents"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if hover_value.contains("Localisation") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    child.kill().ok();
+
+    assert!(
+        hover_value.contains("Localisation"),
+        "hover should include localisation section, got: {}",
+        hover_value
+    );
+    assert!(
+        hover_value.contains("My Awesome Idea"),
+        "hover should include loc text, got: {}",
+        hover_value
+    );
+    assert!(
+        hover_value.contains("English"),
+        "hover should include language label, got: {}",
+        hover_value
     );
 }
