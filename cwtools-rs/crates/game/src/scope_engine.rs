@@ -1,4 +1,5 @@
 use crate::constants::Game;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 /// Opaque scope id — a thin newtype over the same u32 used by `Scope`.
@@ -52,11 +53,14 @@ pub enum ScopeResult {
 
 /// Snapshot of a `ScopeContext` that can be restored after recursing into a
 /// child block.  Returned by `save()` / accepted by `restore()`.
+///
+/// Scope stacks are typically shallow (1–8 entries); SmallVec avoids a heap
+/// allocation in the common case.
 #[derive(Debug, Clone)]
 pub struct SavedContext {
     pub root: ScopeId,
-    pub scopes: Vec<ScopeId>,
-    pub from: Vec<ScopeId>,
+    pub scopes: SmallVec<[ScopeId; 8]>,
+    pub from: SmallVec<[ScopeId; 4]>,
 }
 
 // ── ScopeContext ─────────────────────────────────────────────────────────────
@@ -168,16 +172,16 @@ impl ScopeContext {
     pub fn save(&self) -> SavedContext {
         SavedContext {
             root: self.root,
-            scopes: self.scopes.clone(),
-            from: self.from.clone(),
+            scopes: self.scopes.iter().copied().collect(),
+            from: self.from.iter().copied().collect(),
         }
     }
 
     /// Restore the mutable parts from a snapshot.
     pub fn restore(&mut self, saved: SavedContext) {
         self.root = saved.root;
-        self.scopes = saved.scopes;
-        self.from = saved.from;
+        self.scopes = saved.scopes.into_vec();
+        self.from = saved.from.into_vec();
     }
 
     // ── replace_scope ────────────────────────────────────────────────────────

@@ -216,6 +216,27 @@ pub(crate) fn match_text(table: &StringTable, t: &StringTokens) -> String {
     }
 }
 
+/// Zero-copy variant of [`match_text`]: borrows the string from the table,
+/// strips surrounding quotes via a slice (no allocation), and passes the
+/// resulting `&str` to `f`.  Returns `f`'s value, or the default if the id
+/// is out of range.
+pub(crate) fn with_match_text<R: Default>(
+    table: &StringTable,
+    t: &StringTokens,
+    f: impl FnOnce(&str) -> R,
+) -> R {
+    table
+        .with_string(t.normal, |s| {
+            let unquoted = if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+                &s[1..s.len() - 1]
+            } else {
+                s
+            };
+            f(unquoted)
+        })
+        .unwrap_or_default()
+}
+
 /// Strip a balanced pair of surrounding double-quotes from a child key.
 pub(crate) fn unquote_key(s: &str) -> &str {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {

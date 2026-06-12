@@ -1685,11 +1685,12 @@ pub(crate) fn field_matches_value(
     // references ($$), and inline math ([...]).  These are valid CW script idioms that
     // can legitimately appear in place of any typed value.
     match value {
-        Value::String(t) | Value::QString(t) => {
-            let text = match_text(table, t);
-            if text.starts_with('@') || text.contains("$$") || text.starts_with('[') {
-                return true;
-            }
+        Value::String(t) | Value::QString(t)
+            if with_match_text(table, t, |text| {
+                text.starts_with('@') || text.contains("$$") || text.starts_with('[')
+            }) =>
+        {
+            return true;
         }
         _ => {}
     }
@@ -1699,8 +1700,9 @@ pub(crate) fn field_matches_value(
         (NewField::ValueField(ValueType::Bool), Value::Bool(_)) => true,
         (NewField::ValueField(ValueType::Bool), Value::String(t))
         | (NewField::ValueField(ValueType::Bool), Value::QString(t)) => {
-            let v = match_text(table, t).to_lowercase();
-            v == "yes" || v == "no"
+            with_match_text(table, t, |text| {
+                text.eq_ignore_ascii_case("yes") || text.eq_ignore_ascii_case("no")
+            })
         }
 
         // --- Int with range enforcement (item 4) ---
@@ -1710,12 +1712,13 @@ pub(crate) fn field_matches_value(
         }
         (NewField::ValueField(ValueType::Int { min, max }), Value::String(t))
         | (NewField::ValueField(ValueType::Int { min, max }), Value::QString(t)) => {
-            let text = match_text(table, t);
-            if let Ok(v) = text.parse::<i64>() {
-                v >= i64::from(*min) && v <= i64::from(*max)
-            } else {
-                false
-            }
+            with_match_text(table, t, |text| {
+                if let Ok(v) = text.parse::<i64>() {
+                    v >= i64::from(*min) && v <= i64::from(*max)
+                } else {
+                    false
+                }
+            })
         }
 
         // --- Float with range enforcement (item 4) ---
@@ -1728,12 +1731,13 @@ pub(crate) fn field_matches_value(
         }
         (NewField::ValueField(ValueType::Float { min, max }), Value::String(t))
         | (NewField::ValueField(ValueType::Float { min, max }), Value::QString(t)) => {
-            let text = match_text(table, t);
-            if let Ok(v) = text.parse::<f64>() {
-                v >= *min && v <= *max
-            } else {
-                false
-            }
+            with_match_text(table, t, |text| {
+                if let Ok(v) = text.parse::<f64>() {
+                    v >= *min && v <= *max
+                } else {
+                    false
+                }
+            })
         }
 
         // --- Enum ---
@@ -1743,8 +1747,7 @@ pub(crate) fn field_matches_value(
         // (e.g. province ids) are compared by their string form.
         (NewField::ValueField(ValueType::Enum(enum_name)), Value::String(t))
         | (NewField::ValueField(ValueType::Enum(enum_name)), Value::QString(t)) => {
-            let text = match_text(table, t);
-            enum_contains(enum_map, enum_name, &text)
+            with_match_text(table, t, |text| enum_contains(enum_map, enum_name, text))
         }
         (NewField::ValueField(ValueType::Enum(enum_name)), Value::Int(i)) => {
             enum_contains(enum_map, enum_name, &i.to_string())
@@ -1756,33 +1759,36 @@ pub(crate) fn field_matches_value(
         // --- Percent (item 3): value ends with '%' or is a number ---
         (NewField::ValueField(ValueType::Percent), Value::String(t))
         | (NewField::ValueField(ValueType::Percent), Value::QString(t)) => {
-            let text = match_text(table, t);
-            text.ends_with('%') || text.parse::<f64>().is_ok()
+            with_match_text(table, t, |text| {
+                text.ends_with('%') || text.parse::<f64>().is_ok()
+            })
         }
         (NewField::ValueField(ValueType::Percent), Value::Float(_) | Value::Int(_)) => true,
 
         // --- Date / DateTime (item 3): basic YYYY.MM.DD[.HH] shape ---
         (NewField::ValueField(ValueType::Date), Value::String(t))
         | (NewField::ValueField(ValueType::Date), Value::QString(t)) => {
-            is_date_shape(&match_text(table, t))
+            with_match_text(table, t, is_date_shape)
         }
         (NewField::ValueField(ValueType::DateTime), Value::String(t))
         | (NewField::ValueField(ValueType::DateTime), Value::QString(t)) => {
-            is_datetime_shape(&match_text(table, t))
+            with_match_text(table, t, is_datetime_shape)
         }
 
         // --- Ck2Dna (item 3): exactly 32 hex chars (F# FieldValidators.fs:194-204) ---
         (NewField::ValueField(ValueType::Ck2Dna), Value::String(t))
         | (NewField::ValueField(ValueType::Ck2Dna), Value::QString(t)) => {
-            let text = match_text(table, t);
-            text.len() == 32 && text.chars().all(|c| c.is_ascii_hexdigit())
+            with_match_text(table, t, |text| {
+                text.len() == 32 && text.chars().all(|c| c.is_ascii_hexdigit())
+            })
         }
 
         // --- Ck2DnaProperty (item 3): length 8 or 32, hex chars (F# FieldValidators.fs:205-211) ---
         (NewField::ValueField(ValueType::Ck2DnaProperty), Value::String(t))
         | (NewField::ValueField(ValueType::Ck2DnaProperty), Value::QString(t)) => {
-            let text = match_text(table, t);
-            (text.len() == 8 || text.len() == 32) && text.chars().all(|c| c.is_ascii_hexdigit())
+            with_match_text(table, t, |text| {
+                (text.len() == 8 || text.len() == 32) && text.chars().all(|c| c.is_ascii_hexdigit())
+            })
         }
 
         // --- IrFamilyName / StlNameFormat (item 3): accept any string ---
@@ -1849,13 +1855,14 @@ pub(crate) fn field_matches_value(
         (NewField::VariableField { .. }, Value::Bool(_)) => true,
         (NewField::VariableField { min, max, .. }, Value::String(t))
         | (NewField::VariableField { min, max, .. }, Value::QString(t)) => {
-            let text = match_text(table, t);
-            if let Ok(v) = text.parse::<f64>() {
-                v >= *min && v <= *max
-            } else {
-                // non-numeric string: accept (could be a scripted variable not caught by bypass)
-                true
-            }
+            with_match_text(table, t, |text| {
+                if let Ok(v) = text.parse::<f64>() {
+                    v >= *min && v <= *max
+                } else {
+                    // non-numeric string: accept (could be a scripted variable not caught by bypass)
+                    true
+                }
+            })
         }
 
         // --- LocalisationField / FilepathField ---

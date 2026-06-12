@@ -187,7 +187,8 @@ pub fn rules_at_pos(
     }
 
     // 2. Path-based fallback — mirrors validate_prepared.
-    let td = find_type_by_path_and_key(file_path, Some(&root_key), ruleset)?;
+    let file_path_lower = file_path.to_lowercase();
+    let td = find_type_by_path_and_key(&file_path_lower, Some(&root_key), ruleset)?;
     let inner_rules = find_rules_by_name(&td.name, ruleset);
     let has_content = !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
     if !has_content {

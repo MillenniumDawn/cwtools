@@ -26,7 +26,7 @@ use common::{leaf_value_to_string, path_contains_segment};
 use ctx::ValidationCtx;
 use resolve::{
     find_grandchild_type, find_rules_by_name, find_type_and_rules_for_file, find_type_by_path,
-    find_type_by_path_and_key, should_skip_root_key, skip_root_key_tail,
+    find_type_from_candidates, path_candidates_for_file, should_skip_root_key, skip_root_key_tail,
 };
 use rule_core::validate_with_type;
 use scope::build_scope_registry;
@@ -342,7 +342,12 @@ pub fn validate_prepared(
         var_checks,
     };
 
-    // Pre-compute path-based type match (most specific wins)
+    // Pre-compute path-based type match (most specific wins).
+    // Lowercase once and filter path-matching type candidates once per file so
+    // the per-child loop only runs key-dependent scoring over the small candidate
+    // set rather than scanning all types N_children times.
+    let file_path_lower = file_path.to_lowercase();
+    let path_candidates = path_candidates_for_file(&file_path_lower, ruleset);
     let path_type = find_type_by_path(file_path, ruleset);
 
     // type_per_file: the WHOLE file is a single instance of this type (e.g. an
@@ -451,7 +456,7 @@ pub fn validate_prepared(
             _ => String::new(),
         };
         let path_type_for_child =
-            find_type_by_path_and_key(file_path, Some(&child_root_key), ruleset);
+            find_type_from_candidates(&path_candidates, Some(&child_root_key));
         if let Some(type_def) = path_type_for_child {
             let inner_rules = find_rules_by_name(&type_def.name, ruleset);
 
