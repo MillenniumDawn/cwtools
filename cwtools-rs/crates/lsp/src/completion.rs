@@ -33,8 +33,13 @@ impl Backend {
 
         // .yml localisation file — offer loc-key / data-function completions.
         if uri.ends_with(".yml") || uri.ends_with(".yaml") {
+            let rules_guard = self.state.rules.read();
             let info_guard = self.state.info_service.read();
-            let items = loc_completions(&info_guard, &language);
+            let items = loc_completions(
+                &info_guard,
+                &language,
+                rules_guard.scope_registry.as_deref(),
+            );
             if !items.is_empty() {
                 return Ok(Some(CompletionResponse::Array(items)));
             }
@@ -103,6 +108,7 @@ impl Backend {
                                 &info_guard,
                                 &language,
                                 &rules_guard.modifier_keys,
+                                rules_guard.scope_registry.as_deref(),
                             )
                         };
                         Some(items)
@@ -214,6 +220,7 @@ pub(crate) fn completions_from_rules(
     info: &InfoService,
     language: &str,
     modifier_keys: &HashSet<String>,
+    registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
 
@@ -435,9 +442,9 @@ pub(crate) fn completions_from_rules(
             | RuleType::LeafValueRule {
                 right: NewField::ScopeField(_),
             } => {
-                for scope in scope_names_for_game(language) {
+                for name in scope_completion_names(language, registry) {
                     items.push(CompletionItem {
-                        label: scope.to_string(),
+                        label: name,
                         kind: Some(CompletionItemKind::VALUE),
                         detail: Some("scope".to_string()),
                         ..Default::default()
@@ -573,21 +580,9 @@ pub(crate) fn value_completions(
             NewField::ScopeField(_)
             | NewField::ValueScopeField { .. }
             | NewField::ValueScopeMarkerField { .. } => {
-                // Config-driven link names (owner, capital_scope, …) when a
-                // registry is loaded; static keyword list as the floor.
-                if let Some(reg) = registry {
-                    for link in reg.links.keys() {
-                        push(
-                            link.clone(),
-                            CompletionItemKind::VALUE,
-                            "scope link".to_string(),
-                            &mut items,
-                        );
-                    }
-                }
-                for scope in scope_names_for_game(language) {
+                for name in scope_completion_names(language, registry) {
                     push(
-                        scope.to_string(),
+                        name,
                         CompletionItemKind::VALUE,
                         "scope".to_string(),
                         &mut items,
@@ -787,7 +782,11 @@ pub(crate) fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<C
 /// function block, offers scope/command names instead.  Best-effort only —
 /// full CWTools loc completion (F# locComplete:208-243) would need the loc
 /// database and scope tracking, which are not yet ported.
-pub(crate) fn loc_completions(info: &InfoService, language: &str) -> Vec<CompletionItem> {
+pub(crate) fn loc_completions(
+    info: &InfoService,
+    language: &str,
+    registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
+) -> Vec<CompletionItem> {
     // Collect all top-level keys from all files as potential loc keys
     let mut items: Vec<CompletionItem> = info
         .files
@@ -804,9 +803,9 @@ pub(crate) fn loc_completions(info: &InfoService, language: &str) -> Vec<Complet
         .collect();
 
     // Offer scope names as data-function completions inside [...]
-    for scope in scope_names_for_game(language) {
+    for name in scope_completion_names(language, registry) {
         items.push(CompletionItem {
-            label: scope.to_string(),
+            label: name,
             kind: Some(CompletionItemKind::FUNCTION),
             detail: Some("scope command".to_string()),
             ..Default::default()
@@ -816,7 +815,56 @@ pub(crate) fn loc_completions(info: &InfoService, language: &str) -> Vec<Complet
     items
 }
 
-/// Best-effort scope name list for the current game.
+/// Chain-keyword prelude for scope completions. These are runtime traversal
+/// keywords (`THIS`/`ROOT`/`PREV`/`FROM`) that are not scope types and will
+/// not appear in the registry. HOI4 convention is uppercase; other games use
+/// lowercase.
+fn scope_prelude(language: &str) -> &'static [&'static str] {
+    if language == "hoi4" {
+        &["THIS", "ROOT", "PREV", "FROM"]
+    } else {
+        &["this", "root", "prev", "from"]
+    }
+}
+
+/// Derive scope completion names from the loaded registry when available, with
+/// `scope_names_for_game` as the fallback when no registry is loaded.
+///
+/// The returned list is: chain-keyword prelude + scope type names (from
+/// `registry.by_name` keys) + link names (from `registry.links` keys). All
+/// registry keys are lowercase; the prelude follows per-game casing.
+pub(crate) fn scope_completion_names(
+    language: &str,
+    registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
+) -> Vec<String> {
+    let Some(reg) = registry else {
+        return scope_names_for_game(language)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    };
+
+    let mut names: Vec<String> = scope_prelude(language)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // Scope type names from the registry (lowercased). Use `by_id` to get the
+    // canonical name for each scope (avoids duplicating aliases).
+    let mut scope_names: Vec<String> = reg.by_id.values().map(|d| d.name.clone()).collect();
+    scope_names.sort_unstable();
+    names.extend(scope_names);
+
+    // Named links (owner, capital_scope, every_state, …).
+    let mut link_names: Vec<String> = reg.links.keys().cloned().collect();
+    link_names.sort_unstable();
+    names.extend(link_names);
+
+    names
+}
+
+/// Best-effort scope name list for the current game. Used as a fallback when
+/// no registry has been loaded.
 pub(crate) fn scope_names_for_game(language: &str) -> &'static [&'static str] {
     match language {
         "hoi4" => &[
@@ -960,7 +1008,7 @@ mod tests {
             panic!("expected TypeRule");
         };
 
-        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new());
+        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None);
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");

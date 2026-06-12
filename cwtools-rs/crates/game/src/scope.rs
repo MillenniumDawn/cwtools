@@ -13,10 +13,3 @@ pub struct ScopeDef {
     /// IDs of scopes this scope is a sub-scope of.
     pub subscope_of: &'static [Scope],
 }
-
-/// A game-specific modifier category.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModifierCategory {
-    pub name: &'static str,
-    pub scopes: &'static [Scope],
-}

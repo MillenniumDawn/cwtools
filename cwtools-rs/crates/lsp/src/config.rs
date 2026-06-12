@@ -5,6 +5,7 @@ use serde_json::Value;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
+use cwtools_info::check_path_dir;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_validation::build_scope_registry_arc;
@@ -411,6 +412,26 @@ impl Backend {
     }
 
     pub(crate) async fn determine_file_types(&self, uri: &str) -> Vec<String> {
+        let ws_uri = self.state.config.read().workspace_uri.clone();
+        let rules = self.state.rules.read();
+
+        // Derive from the loaded ruleset when available: any TypeDefinition whose
+        // path matches the logical path contributes its name to the result.
+        if let Some(rs) = rules.ruleset.as_ref() {
+            let logical_path = crate::paths::logical_path_from_uri(uri, &ws_uri);
+            let types: Vec<String> = rs
+                .types
+                .iter()
+                .filter(|td| check_path_dir(&td.path_options, &logical_path))
+                .map(|td| td.name.clone())
+                .collect();
+            if !types.is_empty() {
+                return types;
+            }
+        }
+        drop(rules);
+
+        // Fallback when no ruleset is loaded.
         let path = uri.to_lowercase();
         let mut types = Vec::new();
 

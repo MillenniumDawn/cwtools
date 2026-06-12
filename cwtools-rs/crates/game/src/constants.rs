@@ -1,4 +1,4 @@
-use crate::scope::{ModifierCategory, Scope, ScopeDef};
+use crate::scope::{Scope, ScopeDef};
 
 /// Game identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,22 +52,6 @@ impl Game {
         }
     }
 
-    /// Default script folders to scan for this game.
-    pub fn script_folders(&self) -> &'static [&'static str] {
-        match self {
-            Game::Hoi4 => HOI4_FOLDERS,
-            Game::Stellaris => STELLARIS_FOLDERS,
-            Game::Eu4 => EU4_FOLDERS,
-            Game::Ck2 => CK2_FOLDERS,
-            Game::Ck3 => CK3_FOLDERS,
-            Game::Vic2 => VIC2_FOLDERS,
-            Game::Vic3 => VIC3_FOLDERS,
-            Game::Ir => IR_FOLDERS,
-            Game::Eu5 => EU5_FOLDERS,
-            Game::Custom => CUSTOM_FOLDERS,
-        }
-    }
-
     /// Scope definitions for this game (name, aliases, numeric id, subscope_of).
     pub fn scope_defs(&self) -> &'static [ScopeDef] {
         match self {
@@ -85,83 +69,19 @@ impl Game {
             Game::Custom => CUSTOM_SCOPES,
         }
     }
-
-    /// Modifier categories for this game.
-    pub fn modifier_categories(&self) -> &'static [ModifierCategory] {
-        match self {
-            Game::Hoi4 => HOI4_MODIFIERS,
-            Game::Stellaris => STELLARIS_MODIFIERS,
-            Game::Eu4 => EU4_MODIFIERS,
-            Game::Ck2 => CK2_MODIFIERS,
-            Game::Ck3 => CK3_MODIFIERS,
-            Game::Vic2 => VIC2_MODIFIERS,
-            Game::Vic3 => VIC3_MODIFIERS,
-            Game::Ir => IR_MODIFIERS,
-            Game::Eu5 => EU5_MODIFIERS,
-            Game::Custom => CUSTOM_MODIFIERS,
-        }
-    }
 }
 
 // ── HOI4 ─────────────────────────────────────────────────────────────────────
 // IDs: Country=100, State=101, Unit Leader=102, Air=103
 
-const HOI4_FOLDERS: &[&str] = &[
-    "common",
-    "country_metadata",
-    "events",
-    "gfx",
-    "interface",
-    "localisation",
-    "history",
-    "map",
-    "music",
-    "portraits",
-    "sound",
-];
-
 // HOI4 scopes are now loaded from `scopes.cwt` into the runtime ScopeRegistry
 // (see `scope_registry.rs`); the hardcoded `HOI4_SCOPES` table was removed.
-
-const HOI4_MODIFIERS: &[ModifierCategory] = &[
-    ModifierCategory {
-        name: "State",
-        scopes: &[Scope(101)],
-    },
-    ModifierCategory {
-        name: "Country",
-        scopes: &[Scope(100)],
-    },
-    ModifierCategory {
-        name: "Unit",
-        scopes: &[Scope(102), Scope(100)],
-    },
-    ModifierCategory {
-        name: "UnitLeader",
-        scopes: &[Scope(102), Scope(100)],
-    },
-    ModifierCategory {
-        name: "Air",
-        scopes: &[Scope(103), Scope(100)],
-    },
-];
 
 // ── Stellaris ─────────────────────────────────────────────────────────────────
 // IDs: Country=200, Leader=201, System=202, Planet=203, Ship=204, Fleet=205,
 //      Pop=206, Army=207, Species=208, Pop Faction=209, Sector=210,
 //      Federation=211, War=212, Megastructure=213, Design=214, Starbase=215,
 //      Star=216, Deposit=217, Archaeological Site=218, Ambient Object=219
-
-const STELLARIS_FOLDERS: &[&str] = &[
-    "common",
-    "events",
-    "gfx",
-    "interface",
-    "localisation",
-    "map",
-    "music",
-    "sound",
-];
 
 const STELLARIS_SCOPES: &[ScopeDef] = &[
     ScopeDef {
@@ -286,90 +206,11 @@ const STELLARIS_SCOPES: &[ScopeDef] = &[
     },
 ];
 
-const STELLARIS_MODIFIERS: &[ModifierCategory] = &[
-    ModifierCategory {
-        name: "Pop",
-        scopes: &[Scope(206), Scope(203), Scope(202), Scope(200)],
-    },
-    ModifierCategory {
-        name: "Science",
-        scopes: &[Scope(204), Scope(200)],
-    },
-    ModifierCategory {
-        name: "Country",
-        scopes: &[Scope(200)],
-    },
-    ModifierCategory {
-        name: "Army",
-        scopes: &[Scope(207), Scope(203), Scope(200)],
-    },
-    ModifierCategory {
-        name: "Leader",
-        scopes: &[Scope(201), Scope(200)],
-    },
-    ModifierCategory {
-        name: "Planet",
-        scopes: &[Scope(203), Scope(202), Scope(200)],
-    },
-    ModifierCategory {
-        name: "PopFaction",
-        scopes: &[Scope(209), Scope(200)],
-    },
-    ModifierCategory {
-        name: "ShipSize",
-        scopes: &[Scope(204), Scope(215), Scope(200)],
-    },
-    ModifierCategory {
-        name: "Ship",
-        scopes: &[Scope(204), Scope(215), Scope(205), Scope(200)],
-    },
-    ModifierCategory {
-        name: "Megastructure",
-        scopes: &[Scope(213), Scope(200)],
-    },
-    ModifierCategory {
-        name: "PlanetClass",
-        scopes: &[Scope(203), Scope(206), Scope(200)],
-    },
-    ModifierCategory {
-        name: "Starbase",
-        scopes: &[Scope(215), Scope(200)],
-    },
-    ModifierCategory {
-        name: "Resource",
-        scopes: &[
-            Scope(200),
-            Scope(202),
-            Scope(203),
-            Scope(206),
-            Scope(215),
-            Scope(201),
-            Scope(204),
-        ],
-    },
-    ModifierCategory {
-        name: "Federation",
-        scopes: &[Scope(211)],
-    },
-];
-
 // ── EU4 ───────────────────────────────────────────────────────────────────────
 // IDs: Country=300, Province=301, Trade Node=302 (subscope of Province),
 //      Unit=303, Monarch=304, Heir=305, Consort=306, Rebel Faction=307,
 //      Religion=308, Culture=309, Advisor=310
 // F# source: CWTools/Common/EU4Constants.fs defaultScopes
-
-const EU4_FOLDERS: &[&str] = &[
-    "common",
-    "events",
-    "gfx",
-    "interface",
-    "localisation",
-    "history",
-    "map",
-    "music",
-    "sound",
-];
 
 const EU4_SCOPES: &[ScopeDef] = &[
     ScopeDef {
@@ -441,34 +282,11 @@ const EU4_SCOPES: &[ScopeDef] = &[
     },
 ];
 
-const EU4_MODIFIERS: &[ModifierCategory] = &[
-    ModifierCategory {
-        name: "Country",
-        scopes: &[Scope(300)],
-    },
-    ModifierCategory {
-        name: "Province",
-        scopes: &[Scope(301)],
-    },
-];
-
 // ── CK2 ───────────────────────────────────────────────────────────────────────
 // IDs: Character=400, Title=401, Province=402, Offmap=403, War=404,
 //      Siege=405, Unit=406, Religion=407, Culture=408, Society=409,
 //      Artifact=410, Bloodline=411, Wonder=412
 // F# source: CWTools/Common/CK2Constants.fs defaultScopes
-
-const CK2_FOLDERS: &[&str] = &[
-    "common",
-    "events",
-    "gfx",
-    "interface",
-    "localisation",
-    "history",
-    "map",
-    "music",
-    "sound",
-];
 
 const CK2_SCOPES: &[ScopeDef] = &[
     ScopeDef {
@@ -551,37 +369,12 @@ const CK2_SCOPES: &[ScopeDef] = &[
     },
 ];
 
-const CK2_MODIFIERS: &[ModifierCategory] = &[
-    ModifierCategory {
-        name: "Character",
-        scopes: &[Scope(400)],
-    },
-    ModifierCategory {
-        name: "Province",
-        scopes: &[Scope(402)],
-    },
-    ModifierCategory {
-        name: "Unit",
-        scopes: &[Scope(406), Scope(402)],
-    },
-];
-
 // ── CK3 ───────────────────────────────────────────────────────────────────────
 // IDs: Value=500, Bool=501, Flag=502, Color=503, Country=504, Character=505,
 //      Province=506, Combat=507, Unit=508, Pop=509, Family=510, Party=511,
 //      Religion=512, Culture=513, Job=514, CultureGroup=515, Area=516,
 //      State=517, Subunit=518, Governorship=519, Region=520
 // F# source: CWTools/Common/CK3Constants.fs defaultScopes
-
-const CK3_FOLDERS: &[&str] = &[
-    "common",
-    "events",
-    "gfx",
-    "gui",
-    "localization",
-    "history",
-    "map_data",
-];
 
 const CK3_SCOPES: &[ScopeDef] = &[
     ScopeDef {
@@ -712,30 +505,9 @@ const CK3_SCOPES: &[ScopeDef] = &[
     },
 ];
 
-const CK3_MODIFIERS: &[ModifierCategory] = &[
-    ModifierCategory {
-        name: "Province",
-        scopes: &[Scope(506), Scope(504)],
-    },
-    ModifierCategory {
-        name: "Country",
-        scopes: &[Scope(504)],
-    },
-    ModifierCategory {
-        name: "Unit",
-        scopes: &[Scope(508), Scope(504)],
-    },
-    ModifierCategory {
-        name: "Character",
-        scopes: &[Scope(505), Scope(504)],
-    },
-];
-
 // ── VIC2 ──────────────────────────────────────────────────────────────────────
 // F# VIC2Constants.fs has identical scope list to CK3 / IR.
 // Using IDs 600-620 to avoid collision.
-
-const VIC2_FOLDERS: &[&str] = &["common", "events", "localisation", "map_data"];
 
 const VIC2_SCOPES: &[ScopeDef] = &[
     ScopeDef {
@@ -866,48 +638,15 @@ const VIC2_SCOPES: &[ScopeDef] = &[
     },
 ];
 
-const VIC2_MODIFIERS: &[ModifierCategory] = &[
-    ModifierCategory {
-        name: "Province",
-        scopes: &[Scope(606), Scope(604)],
-    },
-    ModifierCategory {
-        name: "Country",
-        scopes: &[Scope(604)],
-    },
-    ModifierCategory {
-        name: "Unit",
-        scopes: &[Scope(608), Scope(604)],
-    },
-    ModifierCategory {
-        name: "Character",
-        scopes: &[Scope(605), Scope(604)],
-    },
-];
-
 // ── VIC3 ──────────────────────────────────────────────────────────────────────
 // F# VIC3Constants.fs is currently minimal (commented-out or stub).
 // Keeping as-is pending upstream F# work.
 
-const VIC3_FOLDERS: &[&str] = &[
-    "common",
-    "events",
-    "gfx",
-    "interface",
-    "localization",
-    "history",
-    "map",
-    "music",
-    "sound",
-];
 const VIC3_SCOPES: &[ScopeDef] = &[];
-const VIC3_MODIFIERS: &[ModifierCategory] = &[];
 
 // ── IR (Imperator: Rome) ──────────────────────────────────────────────────────
 // F# IRConstants.fs — same scope list as CK3 / VIC2.
 // Using IDs 700-720.
-
-const IR_FOLDERS: &[&str] = &["common", "events", "localization", "map_data"];
 
 const IR_SCOPES: &[ScopeDef] = &[
     ScopeDef {
@@ -1038,53 +777,11 @@ const IR_SCOPES: &[ScopeDef] = &[
     },
 ];
 
-const IR_MODIFIERS: &[ModifierCategory] = &[
-    ModifierCategory {
-        name: "Province",
-        scopes: &[Scope(706), Scope(704)],
-    },
-    ModifierCategory {
-        name: "Country",
-        scopes: &[Scope(704)],
-    },
-    ModifierCategory {
-        name: "Unit",
-        scopes: &[Scope(708), Scope(704)],
-    },
-    ModifierCategory {
-        name: "Character",
-        scopes: &[Scope(705), Scope(704)],
-    },
-];
-
 // ── EU5 ───────────────────────────────────────────────────────────────────────
 // F# EU5Constants.fs is a stub in the upstream codebase.
 
-const EU5_FOLDERS: &[&str] = &[
-    "common",
-    "events",
-    "gfx",
-    "interface",
-    "localization",
-    "history",
-    "map",
-    "music",
-    "sound",
-];
 const EU5_SCOPES: &[ScopeDef] = &[];
-const EU5_MODIFIERS: &[ModifierCategory] = &[];
 
 // ── Custom ────────────────────────────────────────────────────────────────────
 
-const CUSTOM_FOLDERS: &[&str] = &[
-    "common",
-    "events",
-    "gfx",
-    "interface",
-    "localisation",
-    "map",
-    "music",
-    "sound",
-];
 const CUSTOM_SCOPES: &[ScopeDef] = &[];
-const CUSTOM_MODIFIERS: &[ModifierCategory] = &[];

@@ -759,7 +759,7 @@ mod tests {
             panic!("expected TypeRule");
         };
 
-        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new());
+        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None);
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");
