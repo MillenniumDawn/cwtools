@@ -135,7 +135,10 @@ impl Session {
 
         // Rules share their StringTable with the game files so interned ids match.
         let rules_table = StringTable::new();
-        let ruleset = load_rules(&rules, &rules_table, on_rules_warning);
+        let ruleset = load_rules(&rules, &rules_table, on_rules_warning).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            RuleSet::new()
+        });
 
         // Discover + parse mod files using the SAME string table. Layer the
         // user-supplied ignore globs on top of the engine defaults.
@@ -621,12 +624,13 @@ pub fn search_config_for(directory: &Path) -> FileManagerConfig {
 }
 
 /// Load a `RuleSet` from a `.cwt` file or a directory of `.cwt` files. Directory
-/// load warnings are sent to `on_warning` if provided.
-fn load_rules(
+/// load warnings are sent to `on_warning` if provided; a rules *file* that can't
+/// be read or parsed is an `Err` (the caller decides whether that's fatal).
+pub fn load_rules(
     rules: &RulesInput,
     table: &StringTable,
     on_warning: Option<&mut dyn FnMut(String)>,
-) -> RuleSet {
+) -> Result<RuleSet, String> {
     match rules {
         RulesInput::Dir(dir) => {
             let (ruleset, errors) = load_ruleset_from_dir(dir, table);
@@ -635,23 +639,14 @@ fn load_rules(
                     sink(err.clone());
                 }
             }
-            ruleset
+            Ok(ruleset)
         }
         RulesInput::File(file) => {
-            let rules_str = match std::fs::read_to_string(file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: could not read rules {}: {}", file.display(), e);
-                    return RuleSet::new();
-                }
-            };
-            match parse_string(&rules_str, table) {
-                Ok(parsed) => ast_to_ruleset(&parsed, table),
-                Err(e) => {
-                    eprintln!("error: could not parse rules {}: {}", file.display(), e);
-                    RuleSet::new()
-                }
-            }
+            let rules_str = std::fs::read_to_string(file)
+                .map_err(|e| format!("could not read rules {}: {}", file.display(), e))?;
+            parse_string(&rules_str, table)
+                .map(|parsed| ast_to_ruleset(&parsed, table))
+                .map_err(|e| format!("could not parse rules {}: {}", file.display(), e))
         }
     }
 }

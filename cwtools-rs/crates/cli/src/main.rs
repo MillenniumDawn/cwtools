@@ -2,7 +2,6 @@ use clap::{Parser, Subcommand};
 use cwtools_driver::{index_game_dir, search_config_for};
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
 use cwtools_parser::parser::parse_string;
-use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
@@ -162,25 +161,19 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// Load a RuleSet from either a single `.cwt` file or a directory of `.cwt` files.
+/// Load a RuleSet from either a single `.cwt` file or a directory of `.cwt`
+/// files (shared loader in the driver). Rules-load failure is fatal in the CLI.
 fn load_rules(rules_path: &std::path::Path, table: &StringTable) -> RuleSet {
-    if rules_path.is_dir() {
-        let (ruleset, errors) = load_ruleset_from_dir(rules_path, table);
-        for err in &errors {
-            eprintln!("warn: {}", err);
-        }
-        ruleset
-    } else {
-        let rules_str = std::fs::read_to_string(rules_path).unwrap_or_else(|e| {
-            eprintln!("Error reading rules {}: {}", rules_path.display(), e);
-            std::process::exit(1);
-        });
-        let parsed = parse_string(&rules_str, table).unwrap_or_else(|e| {
-            eprintln!("Error parsing rules {}: {}", rules_path.display(), e);
-            std::process::exit(1);
-        });
-        ast_to_ruleset(&parsed, table)
-    }
+    let mut warn = |w: String| eprintln!("warn: {}", w);
+    cwtools_driver::load_rules(
+        &cwtools_driver::RulesInput::from_path(rules_path.to_path_buf()),
+        table,
+        Some(&mut warn),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Error loading rules: {}", e);
+        std::process::exit(1);
+    })
 }
 
 /// Print a compact summary of a loaded RuleSet. Shared by the Parse-on-directory
