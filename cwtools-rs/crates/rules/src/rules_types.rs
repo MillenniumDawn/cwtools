@@ -48,6 +48,12 @@ pub struct RuleSet {
     /// name to its index in `root_rules`, so `find_rules_by_name` is O(1)
     /// instead of a linear scan per root child.
     pub type_rules_idx: std::collections::HashMap<String, usize>,
+    /// Built by `reindex()`: lowercased effect/trigger alias key -> the
+    /// `value_set[...]` namespace its body declares (e.g. `set_country_flag` ->
+    /// `country_flag`). Used to collect dynamically-defined set members (flags,
+    /// tokens, …) for completion. Aliases declaring multiple namespaces keep
+    /// the first found.
+    pub value_set_effects: std::collections::HashMap<String, String>,
 }
 
 /// Scope/link config inputs (`scopes.cwt` / `links.cwt`). The types live in the
@@ -92,6 +98,7 @@ impl RuleSet {
             type_by_name: std::collections::HashMap::new(),
             enum_by_name: std::collections::HashMap::new(),
             type_rules_idx: std::collections::HashMap::new(),
+            value_set_effects: std::collections::HashMap::new(),
         }
     }
 
@@ -100,6 +107,35 @@ impl RuleSet {
     pub fn reindex(&mut self) {
         self.alias_exact.clear();
         self.alias_categories.clear();
+        self.value_set_effects.clear();
+        // Which value_set namespace (if any) a rule tree declares.
+        fn first_value_set_ns(rule: &RuleType) -> Option<&str> {
+            fn of_field(f: &NewField) -> Option<&str> {
+                match f {
+                    NewField::VariableSetField(ns) => Some(ns.as_str()),
+                    _ => None,
+                }
+            }
+            match rule {
+                RuleType::LeafRule { left, right } => of_field(left).or_else(|| of_field(right)),
+                RuleType::LeafValueRule { right } => of_field(right),
+                RuleType::NodeRule { left, rules } => of_field(left)
+                    .or_else(|| rules.iter().find_map(|(rt, _)| first_value_set_ns(rt))),
+                RuleType::ValueClauseRule { rules } | RuleType::SubtypeRule { rules, .. } => {
+                    rules.iter().find_map(|(rt, _)| first_value_set_ns(rt))
+                }
+            }
+        }
+        for (name, (rule, _)) in &self.aliases {
+            if let Some((cat, key)) = name.split_once(':')
+                && (cat == "effect" || cat == "trigger")
+                && let Some(ns) = first_value_set_ns(rule)
+            {
+                self.value_set_effects
+                    .entry(key.to_ascii_lowercase())
+                    .or_insert_with(|| ns.to_string());
+            }
+        }
         for (i, (name, _)) in self.aliases.iter().enumerate() {
             // Store under the original name AND the all-lowercase variant so
             // that game-file keys like `instantTextboxType` (mixed case) match
@@ -445,6 +481,9 @@ pub enum ComplexEnumNameTreeEntry {
         key: String,
         children: ComplexEnumNameTree,
     },
+    /// A bare `enum_name` value inside a block (`stats = { enum_name }`):
+    /// every bare value at this level of the target file is an enum member.
+    BareName,
 }
 
 /// Root-level rule from a .cwt file.

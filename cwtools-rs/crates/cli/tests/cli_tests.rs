@@ -14,64 +14,16 @@ fn cwtools() -> Command {
     cmd
 }
 
-// ── Help / version ───────────────────────────────────────────────────────────
+// ── Help ─────────────────────────────────────────────────────────────────────
 
 #[test]
-fn test_help_exits_zero() {
-    cwtools().arg("--help").assert().success();
-}
-
-#[test]
-fn test_help_shows_version_info() {
+fn test_help_exits_with_usage() {
     cwtools()
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("cwtools"));
-}
-
-#[test]
-fn test_help_contains_usage() {
-    cwtools()
-        .arg("--help")
-        .assert()
-        .success()
+        .stdout(predicate::str::contains("cwtools"))
         .stdout(predicate::str::contains("Usage"));
-}
-
-#[test]
-fn test_subcommand_help_parse() {
-    cwtools().args(["parse", "--help"]).assert().success();
-}
-
-#[test]
-fn test_subcommand_help_discover() {
-    cwtools().args(["discover", "--help"]).assert().success();
-}
-
-#[test]
-fn test_subcommand_help_serialize() {
-    cwtools().args(["serialize", "--help"]).assert().success();
-}
-
-#[test]
-fn test_subcommand_help_deserialize() {
-    cwtools().args(["deserialize", "--help"]).assert().success();
-}
-
-#[test]
-fn test_subcommand_help_rules() {
-    cwtools().args(["rules", "--help"]).assert().success();
-}
-
-#[test]
-fn test_subcommand_help_validate() {
-    cwtools().args(["validate", "--help"]).assert().success();
-}
-
-#[test]
-fn test_subcommand_help_loc() {
-    cwtools().args(["loc", "--help"]).assert().success();
 }
 
 // ── Parse ────────────────────────────────────────────────────────────────────

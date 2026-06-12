@@ -14,7 +14,7 @@ use super::common::as_block;
 use crate::{ValidationError, error_codes};
 use cwtools_game::constants::Game;
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
-use cwtools_string_table::string_table::StringTable;
+use cwtools_string_table::string_table::{StringId, StringTable};
 
 /// The implicit boolean context a node sits in, mirroring F#'s `BoolState`.
 #[derive(Clone, Copy, PartialEq)]
@@ -23,21 +23,30 @@ enum BoolState {
     Or,
 }
 
-/// A reserved boolean keyword that opens a block (`AND`/`OR`/`NOR`).
-#[derive(Clone, Copy, PartialEq)]
-enum BoolKeyword {
-    And,
-    Or,
-    Nor,
+/// The reserved keywords' interned ids, resolved once per file so the walk
+/// compares token ids instead of doing string-table lookups per block. This
+/// walk visits every block of every file and the per-block lookups dominated
+/// its cost (~25% of the whole MD validate phase before; integer compares now).
+struct Keywords {
+    not: StringId,
+    if_: StringId,
+    else_if: StringId,
+    and: StringId,
+    or: StringId,
+    nor: StringId,
+    limit: StringId,
 }
 
-impl BoolKeyword {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "AND" => Some(Self::And),
-            "OR" => Some(Self::Or),
-            "NOR" => Some(Self::Nor),
-            _ => None,
+impl Keywords {
+    fn new(table: &StringTable) -> Self {
+        Self {
+            not: table.intern("NOT").normal,
+            if_: table.intern("if").normal,
+            else_if: table.intern("else_if").normal,
+            and: table.intern("AND").normal,
+            or: table.intern("OR").normal,
+            nor: table.intern("NOR").normal,
+            limit: table.intern("limit").normal,
         }
     }
 }
@@ -52,7 +61,7 @@ fn non_comment_count(children: &[Child]) -> usize {
 
 /// F# `validateIfWithNoEffect`: an `if`/`else_if` with no leaf assignments and
 /// no block children other than `limit`.
-fn is_empty_if(children: &[Child], ast: &ParsedFile, table: &StringTable) -> bool {
+fn is_empty_if(children: &[Child], ast: &ParsedFile, kw: &Keywords) -> bool {
     for child in children {
         match child {
             // A bare `key = value` leaf counts as an effect -> not empty.
@@ -62,10 +71,7 @@ fn is_empty_if(children: &[Child], ast: &ParsedFile, table: &StringTable) -> boo
                     return false;
                 }
                 // A `key = { ... }` leaf-clause: only `limit` is allowed.
-                if !table
-                    .with_string(l.key.normal, |s| s == "limit")
-                    .unwrap_or(false)
-                {
+                if l.key.normal != kw.limit {
                     return false;
                 }
             }
@@ -97,7 +103,7 @@ fn push(
 fn walk(
     children: &[Child],
     ast: &ParsedFile,
-    table: &StringTable,
+    kw: &Keywords,
     file_path: &str,
     parent: BoolState,
     cw223_msg: &str,
@@ -107,10 +113,11 @@ fn walk(
         let Some(block) = as_block(child, ast) else {
             continue;
         };
+        let key = block.key;
 
         // CW223 — NOT with more than one child. The remediation differs by game
         // (HOI4 has no NOR/NAND triggers), so the message is chosen by the caller.
-        if block.key_is(table, "NOT") && non_comment_count(block.children) > 1 {
+        if key == kw.not && non_comment_count(block.children) > 1 {
             push(
                 errors,
                 &error_codes::CW223_INCORRECT_NOT_USAGE,
@@ -121,9 +128,7 @@ fn walk(
         }
 
         // CW121 — empty if/else_if.
-        if (block.key_is(table, "if") || block.key_is(table, "else_if"))
-            && is_empty_if(block.children, ast, table)
-        {
+        if (key == kw.if_ || key == kw.else_if) && is_empty_if(block.children, ast, kw) {
             push(
                 errors,
                 &error_codes::CW121_EMPTY_IF,
@@ -134,13 +139,8 @@ fn walk(
         }
 
         // CW251 — redundant boolean nesting; also compute the child context.
-        // Resolve the key once into the boolean keyword (if any), comparing the
-        // borrowed text rather than cloning it.
-        let kw = table
-            .with_string(block.key, BoolKeyword::from_str)
-            .flatten();
-        let state = match (parent, kw) {
-            (BoolState::And, Some(BoolKeyword::And)) => {
+        let state = if key == kw.and {
+            if parent == BoolState::And {
                 push(
                     errors,
                     &error_codes::CW251_UNNECESSARY_BOOLEAN,
@@ -148,9 +148,10 @@ fn walk(
                     block.range,
                     file_path,
                 );
-                BoolState::And
             }
-            (BoolState::Or, Some(BoolKeyword::Or)) => {
+            BoolState::And
+        } else if key == kw.or {
+            if parent == BoolState::Or {
                 push(
                     errors,
                     &error_codes::CW251_UNNECESSARY_BOOLEAN,
@@ -158,23 +159,17 @@ fn walk(
                     block.range,
                     file_path,
                 );
-                BoolState::Or
             }
+            BoolState::Or
+        } else if key == kw.nor {
             // OR and NOR both put their children in an Or context (NOR never
             // pushes CW251, matching F#).
-            (_, Some(BoolKeyword::Or)) | (_, Some(BoolKeyword::Nor)) => BoolState::Or,
-            _ => BoolState::And,
+            BoolState::Or
+        } else {
+            BoolState::And
         };
 
-        walk(
-            block.children,
-            ast,
-            table,
-            file_path,
-            state,
-            cw223_msg,
-            errors,
-        );
+        walk(block.children, ast, kw, file_path, state, cw223_msg, errors);
     }
 }
 
@@ -191,10 +186,11 @@ pub fn validate_structural(
         Game::Hoi4 => error_codes::CW223_INCORRECT_NOT_USAGE_HOI4_MSG,
         _ => error_codes::CW223_INCORRECT_NOT_USAGE.message_template,
     };
+    let kw = Keywords::new(table);
     walk(
         &ast.root_children,
         ast,
-        table,
+        &kw,
         file_path,
         BoolState::And,
         cw223_msg,

@@ -372,21 +372,23 @@ fn main() {
             // the ruleset); stale caches are detected there and re-generated.
             let vanilla_cache_index = vanilla_cache.as_ref().and_then(|cache_path| {
                 match vanilla_cache::load(cache_path) {
-                    Ok((cache_game, cached_fp, per_type)) => {
+                    Ok((cache_game, cached_fp, data)) => {
                         if cache_game != game {
                             eprintln!(
                                 "  warn: vanilla cache was built for game '{}', validating '{}'",
                                 cache_game, game
                             );
                         }
-                        let total: usize = per_type.values().map(|v| v.len()).sum();
+                        let total: usize = data.per_type.values().map(|v| v.len()).sum();
                         eprintln!(
-                            "  Loaded {} base-game instances from cache {} (fp: {})",
+                            "  Loaded {} base-game instances, {} loc languages, {} files from cache {} (fp: {})",
                             total,
+                            data.loc_keys.len(),
+                            data.file_paths.len(),
                             cache_path.display(),
                             cached_fp,
                         );
-                        Some((cached_fp, per_type))
+                        Some((cached_fp, data))
                     }
                     Err(e) => {
                         eprintln!(
@@ -426,7 +428,9 @@ fn main() {
 
             // Vanilla-cache freshness check. If both --vanilla-cache and --vanilla
             // are given we can compute the combined fingerprint (game version +
-            // ruleset shape) and detect staleness.
+            // ruleset shape) and detect staleness. THIS run already used the
+            // cached data (the cache short-circuits the vanilla walk); the
+            // rebuild makes the next run correct.
             if let (Some(cache_path), Some(fp_loaded), Some(vanilla_dir)) =
                 (&vanilla_cache, &cached_fingerprint, &vanilla)
             {
@@ -439,7 +443,8 @@ fn main() {
                     let rules_table = session.string_table();
                     let var_effects = cwtools_info::variable_defining_effects(ruleset);
                     let index = index_game_dir(vanilla_dir, ruleset, rules_table, &var_effects);
-                    match vanilla_cache::save(&index, &game, &fp_live, cache_path) {
+                    let aux = cwtools_driver::build_vanilla_cache_aux(vanilla_dir, &index);
+                    match vanilla_cache::save(&index, &game, &fp_live, cache_path, aux) {
                         Ok(n) => eprintln!("  Rebuilt vanilla cache with {} instances", n),
                         Err(e) => eprintln!(
                             "  warn: could not write rebuilt cache {}: {}",
@@ -714,21 +719,18 @@ fn main() {
             let ruleset = load_rules(&rules, &rules_table);
             println!("  Loaded {} types from rules", ruleset.types.len());
 
-            // The vanilla cache stores type instances only; no variable
-            // collection needed here (empty effect set skips it).
-            let index = index_game_dir(
-                &vanilla,
-                &ruleset,
-                &rules_table,
-                &std::collections::HashSet::new(),
-            );
+            let var_effects = cwtools_info::variable_defining_effects(&ruleset);
+            let index = index_game_dir(&vanilla, &ruleset, &rules_table, &var_effects);
+            // Loc keys + file paths + variable names ride along so a cache hit
+            // also skips the loc walk and file-index walk over the install.
+            let aux = cwtools_driver::build_vanilla_cache_aux(&vanilla, &index);
             // Combined fingerprint = game version + ruleset shape, so a cache
             // built against one rules set is treated as stale by another (the
             // cached instances are extracted by the rules; a rules change can
             // change which instances exist and under what name).
             let fingerprint = vanilla_cache::combined_fingerprint(&vanilla, &ruleset);
             println!("  Vanilla fingerprint: {}", fingerprint);
-            match vanilla_cache::save(&index, &game, &fingerprint, &output) {
+            match vanilla_cache::save(&index, &game, &fingerprint, &output, aux) {
                 Ok(n) => println!("Wrote {} base-game instances to {}", n, output.display()),
                 Err(e) => {
                     eprintln!("Error writing vanilla cache {}: {}", output.display(), e);

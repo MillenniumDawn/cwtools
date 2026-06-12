@@ -8,14 +8,13 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use cwtools_info::{
-    PositionElement, ReferenceHint, TypeInstance, element_at_position, info_at_position,
-};
+use cwtools_info::{PositionElement, ReferenceHint, TypeInstance, element_at_position};
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType, ValueType};
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
+use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 use cwtools_validation::{
     Prepared, ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
     validate_prepared,
@@ -52,17 +51,27 @@ fn loc_diag_to_validation_error(d: &cwtools_localization::LocDiagnostic) -> Vali
 /// discovered ASTs are used directly (no re-parse) because vanilla files are only
 /// indexed, never validated. Drops the per-instance file_uri; the merge slot only
 /// needs the instances.
+///
+/// Also returns the cache aux payload (loc keys, file paths, variable names) so
+/// a cache written by the LSP is as complete as one from the CLI's
+/// `cache-vanilla`.
 fn index_vanilla_dir(
     dir: &std::path::Path,
     ruleset: &RuleSet,
     table: &StringTable,
-) -> HashMap<String, Vec<TypeInstance>> {
-    let index = cwtools_driver::index_game_dir(dir, ruleset, table, &HashSet::new());
-    index
+) -> (
+    HashMap<String, Vec<TypeInstance>>,
+    cwtools_info::vanilla_cache::VanillaCacheAux,
+) {
+    let var_effects = cwtools_info::variable_defining_effects(ruleset);
+    let index = cwtools_driver::index_game_dir(dir, ruleset, table, &var_effects);
+    let aux = cwtools_driver::build_vanilla_cache_aux(dir, &index);
+    let per_type = index
         .map
         .into_iter()
         .map(|(k, v)| (k, v.into_iter().map(|(_, inst)| inst).collect()))
-        .collect()
+        .collect();
+    (per_type, aux)
 }
 
 /// Best-effort discovery of a base-game install for `game`, checking the usual
@@ -197,18 +206,35 @@ struct DocumentState {
     /// base-game install dir (from the `vanilla` init option, or auto-discovered).
     /// Indexed lazily into `vanilla_index` on the first full-workspace scan.
     vanilla_dir: Mutex<Option<std::path::PathBuf>>,
+    /// Vanilla loc keys per language (display name -> lowercased keys), from the
+    /// vanilla cache or extracted when rebuilding it. When set, the loc rebuild
+    /// skips walking the install's loc files and merges these instead.
+    #[allow(clippy::type_complexity)]
+    vanilla_loc_keys: Mutex<Option<Vec<(String, Vec<String>)>>>,
     /// cached modifier-key set; rebuilt after ruleset load and after each full
     /// workspace scan when the type index is complete.
     modifier_keys: parking_lot::RwLock<HashSet<String>>,
     /// loc-key index (workspace + vanilla) for CW100/CW122 on config files and
     /// for scope-aware loc-command checks. Rebuilt on each full workspace scan.
     loc_index: parking_lot::RwLock<Option<cwtools_localization::LocIndex>>,
+    /// Display text per loc key (lowercased) → list of (language, display text).
+    /// Built from the LocService during workspace scan so hover can show
+    /// localisation without re-reading loc files. Outer quotes are stripped
+    /// from the desc for cleaner display.
+    #[allow(clippy::type_complexity)]
+    loc_text: parking_lot::RwLock<HashMap<String, Vec<(cwtools_localization::Lang, String)>>>,
     /// languages to validate loc against, from the `localisationLanguages` init
     /// option. `None` = all languages with data (the default). When set, the
     /// missing-translation check and per-file loc checks are scoped to these,
     /// so an english-targeted mod isn't flagged for every other language vanilla
     /// happens to ship.
     loc_languages: Mutex<Option<Vec<cwtools_localization::Lang>>>,
+    /// When `false` (the default), hover shows localisation for the primary
+    /// language only (the first of `loc_languages`, else English) and the
+    /// `loc_text` map only stores that language. Set via the
+    /// `hoverShowAllLanguages` init option. Storing one language keeps the map
+    /// small; the user opts into all translations explicitly.
+    hover_show_all_languages: std::sync::atomic::AtomicBool,
     /// Writable directory for persistent caches (from the `cacheDir` init
     /// option, else an OS cache dir). The base-game type index is cached here
     /// keyed by game + version, so it isn't re-parsed on every startup.
@@ -267,9 +293,12 @@ impl DocumentState {
             workspace_uri: Mutex::new(None),
             vanilla_index: Mutex::new(None),
             vanilla_dir: Mutex::new(None),
+            vanilla_loc_keys: Mutex::new(None),
             modifier_keys: parking_lot::RwLock::new(HashSet::new()),
             loc_index: parking_lot::RwLock::new(None),
+            loc_text: parking_lot::RwLock::new(HashMap::new()),
             loc_languages: Mutex::new(None),
+            hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             cache_dir: Mutex::new(None),
             edit_generation: AtomicU64::new(0),
             ignore_file_patterns: parking_lot::RwLock::new(Vec::new()),
@@ -306,6 +335,97 @@ impl Backend {
         // C→S: accept silently.
     }
 
+    /// Resolve the leaf under the cursor with the position resolver and
+    /// classify it: the AST element, a [`ReferenceHint`] derived from the
+    /// matched rule's right-hand side, the alias category the key resolves
+    /// through (trigger/effect/…), and the matched rule's description +
+    /// required scopes (for hover).
+    ///
+    /// Shared by hover, goto_definition, references, prepare_rename, and
+    /// rename. Returns `None` when the cursor isn't on a leaf inside a known
+    /// entity — callers fall back to `element_at_position`.
+    fn rule_info_at_cursor(
+        &self,
+        uri: &str,
+        pos: tower_lsp::lsp_types::Position,
+        logical_path: &str,
+    ) -> Option<RuleCursorInfo> {
+        let language = self.state.language.lock().clone();
+        // Lock order: documents -> ruleset -> scope_registry -> info_service
+        // -> modifier_keys (field-declaration order, see DocumentState).
+        let docs = self.state.documents.lock();
+        let ruleset_guard = self.state.ruleset.read();
+        let registry_guard = self.state.scope_registry.read();
+        let info_guard = self.state.info_service.read();
+        let modifier_guard = self.state.modifier_keys.read();
+        let doc = docs.get(uri)?;
+        let rs = ruleset_guard.as_ref()?;
+        let ast = doc.ast.as_ref()?;
+
+        let enum_map = build_enum_map(rs);
+        let prepared = Prepared {
+            ruleset: rs,
+            table: &self.state.string_table,
+            game: cwtools_game::constants::Game::from_str(&language),
+            type_index: Some(&info_guard.type_index),
+            modifier_keys: Some(&modifier_guard),
+            loc_index: None,
+            registry: registry_guard.as_ref(),
+            enum_map: &enum_map,
+        };
+        let rctx = rules_at_pos(
+            ast,
+            logical_path,
+            &prepared,
+            pos.line + 1,
+            pos.character as u16,
+        )?;
+        let leaf = rctx.leaf?;
+
+        let element = if leaf.key.is_empty() {
+            PositionElement::LeafValue {
+                value: leaf.value.clone(),
+            }
+        } else {
+            PositionElement::Leaf {
+                key: leaf.key.clone(),
+                value: leaf.value.clone(),
+            }
+        };
+
+        let mut hint = ReferenceHint::Unknown;
+        let mut description: Option<String> = None;
+        let mut scopes: Vec<String> = Vec::new();
+        for (rule_type, opts) in &rctx.value_rules {
+            if description.is_none() && opts.description.is_some() {
+                description = opts.description.clone();
+            }
+            if scopes.is_empty() && !opts.required_scopes.is_empty() {
+                scopes = opts.required_scopes.clone();
+            }
+            if matches!(hint, ReferenceHint::Unknown) {
+                hint = hint_from_rule_right(rule_type, &leaf.value);
+            }
+        }
+        let category = if leaf.key.is_empty() {
+            None
+        } else {
+            cwtools_validation::position::alias_category_for_key(
+                rs,
+                Some(&info_guard.type_index),
+                &rctx.child_rules,
+                &leaf.key,
+            )
+        };
+        Some(RuleCursorInfo {
+            element,
+            hint,
+            category,
+            description,
+            required_scopes: scopes,
+        })
+    }
+
     /// Look up the TypeRef (type_name, instance_name) under the cursor.
     ///
     /// Shared by goto_definition, references, prepare_rename, and rename to
@@ -316,25 +436,13 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
     ) -> Option<(String, String)> {
-        let docs = self.state.documents.lock();
-        let ruleset_guard = self.state.ruleset.read();
-        if let (Some(doc), Some(rs)) = (docs.get(uri), ruleset_guard.as_ref())
-            && let Some(ast) = &doc.ast
-        {
-            let info = info_at_position(
-                ast,
-                pos.line + 1,
-                pos.character as u16,
-                rs,
-                logical_path,
-                &self.state.string_table,
-            );
-            return info.and_then(|i| match i.hint {
-                ReferenceHint::TypeRef { type_name, value } => Some((type_name, value)),
-                _ => None,
-            });
+        match self.rule_info_at_cursor(uri, pos, logical_path) {
+            Some(RuleCursorInfo {
+                hint: ReferenceHint::TypeRef { type_name, value },
+                ..
+            }) => Some((type_name, value)),
+            _ => None,
         }
-        None
     }
 
     /// The variable name read at the cursor, if it resolves to a
@@ -345,25 +453,77 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
     ) -> Option<String> {
-        let docs = self.state.documents.lock();
-        let ruleset_guard = self.state.ruleset.read();
-        if let (Some(doc), Some(rs)) = (docs.get(uri), ruleset_guard.as_ref())
-            && let Some(ast) = &doc.ast
-        {
-            let info = info_at_position(
-                ast,
-                pos.line + 1,
-                pos.character as u16,
-                rs,
-                logical_path,
-                &self.state.string_table,
-            );
-            return info.and_then(|i| match i.hint {
-                ReferenceHint::Variable { name, .. } => Some(name),
-                _ => None,
-            });
+        match self.rule_info_at_cursor(uri, pos, logical_path) {
+            Some(RuleCursorInfo {
+                hint: ReferenceHint::Variable { name, .. },
+                ..
+            }) => Some(name),
+            _ => None,
         }
-        None
+    }
+}
+
+/// What `rule_info_at_cursor` resolves for the leaf under the cursor.
+struct RuleCursorInfo {
+    element: PositionElement,
+    hint: ReferenceHint,
+    /// Alias category the key resolves through (`trigger`, `effect`, …), for
+    /// the hover header.
+    category: Option<String>,
+    /// The matched rule's `###` description.
+    description: Option<String>,
+    required_scopes: Vec<String>,
+}
+
+/// Map a matched leaf rule's right-hand field to a [`ReferenceHint`] for the
+/// leaf's value (the same classification `info_at_position` used to do at
+/// depth 0-1, now fed by the full position resolver).
+fn hint_from_rule_right(rule_type: &RuleType, value: &str) -> ReferenceHint {
+    let right = match rule_type {
+        RuleType::LeafRule { right, .. } => right,
+        RuleType::LeafValueRule { right } => right,
+        _ => return ReferenceHint::Unknown,
+    };
+    match right {
+        NewField::TypeField(TypeType::Simple(t)) => ReferenceHint::TypeRef {
+            type_name: t.clone(),
+            value: value.to_string(),
+        },
+        // `modifier:production_speed_<building>_factor` style: strip the
+        // literal affixes so the instance name is what's looked up.
+        NewField::TypeField(TypeType::Complex {
+            prefix,
+            name,
+            suffix,
+        }) => {
+            let inner = value
+                .strip_prefix(prefix.as_str())
+                .unwrap_or(value)
+                .strip_suffix(suffix.as_str())
+                .unwrap_or(value);
+            ReferenceHint::TypeRef {
+                type_name: name.clone(),
+                value: inner.to_string(),
+            }
+        }
+        NewField::ValueField(ValueType::Enum(e)) => ReferenceHint::EnumRef {
+            enum_name: e.clone(),
+            value: value.to_string(),
+        },
+        NewField::LocalisationField { .. } => ReferenceHint::LocRef {
+            key: value.to_string(),
+        },
+        NewField::FilepathField { .. } => ReferenceHint::FileRef {
+            path: value.to_string(),
+        },
+        NewField::VariableGetField(ns) => ReferenceHint::Variable {
+            name: value.to_string(),
+            namespace: ns.clone(),
+        },
+        NewField::ScopeField(_) => ReferenceHint::ScopeName {
+            name: value.to_string(),
+        },
+        _ => ReferenceHint::Unknown,
     }
 }
 
@@ -436,19 +596,29 @@ fn logical_path_from_uri(uri: &str, workspace_uri: &Option<String>) -> String {
     path
 }
 
-/// Build a Markdown hover string from a PositionInfo + optional rule options.
+/// Build a Markdown hover string from the classified element + the matched
+/// rule's category, description, and required scopes (from
+/// `rule_info_at_cursor`).
 fn build_hover_markdown(
     element: &PositionElement,
     hint: &ReferenceHint,
-    ruleset: Option<&RuleSet>,
+    category: Option<&str>,
+    rule_desc: Option<&str>,
+    rule_scopes: &[String],
 ) -> String {
-    // Try to find a matching rule's description and scope info for the element key.
-    let (rule_desc, rule_scopes) = match (ruleset, element) {
-        (Some(rules), PositionElement::Leaf { key, .. }) => find_rule_description(rules, key),
-        _ => (None, Vec::new()),
-    };
-
     let mut parts: Vec<String> = Vec::new();
+
+    // Header: which alias category the key resolves through, so a trigger
+    // reads as a trigger and an effect as an effect at a glance.
+    if let (Some(cat), PositionElement::Leaf { key, .. }) = (category, element) {
+        let label = match cat {
+            "trigger" => "Trigger",
+            "effect" => "Effect",
+            "modifier" => "Modifier",
+            other => other,
+        };
+        parts.push(format!("**{}** `{}`", label, key));
+    }
 
     // Primary classification
     match hint {
@@ -493,7 +663,7 @@ fn build_hover_markdown(
     }
 
     // Append rule description if found
-    if let Some(desc) = &rule_desc {
+    if let Some(desc) = rule_desc {
         parts.push(format!("\n{}", desc));
     }
 
@@ -505,191 +675,92 @@ fn build_hover_markdown(
     parts.join("\n\n")
 }
 
-/// Walk root_rules for a leaf rule whose left field matches `key` and return
-/// the Options.description (and required_scopes) if found.
-fn find_rule_description(rules: &RuleSet, key: &str) -> (Option<String>, Vec<String>) {
-    for root_rule in &rules.root_rules {
-        let (_, (rule_type, _)) = match root_rule {
-            RootRule::TypeRule(n, r) => (n, r),
-            RootRule::AliasRule(n, r) => (n, r),
-            RootRule::SingleAliasRule(n, r) => (n, r),
-        };
-        let child_rules = match rule_type {
-            RuleType::NodeRule { rules, .. } => rules.as_slice(),
-            _ => continue,
-        };
-        for (inner_type, opts) in child_rules {
-            match inner_type {
-                RuleType::LeafRule {
-                    left: NewField::SpecificField(k),
-                    ..
-                }
-                | RuleType::NodeRule {
-                    left: NewField::SpecificField(k),
-                    ..
-                } if k.eq_ignore_ascii_case(key) => {
-                    return (opts.description.clone(), opts.required_scopes.clone());
-                }
-                _ => {}
+/// Strip matching outer double quotes from a loc desc string for hover display.
+/// `"Hello"` → `Hello`, `Hello` → `Hello`, `""` → `` (empty).
+fn strip_loc_quotes(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Human-readable language name for hover display.
+fn lang_display_name(lang: cwtools_localization::Lang) -> &'static str {
+    match lang {
+        cwtools_localization::Lang::English => "English",
+        cwtools_localization::Lang::French => "French",
+        cwtools_localization::Lang::German => "German",
+        cwtools_localization::Lang::Spanish => "Spanish",
+        cwtools_localization::Lang::Russian => "Russian",
+        cwtools_localization::Lang::Polish => "Polish",
+        cwtools_localization::Lang::BrazPor => "Brazilian Portuguese",
+        cwtools_localization::Lang::SimpChinese => "Chinese",
+        cwtools_localization::Lang::Japanese => "Japanese",
+        cwtools_localization::Lang::Korean => "Korean",
+        cwtools_localization::Lang::Turkish => "Turkish",
+        cwtools_localization::Lang::Default => "Default",
+    }
+}
+
+/// Append localisation translations for the hovered element to `md`.
+///
+/// A reference (`add_ideas = DEN_Maersk1`) looks up the leaf value. A definition
+/// key (`DEN_Maersk1 = { ... }`, value empty) looks up the key itself: for ideas,
+/// decisions and similar entities the token IS the loc key, and the `<key>_desc`
+/// entry holds the description tooltip. The cwt config doesn't model this, so it
+/// can't be resolved through the rule walk.
+fn append_localisation(
+    md: &mut String,
+    element: &PositionElement,
+    loc_text: &HashMap<String, Vec<(cwtools_localization::Lang, String)>>,
+) {
+    let (name_key, desc_key): (Option<String>, Option<String>) = match element {
+        PositionElement::Leaf { key, value } if value.is_empty() => {
+            let k = key.to_lowercase();
+            (Some(k.clone()), Some(format!("{k}_desc")))
+        }
+        PositionElement::Leaf { value, .. } => (Some(value.to_lowercase()), None),
+        PositionElement::LeafValue { value } => (Some(value.to_lowercase()), None),
+    };
+    let mut emit = |loc_key: &str, label: &str| {
+        if let Some(translations) = loc_text.get(loc_key) {
+            md.push_str(label);
+            for (lang, text) in translations {
+                md.push_str(&format!("\n- {}: {}", lang_display_name(*lang), text));
             }
         }
+    };
+    if let Some(nk) = name_key {
+        emit(&nk, "\n\n**Localisation**:");
     }
-    (None, Vec::new())
+    if let Some(dk) = desc_key {
+        emit(&dk, "\n\n**Description**:");
+    }
 }
 
 // ── Completion context helpers ────────────────────────────────────────────────
 
-/// Walk the AST to find the cursor's enclosing node key path.
-/// Returns the list of ancestor node keys from outermost to innermost.
-///
-/// Limitation: this is a linear scan; aliases and deeply nested rules are not
-/// fully resolved.  When context can't be determined we fall back to the flat
-/// global list.
-fn enclosing_key_path(ast: &ParsedFile, line: u32, col: u16, table: &StringTable) -> Vec<String> {
-    let target = cwtools_parser::ast::SourcePos { line, col };
-    let mut path = Vec::new();
-    collect_enclosing_path(&ast.root_children, &ast.arena, &target, table, &mut path);
-    path
-}
-
-fn collect_enclosing_path(
-    children: &[cwtools_parser::ast::Child],
-    arena: &cwtools_parser::ast::Arena,
-    target: &cwtools_parser::ast::SourcePos,
-    table: &StringTable,
-    path: &mut Vec<String>,
-) -> bool {
-    use cwtools_parser::ast::{Child, Value};
-
-    for child in children {
-        if let Child::Leaf(idx) = child {
-            let leaf = &arena.leaves[*idx as usize];
-            if let Value::Clause(ch) = &leaf.value
-                && pos_in_range_simple(target, &leaf.pos)
-            {
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                path.push(key);
-                // Descend (extending `path`) but stop at this branch regardless:
-                // the first enclosing clause that contains the cursor wins.
-                collect_enclosing_path(ch, arena, target, table, path);
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn pos_in_range_simple(
-    pos: &cwtools_parser::ast::SourcePos,
-    range: &cwtools_parser::ast::SourceRange,
-) -> bool {
-    let s = &range.start;
-    let e = &range.end;
-    if pos.line < s.line || pos.line > e.line {
-        return false;
-    }
-    if pos.line == s.line && pos.col < s.col {
-        return false;
-    }
-    if pos.line == e.line && pos.col > e.col {
-        return false;
-    }
-    true
-}
-
-/// Given an enclosing key path and a ruleset, find the applicable child rules.
-///
-/// Walks root_rules: for the outermost key (the type block) it finds a
-/// TypeRule whose name matches a type definition that covers `logical_path`;
-/// then descends the rule tree following the remaining path elements.
-///
-/// Returns the slice of child (RuleType, Options) pairs that apply at the
-/// cursor's level, or None when no match is found.
-fn rules_for_context<'a>(
-    ruleset: &'a RuleSet,
-    key_path: &[String],
-    logical_path: &str,
-) -> Option<&'a [(RuleType, cwtools_rules::rules_types::Options)]> {
-    if key_path.is_empty() {
-        // Top-level context: return all rules from all type rules for this path
-        // (no single slice, caller handles)
+/// When the line prefix before the cursor reads `key =` (value not typed yet,
+/// so the last good parse has no leaf there), return the key so value
+/// completions can still resolve. `line0`/`char0` are LSP 0-based.
+fn line_value_key(text: &str, line0: u32, char0: u32) -> Option<String> {
+    let line = text.lines().nth(line0 as usize)?;
+    let n = line.len().min(char0 as usize);
+    let n = (0..=n).rev().find(|&i| line.is_char_boundary(i))?;
+    let upto = &line[..n];
+    let trimmed = upto.trim_end();
+    let rest = trimmed
+        .strip_suffix(['=', '<', '>'])?
+        .trim_end_matches(['=', '<', '>', '!', '?'])
+        .trim_end();
+    let key = rest
+        .rsplit(|c: char| c.is_whitespace() || c == '{')
+        .next()?;
+    if key.is_empty() || key.contains('}') || key.contains('"') {
         return None;
     }
-
-    // Find a TypeRule whose corresponding TypeDef covers logical_path.
-    for root_rule in &ruleset.root_rules {
-        let (type_name, (rule_type, _)) = match root_rule {
-            RootRule::TypeRule(n, r) => (n, r),
-            _ => continue,
-        };
-        if let Some(&idx) = ruleset.type_by_name.get(type_name) {
-            let td = &ruleset.types[idx];
-            // Check path
-            if !cwtools_info_path_check(&td.path_options, logical_path) {
-                continue;
-            }
-            // Check the key matches (type_key_filter or starts_with)
-            // We check the top-level key against the type's skip_root_key stack.
-            // Simple case: no skip_root_key, so key_path[0] IS the instance.
-            // With skip_root_key we'd need to look for key_path[1] etc.; skip for now.
-            // For path[1..] we descend into the NodeRule's child rules.
-            if let RuleType::NodeRule { rules, .. } = rule_type {
-                // If there's only one level, return these rules directly
-                if key_path.len() == 1 {
-                    return Some(rules);
-                }
-                // Descend further into nested rules
-                return descend_rules(rules, &key_path[1..]);
-            }
-        }
-    }
-
-    // Also try alias rules (the cursor might be inside an alias block)
-    for root_rule in &ruleset.root_rules {
-        let (_, (rule_type, _)) = match root_rule {
-            RootRule::AliasRule(n, r) => (n, r),
-            RootRule::SingleAliasRule(n, r) => (n, r),
-            _ => continue,
-        };
-        if let RuleType::NodeRule { rules, .. } = rule_type {
-            if key_path.len() == 1 {
-                return Some(rules);
-            }
-            if let Some(slice) = descend_rules(rules, &key_path[1..]) {
-                return Some(slice);
-            }
-        }
-    }
-
-    None
-}
-
-fn descend_rules<'a>(
-    rules: &'a [(RuleType, cwtools_rules::rules_types::Options)],
-    remaining: &[String],
-) -> Option<&'a [(RuleType, cwtools_rules::rules_types::Options)]> {
-    if remaining.is_empty() {
-        return Some(rules);
-    }
-    let next_key = &remaining[0];
-    for (rule_type, _) in rules {
-        match rule_type {
-            RuleType::NodeRule {
-                left: NewField::SpecificField(k),
-                rules: inner,
-                ..
-            }
-            | RuleType::NodeRule {
-                left: NewField::AliasValueKeysField(k),
-                rules: inner,
-                ..
-            } if k.eq_ignore_ascii_case(next_key) => {
-                return descend_rules(inner, &remaining[1..]);
-            }
-            _ => {}
-        }
-    }
-    None
+    Some(key.to_string())
 }
 
 /// Thin wrapper around the info crate's path check (avoids re-exporting it).
@@ -733,17 +804,14 @@ fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
 }
 
 /// Build context-aware completion items from the child rules at the cursor's
-/// position.
-///
-/// Limitation: AliasField expansion is not fully recursive (that requires
-/// following the alias chain, which can be large).  TypeField completions use
-/// the TypeIndex from the InfoService.  ScopeField completions are placeholder
-/// scope names.
+/// position (the rules come from `position::rules_at_pos`, which resolves
+/// aliases, typed keys, and subtypes the same way validation does).
 fn completions_from_rules(
     rules: &[(RuleType, cwtools_rules::rules_types::Options)],
     ruleset: &RuleSet,
     info: &cwtools_info::InfoService,
     language: &str,
+    modifier_keys: &HashSet<String>,
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
 
@@ -806,11 +874,74 @@ fn completions_from_rules(
                     ..Default::default()
                 });
             }
+            // An enum-keyed field: every member of the enum is a valid key here
+            // (e.g. MIO `equipment_bonus = { enum[equipment_stat] = variable_field }`).
+            RuleType::LeafRule {
+                left: NewField::ValueField(ValueType::Enum(e)),
+                right,
+            } => {
+                let snippet_value = match right {
+                    NewField::ValueField(ValueType::Bool) => "${1|yes,no|}".to_string(),
+                    _ => "${1}".to_string(),
+                };
+                for v in all_enum_values(ruleset, info, e) {
+                    items.push(CompletionItem {
+                        label: v.clone(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: Some(format!("enum {}", e)),
+                        insert_text: Some(format!("{} = {}", v, snippet_value)),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
+            }
+            RuleType::NodeRule {
+                left: NewField::ValueField(ValueType::Enum(e)),
+                ..
+            } => {
+                for v in all_enum_values(ruleset, info, e) {
+                    items.push(CompletionItem {
+                        label: v.clone(),
+                        kind: Some(CompletionItemKind::STRUCT),
+                        detail: Some(format!("enum {}", e)),
+                        insert_text: Some(format!("{} = {{\n\t$0\n}}", v)),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
+            }
+            // A typed key: every instance of the type is a valid key here
+            // (e.g. `equipment_type = { <equipment_group> }` blocks, or
+            // `<equipment> = { ... }` entries).
+            RuleType::LeafRule {
+                left: NewField::TypeField(TypeType::Simple(t)),
+                right: NewField::AliasField(_) | NewField::ValueField(_) | NewField::ScalarField,
+            }
+            | RuleType::NodeRule {
+                left: NewField::TypeField(TypeType::Simple(t)),
+                ..
+            } => {
+                let is_node = matches!(rule_type, RuleType::NodeRule { .. });
+                for (_, inst) in info.type_index.instances(t) {
+                    items.push(CompletionItem {
+                        label: inst.name.clone(),
+                        kind: Some(CompletionItemKind::STRUCT),
+                        detail: Some(format!("{} instance", t)),
+                        insert_text: Some(if is_node {
+                            format!("{} = {{\n\t$0\n}}", inst.name)
+                        } else {
+                            format!("{} = ${{1}}", inst.name)
+                        }),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
+            }
             // An enum value at the leaf level
             RuleType::LeafValueRule {
                 right: NewField::ValueField(ValueType::Enum(e)),
             } => {
-                for v in enum_values_for(ruleset, e) {
+                for v in all_enum_values(ruleset, info, e) {
                     items.push(CompletionItem {
                         label: v,
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
@@ -848,13 +979,47 @@ fn completions_from_rules(
                 left: NewField::AliasField(cat),
                 ..
             } => {
-                // Emit the keys of all alias:<cat> entries
-                for (alias_name, _) in &ruleset.aliases {
-                    if let Some(k) = alias_name.strip_prefix(&format!("{}:", cat)) {
+                // Emit the keys of all alias:<cat> entries, labelled with the
+                // category (trigger/effect/…) and carrying the alias's ###
+                // docs. Overloads collapse onto one item (first description wins).
+                let prefix = format!("{}:", cat);
+                let mut seen: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for (alias_name, (_, opts)) in &ruleset.aliases {
+                    let Some(k) = alias_name.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    if k == "scope_field" {
+                        continue;
+                    }
+                    if let Some(&idx) = seen.get(k) {
+                        let item: &mut CompletionItem = &mut items[idx];
+                        if item.documentation.is_none()
+                            && let Some(d) = &opts.description
+                        {
+                            item.documentation = Some(Documentation::String(d.clone()));
+                        }
+                        continue;
+                    }
+                    seen.insert(k, items.len());
+                    items.push(CompletionItem {
+                        label: k.to_string(),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        detail: Some(cat.to_string()),
+                        documentation: opts.description.clone().map(Documentation::String),
+                        ..Default::default()
+                    });
+                }
+                // The `modifier` category has no alias entries — modifiers live
+                // in the expanded modifier-key set (modifiers.cwt + templated
+                // names like production_speed_<building>_factor). This is the
+                // MIO `equipment_bonus` / idea `modifier` block case.
+                if cat == "modifier" {
+                    for m in modifier_keys {
                         items.push(CompletionItem {
-                            label: k.to_string(),
-                            kind: Some(CompletionItemKind::KEYWORD),
-                            detail: Some(format!("alias {}", cat)),
+                            label: m.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some("modifier".to_string()),
                             ..Default::default()
                         });
                     }
@@ -902,6 +1067,172 @@ fn enum_values_for(ruleset: &RuleSet, enum_name: &str) -> Vec<String> {
         return ruleset.enums[idx].values.clone();
     }
     Vec::new()
+}
+
+/// Enum members from the static definition AND the collected complex-enum
+/// values (equipment_stat, country_tags, idea_name, … extracted from game
+/// files). The completion-item paths use this; snippet placeholders stick to
+/// the static list (dynamic enums are too large for inline choices).
+fn all_enum_values(
+    ruleset: &RuleSet,
+    info: &cwtools_info::InfoService,
+    enum_name: &str,
+) -> Vec<String> {
+    let mut vals = enum_values_for(ruleset, enum_name);
+    vals.extend(
+        info.type_index
+            .complex_enum_values
+            .values(enum_name)
+            .cloned(),
+    );
+    vals.sort_unstable();
+    vals.dedup();
+    vals
+}
+
+/// Completion items for a leaf VALUE position: enumerate what the matched
+/// rules' right-hand sides accept. `value_rules` comes from
+/// `position::rules_at_pos` (alias usages already expanded to their overloads,
+/// so `has_completed_focus = |` arrives here as a `TypeField("focus")` rule).
+fn value_completions(
+    value_rules: &[(RuleType, cwtools_rules::rules_types::Options)],
+    ruleset: &RuleSet,
+    info: &cwtools_info::InfoService,
+    registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
+    language: &str,
+) -> Vec<CompletionItem> {
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |label: String,
+                    kind: CompletionItemKind,
+                    detail: String,
+                    items: &mut Vec<CompletionItem>| {
+        if seen.insert(label.clone()) {
+            items.push(CompletionItem {
+                label,
+                kind: Some(kind),
+                detail: Some(detail),
+                ..Default::default()
+            });
+        }
+    };
+
+    for (rule_type, _opts) in value_rules {
+        let right = match rule_type {
+            RuleType::LeafRule { right, .. } => right,
+            RuleType::LeafValueRule { right } => right,
+            _ => continue,
+        };
+        match right {
+            NewField::TypeField(TypeType::Simple(t)) => {
+                for (_, inst) in info.type_index.instances(t) {
+                    push(
+                        inst.name.clone(),
+                        CompletionItemKind::REFERENCE,
+                        format!("{} instance", t),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::TypeField(TypeType::Complex {
+                prefix,
+                name,
+                suffix,
+            }) => {
+                for (_, inst) in info.type_index.instances(name) {
+                    push(
+                        format!("{}{}{}", prefix, inst.name, suffix),
+                        CompletionItemKind::REFERENCE,
+                        format!("{} instance", name),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::ValueField(ValueType::Enum(e)) => {
+                for v in all_enum_values(ruleset, info, e) {
+                    push(
+                        v,
+                        CompletionItemKind::ENUM_MEMBER,
+                        format!("enum {}", e),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::ValueField(ValueType::Bool) => {
+                for v in ["yes", "no"] {
+                    push(
+                        v.to_string(),
+                        CompletionItemKind::KEYWORD,
+                        "bool".to_string(),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::ScopeField(_)
+            | NewField::ValueScopeField { .. }
+            | NewField::ValueScopeMarkerField { .. } => {
+                // Config-driven link names (owner, capital_scope, …) when a
+                // registry is loaded; static keyword list as the floor.
+                if let Some(reg) = registry {
+                    for link in reg.links.keys() {
+                        push(
+                            link.clone(),
+                            CompletionItemKind::VALUE,
+                            "scope link".to_string(),
+                            &mut items,
+                        );
+                    }
+                }
+                for scope in scope_names_for_game(language) {
+                    push(
+                        scope.to_string(),
+                        CompletionItemKind::VALUE,
+                        "scope".to_string(),
+                        &mut items,
+                    );
+                }
+            }
+            // `value[x]` reads and writes both offer the already-collected set
+            // members. A write (`set_country_flag = |`) names a new member, so the
+            // list is a "did you mean an existing one" hint rather than a closed
+            // set; reads (`value[x]`) want exactly these. Same source either way.
+            NewField::VariableGetField(ns) | NewField::VariableSetField(ns) => {
+                let source: Vec<String> = match ns.as_str() {
+                    "event_target" => info.all_event_targets.iter().cloned().collect(),
+                    "variable" => info.all_variables.iter().cloned().collect(),
+                    // Flags/tokens/…: config-declared values plus the members
+                    // collected from mod+vanilla effects (set_country_flag etc.).
+                    other => {
+                        let mut vals: Vec<String> =
+                            ruleset.values.get(other).cloned().unwrap_or_default();
+                        vals.extend(info.type_index.value_set_values.values(other).cloned());
+                        vals
+                    }
+                };
+                for v in source {
+                    push(
+                        v,
+                        CompletionItemKind::CONSTANT,
+                        format!("value[{}]", ns),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::VariableField { .. } => {
+                for v in &info.all_variables {
+                    push(
+                        v.clone(),
+                        CompletionItemKind::CONSTANT,
+                        "variable".to_string(),
+                        &mut items,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    items
 }
 
 /// Build an LSP snippet body for a NodeRule, pre-populating required child fields
@@ -1157,6 +1488,13 @@ impl LanguageServer for Backend {
                 }
             }
 
+            // Whether hover shows all loc languages or just the primary one.
+            if let Some(all) = opts.get("hoverShowAllLanguages").and_then(|v| v.as_bool()) {
+                self.state
+                    .hover_show_all_languages
+                    .store(all, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // Persistent cache directory for the base-game index (so it isn't
             // re-parsed every startup). The client should pass its global
             // storage path; we fall back to an OS cache dir otherwise.
@@ -1173,9 +1511,16 @@ impl LanguageServer for Backend {
             // validate_entire_workspace.
             if let Some(vc) = opts.get("vanillaCache").and_then(|v| v.as_str()) {
                 match cwtools_info::vanilla_cache::load(std::path::Path::new(vc)) {
-                    Ok((game, _fingerprint, per_type)) => {
-                        let total: usize = per_type.values().map(|v| v.len()).sum();
-                        *self.state.vanilla_index.lock() = Some(per_type);
+                    Ok((game, _fingerprint, data)) => {
+                        let total: usize = data.per_type.values().map(|v| v.len()).sum();
+                        *self.state.vanilla_index.lock() = Some(data.per_type);
+                        if !data.loc_keys.is_empty() {
+                            *self.state.vanilla_loc_keys.lock() = Some(data.loc_keys);
+                        }
+                        self.merge_vanilla_dynamic_values(
+                            data.complex_enum_values,
+                            data.value_set_values,
+                        );
                         self.client
                             .log_message(
                                 MessageType::INFO,
@@ -1323,7 +1668,12 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["getFileTypes".to_string(), "exportProfilingLog".to_string()],
+                    commands: vec![
+                        "getFileTypes".to_string(),
+                        "exportProfilingLog".to_string(),
+                        "cacheVanilla".to_string(),
+                        "clearAllCaches".to_string(),
+                    ],
                     work_done_progress_options: Default::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
@@ -1359,9 +1709,17 @@ impl LanguageServer for Backend {
         // handshake returns promptly.
         let client = self.client.clone();
         let state = self.state.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let backend = Backend { client, state };
             backend.validate_entire_workspace().await;
+        });
+        // Log if the workspace scan panics — without this, a panic is silently
+        // swallowed (the JoinHandle is dropped) and the server runs in a
+        // degraded state with no diagnostics.
+        tokio::spawn(async move {
+            if let Err(e) = handle.await {
+                tracing::error!("validate_entire_workspace panicked: {}", e);
+            }
         });
     }
 
@@ -1514,36 +1872,27 @@ impl LanguageServer for Backend {
             docs.get(&uri).and_then(|d| d.ast.clone())
         };
         if let Some(ast) = ast {
-            let lsp_line = pos.line + 1; // LSP is 0-based; parser is 1-based
-            let lsp_col = pos.character as u16;
-
             let ws_uri = self.state.workspace_uri.lock().clone();
             let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-            let ruleset_guard = self.state.ruleset.read();
-            let pos_info = if let Some(rs) = ruleset_guard.as_ref() {
-                info_at_position(
-                    &ast,
-                    lsp_line,
-                    lsp_col,
-                    rs,
-                    &logical_path,
-                    &self.state.string_table,
-                )
-            } else {
-                // No rules: fall back to position-only lookup
-                None
-            };
-            drop(ruleset_guard);
-
-            if let Some(info) = pos_info {
-                let ruleset_guard2 = self.state.ruleset.read();
-                let mut md =
-                    build_hover_markdown(&info.element, &info.hint, ruleset_guard2.as_ref());
-                drop(ruleset_guard2);
+            if let Some(RuleCursorInfo {
+                element,
+                hint,
+                category,
+                description: desc,
+                required_scopes: scopes,
+            }) = self.rule_info_at_cursor(&uri, pos, &logical_path)
+            {
+                let mut md = build_hover_markdown(
+                    &element,
+                    &hint,
+                    category.as_deref(),
+                    desc.as_deref(),
+                    &scopes,
+                );
                 // For a variable read, append the known assigned value(s) so the
                 // user sees what it resolves to without chasing the definition.
-                if let ReferenceHint::Variable { name, .. } = &info.hint {
+                if let ReferenceHint::Variable { name, .. } = &hint {
                     let info_guard = self.state.info_service.read();
                     let (values, more) = info_guard.variable_values(name, 5);
                     if !values.is_empty() {
@@ -1556,6 +1905,9 @@ impl LanguageServer for Backend {
                         md.push_str(&format!("\n\nSet to: {}{}", joined, suffix));
                     }
                 }
+                // Append localisation translations. A reference resolves by leaf
+                // value; a definition key (idea/decision) resolves by its key.
+                append_localisation(&mut md, &element, &self.state.loc_text.read());
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1572,7 +1924,7 @@ impl LanguageServer for Backend {
                 pos.character as u16,
                 &self.state.string_table,
             ) {
-                let contents = match element {
+                let mut contents = match &element {
                     PositionElement::Leaf { key, value } => {
                         format!("**Field**: `{} = {}`", key, value)
                     }
@@ -1580,6 +1932,8 @@ impl LanguageServer for Backend {
                         format!("**Value**: `{}`", value)
                     }
                 };
+                // Append localisation translations for the hovered element.
+                append_localisation(&mut contents, &element, &self.state.loc_text.read());
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1599,14 +1953,9 @@ impl LanguageServer for Backend {
         let lsp_line = pos.line + 1;
         let lsp_col = pos.character as u16;
 
-        // Try context-aware completions first.
-        //
-        // Limitations:
-        //  - Alias expansion is one level deep only (full recursive alias
-        //    expansion would require following chains, which can be large).
-        //  - ScopeField values are a static per-game list; full dynamic scope
-        //    resolution is not implemented.
-        //  - Deeply nested nodes inside aliases or subtypes may not match.
+        // Try context-aware completions first: resolve the rules at the cursor
+        // with the validation engine's own descent (aliases, typed keys,
+        // subtypes, skip_root_key — see cwtools_validation::position).
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
         let language = self.state.language.lock().clone();
@@ -1620,33 +1969,81 @@ impl LanguageServer for Backend {
             }
         }
 
-        let context_items: Vec<CompletionItem> = {
+        // `Some(items)` = the rule context resolved (items may still be empty:
+        // an unknown block where suggestions from any other level would be
+        // wrong). `None` = no doc/ruleset/AST — fall through to the flat list.
+        let context_items: Option<Vec<CompletionItem>> = {
+            // Lock order: documents -> ruleset -> scope_registry -> info_service
+            // -> modifier_keys (field-declaration order, see DocumentState).
             let docs = self.state.documents.lock();
             let ruleset_guard = self.state.ruleset.read();
+            let registry_guard = self.state.scope_registry.read();
             let info_guard = self.state.info_service.read();
+            let modifier_guard = self.state.modifier_keys.read();
 
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref()) {
-                if let Some(ast) = &doc.ast {
-                    let key_path =
-                        enclosing_key_path(ast, lsp_line, lsp_col, &self.state.string_table);
-                    if key_path.is_empty() {
-                        // Top level — offer root-type snippets for this file's path.
-                        root_type_snippets(rs, &logical_path)
-                    } else if let Some(rules) = rules_for_context(rs, &key_path, &logical_path) {
-                        completions_from_rules(rules, rs, &info_guard, &language)
-                    } else {
-                        Vec::new()
+            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref())
+                && let Some(ast) = &doc.ast
+            {
+                let enum_map = build_enum_map(rs);
+                let game = cwtools_game::constants::Game::from_str(&language);
+                let prepared = Prepared {
+                    ruleset: rs,
+                    table: &self.state.string_table,
+                    game,
+                    type_index: Some(&info_guard.type_index),
+                    modifier_keys: Some(&modifier_guard),
+                    loc_index: None,
+                    registry: registry_guard.as_ref(),
+                    enum_map: &enum_map,
+                };
+                match rules_at_pos(ast, &logical_path, &prepared, lsp_line, lsp_col) {
+                    // Outside any known entity — offer root-type snippets.
+                    None => Some(root_type_snippets(rs, &logical_path)),
+                    Some(rctx) => {
+                        let items = if rctx.leaf.as_ref().is_some_and(|l| l.in_value) {
+                            value_completions(
+                                &rctx.value_rules,
+                                rs,
+                                &info_guard,
+                                registry_guard.as_deref(),
+                                &language,
+                            )
+                        } else if let Some(key) = line_value_key(&doc.text, pos.line, pos.character)
+                        {
+                            // Mid-edit `key = |`: the last good parse has no such
+                            // leaf yet; resolve the value rules from the live line.
+                            let vr = value_rules_for_key(
+                                rs,
+                                Some(&info_guard.type_index),
+                                &rctx.child_rules,
+                                &key,
+                            );
+                            value_completions(
+                                &vr,
+                                rs,
+                                &info_guard,
+                                registry_guard.as_deref(),
+                                &language,
+                            )
+                        } else {
+                            completions_from_rules(
+                                &rctx.child_rules,
+                                rs,
+                                &info_guard,
+                                &language,
+                                &modifier_guard,
+                            )
+                        };
+                        Some(items)
                     }
-                } else {
-                    Vec::new()
                 }
             } else {
-                Vec::new()
+                None
             }
         };
 
-        if !context_items.is_empty() {
-            return Ok(Some(CompletionResponse::Array(context_items)));
+        if let Some(items) = context_items {
+            return Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)));
         }
 
         // Fallback: flat global list (original behavior) when context-aware
@@ -1750,7 +2147,7 @@ impl LanguageServer for Backend {
         let ws_uri = self.state.workspace_uri.lock().clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-        // First try the rule-aware lookup via info_at_position so we get a
+        // First try the rule-aware lookup via the position resolver so we get a
         // TypeRef hint and can look up the actual definition location.
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
@@ -2291,6 +2688,52 @@ impl LanguageServer for Backend {
             "exportProfilingLog" => Ok(Some(Value::String(
                 cwtools_profiling::export_profiling_log(),
             ))),
+            // Re-index the base-game install and re-write the vanilla cache,
+            // even when a fresh-looking cache exists.
+            "cacheVanilla" => {
+                self.state.vanilla_merged.store(false, Ordering::SeqCst);
+                *self.state.vanilla_index.lock() = None;
+                *self.state.vanilla_loc_keys.lock() = None;
+                self.ensure_vanilla_index(true).await;
+                self.merge_pending_vanilla_index();
+                self.rebuild_modifier_keys();
+                // ensure_vanilla_index turns the loading bar on but, unlike a full
+                // workspace scan, this command never reaches the code that turns it
+                // off; do it here so the status bar doesn't spin forever.
+                self.send_loading_bar(false, "").await;
+                Ok(Some(Value::String("Vanilla cache rebuilt.".to_string())))
+            }
+            // Purge every on-disk cache (parse cache + vanilla caches), drop the
+            // in-memory vanilla state, and re-scan the workspace from scratch.
+            "clearAllCaches" => {
+                let dir = self
+                    .state
+                    .cache_dir
+                    .lock()
+                    .clone()
+                    .or_else(default_cache_dir);
+                if let Some(dir) = &dir {
+                    let dir = dir.clone();
+                    tokio::task::block_in_place(|| {
+                        let _ = std::fs::remove_dir_all(dir.join("parse-cache"));
+                        if let Ok(entries) = std::fs::read_dir(&dir) {
+                            for e in entries.flatten() {
+                                let name = e.file_name();
+                                if name.to_string_lossy().starts_with("vanilla-") {
+                                    let _ = std::fs::remove_file(e.path());
+                                }
+                            }
+                        }
+                    });
+                }
+                self.state.vanilla_merged.store(false, Ordering::SeqCst);
+                *self.state.vanilla_index.lock() = None;
+                *self.state.vanilla_loc_keys.lock() = None;
+                self.validate_entire_workspace().await;
+                Ok(Some(Value::String(
+                    "Caches cleared; workspace re-indexed.".to_string(),
+                )))
+            }
             _ => Ok(None),
         }
     }
@@ -2298,6 +2741,54 @@ impl LanguageServer for Backend {
 
 impl Backend {
     // ── Custom notification helpers ───────────────────────────────────────────
+
+    /// Merge vanilla dynamic values (complex-enum + value_set members, from the
+    /// vanilla cache or a live index) into the workspace type index so
+    /// completion offers them. Keyed under one synthetic file so a re-merge
+    /// replaces the previous contribution.
+    fn merge_vanilla_dynamic_values(
+        &self,
+        complex_enums: Vec<(String, Vec<String>)>,
+        value_sets: Vec<(String, Vec<String>)>,
+    ) {
+        if complex_enums.is_empty() && value_sets.is_empty() {
+            return;
+        }
+        let mut info = self.state.info_service.write();
+        // NOT "<vanilla-cache>": the workspace scan's instance merge calls
+        // remove_file("<vanilla-cache>") before re-merging, which would wipe
+        // these as a side effect.
+        info.type_index
+            .complex_enum_values
+            .merge_file("<vanilla-dynamic>", complex_enums.into_iter().collect());
+        info.type_index
+            .value_set_values
+            .merge_file("<vanilla-dynamic>", value_sets.into_iter().collect());
+    }
+
+    /// Merge a pending `vanilla_index` (from the cache or a live index) into
+    /// the workspace type index. After the merge the raw per-type data is
+    /// dropped from `vanilla_index` to eliminate double residency (the
+    /// type_index already owns the instances). `vanilla_merged` prevents
+    /// `ensure_vanilla_index` re-running on subsequent workspace scans.
+    fn merge_pending_vanilla_index(&self) {
+        let per_type = self.state.vanilla_index.lock().take();
+        if let Some(per_type) = per_type {
+            let mut info_guard = self.state.info_service.write();
+            info_guard.type_index.remove_file("<vanilla-cache>");
+            info_guard.type_index.merge("<vanilla-cache>", per_type);
+            // Vanilla data is loaded, so the index now holds every base-game
+            // instance. Mark it complete so the CW500/CW222 type-reference
+            // checks fire (they're gated on `complete` to avoid false
+            // positives during mod-only validation). The driver's Session
+            // sets this for the CLI path; the LSP merges vanilla directly and
+            // must set it here too. See rule_core.rs gate on `idx.complete`.
+            info_guard.type_index.complete = true;
+            // `vanilla_index` is now None — mark it merged so
+            // ensure_vanilla_index does not re-run on the next scan.
+            self.state.vanilla_merged.store(true, Ordering::SeqCst);
+        }
+    }
 
     /// Send the `loadingBar` server→client notification so the VS Code extension
     /// status bar reflects background indexing/validation work.
@@ -2353,12 +2844,14 @@ impl Backend {
         // Whole-tree discovery shares file_manager's skip/exclude config so the
         // LSP and CLI agree on what to skip (engine/IDE dirs, free-form text).
         // The user-configured globs extend that baseline.
-        let files_to_validate = cwtools_file_manager::file_manager::walk_workspace_files(
-            &root_path,
-            &extensions,
-            &extra_file_globs,
-            &extra_dir_globs,
-        );
+        let files_to_validate = tokio::task::block_in_place(|| {
+            cwtools_file_manager::file_manager::walk_workspace_files(
+                &root_path,
+                &extensions,
+                &extra_file_globs,
+                &extra_dir_globs,
+            )
+        });
 
         if files_to_validate.is_empty() {
             self.client
@@ -2440,53 +2933,50 @@ impl Backend {
         let mut parsed_files: Vec<Option<ParsedFile>> = Vec::with_capacity(files_to_validate.len());
         let mut cache_hits = 0u64;
         let mut cache_misses = 0u64;
-        for (i, file_path) in files_to_validate.iter().enumerate() {
-            let uri = path_to_uri(file_path);
-            // Open docs are already indexed from their in-memory text; skip so
-            // we don't re-index stale disk content on top of the live version.
-            if open_uris.contains(&uri) {
-                parsed_files.push(None);
-                if i % 50 == 49 {
-                    tokio::task::yield_now().await;
+        // block_in_place tells tokio this thread is about to do synchronous
+        // blocking I/O; the runtime shifts its remaining tasks to other workers
+        // so the LSP request loop is not starved.
+        tokio::task::block_in_place(|| {
+            for file_path in &files_to_validate {
+                let uri = path_to_uri(file_path);
+                // Open docs are already indexed from their in-memory text; skip so
+                // we don't re-index stale disk content on top of the live version.
+                if open_uris.contains(&uri) {
+                    parsed_files.push(None);
+                    continue;
                 }
-                continue;
-            }
-            let parsed = match std::fs::read_to_string(file_path) {
-                Ok(text) => {
-                    // Try the parse cache first.
-                    if let Some((ref cd, fp)) = cache_info
-                        && let Some(parsed) =
-                            workspace_cache::load(cd, fp, &text, &self.state.string_table)
-                    {
-                        self.index_parsed_file(&uri, &parsed);
-                        cache_hits += 1;
-                        Some(parsed)
-                    } else if let Some(parsed) = self.index_document(&uri, &text).await {
-                        // Cache miss — parse + index, then persist for next scan.
-                        if let Some((ref cd, fp)) = cache_info {
-                            workspace_cache::store(
-                                cd,
-                                fp,
-                                &text,
-                                &parsed,
-                                &self.state.string_table,
-                            );
+                let parsed = match std::fs::read_to_string(file_path) {
+                    Ok(text) => {
+                        // Try the parse cache first.
+                        if let Some((ref cd, fp)) = cache_info
+                            && let Some(parsed) =
+                                workspace_cache::load(cd, fp, &text, &self.state.string_table)
+                        {
+                            self.index_parsed_file(&uri, &parsed);
+                            cache_hits += 1;
+                            Some(parsed)
+                        } else if let Some(parsed) = self.index_document_sync(&uri, &text) {
+                            // Cache miss — parse + index, then persist for next scan.
+                            if let Some((ref cd, fp)) = cache_info {
+                                workspace_cache::store(
+                                    cd,
+                                    fp,
+                                    &text,
+                                    &parsed,
+                                    &self.state.string_table,
+                                );
+                            }
+                            cache_misses += 1;
+                            Some(parsed)
+                        } else {
+                            None
                         }
-                        cache_misses += 1;
-                        Some(parsed)
-                    } else {
-                        None
                     }
-                }
-                Err(_) => None,
-            };
-            parsed_files.push(parsed);
-            // Yield every 50 files so LSP requests (hover, completion) can
-            // interleave with the workspace scan.
-            if i % 50 == 49 {
-                tokio::task::yield_now().await;
+                    Err(_) => None,
+                };
+                parsed_files.push(parsed);
             }
-        }
+        });
 
         self.client
             .log_message(
@@ -2500,31 +2990,11 @@ impl Backend {
 
         // Build the base-game index from a `vanilla` dir (or auto-discovery) if
         // we have one and haven't indexed it yet. Populates `vanilla_index`.
-        self.ensure_vanilla_index().await;
+        self.ensure_vanilla_index(false).await;
 
         // Merge the pre-generated vanilla index (if loaded) so base-game
-        // references resolve. After the merge the raw per-type data is dropped
-        // from `vanilla_index` to eliminate double residency (the type_index
-        // already owns the instances). `vanilla_merged` prevents re-running on
-        // subsequent workspace scans.
-        {
-            let per_type = self.state.vanilla_index.lock().take();
-            if let Some(per_type) = per_type {
-                let mut info_guard = self.state.info_service.write();
-                info_guard.type_index.remove_file("<vanilla-cache>");
-                info_guard.type_index.merge("<vanilla-cache>", per_type);
-                // Vanilla data is loaded, so the index now holds every base-game
-                // instance. Mark it complete so the CW500/CW222 type-reference
-                // checks fire (they're gated on `complete` to avoid false
-                // positives during mod-only validation). The driver's Session
-                // sets this for the CLI path; the LSP merges vanilla directly and
-                // must set it here too. See rule_core.rs gate on `idx.complete`.
-                info_guard.type_index.complete = true;
-                // `vanilla_index` is now None — mark it merged so
-                // ensure_vanilla_index does not re-run on the next scan.
-                self.state.vanilla_merged.store(true, Ordering::SeqCst);
-            }
-        }
+        // references resolve.
+        self.merge_pending_vanilla_index();
 
         // Rebuild the cached modifier-key set now that the type index is
         // complete (templated modifiers like production_speed_<building>_factor
@@ -2726,12 +3196,29 @@ impl Backend {
         };
         let loc_game = cwtools_localization::Game::from_engine(game);
 
+        // Cached vanilla loc keys (from the vanilla cache) stand in for walking
+        // the install's loc files — only the workspace is walked then.
+        let cached_vanilla_loc = self.state.vanilla_loc_keys.lock().clone();
         let mut loc_dirs: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
-        if let Some(v) = self.state.vanilla_dir.lock().clone() {
+        if cached_vanilla_loc.is_none()
+            && let Some(v) = self.state.vanilla_dir.lock().clone()
+        {
             loc_dirs.push(v);
         }
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
         let loc_languages = self.state.loc_languages.lock().clone();
+
+        // Hover language scope: unless the user opted into all translations, keep
+        // only the primary language (first configured loc language, else English)
+        // in the hover map so it stays small.
+        let hover_all = self
+            .state
+            .hover_show_all_languages
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let primary_lang = loc_languages
+            .as_deref()
+            .and_then(|l| l.first().copied())
+            .unwrap_or(cwtools_localization::Lang::English);
 
         // Build the index and collect per-file diagnostics in one block, then
         // drop the LocService before the index is published. The service holds
@@ -2741,23 +3228,42 @@ impl Backend {
         // closes only LocIndex (keys) and the diagnostic map survive.
         // Names a `$ref$` may resolve to besides loc keys: `$modifier$` / `$idea$`
         // embeds resolve against those registries (mirrors the CLI/driver path).
+        // With cached vanilla loc keys, the service holds no vanilla keys, so
+        // they join this set too — otherwise mod loc referencing a base-game key
+        // would flag CW225.
         let extra_valid_refs: HashSet<String> = {
             let mut extra = self.state.modifier_keys.read().clone();
             let info = self.state.info_service.read();
             for (_uri, inst) in info.type_index.instances("idea") {
                 extra.insert(inst.name.to_lowercase());
             }
+            if let Some(cached) = &cached_vanilla_loc {
+                for (_, keys) in cached {
+                    extra.extend(keys.iter().cloned());
+                }
+            }
             extra
         };
 
         let root_str = root_path.to_string_lossy().to_string();
-        let (loc_index, mut by_file) = {
+        // block_in_place: the loc service reads and parses hundreds of loc files
+        // from disk — synchronous I/O that must not starve the async executor.
+        let (loc_index, mut by_file, loc_text_map) = tokio::task::block_in_place(|| {
             let service = cwtools_localization::LocService::from_folders(&dir_refs);
-            let idx = cwtools_localization::LocIndex::build_scoped(
+            let mut idx = cwtools_localization::LocIndex::build_scoped(
                 &service,
                 loc_game,
                 loc_languages.as_deref(),
             );
+            if let Some(cached) = cached_vanilla_loc {
+                let typed: Vec<(cwtools_localization::Lang, Vec<String>)> = cached
+                    .into_iter()
+                    .filter_map(|(name, ks)| {
+                        cwtools_localization::Lang::from_name(&name).map(|l| (l, ks))
+                    })
+                    .collect();
+                idx.merge_cached_keys(typed, loc_languages.as_deref());
+            }
             let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
             for d in cwtools_localization::validate_loc_project_scoped(
                 &service,
@@ -2774,9 +3280,26 @@ impl Backend {
                     .or_default()
                     .push(validation_error_to_diagnostic(&ve));
             }
-            (idx, by_file)
-        };
+            // Extract per-key display text for hover before dropping the service.
+            let mut lt: HashMap<String, Vec<(cwtools_localization::Lang, String)>> = HashMap::new();
+            for file in service.files() {
+                let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
+                if !hover_all && lang != primary_lang {
+                    continue;
+                }
+                for entry in &file.entries {
+                    let display = strip_loc_quotes(&entry.desc);
+                    if !display.is_empty() {
+                        lt.entry(entry.key.to_lowercase())
+                            .or_default()
+                            .push((lang, display.to_string()));
+                    }
+                }
+            }
+            (idx, by_file, lt)
+        });
         *self.state.loc_index.write() = Some(loc_index);
+        *self.state.loc_text.write() = loc_text_map;
 
         // Publish per-file loc diagnostics, but only for workspace loc files
         // (not vanilla). Group by file so each gets a complete diagnostic set.
@@ -2794,7 +3317,10 @@ impl Backend {
     /// file so cross-file references (scripted triggers/effects, type instances,
     /// templated modifiers) resolve before ANY file is validated. Without this,
     /// a file validated early can't see definitions that live in later files.
-    async fn index_document(&self, uri: &str, text: &str) -> Option<ParsedFile> {
+    ///
+    /// This is synchronous — the original async wrapper was removed because the
+    /// body never `.await`s and `block_in_place` callers need a sync variant.
+    fn index_document_sync(&self, uri: &str, text: &str) -> Option<ParsedFile> {
         let parsed = parse_string(text, &self.state.string_table).ok()?;
         self.index_parsed_file(uri, &parsed);
         Some(parsed)
@@ -3290,10 +3816,15 @@ impl Backend {
     /// the dir from the `vanilla` init option, falling back to auto-discovery by
     /// game. No-op if already indexed (or already merged into the type_index),
     /// if no dir is found, or if the ruleset isn't loaded yet.
-    async fn ensure_vanilla_index(&self) {
+    ///
+    /// `force_rebuild` skips the cache-load fast path (and the already-indexed
+    /// check) so the install is re-indexed and the cache re-written — the
+    /// `cacheVanilla` command.
+    async fn ensure_vanilla_index(&self, force_rebuild: bool) {
         // Already populated (or already merged into type_index and dropped)? Done.
-        if self.state.vanilla_index.lock().is_some()
-            || self.state.vanilla_merged.load(Ordering::SeqCst)
+        if !force_rebuild
+            && (self.state.vanilla_index.lock().is_some()
+                || self.state.vanilla_merged.load(Ordering::SeqCst))
         {
             return;
         }
@@ -3339,15 +3870,23 @@ impl Backend {
         let cache_path = self.vanilla_cache_path(&game, &fingerprint);
 
         // Try a fresh cache first — skip parsing the whole base game entirely.
-        if let Some(cp) = &cache_path
+        if !force_rebuild
+            && let Some(cp) = &cache_path
             && cp.exists()
         {
             match cwtools_info::vanilla_cache::load(cp) {
-                Ok((cache_game, cache_fp, per_type))
+                Ok((cache_game, cache_fp, data))
                     if cache_game == game && cache_fp == fingerprint =>
                 {
-                    let total: usize = per_type.values().map(|v| v.len()).sum();
-                    *self.state.vanilla_index.lock() = Some(per_type);
+                    let total: usize = data.per_type.values().map(|v| v.len()).sum();
+                    *self.state.vanilla_index.lock() = Some(data.per_type);
+                    if !data.loc_keys.is_empty() {
+                        *self.state.vanilla_loc_keys.lock() = Some(data.loc_keys);
+                    }
+                    self.merge_vanilla_dynamic_values(
+                        data.complex_enum_values,
+                        data.value_set_values,
+                    );
                     self.client
                         .log_message(
                             MessageType::INFO,
@@ -3401,8 +3940,8 @@ impl Backend {
         let join_result =
             tokio::task::spawn_blocking(move || index_vanilla_dir(&index_dir, &ruleset, &table))
                 .await;
-        let per_type = match join_result {
-            Ok(map) => map,
+        let (per_type, aux) = match join_result {
+            Ok(result) => result,
             Err(e) => {
                 // The blocking task panicked or was cancelled. Log loudly and
                 // bail without setting vanilla_merged, so that type_index stays
@@ -3425,9 +3964,25 @@ impl Backend {
 
         let total: usize = per_type.values().map(|v| v.len()).sum();
 
+        // The freshly-extracted loc keys and dynamic values feed this session
+        // directly too (not just the persisted cache).
+        if !aux.loc_keys.is_empty() {
+            *self.state.vanilla_loc_keys.lock() = Some(aux.loc_keys.clone());
+        }
+        self.merge_vanilla_dynamic_values(
+            aux.complex_enum_values.clone(),
+            aux.value_set_values.clone(),
+        );
+
         // Persist for next startup so the base game isn't re-parsed every time.
         if let Some(cp) = &cache_path {
-            match cwtools_info::vanilla_cache::save_per_type(&per_type, &game, &fingerprint, cp) {
+            match cwtools_info::vanilla_cache::save_per_type(
+                &per_type,
+                &game,
+                &fingerprint,
+                cp,
+                aux,
+            ) {
                 Ok(n) => {
                     self.client
                         .log_message(
@@ -3483,7 +4038,7 @@ impl Backend {
                 })
                 .collect()
         };
-        Some(base.join(format!("vanilla-{}-{}.json", safe(game), safe(fingerprint))))
+        Some(base.join(format!("vanilla-{}-{}.cwv", safe(game), safe(fingerprint))))
     }
 
     async fn determine_file_types(&self, uri: &str) -> Vec<String> {
@@ -3519,8 +4074,8 @@ impl Backend {
 /// Returns a list of (file_uri, SourceLocation) use-sites.
 ///
 /// Implementation: walks every leaf in every indexed file's AST.  For each
-/// leaf, we call `info_at_position` to classify it.  If it comes back as a
-/// TypeRef for the right type+name, we record the location.
+/// leaf whose value equals the target name, `is_type_ref_leaf` classifies the
+/// key against the ruleset; matches are recorded as use-sites.
 ///
 /// This is O(files × leaves) but runs only on demand (find-references / rename)
 /// so is acceptable for mod-sized workspaces.
@@ -3811,6 +4366,26 @@ fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnostic {
 }
 
 fn main() {
+    // Handle --help / --version before entering the LSP serve loop so the
+    // binary prints useful output instead of silently blocking on stdin.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        eprintln!("cwtools-server {}", env!("CARGO_PKG_VERSION"));
+        eprintln!();
+        eprintln!("CWTools language server for Paradox game scripts.");
+        eprintln!("Communicates over stdin/stdout using the Language Server Protocol.");
+        eprintln!();
+        eprintln!("USAGE:");
+        eprintln!("    cwtools-server              Start the LSP server (default)");
+        eprintln!("    cwtools-server --help       Show this help");
+        eprintln!("    cwtools-server --version    Show version");
+        std::process::exit(0);
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("cwtools-server {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     // Logs/profiling go to stderr (stdout is the LSP JSON-RPC channel). Quiet
     // unless RUST_LOG or CWTOOLS_PROFILE is set. See PROFILING.md.
     cwtools_profiling::init_tracing();
@@ -3830,6 +4405,7 @@ fn main() {
             .custom_method("didFocusFile", Backend::on_did_focus_file)
             .finish();
             Server::new(stdin, stdout, socket).serve(service).await;
+            tracing::info!("LSP server shut down (stdin closed)");
         });
 }
 
@@ -3936,6 +4512,8 @@ mod tests {
                 value: "my_ethos".to_string(),
             },
             None,
+            None,
+            &[],
         );
         assert!(md.contains("Type reference"), "got: {}", md);
         assert!(md.contains("my_ethos"), "got: {}", md);
@@ -3954,6 +4532,8 @@ mod tests {
                 value: "alpha".to_string(),
             },
             None,
+            None,
+            &[],
         );
         assert!(md.contains("Enum value"), "got: {}", md);
         assert!(md.contains("alpha"), "got: {}", md);
@@ -3969,21 +4549,14 @@ mod tests {
             },
             &ReferenceHint::Unknown,
             None,
+            None,
+            &[],
         );
         assert!(md.contains("foo") && md.contains("bar"), "got: {}", md);
     }
 
     #[test]
     fn test_hover_with_rule_description() {
-        let mut rs = bool_enum_ruleset();
-        // Add a description to the "kind" leaf rule
-        if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
-            rs.root_rules.first_mut()
-            && let Some((_, opts)) = rules.first_mut()
-        {
-            opts.description = Some("The kind of this thing".to_string());
-        }
-
         let md = build_hover_markdown(
             &PositionElement::Leaf {
                 key: "kind".to_string(),
@@ -3993,9 +4566,12 @@ mod tests {
                 enum_name: "my_enum".to_string(),
                 value: "alpha".to_string(),
             },
-            Some(&rs),
+            None,
+            Some("The kind of this thing"),
+            &["country".to_string()],
         );
         assert!(md.contains("The kind of this thing"), "got: {}", md);
+        assert!(md.contains("Required scopes"), "got: {}", md);
     }
 
     // ── completion context tests ─────────────────────────────────────────────
@@ -4014,7 +4590,7 @@ mod tests {
             panic!("expected TypeRule");
         };
 
-        let items = completions_from_rules(rules, &rs, &info, "stellaris");
+        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new());
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");
@@ -4037,14 +4613,18 @@ mod tests {
     }
 
     #[test]
-    fn test_enclosing_key_path() {
-        let table = StringTable::new();
-        let source = "country_event = {\n  id = foo\n}\n";
-        let parsed = parse_string(source, &table).unwrap();
-
-        // Line 2 (1-based), somewhere in the id leaf
-        let path = enclosing_key_path(&parsed, 2, 5, &table);
-        assert_eq!(path, vec!["country_event"], "got: {:?}", path);
+    fn test_line_value_key() {
+        let text = "decision = {\n    has_completed_focus = \n}\n";
+        // Cursor right after `= ` on line 1 (0-based), char 26.
+        assert_eq!(
+            line_value_key(text, 1, 26).as_deref(),
+            Some("has_completed_focus")
+        );
+        // Cursor on the key itself — no `=` before it.
+        assert_eq!(line_value_key(text, 1, 10), None);
+        // Comparison operators count too.
+        let text2 = "block = {\n    num > \n}\n";
+        assert_eq!(line_value_key(text2, 1, 10).as_deref(), Some("num"));
     }
 
     #[test]
@@ -4356,7 +4936,7 @@ mod tests {
         std::fs::write(foos.join("a.txt"), "foo_one = { }\nfoo_two = { }\n").unwrap();
 
         let table = StringTable::new();
-        let per_type = index_vanilla_dir(&root, &rs, &table);
+        let (per_type, _aux) = index_vanilla_dir(&root, &rs, &table);
 
         let names: Vec<&str> = per_type
             .get("foo")

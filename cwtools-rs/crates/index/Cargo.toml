@@ -12,3 +12,5 @@ cwtools_string_table = { workspace = true }
 cwtools_rules = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rkyv = { workspace = true }
+zstd = { workspace = true }

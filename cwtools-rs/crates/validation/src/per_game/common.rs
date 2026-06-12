@@ -15,12 +15,6 @@ pub(crate) struct Block<'a> {
 }
 
 impl Block<'_> {
-    /// True if the block's key equals `kw` exactly (case-sensitive, matching
-    /// reserved keyword spellings like `NOT`/`AND`/`if`).
-    pub fn key_is(&self, table: &StringTable, kw: &str) -> bool {
-        table.with_string(self.key, |s| s == kw).unwrap_or(false)
-    }
-
     /// The block's key as an owned `String` (empty if interning lost it).
     pub fn key_string(&self, table: &StringTable) -> String {
         table.get_string(self.key).unwrap_or_default()

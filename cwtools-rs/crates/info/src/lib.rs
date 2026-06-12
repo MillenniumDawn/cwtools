@@ -1,5 +1,5 @@
 use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
-use cwtools_rules::rules_types::{NewField, RuleSet, RuleType};
+use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 use std::collections::{HashMap, HashSet};
 
@@ -16,13 +16,9 @@ pub use cwtools_index::*;
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// A hint about what kind of reference a leaf's value or key represents.
-/// Used by the LSP for hover text and goto-definition.
-///
-/// NOTE: This is a best-effort classification.  The full rule-tree walker is not
-/// yet implemented, so `TypeRef` / `EnumRef` are only returned when the leaf's
-/// value literally matches a `TypeField` or `ValueField(Enum)` rule at depth 1
-/// of the matched typedef rules.  Deeper nesting (e.g. inside `if = { … }`) is
-/// not yet resolved — `Unknown` is returned in that case.
+/// Used by the LSP for hover text and goto-definition. Populated from the
+/// matched rule's right-hand side (the LSP's `hint_from_rule_right`, fed by
+/// `cwtools_validation::position::rules_at_pos`).
 #[derive(Debug, Clone)]
 pub enum ReferenceHint {
     /// The value is a reference to an instance of `type_name`.
@@ -39,14 +35,6 @@ pub enum ReferenceHint {
     Variable { name: String, namespace: String },
     /// Classification was not possible with current rule depth.
     Unknown,
-}
-
-/// The element at the cursor position plus any rule-derived hint.
-#[derive(Debug, Clone)]
-pub struct PositionInfo {
-    pub location: SourceLocation,
-    pub element: PositionElement,
-    pub hint: ReferenceHint,
 }
 
 /// Which kind of AST element is at the cursor.
@@ -104,32 +92,6 @@ fn find_element_in_children(
     None
 }
 
-/// Find the element at `(line, col)` in `file` and, when possible, classify its
-/// rule-field type using `ruleset`.
-///
-/// Limitation: rule matching is only done for leaves at the top or one level
-/// deep.  Aliases and nested nodes are not fully walked.
-pub fn info_at_position(
-    file: &ParsedFile,
-    line: u32,
-    col: u16,
-    ruleset: &RuleSet,
-    logical_path: &str,
-    table: &StringTable,
-) -> Option<PositionInfo> {
-    let target = cwtools_parser::ast::SourcePos { line, col };
-
-    // Walk all children and find the deepest element that contains the position.
-    find_pos_in_children(
-        &file.root_children,
-        &file.arena,
-        &target,
-        table,
-        ruleset,
-        logical_path,
-    )
-}
-
 fn pos_in_range(
     pos: &cwtools_parser::ast::SourcePos,
     range: &cwtools_parser::ast::SourceRange,
@@ -146,151 +108,6 @@ fn pos_in_range(
         return false;
     }
     true
-}
-
-fn find_pos_in_children(
-    children: &[Child],
-    arena: &Arena,
-    target: &cwtools_parser::ast::SourcePos,
-    table: &StringTable,
-    ruleset: &RuleSet,
-    logical_path: &str,
-) -> Option<PositionInfo> {
-    for child in children {
-        match child {
-            Child::Leaf(idx) => {
-                let leaf = &arena.leaves[*idx as usize];
-                if pos_in_range(target, &leaf.pos) {
-                    let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                    let value = leaf_value_string(&leaf.value, table);
-                    // If value is a clause, try to recurse into it
-                    if let Value::Clause(ch) = &leaf.value
-                        && let Some(inner) =
-                            find_pos_in_children(ch, arena, target, table, ruleset, logical_path)
-                    {
-                        return Some(inner);
-                    }
-                    let hint = classify_leaf_value(&key, &value, ruleset, logical_path, table);
-                    return Some(PositionInfo {
-                        location: SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        },
-                        element: PositionElement::Leaf {
-                            key: key.clone(),
-                            value: value.clone(),
-                        },
-                        hint,
-                    });
-                }
-            }
-            Child::LeafValue(idx) => {
-                let lv = &arena.leaf_values[*idx as usize];
-                if pos_in_range(target, &lv.pos) {
-                    let value = leaf_value_string(&lv.value, table);
-                    return Some(PositionInfo {
-                        location: SourceLocation {
-                            line: lv.pos.start.line,
-                            col: lv.pos.start.col,
-                        },
-                        element: PositionElement::LeafValue {
-                            value: value.clone(),
-                        },
-                        hint: ReferenceHint::Unknown,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Best-effort: classify a leaf value using ruleset root_rules.
-fn classify_leaf_value(
-    key: &str,
-    value: &str,
-    ruleset: &RuleSet,
-    logical_path: &str,
-    _table: &StringTable,
-) -> ReferenceHint {
-    // Check if value looks like a type reference (<type>)
-    if value.starts_with('<') && value.ends_with('>') {
-        let inner = &value[1..value.len() - 1];
-        return ReferenceHint::TypeRef {
-            type_name: inner.to_string(),
-            value: inner.to_string(),
-        };
-    }
-
-    // Walk root rules shallowly looking for a LeafRule whose left matches `key`
-    for root_rule in &ruleset.root_rules {
-        let (name, (rule_type, _opts)) = match root_rule {
-            cwtools_rules::rules_types::RootRule::TypeRule(n, r) => (n, r),
-            cwtools_rules::rules_types::RootRule::AliasRule(n, r) => (n, r),
-            cwtools_rules::rules_types::RootRule::SingleAliasRule(n, r) => (n, r),
-        };
-
-        let rules = match rule_type {
-            RuleType::NodeRule { rules, .. } => rules.as_slice(),
-            _ => continue,
-        };
-
-        // Only try path-matching type rules
-        if let cwtools_rules::rules_types::RootRule::TypeRule(..) = root_rule
-            && let Some(&idx) = ruleset.type_by_name.get(name)
-        {
-            let td = &ruleset.types[idx];
-            if !check_path_dir(&td.path_options, logical_path) {
-                continue;
-            }
-        }
-
-        for (inner_rule, _) in rules {
-            if let RuleType::LeafRule { left, right } = inner_rule {
-                let left_matches = match left {
-                    NewField::SpecificField(k) => k.eq_ignore_ascii_case(key),
-                    _ => false,
-                };
-                if !left_matches {
-                    continue;
-                }
-                match right {
-                    NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(t)) => {
-                        return ReferenceHint::TypeRef {
-                            type_name: t.clone(),
-                            value: value.to_string(),
-                        };
-                    }
-                    NewField::ValueField(cwtools_rules::rules_types::ValueType::Enum(e)) => {
-                        return ReferenceHint::EnumRef {
-                            enum_name: e.clone(),
-                            value: value.to_string(),
-                        };
-                    }
-                    NewField::LocalisationField { .. } => {
-                        return ReferenceHint::LocRef {
-                            key: value.to_string(),
-                        };
-                    }
-                    NewField::FilepathField { .. } => {
-                        return ReferenceHint::FileRef {
-                            path: value.to_string(),
-                        };
-                    }
-                    NewField::VariableGetField(ns) => {
-                        return ReferenceHint::Variable {
-                            name: value.to_string(),
-                            namespace: ns.clone(),
-                        };
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    ReferenceHint::Unknown
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -431,6 +248,21 @@ impl InfoService {
         for child in &ast.root_children {
             Self::index_child_heuristic(child, &ast.arena, table, type_names, &mut info);
         }
+
+        // ── Dynamic value collection (completion-only) ────────────────────────
+        self.type_index.complex_enum_values.merge_file(
+            uri,
+            cwtools_index::dynamic_values::collect_complex_enum_values(
+                ruleset,
+                ast,
+                logical_path,
+                table,
+            ),
+        );
+        self.type_index.value_set_values.merge_file(
+            uri,
+            cwtools_index::dynamic_values::collect_value_set_members(ruleset, ast, table),
+        );
 
         // ── Rule-driven: type-instance index ─────────────────────────────────
         // Move the instances straight into the cross-file index. We don't keep a
@@ -1173,36 +1005,18 @@ effect = {
     // ── Item 4 — position query ───────────────────────────────────────────────
 
     #[test]
-    fn test_info_at_position_leaf() {
+    fn test_element_at_position_leaf() {
         let source = "foo = bar\n";
         let table = StringTable::new();
         let parsed = parse_string(source, &table).unwrap();
-        let rs = RuleSet::new();
 
-        let info = info_at_position(&parsed, 1, 6, &rs, "test/a.txt", &table);
-        assert!(info.is_some(), "should find element at (1,6)");
-        let info = info.unwrap();
-        match &info.element {
-            PositionElement::Leaf { key, value } => {
+        let element = element_at_position(&parsed, 1, 6, &table);
+        match element {
+            Some(PositionElement::Leaf { key, value }) => {
                 assert_eq!(key, "foo");
                 assert_eq!(value, "bar");
             }
             other => panic!("expected Leaf, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_info_at_position_type_ref_angle() {
-        let source = "ethos = <my_ethos>\n";
-        let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
-        let rs = RuleSet::new();
-
-        let info = info_at_position(&parsed, 1, 8, &rs, "test/a.txt", &table);
-        let info = info.expect("should find element");
-        match &info.hint {
-            ReferenceHint::TypeRef { type_name, .. } => assert_eq!(type_name, "my_ethos"),
-            other => panic!("expected TypeRef, got {:?}", other),
         }
     }
 

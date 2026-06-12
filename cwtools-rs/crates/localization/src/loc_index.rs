@@ -81,15 +81,26 @@ impl LocIndex {
         }
     }
 
-    /// Build directly from a precomputed key union (no per-language data, no
-    /// entries). Useful for single-file LSP validation where only existence
-    /// matters and the full service isn't rebuilt.
-    pub fn from_union(union: HashSet<String>) -> Self {
-        Self {
-            per_language: HashMap::new(),
-            union,
-            languages_with_data: Vec::new(),
-            entries: HashMap::new(),
+    /// Merge cached per-language key sets (the vanilla-cache restore path):
+    /// keys join the union + per-language sets, and languages new to the index
+    /// join `languages_with_data` subject to the same `langs` scoping as
+    /// [`build_scoped`]. No `entries` are added — cached keys carry no parsed
+    /// loc values (the command check only applies to content we validate).
+    pub fn merge_cached_keys(
+        &mut self,
+        per_language: Vec<(Lang, Vec<String>)>,
+        langs: Option<&[Lang]>,
+    ) {
+        for (lang, keys) in per_language {
+            let set = self.per_language.entry(lang).or_default();
+            for k in keys {
+                self.union.insert(k.clone());
+                set.insert(k);
+            }
+            let allowed = langs.map(|ls| ls.contains(&lang)).unwrap_or(true);
+            if allowed && !self.languages_with_data.contains(&lang) {
+                self.languages_with_data.push(lang);
+            }
         }
     }
 
@@ -129,6 +140,22 @@ impl LocIndex {
     pub fn union(&self) -> &HashSet<String> {
         &self.union
     }
+}
+
+/// Extract per-language lowercased key sets from a loaded [`LocService`] —
+/// the shape the vanilla cache stores (language display name -> keys).
+pub fn per_language_keys(service: &LocService) -> Vec<(String, Vec<String>)> {
+    let mut per: HashMap<Lang, HashSet<String>> = HashMap::new();
+    for file in service.files() {
+        let Some(lang) = file.lang else { continue };
+        let set = per.entry(lang).or_default();
+        for entry in &file.entries {
+            set.insert(entry.key.to_lowercase());
+        }
+    }
+    per.into_iter()
+        .map(|(lang, keys)| (lang.to_string(), keys.into_iter().collect()))
+        .collect()
 }
 
 #[cfg(test)]

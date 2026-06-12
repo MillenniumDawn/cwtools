@@ -5,6 +5,7 @@ use cwtools_rules::rules_types::{
 use cwtools_string_table::string_table::StringTable;
 use std::collections::{HashMap, HashSet};
 
+pub mod dynamic_values;
 pub mod vanilla_cache;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -101,6 +102,16 @@ impl FileIndex {
             .to_ascii_lowercase();
         self.files.contains(&norm)
     }
+
+    /// Add already-normalized relative paths (the vanilla-cache restore path).
+    pub fn add_paths<I: IntoIterator<Item = String>>(&mut self, paths: I) {
+        self.files.extend(paths);
+    }
+
+    /// The normalized relative paths, for persisting to the vanilla cache.
+    pub fn paths(&self) -> impl Iterator<Item = &String> {
+        self.files.iter()
+    }
 }
 
 /// Project-wide set of defined script-variable names (every `value_set[...]`
@@ -173,6 +184,11 @@ impl VarIndex {
             *self.names.entry(name.clone()).or_insert(0) += count;
         }
     }
+
+    /// The normalized defined names, for persisting to the vanilla cache.
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.names.keys()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -202,6 +218,12 @@ pub struct TypeIndex {
     /// positives on valid vanilla cross-references. The driver sets this
     /// to `true` after merging vanilla data.
     pub complete: bool,
+    /// Complex-enum members collected from indexed files (enum name -> values),
+    /// e.g. `equipment_stat`, `country_tags`, `idea_name`. Completion-only.
+    pub complex_enum_values: dynamic_values::NamedValueIndex,
+    /// `value_set[...]` members collected from indexed files (namespace ->
+    /// values), e.g. `country_flag`, `global_flag`. Completion-only.
+    pub value_set_values: dynamic_values::NamedValueIndex,
 }
 
 impl TypeIndex {
@@ -263,6 +285,8 @@ impl TypeIndex {
 
     /// Remove all instances contributed by `file_uri`.
     pub fn remove_file(&mut self, file_uri: &str) {
+        self.complex_enum_values.remove_file(file_uri);
+        self.value_set_values.remove_file(file_uri);
         for (type_name, v) in self.map.iter_mut() {
             v.retain(|(uri, inst)| {
                 let keep = uri != file_uri;
@@ -1067,6 +1091,14 @@ pub fn index_discovered_files(
                 index.var_index.add_name(n);
             }
         }
+        index.complex_enum_values.merge_file(
+            &path,
+            dynamic_values::collect_complex_enum_values(ruleset, &pf, &file.logical_path, table),
+        );
+        index.value_set_values.merge_file(
+            &path,
+            dynamic_values::collect_value_set_members(ruleset, &pf, table),
+        );
     }
     index
 }

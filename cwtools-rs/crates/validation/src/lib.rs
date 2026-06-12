@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 pub mod error_codes;
 pub mod per_game;
+pub mod position;
 
 mod common;
 mod ctx;
@@ -250,6 +251,41 @@ pub struct Prepared<'a> {
     pub enum_map: &'a HashMap<&'a str, &'a EnumDefinition>,
 }
 
+/// Build the per-file starting scope context — shared by `validate_prepared`
+/// and the position resolver so both seed the same root scope.
+///
+/// Scope-agnostic content is reused from many calling scopes (or operates on a
+/// data-dependent element scope), so it can't be pinned to one. Seed ANY so its
+/// body isn't scope-checked against an arbitrary default. Everything else starts
+/// at the game's primary scope (HOI4 country = 100).
+///   - scripted_effects/triggers/localisation: called from any scope.
+///   - collections: the `limit`/`operators` run in the input element's scope
+///     (`game:all_states` -> state, `game:all_countries` -> country); per the
+///     HOI4 collections docs the element scope is data-dependent.
+///   - dynamic_modifiers: the `enable`/`remove_trigger` run in the scope the
+///     modifier is applied to (country, state, or unit leader; "root is the
+///     effect scope" per the HOI4 docs).
+pub(crate) fn initial_scope_context(
+    file_path: &str,
+    registry: Option<&std::sync::Arc<ScopeRegistry>>,
+) -> Option<ScopeContext> {
+    let clean = file_path.to_ascii_lowercase().replace('\\', "/");
+    let scope_agnostic = path_contains_segment(&clean, "scripted_effects")
+        || path_contains_segment(&clean, "scripted_triggers")
+        || path_contains_segment(&clean, "scripted_localisation")
+        || path_contains_segment(&clean, "collections")
+        || path_contains_segment(&clean, "dynamic_modifiers");
+    let default_root = registry
+        .and_then(|r| r.id_of("country"))
+        .unwrap_or(ScopeId(100));
+    let initial_scope = if scope_agnostic {
+        SCOPE_ANY
+    } else {
+        default_root
+    };
+    registry.map(|r| ScopeContext::from_registry(std::sync::Arc::clone(r), initial_scope))
+}
+
 /// Validate one parsed file against prebuilt per-run state. The hot path: build
 /// [`Prepared`] once (scope registry + enum map + indexes) and call this per file
 /// instead of rebuilding that state for every file.
@@ -271,33 +307,7 @@ pub fn validate_prepared(
     } = *prepared;
     let mut errors = Vec::new();
 
-    // Scope-agnostic content is reused from many calling scopes (or operates on a
-    // data-dependent element scope), so it can't be pinned to one. Seed ANY so its
-    // body isn't scope-checked against an arbitrary default. Everything else starts
-    // at the game's primary scope (HOI4 country = 100).
-    //   - scripted_effects/triggers/localisation: called from any scope.
-    //   - collections: the `limit`/`operators` run in the input element's scope
-    //     (`game:all_states` -> state, `game:all_countries` -> country); per the
-    //     HOI4 collections docs the element scope is data-dependent.
-    //   - dynamic_modifiers: the `enable`/`remove_trigger` run in the scope the
-    //     modifier is applied to (country, state, or unit leader; "root is the
-    //     effect scope" per the HOI4 docs).
-    let clean = file_path.to_ascii_lowercase().replace('\\', "/");
-    let scope_agnostic = path_contains_segment(&clean, "scripted_effects")
-        || path_contains_segment(&clean, "scripted_triggers")
-        || path_contains_segment(&clean, "scripted_localisation")
-        || path_contains_segment(&clean, "collections")
-        || path_contains_segment(&clean, "dynamic_modifiers");
-    let default_root = registry
-        .and_then(|r| r.id_of("country"))
-        .unwrap_or(ScopeId(100));
-    let initial_scope = if scope_agnostic {
-        SCOPE_ANY
-    } else {
-        default_root
-    };
-    let mut scope_context =
-        registry.map(|r| ScopeContext::from_registry(std::sync::Arc::clone(r), initial_scope));
+    let mut scope_context = initial_scope_context(file_path, registry);
 
     let ctx = ValidationCtx {
         ast,

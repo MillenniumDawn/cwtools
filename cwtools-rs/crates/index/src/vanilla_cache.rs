@@ -1,19 +1,30 @@
-//! Pre-generated cache of base-game ("vanilla") type instances.
+//! Pre-generated cache of base-game ("vanilla") data.
 //!
-//! Parsing and indexing a full game install on every run is slow, so a vanilla
-//! TypeIndex is built once and serialized here as JSON. Loading it resolves
+//! Parsing and indexing a full game install on every run is slow, so the
+//! vanilla data is built once and serialized here. Loading it resolves
 //! references into base-game content (sprites, operation_tokens, equipment, …)
 //! without re-parsing, and without validating vanilla files (which carry known
 //! base-game errors we never want to report). Shared by the CLI
 //! (`cache-vanilla` / `validate --vanilla-cache`) and the LSP server.
+//!
+//! Besides the type instances the cache also carries the vanilla loc-key sets
+//! (per language), the vanilla file-path set (for CW113 `filepath` checks) and
+//! the vanilla script-variable names, so a cache hit skips walking the install
+//! for loc and file indexing too. Vanilla loc *entries* (command chains) are
+//! NOT cached: the only consumer is the scope-aware command check on vanilla's
+//! own content, which we never validate.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use cwtools_rules::rules_types::{RuleSet, SkipRootKey};
-use serde::{Deserialize, Serialize};
 
 use crate::{SourceLocation, TypeIndex, TypeInstance};
+
+/// Magic bytes at the start of every vanilla cache file. Distinct from the
+/// `.cwb` parse cache magic (`CWB\0`) so the two can never be confused.
+const MAGIC: &[u8; 4] = b"CWV\x00";
 
 // v2 adds `fingerprint` (game version) so a cache can be validated against the
 // installed game and shared between users on the same version. v1 files fail the
@@ -21,9 +32,13 @@ use crate::{SourceLocation, TypeIndex, TypeInstance};
 // v3 folds the ruleset shape into the fingerprint (see `combined_fingerprint`):
 // the cached instances are extracted *by the .cwt rules*, so a rules change makes
 // a same-game-version cache stale. v2 files fail the version check (rebuilt).
-const CACHE_VERSION: u32 = 3;
+// v4 switches the on-disk format from JSON to magic+version-framed zstd(rkyv)
+// and adds loc keys, file paths, and variable names. Older JSON files fail the
+// magic check and are treated as a cache miss (rebuilt).
+// v5 adds complex-enum members and value_set members (completion data).
+const CACHE_VERSION: u8 = 5;
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CachedInstance {
     /// type name
     t: String,
@@ -37,15 +52,57 @@ struct CachedInstance {
     c: u16,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct VanillaCacheFile {
-    version: u32,
     game: String,
     /// Game-version fingerprint (see [`fingerprint`]). A cache is valid only for
     /// the install that produced this fingerprint.
-    #[serde(default)]
     fingerprint: String,
     instances: Vec<CachedInstance>,
+    /// language name (`english`, `simp_chinese`, …) -> lowercased loc keys.
+    loc_keys: Vec<(String, Vec<String>)>,
+    /// Normalized relative paths of every file under the install (the
+    /// `FileIndex` form: lowercased, forward slashes).
+    file_paths: Vec<String>,
+    /// Script-variable names defined in vanilla (`VarIndex` form).
+    var_names: Vec<String>,
+    /// Complex-enum members extracted from vanilla files (enum name -> values).
+    complex_enum_values: Vec<(String, Vec<String>)>,
+    /// `value_set[...]` members written by vanilla files (namespace -> values).
+    value_set_values: Vec<(String, Vec<String>)>,
+}
+
+/// The non-instance half of the cache payload. Built by whoever walks the
+/// install (CLI `cache-vanilla`, the stale-rebuild paths) and stored alongside
+/// the type instances.
+#[derive(Default)]
+pub struct VanillaCacheAux {
+    /// language name -> lowercased loc keys
+    pub loc_keys: Vec<(String, Vec<String>)>,
+    /// normalized relative file paths (FileIndex form)
+    pub file_paths: Vec<String>,
+    /// script-variable names
+    pub var_names: Vec<String>,
+    /// complex-enum members (enum name -> values)
+    pub complex_enum_values: Vec<(String, Vec<String>)>,
+    /// `value_set[...]` members (namespace -> values)
+    pub value_set_values: Vec<(String, Vec<String>)>,
+}
+
+/// Everything a loaded cache provides, ready to merge into a session.
+#[derive(Debug)]
+pub struct VanillaCacheData {
+    pub per_type: HashMap<String, Vec<TypeInstance>>,
+    /// language name -> lowercased loc keys
+    pub loc_keys: Vec<(String, Vec<String>)>,
+    /// normalized relative file paths (FileIndex form)
+    pub file_paths: Vec<String>,
+    /// script-variable names
+    pub var_names: Vec<String>,
+    /// complex-enum members (enum name -> values)
+    pub complex_enum_values: Vec<(String, Vec<String>)>,
+    /// `value_set[...]` members (namespace -> values)
+    pub value_set_values: Vec<(String, Vec<String>)>,
 }
 
 /// A stable fingerprint of a base-game install, used to invalidate the cache
@@ -156,34 +213,48 @@ pub fn combined_fingerprint(dir: &Path, ruleset: &RuleSet) -> String {
     format!("{}|rs:{}", fingerprint(dir), ruleset_shape_hash(ruleset))
 }
 
+/// zstd level for the cache body — matches the `.cwb` parse cache.
+const ZSTD_LEVEL: i32 = 3;
+
 fn write_cache(
     instances: Vec<CachedInstance>,
     game: &str,
     fingerprint: &str,
     path: &Path,
+    aux: VanillaCacheAux,
 ) -> std::io::Result<usize> {
     let count = instances.len();
     let cache = VanillaCacheFile {
-        version: CACHE_VERSION,
         game: game.to_string(),
         fingerprint: fingerprint.to_string(),
         instances,
+        loc_keys: aux.loc_keys,
+        file_paths: aux.file_paths,
+        var_names: aux.var_names,
+        complex_enum_values: aux.complex_enum_values,
+        value_set_values: aux.value_set_values,
     };
-    let json = serde_json::to_string(&cache).map_err(std::io::Error::other)?;
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache).map_err(std::io::Error::other)?;
+    let compressed = zstd::encode_all(&bytes[..], ZSTD_LEVEL)?;
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(path, json)?;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(MAGIC)?;
+    file.write_all(&[CACHE_VERSION])?;
+    file.write_all(&compressed)?;
     Ok(count)
 }
 
-/// Serialize a vanilla type index to `path`. Returns the instance count written.
-/// `fingerprint` ties the cache to a specific game version (see [`fingerprint`]).
+/// Serialize a vanilla type index (plus aux data) to `path`. Returns the
+/// instance count written. `fingerprint` ties the cache to a specific game
+/// version (see [`fingerprint`]).
 pub fn save(
     index: &TypeIndex,
     game: &str,
     fingerprint: &str,
     path: &Path,
+    aux: VanillaCacheAux,
 ) -> std::io::Result<usize> {
     let instances = index
         .map
@@ -198,7 +269,7 @@ pub fn save(
             })
         })
         .collect();
-    write_cache(instances, game, fingerprint, path)
+    write_cache(instances, game, fingerprint, path, aux)
 }
 
 /// As [`save`], but from a per-type instance map (the form the LSP keeps its
@@ -208,6 +279,7 @@ pub fn save_per_type(
     game: &str,
     fingerprint: &str,
     path: &Path,
+    aux: VanillaCacheAux,
 ) -> std::io::Result<usize> {
     let instances = per_type
         .iter()
@@ -221,21 +293,30 @@ pub fn save_per_type(
             })
         })
         .collect();
-    write_cache(instances, game, fingerprint, path)
+    write_cache(instances, game, fingerprint, path, aux)
 }
 
-/// Load a vanilla cache file into per-type instances ready to merge into a
-/// `TypeIndex` via `merge`. Returns `(game, fingerprint, per_type)`; the caller
-/// compares `fingerprint` against the live install to decide whether it is fresh.
-pub fn load(path: &Path) -> std::io::Result<(String, String, HashMap<String, Vec<TypeInstance>>)> {
-    let json = std::fs::read_to_string(path)?;
-    let cache: VanillaCacheFile = serde_json::from_str(&json).map_err(std::io::Error::other)?;
-    if cache.version != CACHE_VERSION {
+/// Load a vanilla cache file. Returns `(game, fingerprint, data)`; the caller
+/// compares `fingerprint` against the live install to decide whether it is
+/// fresh. Old JSON caches (pre-v4) fail the magic check and read as a miss.
+pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> {
+    let mut data = Vec::new();
+    std::fs::File::open(path)?.read_to_end(&mut data)?;
+    if data.len() < MAGIC.len() + 1 || &data[..MAGIC.len()] != MAGIC {
+        return Err(std::io::Error::other(
+            "not a vanilla cache file (old JSON format or wrong file); rebuild with cache-vanilla",
+        ));
+    }
+    if data[MAGIC.len()] != CACHE_VERSION {
         return Err(std::io::Error::other(format!(
             "vanilla cache version {} unsupported (expected {})",
-            cache.version, CACHE_VERSION
+            data[MAGIC.len()],
+            CACHE_VERSION
         )));
     }
+    let bytes = zstd::decode_all(&data[MAGIC.len() + 1..])?;
+    let cache: VanillaCacheFile = rkyv::from_bytes::<VanillaCacheFile, rkyv::rancor::Error>(&bytes)
+        .map_err(std::io::Error::other)?;
     let mut per_type: HashMap<String, Vec<TypeInstance>> = HashMap::new();
     for ci in cache.instances {
         per_type.entry(ci.t).or_default().push(TypeInstance {
@@ -246,7 +327,18 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, HashMap<String, Vec
             },
         });
     }
-    Ok((cache.game, cache.fingerprint, per_type))
+    Ok((
+        cache.game,
+        cache.fingerprint,
+        VanillaCacheData {
+            per_type,
+            loc_keys: cache.loc_keys,
+            file_paths: cache.file_paths,
+            var_names: cache.var_names,
+            complex_enum_values: cache.complex_enum_values,
+            value_set_values: cache.value_set_values,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -273,18 +365,41 @@ mod tests {
         idx.merge("vanilla/x.gfx", per);
 
         let dir = std::env::temp_dir();
-        let path = dir.join("cwtools_vanilla_cache_test.json");
-        assert_eq!(save(&idx, "hoi4", "v1.16.4", &path).unwrap(), 2);
+        let path = dir.join("cwtools_vanilla_cache_test.cwv");
+        let aux = VanillaCacheAux {
+            loc_keys: vec![("english".into(), vec!["key_a".into(), "key_b".into()])],
+            file_paths: vec!["gfx/interface/icon.dds".into()],
+            var_names: vec!["my_var".into()],
+            complex_enum_values: vec![("equipment_stat".into(), vec!["build_cost_ic".into()])],
+            value_set_values: vec![("country_flag".into(), vec!["my_flag".into()])],
+        };
+        assert_eq!(save(&idx, "hoi4", "v1.16.4", &path, aux).unwrap(), 2);
 
         let (game, fp, loaded) = load(&path).unwrap();
         assert_eq!(game, "hoi4");
         assert_eq!(fp, "v1.16.4");
-        assert_eq!(loaded.get("spriteType").map(|v| v.len()), Some(2));
+        assert_eq!(loaded.per_type.get("spriteType").map(|v| v.len()), Some(2));
+        assert_eq!(loaded.loc_keys.len(), 1);
+        assert_eq!(loaded.loc_keys[0].0, "english");
+        assert_eq!(loaded.file_paths, vec!["gfx/interface/icon.dds"]);
+        assert_eq!(loaded.var_names, vec!["my_var"]);
+        assert_eq!(loaded.complex_enum_values[0].0, "equipment_stat");
+        assert_eq!(loaded.value_set_values[0].0, "country_flag");
 
         let mut idx2 = TypeIndex::new();
-        idx2.merge("<vanilla-cache>", loaded);
+        idx2.merge("<vanilla-cache>", loaded.per_type);
         assert!(idx2.contains("spriteType", "GFX_A"));
         assert!(idx2.contains("spriteType", "gfx_b"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn old_json_cache_is_a_clean_miss() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("cwtools_vanilla_cache_old_json.json");
+        std::fs::write(&path, r#"{"version":3,"game":"hoi4","instances":[]}"#).unwrap();
+        let err = load(&path).unwrap_err();
+        assert!(err.to_string().contains("not a vanilla cache file"));
         let _ = std::fs::remove_file(&path);
     }
 
