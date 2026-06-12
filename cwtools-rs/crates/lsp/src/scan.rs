@@ -117,13 +117,17 @@ impl Backend {
 
     /// Rebuild the cached modifier-key set from the current ruleset and type index.
     pub(crate) fn rebuild_modifier_keys(&self) {
-        let ruleset_guard = self.state.ruleset.read();
-        let info_guard = self.state.info_service.read();
-        let keys = match ruleset_guard.as_ref() {
-            Some(rs) => build_modifier_keys(rs, &info_guard.type_index),
+        // Lock order: rules -> info_service. One `rules` write guard holds the
+        // ruleset we read from and the modifier_keys we write into.
+        let mut rules = self.state.rules.write();
+        let keys = match rules.ruleset.as_ref() {
+            Some(rs) => {
+                let info_guard = self.state.info_service.read();
+                build_modifier_keys(rs, &info_guard.type_index)
+            }
             None => HashSet::new(),
         };
-        *self.state.modifier_keys.write() = keys;
+        rules.modifier_keys = keys;
     }
 
     /// Scan the entire workspace for relevant game files and validate them all.
@@ -132,10 +136,7 @@ impl Backend {
         cwtools_profiling::log_rss("workspace_scan_start");
         self.send_loading_bar(true, "Indexing workspace…").await;
 
-        let workspace_uri = {
-            let guard = self.state.workspace_uri.lock();
-            guard.clone()
-        };
+        let workspace_uri = self.state.config.read().workspace_uri.clone();
 
         let root_path = match workspace_uri {
             Some(ref uri) => std::path::PathBuf::from(uri_to_path_str(uri)),
@@ -156,8 +157,13 @@ impl Backend {
         // The engine's hard-coded baseline (Changelog.txt, README.*, *.md)
         // is layered on top inside the walker closure so it can't be
         // accidentally cleared by a user who sets an empty list.
-        let extra_file_globs = self.state.ignore_file_patterns.read().clone();
-        let extra_dir_globs = self.state.ignore_dir_patterns.read().clone();
+        let (extra_file_globs, extra_dir_globs) = {
+            let cfg = self.state.config.read();
+            (
+                cfg.ignore_file_patterns.clone(),
+                cfg.ignore_dir_patterns.clone(),
+            )
+        };
 
         // Whole-tree discovery shares file_manager's skip/exclude config so the
         // LSP and CLI agree on what to skip (engine/IDE dirs, free-form text).
@@ -193,11 +199,13 @@ impl Backend {
         // fingerprint encodes the game, ruleset shape, and workspace root so
         // stale caches are cleared automatically when any of those change.
         let (cache_info, cache_was_valid) = {
-            let cache_dir = self.state.cache_dir.lock().clone();
+            let (cache_dir, language) = {
+                let cfg = self.state.config.read();
+                (cfg.cache_dir.clone(), cfg.language.clone())
+            };
             match cache_dir {
                 Some(cd) => {
-                    let language = self.state.language.lock().clone();
-                    let ruleset_snap = self.state.ruleset.read().clone();
+                    let ruleset_snap = self.state.rules.read().ruleset.clone();
                     let fp = match ruleset_snap {
                         Some(ref rs) => {
                             workspace_cache::settings_fingerprint(&language, rs, &root_path)
@@ -342,24 +350,29 @@ impl Backend {
         self.send_loading_bar(true, "Validating workspace…").await;
         let mut total_errors = 0usize;
         let total_files = files_to_validate.len();
-        // Snapshot modifier_keys once before the loop; the set doesn't change
-        // during validation and we can't hold the guard across await points.
-        let modifier_keys_snap: HashSet<String> = self.state.modifier_keys.read().clone();
         // Build the scope registry + enum_map ONCE for the whole scan instead of
         // once per file: they depend only on (ruleset, game) and are the
         // expensive part of per-file setup (many inserts + lowercasing +
-        // per-iterator `format!`). Both are reused across the rayon section.
-        let scan_game = {
-            let language = self.state.language.lock().clone();
-            cwtools_game::constants::Game::from_str(&language)
+        // per-iterator `format!`). All are reused across the rayon section.
+        let scan_game = self.state.config.read().game();
+        // Snapshot the ruleset-family state once before the loop; none of it
+        // changes during validation and we can't hold the guard across the await
+        // points below. One `rules` read guard clones all three: the shared
+        // `Arc<RuleSet>` (so the `enum_map` borrow stays valid across the
+        // parallel section), the cached scope-registry `Arc`, and the
+        // modifier-key set.
+        let (scan_ruleset, scan_registry, modifier_keys_snap): (
+            Option<Arc<RuleSet>>,
+            _,
+            HashSet<String>,
+        ) = {
+            let rules = self.state.rules.read();
+            (
+                rules.ruleset.clone(),
+                rules.scope_registry.clone(),
+                rules.modifier_keys.clone(),
+            )
         };
-        // Snapshot the shared `Arc<RuleSet>` for the whole batch so the
-        // `enum_map` (which borrows the ruleset) stays valid across the
-        // parallel section without holding the ruleset lock across rayon work.
-        let scan_ruleset: Option<Arc<RuleSet>> = self.state.ruleset.read().clone();
-        // The scope registry is cached (built once at ruleset load); snapshot the
-        // `Arc` for the batch instead of rebuilding it for the whole scan.
-        let scan_registry = self.state.scope_registry.read().clone();
 
         // Validate every file in parallel, then publish serially. The
         // CPU-bound validation runs under a single shared `info_service` /
@@ -453,7 +466,7 @@ impl Backend {
             .await;
 
         // Build and send the file list for the extension's file explorer.
-        let ws_uri = self.state.workspace_uri.lock().clone();
+        let ws_uri = self.state.config.read().workspace_uri.clone();
         let file_list: Vec<serde_json::Value> = files_to_validate
             .iter()
             .map(|file_path| {
@@ -509,10 +522,7 @@ impl Backend {
     /// diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace loc files.
     #[tracing::instrument(skip_all)]
     pub(crate) async fn rebuild_and_publish_loc(&self, root_path: &std::path::Path) {
-        let game = {
-            let language = self.state.language.lock().clone();
-            cwtools_game::constants::Game::from_str(&language)
-        };
+        let game = self.state.config.read().game();
         let loc_game = cwtools_localization::Game::from_engine(game);
 
         // Cached vanilla loc keys (from the vanilla cache) stand in for walking
@@ -520,12 +530,12 @@ impl Backend {
         let cached_vanilla_loc = self.state.vanilla_loc_keys.lock().clone();
         let mut loc_dirs: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
         if cached_vanilla_loc.is_none()
-            && let Some(v) = self.state.vanilla_dir.lock().clone()
+            && let Some(v) = self.state.config.read().vanilla_dir.clone()
         {
             loc_dirs.push(v);
         }
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
-        let loc_languages = self.state.loc_languages.lock().clone();
+        let loc_languages = self.state.config.read().loc_languages.clone();
 
         // Hover language scope: unless the user opted into all translations, keep
         // only the primary language (first configured loc language, else English)
@@ -551,7 +561,8 @@ impl Backend {
         // they join this set too — otherwise mod loc referencing a base-game key
         // would flag CW225.
         let extra_valid_refs: HashSet<String> = {
-            let mut extra = self.state.modifier_keys.read().clone();
+            // Lock order: rules -> info_service.
+            let mut extra = self.state.rules.read().modifier_keys.clone();
             let info = self.state.info_service.read();
             for (_uri, inst) in info.type_index.instances("idea") {
                 extra.insert(inst.name.to_lowercase());
@@ -648,25 +659,21 @@ impl Backend {
             return;
         }
         // Resolve the install dir: explicit `vanilla` option, else auto-discover.
-        let dir = {
-            let explicit = self.state.vanilla_dir.lock().clone();
-            explicit.or_else(|| {
-                let game = self.state.language.lock().clone();
-                discover_vanilla_dir(&game)
-            })
+        let (explicit_dir, game) = {
+            let cfg = self.state.config.read();
+            (cfg.vanilla_dir.clone(), cfg.language.clone())
         };
+        let dir = explicit_dir.or_else(|| discover_vanilla_dir(&game));
         let dir = match dir {
             Some(d) if d.is_dir() => d,
             _ => return,
         };
 
-        let game = self.state.language.lock().clone();
-
         // We need the ruleset both to key the cache (the fingerprint folds in the
         // ruleset shape) and to map definitions to their types when rebuilding.
         // Clone it out in its own statement so the parking_lot guard is dropped
         // before the `match` (guards aren't Send and the None arm awaits below).
-        let ruleset_opt = self.state.ruleset.read().clone();
+        let ruleset_opt = self.state.rules.read().ruleset.clone();
         let ruleset = match ruleset_opt {
             Some(rs) => rs,
             None => {
@@ -846,8 +853,9 @@ impl Backend {
     ) -> Option<std::path::PathBuf> {
         let base = self
             .state
+            .config
+            .read()
             .cache_dir
-            .lock()
             .clone()
             .or_else(default_cache_dir)?;
         let safe = |s: &str| -> String {

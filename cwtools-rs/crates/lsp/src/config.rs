@@ -43,23 +43,22 @@ pub(crate) fn extract_ignore_patterns(opts: &Value) -> (Vec<String>, Vec<String>
 impl Backend {
     /// Install a freshly-loaded ruleset and rebuild the cached scope registry to
     /// match it. The registry depends only on `(ruleset, game)`; building it here
-    /// (once per load) keeps it out of the per-file validation hot path. Holds
-    /// `ruleset.write()` across the `scope_registry.write()` so the two never
-    /// disagree; no other site takes both ruleset and scope_registry.
+    /// (once per load) keeps it out of the per-file validation hot path. The
+    /// ruleset + registry live in one `rules` guard so they never disagree.
     pub(crate) fn set_ruleset(&self, ruleset: RuleSet) {
-        let game = {
-            let language = self.state.language.lock().clone();
-            cwtools_game::constants::Game::from_str(&language)
-        };
-        let mut guard = self.state.ruleset.write();
+        let game = self.state.config.read().game();
+        // Build the registry and the cached var-effects before taking any of the
+        // ruleset-family locks, so the write section is short.
         let registry = build_scope_registry_arc(&ruleset, game);
-        *self.state.scope_registry.write() = registry;
         // Cache the variable-defining effects so per-file indexing can collect
         // value_set[variable] names (and values) for the CW246 / VariableGetField
         // checks and for hover/goto.
         let var_effects = cwtools_info::variable_defining_effects(&ruleset);
+        // Lock order: rules -> info_service.
+        let mut rules = self.state.rules.write();
+        rules.ruleset = Some(Arc::new(ruleset));
+        rules.scope_registry = registry;
         self.state.info_service.write().set_var_effects(var_effects);
-        *guard = Some(Arc::new(ruleset));
     }
 
     pub(crate) async fn initialize_impl(
@@ -77,7 +76,7 @@ impl Backend {
         // Store language from init options
         if let Some(opts) = &params.initialization_options {
             if let Some(lang) = opts.get("language").and_then(|v| v.as_str()) {
-                *self.state.language.lock() = lang.to_string();
+                self.state.config.write().language = lang.to_string();
                 self.client
                     .log_message(MessageType::INFO, format!("language: {}", lang))
                     .await;
@@ -99,7 +98,7 @@ impl Backend {
                             format!("localisation languages scoped to: {:?}", langs),
                         )
                         .await;
-                    *self.state.loc_languages.lock() = Some(langs);
+                    self.state.config.write().loc_languages = Some(langs);
                 }
             }
 
@@ -114,7 +113,7 @@ impl Backend {
             // re-parsed every startup). The client should pass its global
             // storage path; we fall back to an OS cache dir otherwise.
             if let Some(cd) = opts.get("cacheDir").and_then(|v| v.as_str()) {
-                *self.state.cache_dir.lock() = Some(std::path::PathBuf::from(cd));
+                self.state.config.write().cache_dir = Some(std::path::PathBuf::from(cd));
             }
             self.client
                 .log_message(MessageType::INFO, format!("init options: {:?}", opts))
@@ -163,7 +162,7 @@ impl Backend {
             if let Some(vd) = opts.get("vanilla").and_then(|v| v.as_str()) {
                 let p = std::path::PathBuf::from(vd);
                 if p.is_dir() {
-                    *self.state.vanilla_dir.lock() = Some(p);
+                    self.state.config.write().vanilla_dir = Some(p);
                     self.client
                         .log_message(MessageType::INFO, format!("Base-game dir set: {}", vd))
                         .await;
@@ -229,9 +228,9 @@ impl Backend {
         if let Some(folders) = &params.workspace_folders
             && let Some(first) = folders.first()
         {
-            *self.state.workspace_uri.lock() = Some(first.uri.to_string());
+            self.state.config.write().workspace_uri = Some(first.uri.to_string());
         } else if let Some(root_uri) = &params.root_uri {
-            *self.state.workspace_uri.lock() = Some(root_uri.to_string());
+            self.state.config.write().workspace_uri = Some(root_uri.to_string());
         }
 
         // Per-workspace ignore globs from the extension. The extension
@@ -244,15 +243,18 @@ impl Backend {
         if let Some(opts) = &params.initialization_options {
             let (files, dirs) = extract_ignore_patterns(opts);
             if !files.is_empty() || !dirs.is_empty() {
-                *self.state.ignore_file_patterns.write() = files;
-                *self.state.ignore_dir_patterns.write() = dirs;
+                let (n_files, n_dirs) = (files.len(), dirs.len());
+                {
+                    let mut cfg = self.state.config.write();
+                    cfg.ignore_file_patterns = files;
+                    cfg.ignore_dir_patterns = dirs;
+                }
                 self.client
                     .log_message(
                         MessageType::INFO,
                         format!(
                             "ignore patterns: {} files, {} dirs (engine defaults still apply)",
-                            self.state.ignore_file_patterns.read().len(),
-                            self.state.ignore_dir_patterns.read().len(),
+                            n_files, n_dirs,
                         ),
                     )
                     .await;
@@ -327,11 +329,15 @@ impl Backend {
         // changed slice. `extract_ignore_patterns` looks for the same two
         // keys at the top level — works in both cases.
         let (files, dirs) = extract_ignore_patterns(&params.settings);
-        *self.state.ignore_file_patterns.write() = files;
-        *self.state.ignore_dir_patterns.write() = dirs;
+        let (n_files, n_dirs) = (files.len(), dirs.len());
+        {
+            let mut cfg = self.state.config.write();
+            cfg.ignore_file_patterns = files;
+            cfg.ignore_dir_patterns = dirs;
+        }
         tracing::info!(
-            file_globs = self.state.ignore_file_patterns.read().len(),
-            dir_globs = self.state.ignore_dir_patterns.read().len(),
+            file_globs = n_files,
+            dir_globs = n_dirs,
             "ignore patterns updated via didChangeConfiguration"
         );
     }
@@ -373,8 +379,9 @@ impl Backend {
             "clearAllCaches" => {
                 let dir = self
                     .state
+                    .config
+                    .read()
                     .cache_dir
-                    .lock()
                     .clone()
                     .or_else(default_cache_dir);
                 if let Some(dir) = &dir {

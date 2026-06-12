@@ -25,9 +25,11 @@ impl Backend {
         // Try context-aware completions first: resolve the rules at the cursor
         // with the validation engine's own descent (aliases, typed keys,
         // subtypes, skip_root_key — see cwtools_validation::position).
-        let ws_uri = self.state.workspace_uri.lock().clone();
+        let (ws_uri, language) = {
+            let cfg = self.state.config.read();
+            (cfg.workspace_uri.clone(), cfg.language.clone())
+        };
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
-        let language = self.state.language.lock().clone();
 
         // .yml localisation file — offer loc-key / data-function completions.
         if uri.ends_with(".yml") || uri.ends_with(".yaml") {
@@ -42,15 +44,12 @@ impl Backend {
         // an unknown block where suggestions from any other level would be
         // wrong). `None` = no doc/ruleset/AST — fall through to the flat list.
         let context_items: Option<Vec<CompletionItem>> = {
-            // Lock order: documents -> ruleset -> scope_registry -> info_service
-            // -> modifier_keys (field-declaration order, see DocumentState).
+            // Lock order: documents -> rules -> info_service (see DocumentState).
             let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.read();
-            let registry_guard = self.state.scope_registry.read();
+            let rules_guard = self.state.rules.read();
             let info_guard = self.state.info_service.read();
-            let modifier_guard = self.state.modifier_keys.read();
 
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), ruleset_guard.as_ref())
+            if let (Some(doc), Some(rs)) = (docs.get(&uri), rules_guard.ruleset.as_ref())
                 && let Some(ast) = &doc.ast
             {
                 let enum_map = build_enum_map(rs);
@@ -61,9 +60,9 @@ impl Backend {
                     table: &self.state.string_table,
                     game,
                     type_index: Some(&info_guard.type_index),
-                    modifier_keys: Some(&modifier_guard),
+                    modifier_keys: Some(&rules_guard.modifier_keys),
                     loc_index: None,
-                    registry: registry_guard.as_ref(),
+                    registry: rules_guard.scope_registry.as_ref(),
                     enum_map: &enum_map,
                     scope_checks,
                     var_checks,
@@ -77,7 +76,7 @@ impl Backend {
                                 &rctx.value_rules,
                                 rs,
                                 &info_guard,
-                                registry_guard.as_deref(),
+                                rules_guard.scope_registry.as_deref(),
                                 &language,
                             )
                         } else if let Some(key) = line_value_key(&doc.text, pos.line, pos.character)
@@ -94,7 +93,7 @@ impl Backend {
                                 &vr,
                                 rs,
                                 &info_guard,
-                                registry_guard.as_deref(),
+                                rules_guard.scope_registry.as_deref(),
                                 &language,
                             )
                         } else {
@@ -103,7 +102,7 @@ impl Backend {
                                 rs,
                                 &info_guard,
                                 &language,
-                                &modifier_guard,
+                                &rules_guard.modifier_keys,
                             )
                         };
                         Some(items)
@@ -127,8 +126,8 @@ impl Backend {
         const FALLBACK_CAP: usize = 2000;
         let mut items = Vec::new();
 
-        let ruleset = self.state.ruleset.read();
-        if let Some(rules) = ruleset.as_ref() {
+        let rules_guard = self.state.rules.read();
+        if let Some(rules) = rules_guard.ruleset.as_ref() {
             for t in &rules.types {
                 if items.len() >= FALLBACK_CAP {
                     break;
@@ -152,7 +151,7 @@ impl Backend {
                 });
             }
         }
-        drop(ruleset);
+        drop(rules_guard);
 
         let info = self.state.info_service.read();
         for var in &info.all_variables {

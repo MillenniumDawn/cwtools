@@ -45,33 +45,109 @@ impl tower_lsp::lsp_types::notification::Notification for UpdateFileList {
     const METHOD: &'static str = "updateFileList";
 }
 
-/// Server state.
-///
-/// LOCK ORDER: when holding more than one guard, acquire in field-declaration
-/// order — `documents` -> `ruleset` -> `scope_registry` -> `info_service` ->
-/// `modifier_keys` -> `loc_index`. Most sites snapshot-and-drop
-/// (`.lock().clone()`) instead of co-holding; the only places two
-/// ruleset-family guards are co-held are `set_ruleset` (writer) and the
-/// single-file validate (reader), both `ruleset` -> `scope_registry`. Never
-/// acquire an earlier lock while holding a later one.
-struct DocumentState {
-    /// file URI -> parsed document
-    documents: Mutex<HashMap<String, ParsedDoc>>,
-    /// loaded .cwt ruleset. `RwLock` so the many readers (hover, completion,
-    /// validation, the cross-file sweep) share the guard and don't serialize
-    /// behind a debounced validate; only the rare ruleset load/reload takes
-    /// `write()`.
-    ruleset: parking_lot::RwLock<Option<Arc<RuleSet>>>,
+/// Settings group: values set once at `initialize` / `didChangeConfiguration`
+/// and only read (clone-and-drop) everywhere else. Held behind a single
+/// `RwLock<Config>` so a config read never serializes behind an unrelated
+/// write. The guard is never held across another lock or an await — every
+/// reader clones what it needs and drops the guard immediately.
+pub(crate) struct Config {
+    /// game language from init options
+    pub(crate) language: String,
+    /// workspace folder URI captured from initialize params
+    pub(crate) workspace_uri: Option<String>,
+    /// base-game install dir (from the `vanilla` init option, or auto-discovered).
+    /// Indexed lazily into `vanilla_index` on the first full-workspace scan.
+    pub(crate) vanilla_dir: Option<std::path::PathBuf>,
+    /// Writable directory for persistent caches (from the `cacheDir` init
+    /// option, else an OS cache dir). The base-game type index is cached here
+    /// keyed by game + version, so it isn't re-parsed on every startup.
+    pub(crate) cache_dir: Option<std::path::PathBuf>,
+    /// languages to validate loc against, from the `localisationLanguages` init
+    /// option. `None` = all languages with data (the default). When set, the
+    /// missing-translation check and per-file loc checks are scoped to these,
+    /// so an english-targeted mod isn't flagged for every other language vanilla
+    /// happens to ship.
+    pub(crate) loc_languages: Option<Vec<cwtools_localization::Lang>>,
+    /// Extra filename glob patterns to skip during the workspace scan (on top
+    /// of the engine baseline like Changelog.txt / README.md). Sourced from
+    /// `ignoreFilePatterns` in `initializationOptions` and the
+    /// `workspace/didChangeConfiguration` payload.
+    pub(crate) ignore_file_patterns: Vec<String>,
+    /// Extra directory glob patterns to skip during the workspace scan. Sourced
+    /// from `ignoreDirectories` in `initializationOptions` and
+    /// `workspace/didChangeConfiguration`.
+    pub(crate) ignore_dir_patterns: Vec<String>,
+}
+
+impl Config {
+    fn new() -> Self {
+        Self {
+            language: "paradox".to_string(),
+            workspace_uri: None,
+            vanilla_dir: None,
+            cache_dir: None,
+            loc_languages: None,
+            ignore_file_patterns: Vec::new(),
+            ignore_dir_patterns: Vec::new(),
+        }
+    }
+
+    /// Resolve the configured language to an engine [`Game`], for the many
+    /// sites that only need the typed game (not the raw language string).
+    pub(crate) fn game(&self) -> Option<cwtools_game::constants::Game> {
+        cwtools_game::constants::Game::from_str(&self.language)
+    }
+}
+
+/// Ruleset-derived group: rebuilt together whenever a ruleset is loaded.
+/// One `RwLock<RuleData>` so the readers that need all three (hover,
+/// completion, the workspace scan) take a single guard instead of three.
+pub(crate) struct RuleData {
+    /// loaded .cwt ruleset. The many readers (hover, completion, validation,
+    /// the cross-file sweep) share the guard and don't serialize behind a
+    /// debounced validate; only the rare ruleset load/reload takes `write()`.
+    pub(crate) ruleset: Option<Arc<RuleSet>>,
     /// Scope/link registry built from `ruleset` (config-driven scopes.cwt +
     /// links.cwt). Cached here because `build_scope_registry` is the expensive
     /// part of per-file validation setup and depends only on the loaded ruleset,
     /// which changes rarely. Rebuilt at the ruleset write site, so it always
     /// matches the ruleset it was derived from. `None` until the first load.
-    scope_registry: parking_lot::RwLock<Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>>,
+    pub(crate) scope_registry: Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>,
+    /// cached modifier-key set; rebuilt after ruleset load and after each full
+    /// workspace scan when the type index is complete.
+    pub(crate) modifier_keys: HashSet<String>,
+}
+
+impl RuleData {
+    fn new() -> Self {
+        Self {
+            ruleset: None,
+            scope_registry: None,
+            modifier_keys: HashSet::new(),
+        }
+    }
+}
+
+/// Server state.
+///
+/// LOCK ORDER: when holding more than one guard, acquire in this order —
+/// `documents` -> `rules` -> `info_service` -> `loc_index`. `config` is a
+/// settings snapshot: it is always read-clone-dropped and never held across
+/// another lock or an await. Most sites snapshot-and-drop the others too; the
+/// places that co-hold are the workspace scan and single-file validate
+/// (`rules` -> `info_service` -> `loc_index`). Never acquire an earlier lock
+/// while holding a later one.
+struct DocumentState {
+    /// file URI -> parsed document
+    documents: Mutex<HashMap<String, ParsedDoc>>,
+    /// Settings set at init / didChangeConfiguration, read-clone-dropped
+    /// elsewhere. See [`Config`].
+    config: parking_lot::RwLock<Config>,
+    /// Ruleset + scope registry + modifier keys, rebuilt together on ruleset
+    /// load. See [`RuleData`].
+    rules: parking_lot::RwLock<RuleData>,
     /// shared string table
     string_table: StringTable,
-    /// game language from init options
-    language: Mutex<String>,
     /// symbol index for goto-definition and references
     symbol_index: Mutex<symbols::SymbolIndex>,
     /// computed info service for type/references/definitions. `RwLock` so the
@@ -79,23 +155,15 @@ struct DocumentState {
     /// rayon threads, and the many read-only consumers (hover, completion,
     /// document-symbol, export fingerprinting, validation) don't serialize.
     info_service: parking_lot::RwLock<cwtools_info::InfoService>,
-    /// workspace folder URI captured from initialize params
-    workspace_uri: Mutex<Option<String>>,
     /// pre-generated base-game type instances (from a vanilla cache OR a live
-    /// index of `vanilla_dir`), merged into the workspace index so the editor
-    /// resolves base-game references.
+    /// index of `config.vanilla_dir`), merged into the workspace index so the
+    /// editor resolves base-game references.
     vanilla_index: Mutex<Option<HashMap<String, Vec<TypeInstance>>>>,
-    /// base-game install dir (from the `vanilla` init option, or auto-discovered).
-    /// Indexed lazily into `vanilla_index` on the first full-workspace scan.
-    vanilla_dir: Mutex<Option<std::path::PathBuf>>,
     /// Vanilla loc keys per language (display name -> lowercased keys), from the
     /// vanilla cache or extracted when rebuilding it. When set, the loc rebuild
     /// skips walking the install's loc files and merges these instead.
     #[allow(clippy::type_complexity)]
     vanilla_loc_keys: Mutex<Option<Vec<(String, Vec<String>)>>>,
-    /// cached modifier-key set; rebuilt after ruleset load and after each full
-    /// workspace scan when the type index is complete.
-    modifier_keys: parking_lot::RwLock<HashSet<String>>,
     /// loc-key index (workspace + vanilla) for CW100/CW122 on config files and
     /// for scope-aware loc-command checks. Rebuilt on each full workspace scan.
     loc_index: parking_lot::RwLock<Option<cwtools_localization::LocIndex>>,
@@ -105,36 +173,17 @@ struct DocumentState {
     /// from the desc for cleaner display.
     #[allow(clippy::type_complexity)]
     loc_text: parking_lot::RwLock<HashMap<String, Vec<(cwtools_localization::Lang, String)>>>,
-    /// languages to validate loc against, from the `localisationLanguages` init
-    /// option. `None` = all languages with data (the default). When set, the
-    /// missing-translation check and per-file loc checks are scoped to these,
-    /// so an english-targeted mod isn't flagged for every other language vanilla
-    /// happens to ship.
-    loc_languages: Mutex<Option<Vec<cwtools_localization::Lang>>>,
     /// When `false` (the default), hover shows localisation for the primary
-    /// language only (the first of `loc_languages`, else English) and the
+    /// language only (the first of `config.loc_languages`, else English) and the
     /// `loc_text` map only stores that language. Set via the
     /// `hoverShowAllLanguages` init option. Storing one language keeps the map
     /// small; the user opts into all translations explicitly.
     hover_show_all_languages: std::sync::atomic::AtomicBool,
-    /// Writable directory for persistent caches (from the `cacheDir` init
-    /// option, else an OS cache dir). The base-game type index is cached here
-    /// keyed by game + version, so it isn't re-parsed on every startup.
-    cache_dir: Mutex<Option<std::path::PathBuf>>,
     /// Monotonic edit counter, bumped on every `did_change`. A debounced
     /// validation captures the value at spawn time; the cross-file dependent
     /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
     /// into the latest one instead of stacking up and double-validating.
     edit_generation: AtomicU64,
-    /// Extra filename glob patterns to skip during the workspace scan (on top
-    /// of the engine baseline like Changelog.txt / README.md). Sourced from
-    /// `ignoreFilePatterns` in `initializationOptions` and the
-    /// `workspace/didChangeConfiguration` payload.
-    ignore_file_patterns: parking_lot::RwLock<Vec<String>>,
-    /// Extra directory glob patterns to skip during the workspace scan. Sourced
-    /// from `ignoreDirectories` in `initializationOptions` and
-    /// `workspace/didChangeConfiguration`.
-    ignore_dir_patterns: parking_lot::RwLock<Vec<String>>,
     /// Per open document, the set of lowercased identifier-like tokens it
     /// mentions (keys + string values from its parsed AST). Used by the
     /// dependent sweep to revalidate only the open docs that actually reference a
@@ -166,25 +215,17 @@ impl DocumentState {
     fn new() -> Self {
         Self {
             documents: Mutex::new(HashMap::new()),
-            ruleset: parking_lot::RwLock::new(None),
-            scope_registry: parking_lot::RwLock::new(None),
+            config: parking_lot::RwLock::new(Config::new()),
+            rules: parking_lot::RwLock::new(RuleData::new()),
             string_table: StringTable::new(),
-            language: Mutex::new("paradox".to_string()),
             symbol_index: Mutex::new(symbols::SymbolIndex::new()),
             info_service: parking_lot::RwLock::new(cwtools_info::InfoService::new()),
-            workspace_uri: Mutex::new(None),
             vanilla_index: Mutex::new(None),
-            vanilla_dir: Mutex::new(None),
             vanilla_loc_keys: Mutex::new(None),
-            modifier_keys: parking_lot::RwLock::new(HashSet::new()),
             loc_index: parking_lot::RwLock::new(None),
             loc_text: parking_lot::RwLock::new(HashMap::new()),
-            loc_languages: Mutex::new(None),
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
-            cache_dir: Mutex::new(None),
             edit_generation: AtomicU64::new(0),
-            ignore_file_patterns: parking_lot::RwLock::new(Vec::new()),
-            ignore_dir_patterns: parking_lot::RwLock::new(Vec::new()),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
             pending_changed_names: Mutex::new(HashSet::new()),
             vanilla_merged: std::sync::atomic::AtomicBool::new(false),
@@ -232,16 +273,13 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
     ) -> Option<RuleCursorInfo> {
-        let language = self.state.language.lock().clone();
-        // Lock order: documents -> ruleset -> scope_registry -> info_service
-        // -> modifier_keys (field-declaration order, see DocumentState).
+        let game = self.state.config.read().game();
+        // Lock order: documents -> rules -> info_service (see DocumentState).
         let docs = self.state.documents.lock();
-        let ruleset_guard = self.state.ruleset.read();
-        let registry_guard = self.state.scope_registry.read();
+        let rules_guard = self.state.rules.read();
         let info_guard = self.state.info_service.read();
-        let modifier_guard = self.state.modifier_keys.read();
         let doc = docs.get(uri)?;
-        let rs = ruleset_guard.as_ref()?;
+        let rs = rules_guard.ruleset.as_ref()?;
         let ast = doc.ast.as_ref()?;
 
         let enum_map = build_enum_map(rs);
@@ -249,11 +287,11 @@ impl Backend {
         let prepared = Prepared {
             ruleset: rs,
             table: &self.state.string_table,
-            game: cwtools_game::constants::Game::from_str(&language),
+            game,
             type_index: Some(&info_guard.type_index),
-            modifier_keys: Some(&modifier_guard),
+            modifier_keys: Some(&rules_guard.modifier_keys),
             loc_index: None,
-            registry: registry_guard.as_ref(),
+            registry: rules_guard.scope_registry.as_ref(),
             enum_map: &enum_map,
             scope_checks,
             var_checks,

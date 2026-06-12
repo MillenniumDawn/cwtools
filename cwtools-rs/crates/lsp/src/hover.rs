@@ -26,7 +26,7 @@ impl Backend {
             docs.get(&uri).and_then(|d| d.ast.clone())
         };
         if let Some(ast) = ast {
-            let ws_uri = self.state.workspace_uri.lock().clone();
+            let ws_uri = self.state.config.read().workspace_uri.clone();
             let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
             if let Some(RuleCursorInfo {

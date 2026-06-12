@@ -229,12 +229,13 @@ impl Backend {
             index.clear_document(uri);
             index.index_document(uri, parsed, &self.state.string_table);
         }
-        let ws_uri = self.state.workspace_uri.lock().clone();
+        let ws_uri = self.state.config.read().workspace_uri.clone();
         let logical_path = logical_path_from_uri(uri, &ws_uri);
-        let ruleset_guard = self.state.ruleset.read();
+        // Lock order: rules -> info_service.
+        let rules_guard = self.state.rules.read();
         let mut info = self.state.info_service.write();
         info.clear_file(uri);
-        if let Some(ruleset) = ruleset_guard.as_ref() {
+        if let Some(ruleset) = rules_guard.ruleset.as_ref() {
             info.index_file_with_path(
                 uri,
                 parsed,
@@ -436,30 +437,22 @@ impl Backend {
         if others.is_empty() {
             return;
         }
-        // Modifier keys only change on a full scan, so snapshot once for the
-        // whole sweep rather than re-locking per file.
-        let modifier_keys = self.state.modifier_keys.read().clone();
         tracing::debug!(
             count = others.len(),
             generation,
             "revalidate_open_dependents"
         );
-        let game = {
-            let language = self.state.language.lock().clone();
-            cwtools_game::constants::Game::from_str(&language)
-        };
-        // The scope registry is cached (built once at ruleset load), so snapshot
-        // the `Arc` here instead of rebuilding it per sweep.
-        let registry = self.state.scope_registry.read().clone();
+        let game = self.state.config.read().game();
         // Validate every dependent synchronously, then publish. The enum_map
         // borrows the ruleset, so build it ONCE for the whole sweep (cheap, but
-        // pointless to repeat per file). No await is held across the ruleset lock.
-        // Validate all dependents while holding ruleset (read), but do NOT lock
-        // documents inside this block (ABBA: request handlers take documents
-        // then ruleset; we must take ruleset then nothing-or-documents-after).
+        // pointless to repeat per file). No await is held across the rules lock.
+        // The single `rules` read guard covers the ruleset, the cached scope
+        // registry, and the modifier-key set (none change during the sweep). Do
+        // NOT lock documents inside this block (ABBA: request handlers take
+        // documents then rules; we must take rules then nothing-or-documents-after).
         let validated: Vec<(String, i32, Vec<Diagnostic>)> = {
-            let ruleset_guard = self.state.ruleset.read();
-            let enum_map = ruleset_guard.as_ref().map(|rs| build_enum_map(rs));
+            let rules_guard = self.state.rules.read();
+            let enum_map = rules_guard.ruleset.as_ref().map(|rs| build_enum_map(rs));
             let mut out = Vec::with_capacity(others.len());
             for (uri, snapshot_version, ast) in others {
                 // Preempt: a newer edit arrived. Save our changed_names into the
@@ -476,14 +469,14 @@ impl Backend {
                     // set and, combined with a `None` scope, covers all dependents).
                     return;
                 }
-                let diagnostics = match (ruleset_guard.as_ref(), enum_map.as_ref()) {
+                let diagnostics = match (rules_guard.ruleset.as_ref(), enum_map.as_ref()) {
                     (Some(ruleset), Some(enum_map)) => self.validate_parsed_prebuilt(
                         &uri,
                         &ast,
-                        &modifier_keys,
+                        &rules_guard.modifier_keys,
                         ruleset,
                         game,
-                        registry.as_ref(),
+                        rules_guard.scope_registry.as_ref(),
                         enum_map,
                     ),
                     _ => ast.errors.iter().map(parse_error_to_diagnostic).collect(),
@@ -529,7 +522,8 @@ impl Backend {
             // `$idea$` embeds). Built before the loc_index guard to honour the
             // info_service -> loc_index lock order.
             let extra_valid_refs: HashSet<String> = {
-                let mut extra = self.state.modifier_keys.read().clone();
+                // Lock order: rules -> info_service.
+                let mut extra = self.state.rules.read().modifier_keys.clone();
                 let info = self.state.info_service.read();
                 for (_uri, inst) in info.type_index.instances("idea") {
                     extra.insert(inst.name.to_lowercase());
@@ -569,15 +563,15 @@ impl Backend {
                 }
 
                 // Derive logical path for type-instance indexing
-                let ws_uri = self.state.workspace_uri.lock().clone();
+                let ws_uri = self.state.config.read().workspace_uri.clone();
                 let logical_path = logical_path_from_uri(uri, &ws_uri);
 
-                // Update info service
+                // Update info service. Lock order: rules -> info_service.
                 {
-                    let ruleset_guard = self.state.ruleset.read();
+                    let rules_guard = self.state.rules.read();
                     let mut info = self.state.info_service.write();
                     info.clear_file(uri);
-                    if let Some(ruleset) = ruleset_guard.as_ref() {
+                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
                         info.index_file_with_path(
                             uri,
                             &parsed,
@@ -588,22 +582,19 @@ impl Backend {
                     }
                 }
 
-                // Validation
+                // Validation. Lock order: rules -> info_service -> loc_index.
                 let (errors, log_msg) = {
-                    let ruleset_guard = self.state.ruleset.read();
-                    if let Some(ruleset) = ruleset_guard.as_ref() {
-                        let language = self.state.language.lock().clone();
-                        let game = cwtools_game::constants::Game::from_str(&language);
+                    let game = self.state.config.read().game();
+                    let rules_guard = self.state.rules.read();
+                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
                         let start = std::time::Instant::now();
                         // Pass the workspace TypeIndex for cross-file type reference checking.
                         let info_guard = self.state.info_service.read();
                         let type_index = &info_guard.type_index;
-                        let modifier_keys = self.state.modifier_keys.read();
                         let loc_guard = self.state.loc_index.read();
                         // Single-file path: the scope registry is cached (built
                         // once at ruleset load); the enum_map borrows the ruleset
                         // and is cheap, so build it inline.
-                        let registry = self.state.scope_registry.read().clone();
                         let enum_map = build_enum_map(ruleset);
                         let (scope_checks, var_checks) = checks_from_env();
                         let mut errs = validate_prepared(
@@ -614,16 +605,15 @@ impl Backend {
                                 table: &self.state.string_table,
                                 game,
                                 type_index: Some(type_index),
-                                modifier_keys: Some(&*modifier_keys),
+                                modifier_keys: Some(&rules_guard.modifier_keys),
                                 loc_index: loc_guard.as_ref(),
-                                registry: registry.as_ref(),
+                                registry: rules_guard.scope_registry.as_ref(),
                                 enum_map: &enum_map,
                                 scope_checks,
                                 var_checks,
                             },
                         );
                         drop(loc_guard);
-                        drop(modifier_keys);
                         drop(info_guard);
                         let elapsed = start.elapsed();
                         let total = truncate_validation_errors(&mut errs, uri);

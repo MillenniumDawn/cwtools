@@ -59,7 +59,7 @@ impl Backend {
             .uri
             .to_string();
 
-        let ws_uri = self.state.workspace_uri.lock().clone();
+        let ws_uri = self.state.config.read().workspace_uri.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         // First try the rule-aware lookup via the position resolver so we get a
@@ -175,7 +175,7 @@ impl Backend {
         let pos = params.text_document_position.position;
         let uri = params.text_document_position.text_document.uri.to_string();
 
-        let ws_uri = self.state.workspace_uri.lock().clone();
+        let ws_uri = self.state.config.read().workspace_uri.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         // Try rule-aware: identify a TypeRef at cursor then scan type_index for
@@ -219,9 +219,9 @@ impl Backend {
             // 2. Use-sites: scan all docs for TypeField leaves with the same value.
             {
                 let docs = self.state.documents.lock();
-                let ruleset_guard = self.state.ruleset.read();
-                let ws_uri = self.state.workspace_uri.lock().clone();
-                if let Some(rs) = ruleset_guard.as_ref() {
+                let rules_guard = self.state.rules.read();
+                let ws_uri = self.state.config.read().workspace_uri.clone();
+                if let Some(rs) = rules_guard.ruleset.as_ref() {
                     let use_sites = scan_use_sites(
                         &type_name,
                         &instance_name,
@@ -461,7 +461,7 @@ impl Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri.to_string();
         let pos = params.position;
-        let ws_uri = self.state.workspace_uri.lock().clone();
+        let ws_uri = self.state.config.read().workspace_uri.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
@@ -491,7 +491,7 @@ impl Backend {
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
         let new_name = params.new_name.clone();
-        let ws_uri = self.state.workspace_uri.lock().clone();
+        let ws_uri = self.state.config.read().workspace_uri.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
         // Identify what's under the cursor
@@ -521,9 +521,9 @@ impl Backend {
 
         {
             let docs = self.state.documents.lock();
-            let ruleset_guard = self.state.ruleset.read();
-            let ws_uri2 = self.state.workspace_uri.lock().clone();
-            if let Some(rs) = ruleset_guard.as_ref() {
+            let rules_guard = self.state.rules.read();
+            let ws_uri2 = self.state.config.read().workspace_uri.clone();
+            if let Some(rs) = rules_guard.ruleset.as_ref() {
                 let use_sites = scan_use_sites(
                     &type_name,
                     &instance_name,
