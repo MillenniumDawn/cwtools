@@ -501,8 +501,10 @@ fn instance_name_from_children(
             for child in children {
                 if let Child::Leaf(li) = child {
                     let leaf = &arena.leaves[*li as usize];
-                    let k = table.get_string(leaf.key.normal).unwrap_or_default();
-                    if k.eq_ignore_ascii_case(field_name) {
+                    let matches = table
+                        .with_string(leaf.key.normal, |k| k.eq_ignore_ascii_case(field_name))
+                        .unwrap_or(false);
+                    if matches {
                         let v = leaf_value_string(&leaf.value, table);
                         let v = unquote(&v);
                         if !v.is_empty() {
@@ -529,17 +531,16 @@ fn collect_skip_root_child(
     let Some(kc) = arena.keyed_clause(child) else {
         return; // not a keyed clause — skip
     };
-    let key = table.get_string(kc.key.normal).unwrap_or_default();
     let (clause_children, start_line, start_col) =
         (kc.children, kc.pos.start.line, kc.pos.start.col);
 
-    match skip_stack {
+    table.with_string(kc.key.normal, |key| match skip_stack {
         [] => {
             // We are at the instance node.
-            if type_key_filter_matches(td, &key)
-                && starts_with_matches(td, &key)
+            if type_key_filter_matches(td, key)
+                && starts_with_matches(td, key)
                 && let Some(name) =
-                    instance_name_from_children(td, &key, clause_children, arena, table)
+                    instance_name_from_children(td, key, clause_children, arena, table)
             {
                 out.push(TypeInstance {
                     name,
@@ -552,13 +553,13 @@ fn collect_skip_root_child(
         }
         [head, tail @ ..] => {
             // Must match the skip-root layer; then descend into children.
-            if skip_root_key_matches(head, &key) {
+            if skip_root_key_matches(head, key) {
                 for inner_child in clause_children {
                     collect_skip_root_child(td, tail, inner_child, arena, table, out);
                 }
             }
         }
-    }
+    });
 }
 
 /// Hash one exported symbol's identity, with separators so distinct parts can't
@@ -763,8 +764,12 @@ fn sibling_value_in_children(
     for child in children {
         if let Child::Leaf(li) = child {
             let leaf = &arena.leaves[*li as usize];
-            let k = table.get_string(leaf.key.normal).unwrap_or_default();
-            if matches!(k.to_ascii_lowercase().as_str(), "value" | "amount" | "add") {
+            let is_value_key = table
+                .with_string(leaf.key.normal, |k| {
+                    matches!(k.to_ascii_lowercase().as_str(), "value" | "amount" | "add")
+                })
+                .unwrap_or(false);
+            if is_value_key {
                 let v = leaf_value_string(&leaf.value, table);
                 if !v.is_empty() {
                     return Some(v);
@@ -991,8 +996,12 @@ pub fn collect_set_variable_defs(
         for child in children {
             if let Child::Leaf(li) = child {
                 let leaf = &arena.leaves[*li as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                if key.eq_ignore_ascii_case("var") || key.eq_ignore_ascii_case("variable") {
+                let is_var_key = table
+                    .with_string(leaf.key.normal, |k| {
+                        k.eq_ignore_ascii_case("var") || k.eq_ignore_ascii_case("variable")
+                    })
+                    .unwrap_or(false);
+                if is_var_key {
                     let v = leaf_value_string(&leaf.value, table);
                     if !v.is_empty() {
                         out.push(def(
@@ -1046,8 +1055,12 @@ pub fn collect_set_variable_defs(
             if let Child::Leaf(li) = child {
                 let leaf = &arena.leaves[*li as usize];
                 if let Value::Clause(ch) = &leaf.value {
-                    let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                    if effects.contains(&key.to_ascii_lowercase()) {
+                    let in_effects = table
+                        .with_string(leaf.key.normal, |k| {
+                            effects.contains(k.to_ascii_lowercase().as_str())
+                        })
+                        .unwrap_or(false);
+                    if in_effects {
                         extract(ch, arena, table, out);
                     }
                     walk(ch, arena, table, effects, out);

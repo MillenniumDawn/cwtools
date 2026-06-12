@@ -539,15 +539,19 @@ pub(crate) fn validate_children(
         match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-                let key =
-                    unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default()).to_string();
+                let (key, key_lower) = table
+                    .with_string(leaf.key.normal, |s| {
+                        let k = unquote_key(s).to_string();
+                        let kl = k.to_lowercase();
+                        (k, kl)
+                    })
+                    .unwrap_or_default();
                 let candidates =
                     matching_candidates(rules, &key, ruleset, type_index, rule_matches_leaf_key);
                 if candidates.is_empty() {
                     // Item 5: dynamic modifier keys — if provided and this key is a
                     // known modifier, accept silently (modifier context mechanism).
                     // The modifier set is built lowercase; compare lowercase.
-                    let key_lower = key.to_lowercase();
                     let is_modifier = modifier_keys
                         .map(|mk| mk.contains(key_lower.as_str()))
                         .unwrap_or(false);
@@ -1467,7 +1471,6 @@ fn validate_leaf(
                 .and_then(|s| s.strip_suffix('"'))
                 .unwrap_or(&raw_value)
                 .to_string();
-            let key = table.get_string(leaf.key.normal).unwrap_or_default();
             let type_name = match type_type {
                 TypeType::Simple(n) => n.as_str(),
                 TypeType::Complex { name, .. } => name.as_str(),
@@ -1507,6 +1510,9 @@ fn validate_leaf(
                         let c = &error_codes::CW222_UNDEFINED_EVENT;
                         (c, c.format(&[&lookup_value]))
                     } else {
+                        let key = table
+                            .with_string(leaf.key.normal, |s| s.to_string())
+                            .unwrap_or_default();
                         (
                             &error_codes::CW500_TYPE_NOT_FOUND,
                             format!(
@@ -1684,7 +1690,9 @@ fn validate_leaf(
         if !field_matches_value(right, &leaf.value, table, enum_map) {
             let expected = field_to_description(right);
             let actual = leaf_value_to_string(&leaf.value, table);
-            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            let key = table
+                .with_string(leaf.key.normal, |s| s.to_string())
+                .unwrap_or_default();
             errors.push(ValidationError::from_code(
                 &error_codes::CW240_UNEXPECTED_VALUE,
                 file_path,
