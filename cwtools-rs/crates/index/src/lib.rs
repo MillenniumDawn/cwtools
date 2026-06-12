@@ -1088,32 +1088,59 @@ pub fn index_discovered_files(
     table: &StringTable,
     var_effects: Option<&HashSet<String>>,
 ) -> TypeIndex {
+    use rayon::prelude::*;
+
     let var_effects = var_effects.filter(|e| !e.is_empty());
-    let mut index = TypeIndex::new();
-    for file in files {
-        let path = file.path.to_str().unwrap_or("").to_string();
-        let pf = ParsedFile {
-            arena: file.arena,
-            root_children: file.root_children,
-            errors: vec![],
-        };
-        let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
-        index.merge(&path, instances);
-        if let Some(effects) = var_effects {
-            let mut names: Vec<String> = Vec::new();
-            collect_set_variable_names(&pf, table, effects, &mut names);
-            for n in &names {
-                index.var_index.add_name(n);
+
+    // Collect into a Vec so rayon can split it across threads. The Vec is then
+    // consumed by into_par_iter() so we don't need Clone on the AST types.
+    let files: Vec<cwtools_file_manager::file_manager::ParsedFile> = files.into_iter().collect();
+
+    // Parallel collection: all collector functions take only &-borrows of the
+    // shared ruleset/table, so each file's work is independent. into_par_iter()
+    // on a Vec preserves input order in the output Vec after collect().
+    type PerFileData = (
+        String,                             // path
+        HashMap<String, Vec<TypeInstance>>, // type instances
+        Vec<String>,                        // variable names
+        HashMap<String, Vec<String>>,       // complex enum values
+        HashMap<String, Vec<String>>,       // value set members
+    );
+    let per_file: Vec<PerFileData> = files
+        .into_par_iter()
+        .map(|file| {
+            let path = file.path.to_str().unwrap_or("").to_string();
+            let pf = ParsedFile {
+                arena: file.arena,
+                root_children: file.root_children,
+                errors: vec![],
+            };
+            let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
+            let mut var_names: Vec<String> = Vec::new();
+            if let Some(effects) = var_effects {
+                collect_set_variable_names(&pf, table, effects, &mut var_names);
             }
+            let complex = dynamic_values::collect_complex_enum_values(
+                ruleset,
+                &pf,
+                &file.logical_path,
+                table,
+            );
+            let value_sets = dynamic_values::collect_value_set_members(ruleset, &pf, table);
+            (path, instances, var_names, complex, value_sets)
+        })
+        .collect();
+
+    // Sequential merge in original file order — preserves TypeIndex.merge call
+    // order so goto-def "first match" and refcount semantics are unchanged.
+    let mut index = TypeIndex::new();
+    for (path, instances, var_names, complex, value_sets) in per_file {
+        index.merge(&path, instances);
+        for n in &var_names {
+            index.var_index.add_name(n);
         }
-        index.complex_enum_values.merge_file(
-            &path,
-            dynamic_values::collect_complex_enum_values(ruleset, &pf, &file.logical_path, table),
-        );
-        index.value_set_values.merge_file(
-            &path,
-            dynamic_values::collect_value_set_members(ruleset, &pf, table),
-        );
+        index.complex_enum_values.merge_file(&path, complex);
+        index.value_set_values.merge_file(&path, value_sets);
     }
     index
 }

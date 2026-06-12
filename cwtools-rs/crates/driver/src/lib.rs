@@ -178,21 +178,32 @@ impl Session {
             })
             .collect();
 
-        // Cross-file TypeIndex from the already-parsed arenas. Sequential and
-        // streaming: merge each file's instances then drop them.
-        let mut type_index = TypeIndex::new();
-        for src in &parsed {
-            let instances =
-                collect_type_instances(&ruleset, &src.parsed, &src.logical_path, &rules_table);
-            type_index.merge(src.path.to_str().unwrap_or(""), instances);
-        }
-
-        // Project-wide variable index for `variable_field` checks (CW246).
+        // Cross-file TypeIndex from the already-parsed arenas. Per-file
+        // collection runs in parallel (each call is pure &-borrows); merge is
+        // sequential in the original file order so TypeIndex.merge call order
+        // is identical to the sequential version (goto-def "first match" and
+        // duplicate-name refcounts are order-sensitive).
+        use rayon::prelude::*;
+        type PerFileResult = (
+            HashMap<String, Vec<cwtools_index::TypeInstance>>,
+            Vec<String>,
+        );
         let var_effects = variable_defining_effects(&ruleset);
-        for src in &parsed {
-            let mut names: Vec<String> = Vec::new();
-            collect_set_variable_names(&src.parsed, &rules_table, &var_effects, &mut names);
-            for n in &names {
+        let per_file: Vec<PerFileResult> = parsed
+            .par_iter()
+            .map(|src| {
+                let instances =
+                    collect_type_instances(&ruleset, &src.parsed, &src.logical_path, &rules_table);
+                let mut var_names: Vec<String> = Vec::new();
+                collect_set_variable_names(&src.parsed, &rules_table, &var_effects, &mut var_names);
+                (instances, var_names)
+            })
+            .collect();
+
+        let mut type_index = TypeIndex::new();
+        for (src, (instances, var_names)) in parsed.iter().zip(per_file) {
+            type_index.merge(src.path.to_str().unwrap_or(""), instances);
+            for n in &var_names {
                 type_index.var_index.add_name(n);
             }
         }
