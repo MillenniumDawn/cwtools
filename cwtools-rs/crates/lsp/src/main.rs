@@ -179,7 +179,7 @@ struct DocumentState {
     /// validation, the cross-file sweep) share the guard and don't serialize
     /// behind a debounced validate; only the rare ruleset load/reload takes
     /// `write()`.
-    ruleset: parking_lot::RwLock<Option<RuleSet>>,
+    ruleset: parking_lot::RwLock<Option<Arc<RuleSet>>>,
     /// Scope/link registry built from `ruleset` (config-driven scopes.cwt +
     /// links.cwt). Cached here because `build_scope_registry` is the expensive
     /// part of per-file validation setup and depends only on the loaded ruleset,
@@ -3034,13 +3034,10 @@ impl Backend {
             let language = self.state.language.lock().clone();
             cwtools_game::constants::Game::from_str(&language)
         };
-        // Own an `Arc<RuleSet>` clone for the whole batch so the `enum_map`
-        // (which borrows the ruleset) stays valid across the parallel section
-        // without holding the ruleset mutex across rayon work.
-        let scan_ruleset: Option<Arc<RuleSet>> = {
-            let ruleset_guard = self.state.ruleset.read();
-            ruleset_guard.as_ref().map(|rs| Arc::new(rs.clone()))
-        };
+        // Snapshot the shared `Arc<RuleSet>` for the whole batch so the
+        // `enum_map` (which borrows the ruleset) stays valid across the
+        // parallel section without holding the ruleset lock across rayon work.
+        let scan_ruleset: Option<Arc<RuleSet>> = self.state.ruleset.read().clone();
         // The scope registry is cached (built once at ruleset load); snapshot the
         // `Arc` for the batch instead of rebuilding it for the whole scan.
         let scan_registry = self.state.scope_registry.read().clone();
@@ -3798,7 +3795,7 @@ impl Backend {
         // checks and for hover/goto.
         let var_effects = cwtools_info::variable_defining_effects(&ruleset);
         self.state.info_service.write().set_var_effects(var_effects);
-        *guard = Some(ruleset);
+        *guard = Some(Arc::new(ruleset));
     }
 
     /// Rebuild the cached modifier-key set from the current ruleset and type index.
