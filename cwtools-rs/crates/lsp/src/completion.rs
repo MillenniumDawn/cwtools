@@ -485,7 +485,7 @@ pub(crate) fn all_enum_values(
         info.type_index
             .complex_enum_values
             .values(enum_name)
-            .cloned(),
+            .map(str::to_string),
     );
     vals.sort_unstable();
     vals.dedup();
@@ -607,7 +607,12 @@ pub(crate) fn value_completions(
                     other => {
                         let mut vals: Vec<String> =
                             ruleset.values.get(other).cloned().unwrap_or_default();
-                        vals.extend(info.type_index.value_set_values.values(other).cloned());
+                        vals.extend(
+                            info.type_index
+                                .value_set_values
+                                .values(other)
+                                .map(str::to_string),
+                        );
                         vals
                     }
                 };

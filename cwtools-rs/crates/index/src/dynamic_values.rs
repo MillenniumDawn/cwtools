@@ -12,6 +12,7 @@
 //! changes no diagnostics.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::{ComplexEnumNameTree, ComplexEnumNameTreeEntry, RuleSet};
@@ -19,14 +20,21 @@ use cwtools_string_table::string_table::{StringId, StringTable};
 
 use crate::check_path_dir;
 
+/// One (enum-name, value) pair stored in the per-file bookkeeping list.
+type NameValuePair = (Arc<str>, Arc<str>);
+
 /// `name -> value -> refcount`, with per-file bookkeeping so single-file
 /// re-indexing (the LSP edit path) replaces a file's contribution instead of
 /// leaking it. Used for both complex-enum members (name = enum name) and
 /// value-set members (name = namespace).
+///
+/// `Arc<str>` keys in both maps share the same allocation — each (name, value)
+/// string is allocated once even though it appears in both `by_name` and the
+/// per-file bookkeeping list.
 #[derive(Debug, Default)]
 pub struct NamedValueIndex {
-    by_name: HashMap<String, HashMap<String, usize>>,
-    per_file: HashMap<String, Vec<(String, String)>>,
+    by_name: HashMap<Arc<str>, HashMap<Arc<str>, usize>>,
+    per_file: HashMap<String, Vec<NameValuePair>>,
 }
 
 impl NamedValueIndex {
@@ -37,16 +45,18 @@ impl NamedValueIndex {
     /// Replace `file_uri`'s contribution with `items`.
     pub fn merge_file(&mut self, file_uri: &str, items: HashMap<String, Vec<String>>) {
         self.remove_file(file_uri);
-        let mut flat: Vec<(String, String)> = Vec::new();
+        let mut flat: Vec<(Arc<str>, Arc<str>)> = Vec::new();
         for (name, values) in items {
+            let name_arc: Arc<str> = Arc::from(name.as_str());
             for v in values {
+                let val_arc: Arc<str> = Arc::from(v.as_str());
                 *self
                     .by_name
-                    .entry(name.clone())
+                    .entry(Arc::clone(&name_arc))
                     .or_default()
-                    .entry(v.clone())
+                    .entry(Arc::clone(&val_arc))
                     .or_insert(0) += 1;
-                flat.push((name.clone(), v));
+                flat.push((Arc::clone(&name_arc), val_arc));
             }
         }
         if !flat.is_empty() {
@@ -60,23 +70,26 @@ impl NamedValueIndex {
             return;
         };
         for (name, v) in flat {
-            if let Some(vals) = self.by_name.get_mut(&name) {
-                if let Some(c) = vals.get_mut(&v) {
+            if let Some(vals) = self.by_name.get_mut(name.as_ref()) {
+                if let Some(c) = vals.get_mut(v.as_ref()) {
                     *c -= 1;
                     if *c == 0 {
-                        vals.remove(&v);
+                        vals.remove(v.as_ref());
                     }
                 }
                 if vals.is_empty() {
-                    self.by_name.remove(&name);
+                    self.by_name.remove(name.as_ref());
                 }
             }
         }
     }
 
     /// All known values for `name`.
-    pub fn values(&self, name: &str) -> impl Iterator<Item = &String> {
-        self.by_name.get(name).into_iter().flat_map(|m| m.keys())
+    pub fn values(&self, name: &str) -> impl Iterator<Item = &str> {
+        self.by_name
+            .get(name)
+            .into_iter()
+            .flat_map(|m| m.keys().map(Arc::as_ref))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -87,7 +100,12 @@ impl NamedValueIndex {
     pub fn export(&self) -> Vec<(String, Vec<String>)> {
         self.by_name
             .iter()
-            .map(|(name, vals)| (name.clone(), vals.keys().cloned().collect()))
+            .map(|(name, vals)| {
+                (
+                    name.as_ref().to_string(),
+                    vals.keys().map(|v| v.as_ref().to_string()).collect(),
+                )
+            })
             .collect()
     }
 }
