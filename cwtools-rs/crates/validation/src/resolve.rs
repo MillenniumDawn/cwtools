@@ -75,7 +75,8 @@ pub(crate) fn find_type_and_rules_for_file<'a>(
             return by_name;
         }
         // Extension mismatch: try the path-aware lookup first.
-        if let Some(t) = find_type_by_path_and_key(file_path, Some(name), ruleset) {
+        let file_path_lower = file_path.to_lowercase();
+        if let Some(t) = find_type_by_path_and_key(&file_path_lower, Some(name), ruleset) {
             return Some((t, find_rules_by_name(&t.name, ruleset)));
         }
         // No path match either: the by-name hit was for a different extension;
@@ -117,57 +118,89 @@ pub(crate) fn find_type_by_path<'a>(
     file_path: &str,
     ruleset: &'a RuleSet,
 ) -> Option<&'a TypeDefinition> {
-    find_type_by_path_and_key(file_path, None, ruleset)
+    let lower = file_path.to_lowercase();
+    find_type_by_path_and_key(&lower, None, ruleset)
 }
 
-/// Like `find_type_by_path` but also considers the root key of the child
-/// being validated. Types whose `skip_root_key` matches `root_key` are
-/// given a large bonus, so they beat a longer-path type that has no
-/// skip_root_key and would otherwise win on path length alone.
-///
-/// This mirrors F# behaviour where `type[pdxmesh] { skip_root_key = objectTypes }`
-/// correctly wins over `type[light] { path = "gfx/entities" }` for
-/// a `objectTypes = { pdxmesh = { ... } }` root node in a `.gfx` file.
-pub(crate) fn find_type_by_path_and_key<'a>(
-    file_path: &str,
-    root_key: Option<&str>,
-    ruleset: &'a RuleSet,
-) -> Option<&'a TypeDefinition> {
-    let path_lower = file_path.to_lowercase();
-    let basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
-    // The file's directory (no filename, no trailing slash).
-    let dir = path_lower
-        .strip_suffix(basename)
-        .unwrap_or(&path_lower)
-        .trim_end_matches('/');
-    let mut best: Option<&TypeDefinition> = None;
-    let mut best_len = 0usize;
+/// A path-matched type with its base weight (path length + path_file bonus).
+/// The key-dependent bonuses (`skip_key_bonus`, `tkf_bonus`) are added later
+/// by [`find_type_from_candidates`] so that path filtering is done once per
+/// file while key scoring is done once per root child.
+pub(crate) struct PathCandidate<'a> {
+    pub type_def: &'a TypeDefinition,
+    /// Largest `p_lower.len() + path_file_bonus` over all matching paths.
+    pub base_weight: usize,
+}
 
+/// Pre-filter types to those whose path options match `file_path_lower`.
+/// Returns one entry per matching type (the highest base weight across all
+/// matching paths_lower entries).  Call once per file, then reuse the slice
+/// across all root children via [`find_type_from_candidates`].
+pub(crate) fn path_candidates_for_file<'a>(
+    file_path_lower: &str,
+    ruleset: &'a RuleSet,
+) -> Vec<PathCandidate<'a>> {
+    let basename = file_path_lower
+        .rsplit('/')
+        .next()
+        .unwrap_or(file_path_lower);
+    let dir = file_path_lower
+        .strip_suffix(basename)
+        .unwrap_or(file_path_lower)
+        .trim_end_matches('/');
+    let ext = basename.rsplit('.').next();
+
+    let mut out = Vec::new();
     for t in &ruleset.types {
-        // path_file pins the type to one specific filename (e.g. several types
-        // share path "map" but only airports.txt is the `airports` type).
         if let Some(pf) = &t.path_options.path_file_lower
             && basename != pf.as_str()
         {
             continue;
         }
-        // path_extension restricts the type to files with a given extension
-        // (e.g. sound types require `.asset`, so a `.txt` combat-sounds file must
-        // NOT match them). Treat the extension as a hard filter.
-        if let Some(ext) = &t.path_options.path_ext_lower
-            && basename
-                .rsplit('.')
-                .next()
-                .is_none_or(|e| e != ext.as_str())
+        if let Some(req_ext) = &t.path_options.path_ext_lower
+            && ext.is_none_or(|e| e != req_ext.as_str())
         {
             continue;
         }
+        let path_file_bonus = if t.path_options.path_file.is_some() {
+            1000
+        } else {
+            0
+        };
+        let mut best_weight = 0usize;
+        for p_lower in &t.path_options.paths_lower {
+            if dir_matches_pattern(dir, p_lower, t.path_options.path_strict) {
+                let w = p_lower.len() + path_file_bonus;
+                if w > best_weight {
+                    best_weight = w;
+                }
+            }
+        }
+        if best_weight > 0 {
+            out.push(PathCandidate {
+                type_def: t,
+                base_weight: best_weight,
+            });
+        }
+    }
+    out
+}
+
+/// Pick the best-matching type from path-prefiltered candidates, applying
+/// key-dependent bonuses (`skip_root_key` and `type_key_filter`).
+pub(crate) fn find_type_from_candidates<'a>(
+    candidates: &[PathCandidate<'a>],
+    root_key: Option<&str>,
+) -> Option<&'a TypeDefinition> {
+    let mut best: Option<&TypeDefinition> = None;
+    let mut best_len = 0usize;
+
+    for c in candidates {
+        let t = c.type_def;
         // `## type_key_filter` gates a NON-wrapper type to nodes whose own key
-        // satisfies the filter: a top-level `animation = { ... }` node is only an
-        // instance of `type[model_animation] { type_key_filter = animation }`, not
-        // of `type[light]` that merely shares the path. A matching filter also
-        // earns a bonus so the filtered type beats an unfiltered one on the same
-        // path. (For skip_root_key wrappers the filter applies to GRANDCHILDREN,
+        // satisfies the filter. A matching filter also earns a bonus so the
+        // filtered type beats an unfiltered one on the same path.
+        // (For skip_root_key wrappers the filter applies to GRANDCHILDREN,
         // handled in validate_wrapper_grandchildren, so it is not gated here.)
         let tkf_bonus = match (root_key, t.skip_root_key.is_empty(), &t.type_key_filter) {
             (Some(rk), true, Some((keys, negate))) => {
@@ -180,39 +213,41 @@ pub(crate) fn find_type_by_path_and_key<'a>(
             }
             _ => 0,
         };
-        for p_lower in &t.path_options.paths_lower {
-            // path_strict: the file must be DIRECTLY in this directory (so
-            // `path_strict` type[unit] at common/units does NOT swallow files in
-            // common/units/names/). Otherwise it may be in a subdirectory.
-            let matches = dir_matches_pattern(dir, p_lower, t.path_options.path_strict);
-            // A path_file match is more specific than any bare directory match.
-            // A skip_root_key match for the current root key gets a large bonus
-            // so that e.g. `type[pdxmesh] { skip_root_key = objectTypes }` beats
-            // `type[light] { path = "gfx/entities" }` for an objectTypes node.
-            let skip_key_bonus = if let Some(rk) = root_key {
-                if should_skip_root_key(rk, t) {
-                    10_000
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-            let weight = p_lower.len()
-                + skip_key_bonus
-                + tkf_bonus
-                + if t.path_options.path_file.is_some() {
-                    1000
-                } else {
-                    0
-                };
-            if matches && weight > best_len {
-                best = Some(t);
-                best_len = weight;
-            }
+        let skip_key_bonus = match root_key {
+            Some(rk) if should_skip_root_key(rk, t) => 10_000,
+            _ => 0,
+        };
+        let weight = c.base_weight + skip_key_bonus + tkf_bonus;
+        if weight > best_len {
+            best = Some(t);
+            best_len = weight;
         }
     }
     best
+}
+
+/// Like `find_type_by_path` but also considers the root key of the child
+/// being validated. Types whose `skip_root_key` matches `root_key` are
+/// given a large bonus, so they beat a longer-path type that has no
+/// skip_root_key and would otherwise win on path length alone.
+///
+/// `file_path_lower` must already be lowercased (ASCII) by the caller so
+/// that per-child calls in a hot loop share a single allocation.
+///
+/// For hot loops processing many root children of the same file, prefer
+/// calling [`path_candidates_for_file`] once and [`find_type_from_candidates`]
+/// per child.
+///
+/// This mirrors F# behaviour where `type[pdxmesh] { skip_root_key = objectTypes }`
+/// correctly wins over `type[light] { path = "gfx/entities" }` for
+/// a `objectTypes = { pdxmesh = { ... } }` root node in a `.gfx` file.
+pub(crate) fn find_type_by_path_and_key<'a>(
+    file_path_lower: &str,
+    root_key: Option<&str>,
+    ruleset: &'a RuleSet,
+) -> Option<&'a TypeDefinition> {
+    let candidates = path_candidates_for_file(file_path_lower, ruleset);
+    find_type_from_candidates(&candidates, root_key)
 }
 
 /// True if `t`'s `path_options` select `file_path`. Mirrors the per-path test in

@@ -11,6 +11,7 @@
 //! `VIC2Localisation.fs`.
 
 use crate::commands::{Lang, LocEntry, Position};
+use std::sync::Arc;
 
 /// Column order for CK2 / VIC2 CSV localisation files.
 ///
@@ -43,6 +44,8 @@ pub fn parse_csv_loc_per_lang(
     column_langs: Option<&[Option<Lang>]>,
 ) -> Vec<(String, Lang, LocEntry)> {
     let column_langs = column_langs.unwrap_or(CK2_COLUMN_LANGS);
+    // One Arc allocation shared by every Position in this file.
+    let stream_name: Arc<str> = Arc::from(name);
     let mut out = Vec::new();
 
     for (line_num, line) in text.lines().enumerate() {
@@ -69,7 +72,7 @@ pub fn parse_csv_loc_per_lang(
 
             let desc = parts.get(col_idx).copied().unwrap_or("").to_string();
 
-            let position = Position::new(name, line_num + 1, 1);
+            let position = Position::new(Arc::clone(&stream_name), line_num + 1, 1);
 
             out.push((
                 key.clone(),

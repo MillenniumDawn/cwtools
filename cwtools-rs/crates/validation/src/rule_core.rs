@@ -5,8 +5,8 @@ use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 use crate::common::*;
 use crate::ctx::ValidationCtx;
@@ -138,7 +138,7 @@ pub(crate) fn merged_rules_for_type<'a>(
             children,
             ctx.ast,
             ctx.table,
-            ctx.enum_map,
+            ctx.ruleset,
             node_key,
             ctx.type_index,
         ) {
@@ -456,7 +456,6 @@ pub(crate) fn validate_children(
     errors: &mut Vec<ValidationError>,
 ) {
     let ast = ctx.ast;
-    let enum_map = ctx.enum_map;
     let table = ctx.table;
     let file_path = ctx.file_path;
     let ruleset = ctx.ruleset;
@@ -479,7 +478,8 @@ pub(crate) fn validate_children(
 
     // Track occurrence counts for cardinality checking.
     // Keyed children (Leaf/Node): key string -> count.
-    let mut key_counts: HashMap<String, usize> = HashMap::new();
+    let mut key_counts: FxHashMap<String, usize> =
+        FxHashMap::with_capacity_and_hasher(children.len(), Default::default());
     // Item 5: LeafValues — count per LeafValueRule index.
     let mut leafvalue_counts: Vec<usize> = vec![0usize; rules.len()];
     // Item 5: ValueClause — count per ValueClauseRule index.
@@ -516,7 +516,7 @@ pub(crate) fn validate_children(
                     // producing a spurious "appears 0 time(s)" cardinality error.
                     for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
                         if let RuleType::LeafValueRule { right } = rule_type
-                            && field_matches_value(right, &lv.value, table, enum_map)
+                            && field_matches_value(right, &lv.value, table, ruleset)
                         {
                             leafvalue_counts[rule_idx] += 1;
                         }
@@ -539,15 +539,19 @@ pub(crate) fn validate_children(
         match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-                let key =
-                    unquote_key(&table.get_string(leaf.key.normal).unwrap_or_default()).to_string();
+                let (key, key_lower) = table
+                    .with_string(leaf.key.normal, |s| {
+                        let k = unquote_key(s).to_string();
+                        let kl = k.to_lowercase();
+                        (k, kl)
+                    })
+                    .unwrap_or_default();
                 let candidates =
                     matching_candidates(rules, &key, ruleset, type_index, rule_matches_leaf_key);
                 if candidates.is_empty() {
                     // Item 5: dynamic modifier keys — if provided and this key is a
                     // known modifier, accept silently (modifier context mechanism).
                     // The modifier set is built lowercase; compare lowercase.
-                    let key_lower = key.to_lowercase();
                     let is_modifier = modifier_keys
                         .map(|mk| mk.contains(key_lower.as_str()))
                         .unwrap_or(false);
@@ -650,7 +654,7 @@ pub(crate) fn validate_children(
                     let mut matched = false;
                     for (rule_type, _opts) in rules {
                         if let RuleType::LeafValueRule { right } = rule_type
-                            && field_matches_value(right, &lv.value, table, enum_map)
+                            && field_matches_value(right, &lv.value, table, ruleset)
                         {
                             // VariableGetField bare read: validate against the
                             // project-wide variable index (CW246), mirroring the
@@ -663,6 +667,7 @@ pub(crate) fn validate_children(
                                     file_path,
                                     lv.pos.start.line,
                                     lv.pos.start.col,
+                                    ctx.var_checks,
                                     errors,
                                 );
                             }
@@ -729,7 +734,8 @@ pub(crate) fn validate_children(
     // times, or an absent optional alternative double-reports.
     // Third field tracks strictness: a `~` (soft) minimum on ANY overload of a
     // key makes the whole key's minimum soft, so an under-count is not flagged.
-    let mut key_card: HashMap<String, (i32, i32, bool)> = HashMap::new();
+    let mut key_card: FxHashMap<String, (i32, i32, bool)> =
+        FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
     for (rule_type, opts) in rules.iter() {
         if matches!(
             rule_type,
@@ -745,7 +751,8 @@ pub(crate) fn validate_children(
             e.2 = e.2 && opts.strict_min;
         }
     }
-    let mut reported_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reported_keys: FxHashSet<String> =
+        FxHashSet::with_capacity_and_hasher(key_card.len(), Default::default());
 
     for (rule_idx, (rule_type, opts)) in rules.iter().enumerate() {
         // Both under- and over-count default to a WARNING (config cardinalities are
@@ -943,71 +950,33 @@ fn is_scope_key(
         || type_index.is_some_and(|idx| idx.is_any_instance(key))
 }
 
-/// If `pattern` embeds a placeholder, test whether `key` matches: a literal
-/// prefix and suffix around a member of the placeholder's set. Returns `None`
-/// when there is no placeholder (the caller does a literal compare instead).
+/// Test whether `key` matches the pre-parsed alias pattern.
 ///
-/// Placeholder forms (these appear in dynamic-modifier / scripted-* alias names):
-///   `<type>` / `<type.subtype>` — an instance of `type` (subtype ignored)
-///   `value[set]` / `value_set[set]` — a member of that value set
-///   `enum[name]` — a member of that enum
-fn alias_pattern_matches(
-    pattern: &str,
+/// The pattern was already split into (prefix, kind, placeholder_name, suffix)
+/// at ruleset build time by `ParsedAliasPattern::parse`; this function only
+/// does the per-call key-matching work (prefix/suffix strip + membership test).
+fn parsed_pattern_matches(
+    pat: &ParsedAliasPattern,
     key: &str,
     ruleset: &RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
-) -> Option<bool> {
-    // Locate the placeholder and split into (prefix, kind, name, suffix).
-    let (pre, kind, name, suf): (&str, &str, &str, &str) = if let Some(open) = pattern.find('<') {
-        let close = open + pattern[open..].find('>')?;
-        (
-            &pattern[..open],
-            "type",
-            &pattern[open + 1..close],
-            &pattern[close + 1..],
-        )
-    } else {
-        // Bracketed forms — check the longer markers first so `enum[` doesn't
-        // match inside `complex_enum[`, etc. Pick the earliest match in `pattern`.
-        let markers = [
-            ("value_set[", "value"),
-            ("complex_enum[", "enum"),
-            ("value[", "value"),
-            ("enum[", "enum"),
-        ];
-        let mut found: Option<(usize, &str, &str, &str, &str)> = None;
-        for (marker, kind) in markers {
-            if let Some(open) = pattern.find(marker) {
-                let inner = open + marker.len();
-                let close = inner + pattern[inner..].find(']')?;
-                if found.is_none_or(|(o, ..)| open < o) {
-                    found = Some((
-                        open,
-                        &pattern[..open],
-                        kind,
-                        &pattern[inner..close],
-                        &pattern[close + 1..],
-                    ));
-                }
-            }
-        }
-        let (_, p, k, n, s) = found?;
-        (p, k, n, s)
-    };
-
+) -> bool {
+    let pre = pat.prefix.as_str();
+    let suf = pat.suffix.as_str();
     if key.len() < pre.len() + suf.len() || !key.starts_with(pre) || !key.ends_with(suf) {
-        return Some(false);
+        return false;
     }
     let middle = &key[pre.len()..key.len() - suf.len()];
-    Some(match kind {
-        "type" => {
+    let name = pat.placeholder_name.as_str();
+    match pat.kind {
+        PatternKind::Type => {
             // `<type.subtype>` → check the base type (subtype is a refinement).
             let base = name.split('.').next().unwrap_or(name);
             type_index
                 .map(|idx| idx.contains(base, middle))
                 .unwrap_or(false)
         }
-        "enum" => match ruleset.enum_by_name.get(name) {
+        PatternKind::Enum => match ruleset.enum_by_name.get(name) {
             Some(&idx) if !ruleset.enums[idx].values.is_empty() => {
                 let def = &ruleset.enums[idx];
                 def.values.iter().any(|v| v.eq_ignore_ascii_case(middle))
@@ -1016,12 +985,11 @@ fn alias_pattern_matches(
             }
             _ => true, // enum absent/empty (game-derived) — permissive
         },
-        "value" => match ruleset.values.get(name) {
+        PatternKind::Value => match ruleset.values.get(name) {
             Some(vs) if !vs.is_empty() => vs.iter().any(|v| v == middle),
             _ => true, // value set not collected — permissive
         },
-        _ => false,
-    })
+    }
 }
 
 pub(crate) fn field_matches_key(
@@ -1042,8 +1010,11 @@ pub(crate) fn field_matches_key(
             // The name part can be a literal (`trigger:original_tag`), a `<type>`
             // reference (`trigger:<scripted_trigger>`, `modifier:..<building>..`),
             // or `scope_field` (any scope-switching key).
-            let full = format!("{}:{}", category, key);
-            if ruleset.alias_exact.contains_key(&full) {
+            if ruleset
+                .alias_exact
+                .get(category.as_str())
+                .is_some_and(|m| m.contains_key(key))
+            {
                 return true;
             }
             // Case-insensitive retry: command names like `Country_event` resolve to
@@ -1052,7 +1023,8 @@ pub(crate) fn field_matches_key(
             if lower != key
                 && ruleset
                     .alias_exact
-                    .contains_key(&format!("{}:{}", category, lower))
+                    .get(category.as_str())
+                    .is_some_and(|m| m.contains_key(lower.as_str()))
             {
                 return true;
             }
@@ -1060,10 +1032,8 @@ pub(crate) fn field_matches_key(
                 // Category has no aliases at all — be permissive (avoid floods).
                 None => true,
                 Some(cat) => {
-                    for &idx in &cat.type_pattern_idxs {
-                        let name = &ruleset.aliases[idx].0;
-                        let rest = &name[category.len() + 1..];
-                        if alias_pattern_matches(rest, key, ruleset, type_index) == Some(true) {
+                    for pat in &cat.parsed_patterns {
+                        if parsed_pattern_matches(pat, key, ruleset, type_index) {
                             return true;
                         }
                     }
@@ -1158,9 +1128,8 @@ pub(crate) fn alias_overloads<'a>(
 ) -> Vec<&'a (RuleType, Options)> {
     // Gather candidate overloads via the precomputed alias index (O(1) exact +
     // O(patterns)) rather than scanning every alias.
-    let alias_key = format!("{}:{}", category, key);
     let mut overloads: Vec<&(RuleType, Options)> = Vec::new();
-    if let Some(idxs) = ruleset.alias_exact.get(&alias_key) {
+    if let Some(idxs) = ruleset.alias_exact.get(category).and_then(|m| m.get(key)) {
         for &i in idxs {
             overloads.push(&ruleset.aliases[i].1);
         }
@@ -1171,18 +1140,19 @@ pub(crate) fn alias_overloads<'a>(
     let lower = key.to_ascii_lowercase();
     if overloads.is_empty()
         && lower != key
-        && let Some(idxs) = ruleset.alias_exact.get(&format!("{}:{}", category, lower))
+        && let Some(idxs) = ruleset
+            .alias_exact
+            .get(category)
+            .and_then(|m| m.get(lower.as_str()))
     {
         for &i in idxs {
             overloads.push(&ruleset.aliases[i].1);
         }
     }
     if let Some(cat) = ruleset.alias_categories.get(category) {
-        for &idx in &cat.type_pattern_idxs {
-            let (name, rule) = &ruleset.aliases[idx];
-            let rest = &name[category.len() + 1..];
-            if alias_pattern_matches(rest, key, ruleset, type_index) == Some(true) {
-                overloads.push(rule);
+        for pat in &cat.parsed_patterns {
+            if parsed_pattern_matches(pat, key, ruleset, type_index) {
+                overloads.push(&ruleset.aliases[pat.alias_idx].1);
             }
         }
         if let Some(sf_idx) = cat.scope_field_idx
@@ -1230,7 +1200,7 @@ fn validate_alias_usage(
     // chains (`owner.capital`): a bare command that's missing from this config's
     // links.cwt (e.g. `overlord`) is valid-but-unlisted, not invalid, so only
     // chains — where a segment is genuinely unresolvable — are flagged.
-    if scope_checks_enabled()
+    if ctx.scope_checks
         && key.contains('.')
         && !looks_like_data_ref(key)
         && let Some(sc) = scope_context.as_ref()
@@ -1266,7 +1236,7 @@ fn validate_alias_usage(
     // scope through every scope-change effect/trigger link (`random_owned_state`,
     // leader abilities, iterators). With the config-driven scope/link registry
     // that tracking is now in place, so this runs by default.
-    if scope_checks_enabled()
+    if ctx.scope_checks
         && let Some(sc) = scope_context.as_ref()
         && let Some(current) = sc.current()
     {
@@ -1401,9 +1371,10 @@ fn check_variable_get(
     file_path: &str,
     line: u32,
     col: u16,
+    var_checks: bool,
     errors: &mut Vec<ValidationError>,
 ) {
-    if !var_checks_enabled() {
+    if !var_checks {
         return;
     }
     let v = raw.trim_matches('"').trim();
@@ -1443,7 +1414,6 @@ fn validate_leaf(
     errors: &mut Vec<ValidationError>,
 ) {
     let table = ctx.table;
-    let enum_map = ctx.enum_map;
     let file_path = ctx.file_path;
     let type_index = ctx.type_index;
     if let RuleType::LeafRule { right, .. } = rule_type {
@@ -1465,7 +1435,6 @@ fn validate_leaf(
                 .and_then(|s| s.strip_suffix('"'))
                 .unwrap_or(&raw_value)
                 .to_string();
-            let key = table.get_string(leaf.key.normal).unwrap_or_default();
             let type_name = match type_type {
                 TypeType::Simple(n) => n.as_str(),
                 TypeType::Complex { name, .. } => name.as_str(),
@@ -1505,6 +1474,9 @@ fn validate_leaf(
                         let c = &error_codes::CW222_UNDEFINED_EVENT;
                         (c, c.format(&[&lookup_value]))
                     } else {
+                        let key = table
+                            .with_string(leaf.key.normal, |s| s.to_string())
+                            .unwrap_or_default();
                         (
                             &error_codes::CW500_TYPE_NOT_FOUND,
                             format!(
@@ -1581,7 +1553,7 @@ fn validate_leaf(
         //     violates the field's int/precision constraint, so they cannot
         //     flood valid config.
         //   - the "variable has not been set" check (CW246) is gated behind
-        //     `var_checks_enabled()` because it needs a complete variable index.
+        //     `ctx.var_checks` because it needs a complete variable index.
         if let NewField::VariableField {
             is_int, is_32bit, ..
         } = right
@@ -1622,7 +1594,7 @@ fn validate_leaf(
                             &[],
                         ));
                     }
-                } else if var_checks_enabled() {
+                } else if ctx.var_checks {
                     // Non-numeric value: it must name a defined variable. Stay
                     // lenient: only flag a single bare token (a `.`-chain is a
                     // scope/target, handled elsewhere) that isn't a scope
@@ -1663,6 +1635,7 @@ fn validate_leaf(
                 file_path,
                 leaf.pos.start.line,
                 leaf.pos.start.col,
+                ctx.var_checks,
                 errors,
             );
             return;
@@ -1671,17 +1644,19 @@ fn validate_leaf(
         // Scope-target validation (CW243 target-wrong-scope / CW245 error-in-target):
         // resolve the chain from the current scope. Gated with the other scope checks.
         if let NewField::ScopeField(expected) = right
-            && scope_checks_enabled()
+            && ctx.scope_checks
             && let Some(ctx) = scope_context
         {
             let value = leaf_value_to_string(&leaf.value, table);
             validate_scope_target(ctx, &value, expected, leaf, file_path, errors);
         }
 
-        if !field_matches_value(right, &leaf.value, table, enum_map) {
+        if !field_matches_value(right, &leaf.value, table, ctx.ruleset) {
             let expected = field_to_description(right);
             let actual = leaf_value_to_string(&leaf.value, table);
-            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            let key = table
+                .with_string(leaf.key.normal, |s| s.to_string())
+                .unwrap_or_default();
             errors.push(ValidationError::from_code(
                 &error_codes::CW240_UNEXPECTED_VALUE,
                 file_path,
@@ -1700,18 +1675,19 @@ pub(crate) fn field_matches_value(
     field: &NewField,
     value: &Value,
     table: &StringTable,
-    enum_map: &HashMap<&str, &EnumDefinition>,
+    ruleset: &RuleSet,
 ) -> bool {
     // Item 2: VALUE-VALIDATOR BYPASSES (F# FieldValidators.fs:82-83, 836-839).
     // Before any type-specific checks, accept scripted variables (@...), localisation
     // references ($$), and inline math ([...]).  These are valid CW script idioms that
     // can legitimately appear in place of any typed value.
     match value {
-        Value::String(t) | Value::QString(t) => {
-            let text = match_text(table, t);
-            if text.starts_with('@') || text.contains("$$") || text.starts_with('[') {
-                return true;
-            }
+        Value::String(t) | Value::QString(t)
+            if with_match_text(table, t, |text| {
+                text.starts_with('@') || text.contains("$$") || text.starts_with('[')
+            }) =>
+        {
+            return true;
         }
         _ => {}
     }
@@ -1721,8 +1697,9 @@ pub(crate) fn field_matches_value(
         (NewField::ValueField(ValueType::Bool), Value::Bool(_)) => true,
         (NewField::ValueField(ValueType::Bool), Value::String(t))
         | (NewField::ValueField(ValueType::Bool), Value::QString(t)) => {
-            let v = match_text(table, t).to_lowercase();
-            v == "yes" || v == "no"
+            with_match_text(table, t, |text| {
+                text.eq_ignore_ascii_case("yes") || text.eq_ignore_ascii_case("no")
+            })
         }
 
         // --- Int with range enforcement (item 4) ---
@@ -1732,12 +1709,13 @@ pub(crate) fn field_matches_value(
         }
         (NewField::ValueField(ValueType::Int { min, max }), Value::String(t))
         | (NewField::ValueField(ValueType::Int { min, max }), Value::QString(t)) => {
-            let text = match_text(table, t);
-            if let Ok(v) = text.parse::<i64>() {
-                v >= i64::from(*min) && v <= i64::from(*max)
-            } else {
-                false
-            }
+            with_match_text(table, t, |text| {
+                if let Ok(v) = text.parse::<i64>() {
+                    v >= i64::from(*min) && v <= i64::from(*max)
+                } else {
+                    false
+                }
+            })
         }
 
         // --- Float with range enforcement (item 4) ---
@@ -1750,12 +1728,13 @@ pub(crate) fn field_matches_value(
         }
         (NewField::ValueField(ValueType::Float { min, max }), Value::String(t))
         | (NewField::ValueField(ValueType::Float { min, max }), Value::QString(t)) => {
-            let text = match_text(table, t);
-            if let Ok(v) = text.parse::<f64>() {
-                v >= *min && v <= *max
-            } else {
-                false
-            }
+            with_match_text(table, t, |text| {
+                if let Ok(v) = text.parse::<f64>() {
+                    v >= *min && v <= *max
+                } else {
+                    false
+                }
+            })
         }
 
         // --- Enum ---
@@ -1765,46 +1744,48 @@ pub(crate) fn field_matches_value(
         // (e.g. province ids) are compared by their string form.
         (NewField::ValueField(ValueType::Enum(enum_name)), Value::String(t))
         | (NewField::ValueField(ValueType::Enum(enum_name)), Value::QString(t)) => {
-            let text = match_text(table, t);
-            enum_contains(enum_map, enum_name, &text)
+            with_match_text(table, t, |text| enum_contains(ruleset, enum_name, text))
         }
         (NewField::ValueField(ValueType::Enum(enum_name)), Value::Int(i)) => {
-            enum_contains(enum_map, enum_name, &i.to_string())
+            enum_contains(ruleset, enum_name, &i.to_string())
         }
         (NewField::ValueField(ValueType::Enum(enum_name)), Value::Float(f)) => {
-            enum_contains(enum_map, enum_name, &f.to_string())
+            enum_contains(ruleset, enum_name, &f.to_string())
         }
 
         // --- Percent (item 3): value ends with '%' or is a number ---
         (NewField::ValueField(ValueType::Percent), Value::String(t))
         | (NewField::ValueField(ValueType::Percent), Value::QString(t)) => {
-            let text = match_text(table, t);
-            text.ends_with('%') || text.parse::<f64>().is_ok()
+            with_match_text(table, t, |text| {
+                text.ends_with('%') || text.parse::<f64>().is_ok()
+            })
         }
         (NewField::ValueField(ValueType::Percent), Value::Float(_) | Value::Int(_)) => true,
 
         // --- Date / DateTime (item 3): basic YYYY.MM.DD[.HH] shape ---
         (NewField::ValueField(ValueType::Date), Value::String(t))
         | (NewField::ValueField(ValueType::Date), Value::QString(t)) => {
-            is_date_shape(&match_text(table, t))
+            with_match_text(table, t, is_date_shape)
         }
         (NewField::ValueField(ValueType::DateTime), Value::String(t))
         | (NewField::ValueField(ValueType::DateTime), Value::QString(t)) => {
-            is_datetime_shape(&match_text(table, t))
+            with_match_text(table, t, is_datetime_shape)
         }
 
         // --- Ck2Dna (item 3): exactly 32 hex chars (F# FieldValidators.fs:194-204) ---
         (NewField::ValueField(ValueType::Ck2Dna), Value::String(t))
         | (NewField::ValueField(ValueType::Ck2Dna), Value::QString(t)) => {
-            let text = match_text(table, t);
-            text.len() == 32 && text.chars().all(|c| c.is_ascii_hexdigit())
+            with_match_text(table, t, |text| {
+                text.len() == 32 && text.chars().all(|c| c.is_ascii_hexdigit())
+            })
         }
 
         // --- Ck2DnaProperty (item 3): length 8 or 32, hex chars (F# FieldValidators.fs:205-211) ---
         (NewField::ValueField(ValueType::Ck2DnaProperty), Value::String(t))
         | (NewField::ValueField(ValueType::Ck2DnaProperty), Value::QString(t)) => {
-            let text = match_text(table, t);
-            (text.len() == 8 || text.len() == 32) && text.chars().all(|c| c.is_ascii_hexdigit())
+            with_match_text(table, t, |text| {
+                (text.len() == 8 || text.len() == 32) && text.chars().all(|c| c.is_ascii_hexdigit())
+            })
         }
 
         // --- IrFamilyName / StlNameFormat (item 3): accept any string ---
@@ -1871,13 +1852,14 @@ pub(crate) fn field_matches_value(
         (NewField::VariableField { .. }, Value::Bool(_)) => true,
         (NewField::VariableField { min, max, .. }, Value::String(t))
         | (NewField::VariableField { min, max, .. }, Value::QString(t)) => {
-            let text = match_text(table, t);
-            if let Ok(v) = text.parse::<f64>() {
-                v >= *min && v <= *max
-            } else {
-                // non-numeric string: accept (could be a scripted variable not caught by bypass)
-                true
-            }
+            with_match_text(table, t, |text| {
+                if let Ok(v) = text.parse::<f64>() {
+                    v >= *min && v <= *max
+                } else {
+                    // non-numeric string: accept (could be a scripted variable not caught by bypass)
+                    true
+                }
+            })
         }
 
         // --- LocalisationField / FilepathField ---

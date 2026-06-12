@@ -5,7 +5,7 @@ use cwtools_localization::LocIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub mod error_codes;
 pub mod per_game;
@@ -26,7 +26,7 @@ use common::{leaf_value_to_string, path_contains_segment};
 use ctx::ValidationCtx;
 use resolve::{
     find_grandchild_type, find_rules_by_name, find_type_and_rules_for_file, find_type_by_path,
-    find_type_by_path_and_key, should_skip_root_key, skip_root_key_tail,
+    find_type_from_candidates, path_candidates_for_file, should_skip_root_key, skip_root_key_tail,
 };
 use rule_core::validate_with_type;
 use scope::build_scope_registry;
@@ -196,11 +196,11 @@ pub fn validate_ast_with_loc(
     modifier_keys: Option<&HashSet<String>>,
     loc_index: Option<&LocIndex>,
 ) -> Vec<ValidationError> {
-    // Single-file/test entry point: build the per-run shared state (enum_map +
-    // scope registry) here and delegate. Hot multi-file callers should instead
+    // Single-file/test entry point: build the per-run shared state (scope
+    // registry) here and delegate. Hot multi-file callers should instead
     // build a `Prepared` ONCE outside their loop and call `validate_prepared`.
-    let enum_map = build_enum_map(ruleset);
     let registry = build_scope_registry_arc(ruleset, game);
+    let (scope_checks, var_checks) = checks_from_env();
     validate_prepared(
         ast,
         file_path,
@@ -212,17 +212,16 @@ pub fn validate_ast_with_loc(
             modifier_keys,
             loc_index,
             registry: registry.as_ref(),
-            enum_map: &enum_map,
+            scope_checks,
+            var_checks,
         },
     )
 }
 
-/// Build the `enum name -> definition` lookup used throughout validation. It
-/// borrows from `ruleset`, so the caller must keep `ruleset` alive for the
-/// returned map's lifetime. Cheap to call but pointless to repeat per file, so
-/// hot multi-file loops build it once and reuse it.
-pub fn build_enum_map(ruleset: &RuleSet) -> HashMap<&str, &EnumDefinition> {
-    ruleset.enums.iter().map(|e| (e.key.as_str(), e)).collect()
+/// Look up an enum definition by name directly from the ruleset.
+pub fn enum_def<'a>(ruleset: &'a RuleSet, name: &str) -> Option<&'a EnumDefinition> {
+    let idx = *ruleset.enum_by_name.get(name)?;
+    ruleset.enums.get(idx)
 }
 
 /// Build the config-driven scope/link registry once, wrapped in an `Arc` so it
@@ -233,6 +232,18 @@ pub fn build_scope_registry_arc(
     game: Option<Game>,
 ) -> Option<std::sync::Arc<ScopeRegistry>> {
     game.map(|g| std::sync::Arc::new(build_scope_registry(ruleset, g)))
+}
+
+/// Whether the trigger/effect/target scope checks (CW104/105/106/243/244/245/248)
+/// are on. ON by default; set `CWTOOLS_NO_SCOPE_CHECKS=1` as an escape hatch.
+/// Whether the "variable has not been set" check (CW246) is on. OFF by default;
+/// opt in with `CWTOOLS_VAR_CHECKS=1` once the variable index is proven complete.
+/// Read once at context-construction time.
+pub fn checks_from_env() -> (bool, bool) {
+    (
+        std::env::var("CWTOOLS_NO_SCOPE_CHECKS").is_err(),
+        std::env::var("CWTOOLS_VAR_CHECKS").is_ok(),
+    )
 }
 
 /// The per-run shared validation state, built once and reused across every file
@@ -248,7 +259,8 @@ pub struct Prepared<'a> {
     pub modifier_keys: Option<&'a HashSet<String>>,
     pub loc_index: Option<&'a LocIndex>,
     pub registry: Option<&'a std::sync::Arc<ScopeRegistry>>,
-    pub enum_map: &'a HashMap<&'a str, &'a EnumDefinition>,
+    pub scope_checks: bool,
+    pub var_checks: bool,
 }
 
 /// Build the per-file starting scope context — shared by `validate_prepared`
@@ -303,7 +315,8 @@ pub fn validate_prepared(
         modifier_keys,
         loc_index,
         registry,
-        enum_map,
+        scope_checks,
+        var_checks,
     } = *prepared;
     let mut errors = Vec::new();
 
@@ -313,15 +326,21 @@ pub fn validate_prepared(
         ast,
         ruleset,
         table,
-        enum_map,
         file_path,
         game,
         type_index,
         modifier_keys,
         loc_index,
+        scope_checks,
+        var_checks,
     };
 
-    // Pre-compute path-based type match (most specific wins)
+    // Pre-compute path-based type match (most specific wins).
+    // Lowercase once and filter path-matching type candidates once per file so
+    // the per-child loop only runs key-dependent scoring over the small candidate
+    // set rather than scanning all types N_children times.
+    let file_path_lower = file_path.to_lowercase();
+    let path_candidates = path_candidates_for_file(&file_path_lower, ruleset);
     let path_type = find_type_by_path(file_path, ruleset);
 
     // type_per_file: the WHOLE file is a single instance of this type (e.g. an
@@ -430,7 +449,7 @@ pub fn validate_prepared(
             _ => String::new(),
         };
         let path_type_for_child =
-            find_type_by_path_and_key(file_path, Some(&child_root_key), ruleset);
+            find_type_from_candidates(&path_candidates, Some(&child_root_key));
         if let Some(type_def) = path_type_for_child {
             let inner_rules = find_rules_by_name(&type_def.name, ruleset);
 

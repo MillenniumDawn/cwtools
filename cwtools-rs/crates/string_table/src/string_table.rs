@@ -37,11 +37,16 @@ pub struct StringMetadata {
 
 struct Inner {
     /// Lower‑cased key → the canonical lower token (`lower == normal`).
-    lower_map: HashMap<String, StringTokens>,
+    /// `Arc<str>` key shares the allocation with `id_to_string[lower_id]`.
+    lower_map: HashMap<Arc<str>, StringTokens>,
     /// Exact (case‑preserving) key → the normal token that points to a lower ID.
-    exact_map: HashMap<String, StringTokens>,
+    /// `Arc<str>` key shares the allocation with `id_to_string[normal_id]`.
+    exact_map: HashMap<Arc<str>, StringTokens>,
     /// Dense array: ID → original or lower‑cased text.
-    id_to_string: Vec<String>,
+    /// Each entry is the same `Arc<str>` cloned into the corresponding map key,
+    /// so each string is stored once on the heap regardless of how many maps
+    /// reference it.
+    id_to_string: Vec<Arc<str>>,
     /// Dense array: ID → metadata (both normal and lower slots share the same metadata).
     id_to_metadata: Vec<StringMetadata>,
     /// Next free ID.  IDs are handed out consecutively starting at 1 (0 is the empty string).
@@ -86,7 +91,7 @@ impl StringTable {
         let mut id_to_metadata = Vec::with_capacity(1024);
         // Slot 0 = empty string (never returned by intern, but keeps the
         // array 1-based so that `StringId(0)` is safe to index).
-        id_to_string.push(String::new());
+        id_to_string.push(Arc::from(""));
         id_to_metadata.push(StringMetadata::default());
 
         Self {
@@ -143,10 +148,11 @@ impl StringTable {
         }
 
         // Fast path 2: lower key exists → allocate new normal variant.
-        if let Some(&existing_lower) = inner.lower_map.get(&lower_key) {
+        if let Some(&existing_lower) = inner.lower_map.get(lower_key.as_str()) {
             let normal_id = inner.next_id;
             inner.next_id += 1;
-            inner.id_to_string.push(s.to_string());
+            let normal_arc: Arc<str> = Arc::from(s);
+            inner.id_to_string.push(Arc::clone(&normal_arc));
             let meta = inner.id_to_metadata[existing_lower.lower.0 as usize];
             inner.id_to_metadata.push(meta);
             let token = StringTokens {
@@ -154,7 +160,7 @@ impl StringTable {
                 normal: StringId(normal_id),
                 quoted,
             };
-            inner.exact_map.insert(s.to_string(), token);
+            inner.exact_map.insert(normal_arc, token);
             return token;
         }
 
@@ -165,9 +171,14 @@ impl StringTable {
 
         let metadata = compute_metadata(&lower_key);
 
+        // Allocate each string once; share the same Arc between id_to_string and
+        // the corresponding map key so there is only one heap allocation per string.
+        let normal_arc: Arc<str> = Arc::from(s);
+        let lower_arc: Arc<str> = Arc::from(lower_key.as_str());
+
         inner.id_to_string.reserve_exact(2);
-        inner.id_to_string.push(s.to_string()); // normal_id
-        inner.id_to_string.push(lower_key.clone()); // lower_id
+        inner.id_to_string.push(Arc::clone(&normal_arc)); // normal_id
+        inner.id_to_string.push(Arc::clone(&lower_arc)); // lower_id
         inner.id_to_metadata.push(metadata); // normal_id
         inner.id_to_metadata.push(metadata); // lower_id
 
@@ -182,15 +193,18 @@ impl StringTable {
             quoted,
         };
 
-        inner.lower_map.insert(lower_key, lower_token);
-        inner.exact_map.insert(s.to_string(), normal_token);
+        inner.lower_map.insert(lower_arc, lower_token);
+        inner.exact_map.insert(normal_arc, normal_token);
         normal_token
     }
 
     /// Retrieve the original (case‑preserving) text for a `StringId`.
     pub fn get_string(&self, id: StringId) -> Option<String> {
         let inner = self.inner.read();
-        inner.id_to_string.get(id.0 as usize).cloned()
+        inner
+            .id_to_string
+            .get(id.0 as usize)
+            .map(|s| s.as_ref().to_string())
     }
 
     /// Borrow the original (case-preserving) text for a `StringId` without
@@ -202,7 +216,7 @@ impl StringTable {
     /// `eq_ignore_ascii_case`): it avoids a per-call `String` allocation.
     pub fn with_string<R>(&self, id: StringId, f: impl FnOnce(&str) -> R) -> Option<R> {
         let inner = self.inner.read();
-        inner.id_to_string.get(id.0 as usize).map(|s| f(s.as_str()))
+        inner.id_to_string.get(id.0 as usize).map(|s| f(s.as_ref()))
     }
 
     /// Retrieve the metadata for a `StringId`.

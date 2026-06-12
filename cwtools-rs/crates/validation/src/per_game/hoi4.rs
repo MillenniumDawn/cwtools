@@ -31,7 +31,10 @@ fn sole_always_value(children: &[Child], ast: &ParsedFile, table: &StringTable) 
             Child::Comment(_) => {}
             Child::Leaf(idx) => {
                 let l = &ast.arena.leaves[*idx as usize];
-                if table.get_string(l.key.normal).unwrap_or_default() != "always" {
+                if !table
+                    .with_string(l.key.normal, |k| k == "always")
+                    .unwrap_or(false)
+                {
                     return None;
                 }
                 match l.value {

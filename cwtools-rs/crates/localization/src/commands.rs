@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 /// Supported languages across all games.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -237,15 +238,17 @@ pub struct LocEntry {
 /// Position in a source file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Position {
-    pub stream_name: String,
+    /// Shared file path. One `Arc` allocation per file; every entry in the
+    /// file holds a cheap clone of the same pointer.
+    pub stream_name: Arc<str>,
     pub line: usize,
     pub column: usize,
 }
 
 impl Position {
-    pub fn new(stream_name: impl Into<String>, line: usize, column: usize) -> Self {
+    pub fn new(stream_name: Arc<str>, line: usize, column: usize) -> Self {
         Self {
-            stream_name: stream_name.into(),
+            stream_name,
             line,
             column,
         }

@@ -93,12 +93,13 @@ pub fn rules_at_pos(
         ast,
         ruleset,
         table,
-        enum_map: prepared.enum_map,
         file_path,
         game: prepared.game,
         type_index: prepared.type_index,
         modifier_keys: prepared.modifier_keys,
         loc_index: prepared.loc_index,
+        scope_checks: prepared.scope_checks,
+        var_checks: prepared.var_checks,
     };
 
     // type_per_file: the whole file is one instance; root children are its body.
@@ -185,7 +186,8 @@ pub fn rules_at_pos(
     }
 
     // 2. Path-based fallback — mirrors validate_prepared.
-    let td = find_type_by_path_and_key(file_path, Some(&root_key), ruleset)?;
+    let file_path_lower = file_path.to_lowercase();
+    let td = find_type_by_path_and_key(&file_path_lower, Some(&root_key), ruleset)?;
     let inner_rules = find_rules_by_name(&td.name, ruleset);
     let has_content = !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
     if !has_content {

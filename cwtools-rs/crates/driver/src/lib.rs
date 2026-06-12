@@ -2,11 +2,11 @@
 //!
 //! The full pipeline is: load rules -> discover/parse files -> build the
 //! `TypeIndex` (+ var index + vanilla index) -> expand modifier keys -> build the
-//! loc index -> build the prebuilt `enum_map` + `ScopeRegistry` -> validate. The
-//! reusable primitives for this live in the shared crates ([`index_game_dir`],
-//! `cwtools_validation::{build_scope_registry_arc, build_enum_map, Prepared,
-//! validate_prepared}`); both the CLI and the LSP call those directly so the
-//! sequence isn't reimplemented and can't drift the way it did before.
+//! loc index -> build the `ScopeRegistry` -> validate. The reusable primitives
+//! for this live in the shared crates ([`index_game_dir`],
+//! `cwtools_validation::{build_scope_registry_arc, Prepared, validate_prepared}`);
+//! both the CLI and the LSP call those directly so the sequence isn't
+//! reimplemented and can't drift the way it did before.
 //!
 //! [`Session`] bundles those primitives into the CLI's batch model: load
 //! everything from disk once into immutable-after-load state, then validate the
@@ -37,12 +37,12 @@ use cwtools_localization::{Lang, LocDiagnostic, LocIndex, LocService};
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
-use cwtools_rules::rules_types::{EnumDefinition, RuleSet};
+use cwtools_rules::rules_types::RuleSet;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{
-    ErrorSeverity, Prepared, ValidationError, build_enum_map, build_modifier_keys,
-    build_scope_registry_arc, validate_prepared,
+    ErrorSeverity, Prepared, ValidationError, build_modifier_keys, build_scope_registry_arc,
+    checks_from_env, validate_prepared,
 };
 
 /// A parsed workspace/mod file: its on-disk path, mod-relative logical path, and AST.
@@ -135,7 +135,10 @@ impl Session {
 
         // Rules share their StringTable with the game files so interned ids match.
         let rules_table = StringTable::new();
-        let ruleset = load_rules(&rules, &rules_table, on_rules_warning);
+        let ruleset = load_rules(&rules, &rules_table, on_rules_warning).unwrap_or_else(|e| {
+            eprintln!("error: {}", e);
+            RuleSet::new()
+        });
 
         // Discover + parse mod files using the SAME string table. Layer the
         // user-supplied ignore globs on top of the engine defaults.
@@ -175,21 +178,32 @@ impl Session {
             })
             .collect();
 
-        // Cross-file TypeIndex from the already-parsed arenas. Sequential and
-        // streaming: merge each file's instances then drop them.
-        let mut type_index = TypeIndex::new();
-        for src in &parsed {
-            let instances =
-                collect_type_instances(&ruleset, &src.parsed, &src.logical_path, &rules_table);
-            type_index.merge(src.path.to_str().unwrap_or(""), instances);
-        }
-
-        // Project-wide variable index for `variable_field` checks (CW246).
+        // Cross-file TypeIndex from the already-parsed arenas. Per-file
+        // collection runs in parallel (each call is pure &-borrows); merge is
+        // sequential in the original file order so TypeIndex.merge call order
+        // is identical to the sequential version (goto-def "first match" and
+        // duplicate-name refcounts are order-sensitive).
+        use rayon::prelude::*;
+        type PerFileResult = (
+            HashMap<String, Vec<cwtools_index::TypeInstance>>,
+            Vec<String>,
+        );
         let var_effects = variable_defining_effects(&ruleset);
-        for src in &parsed {
-            let mut names: Vec<String> = Vec::new();
-            collect_set_variable_names(&src.parsed, &rules_table, &var_effects, &mut names);
-            for n in &names {
+        let per_file: Vec<PerFileResult> = parsed
+            .par_iter()
+            .map(|src| {
+                let instances =
+                    collect_type_instances(&ruleset, &src.parsed, &src.logical_path, &rules_table);
+                let mut var_names: Vec<String> = Vec::new();
+                collect_set_variable_names(&src.parsed, &rules_table, &var_effects, &mut var_names);
+                (instances, var_names)
+            })
+            .collect();
+
+        let mut type_index = TypeIndex::new();
+        for (src, (instances, var_names)) in parsed.iter().zip(per_file) {
+            type_index.merge(src.path.to_str().unwrap_or(""), instances);
+            for n in &var_names {
                 type_index.var_index.add_name(n);
             }
         }
@@ -305,9 +319,8 @@ impl Session {
     }
 
     /// Bundle this session's prebuilt state into a [`Prepared`] for validation.
-    /// `enum_map` is passed in (not stored) because it borrows `self.ruleset`;
-    /// callers build it once and reuse it across a batch.
-    fn prepared<'a>(&'a self, enum_map: &'a HashMap<&'a str, &'a EnumDefinition>) -> Prepared<'a> {
+    fn prepared(&self) -> Prepared<'_> {
+        let (scope_checks, var_checks) = checks_from_env();
         Prepared {
             ruleset: &self.ruleset,
             table: &self.rules_table,
@@ -316,15 +329,15 @@ impl Session {
             modifier_keys: Some(&self.modifier_keys),
             loc_index: Some(&self.loc_index),
             registry: self.registry.as_ref(),
-            enum_map,
+            scope_checks,
+            var_checks,
         }
     }
 
-    /// Validate one already-parsed file against this session's prebuilt indexes,
-    /// registry, and enum map. The single-file (incremental) entry point.
+    /// Validate one already-parsed file against this session's prebuilt indexes
+    /// and registry. The single-file (incremental) entry point.
     pub fn validate_file(&self, file_path: &str, parsed: &ParsedFile) -> Vec<ValidationError> {
-        let enum_map = build_enum_map(&self.ruleset);
-        validate_prepared(parsed, file_path, &self.prepared(&enum_map))
+        validate_prepared(parsed, file_path, &self.prepared())
     }
 
     /// Loc-project diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace,
@@ -387,12 +400,6 @@ impl Session {
         &self.loc_index
     }
 
-    /// Build the prebuilt enum map (borrows the session's ruleset). Callers that
-    /// validate many files should build it once and reuse it.
-    pub fn enum_map(&self) -> HashMap<&str, &EnumDefinition> {
-        build_enum_map(&self.ruleset)
-    }
-
     /// The prebuilt scope registry, if a game is set.
     pub fn registry(&self) -> Option<&Arc<ScopeRegistry>> {
         self.registry.as_ref()
@@ -420,12 +427,11 @@ impl std::ops::Deref for SessionWithFiles {
 impl SessionWithFiles {
     /// Validate every parsed mod file in parallel, in input order. Returns one
     /// entry per file as `(path, diagnostics)`. The per-run shared state (scope
-    /// registry + enum map) is built ONCE and reused across the batch.
+    /// registry) is built ONCE and reused across the batch.
     pub fn validate_all(&self) -> Vec<(PathBuf, Vec<ValidationError>)> {
         use rayon::prelude::*;
 
-        let enum_map = self.session.enum_map();
-        let prepared = self.session.prepared(&enum_map);
+        let prepared = self.session.prepared();
         self.parsed
             .par_iter()
             .map(|src| {
@@ -618,12 +624,13 @@ pub fn search_config_for(directory: &Path) -> FileManagerConfig {
 }
 
 /// Load a `RuleSet` from a `.cwt` file or a directory of `.cwt` files. Directory
-/// load warnings are sent to `on_warning` if provided.
-fn load_rules(
+/// load warnings are sent to `on_warning` if provided; a rules *file* that can't
+/// be read or parsed is an `Err` (the caller decides whether that's fatal).
+pub fn load_rules(
     rules: &RulesInput,
     table: &StringTable,
     on_warning: Option<&mut dyn FnMut(String)>,
-) -> RuleSet {
+) -> Result<RuleSet, String> {
     match rules {
         RulesInput::Dir(dir) => {
             let (ruleset, errors) = load_ruleset_from_dir(dir, table);
@@ -632,23 +639,14 @@ fn load_rules(
                     sink(err.clone());
                 }
             }
-            ruleset
+            Ok(ruleset)
         }
         RulesInput::File(file) => {
-            let rules_str = match std::fs::read_to_string(file) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("error: could not read rules {}: {}", file.display(), e);
-                    return RuleSet::new();
-                }
-            };
-            match parse_string(&rules_str, table) {
-                Ok(parsed) => ast_to_ruleset(&parsed, table),
-                Err(e) => {
-                    eprintln!("error: could not parse rules {}: {}", file.display(), e);
-                    RuleSet::new()
-                }
-            }
+            let rules_str = std::fs::read_to_string(file)
+                .map_err(|e| format!("could not read rules {}: {}", file.display(), e))?;
+            parse_string(&rules_str, table)
+                .map(|parsed| ast_to_ruleset(&parsed, table))
+                .map_err(|e| format!("could not parse rules {}: {}", file.display(), e))
         }
     }
 }

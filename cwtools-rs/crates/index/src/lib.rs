@@ -4,6 +4,7 @@ use cwtools_rules::rules_types::{
 };
 use cwtools_string_table::string_table::StringTable;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub mod dynamic_values;
 pub mod vanilla_cache;
@@ -194,7 +195,7 @@ impl VarIndex {
 #[derive(Debug, Default)]
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
-    pub map: HashMap<String, Vec<(String, TypeInstance)>>,
+    pub map: HashMap<String, Vec<(Arc<str>, TypeInstance)>>,
     /// lowercased instance name → how many definitions carry that name (across all
     /// types and files). Lets `is_any_instance` be O(1) instead of scanning every
     /// instance. A refcount so `remove_file` can drop a name only when its last
@@ -250,7 +251,7 @@ impl TypeIndex {
     }
 
     /// All instances for a type (across all files).
-    pub fn instances(&self, type_name: &str) -> &[(String, TypeInstance)] {
+    pub fn instances(&self, type_name: &str) -> &[(Arc<str>, TypeInstance)] {
         self.map.get(type_name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
@@ -261,7 +262,7 @@ impl TypeIndex {
         let mut out = Vec::new();
         for (type_name, entries) in &self.map {
             for (uri, inst) in entries {
-                if uri == file_uri {
+                if uri.as_ref() == file_uri {
                     out.push((type_name.as_str(), inst));
                 }
             }
@@ -271,6 +272,7 @@ impl TypeIndex {
 
     /// Merge per-file results into the index.
     pub fn merge(&mut self, file_uri: &str, per_type: HashMap<String, Vec<TypeInstance>>) {
+        let uri: Arc<str> = Arc::from(file_uri);
         for (type_name, instances) in per_type {
             let set = self.instance_sets.entry(type_name.clone()).or_default();
             let entry = self.map.entry(type_name).or_default();
@@ -278,7 +280,7 @@ impl TypeIndex {
                 let lower = inst.name.to_ascii_lowercase();
                 *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
                 *set.entry(lower).or_insert(0) += 1;
-                entry.push((file_uri.to_string(), inst));
+                entry.push((Arc::clone(&uri), inst));
             }
         }
     }
@@ -289,7 +291,7 @@ impl TypeIndex {
         self.value_set_values.remove_file(file_uri);
         for (type_name, v) in self.map.iter_mut() {
             v.retain(|(uri, inst)| {
-                let keep = uri != file_uri;
+                let keep = uri.as_ref() != file_uri;
                 if !keep {
                     let lower = inst.name.to_ascii_lowercase();
                     if let Some(count) = self.name_counts.get_mut(&lower) {
@@ -501,8 +503,10 @@ fn instance_name_from_children(
             for child in children {
                 if let Child::Leaf(li) = child {
                     let leaf = &arena.leaves[*li as usize];
-                    let k = table.get_string(leaf.key.normal).unwrap_or_default();
-                    if k.eq_ignore_ascii_case(field_name) {
+                    let matches = table
+                        .with_string(leaf.key.normal, |k| k.eq_ignore_ascii_case(field_name))
+                        .unwrap_or(false);
+                    if matches {
                         let v = leaf_value_string(&leaf.value, table);
                         let v = unquote(&v);
                         if !v.is_empty() {
@@ -529,17 +533,16 @@ fn collect_skip_root_child(
     let Some(kc) = arena.keyed_clause(child) else {
         return; // not a keyed clause — skip
     };
-    let key = table.get_string(kc.key.normal).unwrap_or_default();
     let (clause_children, start_line, start_col) =
         (kc.children, kc.pos.start.line, kc.pos.start.col);
 
-    match skip_stack {
+    table.with_string(kc.key.normal, |key| match skip_stack {
         [] => {
             // We are at the instance node.
-            if type_key_filter_matches(td, &key)
-                && starts_with_matches(td, &key)
+            if type_key_filter_matches(td, key)
+                && starts_with_matches(td, key)
                 && let Some(name) =
-                    instance_name_from_children(td, &key, clause_children, arena, table)
+                    instance_name_from_children(td, key, clause_children, arena, table)
             {
                 out.push(TypeInstance {
                     name,
@@ -552,13 +555,13 @@ fn collect_skip_root_child(
         }
         [head, tail @ ..] => {
             // Must match the skip-root layer; then descend into children.
-            if skip_root_key_matches(head, &key) {
+            if skip_root_key_matches(head, key) {
                 for inner_child in clause_children {
                     collect_skip_root_child(td, tail, inner_child, arena, table, out);
                 }
             }
         }
-    }
+    });
 }
 
 /// Hash one exported symbol's identity, with separators so distinct parts can't
@@ -763,8 +766,12 @@ fn sibling_value_in_children(
     for child in children {
         if let Child::Leaf(li) = child {
             let leaf = &arena.leaves[*li as usize];
-            let k = table.get_string(leaf.key.normal).unwrap_or_default();
-            if matches!(k.to_ascii_lowercase().as_str(), "value" | "amount" | "add") {
+            let is_value_key = table
+                .with_string(leaf.key.normal, |k| {
+                    matches!(k.to_ascii_lowercase().as_str(), "value" | "amount" | "add")
+                })
+                .unwrap_or(false);
+            if is_value_key {
                 let v = leaf_value_string(&leaf.value, table);
                 if !v.is_empty() {
                     return Some(v);
@@ -991,8 +998,12 @@ pub fn collect_set_variable_defs(
         for child in children {
             if let Child::Leaf(li) = child {
                 let leaf = &arena.leaves[*li as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                if key.eq_ignore_ascii_case("var") || key.eq_ignore_ascii_case("variable") {
+                let is_var_key = table
+                    .with_string(leaf.key.normal, |k| {
+                        k.eq_ignore_ascii_case("var") || k.eq_ignore_ascii_case("variable")
+                    })
+                    .unwrap_or(false);
+                if is_var_key {
                     let v = leaf_value_string(&leaf.value, table);
                     if !v.is_empty() {
                         out.push(def(
@@ -1046,8 +1057,12 @@ pub fn collect_set_variable_defs(
             if let Child::Leaf(li) = child {
                 let leaf = &arena.leaves[*li as usize];
                 if let Value::Clause(ch) = &leaf.value {
-                    let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                    if effects.contains(&key.to_ascii_lowercase()) {
+                    let in_effects = table
+                        .with_string(leaf.key.normal, |k| {
+                            effects.contains(k.to_ascii_lowercase().as_str())
+                        })
+                        .unwrap_or(false);
+                    if in_effects {
                         extract(ch, arena, table, out);
                     }
                     walk(ch, arena, table, effects, out);
@@ -1073,32 +1088,59 @@ pub fn index_discovered_files(
     table: &StringTable,
     var_effects: Option<&HashSet<String>>,
 ) -> TypeIndex {
+    use rayon::prelude::*;
+
     let var_effects = var_effects.filter(|e| !e.is_empty());
-    let mut index = TypeIndex::new();
-    for file in files {
-        let path = file.path.to_str().unwrap_or("").to_string();
-        let pf = ParsedFile {
-            arena: file.arena,
-            root_children: file.root_children,
-            errors: vec![],
-        };
-        let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
-        index.merge(&path, instances);
-        if let Some(effects) = var_effects {
-            let mut names: Vec<String> = Vec::new();
-            collect_set_variable_names(&pf, table, effects, &mut names);
-            for n in &names {
-                index.var_index.add_name(n);
+
+    // Collect into a Vec so rayon can split it across threads. The Vec is then
+    // consumed by into_par_iter() so we don't need Clone on the AST types.
+    let files: Vec<cwtools_file_manager::file_manager::ParsedFile> = files.into_iter().collect();
+
+    // Parallel collection: all collector functions take only &-borrows of the
+    // shared ruleset/table, so each file's work is independent. into_par_iter()
+    // on a Vec preserves input order in the output Vec after collect().
+    type PerFileData = (
+        String,                             // path
+        HashMap<String, Vec<TypeInstance>>, // type instances
+        Vec<String>,                        // variable names
+        HashMap<String, Vec<String>>,       // complex enum values
+        HashMap<String, Vec<String>>,       // value set members
+    );
+    let per_file: Vec<PerFileData> = files
+        .into_par_iter()
+        .map(|file| {
+            let path = file.path.to_str().unwrap_or("").to_string();
+            let pf = ParsedFile {
+                arena: file.arena,
+                root_children: file.root_children,
+                errors: vec![],
+            };
+            let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
+            let mut var_names: Vec<String> = Vec::new();
+            if let Some(effects) = var_effects {
+                collect_set_variable_names(&pf, table, effects, &mut var_names);
             }
+            let complex = dynamic_values::collect_complex_enum_values(
+                ruleset,
+                &pf,
+                &file.logical_path,
+                table,
+            );
+            let value_sets = dynamic_values::collect_value_set_members(ruleset, &pf, table);
+            (path, instances, var_names, complex, value_sets)
+        })
+        .collect();
+
+    // Sequential merge in original file order — preserves TypeIndex.merge call
+    // order so goto-def "first match" and refcount semantics are unchanged.
+    let mut index = TypeIndex::new();
+    for (path, instances, var_names, complex, value_sets) in per_file {
+        index.merge(&path, instances);
+        for n in &var_names {
+            index.var_index.add_name(n);
         }
-        index.complex_enum_values.merge_file(
-            &path,
-            dynamic_values::collect_complex_enum_values(ruleset, &pf, &file.logical_path, table),
-        );
-        index.value_set_values.merge_file(
-            &path,
-            dynamic_values::collect_value_set_members(ruleset, &pf, table),
-        );
+        index.complex_enum_values.merge_file(&path, complex);
+        index.value_set_values.merge_file(&path, value_sets);
     }
     index
 }

@@ -3,7 +3,7 @@
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::common::{child_key_matches, match_text};
 use crate::rule_core::field_matches_value;
@@ -24,7 +24,7 @@ pub(crate) fn subtype_rules_match(
     children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
-    enum_map: &HashMap<&str, &EnumDefinition>,
+    ruleset: &RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     // A subtype with discriminators must be *positively activated* by the entity:
@@ -47,7 +47,8 @@ pub(crate) fn subtype_rules_match(
         leaf_rights: Vec<(&'a NewField, &'a Options)>,
         node_inners: Vec<(&'a [(RuleType, Options)], &'a Options)>,
     }
-    let mut groups: HashMap<&str, KeyGroup> = HashMap::new();
+    let mut groups: FxHashMap<&str, KeyGroup> =
+        FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
     for (rt, opts) in rules {
         match rt {
             RuleType::LeafRule {
@@ -113,7 +114,7 @@ pub(crate) fn subtype_rules_match(
             count += 1;
             if let Some(v) = leaf_value {
                 for (right, _) in &group.leaf_rights {
-                    if field_matches_value(right, v, table, enum_map) {
+                    if field_matches_value(right, v, table, ruleset) {
                         any_match = true;
                         // A present field activates the subtype. A bare `<type>` ref
                         // doesn't activate on shape alone (the key is common), but it
@@ -132,7 +133,7 @@ pub(crate) fn subtype_rules_match(
             }
             if let Some(ic) = clause
                 && group.node_inners.iter().any(|(inner, _)| {
-                    subtype_rules_match(inner, ic, ast, table, enum_map, type_index)
+                    subtype_rules_match(inner, ic, ast, table, ruleset, type_index)
                 })
             {
                 any_match = true;
@@ -203,7 +204,7 @@ pub(crate) fn subtype_matches(
     children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
-    enum_map: &HashMap<&str, &EnumDefinition>,
+    ruleset: &RuleSet,
     node_key: Option<&str>,
     type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
@@ -222,7 +223,7 @@ pub(crate) fn subtype_matches(
             .iter()
             .any(|c| child_key_matches(c, ast, table, fk));
     }
-    subtype_rules_match(&subtype.rules, children, ast, table, enum_map, type_index)
+    subtype_rules_match(&subtype.rules, children, ast, table, ruleset, type_index)
 }
 
 /// True when `right` is a plain `<type>` reference and `value` is a known instance

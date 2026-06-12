@@ -5,7 +5,6 @@ use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
-use std::collections::HashMap;
 
 use cwtools_error_codes::ErrorCode;
 pub use cwtools_error_codes::ErrorSeverity;
@@ -70,27 +69,6 @@ pub(crate) fn resolves_as_scope_key(ctx: &ScopeContext, key: &str) -> bool {
             | "fromfromfromfrom"
     ) || ctx.registry.id_of(&k).is_some()
         || ctx.registry.links.contains_key(&k)
-}
-
-/// Whether the trigger/effect/target scope checks (CW104/105/106/243/244/245/248)
-/// are on. Now ON by default (the scope engine is config-driven and accurate);
-/// set `CWTOOLS_NO_SCOPE_CHECKS=1` as an escape hatch to turn them off.
-pub(crate) fn scope_checks_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("CWTOOLS_NO_SCOPE_CHECKS").is_err());
-    *ON
-}
-
-/// Whether the project-wide "variable has not been set" check (CW246) is on.
-/// OFF by default: it needs a COMPLETE variable index, and a mod that defines
-/// variables through dynamic `@`-concatenation or base-game scripts the index
-/// hasn't collected would flood. Opt in with `CWTOOLS_VAR_CHECKS=1` once the
-/// index is proven complete for a corpus. The local numeric checks (CW270/271)
-/// run regardless of this gate.
-pub(crate) fn var_checks_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("CWTOOLS_VAR_CHECKS").is_ok());
-    *ON
 }
 
 /// True when a leaf value is numerically zero (`0`, `0.0`, `"0"`, …). Used by
@@ -195,11 +173,11 @@ pub(crate) fn is_datetime_shape(s: &str) -> bool {
 /// tech folders, idea tokens, …) and are treated as advisory — any non-empty
 /// value is accepted, because the CWT rules rarely enumerate every member.
 pub(crate) fn enum_contains(
-    enum_map: &HashMap<&str, &EnumDefinition>,
+    ruleset: &cwtools_rules::rules_types::RuleSet,
     enum_name: &str,
     value: &str,
 ) -> bool {
-    match enum_map.get(enum_name) {
+    match crate::enum_def(ruleset, enum_name) {
         Some(def) if !def.values.is_empty() => {
             // Enum membership is case-insensitive (F# lowercases both the enum
             // values and the checked key — FieldValidators.fs `getLowerKey` +
@@ -235,6 +213,27 @@ pub(crate) fn match_text(table: &StringTable, t: &StringTokens) -> String {
     } else {
         s
     }
+}
+
+/// Zero-copy variant of [`match_text`]: borrows the string from the table,
+/// strips surrounding quotes via a slice (no allocation), and passes the
+/// resulting `&str` to `f`.  Returns `f`'s value, or the default if the id
+/// is out of range.
+pub(crate) fn with_match_text<R: Default>(
+    table: &StringTable,
+    t: &StringTokens,
+    f: impl FnOnce(&str) -> R,
+) -> R {
+    table
+        .with_string(t.normal, |s| {
+            let unquoted = if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+                &s[1..s.len() - 1]
+            } else {
+                s
+            };
+            f(unquoted)
+        })
+        .unwrap_or_default()
 }
 
 /// Strip a balanced pair of surrounding double-quotes from a child key.

@@ -223,13 +223,15 @@ fn validate_event(
             _ => continue,
         };
         for tc in trigger_children {
-            let key = match tc {
-                Child::Leaf(idx) => table
-                    .get_string(ast.arena.leaves[*idx as usize].key.normal)
-                    .unwrap_or_default(),
-                _ => continue,
-            };
-            if PRE_TRIGGERS.contains(&key.as_str()) {
+            let Child::Leaf(idx) = tc else { continue };
+            let leaf = &ast.arena.leaves[*idx as usize];
+            let is_pre = table
+                .with_string(leaf.key.normal, |k| PRE_TRIGGERS.contains(&k))
+                .unwrap_or(false);
+            if is_pre {
+                let key = table
+                    .with_string(leaf.key.normal, |s| s.to_string())
+                    .unwrap_or_default();
                 errors.push(ValidationError {
                     message: format!(
                         "Trigger '{}' can be a pre-trigger at event root for better performance",
@@ -276,7 +278,9 @@ fn child_key_eq(child: &Child, ast: &ParsedFile, table: &StringTable, expected: 
     match child {
         Child::Leaf(idx) => {
             let leaf = &ast.arena.leaves[*idx as usize];
-            table.get_string(leaf.key.normal).unwrap_or_default() == expected
+            table
+                .with_string(leaf.key.normal, |k| k == expected)
+                .unwrap_or(false)
         }
         _ => false,
     }
@@ -304,13 +308,12 @@ fn child_is_bool(child: &Child, ast: &ParsedFile, table: &StringTable, expected:
             let leaf = &ast.arena.leaves[*idx as usize];
             match &leaf.value {
                 Value::Bool(b) => *b == expected,
-                Value::String(t) | Value::QString(t) => {
-                    let text = table
-                        .get_string(t.normal)
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    (expected && text == "yes") || (!expected && text == "no")
-                }
+                Value::String(t) | Value::QString(t) => table
+                    .with_string(t.normal, |s| {
+                        (expected && s.eq_ignore_ascii_case("yes"))
+                            || (!expected && s.eq_ignore_ascii_case("no"))
+                    })
+                    .unwrap_or(false),
                 _ => false,
             }
         }
@@ -346,12 +349,12 @@ pub fn check_key_and_desc(
     for child in &ast.root_children {
         if let Child::Leaf(idx) = child {
             let leaf = &ast.arena.leaves[*idx as usize];
-            let key = table.get_string(leaf.key.normal).unwrap_or_default();
-            if !node_key_filter.is_empty() && !node_key_filter.contains(&key.as_str()) {
-                continue;
-            }
             if let Value::Clause(_) = &leaf.value {
-                check_loc_key_pair(&key, leaf.pos.start.line, loc_keys, file_path, errors);
+                table.with_string(leaf.key.normal, |key| {
+                    if node_key_filter.is_empty() || node_key_filter.contains(&key) {
+                        check_loc_key_pair(key, leaf.pos.start.line, loc_keys, file_path, errors);
+                    }
+                });
             }
         }
     }

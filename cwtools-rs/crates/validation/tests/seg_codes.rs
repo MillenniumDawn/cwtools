@@ -8,30 +8,29 @@ use cwtools_game::constants::Game;
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::validate_ast;
+use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
 use std::collections::HashSet;
 
-/// Scope checks are on by default now; ensure the escape-hatch isn't set so the
-/// LazyLock resolves to enabled regardless of environment.
-fn enable_scope_checks() {
-    // SAFETY: tests are the sole writer; set before any validation runs.
-    unsafe { std::env::remove_var("CWTOOLS_NO_SCOPE_CHECKS") };
-}
-
 fn codes_hoi4(cwt: &str, script: &str) -> Vec<String> {
-    enable_scope_checks();
     let table = StringTable::new();
     let parsed_cwt = parse_string(cwt, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(
+    let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
+    let errors = validate_prepared(
         &parsed,
-        &ruleset,
-        &table,
         "game/common/foo/test.txt",
-        Some(Game::Hoi4),
-        None,
-        None,
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(Game::Hoi4),
+            type_index: None,
+            modifier_keys: None,
+            loc_index: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: false,
+        },
     );
     errors.into_iter().filter_map(|e| e.code).collect()
 }
@@ -161,7 +160,6 @@ fn country_trigger_in_character_subscope_is_clean() {
 
 #[test]
 fn zero_known_modifier_is_cw235() {
-    enable_scope_checks();
     let table = StringTable::new();
     // A rules file with a foo type whose body takes no fixed fields, so the
     // modifier key falls through to the dynamic-modifier accept path.
@@ -183,14 +181,21 @@ foo = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(
+    let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
+    let errors = validate_prepared(
         &parsed,
-        &ruleset,
-        &table,
         "game/common/foo/test.txt",
-        Some(Game::Hoi4),
-        None,
-        Some(&modifiers),
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(Game::Hoi4),
+            type_index: None,
+            modifier_keys: Some(&modifiers),
+            loc_index: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: false,
+        },
     );
     let codes: Vec<String> = errors.into_iter().filter_map(|e| e.code).collect();
     assert!(codes.contains(&"CW235".to_string()), "got: {:?}", codes);
@@ -198,7 +203,6 @@ foo = {
 
 #[test]
 fn nonzero_known_modifier_is_clean() {
-    enable_scope_checks();
     let table = StringTable::new();
     let cwt = r#"
 types = { type[foo] = { path = "game/common/foo" } }
@@ -218,14 +222,21 @@ foo = {
 }
 "#;
     let parsed = parse_string(script, &table).unwrap();
-    let errors = validate_ast(
+    let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
+    let errors = validate_prepared(
         &parsed,
-        &ruleset,
-        &table,
         "game/common/foo/test.txt",
-        Some(Game::Hoi4),
-        None,
-        Some(&modifiers),
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(Game::Hoi4),
+            type_index: None,
+            modifier_keys: Some(&modifiers),
+            loc_index: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: false,
+        },
     );
     let codes: Vec<String> = errors.into_iter().filter_map(|e| e.code).collect();
     assert!(!codes.contains(&"CW235".to_string()), "got: {:?}", codes);
