@@ -201,6 +201,7 @@ pub fn validate_ast_with_loc(
     // build a `Prepared` ONCE outside their loop and call `validate_prepared`.
     let enum_map = build_enum_map(ruleset);
     let registry = build_scope_registry_arc(ruleset, game);
+    let (scope_checks, var_checks) = checks_from_env();
     validate_prepared(
         ast,
         file_path,
@@ -213,6 +214,8 @@ pub fn validate_ast_with_loc(
             loc_index,
             registry: registry.as_ref(),
             enum_map: &enum_map,
+            scope_checks,
+            var_checks,
         },
     )
 }
@@ -235,6 +238,18 @@ pub fn build_scope_registry_arc(
     game.map(|g| std::sync::Arc::new(build_scope_registry(ruleset, g)))
 }
 
+/// Whether the trigger/effect/target scope checks (CW104/105/106/243/244/245/248)
+/// are on. ON by default; set `CWTOOLS_NO_SCOPE_CHECKS=1` as an escape hatch.
+/// Whether the "variable has not been set" check (CW246) is on. OFF by default;
+/// opt in with `CWTOOLS_VAR_CHECKS=1` once the variable index is proven complete.
+/// Read once at context-construction time.
+pub fn checks_from_env() -> (bool, bool) {
+    (
+        std::env::var("CWTOOLS_NO_SCOPE_CHECKS").is_err(),
+        std::env::var("CWTOOLS_VAR_CHECKS").is_ok(),
+    )
+}
+
 /// The per-run shared validation state, built once and reused across every file
 /// in a run. Bundles everything [`validate_prepared`] needs beyond the per-file
 /// `ast` and `file_path`, so callers pass one value instead of a ten-argument
@@ -249,6 +264,8 @@ pub struct Prepared<'a> {
     pub loc_index: Option<&'a LocIndex>,
     pub registry: Option<&'a std::sync::Arc<ScopeRegistry>>,
     pub enum_map: &'a HashMap<&'a str, &'a EnumDefinition>,
+    pub scope_checks: bool,
+    pub var_checks: bool,
 }
 
 /// Build the per-file starting scope context — shared by `validate_prepared`
@@ -304,6 +321,8 @@ pub fn validate_prepared(
         loc_index,
         registry,
         enum_map,
+        scope_checks,
+        var_checks,
     } = *prepared;
     let mut errors = Vec::new();
 
@@ -319,6 +338,8 @@ pub fn validate_prepared(
         type_index,
         modifier_keys,
         loc_index,
+        scope_checks,
+        var_checks,
     };
 
     // Pre-compute path-based type match (most specific wins)

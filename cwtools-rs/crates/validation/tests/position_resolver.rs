@@ -63,6 +63,8 @@ fn resolve(
         loc_index: None,
         registry: registry.as_ref(),
         enum_map: &enum_map,
+        scope_checks: true,
+        var_checks: false,
     };
     let (line, col) = pos_of(script, marker);
     rules_at_pos(&parsed, file_path, &prepared, line, col)
@@ -414,6 +416,8 @@ alias[trigger:always] = bool
         loc_index: None,
         registry: None,
         enum_map: &enum_map,
+        scope_checks: true,
+        var_checks: false,
     };
     let ctx =
         rules_at_pos(&parsed, "game/common/decisions/test.txt", &prepared, 2, 6).expect("context");

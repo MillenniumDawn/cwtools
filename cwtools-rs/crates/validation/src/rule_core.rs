@@ -663,6 +663,7 @@ pub(crate) fn validate_children(
                                     file_path,
                                     lv.pos.start.line,
                                     lv.pos.start.col,
+                                    ctx.var_checks,
                                     errors,
                                 );
                             }
@@ -1230,7 +1231,7 @@ fn validate_alias_usage(
     // chains (`owner.capital`): a bare command that's missing from this config's
     // links.cwt (e.g. `overlord`) is valid-but-unlisted, not invalid, so only
     // chains — where a segment is genuinely unresolvable — are flagged.
-    if scope_checks_enabled()
+    if ctx.scope_checks
         && key.contains('.')
         && !looks_like_data_ref(key)
         && let Some(sc) = scope_context.as_ref()
@@ -1266,7 +1267,7 @@ fn validate_alias_usage(
     // scope through every scope-change effect/trigger link (`random_owned_state`,
     // leader abilities, iterators). With the config-driven scope/link registry
     // that tracking is now in place, so this runs by default.
-    if scope_checks_enabled()
+    if ctx.scope_checks
         && let Some(sc) = scope_context.as_ref()
         && let Some(current) = sc.current()
     {
@@ -1401,9 +1402,10 @@ fn check_variable_get(
     file_path: &str,
     line: u32,
     col: u16,
+    var_checks: bool,
     errors: &mut Vec<ValidationError>,
 ) {
-    if !var_checks_enabled() {
+    if !var_checks {
         return;
     }
     let v = raw.trim_matches('"').trim();
@@ -1581,7 +1583,7 @@ fn validate_leaf(
         //     violates the field's int/precision constraint, so they cannot
         //     flood valid config.
         //   - the "variable has not been set" check (CW246) is gated behind
-        //     `var_checks_enabled()` because it needs a complete variable index.
+        //     `ctx.var_checks` because it needs a complete variable index.
         if let NewField::VariableField {
             is_int, is_32bit, ..
         } = right
@@ -1622,7 +1624,7 @@ fn validate_leaf(
                             &[],
                         ));
                     }
-                } else if var_checks_enabled() {
+                } else if ctx.var_checks {
                     // Non-numeric value: it must name a defined variable. Stay
                     // lenient: only flag a single bare token (a `.`-chain is a
                     // scope/target, handled elsewhere) that isn't a scope
@@ -1663,6 +1665,7 @@ fn validate_leaf(
                 file_path,
                 leaf.pos.start.line,
                 leaf.pos.start.col,
+                ctx.var_checks,
                 errors,
             );
             return;
@@ -1671,7 +1674,7 @@ fn validate_leaf(
         // Scope-target validation (CW243 target-wrong-scope / CW245 error-in-target):
         // resolve the chain from the current scope. Gated with the other scope checks.
         if let NewField::ScopeField(expected) = right
-            && scope_checks_enabled()
+            && ctx.scope_checks
             && let Some(ctx) = scope_context
         {
             let value = leaf_value_to_string(&leaf.value, table);

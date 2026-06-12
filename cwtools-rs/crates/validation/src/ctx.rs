@@ -26,4 +26,6 @@ pub(crate) struct ValidationCtx<'a> {
     pub(crate) type_index: Option<&'a cwtools_index::TypeIndex>,
     pub(crate) modifier_keys: Option<&'a HashSet<String>>,
     pub(crate) loc_index: Option<&'a LocIndex>,
+    pub(crate) scope_checks: bool,
+    pub(crate) var_checks: bool,
 }

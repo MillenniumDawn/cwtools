@@ -42,7 +42,7 @@ use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{
     ErrorSeverity, Prepared, ValidationError, build_enum_map, build_modifier_keys,
-    build_scope_registry_arc, validate_prepared,
+    build_scope_registry_arc, checks_from_env, validate_prepared,
 };
 
 /// A parsed workspace/mod file: its on-disk path, mod-relative logical path, and AST.
@@ -308,6 +308,7 @@ impl Session {
     /// `enum_map` is passed in (not stored) because it borrows `self.ruleset`;
     /// callers build it once and reuse it across a batch.
     fn prepared<'a>(&'a self, enum_map: &'a HashMap<&'a str, &'a EnumDefinition>) -> Prepared<'a> {
+        let (scope_checks, var_checks) = checks_from_env();
         Prepared {
             ruleset: &self.ruleset,
             table: &self.rules_table,
@@ -317,6 +318,8 @@ impl Session {
             loc_index: Some(&self.loc_index),
             registry: self.registry.as_ref(),
             enum_map,
+            scope_checks,
+            var_checks,
         }
     }
 

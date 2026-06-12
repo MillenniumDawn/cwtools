@@ -2,7 +2,7 @@
 //! - CW271 (int-only) / CW270 (3-decimal precision): local numeric checks on a
 //!   `variable_field`, on regardless of any gate.
 //! - CW246 (variable has not been set): a non-numeric `variable_field` value
-//!   that names no defined variable. Gated behind CWTOOLS_VAR_CHECKS and driven
+//!   that names no defined variable. Gated behind var_checks and driven
 //!   by the project variable index.
 
 use cwtools_game::constants::Game;
@@ -10,14 +10,7 @@ use cwtools_index::TypeIndex;
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::validate_ast;
-
-/// The var "has not been set" check is opt-in; turn it on for this binary. Set
-/// before any validation runs so the LazyLock resolves to enabled.
-fn enable_var_checks() {
-    // SAFETY: tests are the sole writer; set before any validation runs.
-    unsafe { std::env::set_var("CWTOOLS_VAR_CHECKS", "1") };
-}
+use cwtools_validation::{Prepared, build_enum_map, build_scope_registry_arc, validate_prepared};
 
 const RULES: &str = r#"
 types = { type[foo] = { path = "game/common/foo" } }
@@ -30,7 +23,6 @@ foo = {
 "#;
 
 fn codes(script: &str, vars: &[&str]) -> Vec<String> {
-    enable_var_checks();
     let table = StringTable::new();
     let parsed_cwt = parse_string(RULES, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
@@ -39,14 +31,23 @@ fn codes(script: &str, vars: &[&str]) -> Vec<String> {
     for v in vars {
         idx.var_index.add_name(v);
     }
-    let errors = validate_ast(
+    let enum_map = build_enum_map(&ruleset);
+    let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
+    let errors = validate_prepared(
         &parsed,
-        &ruleset,
-        &table,
         "game/common/foo/test.txt",
-        Some(Game::Hoi4),
-        Some(&idx),
-        None,
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(Game::Hoi4),
+            type_index: Some(&idx),
+            modifier_keys: None,
+            loc_index: None,
+            registry: registry.as_ref(),
+            enum_map: &enum_map,
+            scope_checks: true,
+            var_checks: true,
+        },
     );
     errors.into_iter().filter_map(|e| e.code).collect()
 }

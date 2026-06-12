@@ -99,6 +99,8 @@ pub fn rules_at_pos(
         type_index: prepared.type_index,
         modifier_keys: prepared.modifier_keys,
         loc_index: prepared.loc_index,
+        scope_checks: prepared.scope_checks,
+        var_checks: prepared.var_checks,
     };
 
     // type_per_file: the whole file is one instance; root children are its body.

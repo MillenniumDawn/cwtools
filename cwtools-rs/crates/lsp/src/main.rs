@@ -17,7 +17,7 @@ use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 use cwtools_validation::{
     Prepared, ValidationError, build_enum_map, build_modifier_keys, build_scope_registry_arc,
-    validate_prepared,
+    checks_from_env, validate_prepared,
 };
 
 mod symbols;
@@ -363,6 +363,7 @@ impl Backend {
         let ast = doc.ast.as_ref()?;
 
         let enum_map = build_enum_map(rs);
+        let (scope_checks, var_checks) = checks_from_env();
         let prepared = Prepared {
             ruleset: rs,
             table: &self.state.string_table,
@@ -372,6 +373,8 @@ impl Backend {
             loc_index: None,
             registry: registry_guard.as_ref(),
             enum_map: &enum_map,
+            scope_checks,
+            var_checks,
         };
         let rctx = rules_at_pos(
             ast,
@@ -1986,6 +1989,7 @@ impl LanguageServer for Backend {
             {
                 let enum_map = build_enum_map(rs);
                 let game = cwtools_game::constants::Game::from_str(&language);
+                let (scope_checks, var_checks) = checks_from_env();
                 let prepared = Prepared {
                     ruleset: rs,
                     table: &self.state.string_table,
@@ -1995,6 +1999,8 @@ impl LanguageServer for Backend {
                     loc_index: None,
                     registry: registry_guard.as_ref(),
                     enum_map: &enum_map,
+                    scope_checks,
+                    var_checks,
                 };
                 match rules_at_pos(ast, &logical_path, &prepared, lsp_line, lsp_col) {
                     // Outside any known entity — offer root-type snippets.
@@ -3057,6 +3063,7 @@ impl Backend {
             // Build enum_map once for the batch; it borrows `scan_ruleset`,
             // which is owned for the whole parallel section above.
             let enum_map = scan_ruleset.as_ref().map(|rs| build_enum_map(rs));
+            let (scope_checks, var_checks) = checks_from_env();
             // One Prepared for the whole batch (None if the ruleset isn't loaded).
             // It is Copy + all-borrows, so it is shared freely across rayon threads.
             let prepared =
@@ -3072,6 +3079,8 @@ impl Backend {
                         loc_index,
                         registry,
                         enum_map,
+                        scope_checks,
+                        var_checks,
                     });
 
             files_to_validate
@@ -3383,6 +3392,7 @@ impl Backend {
     ) -> Vec<Diagnostic> {
         let info_guard = self.state.info_service.read();
         let loc_guard = self.state.loc_index.read();
+        let (scope_checks, var_checks) = checks_from_env();
         validate_parsed_with_indexes(
             uri,
             parsed,
@@ -3395,6 +3405,8 @@ impl Backend {
                 loc_index: loc_guard.as_ref(),
                 registry,
                 enum_map,
+                scope_checks,
+                var_checks,
             },
         )
     }
@@ -3715,6 +3727,7 @@ impl Backend {
                         // and is cheap, so build it inline.
                         let registry = self.state.scope_registry.read().clone();
                         let enum_map = build_enum_map(ruleset);
+                        let (scope_checks, var_checks) = checks_from_env();
                         let mut errs = validate_prepared(
                             &parsed,
                             uri,
@@ -3727,6 +3740,8 @@ impl Backend {
                                 loc_index: loc_guard.as_ref(),
                                 registry: registry.as_ref(),
                                 enum_map: &enum_map,
+                                scope_checks,
+                                var_checks,
                             },
                         );
                         drop(loc_guard);
