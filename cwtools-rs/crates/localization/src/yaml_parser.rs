@@ -15,6 +15,7 @@
 
 use crate::commands::{Lang, LocEntry, LocFile, LocParseError, Position, key_to_language};
 use crate::loc_string::parse_loc_elements;
+use std::sync::Arc;
 
 // ---- UTF-8 BOM check -------------------------------------------------------
 
@@ -166,6 +167,8 @@ pub fn check_loc_file_lang(file: &str, header_key: &str) -> Option<LangHeaderDia
 /// Entries with invalid content still parse; the caller is responsible for
 /// calling `validate_quotes` / `validate_invalid_chars`.
 pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
+    // One Arc allocation shared by every Position in this file.
+    let stream_name: Arc<str> = Arc::from(name);
     // Strip leading UTF-8 BOM(s). Loc files are required to be UTF-8-with-BOM
     // (see CW254) and the disk reader keeps the BOM in the string, so without
     // this the `l_english:` header parses as `\u{FEFF}l_english` and the
@@ -254,7 +257,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         // because in F# `#` is a valid `isLocValueChar`.
         let desc = remainder.strip_prefix(' ').unwrap_or(remainder);
 
-        let position = Position::new(name, i + 1, 1); // 1-based line numbers
+        let position = Position::new(Arc::clone(&stream_name), i + 1, 1); // 1-based line numbers
 
         // Compute the column offset of `desc`'s start within the full line.
         // The key + colon + version + optional space are all ASCII, so byte
@@ -270,7 +273,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         let error_range = find_invalid_loc_char(desc).map(|byte_off| {
             // Column within desc (0-based) + prefix offset gives the line column.
             let col = desc_col_offset + desc[..byte_off].chars().count() + 1;
-            Position::new(name, i + 1, col)
+            Position::new(Arc::clone(&stream_name), i + 1, col)
         });
 
         // Lazy-parse loc elements (refs, commands, etc.)
