@@ -3,6 +3,7 @@
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 
 use crate::common::{child_key_matches, match_text};
@@ -47,7 +48,8 @@ pub(crate) fn subtype_rules_match(
         leaf_rights: Vec<(&'a NewField, &'a Options)>,
         node_inners: Vec<(&'a [(RuleType, Options)], &'a Options)>,
     }
-    let mut groups: HashMap<&str, KeyGroup> = HashMap::new();
+    let mut groups: FxHashMap<&str, KeyGroup> =
+        FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
     for (rt, opts) in rules {
         match rt {
             RuleType::LeafRule {

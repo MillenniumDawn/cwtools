@@ -5,6 +5,7 @@ use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -479,7 +480,8 @@ pub(crate) fn validate_children(
 
     // Track occurrence counts for cardinality checking.
     // Keyed children (Leaf/Node): key string -> count.
-    let mut key_counts: HashMap<String, usize> = HashMap::new();
+    let mut key_counts: FxHashMap<String, usize> =
+        FxHashMap::with_capacity_and_hasher(children.len(), Default::default());
     // Item 5: LeafValues — count per LeafValueRule index.
     let mut leafvalue_counts: Vec<usize> = vec![0usize; rules.len()];
     // Item 5: ValueClause — count per ValueClauseRule index.
@@ -734,7 +736,8 @@ pub(crate) fn validate_children(
     // times, or an absent optional alternative double-reports.
     // Third field tracks strictness: a `~` (soft) minimum on ANY overload of a
     // key makes the whole key's minimum soft, so an under-count is not flagged.
-    let mut key_card: HashMap<String, (i32, i32, bool)> = HashMap::new();
+    let mut key_card: FxHashMap<String, (i32, i32, bool)> =
+        FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
     for (rule_type, opts) in rules.iter() {
         if matches!(
             rule_type,
@@ -750,7 +753,8 @@ pub(crate) fn validate_children(
             e.2 = e.2 && opts.strict_min;
         }
     }
-    let mut reported_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut reported_keys: FxHashSet<String> =
+        FxHashSet::with_capacity_and_hasher(key_card.len(), Default::default());
 
     for (rule_idx, (rule_type, opts)) in rules.iter().enumerate() {
         // Both under- and over-count default to a WARNING (config cardinalities are
@@ -1047,8 +1051,11 @@ pub(crate) fn field_matches_key(
             // The name part can be a literal (`trigger:original_tag`), a `<type>`
             // reference (`trigger:<scripted_trigger>`, `modifier:..<building>..`),
             // or `scope_field` (any scope-switching key).
-            let full = format!("{}:{}", category, key);
-            if ruleset.alias_exact.contains_key(&full) {
+            if ruleset
+                .alias_exact
+                .get(category.as_str())
+                .is_some_and(|m| m.contains_key(key))
+            {
                 return true;
             }
             // Case-insensitive retry: command names like `Country_event` resolve to
@@ -1057,7 +1064,8 @@ pub(crate) fn field_matches_key(
             if lower != key
                 && ruleset
                     .alias_exact
-                    .contains_key(&format!("{}:{}", category, lower))
+                    .get(category.as_str())
+                    .is_some_and(|m| m.contains_key(lower.as_str()))
             {
                 return true;
             }
@@ -1163,9 +1171,8 @@ pub(crate) fn alias_overloads<'a>(
 ) -> Vec<&'a (RuleType, Options)> {
     // Gather candidate overloads via the precomputed alias index (O(1) exact +
     // O(patterns)) rather than scanning every alias.
-    let alias_key = format!("{}:{}", category, key);
     let mut overloads: Vec<&(RuleType, Options)> = Vec::new();
-    if let Some(idxs) = ruleset.alias_exact.get(&alias_key) {
+    if let Some(idxs) = ruleset.alias_exact.get(category).and_then(|m| m.get(key)) {
         for &i in idxs {
             overloads.push(&ruleset.aliases[i].1);
         }
@@ -1176,7 +1183,10 @@ pub(crate) fn alias_overloads<'a>(
     let lower = key.to_ascii_lowercase();
     if overloads.is_empty()
         && lower != key
-        && let Some(idxs) = ruleset.alias_exact.get(&format!("{}:{}", category, lower))
+        && let Some(idxs) = ruleset
+            .alias_exact
+            .get(category)
+            .and_then(|m| m.get(lower.as_str()))
     {
         for &i in idxs {
             overloads.push(&ruleset.aliases[i].1);

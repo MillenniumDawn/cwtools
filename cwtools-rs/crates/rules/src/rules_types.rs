@@ -31,10 +31,11 @@ pub struct RuleSet {
     /// config ships no folders.cwt (discovery then falls back to the engine's
     /// built-in folder list).
     pub folders: Vec<String>,
-    /// Lookup index over `aliases`, built by `reindex()`. Maps a full alias name
-    /// (`"cat:key"`) to the indices of every matching overload, so alias
-    /// resolution is O(1) instead of a linear scan over all aliases per key.
-    pub alias_exact: std::collections::HashMap<String, Vec<usize>>,
+    /// Lookup index over `aliases`, built by `reindex()`. Two-level map:
+    /// `category → key → indices of every matching overload`. Lookups require
+    /// only two borrowed-str probes with zero allocation on the hot path.
+    pub alias_exact:
+        std::collections::HashMap<String, std::collections::HashMap<String, Vec<usize>>>,
     /// Per-category alias metadata (the `<type>` patterns and `scope_field`),
     /// also built by `reindex()`.
     pub alias_categories: std::collections::HashMap<String, AliasCategoryIndex>,
@@ -93,7 +94,7 @@ impl RuleSet {
             scope_inputs: Vec::new(),
             link_inputs: Vec::new(),
             folders: Vec::new(),
-            alias_exact: std::collections::HashMap::new(),
+            alias_exact: std::collections::HashMap::default(),
             alias_categories: std::collections::HashMap::new(),
             type_by_name: std::collections::HashMap::new(),
             enum_by_name: std::collections::HashMap::new(),
@@ -137,14 +138,27 @@ impl RuleSet {
             }
         }
         for (i, (name, _)) in self.aliases.iter().enumerate() {
-            // Store under the original name AND the all-lowercase variant so
-            // that game-file keys like `instantTextboxType` (mixed case) match
+            // Store under the original category+key AND the all-lowercase variant
+            // so that game-file keys like `instantTextboxType` (mixed case) match
             // rule alias keys like `instantTextBoxType` (camelCase). Paradox
             // script keys are case-insensitive; aliases are no different.
-            self.alias_exact.entry(name.clone()).or_default().push(i);
-            let lower = name.to_ascii_lowercase();
-            if lower != *name {
-                self.alias_exact.entry(lower).or_default().push(i);
+            if let Some((cat, key)) = name.split_once(':') {
+                self.alias_exact
+                    .entry(cat.to_string())
+                    .or_default()
+                    .entry(key.to_string())
+                    .or_default()
+                    .push(i);
+                let lower_cat = cat.to_ascii_lowercase();
+                let lower_key = key.to_ascii_lowercase();
+                if lower_cat != cat || lower_key != key {
+                    self.alias_exact
+                        .entry(lower_cat)
+                        .or_default()
+                        .entry(lower_key)
+                        .or_default()
+                        .push(i);
+                }
             }
             if let Some((cat, rest)) = name.split_once(':') {
                 let entry = self.alias_categories.entry(cat.to_string()).or_default();
