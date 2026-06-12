@@ -229,6 +229,12 @@ struct DocumentState {
     /// so an english-targeted mod isn't flagged for every other language vanilla
     /// happens to ship.
     loc_languages: Mutex<Option<Vec<cwtools_localization::Lang>>>,
+    /// When `false` (the default), hover shows localisation for the primary
+    /// language only (the first of `loc_languages`, else English) and the
+    /// `loc_text` map only stores that language. Set via the
+    /// `hoverShowAllLanguages` init option. Storing one language keeps the map
+    /// small; the user opts into all translations explicitly.
+    hover_show_all_languages: std::sync::atomic::AtomicBool,
     /// Writable directory for persistent caches (from the `cacheDir` init
     /// option, else an OS cache dir). The base-game type index is cached here
     /// keyed by game + version, so it isn't re-parsed on every startup.
@@ -292,6 +298,7 @@ impl DocumentState {
             loc_index: parking_lot::RwLock::new(None),
             loc_text: parking_lot::RwLock::new(HashMap::new()),
             loc_languages: Mutex::new(None),
+            hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             cache_dir: Mutex::new(None),
             edit_generation: AtomicU64::new(0),
             ignore_file_patterns: parking_lot::RwLock::new(Vec::new()),
@@ -693,6 +700,42 @@ fn lang_display_name(lang: cwtools_localization::Lang) -> &'static str {
         cwtools_localization::Lang::Korean => "Korean",
         cwtools_localization::Lang::Turkish => "Turkish",
         cwtools_localization::Lang::Default => "Default",
+    }
+}
+
+/// Append localisation translations for the hovered element to `md`.
+///
+/// A reference (`add_ideas = DEN_Maersk1`) looks up the leaf value. A definition
+/// key (`DEN_Maersk1 = { ... }`, value empty) looks up the key itself: for ideas,
+/// decisions and similar entities the token IS the loc key, and the `<key>_desc`
+/// entry holds the description tooltip. The cwt config doesn't model this, so it
+/// can't be resolved through the rule walk.
+fn append_localisation(
+    md: &mut String,
+    element: &PositionElement,
+    loc_text: &HashMap<String, Vec<(cwtools_localization::Lang, String)>>,
+) {
+    let (name_key, desc_key): (Option<String>, Option<String>) = match element {
+        PositionElement::Leaf { key, value } if value.is_empty() => {
+            let k = key.to_lowercase();
+            (Some(k.clone()), Some(format!("{k}_desc")))
+        }
+        PositionElement::Leaf { value, .. } => (Some(value.to_lowercase()), None),
+        PositionElement::LeafValue { value } => (Some(value.to_lowercase()), None),
+    };
+    let mut emit = |loc_key: &str, label: &str| {
+        if let Some(translations) = loc_text.get(loc_key) {
+            md.push_str(label);
+            for (lang, text) in translations {
+                md.push_str(&format!("\n- {}: {}", lang_display_name(*lang), text));
+            }
+        }
+    };
+    if let Some(nk) = name_key {
+        emit(&nk, "\n\n**Localisation**:");
+    }
+    if let Some(dk) = desc_key {
+        emit(&dk, "\n\n**Description**:");
     }
 }
 
@@ -1445,6 +1488,13 @@ impl LanguageServer for Backend {
                 }
             }
 
+            // Whether hover shows all loc languages or just the primary one.
+            if let Some(all) = opts.get("hoverShowAllLanguages").and_then(|v| v.as_bool()) {
+                self.state
+                    .hover_show_all_languages
+                    .store(all, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // Persistent cache directory for the base-game index (so it isn't
             // re-parsed every startup). The client should pass its global
             // storage path; we fall back to an OS cache dir otherwise.
@@ -1855,22 +1905,9 @@ impl LanguageServer for Backend {
                         md.push_str(&format!("\n\nSet to: {}{}", joined, suffix));
                     }
                 }
-                // Append localisation translations if the hovered value is a
-                // known loc key (most common for entity names in scripts).
-                {
-                    let lookup = match &element {
-                        PositionElement::Leaf { value, .. } => value.as_str(),
-                        PositionElement::LeafValue { value } => value.as_str(),
-                    };
-                    let loc_guard = self.state.loc_text.read();
-                    let lower = lookup.to_lowercase();
-                    if let Some(translations) = loc_guard.get(&lower) {
-                        md.push_str("\n\n**Localisation**:");
-                        for (lang, text) in translations {
-                            md.push_str(&format!("\n- {}: {}", lang_display_name(*lang), text));
-                        }
-                    }
-                }
+                // Append localisation translations. A reference resolves by leaf
+                // value; a definition key (idea/decision) resolves by its key.
+                append_localisation(&mut md, &element, &self.state.loc_text.read());
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -1895,25 +1932,8 @@ impl LanguageServer for Backend {
                         format!("**Value**: `{}`", value)
                     }
                 };
-                // Append localisation translations for the hovered value
-                {
-                    let lookup = match &element {
-                        PositionElement::Leaf { value, .. } => value.as_str(),
-                        PositionElement::LeafValue { value } => value.as_str(),
-                    };
-                    let loc_guard = self.state.loc_text.read();
-                    let lower = lookup.to_lowercase();
-                    if let Some(translations) = loc_guard.get(&lower) {
-                        contents.push_str("\n\n**Localisation**:");
-                        for (lang, text) in translations {
-                            contents.push_str(&format!(
-                                "\n- {}: {}",
-                                lang_display_name(*lang),
-                                text
-                            ));
-                        }
-                    }
-                }
+                // Append localisation translations for the hovered element.
+                append_localisation(&mut contents, &element, &self.state.loc_text.read());
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -3191,6 +3211,18 @@ impl Backend {
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
         let loc_languages = self.state.loc_languages.lock().clone();
 
+        // Hover language scope: unless the user opted into all translations, keep
+        // only the primary language (first configured loc language, else English)
+        // in the hover map so it stays small.
+        let hover_all = self
+            .state
+            .hover_show_all_languages
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let primary_lang = loc_languages
+            .as_deref()
+            .and_then(|l| l.first().copied())
+            .unwrap_or(cwtools_localization::Lang::English);
+
         // Build the index and collect per-file diagnostics in one block, then
         // drop the LocService before the index is published. The service holds
         // the full per-file loc ASTs (~2M entries on Millennium Dawn); keeping
@@ -3255,6 +3287,9 @@ impl Backend {
             let mut lt: HashMap<String, Vec<(cwtools_localization::Lang, String)>> = HashMap::new();
             for file in service.files() {
                 let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
+                if !hover_all && lang != primary_lang {
+                    continue;
+                }
                 for entry in &file.entries {
                     let display = strip_loc_quotes(&entry.desc);
                     if !display.is_empty() {

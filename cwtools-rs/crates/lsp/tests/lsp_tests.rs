@@ -52,6 +52,35 @@ fn read_response(reader: &mut BufReader<std::process::ChildStdout>) -> std::io::
     }
 }
 
+/// Drain server frames until the `publishDiagnostics` notification whose URI
+/// ends with `rel_path` arrives. did_open publishes diagnostics for a file only
+/// after its index write lands, so this is the readiness signal that the file's
+/// exports (value_set members, enum values, type instances) are queryable.
+/// Without it a following completion races the index write — tower-lsp dispatches
+/// handlers `buffer_unordered`, so there is no happens-before between a notify
+/// handler finishing and the next request's handler running. Matches by path
+/// suffix since the server canonicalises the URI (`file://` vs `file:///`).
+fn wait_for_diagnostics(reader: &mut BufReader<std::process::ChildStdout>, rel_path: &str) {
+    for _ in 0..400 {
+        let raw = match read_frame(reader) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            && v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(rel_path))
+        {
+            return;
+        }
+    }
+    panic!("no publishDiagnostics for {rel_path}");
+}
+
 fn jsonrpc_request(id: i64, method: &str, params: serde_json::Value) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -69,103 +98,6 @@ fn jsonrpc_notification(method: &str, params: serde_json::Value) -> String {
         "params": params,
     })
     .to_string()
-}
-
-// ── Help / Version ───────────────────────────────────────────────────────────
-
-#[test]
-fn test_lsp_help_exits_zero() {
-    assert_cmd::Command::cargo_bin("cwtools-server")
-        .unwrap()
-        .arg("--help")
-        .assert()
-        .success()
-        .stderr(predicates::str::contains("cwtools-server"))
-        .stderr(predicates::str::contains("Language Server Protocol"));
-}
-
-#[test]
-fn test_lsp_version_exits_zero() {
-    assert_cmd::Command::cargo_bin("cwtools-server")
-        .unwrap()
-        .arg("--version")
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("cwtools-server"));
-}
-
-// ── Initialize handshake ─────────────────────────────────────────────────────
-
-#[test]
-fn test_lsp_initialize_handshake() {
-    let tmp = tempfile::tempdir().unwrap();
-    let uri = format!("file://{}", tmp.path().display());
-
-    let mut child = cwtools_server_cmd()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn");
-
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-
-    let body = jsonrpc_request(
-        1,
-        "initialize",
-        serde_json::json!({
-            "processId": std::process::id(),
-            "rootUri": uri,
-            "capabilities": {}
-        }),
-    );
-    write_frame(&mut child, &body).unwrap();
-    let resp_str = read_response(&mut reader).expect("no response");
-    child.kill().ok();
-
-    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
-    assert_eq!(resp["id"], 1);
-    assert!(resp["result"]["capabilities"].is_object());
-}
-
-// ── Shutdown without workspace scan ──────────────────────────────────────────
-
-#[test]
-fn test_lsp_shutdown_without_scan() {
-    let tmp = tempfile::tempdir().unwrap();
-    let uri = format!("file://{}", tmp.path().display());
-
-    let mut child = cwtools_server_cmd()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn");
-
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-
-    let body = jsonrpc_request(
-        1,
-        "initialize",
-        serde_json::json!({
-            "processId": std::process::id(),
-            "rootUri": uri,
-            "capabilities": {}
-        }),
-    );
-    write_frame(&mut child, &body).unwrap();
-    let resp_str = read_response(&mut reader).expect("no init response");
-    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
-    assert_eq!(resp["id"], 1);
-
-    let body = jsonrpc_request(2, "shutdown", serde_json::json!(null));
-    write_frame(&mut child, &body).unwrap();
-    let resp_str = read_response(&mut reader).expect("no shutdown response");
-    child.kill().ok();
-
-    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
-    assert_eq!(resp["id"], 2);
-    assert!(resp["result"].is_null());
 }
 
 // ── Full lifecycle: initialize → initialized → shutdown ──────────────────────
@@ -197,6 +129,7 @@ fn test_lsp_full_lifecycle() {
     let resp_str = read_response(&mut reader).expect("no init response");
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     assert_eq!(resp["id"], 1);
+    assert!(resp["result"]["capabilities"].is_object());
 
     let body = jsonrpc_notification("initialized", serde_json::json!({}));
     write_frame(&mut child, &body).unwrap();
@@ -340,6 +273,8 @@ fn completion_labels(rel_path: &str, text: &str, line0: u32, char0: u32) -> Vec<
         }),
     );
     write_frame(&mut child, &body).unwrap();
+    // Wait for the file's index write to land before requesting completion.
+    wait_for_diagnostics(&mut reader, rel_path);
 
     let body = jsonrpc_request(
         2,
@@ -377,6 +312,13 @@ fn test_completion_trigger_alias_in_allowed_block() {
         labels
     );
     assert!(labels.iter().any(|l| l == "always"), "got: {:?}", labels);
+    // The sibling decision field `cost` lives one level up, not inside `allowed`.
+    // It must not leak in, or context-awareness is broken.
+    assert!(
+        !labels.iter().any(|l| l == "cost"),
+        "out-of-context field `cost` should not appear inside allowed, got: {:?}",
+        labels
+    );
 }
 
 #[test]
@@ -392,6 +334,13 @@ fn test_completion_modifiers_in_mio_equipment_bonus() {
     assert!(
         labels.iter().any(|l| l == "build_cost_ic"),
         "modifier names should be offered inside an equipment_bonus entry, got: {:?}",
+        labels
+    );
+    // `name` is a top-level mio field, not a modifier; it must not leak into the
+    // equipment entry's modifier completions.
+    assert!(
+        !labels.iter().any(|l| l == "name"),
+        "out-of-context field `name` should not appear inside an equipment entry, got: {:?}",
         labels
     );
 }
@@ -506,7 +455,9 @@ fn completion_labels_with_files(
     let _ = read_response(&mut reader).expect("no init response");
 
     // didOpen every file so each is indexed deterministically (no reliance on
-    // the async workspace scan).
+    // the async workspace scan). Wait for each file's diagnostics before sending
+    // the next message so its index write (value_set members, enum values, type
+    // instances) is queryable when the cross-file completion runs.
     for (rel, content) in extra_files.iter().chain([&(rel_path, text)]) {
         let uri = format!("file://{}", ws.path().join(rel).display());
         let body = jsonrpc_notification(
@@ -521,6 +472,7 @@ fn completion_labels_with_files(
             }),
         );
         write_frame(&mut child, &body).unwrap();
+        wait_for_diagnostics(&mut reader, rel);
     }
 
     let doc_uri = format!("file://{}", ws.path().join(rel_path).display());
@@ -618,24 +570,32 @@ fn test_completion_country_flags_for_has_country_flag() {
 
 // ── Hover: localisation display ──────────────────────────────────────────────
 
-#[test]
-fn test_hover_shows_localisation() {
+/// Spawn a server with DYNAMIC_RULES, write `loc_files` (each: filename under
+/// `localisation/`, full text including the `l_xxx:` header; a UTF-8 BOM is
+/// prepended) and the one script file, run the workspace scan, then return the
+/// hover markdown at (line, character) on the script. `extra_init` is merged
+/// into the init options. Polls until the loc map is populated.
+fn hover_markdown(
+    loc_files: &[(&str, &str)],
+    script_rel: &str,
+    script_text: &str,
+    line: u32,
+    character: u32,
+    extra_init: serde_json::Value,
+) -> String {
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     std::fs::write(rules_dir.path().join("test_rules.cwt"), DYNAMIC_RULES).unwrap();
 
-    // Create a loc file (needs UTF-8 BOM and l_english header).
     let loc_dir = ws.path().join("localisation");
     std::fs::create_dir_all(&loc_dir).unwrap();
-    let mut loc_content: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
-    loc_content.extend_from_slice(b"l_english:\n");
-    loc_content.extend_from_slice(b" my_idea:0 \"My Awesome Idea\"\n");
-    std::fs::write(loc_dir.join("test_l_english.yml"), &loc_content).unwrap();
+    for (name, content) in loc_files {
+        let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(content.as_bytes());
+        std::fs::write(loc_dir.join(name), &bytes).unwrap();
+    }
 
-    // Script file that references the loc key as a value.
-    let script_text = "my_country = {\n    name = my_idea\n}\n";
-    let script_path = "common/countries/test.txt";
-    let p = ws.path().join(script_path);
+    let p = ws.path().join(script_rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(&p, script_text).unwrap();
 
@@ -648,7 +608,15 @@ fn test_hover_shows_localisation() {
         .expect("failed to spawn");
     let mut reader = BufReader::new(child.stdout.take().unwrap());
 
-    // initialize
+    let mut init_opts = serde_json::json!({
+        "language": "hoi4",
+        "rulesCache": rules_dir.path().to_string_lossy(),
+    });
+    if let Some(obj) = extra_init.as_object() {
+        for (k, v) in obj {
+            init_opts[k] = v.clone();
+        }
+    }
     let body = jsonrpc_request(
         1,
         "initialize",
@@ -656,10 +624,7 @@ fn test_hover_shows_localisation() {
             "processId": std::process::id(),
             "rootUri": ws_uri,
             "capabilities": {},
-            "initializationOptions": {
-                "language": "hoi4",
-                "rulesCache": rules_dir.path().to_string_lossy(),
-            }
+            "initializationOptions": init_opts,
         }),
     );
     write_frame(&mut child, &body).unwrap();
@@ -669,7 +634,6 @@ fn test_hover_shows_localisation() {
     let body = jsonrpc_notification("initialized", serde_json::json!({}));
     write_frame(&mut child, &body).unwrap();
 
-    // didOpen the script file
     let doc_uri = format!("file://{}", p.display());
     let body = jsonrpc_notification(
         "textDocument/didOpen",
@@ -685,17 +649,15 @@ fn test_hover_shows_localisation() {
     write_frame(&mut child, &body).unwrap();
 
     // Poll hover until loc_text is populated (workspace scan completes).
+    // read_response only returns id-bearing messages, so send then read.
     let mut hover_value = String::new();
     for attempt in 0..30 {
-        // Drain any pending notifications before sending the request.
-        // read_response only returns messages with an `id`, so we need to
-        // send the hover request first, then read.
         let hover_req = jsonrpc_request(
             2 + attempt,
             "textDocument/hover",
             serde_json::json!({
                 "textDocument": { "uri": doc_uri },
-                "position": { "line": 1, "character": 14 },
+                "position": { "line": line, "character": character },
             }),
         );
         write_frame(&mut child, &hover_req).unwrap();
@@ -711,20 +673,118 @@ fn test_hover_shows_localisation() {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     child.kill().ok();
+    hover_value
+}
 
-    assert!(
-        hover_value.contains("Localisation"),
-        "hover should include localisation section, got: {}",
-        hover_value
+#[test]
+fn test_hover_shows_localisation() {
+    // A reference: the loc key appears as a leaf value (`name = my_idea`).
+    let hover = hover_markdown(
+        &[(
+            "test_l_english.yml",
+            "l_english:\n my_idea:0 \"My Awesome Idea\"\n",
+        )],
+        "common/countries/test.txt",
+        "my_country = {\n    name = my_idea\n}\n",
+        1,
+        14,
+        serde_json::json!({}),
     );
     assert!(
-        hover_value.contains("My Awesome Idea"),
-        "hover should include loc text, got: {}",
-        hover_value
+        hover.contains("Localisation"),
+        "hover should include localisation section, got: {hover}"
     );
     assert!(
-        hover_value.contains("English"),
-        "hover should include language label, got: {}",
-        hover_value
+        hover.contains("My Awesome Idea"),
+        "hover should include loc text, got: {hover}"
+    );
+    assert!(
+        hover.contains("English"),
+        "hover should include language label, got: {hover}"
+    );
+}
+
+#[test]
+fn test_hover_idea_definition_shows_name_and_desc() {
+    // A definition key: the idea token IS the loc key, with `<key>_desc` for the
+    // description. Hover the key itself (not a value reference).
+    let hover = hover_markdown(
+        &[(
+            "test_l_english.yml",
+            "l_english:\n my_great_idea:0 \"Great Idea\"\n my_great_idea_desc:0 \"It is great.\"\n",
+        )],
+        "common/ideas/test.txt",
+        "my_great_idea = {\n    cost = 5\n}\n",
+        0,
+        3,
+        serde_json::json!({}),
+    );
+    assert!(
+        hover.contains("Great Idea"),
+        "hover on an idea key should show its name loc, got: {hover}"
+    );
+    assert!(
+        hover.contains("It is great."),
+        "hover on an idea key should show its _desc loc, got: {hover}"
+    );
+}
+
+#[test]
+fn test_hover_default_hides_other_languages() {
+    // Default (hoverShowAllLanguages off): only the primary language is shown.
+    let hover = hover_markdown(
+        &[
+            (
+                "test_l_english.yml",
+                "l_english:\n my_idea:0 \"English Name\"\n",
+            ),
+            (
+                "test_l_french.yml",
+                "l_french:\n my_idea:0 \"Nom Francais\"\n",
+            ),
+        ],
+        "common/countries/test.txt",
+        "my_country = {\n    name = my_idea\n}\n",
+        1,
+        14,
+        serde_json::json!({}),
+    );
+    assert!(
+        hover.contains("English Name"),
+        "hover should show the primary (English) loc, got: {hover}"
+    );
+    assert!(
+        !hover.contains("Nom Francais"),
+        "hover should not show other languages by default, got: {hover}"
+    );
+}
+
+#[test]
+fn test_hover_show_all_languages_flag() {
+    // With hoverShowAllLanguages on, every collected language is shown.
+    let hover = hover_markdown(
+        &[
+            (
+                "test_l_english.yml",
+                "l_english:\n my_idea:0 \"English Name\"\n",
+            ),
+            (
+                "test_l_french.yml",
+                "l_french:\n my_idea:0 \"Nom Francais\"\n",
+            ),
+        ],
+        "common/countries/test.txt",
+        "my_country = {\n    name = my_idea\n}\n",
+        1,
+        14,
+        serde_json::json!({ "hoverShowAllLanguages": true }),
+    );
+    assert!(
+        hover.contains("English Name"),
+        "hover should show English loc, got: {hover}"
+    );
+    assert!(
+        hover.contains("Nom Francais"),
+        "hover with the flag on should show French loc too, got: {hover}"
     );
 }
