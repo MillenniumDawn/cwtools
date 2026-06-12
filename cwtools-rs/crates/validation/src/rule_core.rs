@@ -952,71 +952,33 @@ fn is_scope_key(
         || type_index.is_some_and(|idx| idx.is_any_instance(key))
 }
 
-/// If `pattern` embeds a placeholder, test whether `key` matches: a literal
-/// prefix and suffix around a member of the placeholder's set. Returns `None`
-/// when there is no placeholder (the caller does a literal compare instead).
+/// Test whether `key` matches the pre-parsed alias pattern.
 ///
-/// Placeholder forms (these appear in dynamic-modifier / scripted-* alias names):
-///   `<type>` / `<type.subtype>` — an instance of `type` (subtype ignored)
-///   `value[set]` / `value_set[set]` — a member of that value set
-///   `enum[name]` — a member of that enum
-fn alias_pattern_matches(
-    pattern: &str,
+/// The pattern was already split into (prefix, kind, placeholder_name, suffix)
+/// at ruleset build time by `ParsedAliasPattern::parse`; this function only
+/// does the per-call key-matching work (prefix/suffix strip + membership test).
+fn parsed_pattern_matches(
+    pat: &ParsedAliasPattern,
     key: &str,
     ruleset: &RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
-) -> Option<bool> {
-    // Locate the placeholder and split into (prefix, kind, name, suffix).
-    let (pre, kind, name, suf): (&str, &str, &str, &str) = if let Some(open) = pattern.find('<') {
-        let close = open + pattern[open..].find('>')?;
-        (
-            &pattern[..open],
-            "type",
-            &pattern[open + 1..close],
-            &pattern[close + 1..],
-        )
-    } else {
-        // Bracketed forms — check the longer markers first so `enum[` doesn't
-        // match inside `complex_enum[`, etc. Pick the earliest match in `pattern`.
-        let markers = [
-            ("value_set[", "value"),
-            ("complex_enum[", "enum"),
-            ("value[", "value"),
-            ("enum[", "enum"),
-        ];
-        let mut found: Option<(usize, &str, &str, &str, &str)> = None;
-        for (marker, kind) in markers {
-            if let Some(open) = pattern.find(marker) {
-                let inner = open + marker.len();
-                let close = inner + pattern[inner..].find(']')?;
-                if found.is_none_or(|(o, ..)| open < o) {
-                    found = Some((
-                        open,
-                        &pattern[..open],
-                        kind,
-                        &pattern[inner..close],
-                        &pattern[close + 1..],
-                    ));
-                }
-            }
-        }
-        let (_, p, k, n, s) = found?;
-        (p, k, n, s)
-    };
-
+) -> bool {
+    let pre = pat.prefix.as_str();
+    let suf = pat.suffix.as_str();
     if key.len() < pre.len() + suf.len() || !key.starts_with(pre) || !key.ends_with(suf) {
-        return Some(false);
+        return false;
     }
     let middle = &key[pre.len()..key.len() - suf.len()];
-    Some(match kind {
-        "type" => {
+    let name = pat.placeholder_name.as_str();
+    match pat.kind {
+        PatternKind::Type => {
             // `<type.subtype>` → check the base type (subtype is a refinement).
             let base = name.split('.').next().unwrap_or(name);
             type_index
                 .map(|idx| idx.contains(base, middle))
                 .unwrap_or(false)
         }
-        "enum" => match ruleset.enum_by_name.get(name) {
+        PatternKind::Enum => match ruleset.enum_by_name.get(name) {
             Some(&idx) if !ruleset.enums[idx].values.is_empty() => {
                 let def = &ruleset.enums[idx];
                 def.values.iter().any(|v| v.eq_ignore_ascii_case(middle))
@@ -1025,12 +987,11 @@ fn alias_pattern_matches(
             }
             _ => true, // enum absent/empty (game-derived) — permissive
         },
-        "value" => match ruleset.values.get(name) {
+        PatternKind::Value => match ruleset.values.get(name) {
             Some(vs) if !vs.is_empty() => vs.iter().any(|v| v == middle),
             _ => true, // value set not collected — permissive
         },
-        _ => false,
-    })
+    }
 }
 
 pub(crate) fn field_matches_key(
@@ -1073,10 +1034,8 @@ pub(crate) fn field_matches_key(
                 // Category has no aliases at all — be permissive (avoid floods).
                 None => true,
                 Some(cat) => {
-                    for &idx in &cat.type_pattern_idxs {
-                        let name = &ruleset.aliases[idx].0;
-                        let rest = &name[category.len() + 1..];
-                        if alias_pattern_matches(rest, key, ruleset, type_index) == Some(true) {
+                    for pat in &cat.parsed_patterns {
+                        if parsed_pattern_matches(pat, key, ruleset, type_index) {
                             return true;
                         }
                     }
@@ -1193,11 +1152,9 @@ pub(crate) fn alias_overloads<'a>(
         }
     }
     if let Some(cat) = ruleset.alias_categories.get(category) {
-        for &idx in &cat.type_pattern_idxs {
-            let (name, rule) = &ruleset.aliases[idx];
-            let rest = &name[category.len() + 1..];
-            if alias_pattern_matches(rest, key, ruleset, type_index) == Some(true) {
-                overloads.push(rule);
+        for pat in &cat.parsed_patterns {
+            if parsed_pattern_matches(pat, key, ruleset, type_index) {
+                overloads.push(&ruleset.aliases[pat.alias_idx].1);
             }
         }
         if let Some(sf_idx) = cat.scope_field_idx
