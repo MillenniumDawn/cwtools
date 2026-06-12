@@ -4,6 +4,7 @@ use cwtools_rules::rules_types::{
 };
 use cwtools_string_table::string_table::StringTable;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub mod dynamic_values;
 pub mod vanilla_cache;
@@ -194,7 +195,7 @@ impl VarIndex {
 #[derive(Debug, Default)]
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
-    pub map: HashMap<String, Vec<(String, TypeInstance)>>,
+    pub map: HashMap<String, Vec<(Arc<str>, TypeInstance)>>,
     /// lowercased instance name → how many definitions carry that name (across all
     /// types and files). Lets `is_any_instance` be O(1) instead of scanning every
     /// instance. A refcount so `remove_file` can drop a name only when its last
@@ -250,7 +251,7 @@ impl TypeIndex {
     }
 
     /// All instances for a type (across all files).
-    pub fn instances(&self, type_name: &str) -> &[(String, TypeInstance)] {
+    pub fn instances(&self, type_name: &str) -> &[(Arc<str>, TypeInstance)] {
         self.map.get(type_name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
@@ -261,7 +262,7 @@ impl TypeIndex {
         let mut out = Vec::new();
         for (type_name, entries) in &self.map {
             for (uri, inst) in entries {
-                if uri == file_uri {
+                if uri.as_ref() == file_uri {
                     out.push((type_name.as_str(), inst));
                 }
             }
@@ -271,6 +272,7 @@ impl TypeIndex {
 
     /// Merge per-file results into the index.
     pub fn merge(&mut self, file_uri: &str, per_type: HashMap<String, Vec<TypeInstance>>) {
+        let uri: Arc<str> = Arc::from(file_uri);
         for (type_name, instances) in per_type {
             let set = self.instance_sets.entry(type_name.clone()).or_default();
             let entry = self.map.entry(type_name).or_default();
@@ -278,7 +280,7 @@ impl TypeIndex {
                 let lower = inst.name.to_ascii_lowercase();
                 *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
                 *set.entry(lower).or_insert(0) += 1;
-                entry.push((file_uri.to_string(), inst));
+                entry.push((Arc::clone(&uri), inst));
             }
         }
     }
@@ -289,7 +291,7 @@ impl TypeIndex {
         self.value_set_values.remove_file(file_uri);
         for (type_name, v) in self.map.iter_mut() {
             v.retain(|(uri, inst)| {
-                let keep = uri != file_uri;
+                let keep = uri.as_ref() != file_uri;
                 if !keep {
                     let lower = inst.name.to_ascii_lowercase();
                     if let Some(count) = self.name_counts.get_mut(&lower) {

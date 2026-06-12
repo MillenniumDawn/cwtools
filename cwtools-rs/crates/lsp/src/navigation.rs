@@ -199,7 +199,7 @@ impl Backend {
                     .filter(|(_, inst)| inst.name == instance_name)
                 {
                     all_locs.push(Location {
-                        uri: file_uri.parse().unwrap_or_else(|_| {
+                        uri: file_uri.as_ref().parse().unwrap_or_else(|_| {
                             params.text_document_position.text_document.uri.clone()
                         }),
                         range: Range {
@@ -422,6 +422,7 @@ impl Backend {
                         deprecated: None,
                         location: Location {
                             uri: file_uri
+                                .as_ref()
                                 .parse()
                                 .unwrap_or_else(|_| Url::parse("file:///unknown").unwrap()),
                             range: Range {
@@ -515,7 +516,7 @@ impl Backend {
             let info = self.state.info_service.read();
             let instances = info.type_index.instances(&type_name);
             for (file_uri, inst) in instances.iter().filter(|(_, i)| i.name == instance_name) {
-                all_locs.push((file_uri.clone(), inst.location, instance_name.len()));
+                all_locs.push((file_uri.to_string(), inst.location, instance_name.len()));
             }
         }
 

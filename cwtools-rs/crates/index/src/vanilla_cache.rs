@@ -263,7 +263,7 @@ pub fn save(
             entries.iter().map(move |(file_uri, inst)| CachedInstance {
                 t: type_name.clone(),
                 n: inst.name.clone(),
-                f: file_uri.clone(),
+                f: file_uri.to_string(),
                 l: inst.location.line,
                 c: inst.location.col,
             })
