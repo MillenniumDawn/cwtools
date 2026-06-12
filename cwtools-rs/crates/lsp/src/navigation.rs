@@ -7,7 +7,7 @@ use cwtools_info::{PositionElement, element_at_position};
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType};
 use cwtools_string_table::string_table::StringTable;
 
-use crate::paths::{cwtools_info_path_check, logical_path_from_uri, parse_uri};
+use crate::paths::{logical_path_from_uri, parse_uri};
 use crate::{Backend, ParsedDoc, RuleCursorInfo};
 use cwtools_info::ReferenceHint;
 
@@ -720,7 +720,7 @@ pub(crate) fn is_type_ref_leaf(
             && let Some(&idx) = ruleset.type_by_name.get(name)
         {
             let td = &ruleset.types[idx];
-            if !cwtools_info_path_check(&td.path_options, logical_path) {
+            if !cwtools_info::check_path_dir(&td.path_options, logical_path) {
                 continue;
             }
         }

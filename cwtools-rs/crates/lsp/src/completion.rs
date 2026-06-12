@@ -9,7 +9,7 @@ use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 use cwtools_validation::{Prepared, build_enum_map, checks_from_env};
 
 use crate::Backend;
-use crate::paths::{cwtools_info_path_check, line_value_key, logical_path_from_uri};
+use crate::paths::{line_value_key, logical_path_from_uri};
 
 impl Backend {
     pub(crate) async fn completion_impl(
@@ -723,7 +723,7 @@ pub(crate) fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<C
     let mut items = Vec::new();
 
     for td in &ruleset.types {
-        if !cwtools_info_path_check(&td.path_options, logical_path) {
+        if !cwtools_info::check_path_dir(&td.path_options, logical_path) {
             continue;
         }
 

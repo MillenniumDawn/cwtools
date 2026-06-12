@@ -138,38 +138,6 @@ pub(crate) fn discover_vanilla_dir(game: &str) -> Option<std::path::PathBuf> {
         .find(|p| p.is_dir())
 }
 
-/// Thin wrapper around the info crate's path check (avoids re-exporting it).
-pub(crate) fn cwtools_info_path_check(
-    opts: &cwtools_rules::rules_types::PathOptions,
-    logical_path: &str,
-) -> bool {
-    if opts.paths.is_empty() {
-        return true;
-    }
-    let norm = logical_path.replace('\\', "/");
-    let dir = match norm.rfind('/') {
-        Some(idx) => &norm[..idx],
-        None => "",
-    };
-    let dir_lower = dir.to_lowercase();
-    for p in &opts.paths {
-        let pat = p.replace('\\', "/");
-        let pat = pat.trim_matches('/');
-        let pat_lower = pat.to_lowercase();
-        if opts.path_strict {
-            if dir_lower == pat_lower {
-                return true;
-            }
-        } else {
-            let after = &dir_lower[std::cmp::min(pat_lower.len(), dir_lower.len())..];
-            if dir_lower.starts_with(&pat_lower) && (after.is_empty() || after.starts_with('/')) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Strip matching outer double quotes from a loc desc string for hover display.
 /// `"Hello"` → `Hello`, `Hello` → `Hello`, `""` → `` (empty).
 pub(crate) fn strip_loc_quotes(s: &str) -> &str {
