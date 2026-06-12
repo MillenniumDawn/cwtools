@@ -104,18 +104,6 @@ impl LocIndex {
         }
     }
 
-    /// Build directly from a precomputed key union (no per-language data, no
-    /// entries). Useful for single-file LSP validation where only existence
-    /// matters and the full service isn't rebuilt.
-    pub fn from_union(union: HashSet<String>) -> Self {
-        Self {
-            per_language: HashMap::new(),
-            union,
-            languages_with_data: Vec::new(),
-            entries: HashMap::new(),
-        }
-    }
-
     /// synced=false: the key exists in at least one language.
     pub fn exists_any(&self, key_lower: &str) -> bool {
         self.union.contains(key_lower)

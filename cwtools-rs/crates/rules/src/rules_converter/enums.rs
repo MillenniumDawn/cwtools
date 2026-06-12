@@ -178,17 +178,10 @@ fn build_name_tree(
                     });
                 } else {
                     let v = leaf_value_string(l, table);
-                    if v == "enum_name" || v == "this" {
-                        entries.push(ComplexEnumNameTreeEntry::Leaf {
-                            key: k,
-                            is_name: true,
-                        });
-                    } else {
-                        entries.push(ComplexEnumNameTreeEntry::Leaf {
-                            key: k,
-                            is_name: false,
-                        });
-                    }
+                    entries.push(ComplexEnumNameTreeEntry::Leaf {
+                        key: k,
+                        is_name: v == "enum_name" || v == "this",
+                    });
                 }
             }
             // A bare `enum_name` value (`stats = { enum_name }`): every bare

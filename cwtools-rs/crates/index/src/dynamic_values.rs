@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::{ComplexEnumNameTree, ComplexEnumNameTreeEntry, RuleSet};
-use cwtools_string_table::string_table::StringTable;
+use cwtools_string_table::string_table::{StringId, StringTable};
 
 use crate::check_path_dir;
 
@@ -138,6 +138,30 @@ fn unquote(s: String) -> String {
     }
 }
 
+/// Push a value-set member, stripping an `@datestamp` suffix
+/// (`my_flag@1936.1.1` sets `my_flag`). Empty bases are skipped.
+fn push_member(out: &mut HashMap<String, Vec<String>>, ns: String, raw: String) {
+    let v = unquote(raw);
+    let base = v.split('@').next().unwrap_or(&v);
+    if !base.is_empty() {
+        out.entry(ns).or_default().push(base.to_string());
+    }
+}
+
+fn push_unquoted_key(out: &mut Vec<String>, table: &StringTable, id: StringId) {
+    if let Some(k) = table.get_string(id) {
+        out.push(unquote(k));
+    }
+}
+
+/// `scalar` matches any key; otherwise compare case-insensitively.
+fn key_matches(table: &StringTable, id: StringId, key: &str) -> bool {
+    key == "scalar"
+        || table
+            .with_string(id, |s| s.eq_ignore_ascii_case(key))
+            .unwrap_or(false)
+}
+
 /// Walk one level of a complex-enum name tree against `children`, capturing
 /// member names per the marker forms:
 ///   * `enum_name = { ... }` (Node, key `enum_name`)  -> each clause child's KEY
@@ -169,14 +193,8 @@ fn walk_name_tree(
                         continue;
                     };
                     if key == "enum_name" {
-                        if let Some(k) = table.get_string(leaf.key.normal) {
-                            out.push(unquote(k));
-                        }
-                    } else if key == "scalar"
-                        || table
-                            .with_string(leaf.key.normal, |s| s.eq_ignore_ascii_case(key))
-                            .unwrap_or(false)
-                    {
+                        push_unquoted_key(out, table, leaf.key.normal);
+                    } else if key_matches(table, leaf.key.normal, key) {
                         walk_name_tree(inner, sub, ast, table, out);
                     }
                 }
@@ -190,11 +208,7 @@ fn walk_name_tree(
                     }
                     if *is_name {
                         // `key = enum_name`: the VALUE of matching leaves.
-                        let key_matches = key == "scalar"
-                            || table
-                                .with_string(leaf.key.normal, |s| s.eq_ignore_ascii_case(key))
-                                .unwrap_or(false);
-                        if key_matches
+                        if key_matches(table, leaf.key.normal, key)
                             && let Value::String(t) | Value::QString(t) = &leaf.value
                             && let Some(v) = table.get_string(t.normal)
                         {
@@ -202,9 +216,7 @@ fn walk_name_tree(
                         }
                     } else if key == "enum_name" {
                         // `enum_name = scalar`: each scalar leaf's KEY.
-                        if let Some(k) = table.get_string(leaf.key.normal) {
-                            out.push(unquote(k));
-                        }
+                        push_unquoted_key(out, table, leaf.key.normal);
                     }
                 }
             }
@@ -266,12 +278,7 @@ fn collect_value_sets_in(
             (_, Some(ns)) if ns == "variable" => {}
             (Value::String(t) | Value::QString(t), Some(ns)) => {
                 if let Some(v) = table.get_string(t.normal) {
-                    // Strip an `@datestamp` suffix (`my_flag@1936.1.1` sets my_flag).
-                    let v = unquote(v);
-                    let base = v.split('@').next().unwrap_or(&v);
-                    if !base.is_empty() {
-                        out.entry(ns).or_default().push(base.to_string());
-                    }
+                    push_member(out, ns, v);
                 }
             }
             (Value::Clause(sub), Some(ns)) => {
@@ -289,11 +296,7 @@ fn collect_value_sets_in(
                         && let Value::String(t) | Value::QString(t) = &cl.value
                         && let Some(v) = table.get_string(t.normal)
                     {
-                        let v = unquote(v);
-                        let base = v.split('@').next().unwrap_or(&v);
-                        if !base.is_empty() {
-                            out.entry(ns.clone()).or_default().push(base.to_string());
-                        }
+                        push_member(out, ns.clone(), v);
                         break;
                     }
                 }

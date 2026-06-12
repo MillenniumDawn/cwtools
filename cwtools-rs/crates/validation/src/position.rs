@@ -155,9 +155,10 @@ pub fn rules_at_pos(
     if let Some((td, inner_rules)) = find_type_and_rules_for_file(&root_key, file_path, ruleset) {
         let has_content =
             !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
-        let skip_gate_ok = td.skip_root_key.is_empty() || should_skip_root_key(&root_key, td);
+        let skips = should_skip_root_key(&root_key, td);
+        let skip_gate_ok = td.skip_root_key.is_empty() || skips;
         if has_content && skip_gate_ok {
-            if should_skip_root_key(&root_key, td) {
+            if skips {
                 return descend_wrapper(
                     &ctx,
                     children,

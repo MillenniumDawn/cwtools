@@ -2043,10 +2043,7 @@ impl LanguageServer for Backend {
         };
 
         if let Some(items) = context_items {
-            if items.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(CompletionResponse::Array(items)));
+            return Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)));
         }
 
         // Fallback: flat global list (original behavior) when context-aware
