@@ -138,6 +138,17 @@ fn walk(
             );
         }
 
+        // CW281 — a `limit = { }` with no trigger conditions.
+        if key == kw.limit && non_comment_count(block.children) == 0 {
+            push(
+                errors,
+                &error_codes::CW281_EMPTY_LIMIT,
+                error_codes::CW281_EMPTY_LIMIT.message_template.to_string(),
+                block.range,
+                file_path,
+            );
+        }
+
         // CW251 — redundant boolean nesting; also compute the child context.
         let state = if key == kw.and {
             if parent == BoolState::And {

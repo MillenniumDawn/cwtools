@@ -37,12 +37,17 @@ impl Backend {
                 required_scopes: scopes,
             }) = self.rule_info_at_cursor(&uri, pos, &logical_path)
             {
+                let debug = self
+                    .state
+                    .hover_debug
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let mut md = build_hover_markdown(
                     &element,
                     &hint,
                     category.as_deref(),
                     desc.as_deref(),
                     &scopes,
+                    debug,
                 );
                 // For a variable read, append the known assigned value(s) so the
                 // user sees what it resolves to without chasing the definition.
@@ -71,30 +76,42 @@ impl Backend {
                 }));
             }
 
-            // Fallback: no-rule position finder
+            // Fallback: no-rule position finder. With debug off this shows only
+            // localisation (the raw `Field`/`Value` line is developer detail); if
+            // there's nothing to show, return no hover rather than an empty box.
             if let Some(element) = element_at_position(
                 &ast,
                 pos.line + 1,
                 pos.character as u16,
                 &self.state.string_table,
             ) {
-                let mut contents = match &element {
-                    PositionElement::Leaf { key, value } => {
-                        format!("**Field**: `{} = {}`", key, value)
+                let debug = self
+                    .state
+                    .hover_debug
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let mut contents = if debug {
+                    match &element {
+                        PositionElement::Leaf { key, value } => {
+                            format!("**Field**: `{} = {}`", key, value)
+                        }
+                        PositionElement::LeafValue { value } => {
+                            format!("**Value**: `{}`", value)
+                        }
                     }
-                    PositionElement::LeafValue { value } => {
-                        format!("**Value**: `{}`", value)
-                    }
+                } else {
+                    String::new()
                 };
                 // Append localisation translations for the hovered element.
                 append_localisation(&mut contents, &element, &self.state.loc_text.read());
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: contents,
-                    }),
-                    range: None,
-                }));
+                if !contents.trim().is_empty() {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: contents,
+                        }),
+                        range: None,
+                    }));
+                }
             }
         }
         Ok(None)
@@ -104,12 +121,19 @@ impl Backend {
 /// Build a Markdown hover string from the classified element + the matched
 /// rule's category, description, and required scopes (from
 /// `rule_info_at_cursor`).
+///
+/// By default this shows only the information a modder needs: the alias category
+/// header (Trigger/Effect/Modifier), the rule description, and the required
+/// scopes (plus localisation, appended by the caller). When `debug` is set the
+/// raw rule classification (`Type reference` / `Field` / `Scope` / …) is added —
+/// useful for extension developers, noise for everyone else.
 pub(crate) fn build_hover_markdown(
     element: &PositionElement,
     hint: &ReferenceHint,
     category: Option<&str>,
     rule_desc: Option<&str>,
     rule_scopes: &[String],
+    debug: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -125,46 +149,29 @@ pub(crate) fn build_hover_markdown(
         parts.push(format!("**{}** `{}`", label, key));
     }
 
-    // Primary classification
-    match hint {
-        ReferenceHint::TypeRef { type_name, value } => {
-            parts.push(format!(
-                "**Type reference** — `{}` (`{}`)",
-                value, type_name
-            ));
-        }
-        ReferenceHint::EnumRef { enum_name, value } => {
-            parts.push(format!(
-                "**Enum value** — `{}` (member of `{}`)",
-                value, enum_name
-            ));
-        }
-        ReferenceHint::LocRef { key } => {
-            parts.push(format!("**Localisation key** — `{}`", key));
-        }
-        ReferenceHint::FileRef { path } => {
-            parts.push(format!("**File path** — `{}`", path));
-        }
-        ReferenceHint::ScopeName { name } => {
-            parts.push(format!("**Scope** — `{}`", name));
-        }
-        ReferenceHint::Variable { name, namespace } => {
-            parts.push(format!(
-                "**Variable** — `{}` (namespace `{}`)",
-                name, namespace
-            ));
-        }
-        ReferenceHint::Unknown => {
-            // Fall back to the raw element description
-            match element {
-                PositionElement::Leaf { key, value } => {
-                    parts.push(format!("**Field** — `{} = {}`", key, value));
-                }
-                PositionElement::LeafValue { value } => {
-                    parts.push(format!("**Value** — `{}`", value));
-                }
+    // Raw rule classification — developer detail, off by default.
+    if debug {
+        let line = match hint {
+            ReferenceHint::TypeRef { type_name, value } => {
+                format!("**Type reference** — `{}` (`{}`)", value, type_name)
             }
-        }
+            ReferenceHint::EnumRef { enum_name, value } => {
+                format!("**Enum value** — `{}` (member of `{}`)", value, enum_name)
+            }
+            ReferenceHint::LocRef { key } => format!("**Localisation key** — `{}`", key),
+            ReferenceHint::FileRef { path } => format!("**File path** — `{}`", path),
+            ReferenceHint::ScopeName { name } => format!("**Scope** — `{}`", name),
+            ReferenceHint::Variable { name, namespace } => {
+                format!("**Variable** — `{}` (namespace `{}`)", name, namespace)
+            }
+            ReferenceHint::Unknown => match element {
+                PositionElement::Leaf { key, value } => {
+                    format!("**Field** — `{} = {}`", key, value)
+                }
+                PositionElement::LeafValue { value } => format!("**Value** — `{}`", value),
+            },
+        };
+        parts.push(line);
     }
 
     // Append rule description if found
@@ -234,10 +241,34 @@ mod tests {
             None,
             None,
             &[],
+            true,
         );
         assert!(md.contains("Type reference"), "got: {}", md);
         assert!(md.contains("my_ethos"), "got: {}", md);
         assert!(md.contains("ethoses"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_default_hides_classification() {
+        // Default (debug off): the raw "Type reference" line is suppressed, but
+        // the description and required scopes still show.
+        let md = build_hover_markdown(
+            &PositionElement::Leaf {
+                key: "ethos".to_string(),
+                value: "my_ethos".to_string(),
+            },
+            &ReferenceHint::TypeRef {
+                type_name: "ethoses".to_string(),
+                value: "my_ethos".to_string(),
+            },
+            None,
+            Some("Pick an ethos"),
+            &["country".to_string()],
+            false,
+        );
+        assert!(!md.contains("Type reference"), "should hide debug: {}", md);
+        assert!(md.contains("Pick an ethos"), "got: {}", md);
+        assert!(md.contains("Required scopes"), "got: {}", md);
     }
 
     #[test]
@@ -254,6 +285,7 @@ mod tests {
             None,
             None,
             &[],
+            true,
         );
         assert!(md.contains("Enum value"), "got: {}", md);
         assert!(md.contains("alpha"), "got: {}", md);
@@ -271,6 +303,7 @@ mod tests {
             None,
             None,
             &[],
+            true,
         );
         assert!(md.contains("foo") && md.contains("bar"), "got: {}", md);
     }
@@ -289,6 +322,7 @@ mod tests {
             None,
             Some("The kind of this thing"),
             &["country".to_string()],
+            false,
         );
         assert!(md.contains("The kind of this thing"), "got: {}", md);
         assert!(md.contains("Required scopes"), "got: {}", md);

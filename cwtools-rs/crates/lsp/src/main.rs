@@ -177,12 +177,28 @@ struct DocumentState {
     /// from the desc for cleaner display.
     #[allow(clippy::type_complexity)]
     loc_text: parking_lot::RwLock<HashMap<String, Vec<(cwtools_localization::Lang, String)>>>,
+    /// Definition site per loc key (lowercased) → (file URI, 0-based line). Built
+    /// from the LocService during workspace scan so goto-definition on a
+    /// `localisation` reference jumps to the `.yml` entry. One representative
+    /// (primary-language) location per key is enough for navigation.
+    loc_locations: parking_lot::RwLock<HashMap<String, (String, u32)>>,
     /// When `false` (the default), hover shows localisation for the primary
     /// language only (the first of `config.loc_languages`, else English) and the
     /// `loc_text` map only stores that language. Set via the
     /// `hoverShowAllLanguages` init option. Storing one language keeps the map
     /// small; the user opts into all translations explicitly.
     hover_show_all_languages: std::sync::atomic::AtomicBool,
+    /// Developer hover toggle (`hoverDebug` init option). When `true`, hover
+    /// includes the raw rule classification (field/type/scope) lines; off by
+    /// default so users see only localisation, description, and required scopes.
+    hover_debug: std::sync::atomic::AtomicBool,
+    /// `false` until the first full workspace scan has finished building the
+    /// index. While `false`, per-file validation still parses and indexes, but
+    /// suppresses published diagnostics (clears instead) so the user never sees
+    /// transient "not found" errors for cross-file references whose defining file
+    /// isn't indexed yet. The scan publishes the real diagnostics once the index
+    /// is complete. Set `true` with no workspace folder (nothing to index).
+    index_ready: std::sync::atomic::AtomicBool,
     /// Monotonic edit counter, bumped on every `did_change`. A debounced
     /// validation captures the value at spawn time; the cross-file dependent
     /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
@@ -228,7 +244,10 @@ impl DocumentState {
             vanilla_loc_keys: Mutex::new(None),
             loc_index: parking_lot::RwLock::new(None),
             loc_text: parking_lot::RwLock::new(HashMap::new()),
+            loc_locations: parking_lot::RwLock::new(HashMap::new()),
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
+            hover_debug: std::sync::atomic::AtomicBool::new(false),
+            index_ready: std::sync::atomic::AtomicBool::new(false),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
             pending_changed_names: Mutex::new(HashSet::new()),
@@ -331,10 +350,42 @@ impl Backend {
                 scopes = opts.required_scopes.clone();
             }
             if matches!(hint, ReferenceHint::Unknown) {
-                hint = hint_from_rule_right(rule_type, &leaf.value);
+                hint = hint_from_rule_right(rule_type, &leaf.value, rs);
             }
         }
-        let category = if leaf.key.is_empty() {
+        // Key-position references: when the right-hand classification yields
+        // nothing and the cursor is on a key (e.g. `<character> = { … }` used as
+        // a scoped-trigger block, or a `type[…]` definition key), classify the
+        // key against the matched rule's LEFT field so hover renders a rich
+        // header and goto can resolve the definition.
+        if matches!(hint, ReferenceHint::Unknown) && !leaf.key.is_empty() {
+            for (rule_type, _) in &rctx.value_rules {
+                let left_hint = hint_from_rule_left(rule_type, &leaf.key);
+                if !matches!(left_hint, ReferenceHint::Unknown) {
+                    hint = left_hint;
+                    break;
+                }
+            }
+        }
+        // Scope-link key: a bare key that is a known instance of a type used as a
+        // link `data_source` (e.g. a character name scoping into that character).
+        // Such keys don't match a rule, so `value_rules` is empty and any
+        // description that did match comes from a coincidental alias — resolve the
+        // key to its type and drop the misleading description/category.
+        let mut scope_link_key = false;
+        if !leaf.in_value
+            && !leaf.key.is_empty()
+            && !matches!(hint, ReferenceHint::TypeRef { .. })
+            && let Some(type_name) = scope_link_key_type(rs, &info_guard.type_index, &leaf.key)
+        {
+            hint = ReferenceHint::TypeRef {
+                type_name,
+                value: leaf.key.clone(),
+            };
+            description = None;
+            scope_link_key = true;
+        }
+        let category = if leaf.key.is_empty() || scope_link_key {
             None
         } else {
             cwtools_validation::position::alias_category_for_key(
@@ -369,19 +420,42 @@ pub(crate) struct RuleCursorInfo {
 /// Map a matched leaf rule's right-hand field to a [`ReferenceHint`] for the
 /// leaf's value (the same classification `info_at_position` used to do at
 /// depth 0-1, now fed by the full position resolver).
-fn hint_from_rule_right(rule_type: &RuleType, value: &str) -> ReferenceHint {
+fn hint_from_rule_right(rule_type: &RuleType, value: &str, ruleset: &RuleSet) -> ReferenceHint {
     let right = match rule_type {
         RuleType::LeafRule { right, .. } => right,
         RuleType::LeafValueRule { right } => right,
         _ => return ReferenceHint::Unknown,
     };
-    match right {
+    field_to_hint(right, value, ruleset)
+}
+
+/// Map a matched rule's LEFT field to a [`ReferenceHint`] for the key — for
+/// references that sit on the key, like a `<character>` used as a scoped-trigger
+/// block key or a `type[…]` entity-definition key.
+fn hint_from_rule_left(rule_type: &RuleType, key: &str) -> ReferenceHint {
+    let left = match rule_type {
+        RuleType::LeafRule { left, .. } => left,
+        RuleType::NodeRule { left, .. } => left,
+        _ => return ReferenceHint::Unknown,
+    };
+    match left {
+        NewField::TypeField(_) | NewField::ValueField(ValueType::Enum(_)) => {
+            // No ruleset needed for the type/enum cases; the scope-link upgrade
+            // only applies to right-hand values, so pass an empty ruleset.
+            field_to_hint_simple(left, key)
+        }
+        _ => ReferenceHint::Unknown,
+    }
+}
+
+/// Shared field → hint mapping for the type/enum cases that don't need the
+/// ruleset (used by the key-side classifier).
+fn field_to_hint_simple(field: &NewField, value: &str) -> ReferenceHint {
+    match field {
         NewField::TypeField(TypeType::Simple(t)) => ReferenceHint::TypeRef {
             type_name: t.clone(),
             value: value.to_string(),
         },
-        // `modifier:production_speed_<building>_factor` style: strip the
-        // literal affixes so the instance name is what's looked up.
         NewField::TypeField(TypeType::Complex {
             prefix,
             name,
@@ -401,6 +475,15 @@ fn hint_from_rule_right(rule_type: &RuleType, value: &str) -> ReferenceHint {
             enum_name: e.clone(),
             value: value.to_string(),
         },
+        _ => ReferenceHint::Unknown,
+    }
+}
+
+/// Full field → hint mapping for a right-hand value. Resolves a prefixed scope
+/// reference (e.g. `sp:sp_nuclear_reactor`) to a `TypeRef` via the matching
+/// link's `data_source` `<type>`, so goto/hover treat the value as that instance.
+fn field_to_hint(field: &NewField, value: &str, ruleset: &RuleSet) -> ReferenceHint {
+    match field {
         NewField::LocalisationField { .. } => ReferenceHint::LocRef {
             key: value.to_string(),
         },
@@ -411,11 +494,67 @@ fn hint_from_rule_right(rule_type: &RuleType, value: &str) -> ReferenceHint {
             name: value.to_string(),
             namespace: ns.clone(),
         },
-        NewField::ScopeField(_) => ReferenceHint::ScopeName {
-            name: value.to_string(),
-        },
-        _ => ReferenceHint::Unknown,
+        NewField::ScopeField(_) => {
+            scope_prefixed_type_ref(value, ruleset).unwrap_or_else(|| ReferenceHint::ScopeName {
+                name: value.to_string(),
+            })
+        }
+        other => field_to_hint_simple(other, value),
     }
+}
+
+/// A prefixed scope reference like `sp:sp_nuclear_reactor` resolves through the
+/// link whose `prefix` matches (`sp` → `prefix = sp:`, `data_source =
+/// <special_project>`). Strip the prefix and point at the data-source type. The
+/// scope-field's scope NAME (`special_project`) is a scope type, not the link
+/// name, so matching must be by value prefix.
+fn scope_prefixed_type_ref(value: &str, ruleset: &RuleSet) -> Option<ReferenceHint> {
+    for li in &ruleset.link_inputs {
+        let prefix = li.prefix.as_deref()?;
+        if prefix.is_empty() {
+            continue;
+        }
+        let Some(rest) = value.strip_prefix(prefix) else {
+            continue;
+        };
+        for ds in &li.data_source {
+            if let Some(t) = ds.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+                return Some(ReferenceHint::TypeRef {
+                    type_name: t.to_string(),
+                    value: rest.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// A bare key that is a known instance of a type used as a prefix-less link
+/// `data_source` (e.g. a character name, where the `character` link's
+/// `data_source` is `<character>`). Returns the type name so the key resolves to
+/// its definition. Used for keys that scope into an entity without a rule match.
+fn scope_link_key_type(
+    ruleset: &RuleSet,
+    type_index: &cwtools_info::TypeIndex,
+    key: &str,
+) -> Option<String> {
+    for li in &ruleset.link_inputs {
+        // A bare key carries no prefix, so only prefix-less links apply.
+        if li.prefix.is_some() {
+            continue;
+        }
+        for ds in &li.data_source {
+            if let Some(t) = ds.strip_prefix('<').and_then(|s| s.strip_suffix('>'))
+                && type_index
+                    .instances(t)
+                    .iter()
+                    .any(|(_, inst)| inst.name == key)
+            {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[tower_lsp::async_trait]
@@ -433,6 +572,7 @@ impl LanguageServer for Backend {
         // handshake returns promptly.
         let client = self.client.clone();
         let state = self.state.clone();
+        let watch_state = self.state.clone();
         let handle = tokio::spawn(async move {
             let backend = Backend { client, state };
             backend.validate_entire_workspace().await;
@@ -443,6 +583,12 @@ impl LanguageServer for Backend {
         tokio::spawn(async move {
             if let Err(e) = handle.await {
                 tracing::error!("validate_entire_workspace panicked: {}", e);
+                // The scan didn't reach the point where it flips index_ready, so
+                // diagnostics would stay suppressed forever. Release the gate so
+                // per-file validation still publishes (degraded but not silent).
+                watch_state
+                    .index_ready
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         });
     }
@@ -479,9 +625,26 @@ impl LanguageServer for Backend {
             );
         }
 
-        self.client
-            .publish_diagnostics(params.text_document.uri, diagnostics, Some(version))
+        self.publish_gated(params.text_document.uri, diagnostics, Some(version))
             .await;
+
+        // Once the index is ready, opening a file makes its exports available to
+        // the rest of the session. An already-open file that references one of
+        // them (e.g. a caller of a scripted_effect whose defining file is opened
+        // afterwards) would still show those references as undefined; re-validate
+        // the open docs that reference any name this file exports. Before the
+        // index is ready the full scan handles this, so skip the sweep.
+        if self.state.index_ready.load(Ordering::Relaxed) {
+            let names = {
+                let info = self.state.info_service.read();
+                info.export_names(&uri)
+            };
+            if !names.is_empty() {
+                let generation = self.state.edit_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                self.revalidate_open_dependents(&uri, generation, Some(&names))
+                    .await;
+            }
+        }
     }
 
     #[tracing::instrument(skip_all)]
@@ -528,8 +691,7 @@ impl LanguageServer for Backend {
             docs.get(&uri).map(|d| d.text.clone())
         } {
             let (diagnostics, _) = self.parse_and_validate(&uri, &text).await;
-            self.client
-                .publish_diagnostics(params.text_document.uri, diagnostics, None)
+            self.publish_gated(params.text_document.uri, diagnostics, None)
                 .await;
         }
     }

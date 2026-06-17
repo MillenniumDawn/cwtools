@@ -453,6 +453,15 @@ pub const CW280_REDUNDANT_DEFAULT_FIELD: ErrorCode = ErrorCode {
     message_template: "{} = { always = ... } matches the default and can be removed",
 };
 
+/// A `limit = { }` block with no trigger conditions. An empty limit matches
+/// everything, so it is almost always a mistake (forgotten conditions) or dead
+/// weight. A Rust-original structural hint (no F# equivalent).
+pub const CW281_EMPTY_LIMIT: ErrorCode = ErrorCode {
+    id: "CW281",
+    severity: ErrorSeverity::Warning,
+    message_template: "This 'limit' contains no triggers",
+};
+
 // ── Tier B — Stellaris-specific if/else + set_name (per_game::stellaris) ────
 
 /// Nested `if`/`else` in effects, deprecated with Stellaris 2.1. F# `DeprecatedElse`.

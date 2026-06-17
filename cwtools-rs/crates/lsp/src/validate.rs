@@ -302,6 +302,24 @@ impl Backend {
         validate_parsed_with_indexes(uri, parsed, &prepared)
     }
 
+    /// Publish diagnostics, but suppress them (publish an empty set) until the
+    /// initial workspace index is ready. Before the index is built, a cross-file
+    /// reference whose defining file isn't indexed yet would be flagged as
+    /// undefined; the scan publishes the real diagnostics once it completes.
+    pub(crate) async fn publish_gated(
+        &self,
+        uri: tower_lsp::lsp_types::Url,
+        diagnostics: Vec<Diagnostic>,
+        version: Option<i32>,
+    ) {
+        let ready = self
+            .state
+            .index_ready
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let diags = if ready { diagnostics } else { Vec::new() };
+        self.client.publish_diagnostics(uri, diags, version).await;
+    }
+
     /// Parse and validate a single document.
     /// Validate `uri` at `expected_version` after the debounce, but only if it is
     /// still the latest edit (a newer change supersedes it). Publishes the
@@ -354,8 +372,7 @@ impl Backend {
             }
         }
         if let Ok(uri_obj) = Url::parse(&uri) {
-            self.client
-                .publish_diagnostics(uri_obj, diagnostics, Some(expected_version))
+            self.publish_gated(uri_obj, diagnostics, Some(expected_version))
                 .await;
         }
 

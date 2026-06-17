@@ -3,9 +3,35 @@ use crate::post_process::post_process;
 use crate::rules_converter::ast_to_ruleset;
 use crate::rules_converter::ast_to_ruleset_raw;
 use crate::rules_types::RuleSet;
+use cwtools_parser::ast::ParseError;
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::StringTable;
 use std::path::Path;
+
+/// A non-fatal error from loading a `.cwt` rules directory: a file that failed
+/// to read or parse. Carries the source location so the LSP can publish a
+/// diagnostic on the offending file and reveal where the rules broke.
+#[derive(Debug, Clone)]
+pub struct RuleParseError {
+    pub file: std::path::PathBuf,
+    /// 1-based line. `1` for read errors or parse errors without a position.
+    pub line: u32,
+    pub col: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for RuleParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}:{}: {}",
+            self.file.display(),
+            self.line,
+            self.col,
+            self.message
+        )
+    }
+}
 
 /// Recursively collect all `*.cwt` files under `dir`.
 fn collect_cwt_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -60,7 +86,7 @@ fn parse_folders_list(content: &str) -> Vec<String> {
 ///
 /// Returns `(ruleset, errors)`. Errors are non-fatal: files that fail to read
 /// or parse are skipped and their messages collected.
-pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<String>) {
+pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<RuleParseError>) {
     let mut cwt_files = Vec::new();
     collect_cwt_files(dir, &mut cwt_files);
 
@@ -82,11 +108,25 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<S
                     merge_ruleset(&mut combined, ruleset);
                 }
                 Err(e) => {
-                    errors.push(format!("parse error in {}: {}", path.display(), e));
+                    let (line, col, message) = match e {
+                        ParseError::Pos(_, l, c, m) => (l, c, m),
+                        ParseError::General(m) => (1, 0, m),
+                    };
+                    errors.push(RuleParseError {
+                        file: path.clone(),
+                        line,
+                        col,
+                        message: format!("parse error: {}", message),
+                    });
                 }
             },
             Err(e) => {
-                errors.push(format!("read error for {}: {}", path.display(), e));
+                errors.push(RuleParseError {
+                    file: path.clone(),
+                    line: 1,
+                    col: 0,
+                    message: format!("read error: {}", e),
+                });
             }
         }
     }

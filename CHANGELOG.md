@@ -1,3 +1,18 @@
+# 1.0.3
+
+## Bug Fixes
+- Ctrl+Click (go-to-definition) now resolves character, focus, idea, scripted_effect, oob, localisation key, and special_project references, including quoted values and sp:-prefixed scope links
+- Localisation key go-to-definition jumps to the English (primary) entry instead of whichever language loaded first
+- Cross-file references (e.g. scripted effects) no longer show transient "not found" errors before the workspace finishes indexing; opening a definition file now re-validates the open files that use it
+- Autocomplete now works in localisation .yml files
+- `if` without a `limit` is flagged as an error again, and an empty `limit = { }` now warns (CW281)
+
+## Changed
+- Hover tooltips show only localisation, description, and required scopes by default; the raw field/type classification moved behind the new `cwtools.hover.debug` setting (off by default)
+- Ctrl+Click opens the definition in a peek by default for cwtools files; set `editor.definitionLinkOpensInPeek` to false to jump straight to it
+- Diagnostics now wait until the initial workspace index finishes, so references aren't briefly flagged as undefined on startup
+- Rules-config parse errors are surfaced in the editor (a popup, the CWTools output channel, and a diagnostic on the offending .cwt line) instead of being logged silently
+
 # 1.0.2
 
 ## Performance

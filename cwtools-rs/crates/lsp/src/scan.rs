@@ -147,6 +147,10 @@ impl Backend {
                         "No workspace folder; skipping full-workspace validation.",
                     )
                     .await;
+                // Nothing to index — let single-file diagnostics publish normally.
+                self.state
+                    .index_ready
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
@@ -181,6 +185,10 @@ impl Backend {
             self.client
                 .log_message(MessageType::INFO, "No workspace files found to validate.")
                 .await;
+            // Nothing to index — let single-file diagnostics publish normally.
+            self.state
+                .index_ready
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
 
@@ -339,6 +347,14 @@ impl Backend {
         // validation can check LocalisationField references (CW100/CW122), and
         // publish loc-file diagnostics (CW225 etc.) for the workspace loc files.
         self.rebuild_and_publish_loc(&root_path).await;
+
+        // The index (types + loc + vanilla) is now complete. Allow per-file
+        // handlers to publish real diagnostics again: anything opened/edited
+        // during indexing was held back to avoid transient cross-file "not found"
+        // errors, and pass 2 + the open-doc refresh below publish the real set.
+        self.state
+            .index_ready
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Pass 2: validate each file against the now-complete index using
         // the ASTs we already parsed in pass 1. Diagnostics are published to
@@ -511,7 +527,48 @@ impl Backend {
         // reflects the real working set, not the scan peak.
         cwtools_profiling::trim_memory();
         cwtools_profiling::log_rss("after_trim");
+
+        // Re-validate documents that were already open before the index finished.
+        // Both scan passes skip open docs, so a file opened during startup keeps
+        // the diagnostics did_open produced against a then-incomplete index — a
+        // cross-file reference (e.g. a scripted_effect defined in a not-yet-indexed
+        // file) shows as "not found" until a manual re-save. Now that the index is
+        // complete, re-run them so those stale diagnostics clear on their own.
+        self.revalidate_all_open_docs().await;
+
         self.send_loading_bar(false, "").await;
+    }
+
+    /// Re-validate every currently-open document against the current (complete)
+    /// index and re-publish, skipping any whose version changed meanwhile. Called
+    /// once after the workspace scan so open docs validated against a partial
+    /// index don't keep stale cross-file diagnostics.
+    async fn revalidate_all_open_docs(&self) {
+        let open_docs: Vec<(String, String, i32)> = {
+            let docs = self.state.documents.lock();
+            docs.iter()
+                .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
+                .collect()
+        };
+        for (uri, text, version) in open_docs {
+            let (diagnostics, _) = self.parse_and_validate(&uri, &text).await;
+            // Skip if the doc changed or closed while we were validating; its own
+            // did_change/did_close handler owns the fresher result.
+            let still_current = {
+                let docs = self.state.documents.lock();
+                docs.get(&uri)
+                    .map(|d| d.version == version)
+                    .unwrap_or(false)
+            };
+            if !still_current {
+                continue;
+            }
+            if let Ok(uri_obj) = Url::parse(&uri) {
+                self.client
+                    .publish_diagnostics(uri_obj, diagnostics, Some(version))
+                    .await;
+            }
+        }
     }
 
     /// Build the loc-key index from the workspace root plus the vanilla install,
@@ -575,58 +632,78 @@ impl Backend {
         let root_str = root_path.to_string_lossy().to_string();
         // block_in_place: the loc service reads and parses hundreds of loc files
         // from disk — synchronous I/O that must not starve the async executor.
-        let (loc_index, mut by_file, loc_text_map) = tokio::task::block_in_place(|| {
-            let service = cwtools_localization::LocService::from_folders(&dir_refs);
-            let mut idx = cwtools_localization::LocIndex::build_scoped(
-                &service,
-                loc_game,
-                loc_languages.as_deref(),
-            );
-            if let Some(cached) = cached_vanilla_loc {
-                let typed: Vec<(cwtools_localization::Lang, Vec<String>)> = cached
-                    .into_iter()
-                    .filter_map(|(name, ks)| {
-                        cwtools_localization::Lang::from_name(&name).map(|l| (l, ks))
-                    })
-                    .collect();
-                idx.merge_cached_keys(typed, loc_languages.as_deref());
-            }
-            let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
-            for d in cwtools_localization::validate_loc_project_scoped(
-                &service,
-                loc_game,
-                loc_languages.as_deref(),
-                &extra_valid_refs,
-            ) {
-                if !d.file.starts_with(&root_str) {
-                    continue;
+        let (loc_index, mut by_file, loc_text_map, loc_loc_map) =
+            tokio::task::block_in_place(|| {
+                let service = cwtools_localization::LocService::from_folders(&dir_refs);
+                let mut idx = cwtools_localization::LocIndex::build_scoped(
+                    &service,
+                    loc_game,
+                    loc_languages.as_deref(),
+                );
+                if let Some(cached) = cached_vanilla_loc {
+                    let typed: Vec<(cwtools_localization::Lang, Vec<String>)> = cached
+                        .into_iter()
+                        .filter_map(|(name, ks)| {
+                            cwtools_localization::Lang::from_name(&name).map(|l| (l, ks))
+                        })
+                        .collect();
+                    idx.merge_cached_keys(typed, loc_languages.as_deref());
                 }
-                let ve = loc_diag_to_validation_error(&d);
-                by_file
-                    .entry(d.file.clone())
-                    .or_default()
-                    .push(validation_error_to_diagnostic(&ve));
-            }
-            // Extract per-key display text for hover before dropping the service.
-            let mut lt: HashMap<String, Vec<(cwtools_localization::Lang, String)>> = HashMap::new();
-            for file in service.files() {
-                let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
-                if !hover_all && lang != primary_lang {
-                    continue;
+                let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
+                for d in cwtools_localization::validate_loc_project_scoped(
+                    &service,
+                    loc_game,
+                    loc_languages.as_deref(),
+                    &extra_valid_refs,
+                ) {
+                    if !d.file.starts_with(&root_str) {
+                        continue;
+                    }
+                    let ve = loc_diag_to_validation_error(&d);
+                    by_file
+                        .entry(d.file.clone())
+                        .or_default()
+                        .push(validation_error_to_diagnostic(&ve));
                 }
-                for entry in &file.entries {
-                    let display = strip_loc_quotes(&entry.desc);
-                    if !display.is_empty() {
-                        lt.entry(entry.key.to_lowercase())
-                            .or_default()
-                            .push((lang, display.to_string()));
+                // Extract per-key display text for hover and a representative
+                // definition site (for goto) before dropping the service.
+                let mut lt: HashMap<String, Vec<(cwtools_localization::Lang, String)>> =
+                    HashMap::new();
+                let mut ll: HashMap<String, (String, u32)> = HashMap::new();
+                for file in service.files() {
+                    let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
+                    let lang_included = hover_all || lang == primary_lang;
+                    for entry in &file.entries {
+                        // goto: prefer the primary language's location (English by
+                        // default) so Ctrl+Click lands on the canonical entry, not
+                        // whichever language happened to be scanned first.
+                        let loc = || {
+                            (
+                                path_to_uri(std::path::Path::new(&*entry.position.stream_name)),
+                                (entry.position.line.saturating_sub(1)) as u32,
+                            )
+                        };
+                        if lang == primary_lang {
+                            ll.insert(entry.key.to_lowercase(), loc());
+                        } else {
+                            ll.entry(entry.key.to_lowercase()).or_insert_with(loc);
+                        }
+                        if !lang_included {
+                            continue;
+                        }
+                        let display = strip_loc_quotes(&entry.desc);
+                        if !display.is_empty() {
+                            lt.entry(entry.key.to_lowercase())
+                                .or_default()
+                                .push((lang, display.to_string()));
+                        }
                     }
                 }
-            }
-            (idx, by_file, lt)
-        });
+                (idx, by_file, lt, ll)
+            });
         *self.state.loc_index.write() = Some(loc_index);
         *self.state.loc_text.write() = loc_text_map;
+        *self.state.loc_locations.write() = loc_loc_map;
 
         // Publish per-file loc diagnostics, but only for workspace loc files
         // (not vanilla). Group by file so each gets a complete diagnostic set.

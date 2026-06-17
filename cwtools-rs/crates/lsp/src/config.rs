@@ -110,6 +110,15 @@ impl Backend {
                     .store(all, std::sync::atomic::Ordering::Relaxed);
             }
 
+            // Developer hover: when on, include the raw rule classification
+            // (field / type / scope) lines. Off by default — most users only
+            // want the localisation, description, and required scopes.
+            if let Some(dbg) = opts.get("hoverDebug").and_then(|v| v.as_bool()) {
+                self.state
+                    .hover_debug
+                    .store(dbg, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // Persistent cache directory for the base-game index (so it isn't
             // re-parsed every startup). The client should pass its global
             // storage path; we fall back to an OS cache dir otherwise.
@@ -183,9 +192,53 @@ impl Backend {
                 let (combined_ruleset, parse_errors) =
                     load_ruleset_from_dir(cache_path, &self.state.string_table);
 
+                // Rules-config parse/read errors mean the .cwt rules are broken,
+                // which silently degrades every downstream check. Emit at ERROR so
+                // the client reveals its output channel (it auto-reveals on Error),
+                // surface a one-line popup so it's noticed even when the panel is
+                // closed, and publish a diagnostic on each offending .cwt file so
+                // the Problems panel points at the exact line.
+                let mut diags_by_file: std::collections::HashMap<String, Vec<Diagnostic>> =
+                    std::collections::HashMap::new();
                 for err in &parse_errors {
                     self.client
-                        .log_message(MessageType::WARNING, err.clone())
+                        .log_message(MessageType::ERROR, err.to_string())
+                        .await;
+                    let line0 = err.line.saturating_sub(1);
+                    diags_by_file
+                        .entry(crate::paths::path_to_uri(&err.file))
+                        .or_default()
+                        .push(Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line: line0,
+                                    character: err.col as u32,
+                                },
+                                end: Position {
+                                    line: line0,
+                                    character: err.col as u32,
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("cwtools-rules".to_string()),
+                            message: err.message.clone(),
+                            ..Default::default()
+                        });
+                }
+                for (uri, diags) in diags_by_file {
+                    if let Ok(url) = uri.parse() {
+                        self.client.publish_diagnostics(url, diags, None).await;
+                    }
+                }
+                if !parse_errors.is_empty() {
+                    self.client
+                        .show_message(
+                            MessageType::ERROR,
+                            format!(
+                                "CWTools: {} rules-config error(s). See Output → CWTools for details.",
+                                parse_errors.len()
+                            ),
+                        )
                         .await;
                 }
 

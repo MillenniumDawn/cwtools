@@ -636,7 +636,7 @@ pub fn load_rules(
             let (ruleset, errors) = load_ruleset_from_dir(dir, table);
             if let Some(sink) = on_warning {
                 for err in &errors {
-                    sink(err.clone());
+                    sink(err.to_string());
                 }
             }
             Ok(ruleset)
