@@ -26,24 +26,7 @@ impl Backend {
             Some(RuleCursorInfo {
                 hint: ReferenceHint::TypeRef { type_name, value },
                 ..
-            }) => Some((type_name, value)),
-            _ => None,
-        }
-    }
-
-    /// The variable name read at the cursor, if it resolves to a
-    /// `value[variable]` field. Used by goto-definition on a variable read.
-    pub(crate) fn var_ref_at_cursor(
-        &self,
-        uri: &str,
-        pos: tower_lsp::lsp_types::Position,
-        logical_path: &str,
-    ) -> Option<String> {
-        match self.rule_info_at_cursor(uri, pos, logical_path) {
-            Some(RuleCursorInfo {
-                hint: ReferenceHint::Variable { name, .. },
-                ..
-            }) => Some(name),
+            }) => Some((type_name, unquote(&value).to_string())),
             _ => None,
         }
     }
@@ -61,63 +44,33 @@ impl Backend {
 
         let ws_uri = self.state.config.read().workspace_uri.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let fallback = &params.text_document_position_params.text_document.uri;
 
-        // First try the rule-aware lookup via the position resolver so we get a
-        // TypeRef hint and can look up the actual definition location.
-        let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
-
-        if let Some((type_name, instance_name)) = type_ref {
-            // Look up in the TypeIndex
-            let info = self.state.info_service.read();
-            let instances = info.type_index.instances(&type_name);
-            let found: Vec<Location> = instances
-                .iter()
-                .filter(|(_, inst)| inst.name == instance_name)
-                .map(|(file_uri, inst)| Location {
-                    uri: parse_uri(
-                        file_uri,
-                        &params.text_document_position_params.text_document.uri,
-                    ),
-                    range: Range {
-                        start: Position {
-                            line: inst.location.line.saturating_sub(1),
-                            character: inst.location.col as u32,
-                        },
-                        end: Position {
-                            line: inst.location.line.saturating_sub(1),
-                            character: inst.location.col as u32 + instance_name.len() as u32,
-                        },
-                    },
-                })
-                .collect();
-            if !found.is_empty() {
-                return Ok(Some(GotoDefinitionResponse::Array(found)));
-            }
-        }
-
-        // Variable read: jump to where the variable is set.
-        if let Some(var_name) = self.var_ref_at_cursor(&uri, pos, &logical_path) {
-            let info = self.state.info_service.read();
-            let defs = info.find_variable_definitions(&var_name);
-            let locations: Vec<Location> = defs
-                .iter()
-                .map(|(file_uri, loc)| Location {
-                    uri: parse_uri(
-                        file_uri,
-                        &params.text_document_position_params.text_document.uri,
-                    ),
-                    range: Range {
-                        start: Position {
-                            line: loc.line.saturating_sub(1),
-                            character: loc.col as u32,
-                        },
-                        end: Position {
-                            line: loc.line.saturating_sub(1),
-                            character: loc.col as u32 + var_name.len() as u32,
-                        },
-                    },
-                })
-                .collect();
+        // Rule-aware lookup via the position resolver. The classified hint tells
+        // us how to find the definition; mirror the kinds hover handles.
+        if let Some(info) = self.rule_info_at_cursor(&uri, pos, &logical_path) {
+            let locations = match &info.hint {
+                ReferenceHint::TypeRef { type_name, value } => {
+                    let value = unquote(value);
+                    let svc = self.state.info_service.read();
+                    type_instance_locations(&svc, type_name, value, fallback)
+                }
+                ReferenceHint::Variable { name, .. } => {
+                    let svc = self.state.info_service.read();
+                    let defs = svc.find_variable_definitions(name);
+                    locations_at(defs.iter().map(|(u, l)| (u.as_str(), *l)), name, fallback)
+                }
+                ReferenceHint::LocRef { key } => {
+                    let map = self.state.loc_locations.read();
+                    map.get(&key.to_lowercase())
+                        .map(|(file_uri, line)| {
+                            vec![line_location(file_uri, *line, 0, key.len(), fallback)]
+                        })
+                        .unwrap_or_default()
+                }
+                ReferenceHint::FileRef { path } => self.file_ref_locations(path, fallback),
+                _ => Vec::new(),
+            };
             if !locations.is_empty() {
                 return Ok(Some(GotoDefinitionResponse::Array(locations)));
             }
@@ -166,6 +119,38 @@ impl Backend {
             }
         }
         Ok(None)
+    }
+
+    /// Resolve a `FilepathField` reference (a game-relative path like
+    /// `gfx/…/foo.dds`) to a file Location by probing the workspace root, then
+    /// the configured vanilla install. Returns an empty Vec when nothing exists.
+    fn file_ref_locations(&self, path: &str, fallback: &Url) -> Vec<Location> {
+        let path = unquote(path).trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let rel = std::path::Path::new(path.trim_start_matches('/'));
+        let (ws_uri, vanilla_dir) = {
+            let cfg = self.state.config.read();
+            (cfg.workspace_uri.clone(), cfg.vanilla_dir.clone())
+        };
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(ws) = &ws_uri {
+            roots.push(std::path::PathBuf::from(crate::paths::uri_to_path_str(ws)));
+        }
+        if let Some(v) = vanilla_dir {
+            roots.push(v);
+        }
+        for root in roots {
+            let candidate = root.join(rel);
+            if std::fs::metadata(&candidate).is_ok() {
+                return vec![Location {
+                    uri: parse_uri(crate::paths::path_to_uri(&candidate), fallback),
+                    range: Range::default(),
+                }];
+            }
+        }
+        Vec::new()
     }
 
     pub(crate) async fn references_impl(
@@ -679,10 +664,11 @@ fn scan_ast_for_type_ref(
         let Child::Leaf(idx) = child else { continue };
         let leaf = &arena.leaves[*idx as usize];
         let key = table.get_string(leaf.key.normal).unwrap_or_default();
-        let val = match &leaf.value {
+        let raw_val = match &leaf.value {
             Value::String(t) | Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
             _ => String::new(),
         };
+        let val = unquote(&raw_val);
         if val == instance_name && is_type_ref_leaf(ruleset, &key, type_name, logical_path) {
             out.push((
                 file_uri.to_string(),
@@ -744,4 +730,74 @@ pub(crate) fn is_type_ref_leaf(
         }
     }
     false
+}
+
+/// Strip matching outer double quotes from a token. Quoted string values keep
+/// their quotes through the parser/string-table, but indexed instance names and
+/// loc keys are unquoted, so references must be unquoted before comparison.
+pub(crate) fn unquote(s: &str) -> &str {
+    s.strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .unwrap_or(s)
+}
+
+/// Build goto Locations for every definition of `instance_name` of `type_name`
+/// in the type index.
+fn type_instance_locations(
+    svc: &cwtools_info::InfoService,
+    type_name: &str,
+    instance_name: &str,
+    fallback: &Url,
+) -> Vec<Location> {
+    let instances = svc.type_index.instances(type_name);
+    instances
+        .iter()
+        .filter(|(_, inst)| inst.name == instance_name)
+        .map(|(file_uri, inst)| {
+            line_location(
+                file_uri,
+                inst.location.line.saturating_sub(1),
+                inst.location.col as u32,
+                instance_name.len(),
+                fallback,
+            )
+        })
+        .collect()
+}
+
+/// Build Locations from `(file_uri, location)` pairs, each highlighting a token
+/// of `name`'s length.
+fn locations_at<'a>(
+    pairs: impl Iterator<Item = (&'a str, cwtools_info::SourceLocation)>,
+    name: &str,
+    fallback: &Url,
+) -> Vec<Location> {
+    pairs
+        .map(|(file_uri, loc)| {
+            line_location(
+                file_uri,
+                loc.line.saturating_sub(1),
+                loc.col as u32,
+                name.len(),
+                fallback,
+            )
+        })
+        .collect()
+}
+
+/// A single-line Location at `(line0, col)` spanning `len` characters.
+fn line_location(file_uri: &str, line0: u32, col: u32, len: usize, fallback: &Url) -> Location {
+    Location {
+        uri: parse_uri(file_uri, fallback),
+        range: Range {
+            start: Position {
+                line: line0,
+                character: col,
+            },
+            end: Position {
+                line: line0,
+                character: col + len as u32,
+            },
+        },
+    }
 }

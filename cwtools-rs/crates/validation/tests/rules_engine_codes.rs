@@ -24,6 +24,37 @@ fn codes_for(cwt: &str, script: &str) -> Vec<String> {
     errors.into_iter().filter_map(|e| e.code).collect()
 }
 
+/// A required field carrying `## severity = error` must report its missing-field
+/// cardinality (CW242) at Error severity, not the default Warning. Mirrors the
+/// HOI4 config's `## severity = error` on `if`/`else_if`'s `limit`.
+#[test]
+fn missing_required_honors_severity_error() {
+    use cwtools_validation::ErrorSeverity;
+    const RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    name = scalar
+    ## severity = error
+    needed = scalar
+}
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(RULES, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let parsed = parse_string("foo = { name = x }", &table).unwrap();
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
+    let cw242 = errors
+        .iter()
+        .find(|e| e.code.as_deref() == Some("CW242"))
+        .expect("CW242 for missing required field");
+    assert_eq!(
+        cw242.severity,
+        ErrorSeverity::Error,
+        "missing required field with ## severity = error must be Error, got {:?}",
+        cw242.severity
+    );
+}
+
 const RULES: &str = r#"
 types = {
     type[foo] = {

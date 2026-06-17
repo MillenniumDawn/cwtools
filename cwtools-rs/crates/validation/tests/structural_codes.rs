@@ -129,6 +129,38 @@ foo = {
 }
 
 #[test]
+fn empty_limit_is_cw281() {
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    every_country = {
+        limit = { }
+        b = 2
+    }
+}
+"#,
+    );
+    assert!(c.contains(&"CW281".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn non_empty_limit_is_clean() {
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    every_country = {
+        limit = { has_war = yes }
+        b = 2
+    }
+}
+"#,
+    );
+    assert!(!c.contains(&"CW281".to_string()), "got: {:?}", c);
+}
+
+#[test]
 fn and_in_and_is_cw251() {
     let c = codes(
         Game::Hoi4,

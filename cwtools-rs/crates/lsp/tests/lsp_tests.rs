@@ -788,3 +788,500 @@ fn test_hover_show_all_languages_flag() {
         "hover with the flag on should show French loc too, got: {hover}"
     );
 }
+
+// ── Go-to-definition ─────────────────────────────────────────────────────────
+
+/// Rules exercising every navigable reference kind goto must resolve.
+const GOTO_RULES: &str = r#"
+types = {
+    type[focus] = { path = "game/common/national_focus" }
+    type[oob] = { path = "game/history/units" }
+    type[character] = { path = "game/common/characters" }
+    type[special_project] = { path = "game/common/special_projects" }
+    type[scripted_effect] = { path = "game/common/scripted_effects" }
+    type[decision] = { path = "game/common/decisions" }
+}
+links = {
+    sp = {
+        prefix = sp:
+        output_scope = special_project
+        input_scopes = country
+        from_data = yes
+        data_source = <special_project>
+    }
+    character = {
+        output_scope = character
+        input_scopes = country
+        from_data = yes
+        data_source = <character>
+    }
+}
+decision = {
+    ## cardinality = 0..1
+    has_focus = <focus>
+    ## cardinality = 0..1
+    load_oob = <oob>
+    ## cardinality = 0..1
+    localization_key = localisation
+    ## cardinality = 0..1
+    complete_special_project = scope[special_project]
+    ## cardinality = 0..1
+    available = {
+        alias_name[trigger] = alias_match_left[trigger]
+    }
+    ## cardinality = 0..1
+    complete_effect = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+    ## cardinality = 0..inf
+    <character> = {
+        is_enabled = bool
+    }
+}
+alias[trigger:always] = bool
+alias[effect:<scripted_effect>] = yes
+focus = { x = bool }
+oob = { y = bool }
+character = { name = scalar }
+special_project = { z = bool }
+scripted_effect = { alias_name[effect] = alias_match_left[effect] }
+"#;
+
+/// Spawn a server with `rules`, write the loc `.yml` files under `localisation/`
+/// and the script files, then resolve textDocument/definition at (line, char) on
+/// `doc_rel`. Polls until a non-empty result arrives (the loc index and type
+/// index land via the async workspace scan). Returns `(uri, start_line)` pairs.
+fn goto_def(
+    rules: &str,
+    loc_files: &[(&str, &str)],
+    files: &[(&str, &str)],
+    doc_rel: &str,
+    line0: u32,
+    char0: u32,
+) -> Vec<(String, u32)> {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), rules).unwrap();
+
+    let loc_dir = ws.path().join("localisation");
+    std::fs::create_dir_all(&loc_dir).unwrap();
+    for (name, content) in loc_files {
+        let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(content.as_bytes());
+        std::fs::write(loc_dir.join(name), &bytes).unwrap();
+    }
+
+    for (rel, content) in files {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    let body = jsonrpc_notification("initialized", serde_json::json!({}));
+    write_frame(&mut child, &body).unwrap();
+
+    for (rel, content) in files {
+        let uri = format!("file://{}", ws.path().join(rel).display());
+        let body = jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri, "languageId": "hoi4", "version": 1, "text": content,
+                }
+            }),
+        );
+        write_frame(&mut child, &body).unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+
+    let doc_uri = format!("file://{}", ws.path().join(doc_rel).display());
+    let mut out: Vec<(String, u32)> = Vec::new();
+    // Loc-key goto depends on the async workspace scan populating loc_locations;
+    // under parallel test load that can lag, so poll generously.
+    for attempt in 0..50 {
+        let req = jsonrpc_request(
+            100 + attempt,
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "position": { "line": line0, "character": char0 },
+            }),
+        );
+        write_frame(&mut child, &req).unwrap();
+        let resp_str = read_response(&mut reader).expect("no definition response");
+        let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+        let arr = resp["result"]
+            .as_array()
+            .cloned()
+            .or_else(|| {
+                resp["result"]
+                    .as_object()
+                    .map(|o| vec![serde_json::Value::Object(o.clone())])
+            })
+            .unwrap_or_default();
+        out = arr
+            .iter()
+            .filter_map(|l| {
+                let uri = l["uri"].as_str()?.to_string();
+                let line = l["range"]["start"]["line"].as_u64()? as u32;
+                Some((uri, line))
+            })
+            .collect();
+        if !out.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    child.kill().ok();
+    out
+}
+
+#[test]
+fn test_goto_focus_value() {
+    // has_focus = MY_FOCUS — goto on the value jumps to the focus definition.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/d.txt",
+            "my_dec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+    ];
+    // Cursor on MY_FOCUS (line 1, col ~16).
+    let locs = goto_def(GOTO_RULES, &[], files, "common/decisions/d.txt", 1, 16);
+    assert!(
+        locs.iter()
+            .any(|(u, _)| u.ends_with("national_focus/f.txt")),
+        "goto should resolve focus def, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_quoted_oob_value() {
+    // load_oob = "MY_OOB" — the quoted value must be unquoted before the index
+    // lookup, else nothing resolves.
+    let files = &[
+        ("history/units/o.txt", "MY_OOB = { y = yes }\n"),
+        (
+            "common/decisions/d.txt",
+            "my_dec = {\n    load_oob = \"MY_OOB\"\n}\n",
+        ),
+    ];
+    // Cursor inside the quoted value (line 1, col ~17).
+    let locs = goto_def(GOTO_RULES, &[], files, "common/decisions/d.txt", 1, 17);
+    assert!(
+        locs.iter().any(|(u, _)| u.ends_with("units/o.txt")),
+        "goto should resolve quoted oob def, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_character_key() {
+    // MY_CHAR = { ... } used as a <character> key — the reference is on the key,
+    // which only resolves with the key-side classifier.
+    let files = &[
+        ("common/characters/c.txt", "MY_CHAR = { name = bob }\n"),
+        (
+            "common/decisions/d.txt",
+            "my_dec = {\n    MY_CHAR = { is_enabled = yes }\n}\n",
+        ),
+    ];
+    // Cursor on the MY_CHAR key (line 1, col 6).
+    let locs = goto_def(GOTO_RULES, &[], files, "common/decisions/d.txt", 1, 6);
+    assert!(
+        locs.iter().any(|(u, _)| u.ends_with("characters/c.txt")),
+        "goto should resolve character key def, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_localisation_key() {
+    // localization_key = MY_KEY — goto jumps to the .yml entry.
+    let loc = &[("test_l_english.yml", "l_english:\n MY_KEY:0 \"Text\"\n")];
+    let files = &[(
+        "common/decisions/d.txt",
+        "my_dec = {\n    localization_key = MY_KEY\n}\n",
+    )];
+    // Cursor on MY_KEY (line 1, col ~25).
+    let locs = goto_def(GOTO_RULES, loc, files, "common/decisions/d.txt", 1, 25);
+    assert!(
+        locs.iter().any(|(u, _)| u.ends_with("test_l_english.yml")),
+        "goto should resolve loc key to the yml, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_special_project_sp_prefix() {
+    // complete_special_project = sp:MY_PROJ — the sp: prefix resolves through the
+    // matching link's data_source <special_project>.
+    let files = &[
+        ("common/special_projects/p.txt", "MY_PROJ = { z = yes }\n"),
+        (
+            "common/decisions/d.txt",
+            "my_dec = {\n    complete_special_project = sp:MY_PROJ\n}\n",
+        ),
+    ];
+    // Cursor inside the value after the sp: prefix (line 1, col ~34).
+    let locs = goto_def(GOTO_RULES, &[], files, "common/decisions/d.txt", 1, 34);
+    assert!(
+        locs.iter()
+            .any(|(u, _)| u.ends_with("special_projects/p.txt")),
+        "goto should resolve sp: special_project, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_loc_key_prefers_english() {
+    // The key exists in both English and Brazilian Portuguese; goto must land on
+    // the English (primary) entry, not whichever was scanned first.
+    let loc = &[
+        ("test_l_braz_por.yml", "l_braz_por:\n MY_KEY:0 \"Texto\"\n"),
+        ("test_l_english.yml", "l_english:\n MY_KEY:0 \"Text\"\n"),
+    ];
+    let files = &[(
+        "common/decisions/d.txt",
+        "my_dec = {\n    localization_key = MY_KEY\n}\n",
+    )];
+    let locs = goto_def(GOTO_RULES, loc, files, "common/decisions/d.txt", 1, 25);
+    assert!(
+        locs.iter().any(|(u, _)| u.ends_with("test_l_english.yml")),
+        "goto should prefer the English loc file, got: {:?}",
+        locs
+    );
+    assert!(
+        !locs.iter().any(|(u, _)| u.ends_with("braz_por.yml")),
+        "goto must not land on braz_por, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_character_scope_link_key() {
+    // A character used as a scope key inside a trigger block matches no rule
+    // (value_rules is empty); it resolves via the `character` link's data_source
+    // <character>. This is the real MD case the rule-based path missed.
+    let files = &[
+        ("common/characters/c.txt", "MY_CHAR = { name = bob }\n"),
+        (
+            "common/decisions/d.txt",
+            "my_dec = {\n    available = {\n        MY_CHAR = { always = yes }\n    }\n}\n",
+        ),
+    ];
+    // Cursor on the MY_CHAR key (line 2, col 8).
+    let locs = goto_def(GOTO_RULES, &[], files, "common/decisions/d.txt", 2, 8);
+    assert!(
+        locs.iter().any(|(u, _)| u.ends_with("characters/c.txt")),
+        "goto should resolve scope-link character key, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_scripted_effect_call() {
+    // A scripted_effect call (`my_se = yes`) resolves through the
+    // `alias[effect:<scripted_effect>]` rule whose left field names the type.
+    let files = &[
+        (
+            "common/scripted_effects/e.txt",
+            "my_se = { log = \"hi\" }\n",
+        ),
+        (
+            "common/decisions/d.txt",
+            "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n",
+        ),
+    ];
+    // Cursor on the my_se call key (line 2, col 8).
+    let locs = goto_def(GOTO_RULES, &[], files, "common/decisions/d.txt", 2, 8);
+    assert!(
+        locs.iter()
+            .any(|(u, _)| u.ends_with("scripted_effects/e.txt")),
+        "goto should resolve scripted_effect call, got: {:?}",
+        locs
+    );
+}
+
+// ── did_open re-validates open dependents (stale scripted_effect bug) ─────────
+
+/// Read frames until a publishDiagnostics for a URI ending in `suffix` arrives
+/// (after at least `min_skips` matching ones already seen), returning its codes.
+/// Returns None on timeout.
+fn diags_for(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    suffix: &str,
+    occurrence: usize,
+) -> Option<Vec<String>> {
+    let mut seen = 0usize;
+    for _ in 0..2000 {
+        let raw = read_frame(reader).ok()?;
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(suffix))
+        {
+            seen += 1;
+            if seen >= occurrence {
+                return Some(
+                    v["params"]["diagnostics"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|d| d["code"].as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Read frames until the `loadingBar` notification with `enable=false` arrives,
+/// i.e. the workspace scan finished (index_ready is now set).
+fn wait_for_scan_done(reader: &mut BufReader<std::process::ChildStdout>) {
+    for _ in 0..5000 {
+        let Ok(raw) = read_frame(reader) else { return };
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            && v["method"] == "loadingBar"
+            && v["params"]["enable"] == serde_json::Value::Bool(false)
+        {
+            return;
+        }
+    }
+}
+
+#[test]
+fn test_did_open_definition_clears_open_caller_stale_error() {
+    // Caller B references scripted_effect my_se; the defining file A is opened
+    // afterwards. Opening A must re-validate B so its "undefined" diagnostic
+    // (CW263 — the call matches no `<scripted_effect>` alias until my_se is
+    // indexed) clears without a manual re-save.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    // Only the caller exists on disk at first; the definition is added later.
+    let b_rel = "common/decisions/b.txt";
+    let b_path = ws.path().join(b_rel);
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &b_path,
+        "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n",
+    )
+    .unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // Wait until the scan finishes so diagnostics are no longer deferred.
+    wait_for_scan_done(&mut reader);
+
+    // Open the caller; the definition is absent, so B shows CW263.
+    let b_uri = format!("file://{}", b_path.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text":"my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n"}}),
+        ),
+    )
+    .unwrap();
+    let before = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics");
+    assert!(
+        before.contains(&"CW263".to_string()),
+        "expected CW263 before the definition is opened, got: {:?}",
+        before
+    );
+
+    // Now create + open the defining scripted_effect file.
+    let a_rel = "common/scripted_effects/a.txt";
+    let a_path = ws.path().join(a_rel);
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, "my_se = { log = \"hi\" }\n").unwrap();
+    let a_uri = format!("file://{}", a_path.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":a_uri,"languageId":"hoi4","version":1,
+                "text":"my_se = { log = \"hi\" }\n"}}),
+        ),
+    )
+    .unwrap();
+
+    // The did_open dependent sweep must re-publish B without the CW263.
+    let after = diags_for(&mut reader, "b.txt", 1).expect("B re-validated");
+    child.kill().ok();
+    assert!(
+        !after.contains(&"CW263".to_string()),
+        "opening the definition file should clear B's stale CW263, got: {:?}",
+        after
+    );
+}
