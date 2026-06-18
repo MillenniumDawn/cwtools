@@ -835,6 +835,31 @@ mod tests {
         assert_eq!(instances[0].name, "GFX_test_icon");
     }
 
+    /// type_per_file: the instance name is the file stem. On Windows the LSP can
+    /// derive logical paths with backslash separators; the name extraction must
+    /// normalise them, else `load_oob = "MY_OOB"` is a false positive because the
+    /// indexed name becomes the whole path rather than the stem.
+    #[test]
+    fn test_type_per_file_backslash_path() {
+        let source = "MY_OOB = { y = yes }\n";
+        let table = StringTable::new();
+        let parsed = parse_string(source, &table).unwrap();
+
+        let mut td = empty_type_def("oob", vec!["history/units"]);
+        td.type_per_file = true;
+        let rs = make_ruleset_with_type(td);
+
+        // Backslash separators, as produced by logical_path_from_uri on Windows.
+        let result = collect_type_instances(&rs, &parsed, "history\\units\\MY_OOB.txt", &table);
+        let instances = result.get("oob").expect("should find oob");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(
+            instances[0].name, "MY_OOB",
+            "type_per_file name must be the file stem, got {:?}",
+            instances[0].name
+        );
+    }
+
     /// type_key_filter: only nodes with a matching key qualify.
     #[test]
     fn test_type_instance_key_filter() {

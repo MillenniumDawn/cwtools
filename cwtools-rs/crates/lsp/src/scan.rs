@@ -618,9 +618,9 @@ impl Backend {
             // Lock order: rules -> info_service.
             let mut extra = self.state.rules.read().modifier_keys.clone();
             let info = self.state.info_service.read();
-            for (_uri, inst) in info.type_index.instances("idea") {
-                extra.insert(inst.name.to_lowercase());
-            }
+            // Dynamic modifiers, ideas, other game-object names + defined
+            // variables a `$ref$` can bind to (mirrors the CLI/driver path).
+            extra.extend(info.type_index.loc_bindable_names());
             if let Some(cached) = &cached_vanilla_loc {
                 for (_, keys) in cached {
                     extra.extend(keys.iter().cloned());

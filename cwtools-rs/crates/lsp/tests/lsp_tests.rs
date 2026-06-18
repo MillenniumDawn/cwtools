@@ -586,6 +586,13 @@ fn hover_markdown(
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     std::fs::write(rules_dir.path().join("test_rules.cwt"), DYNAMIC_RULES).unwrap();
+    // Named scopes so the registry resolves `country` (HOI4 has no hardcoded
+    // scope table); lets the hover surface the current scope context.
+    std::fs::write(
+        rules_dir.path().join("scopes.cwt"),
+        "scopes = { country = { } state = { } }\n",
+    )
+    .unwrap();
 
     let loc_dir = ws.path().join("localisation");
     std::fs::create_dir_all(&loc_dir).unwrap();
@@ -598,6 +605,13 @@ fn hover_markdown(
     let p = ws.path().join(script_rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(&p, script_text).unwrap();
+
+    // The workspace scan (which builds the loc index) early-returns when there
+    // are no game files. Real mods always have some; drop a tiny one so the scan
+    // runs even when the opened document is itself a .yml.
+    let trigger = ws.path().join("common/_scan_trigger.txt");
+    std::fs::create_dir_all(trigger.parent().unwrap()).unwrap();
+    std::fs::write(&trigger, "# scan trigger\n").unwrap();
 
     let ws_uri = format!("file://{}", ws.path().display());
     let mut child = cwtools_server_cmd()
@@ -674,6 +688,43 @@ fn hover_markdown(
     }
     child.kill().ok();
     hover_value
+}
+
+#[test]
+fn test_hover_shows_current_scope() {
+    // Anything hovered inside a scoped block shows the current scope context,
+    // independent of whether the rule declares a required scope. The decisions
+    // file is country-scoped, so a trigger value there reads as `country`.
+    let hover = hover_markdown(
+        &[("test_l_english.yml", "l_english:\n my_focus:0 \"Focus\"\n")],
+        "common/decisions/d.txt",
+        "my_dec = {\n    allowed = {\n        has_completed_focus = my_focus\n    }\n}\n",
+        2,
+        32,
+        serde_json::json!({}),
+    );
+    assert!(
+        hover.contains("**Scope**: country"),
+        "hover should surface the current scope, got: {hover}"
+    );
+}
+
+#[test]
+fn test_hover_nested_loc_key_in_yml() {
+    // Hovering a `$MY_KEY$` reference inside a .yml loc value resolves to the
+    // referenced loc entry's text (nested loc keys / dynamic bindings).
+    let hover = hover_markdown(
+        &[("test_l_english.yml", "l_english:\n MY_KEY:0 \"My Value\"\n")],
+        "localisation/english/ref_l_english.yml",
+        "\u{FEFF}l_english:\n OTHER:0 \"see $MY_KEY$\"\n",
+        1,
+        17,
+        serde_json::json!({}),
+    );
+    assert!(
+        hover.contains("My Value"),
+        "hover on $MY_KEY$ should resolve to the loc entry text, got: {hover}"
+    );
 }
 
 #[test]
@@ -1013,6 +1064,35 @@ fn test_goto_quoted_oob_value() {
     assert!(
         locs.iter().any(|(u, _)| u.ends_with("units/o.txt")),
         "goto should resolve quoted oob def, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_nested_loc_key_in_yml() {
+    // Goto on a `$MY_KEY$` reference inside a .yml jumps to the loc entry it
+    // names. A game file is present so the workspace scan (which builds
+    // loc_locations) runs.
+    let loc = &[("def_l_english.yml", "l_english:\n MY_KEY:0 \"My Value\"\n")];
+    let files = &[
+        ("common/scan_trigger.txt", "# trigger\n"),
+        (
+            "localisation/english/use_l_english.yml",
+            "\u{FEFF}l_english:\n OTHER:0 \"$MY_KEY$\"\n",
+        ),
+    ];
+    // Cursor inside `$MY_KEY$` on line 1 (col 12).
+    let locs = goto_def(
+        GOTO_RULES,
+        loc,
+        files,
+        "localisation/english/use_l_english.yml",
+        1,
+        12,
+    );
+    assert!(
+        locs.iter().any(|(u, _)| u.ends_with("def_l_english.yml")),
+        "goto on $MY_KEY$ should resolve to its loc definition, got: {:?}",
         locs
     );
 }

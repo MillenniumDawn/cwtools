@@ -94,12 +94,16 @@ impl FileIndex {
     }
 
     /// Whether a game-relative path exists (case-insensitive). The argument is
-    /// normalised (lowercased, forward slashes, leading slash stripped).
+    /// normalised (lowercased, forward slashes, leading slash stripped, repeated
+    /// slashes collapsed — the engine treats `gfx//interface` as `gfx/interface`,
+    /// and some mod files write the doubled form).
     pub fn contains(&self, path: &str) -> bool {
-        let norm = path
-            .trim()
-            .trim_start_matches('/')
-            .replace('\\', "/")
+        let cleaned = path.trim().replace('\\', "/");
+        let norm = cleaned
+            .split('/')
+            .filter(|seg| !seg.is_empty())
+            .collect::<Vec<_>>()
+            .join("/")
             .to_ascii_lowercase();
         self.files.contains(&norm)
     }
@@ -253,6 +257,20 @@ impl TypeIndex {
     /// All instances for a type (across all files).
     pub fn instances(&self, type_name: &str) -> &[(Arc<str>, TypeInstance)] {
         self.map.get(type_name).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Names a loc `$ref$` may bind to besides loc keys: every type-instance
+    /// name (dynamic modifiers, ideas, buildings, …) and every defined variable,
+    /// lowercased. The caller unions modifiers / vanilla loc keys on top. Lets
+    /// loc validation accept `$education_dynamic_modifier$` / `$some_variable$`
+    /// embeds without a CW225 while genuine typos (matching nothing) still flag.
+    pub fn loc_bindable_names(&self) -> impl Iterator<Item = String> + '_ {
+        // `name_counts` keys and `var_index` names are already lowercased /
+        // normalised, matching the loc validator's case-insensitive lookup.
+        self.name_counts
+            .keys()
+            .cloned()
+            .chain(self.var_index.names().cloned())
     }
 
     /// Every `(type_name, instance)` defined in `file_uri`. Scans the whole
@@ -612,10 +630,15 @@ pub fn collect_type_instances(
 
         if td.type_per_file {
             // The file itself is the instance; the name is the file stem.
-            let name = logical_path
+            // Normalise separators first: the LSP on Windows derives logical
+            // paths with backslashes (`check_path_dir` already normalises, this
+            // must too), else the stem becomes the whole path and references
+            // like `load_oob = "MY_OOB"` flag as false positives.
+            let norm = logical_path.replace('\\', "/");
+            let name = norm
                 .rsplit('/')
                 .next()
-                .unwrap_or(logical_path)
+                .unwrap_or(norm.as_str())
                 .trim_end_matches(".txt")
                 .trim_end_matches(".gfx")
                 .trim_end_matches(".gui")
@@ -1160,3 +1183,49 @@ pub struct SavedEventTarget {
 
 // collect_saved_event_targets and collect_event_targets_rec deleted:
 // no production callers.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_index_collapses_double_slashes() {
+        // The engine collapses repeated slashes, so a `gfx//interface/x.dds`
+        // reference (as some MD .gfx files write) must resolve to the indexed
+        // `gfx/interface/x.dds`, not flag CW113.
+        let mut idx = FileIndex::new();
+        idx.add_paths(vec!["gfx/interface/x.dds".to_string()]);
+        assert!(
+            idx.contains("gfx//interface/x.dds"),
+            "double-slash reference must resolve"
+        );
+        assert!(idx.contains("gfx/interface/x.dds"));
+    }
+
+    #[test]
+    fn loc_bindable_names_includes_instances_and_variables() {
+        let mut idx = TypeIndex::new();
+        let mut per_type: HashMap<String, Vec<TypeInstance>> = HashMap::new();
+        per_type.insert(
+            "ln".to_string(),
+            vec![TypeInstance {
+                name: "Education_Dynamic_Modifier".to_string(),
+                location: SourceLocation { line: 1, col: 0 },
+            }],
+        );
+        idx.merge("common/lns/x.txt", per_type);
+        idx.var_index.add_name("My_Variable");
+
+        let names: std::collections::HashSet<String> = idx.loc_bindable_names().collect();
+        assert!(
+            names.contains("education_dynamic_modifier"),
+            "instance names (lowercased) must be bindable, got {:?}",
+            names
+        );
+        assert!(
+            names.contains("my_variable"),
+            "defined variables (lowercased) must be bindable, got {:?}",
+            names
+        );
+    }
+}

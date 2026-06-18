@@ -15,7 +15,7 @@
 
 mod comment_directives;
 mod enums;
-mod field_parser;
+pub(crate) mod field_parser;
 mod scopes_links;
 mod subtypes;
 mod types;
