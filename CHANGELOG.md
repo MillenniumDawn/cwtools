@@ -1,3 +1,8 @@
+# 1.4.1
+
+## Bug Fixes
+- Ctrl+Click and hover now resolve scripted-effect calls inside on_actions effect blocks (e.g. a `*_on_actions` effect called under `on_weekly`), not just in event and decision effect blocks
+
 # 1.0.3
 
 ## Bug Fixes

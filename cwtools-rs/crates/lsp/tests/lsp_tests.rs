@@ -800,6 +800,12 @@ types = {
     type[special_project] = { path = "game/common/special_projects" }
     type[scripted_effect] = { path = "game/common/scripted_effects" }
     type[decision] = { path = "game/common/decisions" }
+    type[on_action] = { path = "game/common/on_actions" }
+    ## type_key_filter = on_weekly
+    type[on_weekly] = {
+        path = "game/common/on_actions"
+        skip_root_key = on_actions
+    }
 }
 links = {
     sp = {
@@ -845,6 +851,16 @@ oob = { y = bool }
 character = { name = scalar }
 special_project = { z = bool }
 scripted_effect = { alias_name[effect] = alias_match_left[effect] }
+on_action = {
+    ## cardinality = 0..inf
+    on_weekly = single_alias_right[country_event_effect]
+}
+single_alias[country_event_effect] = {
+    ## cardinality = 0..inf
+    effect = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+}
 "#;
 
 /// Spawn a server with `rules`, write the loc `.yml` files under `localisation/`
@@ -1125,6 +1141,62 @@ fn test_goto_scripted_effect_call() {
         locs.iter()
             .any(|(u, _)| u.ends_with("scripted_effects/e.txt")),
         "goto should resolve scripted_effect call, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_scripted_effect_in_on_actions() {
+    // A `*_on_actions`-style scripted_effect call inside an on_actions effect
+    // block. The call site sits behind skip_root_key=on_actions + an inlined
+    // single_alias_right effect block — a far deeper path than the decision case.
+    let files = &[
+        (
+            "common/scripted_effects/e.txt",
+            "my_se = { log = \"hi\" }\n",
+        ),
+        (
+            "common/on_actions/x.txt",
+            "on_actions = {\n    on_weekly = {\n        effect = {\n            my_se = yes\n        }\n    }\n}\n",
+        ),
+    ];
+    // Cursor on the my_se call key (line 3, col 12).
+    let locs = goto_def(GOTO_RULES, &[], files, "common/on_actions/x.txt", 3, 12);
+    assert!(
+        locs.iter()
+            .any(|(u, _)| u.ends_with("scripted_effects/e.txt")),
+        "goto should resolve scripted_effect call inside on_actions, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_scripted_effect_in_scripted_effect_body() {
+    // A scripted_effect call nested inside another scripted_effect's body
+    // (common/scripted_effects/), not behind a decision/event effect block.
+    let files = &[
+        (
+            "common/scripted_effects/e.txt",
+            "my_se = { log = \"hi\" }\n",
+        ),
+        (
+            "common/scripted_effects/caller.txt",
+            "my_caller = {\n    my_se = yes\n}\n",
+        ),
+    ];
+    // Cursor on the my_se call key (line 1, col 4).
+    let locs = goto_def(
+        GOTO_RULES,
+        &[],
+        files,
+        "common/scripted_effects/caller.txt",
+        1,
+        4,
+    );
+    assert!(
+        locs.iter()
+            .any(|(u, _)| u.ends_with("scripted_effects/e.txt")),
+        "goto should resolve scripted_effect call inside a scripted_effect body, got: {:?}",
         locs
     );
 }
