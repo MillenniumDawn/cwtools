@@ -262,6 +262,26 @@ foo = {
 }
 
 #[test]
+fn and_inside_count_triggers_is_clean() {
+    // count_triggers counts how many of its direct children are true, so an AND
+    // that groups several conditions into one counted unit is meaningful, not a
+    // redundant AND-in-AND. It must not fire CW251 (cwtools-vscode#27).
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    count_triggers = {
+        amount = 2
+        has_war_with = INT
+        AND = { has_global_flag = x has_war_with = RUS }
+    }
+}
+"#,
+    );
+    assert!(!c.contains(&"CW251".to_string()), "got: {:?}", c);
+}
+
+#[test]
 fn else_without_if_is_cw238() {
     let c = codes(
         Game::Stellaris,
