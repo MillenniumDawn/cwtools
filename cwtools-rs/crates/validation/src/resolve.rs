@@ -4,6 +4,13 @@
 use cwtools_index::dir_matches_pattern;
 use cwtools_rules::rules_types::*;
 
+/// Lowercased, forward-slashed copy of `file_path` for type-path lookup. Logical
+/// paths are `/`-separated, so a Windows backslash path would make `rsplit('/')`
+/// treat the whole path as the basename and match no type.
+fn lookup_path(file_path: &str) -> String {
+    file_path.to_lowercase().replace('\\', "/")
+}
+
 /// Check if `key` is a level-1 skip_root_key wrapper for this type.
 ///
 /// Only the FIRST entry of the stack is tested: each element in
@@ -45,7 +52,7 @@ pub(crate) fn type_extension_matches(file_path: &str, t: &TypeDefinition) -> boo
             if ext.is_empty() {
                 return true;
             }
-            let path_lower = file_path.to_lowercase().replace('\\', "/");
+            let path_lower = lookup_path(file_path);
             let basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
             basename
                 .rsplit('.')
@@ -118,7 +125,7 @@ pub(crate) fn find_type_by_path<'a>(
     file_path: &str,
     ruleset: &'a RuleSet,
 ) -> Option<&'a TypeDefinition> {
-    let lower = file_path.to_lowercase().replace('\\', "/");
+    let lower = lookup_path(file_path);
     find_type_by_path_and_key(&lower, None, ruleset)
 }
 
@@ -260,7 +267,7 @@ pub(crate) fn find_type_by_path_and_key<'a>(
 /// [`find_type_by_path_and_key`] without the scoring, for use when several types
 /// share a path.
 pub(crate) fn type_path_matches(file_path: &str, t: &TypeDefinition) -> bool {
-    let path_lower = file_path.to_lowercase().replace('\\', "/");
+    let path_lower = lookup_path(file_path);
     let basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
     let dir = path_lower
         .strip_suffix(basename)

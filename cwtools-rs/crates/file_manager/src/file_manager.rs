@@ -680,11 +680,8 @@ fn walk_workspace_inner(
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    // Sort each directory's entries so the workspace scan processes files in a
-    // deterministic, filesystem-order-independent order (matching the CLI's
-    // `collect_paths`). Without this the order follows `read_dir`, which is not
-    // stable across filesystems, so editor diagnostics and indexing order would
-    // vary run to run.
+    // Sort each directory's entries so the scan order matches the CLI's
+    // `collect_paths` and stays stable across filesystems.
     let mut entries: Vec<_> = rd.flatten().collect();
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
