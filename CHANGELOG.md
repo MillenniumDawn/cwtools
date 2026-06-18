@@ -1,3 +1,24 @@
+# 1.5.0
+
+## Bug Fixes
+- Order of battle references (`load_oob`, `oob`, `set_naval_oob`, `set_air_oob`) resolve on the Windows build again; the file under `history/units` is found instead of reporting CW500
+- `NOT = { AND = { … } }` is no longer flagged as an unnecessary AND (CW251); HOI4 `NOT` acts as NOR, so the AND is a meaningful NAND, not redundant
+- Built-in game variables used without the `var:` prefix (e.g. `faction_leader`) are no longer flagged as unset variables (CW246)
+- Event and news pictures set through scripted localisation (`picture = "[SomeFunction]"`) are no longer flagged as an unknown sprite (CW500)
+- Localisation `$…$` references to dynamic modifiers, game-object names, and script variables no longer flag as undefined (CW225); genuine typos still do
+- Filepath references with a redundant double slash (e.g. `gfx//interface/…`) resolve as the engine treats them instead of reporting CW113
+- Windows: trigger/effect documentation (`###`) tooltips, go-to-definition, and validation now work for files whose paths use backslash separators
+
+## Changed
+- Hover tooltips show the current scope at the cursor
+- Hover and Ctrl+Click work on nested `$KEY$` references inside localisation .yml files: hover shows the referenced entry's text, Ctrl+Click jumps to it
+- A broken rules config is flagged: a `.cwt` rule referencing an undefined type, enum, or single_alias reports an error on the offending line
+- Autocompleting a plain field inserts `name = ` with the cursor after the `=`, instead of just `name`
+
+## Developer
+- Normalised Windows path separators across type resolution, the file index, and logical-path derivation so editor features hold up on the Windows build
+- Added regression tests for CRLF `###` docs, scoped hover, `$KEY$` navigation, scripted-loc references, NOT/AND structural checks, built-in variables, and backslash path resolution
+
 # 1.4.1
 
 ## Bug Fixes
