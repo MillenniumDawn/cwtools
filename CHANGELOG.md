@@ -3,6 +3,8 @@
 ## Bug Fixes
 - Order of battle references (`load_oob`, `oob`, `set_naval_oob`, `set_air_oob`) resolve on the Windows build again; the file under `history/units` is found instead of reporting CW500
 - `NOT = { AND = { ... } }` is no longer flagged as an unnecessary AND (CW251); HOI4 `NOT` acts as NOR, so the AND is a meaningful NAND, not redundant
+- An `AND` inside a `count_triggers` block is no longer flagged as unnecessary (CW251); each direct child is a separately counted condition, so the AND groups several into one counted unit
+- A localisation-field value that embeds an inline `[...]` command with a literal prefix/suffix (e.g. a `meta_effect` variable `"[?ROOT...GetTokenKey]_subtype"`) is no longer flagged as an undefined loc key (CW100); it resolves at runtime
 - Built-in game variables used without the `var:` prefix (e.g. `faction_leader`) are no longer flagged as unset variables (CW246)
 - Event and news pictures set through scripted localisation (`picture = "[SomeFunction]"`) are no longer flagged as an unknown sprite (CW500)
 - Localisation `$...$` references to dynamic modifiers, game-object names, and script variables no longer flag as undefined (CW225); genuine typos still do
@@ -20,7 +22,8 @@
 ## Developer
 - Normalised Windows path separators across type resolution, the file index, and logical-path derivation so editor features hold up on the Windows build
 - The LSP workspace scan walks files in a deterministic, sorted order independent of the filesystem's directory order
-- Added regression tests for CRLF `###` docs, scoped hover, `$KEY$` navigation, scripted-loc references, NOT/AND structural checks, built-in variables, backslash path resolution, blank-line completion, and missing-localisation
+- Added regression tests for CRLF `###` docs, scoped hover, `$KEY$` navigation, scripted-loc references, NOT/AND structural checks, count_triggers AND, embedded `[...]` loc commands, built-in variables, backslash path resolution, blank-line completion, and missing-localisation
+- `cwtools_index` no longer declares an unused `serde` dependency; `cargo machete` is clean
 
 # 1.4.1
 
