@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
+use tower_lsp::lsp_types::{
+    Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, Position, Range,
+};
 
 use cwtools_info::{PositionElement, ReferenceHint, element_at_position};
 
@@ -17,6 +19,13 @@ impl Backend {
             .uri
             .to_string();
         let pos = params.text_document_position_params.position;
+
+        // Localisation file: a `$KEY$` under the cursor is a nested loc-key
+        // reference. .yml isn't a game AST, so resolve it directly to the
+        // referenced entry's text instead of the rule walk below.
+        if crate::paths::is_loc_file(&uri) {
+            return Ok(self.loc_ref_hover(&uri, pos));
+        }
 
         // Snapshot the AST (a cheap `Arc` clone) and drop the documents guard
         // before taking ruleset, so hover never co-holds documents + ruleset and
@@ -35,6 +44,7 @@ impl Backend {
                 category,
                 description: desc,
                 required_scopes: scopes,
+                current_scope,
             }) = self.rule_info_at_cursor(&uri, pos, &logical_path)
             {
                 let debug = self
@@ -47,6 +57,7 @@ impl Backend {
                     category.as_deref(),
                     desc.as_deref(),
                     &scopes,
+                    current_scope.as_deref(),
                     debug,
                 );
                 // For a variable read, append the known assigned value(s) so the
@@ -116,6 +127,35 @@ impl Backend {
         }
         Ok(None)
     }
+
+    /// Hover for a `$KEY$` reference in a `.yml` loc file: show the referenced
+    /// entry's translations. `None` when the cursor isn't on a known loc-key
+    /// reference (e.g. a bare runtime variable with no loc entry).
+    fn loc_ref_hover(&self, uri: &str, pos: Position) -> Option<Hover> {
+        let (key, start, end) = self.loc_ref_at_cursor_doc(uri, pos)?;
+        let loc_text = self.state.loc_text.read();
+        let translations = loc_text.get(&key.to_lowercase())?;
+        let mut md = format!("**Localisation key** `{}`", key);
+        for (lang, text) in translations {
+            md.push_str(&format!("\n- {}: {}", lang_display_name(*lang), text));
+        }
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: md,
+            }),
+            range: Some(Range {
+                start: Position {
+                    line: pos.line,
+                    character: start,
+                },
+                end: Position {
+                    line: pos.line,
+                    character: end,
+                },
+            }),
+        })
+    }
 }
 
 /// Build a Markdown hover string from the classified element + the matched
@@ -133,6 +173,7 @@ pub(crate) fn build_hover_markdown(
     category: Option<&str>,
     rule_desc: Option<&str>,
     rule_scopes: &[String],
+    current_scope: Option<&str>,
     debug: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -182,6 +223,12 @@ pub(crate) fn build_hover_markdown(
     // Append required scopes if any
     if !rule_scopes.is_empty() {
         parts.push(format!("\n**Required scopes**: {}", rule_scopes.join(", ")));
+    }
+
+    // Append the current scope at the cursor — shows where you are for anything
+    // hovered in a scoped block, independent of the rule's required scope.
+    if let Some(scope) = current_scope {
+        parts.push(format!("\n**Scope**: {}", scope));
     }
 
     parts.join("\n\n")
@@ -241,6 +288,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             true,
         );
         assert!(md.contains("Type reference"), "got: {}", md);
@@ -264,6 +312,7 @@ mod tests {
             None,
             Some("Pick an ethos"),
             &["country".to_string()],
+            None,
             false,
         );
         assert!(!md.contains("Type reference"), "should hide debug: {}", md);
@@ -285,6 +334,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             true,
         );
         assert!(md.contains("Enum value"), "got: {}", md);
@@ -303,6 +353,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             true,
         );
         assert!(md.contains("foo") && md.contains("bar"), "got: {}", md);
@@ -322,9 +373,29 @@ mod tests {
             None,
             Some("The kind of this thing"),
             &["country".to_string()],
+            None,
             false,
         );
         assert!(md.contains("The kind of this thing"), "got: {}", md);
         assert!(md.contains("Required scopes"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_shows_current_scope() {
+        // The current scope at the cursor renders even when the rule declares no
+        // required scope, so a hover always shows where you are.
+        let md = build_hover_markdown(
+            &PositionElement::Leaf {
+                key: "set_country_flag".to_string(),
+                value: "my_flag".to_string(),
+            },
+            &ReferenceHint::Unknown,
+            Some("effect"),
+            None,
+            &[],
+            Some("country"),
+            false,
+        );
+        assert!(md.contains("**Scope**: country"), "got: {}", md);
     }
 }

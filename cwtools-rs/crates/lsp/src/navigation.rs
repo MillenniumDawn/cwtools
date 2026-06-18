@@ -31,6 +31,26 @@ impl Backend {
         }
     }
 
+    /// Goto for a `$KEY$` reference in a `.yml` loc file: jump to the entry the
+    /// key names. `None` when the cursor isn't on a known loc-key reference.
+    fn loc_ref_goto(
+        &self,
+        uri: &str,
+        pos: Position,
+        fallback: &Url,
+    ) -> Option<GotoDefinitionResponse> {
+        let (key, _, _) = self.loc_ref_at_cursor_doc(uri, pos)?;
+        let map = self.state.loc_locations.read();
+        let (file_uri, line) = map.get(&key.to_lowercase())?;
+        Some(GotoDefinitionResponse::Array(vec![line_location(
+            file_uri,
+            *line,
+            0,
+            key.len(),
+            fallback,
+        )]))
+    }
+
     pub(crate) async fn goto_definition_impl(
         &self,
         params: GotoDefinitionParams,
@@ -45,6 +65,12 @@ impl Backend {
         let ws_uri = self.state.config.read().workspace_uri.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
         let fallback = &params.text_document_position_params.text_document.uri;
+
+        // Localisation file: goto on a `$KEY$` reference jumps to the loc entry
+        // it names. .yml isn't a game AST, so handle it before the rule walk.
+        if crate::paths::is_loc_file(&uri) {
+            return Ok(self.loc_ref_goto(&uri, pos, fallback));
+        }
 
         // Rule-aware lookup via the position resolver. The classified hint tells
         // us how to find the definition; mirror the kinds hover handles.

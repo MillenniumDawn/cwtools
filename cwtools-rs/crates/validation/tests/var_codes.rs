@@ -14,6 +14,11 @@ use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
 
 const RULES: &str = r#"
 types = { type[foo] = { path = "game/common/foo" } }
+values = {
+    value[variable] = {
+        faction_leader
+    }
+}
 foo = {
     add = int_variable_field
     prec = variable_field_32
@@ -84,6 +89,28 @@ fn undefined_variable_is_cw246() {
 #[test]
 fn defined_variable_is_clean() {
     let c = codes("foo = { ref = my_var }", &["my_var"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn builtin_variable_field_is_clean() {
+    // `faction_leader` is a config-declared built-in variable (a `value[variable]`
+    // member). It's valid in a variable_field even without the `var:` prefix and
+    // is never "set", so it must not flag CW246.
+    let c = codes("foo = { ref = faction_leader }", &["something_else"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn builtin_variable_get_is_clean() {
+    let c = codes("foo = { get = faction_leader }", &["something_else"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn var_prefixed_reference_is_clean() {
+    // The explicit `var:` form is already accepted; keep it that way.
+    let c = codes("foo = { ref = var:faction_leader }", &["something_else"]);
     assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
 }
 

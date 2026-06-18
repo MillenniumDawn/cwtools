@@ -395,13 +395,42 @@ impl Backend {
                 &leaf.key,
             )
         };
+        // Current scope at the cursor (the scope the containing block evaluates
+        // in), so a hover shows where you are regardless of whether the rule
+        // declares a required scope. Suppress the wildcards (`any`/`invalid`) and
+        // the unnamed-scope fallback (`scope_N`, when no config scope is loaded):
+        // showing those is noise.
+        let current_scope = rctx.scope.as_ref().and_then(|sc| {
+            let id = sc.current()?;
+            let name = sc.registry.name_of(id);
+            let placeholder =
+                name == "any" || name == "invalid" || name == format!("scope_{}", id.0);
+            (!placeholder).then_some(name)
+        });
         Some(RuleCursorInfo {
             element,
             hint,
             category,
             description,
             required_scopes: scopes,
+            current_scope,
         })
+    }
+}
+
+impl Backend {
+    /// The `$KEY$` loc reference under the cursor in an open `.yml` document, plus
+    /// its `[start, end)` UTF-16 column range. `None` when the cursor isn't on a
+    /// reference (or the document isn't open). Shared by hover and goto.
+    pub(crate) fn loc_ref_at_cursor_doc(
+        &self,
+        uri: &str,
+        pos: tower_lsp::lsp_types::Position,
+    ) -> Option<(String, u32, u32)> {
+        let docs = self.state.documents.lock();
+        let doc = docs.get(uri)?;
+        let line = doc.text.lines().nth(pos.line as usize)?;
+        crate::paths::loc_ref_at_cursor(line, pos.character)
     }
 }
 
@@ -415,6 +444,9 @@ pub(crate) struct RuleCursorInfo {
     /// The matched rule's `###` description.
     pub(crate) description: Option<String>,
     pub(crate) required_scopes: Vec<String>,
+    /// The scope context at the cursor (the scope the block evaluates in), for
+    /// the hover. `None` when no registry or the scope is the `any` wildcard.
+    pub(crate) current_scope: Option<String>,
 }
 
 /// Map a matched leaf rule's right-hand field to a [`ReferenceHint`] for the

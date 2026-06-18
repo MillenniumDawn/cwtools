@@ -92,6 +92,9 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
 
     let mut combined = RuleSet::new();
     let mut errors = Vec::new();
+    // Retain each parsed AST so the structural reference check can re-walk them
+    // against the fully-merged RuleSet (cross-file definitions must all be in).
+    let mut asts: Vec<(std::path::PathBuf, cwtools_parser::ast::ParsedFile)> = Vec::new();
 
     for path in &cwt_files {
         match std::fs::read_to_string(path) {
@@ -106,6 +109,7 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
                 Ok(parsed) => {
                     let ruleset = ast_to_ruleset_raw(&parsed, table);
                     merge_ruleset(&mut combined, ruleset);
+                    asts.push((path.clone(), parsed));
                 }
                 Err(e) => {
                     let (line, col, message) = match e {
@@ -137,6 +141,12 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
 
     // Build alias lookup indexes last — alias names/order are stable after this.
     combined.reindex();
+
+    // Structural validation: now that every definition is merged and indexed,
+    // flag references to undefined types/enums/aliases in the rule config.
+    errors.extend(crate::config_validation::validate_ruleset_references(
+        &asts, &combined, table,
+    ));
 
     (combined, errors)
 }

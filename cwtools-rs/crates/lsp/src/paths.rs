@@ -26,9 +26,14 @@ pub(crate) fn path_to_uri(path: &std::path::Path) -> String {
 /// workspace root URI.  Falls back to the raw path if the workspace prefix
 /// cannot be stripped.
 pub(crate) fn logical_path_from_uri(uri: &str, workspace_uri: &Option<String>) -> String {
-    let path = uri_to_path_str(uri);
+    // Logical paths are `/`-separated everywhere downstream (type-instance
+    // indexing, path matching). On Windows `uri_to_path_str` yields backslashes,
+    // so normalise before stripping the workspace prefix — else the leading
+    // separator survives `trim_start_matches('/')` and the path leaks into name
+    // extraction (e.g. `load_oob` false positives).
+    let path = uri_to_path_str(uri).replace('\\', "/");
     if let Some(ws) = workspace_uri {
-        let ws_path = uri_to_path_str(ws);
+        let ws_path = uri_to_path_str(ws).replace('\\', "/");
         // Strip leading slash-terminated prefix
         let prefix = ws_path.trim_end_matches('/');
         if let Some(rel) = path.strip_prefix(prefix) {
@@ -67,6 +72,57 @@ pub(crate) fn line_value_key(text: &str, line0: u32, char0: u32) -> Option<Strin
         return None;
     }
     Some(key.to_string())
+}
+
+/// Whether a URI is a localisation file (`.yml`), where `$KEY$` references
+/// resolve to other loc entries rather than to game-script rules.
+pub(crate) fn is_loc_file(uri: &str) -> bool {
+    uri.to_ascii_lowercase().ends_with(".yml")
+}
+
+/// Locate the `$KEY$` loc-reference token under the cursor in a localisation
+/// line. `col` is the LSP (UTF-16) character offset. Returns the referenced key
+/// plus the token's `[start, end)` range in UTF-16 columns (for the editor to
+/// highlight). Mirrors the loc parser: the body must be an identifier
+/// (`[A-Za-z0-9_.]`, optionally with a `|colour` suffix) or it's literal text
+/// (a currency `$`), not a reference.
+pub(crate) fn loc_ref_at_cursor(line: &str, col: u32) -> Option<(String, u32, u32)> {
+    // Record every `$`'s (utf16 column, byte index).
+    let mut dollars: Vec<(u32, usize)> = Vec::new();
+    let mut u16col: u32 = 0;
+    for (b, ch) in line.char_indices() {
+        if ch == '$' {
+            dollars.push((u16col, b));
+        }
+        u16col += ch.len_utf16() as u32;
+    }
+    // Pair consecutive dollars into `$…$` tokens. A non-identifier body (e.g.
+    // `$5 today $`) is a stray currency `$`: skip just the opening one so the
+    // next dollar can still open a real token.
+    let mut i = 0;
+    while i + 1 < dollars.len() {
+        let (open_col, open_b) = dollars[i];
+        let (close_col, close_b) = dollars[i + 1];
+        let inner = &line[open_b + 1..close_b];
+        let key = inner.split('|').next().unwrap_or(inner);
+        if is_loc_ident(key) {
+            let end_col = close_col + 1;
+            if col >= open_col && col <= end_col {
+                return Some((key.to_string(), open_col, end_col));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// A `$…$` body that names a loc key / variable: non-empty, identifier chars only.
+fn is_loc_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
 }
 
 /// Best-effort discovery of a base-game install for `game`, checking the usual
@@ -183,6 +239,37 @@ mod tests {
         // Comparison operators count too.
         let text2 = "block = {\n    num > \n}\n";
         assert_eq!(line_value_key(text2, 1, 10).as_deref(), Some("num"));
+    }
+
+    #[test]
+    fn test_loc_ref_at_cursor() {
+        //                0123456789012345678
+        let line = "  k:0 \"a $FOO$ b\"";
+        // `$FOO$` spans cols 9..14 (`$`=9, F=10..12, `$`=13).
+        let (key, start, end) = loc_ref_at_cursor(line, 11).expect("cursor in $FOO$");
+        assert_eq!(key, "FOO");
+        assert_eq!((start, end), (9, 14));
+        // Cursor outside any ref.
+        assert!(loc_ref_at_cursor(line, 2).is_none());
+    }
+
+    #[test]
+    fn test_loc_ref_at_cursor_colour_suffix() {
+        let line = "x:0 \"$MY_KEY|Y$\"";
+        let (key, _, _) = loc_ref_at_cursor(line, 8).expect("cursor in ref");
+        assert_eq!(key, "MY_KEY", "colour suffix must be stripped from the key");
+    }
+
+    #[test]
+    fn test_loc_ref_at_cursor_currency_not_a_ref() {
+        // A stray currency `$` followed by a real ref: only the ref resolves.
+        let line = "x:0 \"costs $5 for $ITEM$\"";
+        assert!(
+            loc_ref_at_cursor(line, 11).is_none(),
+            "currency $5 must not be a ref"
+        );
+        let (key, _, _) = loc_ref_at_cursor(line, 20).expect("cursor in $ITEM$");
+        assert_eq!(key, "ITEM");
     }
 
     #[test]

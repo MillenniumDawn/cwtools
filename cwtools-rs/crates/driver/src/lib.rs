@@ -354,16 +354,15 @@ impl Session {
     }
 
     /// Names a loc `$ref$` may resolve to besides loc keys: the engine resolves
-    /// `$modifier$` and `$idea$` embeds against those registries. Lowercased to
-    /// match the loc union's case-insensitive lookup. With a vanilla cache the
-    /// loc_service holds no vanilla keys, so the loc_index union (which has the
-    /// cached keys merged in) joins the set — otherwise mod loc referencing a
-    /// base-game key would flag CW225.
+    /// `$modifier$` / `$idea$` / `$dynamic_modifier$` embeds and `$some_variable$`
+    /// substitutions against those registries. Lowercased to match the loc union's
+    /// case-insensitive lookup. With a vanilla cache the loc_service holds no
+    /// vanilla keys, so the loc_index union (which has the cached keys merged in)
+    /// joins the set — otherwise mod loc referencing a base-game key would flag
+    /// CW225.
     pub fn loc_extra_valid_refs(&self) -> HashSet<String> {
         let mut extra = self.modifier_keys.clone();
-        for (_uri, inst) in self.type_index.instances("idea") {
-            extra.insert(inst.name.to_lowercase());
-        }
+        extra.extend(self.type_index.loc_bindable_names());
         if self.vanilla_loc_cached {
             extra.extend(self.loc_index.union().iter().cloned());
         }
