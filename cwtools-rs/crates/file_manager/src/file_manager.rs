@@ -647,8 +647,9 @@ fn collect_files_recursive(
 /// `FileManagerConfig::default()` so they are defined in exactly one place and
 /// stay consistent with the CLI's `discover_and_parse`. `extra_file_globs` and
 /// `extra_dir_globs` layer on top of those defaults (they extend, never
-/// replace, the engine baseline). Traversal order follows `read_dir` and is not
-/// sorted; callers that need determinism should sort the result.
+/// replace, the engine baseline). Each directory's entries are sorted, so the
+/// traversal order is deterministic and independent of the filesystem's
+/// `read_dir` order.
 pub fn walk_workspace_files(
     root: &Path,
     extensions: &[&str],
@@ -676,10 +677,14 @@ fn walk_workspace_inner(
     extra_dir_globs: &[String],
     out: &mut Vec<PathBuf>,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
+    // Sort each directory's entries so the scan order matches the CLI's
+    // `collect_paths` and stays stable across filesystems.
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
         let path = entry.path();
         if path.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1054,5 +1059,28 @@ mod tests {
             by_logical.contains_key("events/bar.txt"),
             "ModB events/bar.txt should be present"
         );
+    }
+
+    #[test]
+    fn walk_workspace_files_returns_sorted_order() {
+        // The workspace scan must process files in a deterministic, sorted order
+        // independent of the filesystem's read_dir order, so editor diagnostics
+        // and indexing are reproducible run to run.
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        for name in ["zebra.txt", "alpha.txt", "middle.txt"] {
+            std::fs::write(root.join(name), "").unwrap();
+        }
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("aaa.txt"), "").unwrap();
+
+        let files = walk_workspace_files(root, &["txt"], &[], &[]);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        let pos = |n: &str| names.iter().position(|x| x == n).expect("file present");
+        assert!(pos("alpha.txt") < pos("middle.txt"), "got: {:?}", names);
+        assert!(pos("middle.txt") < pos("zebra.txt"), "got: {:?}", names);
     }
 }

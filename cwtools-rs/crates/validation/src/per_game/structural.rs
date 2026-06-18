@@ -39,6 +39,7 @@ struct Keywords {
     or: StringId,
     nor: StringId,
     limit: StringId,
+    count_triggers: StringId,
 }
 
 impl Keywords {
@@ -51,6 +52,7 @@ impl Keywords {
             or: table.intern("OR").normal,
             nor: table.intern("NOR").normal,
             limit: table.intern("limit").normal,
+            count_triggers: table.intern("count_triggers").normal,
         }
     }
 }
@@ -184,6 +186,11 @@ fn walk(
             // NOT is a neutral context: HOI4 `NOT = { a b }` means "none true",
             // so a wrapping AND (not-all) or OR (none, the common HOI4 idiom)
             // both change/clarify intent and must not flag CW251.
+            BoolState::Neutral
+        } else if key == kw.count_triggers {
+            // count_triggers counts how many direct children are true, so its
+            // children are independent (not implicitly ANDed). An AND that groups
+            // several into one counted unit is meaningful, not redundant.
             BoolState::Neutral
         } else {
             BoolState::And

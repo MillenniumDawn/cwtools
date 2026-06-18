@@ -322,6 +322,21 @@ fn test_completion_trigger_alias_in_allowed_block() {
 }
 
 #[test]
+fn test_completion_on_blank_line_after_field() {
+    // Completing on a fresh line after `cost = 5` must offer the block's other
+    // fields (the parser's leaf range absorbs the trailing blank line, which used
+    // to resolve to the cost value and return nothing) (cwtools-vscode#20).
+    let text = "my_decision = {\n    cost = 5\n    \n}\n";
+    // Cursor on the blank line after `cost = 5` (line 2, col 4).
+    let labels = completion_labels("common/decisions/test.txt", text, 2, 4);
+    assert!(
+        labels.iter().any(|l| l == "allowed"),
+        "blank line after a field should offer sibling fields, got: {:?}",
+        labels
+    );
+}
+
+#[test]
 fn test_completion_modifiers_in_mio_equipment_bonus() {
     let text = "my_org = {\n    name = org\n    equipment_bonus = {\n        some_equipment = {\n            \n        }\n    }\n}\n";
     // Cursor on the blank line inside the equipment block (line 4, col 12).

@@ -421,3 +421,132 @@ alias[trigger:always] = bool
     assert!(has_specific_key(&ctx.child_rules, "cost"));
     assert!(has_specific_key(&ctx.child_rules, "visible"));
 }
+
+const FOCUS_RULES: &str = r#"
+types = {
+    ## unique = yes
+    ## type_key_filter = style
+    type[focus_style] = { path = "game/common/national_focus" name_field = "name" }
+    ## unique = yes
+    ## type_key_filter = focus_tree
+    type[focus_tree] = { path = "game/common/national_focus" name_field = "id" }
+    ## unique = yes
+    ## type_key_filter = focus
+    type[focus] = { path = "game/common/national_focus" skip_root_key = focus_tree name_field = "id" }
+    ## unique = yes
+    ## type_key_filter = { joint_focus shared_focus }
+    type[shared_focus] = {
+        path = "game/common/national_focus"
+        name_field = "id"
+        ## only_if_not = { joint_focus }
+        ## type_key_filter = shared_focus
+        subtype[shared] = { }
+        ## only_if_not = { shared_focus }
+        ## type_key_filter = joint_focus
+        subtype[joint_focus] = { }
+    }
+    ## type_key_filter = search_filter_prios
+    type[search_filter_prios] = { path = "game/common/national_focus" }
+    type[spriteType] = { path = "game/interface" }
+}
+focus_tree = {
+    id = scalar
+}
+focus = {
+    id = scalar
+}
+alias[trigger:always] = bool
+shared_focus = {
+    id = localisation
+    ## cardinality = 0..1
+    text = localisation
+    ## cardinality = 0..inf
+    icon = <spriteType>
+    ## cardinality = 0..inf
+    icon = {
+        <spriteType> = {
+            alias_name[trigger] = alias_match_left[trigger]
+        }
+    }
+    cost = float
+    x = int
+    y = int
+    ## cardinality = 0..1
+    relative_position_id = <shared_focus>
+    ## cardinality = 0..1
+    relative_position_id = <focus>
+}
+"#;
+
+#[test]
+fn shared_focus_block_resolves_child_rules() {
+    // A top-level `shared_focus = { … }` in a national_focus file must resolve to
+    // the shared_focus rules so the editor offers its fields, not a flat fallback
+    // (cwtools-vscode#20). The type is keyed by a multi-key type_key_filter.
+    let script = "shared_focus = {\n    id = test_focus\n    HERE\n}\n";
+    let ctx = resolve(
+        FOCUS_RULES,
+        script,
+        "common/national_focus/test.txt",
+        "HERE",
+        None,
+    )
+    .expect("should resolve a context inside shared_focus");
+    let keys: Vec<&str> = ctx
+        .child_rules
+        .iter()
+        .filter_map(|(rt, _)| match rt {
+            RuleType::LeafRule {
+                left: NewField::SpecificField(k),
+                ..
+            }
+            | RuleType::NodeRule {
+                left: NewField::SpecificField(k),
+                ..
+            } => Some(k.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        has_specific_key(&ctx.child_rules, "cost"),
+        "expected shared_focus fields (cost/icon), got: {:?}",
+        keys
+    );
+}
+
+#[test]
+fn cursor_on_blank_line_after_field_is_insert_position() {
+    // The parser's leaf range absorbs trailing whitespace, so a cursor on a blank
+    // line after `icon = GFX_x` previously resolved to that leaf's VALUE (offering
+    // value completions, usually empty) instead of the block's fields. It must be
+    // an insert position (cwtools-vscode#20).
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(FOCUS_RULES, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let script = "shared_focus = {\n\tid = my_shared\n\ticon = GFX_x\n\t\n}\n";
+    let parsed = parse_string(script, &table).unwrap();
+    let registry = build_scope_registry_arc(&ruleset, None);
+    let prepared = Prepared {
+        ruleset: &ruleset,
+        table: &table,
+        game: None,
+        type_index: None,
+        modifier_keys: None,
+        loc_index: None,
+        registry: registry.as_ref(),
+        scope_checks: true,
+        var_checks: false,
+    };
+    // The blank line is parser line 4 (1-based), col 1 (after the tab).
+    let ctx = rules_at_pos(&parsed, "common/national_focus/test.txt", &prepared, 4, 1)
+        .expect("should resolve a context on the blank line");
+    assert!(
+        ctx.leaf.as_ref().is_none_or(|l| !l.in_value),
+        "blank line must not be an in-value position, got leaf: {:?}",
+        ctx.leaf.as_ref().map(|l| (l.key.clone(), l.in_value))
+    );
+    assert!(
+        has_specific_key(&ctx.child_rules, "cost"),
+        "blank line should offer the block's fields"
+    );
+}

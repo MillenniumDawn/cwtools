@@ -112,6 +112,25 @@ fn synced_missing_in_a_language_warns() {
 }
 
 #[test]
+fn embedded_inline_command_is_skipped() {
+    // A loc value with an inline `[...]` command plus a literal suffix is a
+    // dynamic, runtime-substituted string (e.g. a meta_effect variable
+    // `"[?ROOT.current_party_ideology_group.GetTokenKey]_subtype"`), not a literal
+    // loc key. It must not warn CW100 (cwtools-vscode#25).
+    let idx = loc_index(&[("a_l_english.yml", "l_english:\n other: \"hi\"\n")]);
+    let errs = run(
+        "mytype = {\n name = \"[GetIdeologyToken]_subtype\"\n}\n",
+        &idx,
+    );
+    assert_eq!(
+        cw100s(&errs),
+        0,
+        "embedded [..] command is dynamic, not a key: {:?}",
+        errs
+    );
+}
+
+#[test]
 fn dollar_var_reference_is_skipped() {
     let idx = loc_index(&[("a_l_english.yml", "l_english:\n other: \"hi\"\n")]);
     let errs = run("mytype = {\n name = \"$SOME_VAR$\"\n}\n", &idx);

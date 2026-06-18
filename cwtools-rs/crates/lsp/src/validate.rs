@@ -103,6 +103,22 @@ pub(crate) fn validate_parsed_with_indexes(
         .map(parse_error_to_diagnostic)
         .collect();
     let mut errs = validate_prepared(parsed, uri, prepared);
+    // CW100: objects defined here whose `## required` localisation keys aren't
+    // provided by any loc file. Gated on the loc index being built — before the
+    // initial scan finishes it's empty and everything would falsely report
+    // missing.
+    if let Some(loc) = prepared.loc_index
+        && !loc.union().is_empty()
+    {
+        errs.extend(cwtools_validation::missing_loc::check_missing_localisation(
+            parsed,
+            uri,
+            uri,
+            prepared.ruleset,
+            prepared.table,
+            |k| loc.exists_any(k),
+        ));
+    }
     truncate_validation_errors(&mut errs, uri);
     for err in &errs {
         diagnostics.push(validation_error_to_diagnostic(err));

@@ -466,6 +466,15 @@ fn descend(
                     return descend(ctx, clause_children, &next, scope_context, line, col);
                 }
 
+                // A scalar `key = value` is single-line, but the parser's leaf
+                // range absorbs trailing whitespace up to the next token (see
+                // parse_value). So a cursor on a later, blank line falls inside
+                // this leaf's range while actually being a new-field insert
+                // position — fall through to the block's child rules instead of
+                // offering this leaf's (usually empty) value completions.
+                if line != leaf.pos.start.line {
+                    continue;
+                }
                 // Scalar leaf: cursor on a `key = value` line.
                 let value = leaf_value_to_string(&leaf.value, ctx.table);
                 return leaf_context(ctx, rules, scope_context, leaf, &key, value, !on_key);

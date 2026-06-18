@@ -66,10 +66,13 @@ pub(crate) fn validate_localisation_field(
 
     // F# skip rules: empty keys, keys with spaces (prose / compound), `[...]`
     // inline command blocks, `$VAR$` scripted references, and `@`-vars are not
-    // plain key references and are accepted.
+    // plain key references and are accepted. The `[...]` command may be embedded
+    // with a literal suffix/prefix (e.g. a meta_effect variable
+    // `"[?ROOT...GetTokenKey]_subtype"`), so test for brackets anywhere — a real
+    // loc key never contains them.
     if key_raw.is_empty()
         || key_raw.contains(' ')
-        || (key_raw.starts_with('[') && key_raw.ends_with(']'))
+        || (key_raw.contains('[') && key_raw.contains(']'))
         || key_raw.contains('$')
         || key_raw.starts_with('@')
     {
