@@ -109,9 +109,7 @@ pub fn rules_at_pos(
         && td.type_per_file
     {
         let inner_rules = find_rules_by_name(&td.name, ruleset);
-        let has_content =
-            !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
-        if !has_content {
+        if !type_has_content(td, inner_rules) {
             return None;
         }
         return Some(enter_entity(
@@ -155,8 +153,7 @@ pub fn rules_at_pos(
 
     // 1. Exact root-key match — mirrors validate_prepared.
     if let Some((td, inner_rules)) = find_type_and_rules_for_file(&root_key, file_path, ruleset) {
-        let has_content =
-            !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
+        let has_content = type_has_content(td, inner_rules);
         let skips = should_skip_root_key(&root_key, td);
         let skip_gate_ok = td.skip_root_key.is_empty() || skips;
         if has_content && skip_gate_ok {
@@ -191,8 +188,6 @@ pub fn rules_at_pos(
     let candidates = path_candidates_for_file(&file_path_lower, ruleset);
     let mut td = find_type_from_candidates(&candidates, Some(&root_key))?;
     let mut inner_rules = find_rules_by_name(&td.name, ruleset);
-    let mut has_content =
-        !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
     // The top path+key match can be an index-only skip wrapper whose rule body
     // lives in a sibling base type. `on_actions` resolves to the `on_weekly`
     // wrapper (skip_root_key = on_actions, no rules) over the `on_action` base
@@ -200,13 +195,9 @@ pub fn rules_at_pos(
     // validator simply skips such a root; for navigation, fall back to the best
     // content-bearing type on this path so the cursor can still descend into the
     // effect block and resolve scripted-effect calls.
-    if !has_content && let Some(base) = best_content_type(&candidates, &root_key, ruleset) {
-        td = base;
+    if !type_has_content(td, inner_rules) {
+        td = best_content_type(&candidates, &root_key, ruleset)?;
         inner_rules = find_rules_by_name(&td.name, ruleset);
-        has_content = !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
-    }
-    if !has_content {
-        return None;
     }
     if should_skip_root_key(&root_key, td) {
         return descend_wrapper(
@@ -237,10 +228,16 @@ pub fn rules_at_pos(
     ))
 }
 
+/// Whether a type has its own validation rules, rather than being an index-only
+/// `type[x]` declaration (path/name_field with no rule body) that exists solely
+/// to register instances.
+fn type_has_content(td: &TypeDefinition, rules: &[(RuleType, Options)]) -> bool {
+    !rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty())
+}
+
 /// The best path candidate that carries an actual rule body, ignoring index-only
-/// `type[x]` declarations (path/name_field with no rules) that exist solely to
-/// register instances. Used as a navigation fallback when the top path+key match
-/// is a rule-less skip wrapper whose content is validated by a sibling base type
+/// types. Used as a navigation fallback when the top path+key match is a
+/// rule-less skip wrapper whose content is validated by a sibling base type
 /// (e.g. the `on_action` base owns the rules that `on_weekly`/`on_daily`
 /// instances under `on_actions = { }` are checked against).
 fn best_content_type<'a>(
@@ -250,10 +247,7 @@ fn best_content_type<'a>(
 ) -> Option<&'a TypeDefinition> {
     let filtered: Vec<PathCandidate<'a>> = candidates
         .iter()
-        .filter(|c| {
-            let r = find_rules_by_name(&c.type_def.name, ruleset);
-            !r.is_empty() || c.type_def.subtypes.iter().any(|st| !st.rules.is_empty())
-        })
+        .filter(|c| type_has_content(c.type_def, find_rules_by_name(&c.type_def.name, ruleset)))
         .map(|c| PathCandidate {
             type_def: c.type_def,
             base_weight: c.base_weight,
