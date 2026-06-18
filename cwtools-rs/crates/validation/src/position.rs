@@ -17,8 +17,9 @@ use cwtools_rules::rules_types::*;
 use crate::common::{leaf_value_to_string, unquote_key};
 use crate::ctx::ValidationCtx;
 use crate::resolve::{
-    find_grandchild_type, find_rules_by_name, find_type_and_rules_for_file, find_type_by_path,
-    find_type_by_path_and_key, should_skip_root_key, skip_root_key_tail,
+    PathCandidate, find_grandchild_type, find_rules_by_name, find_type_and_rules_for_file,
+    find_type_by_path, find_type_from_candidates, path_candidates_for_file, should_skip_root_key,
+    skip_root_key_tail,
 };
 use crate::rule_core::{
     alias_overloads, flatten_nested_subtype_rules, matching_candidates, merged_rules_for_type,
@@ -187,9 +188,23 @@ pub fn rules_at_pos(
 
     // 2. Path-based fallback — mirrors validate_prepared.
     let file_path_lower = file_path.to_lowercase();
-    let td = find_type_by_path_and_key(&file_path_lower, Some(&root_key), ruleset)?;
-    let inner_rules = find_rules_by_name(&td.name, ruleset);
-    let has_content = !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
+    let candidates = path_candidates_for_file(&file_path_lower, ruleset);
+    let mut td = find_type_from_candidates(&candidates, Some(&root_key))?;
+    let mut inner_rules = find_rules_by_name(&td.name, ruleset);
+    let mut has_content =
+        !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
+    // The top path+key match can be an index-only skip wrapper whose rule body
+    // lives in a sibling base type. `on_actions` resolves to the `on_weekly`
+    // wrapper (skip_root_key = on_actions, no rules) over the `on_action` base
+    // type that actually carries `on_weekly = single_alias_right[...]`. The
+    // validator simply skips such a root; for navigation, fall back to the best
+    // content-bearing type on this path so the cursor can still descend into the
+    // effect block and resolve scripted-effect calls.
+    if !has_content && let Some(base) = best_content_type(&candidates, &root_key, ruleset) {
+        td = base;
+        inner_rules = find_rules_by_name(&td.name, ruleset);
+        has_content = !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
+    }
     if !has_content {
         return None;
     }
@@ -220,6 +235,31 @@ pub fn rules_at_pos(
         line,
         col,
     ))
+}
+
+/// The best path candidate that carries an actual rule body, ignoring index-only
+/// `type[x]` declarations (path/name_field with no rules) that exist solely to
+/// register instances. Used as a navigation fallback when the top path+key match
+/// is a rule-less skip wrapper whose content is validated by a sibling base type
+/// (e.g. the `on_action` base owns the rules that `on_weekly`/`on_daily`
+/// instances under `on_actions = { }` are checked against).
+fn best_content_type<'a>(
+    candidates: &[PathCandidate<'a>],
+    root_key: &str,
+    ruleset: &'a RuleSet,
+) -> Option<&'a TypeDefinition> {
+    let filtered: Vec<PathCandidate<'a>> = candidates
+        .iter()
+        .filter(|c| {
+            let r = find_rules_by_name(&c.type_def.name, ruleset);
+            !r.is_empty() || c.type_def.subtypes.iter().any(|st| !st.rules.is_empty())
+        })
+        .map(|c| PathCandidate {
+            type_def: c.type_def,
+            base_weight: c.base_weight,
+        })
+        .collect();
+    find_type_from_candidates(&filtered, Some(root_key))
 }
 
 /// Descend through a skip_root_key wrapper to the grandchild containing the
