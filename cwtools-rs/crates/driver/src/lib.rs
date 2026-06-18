@@ -437,6 +437,18 @@ impl SessionWithFiles {
                 let file_str = src.path.to_str().unwrap_or("").to_string();
                 let mut errors = parse_errors_to_validation(&src.parsed.errors, &file_str);
                 errors.extend(validate_prepared(&src.parsed, &file_str, &prepared));
+                // CW100: objects defined here whose `## required` localisation
+                // keys aren't provided by any loc file.
+                if let Some(loc) = prepared.loc_index {
+                    errors.extend(cwtools_validation::missing_loc::check_missing_localisation(
+                        &src.parsed,
+                        &src.logical_path,
+                        &file_str,
+                        prepared.ruleset,
+                        prepared.table,
+                        |k| loc.exists_any(k),
+                    ));
+                }
                 (src.path.clone(), errors)
             })
             .collect()

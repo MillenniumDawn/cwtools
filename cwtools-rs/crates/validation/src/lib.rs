@@ -8,6 +8,7 @@ use cwtools_string_table::string_table::StringTable;
 use std::collections::HashSet;
 
 pub mod error_codes;
+pub mod missing_loc;
 pub mod per_game;
 pub mod position;
 
