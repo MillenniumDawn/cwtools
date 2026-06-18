@@ -45,7 +45,7 @@ pub(crate) fn type_extension_matches(file_path: &str, t: &TypeDefinition) -> boo
             if ext.is_empty() {
                 return true;
             }
-            let path_lower = file_path.to_lowercase();
+            let path_lower = file_path.to_lowercase().replace('\\', "/");
             let basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
             basename
                 .rsplit('.')
@@ -118,7 +118,7 @@ pub(crate) fn find_type_by_path<'a>(
     file_path: &str,
     ruleset: &'a RuleSet,
 ) -> Option<&'a TypeDefinition> {
-    let lower = file_path.to_lowercase();
+    let lower = file_path.to_lowercase().replace('\\', "/");
     find_type_by_path_and_key(&lower, None, ruleset)
 }
 
@@ -260,7 +260,7 @@ pub(crate) fn find_type_by_path_and_key<'a>(
 /// [`find_type_by_path_and_key`] without the scoring, for use when several types
 /// share a path.
 pub(crate) fn type_path_matches(file_path: &str, t: &TypeDefinition) -> bool {
-    let path_lower = file_path.to_lowercase();
+    let path_lower = file_path.to_lowercase().replace('\\', "/");
     let basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
     let dir = path_lower
         .strip_suffix(basename)
@@ -345,6 +345,23 @@ mod tests {
         assert!(
             !path_candidates_for_file("common\\foo\\x.txt", &rs).is_empty(),
             "backslash path should resolve type foo too"
+        );
+    }
+
+    #[test]
+    fn type_path_matches_handles_backslash_paths() {
+        let table = StringTable::new();
+        let cwt = "types = { type[foo] = { path = \"common/foo\" } }";
+        let parsed = parse_string(cwt, &table).unwrap();
+        let rs = ast_to_ruleset(&parsed, &table);
+        let t = &rs.types[0];
+        assert!(
+            type_path_matches("common/foo/x.txt", t),
+            "forward-slash path should match"
+        );
+        assert!(
+            type_path_matches("common\\foo\\x.txt", t),
+            "backslash path should match too"
         );
     }
 }

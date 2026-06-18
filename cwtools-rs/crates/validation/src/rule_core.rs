@@ -663,6 +663,7 @@ pub(crate) fn validate_children(
                                 let raw = leaf_value_to_string(&lv.value, table);
                                 check_variable_get(
                                     &raw,
+                                    ruleset,
                                     type_index,
                                     file_path,
                                     lv.pos.start.line,
@@ -1365,8 +1366,25 @@ fn alias_mismatch_error(
 /// set. Mirrors F# `checkVariableGetField`: bypasses @-vars, inline math, and
 /// loc embeds (those resolve dynamically), and only fires when the index is
 /// populated AND the variable checks are enabled.
+/// Whether `token` names a config-declared built-in variable: a member of the
+/// `value[variable]` set (variables.cwt lists engine-provided reads like
+/// `faction_leader`, `num_days`, `threat`). These are valid variable references
+/// even without the `var:` prefix and are never dynamically "set", so they must
+/// not flag CW246. Members may carry a scope suffix (`name@<type>` /
+/// `name@enum[...]`); match the base name before the `@`.
+fn is_builtin_variable(ruleset: &RuleSet, token: &str) -> bool {
+    ruleset.values.get("variable").is_some_and(|members| {
+        members.iter().any(|m| {
+            let base = m.split('@').next().unwrap_or(m);
+            base.eq_ignore_ascii_case(token)
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn check_variable_get(
     raw: &str,
+    ruleset: &RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
     file_path: &str,
     line: u32,
@@ -1392,7 +1410,8 @@ fn check_variable_get(
     if core.is_empty() {
         return;
     }
-    if let Some(idx) = type_index
+    if !is_builtin_variable(ruleset, core)
+        && let Some(idx) = type_index
         && !idx.var_index.is_empty()
         && !idx.var_index.contains(core)
     {
@@ -1605,6 +1624,7 @@ fn validate_leaf(
                         .unwrap_or(false);
                     if single_token
                         && !is_scopeish
+                        && !is_builtin_variable(ctx.ruleset, core)
                         && let Some(idx) = type_index
                         && !idx.var_index.is_empty()
                         && !idx.var_index.contains(core)
@@ -1631,6 +1651,7 @@ fn validate_leaf(
             let raw = leaf_value_to_string(&leaf.value, table);
             check_variable_get(
                 &raw,
+                ctx.ruleset,
                 type_index,
                 file_path,
                 leaf.pos.start.line,
