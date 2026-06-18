@@ -21,6 +21,10 @@ use cwtools_string_table::string_table::{StringId, StringTable};
 enum BoolState {
     And,
     Or,
+    /// Inside a `NOT`: neither an explicit `AND` nor `OR` is redundant here.
+    /// `NOT = { a b }` means "none true", so `NOT = { AND = {…} }` (not-all) and
+    /// `NOT = { OR = {…} }` (none, the standard HOI4 idiom) are both meaningful.
+    Neutral,
 }
 
 /// The reserved keywords' interned ids, resolved once per file so the walk
@@ -173,9 +177,14 @@ fn walk(
             }
             BoolState::Or
         } else if key == kw.nor {
-            // OR and NOR both put their children in an Or context (NOR never
-            // pushes CW251, matching F#).
+            // NOR puts its children in an Or context (an OR directly inside is
+            // redundant), and never pushes CW251 itself. Matches F#.
             BoolState::Or
+        } else if key == kw.not {
+            // NOT is a neutral context: HOI4 `NOT = { a b }` means "none true",
+            // so a wrapping AND (not-all) or OR (none, the common HOI4 idiom)
+            // both change/clarify intent and must not flag CW251.
+            BoolState::Neutral
         } else {
             BoolState::And
         };

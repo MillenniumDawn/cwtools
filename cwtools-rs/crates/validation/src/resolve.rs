@@ -140,6 +140,12 @@ pub(crate) fn path_candidates_for_file<'a>(
     file_path_lower: &str,
     ruleset: &'a RuleSet,
 ) -> Vec<PathCandidate<'a>> {
+    // Logical paths are `/`-separated. A backslash path (Windows, if a caller
+    // didn't normalize) would make `rsplit('/')` treat the whole path as the
+    // basename and match no type — silently breaking hover/goto/validation
+    // (e.g. trigger doc tooltips) for that file.
+    let normalized = file_path_lower.replace('\\', "/");
+    let file_path_lower = normalized.as_str();
     let basename = file_path_lower
         .rsplit('/')
         .next()
@@ -313,4 +319,32 @@ pub(crate) fn find_grandchild_type<'a>(
         }
     }
     generic
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cwtools_parser::parser::parse_string;
+    use cwtools_rules::rules_converter::ast_to_ruleset;
+    use cwtools_string_table::string_table::StringTable;
+
+    #[test]
+    fn path_candidates_handle_backslash_paths() {
+        let table = StringTable::new();
+        let cwt = "types = { type[foo] = { path = \"common/foo\" } }";
+        let parsed = parse_string(cwt, &table).unwrap();
+        let rs = ast_to_ruleset(&parsed, &table);
+
+        // Forward-slash resolves the type.
+        assert!(
+            !path_candidates_for_file("common/foo/x.txt", &rs).is_empty(),
+            "forward-slash path should resolve type foo"
+        );
+        // A Windows backslash path must resolve the same type, not silently
+        // fail (which would break hover/goto/validation for the file).
+        assert!(
+            !path_candidates_for_file("common\\foo\\x.txt", &rs).is_empty(),
+            "backslash path should resolve type foo too"
+        );
+    }
 }

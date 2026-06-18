@@ -226,6 +226,42 @@ foo = {
 }
 
 #[test]
+fn and_inside_not_is_clean() {
+    // HOI4 `NOT = { a b }` means "none true" (= NOT(a OR b)), so an explicit AND
+    // inside NOT is meaningful — `NOT = { AND = {...} }` (not-all) differs from
+    // `NOT = {...}` (none). It must NOT fire CW251.
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    NOT = {
+        AND = { a = 1 b = 2 }
+    }
+}
+"#,
+    );
+    assert!(!c.contains(&"CW251".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn or_inside_not_is_clean() {
+    // `NOT = { OR = {…} }` is the standard HOI4 "none of these" idiom (HOI4 has
+    // no NOR trigger). It's intentional, not redundant, so it must not flag
+    // CW251.
+    let c = codes(
+        Game::Hoi4,
+        r#"
+foo = {
+    NOT = {
+        OR = { a = 1 b = 2 }
+    }
+}
+"#,
+    );
+    assert!(!c.contains(&"CW251".to_string()), "got: {:?}", c);
+}
+
+#[test]
 fn else_without_if_is_cw238() {
     let c = codes(
         Game::Stellaris,
