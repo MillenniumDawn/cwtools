@@ -244,10 +244,15 @@ pub(crate) fn completions_from_rules(
                             let choices = vals.join(",");
                             Some(format!("{} = ${{1|{}|}}", k, choices))
                         } else {
-                            None
+                            // Long enum: still complete the `key = ` and let the
+                            // value be typed/triggered.
+                            Some(format!("{} = $0", k))
                         }
                     }
-                    _ => None,
+                    // Any other value kind (scalar, int, float, type ref, …):
+                    // complete `key = ` with the cursor after the `=`, rather than
+                    // a bare `key` with no operator (cwtools-vscode#16).
+                    _ => Some(format!("{} = $0", k)),
                 };
                 items.push(CompletionItem {
                     label: k.clone(),
@@ -985,6 +990,7 @@ mod tests {
                         NewField::ValueField(ValueType::Enum("my_enum".to_string())),
                     ),
                     make_leaf_rule("active", NewField::ValueField(ValueType::Bool)),
+                    make_leaf_rule("name", NewField::ScalarField),
                 ],
             ),
         ));
@@ -1029,6 +1035,32 @@ mod tests {
         let active = active_item.unwrap();
         let asnip = active.insert_text.as_deref().unwrap_or("");
         assert!(asnip.contains("yes"), "active snippet: {}", asnip);
+    }
+
+    #[test]
+    fn test_completion_scalar_key_inserts_equals() {
+        // A plain field (scalar/int/type value) must autocomplete to `name = `,
+        // not a bare `name` (cwtools-vscode#16).
+        let rs = bool_enum_ruleset();
+        let info = cwtools_info::InfoService::new();
+        let rules = if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
+            rs.root_rules.first()
+        {
+            rules.as_slice()
+        } else {
+            panic!("expected TypeRule");
+        };
+        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None);
+        let name = items
+            .iter()
+            .find(|i| i.label == "name")
+            .expect("name completion");
+        let snip = name.insert_text.as_deref().unwrap_or("");
+        assert!(
+            snip.starts_with("name = "),
+            "scalar key should insert 'name = ', got: {:?}",
+            name.insert_text
+        );
     }
 
     // ── snippet generation tests ─────────────────────────────────────────────
