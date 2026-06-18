@@ -14,10 +14,13 @@
 - Hover and Ctrl+Click work on nested `$KEY$` references inside localisation .yml files: hover shows the referenced entry's text, Ctrl+Click jumps to it
 - A broken rules config is flagged: a `.cwt` rule referencing an undefined type, enum, or single_alias reports an error on the offending line
 - Autocompleting a plain field inserts `name = ` with the cursor after the `=`, instead of just `name`
+- Autocompletion on a fresh line after a field offers the block's fields again, instead of the editor falling back to plain word suggestions (most visible in shared_focus / focus files)
+- Objects whose type declares `## required` localisation are flagged when that loc key is missing (CW100), so missing localisation is visible again
 
 ## Developer
 - Normalised Windows path separators across type resolution, the file index, and logical-path derivation so editor features hold up on the Windows build
-- Added regression tests for CRLF `###` docs, scoped hover, `$KEY$` navigation, scripted-loc references, NOT/AND structural checks, built-in variables, and backslash path resolution
+- The LSP workspace scan walks files in a deterministic, sorted order independent of the filesystem's directory order
+- Added regression tests for CRLF `###` docs, scoped hover, `$KEY$` navigation, scripted-loc references, NOT/AND structural checks, built-in variables, backslash path resolution, blank-line completion, and missing-localisation
 
 # 1.4.1
 
