@@ -352,4 +352,21 @@ mod tests {
     fn required_scopes_triple_hash_ignored() {
         assert!(parse_required_scopes(&s(&["### scope = the owning country"])).is_empty());
     }
+
+    #[test]
+    fn extract_description_crlf_line_endings() {
+        // Windows CRLF: the parser keeps the trailing `\r` in comment text, so
+        // `### doc\r` must still extract as documentation (precompute_comments
+        // trims it in the real pipeline; this guards the extractor directly).
+        let comments_with_crlf = vec![
+            "### First doc line\r".to_string(),
+            "## cardinality = 0..1\r".to_string(),
+            "### Second doc line\r".to_string(),
+        ];
+        let desc = extract_description_from_comments(&comments_with_crlf).unwrap();
+        assert_eq!(
+            desc, "First doc line\nSecond doc line",
+            "CRLF comments should extract as documentation"
+        );
+    }
 }
