@@ -1454,6 +1454,13 @@ fn validate_leaf(
                 .and_then(|s| s.strip_suffix('"'))
                 .unwrap_or(&raw_value)
                 .to_string();
+            // A `[...]` value is inline scripted localisation / a defined_text
+            // reference (e.g. `picture = "[GetCivilWarVictorPicture]"`) that the
+            // engine resolves at runtime, so it can't be checked against a literal
+            // type instance.
+            if value_str.starts_with('[') {
+                return;
+            }
             let type_name = match type_type {
                 TypeType::Simple(n) => n.as_str(),
                 TypeType::Complex { name, .. } => name.as_str(),

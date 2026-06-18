@@ -874,3 +874,51 @@ guiTypes = {
         "Expected a validation error for moveable = 42, got none"
     );
 }
+
+#[test]
+fn scripted_loc_value_is_not_cw500() {
+    // A `[...]` value is inline scripted localisation / a defined_text reference
+    // resolved at runtime (e.g. `picture = "[GetCivilWarVictorPicture]"`), not a
+    // literal type instance, so it must not flag CW500.
+    let cwt = r#"
+event = {
+    requires_technology = <technology>
+}
+types = {
+    type[event] = { path = "game/events" }
+    type[technology] = { path = "game/common/technology" }
+}
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+
+    let mut idx = TypeIndex::new();
+    let mut map = HashMap::new();
+    map.insert(
+        "technology".to_string(),
+        vec![TypeInstance {
+            name: "my_tech_alpha".to_string(),
+            location: SourceLocation { line: 1, col: 0 },
+        }],
+    );
+    idx.merge("file://tech.txt", map);
+    idx.complete = true;
+
+    let script = "event = { requires_technology = \"[GetSomeTech]\" }\n";
+    let parsed = parse_string(script, &table).unwrap();
+    let errs = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/events/test.txt",
+        None,
+        Some(&idx),
+        None,
+    );
+    assert!(
+        errs.iter().all(|e| e.code.as_deref() != Some("CW500")),
+        "scripted-loc [..] value must not flag CW500, got: {:?}",
+        errs
+    );
+}
