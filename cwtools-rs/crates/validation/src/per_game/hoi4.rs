@@ -14,14 +14,6 @@ use crate::{ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_string_table::string_table::StringTable;
 
-/// Fields whose body `{ always = <bool> }` matches the game default, keyed by
-/// field name -> the default the `always` value must equal to be a no-op.
-const REDUNDANT_DEFAULT_FIELDS: &[(&str, bool)] = &[
-    // An idea/spirit's allowed_civil_war defaults to "no"; `{ always = no }` is
-    // therefore redundant and can be deleted.
-    ("allowed_civil_war", false),
-];
-
 /// If the block's only non-comment child is `always = <bool>`, return that bool;
 /// otherwise `None` (anything else means the block does real work).
 fn sole_always_value(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Option<bool> {
@@ -61,10 +53,15 @@ fn walk(
         };
         let key = block.key_string(table);
 
-        if let Some((_, default)) = REDUNDANT_DEFAULT_FIELDS
-            .iter()
-            .find(|(k, _)| *k == key.as_str())
-            && sole_always_value(block.children, ast, table) == Some(*default)
+        // Fields whose body `{ always = <bool> }` matches the game default (so the
+        // field is a no-op) -> the default the `always` value must equal. Listed
+        // explicitly: an idea/spirit's allowed_civil_war defaults to "no".
+        let default = match key.as_str() {
+            "allowed_civil_war" => Some(false),
+            _ => None,
+        };
+        if let Some(default) = default
+            && sole_always_value(block.children, ast, table) == Some(default)
         {
             errors.push(ValidationError {
                 message: error_codes::CW280_REDUNDANT_DEFAULT_FIELD.format(&[&key]),

@@ -146,12 +146,12 @@ pub(crate) fn merged_rules_for_type<'a>(
         }
     }
     // Apply only_if_not: remove a subtype if any of its only_if_not names are in the matched set.
-    let all_names_copy: Vec<&str> = matched_subtype_names.clone();
+    let all_names_copy: FxHashSet<&str> = matched_subtype_names.iter().copied().collect();
     matched_subtype_names.retain(|name| {
         let st = type_def.subtypes.iter().find(|s| s.name == *name).unwrap();
         !st.only_if_not
             .iter()
-            .any(|excl| all_names_copy.contains(&excl.as_str()))
+            .any(|excl| all_names_copy.contains(excl.as_str()))
     });
 
     // Step 2: collect base rules (non-SubtypeRule entries) + matching SubtypeRule entries.
@@ -366,15 +366,17 @@ where
         return;
     }
     let mut best: Option<Vec<ValidationError>> = None;
+    let mut temp: Vec<ValidationError> = Vec::new();
     for i in 0..n {
-        let mut temp = Vec::new();
+        temp.clear();
         validate_one(i, &mut temp);
         if temp.is_empty() {
             return; // clean match
         }
         match &best {
             Some(b) if b.len() <= temp.len() => {}
-            _ => best = Some(temp),
+            // New best — take `temp`'s contents, leaving a reusable empty buffer.
+            _ => best = Some(std::mem::take(&mut temp)),
         }
     }
     if let Some(b) = best {
@@ -396,20 +398,22 @@ pub(crate) fn matching_candidates<'a, F>(
 where
     F: Fn(&RuleType, &str, &RuleSet, Option<&cwtools_index::TypeIndex>) -> bool,
 {
-    let all: Vec<&(RuleType, Options)> = rules
+    let is_specific = |rt: &RuleType| {
+        matches!(rt,
+        RuleType::LeafRule { left: NewField::SpecificField(s), .. }
+        | RuleType::NodeRule { left: NewField::SpecificField(s), .. } if s.eq_ignore_ascii_case(key))
+    };
+    // A literal `SpecificField` rule wins over catch-all matches; scan once to see
+    // if any exists, then collect only the relevant subset (one heap alloc, not two).
+    let has_specific = rules
         .iter()
-        .filter(|(rt, _)| matcher(rt, key, ruleset, type_index))
-        .collect();
-    let specific: Vec<&(RuleType, Options)> = all
+        .any(|(rt, _)| is_specific(rt) && matcher(rt, key, ruleset, type_index));
+    rules
         .iter()
         .filter(|(rt, _)| {
-            matches!(rt,
-            RuleType::LeafRule { left: NewField::SpecificField(s), .. }
-            | RuleType::NodeRule { left: NewField::SpecificField(s), .. } if s.eq_ignore_ascii_case(key))
+            matcher(rt, key, ruleset, type_index) && (!has_specific || is_specific(rt))
         })
-        .copied()
-        .collect();
-    if specific.is_empty() { all } else { specific }
+        .collect()
 }
 
 /// Expand nested `SubtypeRule` entries into their inner rules.
@@ -493,7 +497,7 @@ pub(crate) fn validate_children(
                 // Paradox keys are case-insensitive; key the counts in lowercase so
                 // a field written `texturefile` satisfies a rule keyed `textureFile`.
                 let key = table
-                    .with_string(leaf.key.normal, |s| unquote_key(s).to_lowercase())
+                    .with_string(leaf.key.normal, |s| unquote_key(s).to_ascii_lowercase())
                     .unwrap_or_default();
                 *key_counts.entry(key).or_insert(0) += 1;
             }
@@ -743,10 +747,11 @@ pub(crate) fn validate_children(
             RuleType::LeafRule { .. } | RuleType::NodeRule { .. }
         ) && let Some(k) = get_rule_key(rule_type)
         {
-            let e =
-                key_card
-                    .entry(k.to_lowercase())
-                    .or_insert((opts.min, opts.max, opts.strict_min));
+            let e = key_card.entry(k.to_ascii_lowercase()).or_insert((
+                opts.min,
+                opts.max,
+                opts.strict_min,
+            ));
             e.0 = e.0.min(opts.min);
             e.1 = e.1.max(opts.max);
             e.2 = e.2 && opts.strict_min;
@@ -762,7 +767,7 @@ pub(crate) fn validate_children(
         let card_sev = opts
             .severity
             .as_ref()
-            .map(|s| severity_to_error(s.clone()))
+            .map(severity_to_error)
             .unwrap_or(ErrorSeverity::Warning);
         let missing_sev = card_sev;
         let max_sev = card_sev;
@@ -770,7 +775,7 @@ pub(crate) fn validate_children(
         match rule_type {
             RuleType::LeafRule { .. } | RuleType::NodeRule { .. } => {
                 if let Some(key) = get_rule_key(rule_type) {
-                    let lkey = key.to_lowercase();
+                    let lkey = key.to_ascii_lowercase();
                     // Each distinct key is reported at most once (see key_card above).
                     if reported_keys.insert(lkey.clone()) {
                         let (kmin, kmax, kstrict) = key_card.get(&lkey).copied().unwrap_or((
@@ -915,8 +920,7 @@ fn looks_like_scope_command(key: &str) -> bool {
         "CAPITAL",
         "OVERLORD",
     ];
-    let upper = key.to_ascii_uppercase();
-    if KEYWORDS.contains(&upper.as_str()) {
+    if KEYWORDS.iter().any(|kw| key.eq_ignore_ascii_case(kw)) {
         return true;
     }
     // Scope chains (ROOT.owner) and prefixed refs (event_target:x, var:x).
@@ -945,10 +949,21 @@ fn is_scope_key(
     type_index: Option<&cwtools_index::TypeIndex>,
 ) -> bool {
     looks_like_scope_command(key)
-        || ruleset
+        || scope_links_contains(ruleset, key)
+        || type_index.is_some_and(|idx| idx.is_any_instance(key))
+}
+
+/// Case-insensitive membership in `ruleset.scope_links` (a lowercase `String`
+/// set), allocating a lowercased key only when `key` actually has uppercase
+/// bytes — the common all-lowercase case probes the set directly.
+fn scope_links_contains(ruleset: &RuleSet, key: &str) -> bool {
+    if key.bytes().any(|b| b.is_ascii_uppercase()) {
+        ruleset
             .scope_links
             .contains(&key.to_ascii_lowercase() as &str)
-        || type_index.is_some_and(|idx| idx.is_any_instance(key))
+    } else {
+        ruleset.scope_links.contains(key)
+    }
 }
 
 /// Test whether `key` matches the pre-parsed alias pattern.
@@ -1020,14 +1035,16 @@ pub(crate) fn field_matches_key(
             }
             // Case-insensitive retry: command names like `Country_event` resolve to
             // the lowercase `country_event` alias (config alias names are lowercase).
-            let lower = key.to_ascii_lowercase();
-            if lower != key
-                && ruleset
+            // Only allocate the lowercased form when `key` actually has uppercase.
+            if key.bytes().any(|b| b.is_ascii_uppercase()) {
+                let lower = key.to_ascii_lowercase();
+                if ruleset
                     .alias_exact
                     .get(category.as_str())
                     .is_some_and(|m| m.contains_key(lower.as_str()))
-            {
-                return true;
+                {
+                    return true;
+                }
             }
             match ruleset.alias_categories.get(category.as_str()) {
                 // Category has no aliases at all — be permissive (avoid floods).
@@ -1100,16 +1117,16 @@ pub(crate) fn field_matches_key(
     }
 }
 
-fn get_rule_key(rule_type: &RuleType) -> Option<String> {
+fn get_rule_key(rule_type: &RuleType) -> Option<&str> {
     match rule_type {
         RuleType::LeafRule { left, .. } | RuleType::NodeRule { left, .. } => field_to_key(left),
         _ => None,
     }
 }
 
-fn field_to_key(field: &NewField) -> Option<String> {
+fn field_to_key(field: &NewField) -> Option<&str> {
     match field {
-        NewField::SpecificField(s) => Some(s.clone()),
+        NewField::SpecificField(s) => Some(s.as_str()),
         _ => None,
     }
 }
@@ -1138,16 +1155,17 @@ pub(crate) fn alias_overloads<'a>(
     // Case-insensitive retry: usages like `IF`, `Country_event` resolve to the
     // lowercase alias (config alias names are lowercase). Mirrors the fallback in
     // field_matches_key, which matches the key so the body must validate too.
-    let lower = key.to_ascii_lowercase();
-    if overloads.is_empty()
-        && lower != key
-        && let Some(idxs) = ruleset
+    // Only allocate the lowercased form when `key` actually has uppercase.
+    if overloads.is_empty() && key.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lower = key.to_ascii_lowercase();
+        if let Some(idxs) = ruleset
             .alias_exact
             .get(category)
             .and_then(|m| m.get(lower.as_str()))
-    {
-        for &i in idxs {
-            overloads.push(&ruleset.aliases[i].1);
+        {
+            for &i in idxs {
+                overloads.push(&ruleset.aliases[i].1);
+            }
         }
     }
     if let Some(cat) = ruleset.alias_categories.get(category) {
@@ -1271,8 +1289,9 @@ fn validate_alias_usage(
     }
 
     let mut best: Option<Vec<ValidationError>> = None;
+    let mut temp: Vec<ValidationError> = Vec::new();
     for (rule_type, opts) in overloads {
-        let mut temp: Vec<ValidationError> = Vec::new();
+        temp.clear();
         match rule_type {
             RuleType::LeafRule { .. } => {
                 if let Some(leaf) = leaf {
@@ -1331,7 +1350,8 @@ fn validate_alias_usage(
         }
         match &best {
             Some(b) if b.len() <= temp.len() => {}
-            _ => best = Some(temp),
+            // New best — take `temp`'s contents, leaving a reusable empty buffer.
+            _ => best = Some(std::mem::take(&mut temp)),
         }
     }
 

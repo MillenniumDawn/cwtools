@@ -5,7 +5,7 @@ use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
 use rustc_hash::FxHashMap;
 
-use crate::common::{child_key_matches, match_text};
+use crate::common::child_key_matches;
 use crate::rule_core::field_matches_value;
 
 /// Test whether a subtype's rules are satisfied by an entity's children.
@@ -81,6 +81,8 @@ pub(crate) fn subtype_rules_match(
     let mut activated = false;
 
     for (k, group) in &groups {
+        // `k` is loop-invariant; unquote it once instead of per child.
+        let k_unq = crate::common::unquote_key(k);
         let mut count: i32 = 0;
         let mut any_match = false;
         for c in children {
@@ -93,8 +95,7 @@ pub(crate) fn subtype_rules_match(
                         let leaf = &ast.arena.leaves[*idx as usize];
                         if table
                             .with_string(leaf.key.normal, |s| {
-                                crate::common::unquote_key(s)
-                                    .eq_ignore_ascii_case(crate::common::unquote_key(k))
+                                crate::common::unquote_key(s).eq_ignore_ascii_case(k_unq)
                             })
                             .unwrap_or(false)
                         {
@@ -239,9 +240,10 @@ pub(crate) fn typefield_value_is_instance(
     let (NewField::TypeField(TypeType::Simple(tname)), Some(idx)) = (right, type_index) else {
         return false;
     };
-    let v = match value {
-        Value::String(t) | Value::QString(t) => match_text(table, t),
-        _ => return false,
-    };
-    idx.contains(tname, &v)
+    match value {
+        Value::String(t) | Value::QString(t) => {
+            crate::common::with_match_text(table, t, |v| idx.contains(tname, v))
+        }
+        _ => false,
+    }
 }
