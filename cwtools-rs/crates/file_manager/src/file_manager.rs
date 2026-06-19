@@ -842,23 +842,28 @@ fn glob_match_general(pattern: &str, text: &str) -> bool {
 fn glob_dp(p: &[char], t: &[char]) -> bool {
     let m = p.len();
     let n = t.len();
-    let mut dp = vec![vec![false; n + 1]; m + 1];
-    dp[0][0] = true;
+    // Single rolling row instead of an (m+1)x(n+1) `Vec<Vec<bool>>` per call
+    // (#17): dp[j] holds whether p[0..i] matches t[0..j]; `prev_diag` carries the
+    // dp[i-1][j-1] value as we sweep j left-to-right.
+    let mut dp = vec![false; n + 1];
+    dp[0] = true; // empty pattern matches empty text
     for i in 1..=m {
-        if p[i - 1] == '*' {
-            dp[i][0] = dp[i - 1][0];
-        }
-    }
-    for i in 1..=m {
+        let mut prev_diag = dp[0]; // dp[i-1][0]
+        // dp[i][0] is true only if every pattern char so far is '*'.
+        dp[0] = dp[0] && p[i - 1] == '*';
         for j in 1..=n {
+            let above = dp[j]; // dp[i-1][j], before overwrite
             if p[i - 1] == '*' {
-                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+                dp[j] = dp[j] || dp[j - 1]; // dp[i-1][j] || dp[i][j-1]
             } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1];
+                dp[j] = prev_diag; // dp[i-1][j-1]
+            } else {
+                dp[j] = false;
             }
+            prev_diag = above;
         }
     }
-    dp[m][n]
+    dp[n]
 }
 
 #[cfg(test)]
