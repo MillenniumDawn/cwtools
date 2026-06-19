@@ -245,16 +245,16 @@ impl Backend {
     /// `ast = None` (e.g. a file that failed to parse) clears the set, so the
     /// sweep treats the doc as "unknown" and always includes it.
     pub(crate) fn update_doc_tokens(&self, uri: &str, ast: Option<&Arc<ParsedFile>>) {
-        let mut tokens = self.state.doc_tokens.write();
+        // Build the token set BEFORE taking the write lock. collect_doc_tokens
+        // walks the whole arena; holding doc_tokens.write() across it blocks the
+        // dependent sweep's readers (doc_tokens.read()) for the whole walk.
         match ast {
             Some(ast) => {
-                tokens.insert(
-                    uri.to_string(),
-                    collect_doc_tokens(ast, &self.state.string_table),
-                );
+                let toks = collect_doc_tokens(ast, &self.state.string_table);
+                self.state.doc_tokens.write().insert(uri.to_string(), toks);
             }
             None => {
-                tokens.remove(uri);
+                self.state.doc_tokens.write().remove(uri);
             }
         }
     }
@@ -515,10 +515,11 @@ impl Backend {
                         let mut pending = self.state.pending_changed_names.lock();
                         pending.extend(names.iter().cloned());
                     }
-                    // None means "revalidate everything" — mark with a sentinel
-                    // by draining to empty (the next sweep sees an empty pending
-                    // set and, combined with a `None` scope, covers all dependents).
-                    return;
+                    // Stop computing further dependents, but fall through to
+                    // publish the ones already validated this sweep instead of
+                    // discarding them. The newer sweep (draining
+                    // pending_changed_names) covers the rest.
+                    break;
                 }
                 let diagnostics = match rules_guard.ruleset.as_ref() {
                     Some(ruleset) => self.validate_parsed_prebuilt(
