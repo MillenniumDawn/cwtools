@@ -11,6 +11,13 @@
 - Glob matching (file include/exclude, run for every file and directory) uses a single rolling DP row instead of allocating an (m+1)x(n+1) grid per match
 - Validation error codes are stored as `&'static` references instead of allocating a `String` per finding
 - LSP: a burst of keystrokes coalesces to one pending validation task per file instead of stacking a debounced task per keystroke, the shared modifier-key set is snapshotted by refcount instead of deep-copied per scan, and the per-document token lock is no longer held across the full arena walk that rebuilds the set
+- Scope resolution (run per command token during validation) is ~49% faster: the per-token lowercase, scope-stack copy, and subscope check no longer allocate
+- Parsing is ~32% faster: tokens intern slices of the source directly instead of building a throwaway `String` first, and the character-class checks use a lookup table
+- Localisation parsing is ~14% faster: streaming line and element parsing with borrowed text runs instead of an allocation per entry
+- Rule validation does fewer per-leaf and per-block allocations: candidate matching, alias and scope-key lookups, cardinality counting, and subtype selection lowercase lazily, reuse scratch buffers, and use O(1) alias/type-instance maps
+- The workspace index avoids per-leaf string allocations via thread-local lowercase buffers, borrowed value lookups, and a one-pass type-instance map
+- LSP requests reuse work instead of rebuilding it: parallel first-pass scanning, memoised scope and enum completions, a refcounted workspace URI, in-place document updates, and async file-existence checks off the request path
+- Loading a cached file interns its strings in one locked batch instead of taking the interner lock per string
 
 ## Changed
 - The CLI exits with distinct codes so CI can tell an operational failure from validation findings: 3 = file discovery failed, 2 = report write failed, 1 = validation found errors, 0 = clean. Previously all three returned 1
@@ -20,6 +27,7 @@
 - Filesystem read errors during index building are logged instead of silently producing an incomplete index, and `write_cache` propagates a `create_dir_all` failure instead of swallowing it
 - Added a criterion benchmark harness for hot-path functions (glob matching, scope resolution, parsing, string interning, localisation parsing)
 - Added a code-review findings spec mapping the reviewed issues to the 1.6/1.7/1.8 releases
+- Collapsed the duplicate `JominiCommand`/`JominiParam` types into one: the localisation parser stores command chains directly instead of converting between near-identical types and dropping nested parameters (validation output unchanged)
 
 # 1.5.0
 

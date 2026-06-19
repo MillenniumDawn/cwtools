@@ -78,11 +78,41 @@ pub(crate) fn find_directive<'a>(comments: &'a [String], key: &str) -> Option<&'
     None
 }
 
+/// Collect every `## key = value` directive into a map in a single pass.
+///
+/// `key` is the token before the first `=` (trimmed); `value` is the trimmed RHS.
+/// Forward iteration with overwrite yields newest-match-wins, so for any `key`
+/// `map.get(key)` returns exactly what `find_directive(comments, key)` would.
+/// `###` documentation lines and plain `#` comments are skipped.
+fn collect_directives(comments: &[String]) -> std::collections::HashMap<&str, &str> {
+    let mut map = std::collections::HashMap::new();
+    for c in comments {
+        let Some(rest) = c.strip_prefix("##") else {
+            continue;
+        };
+        if rest.starts_with('#') {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let Some((key, rhs)) = rest.split_once('=') else {
+            continue;
+        };
+        map.insert(key.trim_end(), rhs.trim());
+    }
+    map
+}
+
 /// Parse Options from comment lines preceding a rule.
 /// CRITICAL: when NO cardinality comment is present, use min=1, max=1, strict_min=true (F# default).
 pub(crate) fn options_from_comments(comments: &[String], is_comparison: bool) -> Options {
+    // Collect every `## key = value` directive once (newest-wins via overwrite),
+    // then look up each option below — avoids re-scanning `comments` per directive.
+    // `directives.get(key)` is exactly equivalent to `find_directive(comments, key)`:
+    // both key on the token before `=` and return the trimmed RHS.
+    let directives = collect_directives(comments);
+
     // Cardinality: from exactly-## lines only, newest-match-wins.
-    let (min, max, strict_min) = if let Some(spec) = find_directive(comments, "cardinality") {
+    let (min, max, strict_min) = if let Some(spec) = directives.get("cardinality").copied() {
         if let Some((min_s, max_s)) = spec.split_once("..") {
             let min_s = min_s.trim();
             let (min_s, strict) = match min_s.strip_prefix('~') {
@@ -108,7 +138,9 @@ pub(crate) fn options_from_comments(comments: &[String], is_comparison: bool) ->
     let description = extract_description_from_comments(comments);
 
     // push_scope: from exactly-## lines only, newest-match-wins.
-    let push_scope = find_directive(comments, "push_scope")
+    let push_scope = directives
+        .get("push_scope")
+        .copied()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
@@ -116,26 +148,34 @@ pub(crate) fn options_from_comments(comments: &[String], is_comparison: bool) ->
     let replace_scopes = parse_replace_scopes_from_comments(comments);
 
     // severity: from exactly-## lines only.
-    let severity = find_directive(comments, "severity").and_then(|sev| match sev {
-        "error" => Some(Severity::Error),
-        "warning" => Some(Severity::Warning),
-        "info" | "information" => Some(Severity::Information),
-        "hint" => Some(Severity::Hint),
-        _ => None,
-    });
+    let severity = directives
+        .get("severity")
+        .copied()
+        .and_then(|sev| match sev {
+            "error" => Some(Severity::Error),
+            "warning" => Some(Severity::Warning),
+            "info" | "information" => Some(Severity::Information),
+            "hint" => Some(Severity::Hint),
+            _ => None,
+        });
 
     // required_scopes: ## scope = X or ## scope = { A B }
     let required_scopes = parse_required_scopes(comments);
 
     // reference_details: from exactly-## lines.
-    let reference_details = find_directive(comments, "outgoingReferenceLabel")
+    let reference_details = directives
+        .get("outgoingReferenceLabel")
         .map(|v| (true, v.to_string()))
         .or_else(|| {
-            find_directive(comments, "incomingReferenceLabel").map(|v| (false, v.to_string()))
+            directives
+                .get("incomingReferenceLabel")
+                .map(|v| (false, v.to_string()))
         });
 
     // error_if_only_match: from exactly-## lines.
-    let error_if_only_match = find_directive(comments, "error_if_only_match")
+    let error_if_only_match = directives
+        .get("error_if_only_match")
+        .copied()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
@@ -174,69 +214,73 @@ pub(crate) fn parse_replace_scopes_from_comments(comments: &[String]) -> Option<
     let mut froms = Vec::new();
     let mut prevs = Vec::new();
 
-    // Parse space-separated key = value pairs
-    let tokens: Vec<&str> = pairs_str.split_whitespace().collect();
-    let mut ti = 0;
-    while ti + 2 < tokens.len() {
-        if tokens[ti + 1] == "=" {
-            match tokens[ti] {
-                "this" => this = Some(tokens[ti + 2].to_string()),
-                "root" => root = Some(tokens[ti + 2].to_string()),
-                "from" => {
-                    if froms.is_empty() {
-                        froms.push(tokens[ti + 2].to_string());
-                    } else {
-                        froms[0] = tokens[ti + 2].to_string();
-                    }
+    // Parse space-separated `key = value` triples in a single streaming pass.
+    // Peek the next two tokens without collecting: when `key =` is followed by a
+    // value, consume all three; otherwise drop the current token and re-sync on
+    // the next. Mirrors the prior `tokens[ti+1] == "="` / advance-by-3-or-1 logic.
+    let mut tokens = pairs_str.split_whitespace().peekable();
+    while let Some(key) = tokens.next() {
+        if tokens.peek() != Some(&"=") {
+            continue;
+        }
+        tokens.next(); // consume "="
+        let Some(value) = tokens.next() else {
+            break;
+        };
+        match key {
+            "this" => this = Some(value.to_string()),
+            "root" => root = Some(value.to_string()),
+            "from" => {
+                if froms.is_empty() {
+                    froms.push(value.to_string());
+                } else {
+                    froms[0] = value.to_string();
                 }
-                "fromfrom" => {
-                    while froms.len() < 2 {
-                        froms.push(String::new());
-                    }
-                    froms[1] = tokens[ti + 2].to_string();
-                }
-                "fromfromfrom" => {
-                    while froms.len() < 3 {
-                        froms.push(String::new());
-                    }
-                    froms[2] = tokens[ti + 2].to_string();
-                }
-                "fromfromfromfrom" => {
-                    while froms.len() < 4 {
-                        froms.push(String::new());
-                    }
-                    froms[3] = tokens[ti + 2].to_string();
-                }
-                "prev" => {
-                    if prevs.is_empty() {
-                        prevs.push(tokens[ti + 2].to_string());
-                    } else {
-                        prevs[0] = tokens[ti + 2].to_string();
-                    }
-                }
-                "prevprev" => {
-                    while prevs.len() < 2 {
-                        prevs.push(String::new());
-                    }
-                    prevs[1] = tokens[ti + 2].to_string();
-                }
-                "prevprevprev" => {
-                    while prevs.len() < 3 {
-                        prevs.push(String::new());
-                    }
-                    prevs[2] = tokens[ti + 2].to_string();
-                }
-                "prevprevprevprev" => {
-                    while prevs.len() < 4 {
-                        prevs.push(String::new());
-                    }
-                    prevs[3] = tokens[ti + 2].to_string();
-                }
-                _ => {}
             }
-            ti += 3;
-        } else {
-            ti += 1;
+            "fromfrom" => {
+                while froms.len() < 2 {
+                    froms.push(String::new());
+                }
+                froms[1] = value.to_string();
+            }
+            "fromfromfrom" => {
+                while froms.len() < 3 {
+                    froms.push(String::new());
+                }
+                froms[2] = value.to_string();
+            }
+            "fromfromfromfrom" => {
+                while froms.len() < 4 {
+                    froms.push(String::new());
+                }
+                froms[3] = value.to_string();
+            }
+            "prev" => {
+                if prevs.is_empty() {
+                    prevs.push(value.to_string());
+                } else {
+                    prevs[0] = value.to_string();
+                }
+            }
+            "prevprev" => {
+                while prevs.len() < 2 {
+                    prevs.push(String::new());
+                }
+                prevs[1] = value.to_string();
+            }
+            "prevprevprev" => {
+                while prevs.len() < 3 {
+                    prevs.push(String::new());
+                }
+                prevs[2] = value.to_string();
+            }
+            "prevprevprevprev" => {
+                while prevs.len() < 4 {
+                    prevs.push(String::new());
+                }
+                prevs[3] = value.to_string();
+            }
+            _ => {}
         }
     }
 

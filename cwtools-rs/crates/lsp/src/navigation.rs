@@ -94,7 +94,7 @@ impl Backend {
                         })
                         .unwrap_or_default()
                 }
-                ReferenceHint::FileRef { path } => self.file_ref_locations(path, fallback),
+                ReferenceHint::FileRef { path } => self.file_ref_locations(path, fallback).await,
                 _ => Vec::new(),
             };
             if !locations.is_empty() {
@@ -150,7 +150,7 @@ impl Backend {
     /// Resolve a `FilepathField` reference (a game-relative path like
     /// `gfx/…/foo.dds`) to a file Location by probing the workspace root, then
     /// the configured vanilla install. Returns an empty Vec when nothing exists.
-    fn file_ref_locations(&self, path: &str, fallback: &Url) -> Vec<Location> {
+    async fn file_ref_locations(&self, path: &str, fallback: &Url) -> Vec<Location> {
         let path = unquote(path).trim();
         if path.is_empty() {
             return Vec::new();
@@ -169,7 +169,9 @@ impl Backend {
         }
         for root in roots {
             let candidate = root.join(rel);
-            if std::fs::metadata(&candidate).is_ok() {
+            // Async stat: a goto request must not block the runtime on a sync
+            // filesystem syscall (at most two candidate roots, so no batching).
+            if tokio::fs::metadata(&candidate).await.is_ok() {
                 return vec![Location {
                     uri: parse_uri(crate::paths::path_to_uri(&candidate), fallback),
                     range: Range::default(),
@@ -624,7 +626,7 @@ pub(crate) fn scan_use_sites(
     instance_name: &str,
     docs: &HashMap<String, ParsedDoc>,
     ruleset: &RuleSet,
-    workspace_uri: &Option<String>,
+    workspace_uri: &Option<std::sync::Arc<str>>,
     string_table: &cwtools_string_table::string_table::StringTable,
 ) -> Vec<(String, cwtools_info::SourceLocation)> {
     let mut results = Vec::new();

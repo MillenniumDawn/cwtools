@@ -49,7 +49,7 @@ impl SymbolIndex {
                     .or_default()
                     .insert(key.clone());
                 self.definitions
-                    .entry(key.clone())
+                    .entry(key)
                     .or_default()
                     .push(SymbolLocation {
                         uri: uri.to_string(),

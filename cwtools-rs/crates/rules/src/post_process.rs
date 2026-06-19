@@ -6,6 +6,20 @@
 /// Run after all .cwt files have been parsed and merged so that single_alias
 /// definitions referenced in one file but defined in another are all present.
 use crate::rules_types::*;
+use std::collections::HashMap;
+
+/// Borrowed name -> body index over a single_alias snapshot, built once per pass
+/// for O(1) lookups (see `build_alias_index`). On duplicate names the first wins,
+/// matching the prior linear `find(|(n, _)| n == name)` scan.
+type AliasIndex<'a> = HashMap<&'a str, &'a NewRule>;
+
+fn build_alias_index(snapshot: &[(String, NewRule)]) -> AliasIndex<'_> {
+    let mut map = HashMap::with_capacity(snapshot.len());
+    for (name, rule) in snapshot {
+        map.entry(name.as_str()).or_insert(rule);
+    }
+    map
+}
 
 /// Run all four post-processing passes over `ruleset` in the same order as F#.
 #[tracing::instrument(skip_all)]
@@ -31,7 +45,12 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
     // doesn't decrease), bail rather than growing the rule tree exponentially.
     let mut prev_unresolved = usize::MAX;
     for _ in 0..10 {
-        let map: Vec<(String, NewRule)> = ruleset.single_aliases.clone();
+        // Snapshot of round-start bodies. The self-expansion below mutates
+        // `single_aliases` while reading the map, so we read from a frozen copy
+        // (preserves round-start fixpoint semantics) — but index it for O(1)
+        // lookups instead of a linear scan per reference.
+        let snapshot: Vec<(String, NewRule)> = ruleset.single_aliases.clone();
+        let map = build_alias_index(&snapshot);
         let mut changed = false;
         for (_, rule) in ruleset.single_aliases.iter_mut() {
             inline_single_alias_rule(rule, &map, &mut changed);
@@ -50,8 +69,10 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
         prev_unresolved = unresolved;
     }
 
-    // Now expand all root_rules and aliases
-    let map: Vec<(String, NewRule)> = ruleset.single_aliases.clone();
+    // Now expand all root_rules and aliases. The final single_aliases sub-pass
+    // mutates `single_aliases` while reading the map, so snapshot once and index it.
+    let snapshot: Vec<(String, NewRule)> = ruleset.single_aliases.clone();
+    let map = build_alias_index(&snapshot);
     for root in ruleset.root_rules.iter_mut() {
         match root {
             RootRule::TypeRule(_, rule) => inline_single_alias_rule(rule, &map, &mut true),
@@ -69,7 +90,7 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
 
 /// Recursively walk `rule` and replace any `SingleAliasField` / `SingleAliasClauseField`
 /// references with the body from `map`. Sets `changed` to true if any rewrite occurs.
-fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)], changed: &mut bool) {
+fn inline_single_alias_rule(rule: &mut NewRule, map: &AliasIndex, changed: &mut bool) {
     // A body that is *itself* a single_alias reference, e.g.
     // `alias[effect:every_country] = single_alias_right[every_effect_clause]`.
     // Resolve it in place so the alias body becomes the referenced rules and is
@@ -113,7 +134,7 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &[(String, NewRule)], chang
 
 /// Walk a `Vec<NewRule>` in place, replacing SingleAliasField entries by
 /// substituting the resolved body and recursing into nested rules.
-fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)], changed: &mut bool) {
+fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex, changed: &mut bool) {
     let needs_rewrite = rules.iter().any(|r| {
         matches!(
             r.0,
@@ -190,8 +211,8 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &[(String, NewRule)], change
     }
 }
 
-fn lookup_single_alias(name: &str, map: &[(String, NewRule)]) -> Option<NewRule> {
-    map.iter().find(|(n, _)| n == name).map(|(_, r)| r.clone())
+fn lookup_single_alias(name: &str, map: &AliasIndex) -> Option<NewRule> {
+    map.get(name).map(|r| (*r).clone())
 }
 
 /// Count the total number of `SingleAliasField` / `SingleAliasClauseField` leaf

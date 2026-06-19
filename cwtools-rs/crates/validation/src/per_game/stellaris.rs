@@ -171,19 +171,24 @@ fn validate_event(
     file_path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    let has_mtth = children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "mean_time_to_happen"));
-    let has_trig = children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "is_triggered_only"));
-    let has_once = children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "fire_only_once"));
-    let has_base = children.iter().any(|c| child_key_eq(c, ast, table, "base"));
-    let has_always_no = children
-        .iter()
-        .any(|c| child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table));
+    let mut has_mtth = false;
+    let mut has_trig = false;
+    let mut has_once = false;
+    let mut has_base = false;
+    let mut has_always_no = false;
+    for c in children {
+        if child_key_eq(c, ast, table, "mean_time_to_happen") {
+            has_mtth = true;
+        } else if child_key_eq(c, ast, table, "is_triggered_only") {
+            has_trig = true;
+        } else if child_key_eq(c, ast, table, "fire_only_once") {
+            has_once = true;
+        } else if child_key_eq(c, ast, table, "base") {
+            has_base = true;
+        } else if child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table) {
+            has_always_no = true;
+        }
+    }
 
     if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
         errors.push(ValidationError {

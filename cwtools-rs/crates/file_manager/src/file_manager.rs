@@ -273,14 +273,13 @@ impl FileManager {
         // expensive part and is independent per file. `into_par_iter().collect()`
         // preserves the input order, so discovery output is deterministic.
         let mut paths: Vec<(PathBuf, String)> = Vec::new();
-        let include_dirs: Vec<String> = self.config.include_dirs.clone();
-        let root = self.config.root.clone();
+        let root = &self.config.root;
 
-        for include_dir in include_dirs {
+        for include_dir in &self.config.include_dirs {
             let dir = if include_dir == "." {
                 root.clone()
             } else {
-                root.join(&include_dir)
+                root.join(include_dir)
             };
             if !dir.exists() {
                 continue;
@@ -317,14 +316,27 @@ impl FileManager {
     /// extension/pattern/size filters. Reading and parsing happen later, in
     /// parallel; this pass is just filesystem traversal.
     fn collect_paths(&self, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), FileError> {
-        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect();
-        // Sort for deterministic ordering
-        entries.sort_by_key(|e| e.as_ref().map(|e| e.file_name()).unwrap_or_default());
+        let root_prefix = normalize_root_prefix(&self.config.root);
+        self.collect_paths_inner(dir, &root_prefix, out)
+    }
 
-        for entry in entries {
+    fn collect_paths_inner(
+        &self,
+        dir: &Path,
+        root_prefix: &str,
+        out: &mut Vec<(PathBuf, String)>,
+    ) -> Result<(), FileError> {
+        // Collect (sort-key, path) once so sorting doesn't re-allocate an
+        // OsString per comparison.
+        let mut entries: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            let path = entry.path();
+            entries.push((entry.file_name(), entry.path()));
+        }
+        // Sort for deterministic ordering
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
 
+        for (_name, path) in entries {
             if path.is_dir() {
                 let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if self
@@ -343,7 +355,7 @@ impl FileManager {
                 {
                     continue;
                 }
-                if let Err(e) = self.collect_paths(&path, out) {
+                if let Err(e) = self.collect_paths_inner(&path, root_prefix, out) {
                     eprintln!("warn: skipping {}: {}", path.display(), e);
                 }
                 continue;
@@ -389,7 +401,7 @@ impl FileManager {
             }
 
             // Compute logical path relative to root
-            let logical_path = compute_logical_path(&path, &self.config.root);
+            let logical_path = compute_logical_path_with_root(&path, root_prefix);
             out.push((path, logical_path));
         }
         Ok(())
@@ -416,18 +428,26 @@ impl FileManager {
 /// Given `root = /mnt/mod` and `path = /mnt/mod/common/effects/foo.txt`,
 /// returns `common/effects/foo.txt`.
 pub fn compute_logical_path(path: &Path, root: &Path) -> String {
-    // Normalise both to forward slashes
-    let path_str = path.to_string_lossy().replace('\\', "/");
-    let root_str = {
-        let s = root.to_string_lossy().replace('\\', "/");
-        if s.ends_with('/') {
-            s
-        } else {
-            format!("{}/", s)
-        }
-    };
+    compute_logical_path_with_root(path, &normalize_root_prefix(root))
+}
 
-    if let Some(rel) = path_str.strip_prefix(&root_str) {
+/// Normalise `root` to a forward-slash, trailing-slash prefix once, so callers
+/// that strip many paths against the same root don't redo the work per file.
+fn normalize_root_prefix(root: &Path) -> String {
+    let s = normalize_slashes(root.to_string_lossy());
+    if s.ends_with('/') {
+        s.into_owned()
+    } else {
+        format!("{}/", s)
+    }
+}
+
+/// Like [`compute_logical_path`] but takes a root prefix already normalised by
+/// [`normalize_root_prefix`].
+fn compute_logical_path_with_root(path: &Path, root_prefix: &str) -> String {
+    let path_str = normalize_slashes(path.to_string_lossy());
+
+    if let Some(rel) = path_str.strip_prefix(root_prefix) {
         rel.to_string()
     } else {
         // fallback: just the file name
@@ -435,6 +455,16 @@ pub fn compute_logical_path(path: &Path, root: &Path) -> String {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string()
+    }
+}
+
+/// Convert backslashes to forward slashes, avoiding a full scan/allocation when
+/// the string contains none (the common case on Unix).
+fn normalize_slashes(s: std::borrow::Cow<'_, str>) -> std::borrow::Cow<'_, str> {
+    if s.contains('\\') {
+        std::borrow::Cow::Owned(s.replace('\\', "/"))
+    } else {
+        s
     }
 }
 
@@ -591,6 +621,7 @@ pub fn discover_files_multi_mod(
 
     // Collect candidate files from all sources
     for (priority, root, dirs) in &sources {
+        let root_prefix = normalize_root_prefix(root);
         for include_dir in *dirs {
             let dir = if *include_dir == "." {
                 root.to_path_buf()
@@ -600,25 +631,30 @@ pub fn discover_files_multi_mod(
             if !dir.is_dir() {
                 continue;
             }
-            collect_files_recursive(&dir, root, *priority, &mut best);
+            collect_files_recursive(&dir, &root_prefix, *priority, &mut best);
         }
     }
 
     // Apply replace_path suppression: for each mod (in priority order, highest
     // first), any file whose logical path starts with a replace_path prefix and
     // originates from a *lower* priority source is removed.
+    // Lowercase each logical path once, rather than per replace_path entry below.
+    let logical_lower: HashMap<String, String> = best
+        .keys()
+        .map(|k| (k.clone(), k.to_ascii_lowercase()))
+        .collect();
     for (i, m) in mods.iter().enumerate().rev() {
         let mod_priority = i + 1;
         for rp in &m.descriptor.replace_paths {
             // Normalize: backslash → slash (Windows-authored .mod files), trim
             // leading/trailing slashes, then lowercase for case-insensitive match.
             let prefix_lower = rp.replace('\\', "/").trim_matches('/').to_ascii_lowercase();
+            let prefix_lower_slash = format!("{}/", prefix_lower);
             best.retain(|logical, (_path, file_prio)| {
                 // If the file's logical path is under this replace_path and
                 // comes from a lower-priority source → suppress it.
-                let logical_lower = logical.to_ascii_lowercase();
-                let under_prefix = logical_lower == prefix_lower
-                    || logical_lower.starts_with(&format!("{}/", prefix_lower));
+                let ll = &logical_lower[logical.as_str()];
+                let under_prefix = *ll == prefix_lower || ll.starts_with(&prefix_lower_slash);
                 if under_prefix && *file_prio < mod_priority {
                     return false;
                 }
@@ -637,7 +673,7 @@ pub fn discover_files_multi_mod(
 
 fn collect_files_recursive(
     dir: &Path,
-    root: &Path,
+    root_prefix: &str,
     priority: usize,
     out: &mut std::collections::HashMap<String, (PathBuf, usize)>,
 ) {
@@ -648,9 +684,9 @@ fn collect_files_recursive(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_files_recursive(&path, root, priority, out);
+            collect_files_recursive(&path, root_prefix, priority, out);
         } else {
-            let logical = compute_logical_path(&path, root);
+            let logical = compute_logical_path_with_root(&path, root_prefix);
             // Higher priority wins
             let entry = out.entry(logical).or_insert((path.clone(), priority));
             if priority > entry.1 {
@@ -702,11 +738,12 @@ fn walk_workspace_inner(
         return;
     };
     // Sort each directory's entries so the scan order matches the CLI's
-    // `collect_paths` and stays stable across filesystems.
-    let mut entries: Vec<_> = rd.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let path = entry.path();
+    // `collect_paths` and stays stable across filesystems. Collect the sort key
+    // once so sorting doesn't re-allocate an OsString per comparison.
+    let mut entries: Vec<(std::ffi::OsString, PathBuf)> =
+        rd.flatten().map(|e| (e.file_name(), e.path())).collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_name, path) in entries {
         if path.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let skip = cfg

@@ -5,10 +5,12 @@
 //! when a chain is invalid.  Unknown commands are accepted leniently so missing
 //! entries don't produce false positives.
 
-use crate::commands::{Game, JominiCommand, LocEntry};
+use crate::commands::{Game, LocEntry};
+use crate::loc_string::JominiCommand;
 use cwtools_game::constants::Game as EngineGame;
 use cwtools_game::scope_engine::{SCOPE_ANY, ScopeContext, ScopeId, ScopeResult};
 use cwtools_game::scope_registry::ScopeRegistry;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -104,17 +106,46 @@ pub fn validate_loc_commands(
     initial_scope: ScopeId,
     data: &LocScopeData,
 ) -> Vec<LocCommandDiagnostic> {
+    // Nothing to validate: skip building the terminal set / engine mapping and
+    // return the empty (non-allocating) Vec for the common no-command entry.
+    if entry.commands.is_empty() && entry.jomini_commands.is_empty() {
+        return Vec::new();
+    }
+
     let engine_game = game_to_engine(data.game);
     let mut diags = Vec::new();
 
+    // Lowercased terminal-command set, built once per entry. The membership test
+    // (`is_terminal_command`) ran a linear case-insensitive scan per segment;
+    // a set turns that into an O(1) lookup. Identifiers are ASCII.
+    let terminal_set: HashSet<String> = data
+        .terminal_commands
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+
     // Validate legacy [command] strings (single-segment, dot-split internally)
     for cmd in &entry.commands {
-        validate_command_string(cmd, initial_scope, engine_game, data, &mut diags);
+        validate_command_string(
+            cmd,
+            initial_scope,
+            engine_game,
+            data,
+            &terminal_set,
+            &mut diags,
+        );
     }
 
     // Validate Jomini command chains — each inner Vec is one bracket's chain.
     for chain in &entry.jomini_commands {
-        validate_jomini_chain(chain, initial_scope, engine_game, data, &mut diags);
+        validate_jomini_chain(
+            chain,
+            initial_scope,
+            engine_game,
+            data,
+            &terminal_set,
+            &mut diags,
+        );
     }
 
     diags
@@ -136,11 +167,12 @@ fn game_to_engine(game: Game) -> EngineGame {
     }
 }
 
-/// Returns true if `cmd` is a special prefix that bypasses scope checks.
+/// Returns true if `lower` (an already-lowercased command/segment) is a special
+/// prefix that bypasses scope checks.
 ///
-/// Mirrors F# handling of `event_target:`, `parameter:`, `?`.
-fn is_bypass_prefix(cmd: &str, data: &LocScopeData) -> bool {
-    let lower = cmd.to_ascii_lowercase();
+/// Mirrors F# handling of `event_target:`, `parameter:`, `?`. The caller
+/// lowercases once and shares the result with `is_terminal_command`.
+fn is_bypass_prefix(lower: &str, data: &LocScopeData) -> bool {
     lower.starts_with("event_target:")
         || lower.starts_with("scope:")
         || (data.parameter_variables && lower.starts_with("parameter:"))
@@ -153,9 +185,10 @@ fn validate_command_string(
     initial_scope: ScopeId,
     engine_game: EngineGame,
     data: &LocScopeData,
+    terminal_set: &HashSet<String>,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
-    if is_bypass_prefix(cmd, data) {
+    if is_bypass_prefix(&cmd.to_ascii_lowercase(), data) {
         return;
     }
 
@@ -167,15 +200,18 @@ fn validate_command_string(
     for (i, seg) in segments.iter().enumerate() {
         let is_last = i == last_idx;
 
+        // Lowercase once per segment; shared by the bypass and terminal checks.
+        let seg_lower = seg.to_ascii_lowercase();
+
         // Bypass prefixes in any segment
-        if is_bypass_prefix(seg, data) {
+        if is_bypass_prefix(&seg_lower, data) {
             ctx.push_scope(SCOPE_ANY);
             continue;
         }
 
         // Check if this looks like a terminal getter (starts with "Get" or
         // is in the explicit terminal-commands list)
-        let looks_terminal = is_terminal_command(seg, data);
+        let looks_terminal = is_terminal_command(&seg_lower, terminal_set);
 
         if is_last && looks_terminal {
             // Terminal command — no scope check needed; accept.
@@ -241,6 +277,7 @@ fn validate_jomini_chain(
     initial_scope: ScopeId,
     engine_game: EngineGame,
     data: &LocScopeData,
+    terminal_set: &HashSet<String>,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
     if chain.is_empty() {
@@ -262,7 +299,10 @@ fn validate_jomini_chain(
         let seg = &cmd.key;
         let is_last = i == last_idx;
 
-        if is_bypass_prefix(seg, data) {
+        // Lowercase once per segment; shared by the bypass and terminal checks.
+        let seg_lower = seg.to_ascii_lowercase();
+
+        if is_bypass_prefix(&seg_lower, data) {
             ctx.push_scope(SCOPE_ANY);
             if !is_last {
                 had_lenient_intermediate = true;
@@ -270,7 +310,7 @@ fn validate_jomini_chain(
             continue;
         }
 
-        let looks_terminal = is_terminal_command(seg, data);
+        let looks_terminal = is_terminal_command(&seg_lower, terminal_set);
         if is_last && looks_terminal {
             return; // terminal — accepted without scope check
         }
@@ -324,20 +364,11 @@ fn validate_jomini_chain(
 ///
 /// This covers the common Paradox naming convention (`GetName`, `GetDesc`,
 /// `GetRuler`…) plus the per-game list provided in `LocScopeData`.
-fn is_terminal_command(seg: &str, data: &LocScopeData) -> bool {
+/// `lower` is the already-lowercased segment; `terminal_set` is the lowercased
+/// terminal-command set (built once per entry by `validate_loc_commands`).
+fn is_terminal_command(lower: &str, terminal_set: &HashSet<String>) -> bool {
     // Convention: terminal getters start with "Get" (case-insensitive)
-    if seg.to_ascii_lowercase().starts_with("get") {
-        return true;
-    }
-    // Explicit list provided by the caller
-    if data
-        .terminal_commands
-        .iter()
-        .any(|c| c.eq_ignore_ascii_case(seg))
-    {
-        return true;
-    }
-    false
+    lower.starts_with("get") || terminal_set.contains(lower)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -345,7 +376,8 @@ fn is_terminal_command(seg: &str, data: &LocScopeData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Game, JominiCommand, LocEntry, Position};
+    use crate::commands::{Game, LocEntry, Position};
+    use crate::loc_string::JominiCommand;
 
     fn make_entry_with_commands(commands: Vec<String>) -> LocEntry {
         LocEntry {

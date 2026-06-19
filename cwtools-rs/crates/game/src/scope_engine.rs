@@ -146,17 +146,6 @@ impl ScopeContext {
         self.scopes.push(scope);
     }
 
-    /// Apply N `prev` hops to a scope list, returning the resulting list.
-    fn pop_n(scopes: &[ScopeId], n: usize) -> Vec<ScopeId> {
-        let mut v = scopes.to_vec();
-        for _ in 0..n {
-            if v.len() > 1 {
-                v.pop();
-            }
-        }
-        v
-    }
-
     /// Return GET_FROM(i) (1-based, matching F# `GetFrom`).
     pub fn get_from(&self, i: usize) -> ScopeId {
         if i >= 1 && self.from.len() >= i {
@@ -246,23 +235,23 @@ impl ScopeContext {
     ///   `from`/`fromfrom`/…, `root_from`/`root_fromfrom`/….
     /// * Dotted chains: `owner.capital.controller` split and folded.
     /// * Game-specific named links looked up in `scope_links`.
+    #[inline]
     pub fn change_scope(&mut self, key: &str) -> ScopeResult {
-        // Strip leading `hidden:` prefix (F# Scopes.fs:148-149).
-        // Compute lowercase once for the hidden: check and reuse below.
-        let lower_full = key.to_ascii_lowercase();
-        let key = if lower_full.starts_with("hidden:") {
-            &key[7..]
-        } else {
-            key
+        // Strip leading `hidden:` prefix (F# Scopes.fs:148-149). Compare
+        // case-insensitively without allocating in the common (unprefixed) case.
+        let key = match key.get(..7) {
+            Some(p) if p.eq_ignore_ascii_case("hidden:") => &key[7..],
+            _ => key,
         };
 
-        // Reuse the already-computed lowercase when the key wasn't trimmed.
+        // Only allocate a lowercase copy when the key actually has uppercase
+        // bytes; the common case (already lowercase) borrows `key` directly.
         let lower_owned;
-        let lower: &str = if lower_full.len() == key.len() {
-            &lower_full
-        } else {
+        let lower: &str = if key.bytes().any(|b| b.is_ascii_uppercase()) {
             lower_owned = key.to_ascii_lowercase();
             &lower_owned
+        } else {
+            key
         };
 
         // Config-driven prefix links (`var:`, `sp:`, `mio:`, `event_target:`, …).
@@ -305,12 +294,11 @@ impl ScopeContext {
 
     /// Fold a dotted key like `owner.capital.controller` left-to-right.
     fn change_scope_dotted(&mut self, key: &str) -> ScopeResult {
-        let segments: Vec<&str> = key.split('.').collect();
-        let last_idx = segments.len().saturating_sub(1);
+        let mut segments = key.split('.').peekable();
         let mut last_result = ScopeResult::NotFound;
 
-        for (i, seg) in segments.iter().enumerate() {
-            let is_last = i == last_idx;
+        while let Some(seg) = segments.next() {
+            let is_last = segments.peek().is_none();
             let result = self.resolve_single(seg);
             match &result {
                 ScopeResult::NewScope { .. } | ScopeResult::AnyScope => {
@@ -336,6 +324,7 @@ impl ScopeContext {
         self.resolve_single_with_lower(key, &lower_owned)
     }
 
+    #[inline]
     fn resolve_single_with_lower(&mut self, key: &str, lower: &str) -> ScopeResult {
         // Variable / scripted prefix
         if lower.starts_with('@') {
@@ -465,10 +454,14 @@ impl ScopeContext {
     // ── prev / from helpers ───────────────────────────────────────────────────
 
     fn apply_prev(&mut self, hops: usize) -> ScopeResult {
-        // Pop `hops` levels.  The resulting top of stack is the PREV scope.
-        let new_scopes = Self::pop_n(&self.scopes, hops);
-        let scope = new_scopes.last().copied().unwrap_or(self.root);
-        self.scopes = new_scopes;
+        // Pop `hops` levels in place.  The resulting top of stack is the PREV
+        // scope; never pop the last entry so the stack stays non-empty.
+        for _ in 0..hops {
+            if self.scopes.len() > 1 {
+                self.scopes.pop();
+            }
+        }
+        let scope = self.scopes.last().copied().unwrap_or(self.root);
         ScopeResult::NewScope {
             scope,
             ignore_keys: vec![],

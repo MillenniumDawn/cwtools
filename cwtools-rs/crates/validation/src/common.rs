@@ -56,20 +56,23 @@ pub(crate) fn decimal_places(s: &str) -> usize {
 /// variable. A `variable_field` value naming a scope must not be flagged as an
 /// unset variable (CW246).
 pub(crate) fn resolves_as_scope_key(ctx: &ScopeContext, key: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "this",
+        "root",
+        "prev",
+        "prevprev",
+        "prevprevprev",
+        "from",
+        "fromfrom",
+        "fromfromfrom",
+        "fromfromfromfrom",
+    ];
+    if KEYWORDS.iter().any(|kw| key.eq_ignore_ascii_case(kw)) {
+        return true;
+    }
+    // Only the registry lookups need a lowercased key; allocate at most once.
     let k = key.to_ascii_lowercase();
-    matches!(
-        k.as_str(),
-        "this"
-            | "root"
-            | "prev"
-            | "prevprev"
-            | "prevprevprev"
-            | "from"
-            | "fromfrom"
-            | "fromfromfrom"
-            | "fromfromfromfrom"
-    ) || ctx.registry.id_of(&k).is_some()
-        || ctx.registry.links.contains_key(&k)
+    ctx.registry.id_of(&k).is_some() || ctx.registry.links.contains_key(&k)
 }
 
 /// True when a leaf value is numerically zero (`0`, `0.0`, `"0"`, …). Used by
@@ -141,25 +144,33 @@ pub(crate) fn looks_like_data_ref(key: &str) -> bool {
 /// Check that a string has the YYYY.MM.DD shape for a CW date field.
 pub(crate) fn is_date_shape(s: &str) -> bool {
     // Exactly YYYY.MM.DD — three numeric parts separated by dots.
-    let parts: Vec<&str> = s.splitn(4, '.').collect();
-    parts.len() == 3
-        && parts[0].parse::<i32>().is_ok()
-        && parts[1].parse::<u32>().is_ok()
-        && parts[2].parse::<u32>().is_ok()
+    let mut parts = s.splitn(4, '.');
+    let (Some(y), Some(m), Some(d), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    y.parse::<i32>().is_ok() && m.parse::<u32>().is_ok() && d.parse::<u32>().is_ok()
 }
 
 /// Check that a string has the YYYY.MM.DD or YYYY.MM.DD.HH shape for a CW
 /// datetime field. Mirrors F# `IsValidDateTime` which accepts both 3 and 4
 /// dot-separated numeric parts (3-part dates are valid for datetime fields).
 pub(crate) fn is_datetime_shape(s: &str) -> bool {
-    let parts: Vec<&str> = s.splitn(5, '.').collect();
-    match parts.len() {
-        3 => is_date_shape(s),
-        4 => {
-            parts[0].parse::<i32>().is_ok()
-                && parts[1].parse::<u32>().is_ok()
-                && parts[2].parse::<u32>().is_ok()
-                && parts[3].parse::<u32>().is_ok()
+    let mut parts = s.splitn(5, '.');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some(_), Some(_), Some(_), None, None) => is_date_shape(s),
+        (Some(y), Some(m), Some(d), Some(h), None) => {
+            y.parse::<i32>().is_ok()
+                && m.parse::<u32>().is_ok()
+                && d.parse::<u32>().is_ok()
+                && h.parse::<u32>().is_ok()
         }
         _ => false,
     }
@@ -207,16 +218,7 @@ pub(crate) fn enum_contains(
     }
 }
 
-pub(crate) fn match_text(table: &StringTable, t: &StringTokens) -> String {
-    let s = table.get_string(t.normal).unwrap_or_default();
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s
-    }
-}
-
-/// Zero-copy variant of [`match_text`]: borrows the string from the table,
+/// Zero-copy variant of `match_text`: borrows the string from the table,
 /// strips surrounding quotes via a slice (no allocation), and passes the
 /// resulting `&str` to `f`.  Returns `f`'s value, or the default if the id
 /// is out of range.
@@ -256,7 +258,7 @@ pub(crate) fn leaf_value_to_string(value: &Value, table: &StringTable) -> String
     }
 }
 
-pub(crate) fn severity_to_error(sev: Severity) -> ErrorSeverity {
+pub(crate) fn severity_to_error(sev: &Severity) -> ErrorSeverity {
     match sev {
         Severity::Error => ErrorSeverity::Error,
         Severity::Warning => ErrorSeverity::Warning,

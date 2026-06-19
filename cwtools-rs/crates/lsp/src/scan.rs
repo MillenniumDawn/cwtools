@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use tower_lsp::lsp_types::*;
 
+use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::build_modifier_keys;
 
@@ -264,54 +265,74 @@ impl Backend {
             docs.keys().cloned().collect()
         };
 
-        let mut parsed_files: Vec<Option<cwtools_parser::ast::ParsedFile>> =
-            Vec::with_capacity(files_to_validate.len());
         let mut cache_hits = 0u64;
         let mut cache_misses = 0u64;
+        // Pass 1 splits into a parallel parse/cache-load phase and a serial
+        // index phase. Reading + parsing (or deserializing from the parse
+        // cache) and persisting the cache are pure functions over the
+        // lock-guarded string-table interner, so they run in parallel across
+        // files exactly as the driver parallelizes the same work. Indexing
+        // mutates the shared symbol/info indexes, so it stays serial and in the
+        // original file order — the merge order is observable (goto-def "first
+        // match", duplicate-name refcounts), and the cache-hit/miss tally must
+        // match the sequential version.
+        //
+        // `par_iter().collect()` preserves file order, so `outcomes[i]`
+        // corresponds to `files_to_validate[i]`.
+        use rayon::prelude::*;
+        // (cache_hit, parsed) per file; None = open doc, parse failure, or read error.
+        type ParseOutcome = (bool, cwtools_parser::ast::ParsedFile);
         // block_in_place tells tokio this thread is about to do synchronous
         // blocking I/O; the runtime shifts its remaining tasks to other workers
-        // so the LSP request loop is not starved.
-        tokio::task::block_in_place(|| {
-            for file_path in &files_to_validate {
-                let uri = path_to_uri(file_path);
-                // Open docs are already indexed from their in-memory text; skip so
-                // we don't re-index stale disk content on top of the live version.
-                if open_uris.contains(&uri) {
-                    parsed_files.push(None);
-                    continue;
-                }
-                let parsed = match std::fs::read_to_string(file_path) {
-                    Ok(text) => {
-                        // Try the parse cache first.
-                        if let Some((ref cd, fp)) = cache_info
-                            && let Some(parsed) =
-                                workspace_cache::load(cd, fp, &text, &self.state.string_table)
-                        {
-                            self.index_parsed_file(&uri, &parsed);
-                            cache_hits += 1;
-                            Some(parsed)
-                        } else if let Some(parsed) = self.index_document_sync(&uri, &text) {
-                            // Cache miss — parse + index, then persist for next scan.
-                            if let Some((ref cd, fp)) = cache_info {
-                                workspace_cache::store(
-                                    cd,
-                                    fp,
-                                    &text,
-                                    &parsed,
-                                    &self.state.string_table,
-                                );
-                            }
-                            cache_misses += 1;
-                            Some(parsed)
-                        } else {
-                            None
-                        }
+        // so the LSP request loop is not starved while rayon parses.
+        let outcomes: Vec<Option<ParseOutcome>> = tokio::task::block_in_place(|| {
+            files_to_validate
+                .par_iter()
+                .map(|file_path| {
+                    let uri = path_to_uri(file_path);
+                    // Open docs are already indexed from their in-memory text;
+                    // skip so we don't re-index stale disk content on top of the
+                    // live version.
+                    if open_uris.contains(&uri) {
+                        return None;
                     }
-                    Err(_) => None,
-                };
-                parsed_files.push(parsed);
-            }
+                    let text = std::fs::read_to_string(file_path).ok()?;
+                    // Try the parse cache first.
+                    if let Some((ref cd, fp)) = cache_info
+                        && let Some(parsed) =
+                            workspace_cache::load(cd, fp, &text, &self.state.string_table)
+                    {
+                        return Some((true, parsed));
+                    }
+                    // Cache miss — parse, then persist for the next scan.
+                    let parsed = parse_string(&text, &self.state.string_table).ok()?;
+                    if let Some((ref cd, fp)) = cache_info {
+                        workspace_cache::store(cd, fp, &text, &parsed, &self.state.string_table);
+                    }
+                    Some((false, parsed))
+                })
+                .collect()
         });
+
+        // Serial index phase, in file order.
+        let mut parsed_files: Vec<Option<cwtools_parser::ast::ParsedFile>> =
+            Vec::with_capacity(files_to_validate.len());
+        for (file_path, outcome) in files_to_validate.iter().zip(outcomes) {
+            let parsed = match outcome {
+                Some((cache_hit, parsed)) => {
+                    let uri = path_to_uri(file_path);
+                    self.index_parsed_file(&uri, &parsed);
+                    if cache_hit {
+                        cache_hits += 1;
+                    } else {
+                        cache_misses += 1;
+                    }
+                    Some(parsed)
+                }
+                None => None,
+            };
+            parsed_files.push(parsed);
+        }
 
         self.client
             .log_message(
@@ -399,7 +420,6 @@ impl Backend {
             let cfg = self.state.config.read();
             (cfg.scope_checks, cfg.var_checks)
         };
-        use rayon::prelude::*;
         let results: Vec<(String, Vec<Diagnostic>)> = {
             let info_guard = self.state.info_service.read();
             let loc_guard = self.state.loc_index.read();

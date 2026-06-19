@@ -52,8 +52,9 @@ impl tower_lsp::lsp_types::notification::Notification for UpdateFileList {
 pub(crate) struct Config {
     /// game language from init options
     pub(crate) language: String,
-    /// workspace folder URI captured from initialize params
-    pub(crate) workspace_uri: Option<String>,
+    /// workspace folder URI captured from initialize params. `Arc<str>` so the
+    /// per-handler reads clone a cheap refcount bump, not the whole string.
+    pub(crate) workspace_uri: Option<Arc<str>>,
     /// base-game install dir (from the `vanilla` init option, or auto-discovered).
     /// Indexed lazily into `vanilla_index` on the first full-workspace scan.
     pub(crate) vanilla_dir: Option<std::path::PathBuf>,
@@ -410,8 +411,9 @@ impl Backend {
         let current_scope = rctx.scope.as_ref().and_then(|sc| {
             let id = sc.current()?;
             let name = sc.registry.name_of(id);
-            let placeholder =
-                name == "any" || name == "invalid" || name == format!("scope_{}", id.0);
+            let placeholder = name == "any"
+                || name == "invalid"
+                || name.strip_prefix("scope_").and_then(|s| s.parse().ok()) == Some(id.0);
             (!placeholder).then_some(name)
         });
         Some(RuleCursorInfo {
@@ -679,7 +681,7 @@ impl LanguageServer for Backend {
                 info.export_names(&uri)
             };
             if !names.is_empty() {
-                let generation = self.state.edit_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                let generation = self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1;
                 self.revalidate_open_dependents(&uri, generation, Some(&names))
                     .await;
             }
@@ -703,13 +705,27 @@ impl LanguageServer for Backend {
         // is still the latest edit.
         {
             let mut docs = self.state.documents.lock();
-            let ast = docs.remove(&uri).and_then(|d| d.ast);
-            docs.insert(uri.clone(), ParsedDoc { version, text, ast });
+            // Update the text+version in place, preserving the prior AST (kept
+            // until the debounced task revalidates). get_mut avoids a
+            // remove+reinsert and the uri clone the insert would need.
+            if let Some(d) = docs.get_mut(&uri) {
+                d.version = version;
+                d.text = text;
+            } else {
+                docs.insert(
+                    uri.clone(),
+                    ParsedDoc {
+                        version,
+                        text,
+                        ast: None,
+                    },
+                );
+            }
         }
 
         // Bump the global edit counter so any in-flight dependent sweep from an
         // earlier edit knows it has been superseded and can stop early.
-        let generation = self.state.edit_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Validate in the background after a short debounce so a burst of
         // keystrokes coalesces into one validation and the handler returns
@@ -1211,7 +1227,7 @@ mod tests {
             },
         );
 
-        let ws_uri = Some("file:///".to_string());
+        let ws_uri: Option<std::sync::Arc<str>> = Some("file:///".into());
         let sites = scan_use_sites("my_type", "my_instance", &docs, &rs, &ws_uri, &table);
         assert!(!sites.is_empty(), "expected use sites, got none");
         assert!(

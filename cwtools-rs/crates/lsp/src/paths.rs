@@ -25,15 +25,18 @@ pub(crate) fn path_to_uri(path: &std::path::Path) -> String {
 /// Derive the logical path (relative to mod root) from a file:// URI and the
 /// workspace root URI.  Falls back to the raw path if the workspace prefix
 /// cannot be stripped.
-pub(crate) fn logical_path_from_uri(uri: &str, workspace_uri: &Option<String>) -> String {
+pub(crate) fn logical_path_from_uri(
+    uri: &str,
+    workspace_uri: &Option<std::sync::Arc<str>>,
+) -> String {
     // Logical paths are `/`-separated everywhere downstream (type-instance
     // indexing, path matching). On Windows `uri_to_path_str` yields backslashes,
     // so normalise before stripping the workspace prefix — else the leading
     // separator survives `trim_start_matches('/')` and the path leaks into name
     // extraction (e.g. `load_oob` false positives).
-    let path = uri_to_path_str(uri).replace('\\', "/");
+    let path = normalize_separators(uri_to_path_str(uri));
     if let Some(ws) = workspace_uri {
-        let ws_path = uri_to_path_str(ws).replace('\\', "/");
+        let ws_path = normalize_separators(uri_to_path_str(ws));
         // Strip leading slash-terminated prefix
         let prefix = ws_path.trim_end_matches('/');
         if let Some(rel) = path.strip_prefix(prefix) {
@@ -42,6 +45,17 @@ pub(crate) fn logical_path_from_uri(uri: &str, workspace_uri: &Option<String>) -
     }
     // Fallback: use the decoded path as-is
     path
+}
+
+/// Normalise path separators to `/`. On the common (Linux/macOS) path the input
+/// has no backslash, so the owned string is returned unchanged with no
+/// allocation or scan-and-copy; only Windows paths actually pay the `replace`.
+fn normalize_separators(path: String) -> String {
+    if path.contains('\\') {
+        path.replace('\\', "/")
+    } else {
+        path
+    }
 }
 
 /// Parse a string into an LSP Url, falling back to a clone of `fallback` on error.
@@ -292,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_logical_path_from_uri_strips_workspace() {
-        let ws = Some("file:///home/user/mod".to_string());
+        let ws: Option<std::sync::Arc<str>> = Some("file:///home/user/mod".into());
         let lp = logical_path_from_uri("file:///home/user/mod/events/foo.txt", &ws);
         assert_eq!(lp, "events/foo.txt");
     }
@@ -327,7 +341,7 @@ mod tests {
     #[test]
     fn test_logical_path_from_uri_percent_decode() {
         // Workspace and file URIs with percent-encoded spaces.
-        let ws = Some("file:///home/user/My%20Mod".to_string());
+        let ws: Option<std::sync::Arc<str>> = Some("file:///home/user/My%20Mod".into());
         let lp = logical_path_from_uri("file:///home/user/My%20Mod/events/foo.txt", &ws);
         assert_eq!(lp, "events/foo.txt", "got: {}", lp);
     }

@@ -487,6 +487,7 @@ impl InfoService {
     /// caps the returned set; the returned `bool` is `true` when more existed.
     pub fn variable_values(&self, name: &str, limit: usize) -> (Vec<String>, bool) {
         let mut values: Vec<String> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         let mut truncated = false;
         for fi in self.files.values() {
             for vars in fi.defined_variables_ns.values() {
@@ -495,7 +496,7 @@ impl InfoService {
                         continue;
                     }
                     if let Some(val) = &v.value
-                        && !values.iter().any(|x| x == val)
+                        && seen.insert(val.as_str())
                     {
                         if values.len() >= limit {
                             truncated = true;
@@ -560,16 +561,6 @@ impl InfoService {
             }
 
             let value_str = leaf_value_string(&leaf.value, table);
-
-            if key.starts_with('@') {
-                info.defined_variables.insert(
-                    key.clone(),
-                    SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    },
-                );
-            }
 
             if value_str.starts_with('<') && value_str.ends_with('>') {
                 let inner = &value_str[1..value_str.len() - 1];
@@ -643,6 +634,19 @@ impl InfoService {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
                 });
+            }
+
+            // Owned consumer last so `key` moves in rather than clones. An
+            // `@`-prefixed key never matches any of the borrow-only checks above,
+            // so position is behavior-neutral.
+            if key.starts_with('@') {
+                info.defined_variables.insert(
+                    key,
+                    SourceLocation {
+                        line: leaf.pos.start.line,
+                        col: leaf.pos.start.col,
+                    },
+                );
             }
         }
     }

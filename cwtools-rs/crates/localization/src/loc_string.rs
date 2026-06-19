@@ -14,14 +14,19 @@
 //! Jomini syntax.
 
 /// Parsed element inside a loc string.
+///
+/// `Chars`/`Ref`/`Command` borrow directly from the source string (they are
+/// always substrings of the input), so parsing a loc value allocates nothing
+/// for plain-text runs. `JominiCommand` keeps owned `String`s because the
+/// Jomini parser rebuilds segment text character-by-character.
 #[derive(Debug, Clone, PartialEq)]
-pub enum LocElement {
+pub enum LocElement<'a> {
     /// Plain text characters.
-    Chars(String),
+    Chars(&'a str),
     /// `$ref$` reference to another loc key.
-    Ref(String),
+    Ref(&'a str),
     /// `[command]` block (non-Jomini).
-    Command(String),
+    Command(&'a str),
     /// `[Scope.Owner.GetName]` Jomini command chain or function call.
     JominiCommand(Vec<JominiCommand>),
 }
@@ -51,7 +56,7 @@ pub enum JominiParam {
 ///
 /// # Arguments
 /// * `s` – the raw description string (may include surrounding quotes)
-pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
+pub fn parse_loc_elements(s: &str) -> Vec<LocElement<'_>> {
     let mut elements = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0; // byte offset; always lands on a char boundary
@@ -64,7 +69,7 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
                     i = new_i;
                 } else {
                     let end = next_special(s, i + 1);
-                    elements.push(LocElement::Chars(s[i..end].to_string()));
+                    elements.push(LocElement::Chars(&s[i..end]));
                     i = end;
                 }
             }
@@ -74,7 +79,7 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
                     i = new_i;
                 } else {
                     let end = next_special(s, i + 1);
-                    elements.push(LocElement::Chars(s[i..end].to_string()));
+                    elements.push(LocElement::Chars(&s[i..end]));
                     i = end;
                 }
             }
@@ -83,7 +88,7 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
                 // It is special (so `next_special` stops on it); consume the
                 // single ASCII byte explicitly, otherwise the `_` arm below
                 // would make no progress and loop forever (OOM).
-                elements.push(LocElement::Chars("]".to_string()));
+                elements.push(LocElement::Chars("]"));
                 i += 1;
             }
             _ => {
@@ -93,7 +98,7 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement> {
                 // `i` stays on a char boundary. Searching from `i + 1` would be
                 // unsafe: `i + 1` may fall inside a multi-byte UTF-8 sequence.
                 let end = next_special(s, i);
-                elements.push(LocElement::Chars(s[i..end].to_string()));
+                elements.push(LocElement::Chars(&s[i..end]));
                 i = end;
             }
         }
@@ -117,7 +122,7 @@ fn next_special(s: &str, start: usize) -> usize {
 ///
 /// Mirrors F# `dollarColour`: the ref name ends at `|` or `$`.
 /// So `$MY_KEY|Y$` yields `Ref("MY_KEY")`.
-fn parse_ref(s: &str, start: usize) -> Option<(LocElement, usize)> {
+fn parse_ref(s: &str, start: usize) -> Option<(LocElement<'_>, usize)> {
     let bytes = s.as_bytes();
     let content_start = start + 1; // skip opening '$'
 
@@ -144,10 +149,10 @@ fn parse_ref(s: &str, start: usize) -> Option<(LocElement, usize)> {
             .iter()
             .position(|&b| b == b'$')
             .map(|off| after_pipe + off)?;
-        Some((LocElement::Ref(key.to_string()), close + 1))
+        Some((LocElement::Ref(key), close + 1))
     } else {
         // bytes[key_end] == b'$' — consume it
-        Some((LocElement::Ref(key.to_string()), key_end + 1))
+        Some((LocElement::Ref(key), key_end + 1))
     }
 }
 
@@ -163,7 +168,7 @@ fn is_loc_ref_key(key: &str) -> bool {
 }
 
 /// Parse a `[...]` block starting at `s[start]` where `s.as_bytes()[start] == b'['`.
-fn parse_bracket(s: &str, start: usize) -> Option<(LocElement, usize)> {
+fn parse_bracket(s: &str, start: usize) -> Option<(LocElement<'_>, usize)> {
     let bytes = s.as_bytes();
     let mut depth = 1usize;
     let mut i = start + 1;
@@ -192,7 +197,7 @@ fn parse_bracket(s: &str, start: usize) -> Option<(LocElement, usize)> {
 
     let command = content.find('|').map(|p| &content[..p]).unwrap_or(content);
 
-    Some((LocElement::Command(command.to_string()), i))
+    Some((LocElement::Command(command), i))
 }
 
 /// Parse Jomini command chain / function call.
@@ -288,37 +293,37 @@ mod tests {
     #[test]
     fn test_simple_ref() {
         let elems = parse_loc_elements("$FOO$");
-        assert_eq!(elems, vec![LocElement::Ref("FOO".to_string())]);
+        assert_eq!(elems, vec![LocElement::Ref("FOO")]);
     }
 
     #[test]
     fn test_simple_command() {
         let elems = parse_loc_elements("[GetName]");
-        assert_eq!(elems, vec![LocElement::Command("GetName".to_string())]);
+        assert_eq!(elems, vec![LocElement::Command("GetName")]);
     }
 
     #[test]
     fn test_command_with_format() {
         let elems = parse_loc_elements("[GetName|Y]");
-        assert_eq!(elems, vec![LocElement::Command("GetName".to_string())]);
+        assert_eq!(elems, vec![LocElement::Command("GetName")]);
     }
 
     #[test]
     fn test_mixed_text_and_commands() {
         let elems = parse_loc_elements("Hello [GetName], welcome!");
         assert_eq!(elems.len(), 3);
-        assert_eq!(elems[0], LocElement::Chars("Hello ".to_string()));
-        assert_eq!(elems[1], LocElement::Command("GetName".to_string()));
-        assert_eq!(elems[2], LocElement::Chars(", welcome!".to_string()));
+        assert_eq!(elems[0], LocElement::Chars("Hello "));
+        assert_eq!(elems[1], LocElement::Command("GetName"));
+        assert_eq!(elems[2], LocElement::Chars(", welcome!"));
     }
 
     #[test]
     fn test_ref_and_command() {
         let elems = parse_loc_elements("$TITLE$ [GetName]");
         assert_eq!(elems.len(), 3);
-        assert_eq!(elems[0], LocElement::Ref("TITLE".to_string()));
-        assert_eq!(elems[1], LocElement::Chars(" ".to_string()));
-        assert_eq!(elems[2], LocElement::Command("GetName".to_string()));
+        assert_eq!(elems[0], LocElement::Ref("TITLE"));
+        assert_eq!(elems[1], LocElement::Chars(" "));
+        assert_eq!(elems[2], LocElement::Command("GetName"));
     }
 
     #[test]
@@ -353,31 +358,28 @@ mod tests {
     fn test_event_target() {
         let elems = parse_loc_elements("[event_target:foo]");
         assert_eq!(elems.len(), 1);
-        assert_eq!(
-            elems[0],
-            LocElement::Command("event_target:foo".to_string())
-        );
+        assert_eq!(elems[0], LocElement::Command("event_target:foo"));
     }
 
     #[test]
     fn test_question_variable() {
         let elems = parse_loc_elements("[?var_name]");
         assert_eq!(elems.len(), 1);
-        assert_eq!(elems[0], LocElement::Command("?var_name".to_string()));
+        assert_eq!(elems[0], LocElement::Command("?var_name"));
     }
 
     #[test]
     fn test_ref_colour_suffix_stripped() {
         // $MY_KEY|Y$ should yield Ref("MY_KEY"), not Ref("MY_KEY|Y")
         let elems = parse_loc_elements("$MY_KEY|Y$");
-        assert_eq!(elems, vec![LocElement::Ref("MY_KEY".to_string())]);
+        assert_eq!(elems, vec![LocElement::Ref("MY_KEY")]);
     }
 
     #[test]
     fn test_ref_no_colour_suffix() {
         // Plain ref without colour suffix still works
         let elems = parse_loc_elements("$MY_KEY$");
-        assert_eq!(elems, vec![LocElement::Ref("MY_KEY".to_string())]);
+        assert_eq!(elems, vec![LocElement::Ref("MY_KEY")]);
     }
 
     #[test]
@@ -390,7 +392,7 @@ mod tests {
         let joined: String = elems
             .iter()
             .map(|e| match e {
-                LocElement::Chars(c) => c.clone(),
+                LocElement::Chars(c) => (*c).to_string(),
                 _ => String::new(),
             })
             .collect();
@@ -405,7 +407,7 @@ mod tests {
     fn test_only_closing_bracket() {
         // A bare `]` must not loop.
         let elems = parse_loc_elements("]");
-        assert_eq!(elems, vec![LocElement::Chars("]".to_string())]);
+        assert_eq!(elems, vec![LocElement::Chars("]")]);
     }
 
     #[test]
@@ -420,16 +422,16 @@ mod tests {
     fn test_ref_colour_in_mixed_string() {
         // Colour-suffixed ref inside mixed text
         let elems = parse_loc_elements("Hello $NAME|G$ world");
-        assert_eq!(elems[0], LocElement::Chars("Hello ".to_string()));
-        assert_eq!(elems[1], LocElement::Ref("NAME".to_string()));
-        assert_eq!(elems[2], LocElement::Chars(" world".to_string()));
+        assert_eq!(elems[0], LocElement::Chars("Hello "));
+        assert_eq!(elems[1], LocElement::Ref("NAME"));
+        assert_eq!(elems[2], LocElement::Chars(" world"));
     }
 
     fn refs(s: &str) -> Vec<String> {
         parse_loc_elements(s)
             .into_iter()
             .filter_map(|e| match e {
-                LocElement::Ref(r) => Some(r),
+                LocElement::Ref(r) => Some(r.to_string()),
                 _ => None,
             })
             .collect()

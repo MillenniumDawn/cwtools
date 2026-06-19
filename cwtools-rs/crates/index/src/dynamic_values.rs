@@ -279,15 +279,22 @@ fn collect_value_sets_in(
     table: &StringTable,
     out: &mut HashMap<String, Vec<String>>,
 ) {
+    thread_local! {
+        static LOWER_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
     for child in children {
         let Child::Leaf(idx) = child else { continue };
         let leaf = &ast.arena.leaves[*idx as usize];
         let ns = table
             .with_string(leaf.key.normal, |s| {
-                ruleset
-                    .value_set_effects
-                    .get(&s.to_ascii_lowercase())
-                    .cloned()
+                // Lowercase into a reused thread-local buffer instead of allocating
+                // a String per leaf just to probe the (lowercased-key) effect map.
+                LOWER_BUF.with(|buf| {
+                    let mut key = buf.borrow_mut();
+                    key.clear();
+                    key.extend(s.chars().map(|c| c.to_ascii_lowercase()));
+                    ruleset.value_set_effects.get(key.as_str()).cloned()
+                })
             })
             .flatten();
         match (&leaf.value, ns) {
