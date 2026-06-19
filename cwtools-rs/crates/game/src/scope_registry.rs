@@ -205,7 +205,17 @@ impl ScopeRegistry {
             let valid: Vec<ScopeId> = li
                 .input_scopes
                 .iter()
-                .map(|n| reg.id_of(n).unwrap_or(SCOPE_ANY))
+                .map(|n| {
+                    reg.id_of(n).unwrap_or_else(|| {
+                        // Keep the permissive any-scope fallback, but surface a
+                        // typo'd scope name in links.cwt instead of hiding it.
+                        tracing::warn!(
+                            "links.cwt: link `{}` lists unknown input scope `{n}`; treating as any",
+                            li.name
+                        );
+                        SCOPE_ANY
+                    })
+                })
                 .collect();
             let link = ScopeLink {
                 valid_scopes: valid,

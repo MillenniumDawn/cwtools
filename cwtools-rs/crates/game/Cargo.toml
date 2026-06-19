@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 smallvec = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
