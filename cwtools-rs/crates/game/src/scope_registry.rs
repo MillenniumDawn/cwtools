@@ -7,6 +7,7 @@
 
 use crate::constants::Game;
 use crate::scope_engine::{SCOPE_ANY, SCOPE_INVALID, ScopeId, ScopeLink};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 /// A scope definition parsed from `scopes.cwt` (`Country = { aliases = { country } }`).
@@ -77,13 +78,27 @@ impl ScopeRegistry {
 
     /// Resolve a scope name/alias (`country`, `Special Project`, `any`, `none`) to an id.
     /// `none` maps to `SCOPE_ANY` (F# anyScope semantics: unrestricted).
+    #[inline]
     pub fn id_of(&self, name: &str) -> Option<ScopeId> {
-        let lower = name.trim().to_ascii_lowercase();
-        match lower.as_str() {
-            "any" | "all" | "none" => Some(SCOPE_ANY),
-            "invalid" => Some(SCOPE_INVALID),
-            _ => self.by_name.get(&lower).copied(),
+        let trimmed = name.trim();
+        if trimmed.eq_ignore_ascii_case("any")
+            || trimmed.eq_ignore_ascii_case("all")
+            || trimmed.eq_ignore_ascii_case("none")
+        {
+            return Some(SCOPE_ANY);
         }
+        if trimmed.eq_ignore_ascii_case("invalid") {
+            return Some(SCOPE_INVALID);
+        }
+        // Fast path: try the key as-is (already lowercase in the common case),
+        // only allocate a lowercase copy when the borrowed lookup misses.
+        if let Some(id) = self.by_name.get(trimmed) {
+            return Some(*id);
+        }
+        if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+            return self.by_name.get(&trimmed.to_ascii_lowercase()).copied();
+        }
+        None
     }
 
     /// True when no config scopes were loaded (callers then fall back / stay lenient).
@@ -95,19 +110,22 @@ impl ScopeRegistry {
     /// subscope of it (`is_subscope_of`, walked transitively). E.g. a `character`
     /// scope satisfies a `country` requirement because `Character is_subscope_of
     /// { country }` in scopes.cwt.
+    #[inline]
     pub fn is_subscope_or_eq(&self, current: ScopeId, target: ScopeId) -> bool {
         if current == target || current == SCOPE_ANY || target == SCOPE_ANY {
             return true;
         }
-        let mut stack = vec![current];
-        let mut seen = std::collections::HashSet::new();
+        let mut stack: SmallVec<[ScopeId; 8]> = SmallVec::new();
+        stack.push(current);
+        let mut seen: SmallVec<[ScopeId; 8]> = SmallVec::new();
         while let Some(c) = stack.pop() {
             if c == target {
                 return true;
             }
-            if !seen.insert(c) {
+            if seen.contains(&c) {
                 continue;
             }
+            seen.push(c);
             if let Some(def) = self.by_id.get(&c) {
                 stack.extend(def.subscope_of.iter().copied());
             }
