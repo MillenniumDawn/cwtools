@@ -446,6 +446,10 @@ pub fn parse_mod_descriptor(path: &Path) -> Result<ModDescriptor, FileError> {
     let raw = read_text(path)?;
     // Strip UTF-8 BOM (U+FEFF) so the first key isn't parsed as "\u{FEFF}name".
     let content = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+    Ok(parse_mod_descriptor_str(content))
+}
+
+fn parse_mod_descriptor_str(content: &str) -> ModDescriptor {
     let mut name = String::new();
     let mut mod_path = None;
     let mut replace_paths = Vec::new();
@@ -457,7 +461,7 @@ pub fn parse_mod_descriptor(path: &Path) -> Result<ModDescriptor, FileError> {
         }
         if let Some((k, v)) = line.split_once('=') {
             let key = k.trim();
-            let val = v.trim().trim_matches('"').to_string();
+            let val = descriptor_value(v);
             match key {
                 "name" => name = val,
                 "path" | "archive" => mod_path = Some(val),
@@ -467,11 +471,28 @@ pub fn parse_mod_descriptor(path: &Path) -> Result<ModDescriptor, FileError> {
         }
     }
 
-    Ok(ModDescriptor {
+    ModDescriptor {
         name,
         path: mod_path,
         replace_paths,
-    })
+    }
+}
+
+/// Extract a `.mod` value. A quoted value is the text between the quotes, so a
+/// trailing inline comment or an `=` inside the quotes is handled correctly
+/// (`replace_path = "common/ideas" # keep` -> `common/ideas`). An unquoted value
+/// runs up to an inline `#` comment. The old `trim_matches('"')` left the closing
+/// quote in place whenever anything followed it.
+fn descriptor_value(v: &str) -> String {
+    let v = v.trim();
+    if let Some(rest) = v.strip_prefix('"') {
+        match rest.split_once('"') {
+            Some((inner, _)) => inner.to_string(),
+            None => rest.to_string(),
+        }
+    } else {
+        v.split('#').next().unwrap_or(v).trim().to_string()
+    }
 }
 
 // ── Multi-mod expansion ───────────────────────────────────────────────────────
@@ -843,6 +864,45 @@ fn glob_dp(p: &[char], t: &[char]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mod_descriptor_robust_values() {
+        // #213: trailing comments, quoted '=', and unquoted values must parse.
+        let d = parse_mod_descriptor_str(
+            "name = \"Test = Mod\"\n\
+             path = \"mod/root\"  # the root\n\
+             replace_path = \"common/ideas\"\n\
+             replace_path = \"common/foo=bar\"\n\
+             replace_path = \"events\" # keep vanilla out\n\
+             replace_path = common/units\n\
+             replace_path = common/raids # bare with comment\n\
+             # a comment line\n\
+             dependencies = { \"ModA\" \"ModB\" }\n",
+        );
+        assert_eq!(d.name, "Test = Mod");
+        assert_eq!(d.path.as_deref(), Some("mod/root"));
+        assert_eq!(
+            d.replace_paths,
+            vec![
+                "common/ideas",
+                "common/foo=bar",
+                "events",
+                "common/units",
+                "common/raids",
+            ]
+        );
+    }
+
+    #[test]
+    fn mod_descriptor_clean_lines_unchanged() {
+        // The common case (clean quoted lines, as in the Millennium Dawn
+        // descriptor) must parse identically to before.
+        let d = parse_mod_descriptor_str(
+            "name=\"Millennium Dawn\"\nreplace_path = \"common/ideas\"\nreplace_path = \"events\"\n",
+        );
+        assert_eq!(d.name, "Millennium Dawn");
+        assert_eq!(d.replace_paths, vec!["common/ideas", "events"]);
+    }
 
     #[test]
     fn glob_matching() {
