@@ -566,7 +566,7 @@ impl Backend {
         let mut diagnostics = Vec::new();
 
         // Localisation files are parsed and validated as loc, not config.
-        if uri.ends_with(".yml") || uri.ends_with(".yaml") || uri.ends_with(".csv") {
+        if crate::paths::is_loc_file(uri) {
             let path = uri_to_path_str(uri);
             // Names a `$ref$` may resolve to besides loc keys (`$modifier$` /
             // `$idea$` embeds). Built before the loc_index guard to honour the

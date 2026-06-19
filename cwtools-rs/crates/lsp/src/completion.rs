@@ -35,8 +35,8 @@ impl Backend {
         };
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-        // .yml localisation file — offer loc-key / data-function completions.
-        if uri.ends_with(".yml") || uri.ends_with(".yaml") {
+        // Localisation file — offer loc-key / data-function completions.
+        if crate::paths::is_loc_file(&uri) {
             let rules_guard = self.state.rules.read();
             let info_guard = self.state.info_service.read();
             let items = loc_completions(
