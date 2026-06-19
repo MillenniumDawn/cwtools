@@ -380,18 +380,11 @@ fn clone_value_r(
 // ── String helpers ────────────────────────────────────────────────────────────
 
 /// Intern a string and its lowercase form so that `tokens.lower` really is the
-/// lowercase intern.  The original code called `intern` once and reused the
-/// `.normal` id for both, which broke case-insensitive lookups for mixed-case
-/// substitution results.
+/// lowercase intern. `StringTable::intern` already allocates the lowercase
+/// companion id and returns it in `.lower`, so a single call gives the correct
+/// `normal`/`lower`/`quoted` without a redundant `to_lowercase()` + re-intern.
 fn intern_both(table: &mut StringTable, text: &str) -> StringTokens {
-    let normal_tokens = table.intern(text);
-    let lower_str = text.to_lowercase();
-    let lower_tokens = table.intern(&lower_str);
-    StringTokens {
-        normal: normal_tokens.normal,
-        lower: lower_tokens.normal,
-        quoted: normal_tokens.quoted,
-    }
+    table.intern(text)
 }
 
 fn clone_tokens(
@@ -406,6 +399,10 @@ fn clone_tokens(
 }
 
 fn substitute_params(text: &str, params: &HashMap<String, String>) -> String {
+    // Fast path: no `$param$` markers, so nothing is substituted.
+    if !text.contains('$') {
+        return text.to_string();
+    }
     let mut output = String::new();
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
