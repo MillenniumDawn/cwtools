@@ -3,6 +3,7 @@ use cwtools_string_table::string_table::{StringTable, StringTokens};
 use std::str::Chars;
 
 struct Parser<'a> {
+    input: &'a str,
     chars: Chars<'a>,
     line: u32,
     col: u16,
@@ -11,9 +12,18 @@ struct Parser<'a> {
     errors: Vec<ParseError>,
 }
 
+/// Saved cursor for backtracking: the remaining-input iterator plus line/col.
+#[derive(Clone)]
+struct Cursor<'a> {
+    chars: Chars<'a>,
+    line: u32,
+    col: u16,
+}
+
 impl<'a> Parser<'a> {
     fn new(input: &'a str, table: &'a StringTable) -> Self {
         Self {
+            input,
             chars: input.chars(),
             line: 1,
             col: 0,
@@ -28,6 +38,25 @@ impl<'a> Parser<'a> {
             line: self.line,
             col: self.col,
         }
+    }
+
+    /// Byte offset of the cursor into the original input.
+    fn byte_pos(&self) -> usize {
+        self.input.len() - self.chars.as_str().len()
+    }
+
+    fn save(&self) -> Cursor<'a> {
+        Cursor {
+            chars: self.chars.clone(),
+            line: self.line,
+            col: self.col,
+        }
+    }
+
+    fn restore(&mut self, c: Cursor<'a>) {
+        self.chars = c.chars;
+        self.line = c.line;
+        self.col = c.col;
     }
 
     fn advance(&mut self) -> Option<char> {
@@ -157,39 +186,20 @@ impl<'a> Parser<'a> {
             self.skip_whitespace();
             Some(self.table.intern(&s))
         } else {
-            let mut s = String::new();
+            let start = self.byte_pos();
             while let Some(c) = self.peek() {
-                if c.is_alphanumeric()
-                    || c == '_'
-                    || c == ':'
-                    || c == '@'
-                    || c == '.'
-                    || c == '\"'
-                    || c == '-'
-                    || c == '\''
-                    || c == '['
-                    || c == ']'
-                    || c == '!'
-                    || c == '<'
-                    || c == '>'
-                    || c == '$'
-                    || c == '^'
-                    || c == '&'
-                    || c == '|'
-                    || c == '('
-                    || c == ')'
-                {
-                    s.push(c);
+                if is_key_char(c) {
                     self.advance();
                 } else {
                     break;
                 }
             }
+            let s = &self.input[start..self.byte_pos()];
             if s.is_empty() {
                 return None;
             }
             self.skip_whitespace();
-            Some(self.table.intern(&s))
+            Some(self.table.intern(s))
         }
     }
 
@@ -322,7 +332,13 @@ impl<'a> Parser<'a> {
         // We save state and restore it if parse_rgb/parse_hsv returns None, so a
         // bare `rgb` token that isn't followed by `{` doesn't get consumed and lost.
         // Peek 7 chars (max needed: "rgb360" + one char after) without allocating.
-        let (peek7, peek7_len) = self.peek_n::<7>();
+        // Only the keywords rgb/hsv/yes/no and the metaprogramming prefix start
+        // with one of these chars, so plain numbers/identifiers skip the multi-char
+        // peek entirely.
+        let (peek7, peek7_len) = match self.peek() {
+            Some('r' | 'R' | 'h' | 'H' | 'y' | 'n' | '@') => self.peek_n::<7>(),
+            _ => (['\0'; 7], 0),
+        };
         let is_rgb = peek7_len >= 3
             && peek7[0].eq_ignore_ascii_case(&'r')
             && peek7[1].eq_ignore_ascii_case(&'g')
@@ -344,14 +360,11 @@ impl<'a> Parser<'a> {
                 None
             };
             if after.is_none_or(|c| !c.is_alphanumeric()) {
-                let saved = self.pos();
-                let saved_chars = self.chars.clone();
+                let saved = self.save();
                 if let Some(v) = self.parse_color_clause() {
                     return Some(v);
                 }
-                self.chars = saved_chars;
-                self.line = saved.line;
-                self.col = saved.col;
+                self.restore(saved);
             }
         }
         if is_hsv {
@@ -367,19 +380,15 @@ impl<'a> Parser<'a> {
                 None
             };
             if after.is_none_or(|c| !c.is_alphanumeric()) {
-                let saved = self.pos();
-                let saved_chars = self.chars.clone();
+                let saved = self.save();
                 if let Some(v) = self.parse_color_clause() {
                     return Some(v);
                 }
-                self.chars = saved_chars;
-                self.line = saved.line;
-                self.col = saved.col;
+                self.restore(saved);
             }
         }
         if peek7_len >= 3 && peek7[0] == 'y' && peek7[1] == 'e' && peek7[2] == 's' {
-            let saved = self.pos();
-            let saved_chars = self.chars.clone();
+            let saved = self.save();
             for _ in 0..3 {
                 self.advance();
             }
@@ -393,13 +402,10 @@ impl<'a> Parser<'a> {
                 return Some(Value::Bool(true));
             }
             // Not a standalone "yes" — backtrack
-            self.chars = saved_chars;
-            self.line = saved.line;
-            self.col = saved.col;
+            self.restore(saved);
         }
         if peek7_len >= 2 && peek7[0] == 'n' && peek7[1] == 'o' {
-            let saved = self.pos();
-            let saved_chars = self.chars.clone();
+            let saved = self.save();
             for _ in 0..2 {
                 self.advance();
             }
@@ -413,9 +419,7 @@ impl<'a> Parser<'a> {
                 return Some(Value::Bool(false));
             }
             // Not a standalone "no" — backtrack
-            self.chars = saved_chars;
-            self.line = saved.line;
-            self.col = saved.col;
+            self.restore(saved);
         }
         // F# metaprogramming prefix is "@\[" (at, backslash, open-bracket).
         // SharedParsers.fs:244 uses pstring "@\\[" which is the 3-char literal @\[.
@@ -435,8 +439,7 @@ impl<'a> Parser<'a> {
         // path consume the entire token.
         //
         // Leading '+' is accepted by F#'s pint64/pfloat (issue #2).
-        let num_saved_chars = self.chars.clone();
-        let num_saved_pos = self.pos();
+        let num_saved = self.save();
 
         let mut num_str = String::new();
         let mut had_dot = false;
@@ -483,25 +486,23 @@ impl<'a> Parser<'a> {
 
         // Numeric parse didn't commit — backtrack fully so the string path gets the
         // whole token (e.g. "1444.11.11", "1e5", "0x1A", lone "-").
-        self.chars = num_saved_chars;
-        self.line = num_saved_pos.line;
-        self.col = num_saved_pos.col;
+        self.restore(num_saved);
 
         // Fallback: plain string
-        let mut s = String::new();
+        let start = self.byte_pos();
         while let Some(c) = self.peek() {
             if is_value_char(c) {
-                s.push(c);
                 self.advance();
             } else {
                 break;
             }
         }
+        let s = &self.input[start..self.byte_pos()];
         if s.is_empty() {
             return None;
         }
         self.skip_whitespace();
-        let tokens = self.table.intern(&s);
+        let tokens = self.table.intern(s);
         Some(Value::String(tokens))
     }
 
@@ -547,7 +548,7 @@ impl<'a> Parser<'a> {
 
         // Try key=value (or key { ... } shorthand)
         let saved = self.pos();
-        let saved_chars = self.chars.clone();
+        let saved_cursor = self.save();
         if let Some(key) = self.parse_key() {
             if let Some(op) = self.parse_operator() {
                 if let Some(value) = self.parse_value(false) {
@@ -600,9 +601,7 @@ impl<'a> Parser<'a> {
                 return;
             }
             // Not a key=value or shorthand; restore and try leaf-value
-            self.chars = saved_chars;
-            self.line = saved.line;
-            self.col = saved.col;
+            self.restore(saved_cursor);
         }
 
         // Leaf value (bare value)
@@ -654,6 +653,7 @@ impl<'a> Parser<'a> {
         if self.peek() != Some('@') {
             return None;
         }
+        let start = self.byte_pos();
         self.advance(); // '@'
         if self.peek() != Some('\\') {
             return None;
@@ -664,18 +664,14 @@ impl<'a> Parser<'a> {
         }
         self.advance(); // '['
 
-        let mut s = String::new();
-        s.push_str("@\\[");
         let mut found_close = false;
         while let Some(c) = self.peek() {
             if c == ']' {
-                s.push(c);
                 self.advance();
                 found_close = true;
                 break;
             }
             // F# metaprogrammingCharSnippet stops at '\' too — just collect content.
-            s.push(c);
             self.advance();
         }
         if !found_close {
@@ -687,8 +683,9 @@ impl<'a> Parser<'a> {
             ));
             return None;
         }
+        let s = &self.input[start..self.byte_pos()];
         self.skip_whitespace();
-        let tokens = self.table.intern(&s);
+        let tokens = self.table.intern(s);
         Some(Value::String(tokens))
     }
 
@@ -706,37 +703,48 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Build a `[bool; 128]` ASCII class table at compile time: every ASCII
+/// alphanumeric plus the explicit punctuation in `extra` is `true`.
+const fn ascii_class(extra: &[u8]) -> [bool; 128] {
+    let mut table = [false; 128];
+    let mut i = 0u8;
+    while i < 128 {
+        let b = i;
+        if b.is_ascii_alphanumeric() {
+            table[i as usize] = true;
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < extra.len() {
+        table[extra[j] as usize] = true;
+        j += 1;
+    }
+    table
+}
+
+/// ASCII members of the bare-value (leafvalue / value-string) char class.
+/// Non-ASCII chars are handled separately in [`is_value_char`].
+static VALUE_CHAR: [bool; 128] = ascii_class(b"_.-:;'[]@+`%/!,<>?$\\|^*&()");
+
+/// ASCII members of the unquoted-key char class. Non-ASCII alphanumerics are
+/// handled separately in [`is_key_char`].
+static KEY_CHAR: [bool; 128] = ascii_class(b"_:@.\"-'[]!<>$^&|()");
+
 fn is_value_char(c: char) -> bool {
-    c.is_alphanumeric()
-        || c == '_'
-        || c == '.'
-        || c == '-'
-        || c == ':'
-        || c == ';'
-        || c == '\''
-        || c == '['
-        || c == ']'
-        || c == '@'
-        || c == '+'
-        || c == '`'
-        || c == '%'
-        || c == '/'
-        || c == '!'
-        || c == ','
-        || c == '<'
-        || c == '>'
-        || c == '?'
-        || c == '$'
-        || c == '\\'
-        || c == 'š'
-        || c == 'Š'
-        || c == '’'
-        || c == '|'
-        || c == '^'
-        || c == '*'
-        || c == '&'
-        || c == '('
-        || c == ')'
+    if c.is_ascii() {
+        VALUE_CHAR[c as usize]
+    } else {
+        c.is_alphanumeric() || c == 'š' || c == 'Š' || c == '’'
+    }
+}
+
+fn is_key_char(c: char) -> bool {
+    if c.is_ascii() {
+        KEY_CHAR[c as usize]
+    } else {
+        c.is_alphanumeric()
+    }
 }
 
 /// Strip UTF-8 BOM if present, then parse.
