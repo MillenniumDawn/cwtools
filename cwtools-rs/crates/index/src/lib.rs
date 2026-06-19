@@ -70,8 +70,12 @@ impl FileIndex {
     }
 
     fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut HashSet<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("FileIndex::walk: cannot read {}: {e}", dir.display());
+                return;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
