@@ -16,8 +16,9 @@ pub struct ValidationError {
     pub line: u32,
     pub col: u16,
     pub file: String,
-    /// CW### error code, e.g. "CW262" for an unexpected property node.
-    pub code: Option<String>,
+    /// CW### error code, e.g. "CW262" for an unexpected property node. The id is
+    /// `&'static` (the catalog `ErrorCode.id`), so no per-error allocation.
+    pub code: Option<&'static str>,
 }
 
 impl ValidationError {
@@ -37,7 +38,7 @@ impl ValidationError {
             line,
             col,
             file: file.to_string(),
-            code: Some(code.id.to_string()),
+            code: Some(code.id),
         }
     }
 }

@@ -74,10 +74,14 @@ pub(crate) fn line_value_key(text: &str, line0: u32, char0: u32) -> Option<Strin
     Some(key.to_string())
 }
 
-/// Whether a URI is a localisation file (`.yml`), where `$KEY$` references
-/// resolve to other loc entries rather than to game-script rules.
+/// Whether a URI is a localisation file (`.yml` / `.yaml` / `.csv`), where
+/// `$KEY$` references resolve to other loc entries rather than to game-script
+/// rules. One predicate so hover/goto, completion, and validate agree on what
+/// counts as loc (previously hover/goto only matched `.yml`, so loc resolution
+/// silently skipped `.yaml`/`.csv` files that completion and validate handled).
 pub(crate) fn is_loc_file(uri: &str) -> bool {
-    uri.to_ascii_lowercase().ends_with(".yml")
+    let lower = uri.to_ascii_lowercase();
+    lower.ends_with(".yml") || lower.ends_with(".yaml") || lower.ends_with(".csv")
 }
 
 /// Locate the `$KEY$` loc-reference token under the cursor in a localisation
@@ -225,6 +229,20 @@ pub(crate) fn lang_display_name(lang: cwtools_localization::Lang) -> &'static st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_loc_file_matches_all_loc_extensions() {
+        // hover/goto, completion, and validate must agree (#2/#217).
+        assert!(is_loc_file("file:///mod/localisation/foo_l_english.yml"));
+        assert!(is_loc_file("file:///mod/localisation/foo_l_english.yaml"));
+        assert!(is_loc_file("file:///mod/localisation/names.csv"));
+        // case-insensitive (Windows)
+        assert!(is_loc_file("file:///MOD/FOO.YML"));
+        assert!(is_loc_file("file:///MOD/FOO.YAML"));
+        // not loc
+        assert!(!is_loc_file("file:///mod/common/ideas/foo.txt"));
+        assert!(!is_loc_file("file:///mod/gfx/foo.gfx"));
+    }
 
     #[test]
     fn test_line_value_key() {

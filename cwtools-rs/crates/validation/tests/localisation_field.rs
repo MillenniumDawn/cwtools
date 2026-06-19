@@ -48,9 +48,7 @@ fn run(script: &str, idx: &LocIndex) -> Vec<cwtools_validation::ValidationError>
 }
 
 fn cw100s(errs: &[cwtools_validation::ValidationError]) -> usize {
-    errs.iter()
-        .filter(|e| e.code.as_deref() == Some("CW100"))
-        .count()
+    errs.iter().filter(|e| e.code == Some("CW100")).count()
 }
 
 #[test]
@@ -76,10 +74,7 @@ fn unsynced_missing_key_warns_cw100() {
 fn inline_quoted_existing_key_warns_cw122() {
     let idx = loc_index(&[("a_l_english.yml", "l_english:\n my_key: \"hi\"\n")]);
     let errs = run("mytype = {\n iname = \"my_key\"\n}\n", &idx);
-    let cw122 = errs
-        .iter()
-        .filter(|e| e.code.as_deref() == Some("CW122"))
-        .count();
+    let cw122 = errs.iter().filter(|e| e.code == Some("CW122")).count();
     assert_eq!(cw122, 1, "quoted inline existing key → CW122: {:?}", errs);
 }
 

@@ -196,6 +196,6 @@ fn push_loc_command_diagnostic(
         line: leaf.pos.start.line,
         col: leaf.pos.start.col,
         file: file_path.to_string(),
-        code: Some(code.id.to_string()),
+        code: Some(code.id),
     });
 }

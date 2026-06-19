@@ -59,7 +59,7 @@ pub(crate) fn loc_diag_to_validation_error(
         line: d.line as u32,
         col: d.col.saturating_sub(1) as u16,
         file: d.file.clone(),
-        code: Some(d.code.to_string()),
+        code: Some(d.code),
     }
 }
 
@@ -171,10 +171,7 @@ pub(crate) fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnosti
             cwtools_validation::ErrorSeverity::Information => Some(DiagnosticSeverity::INFORMATION),
             cwtools_validation::ErrorSeverity::Hint => Some(DiagnosticSeverity::HINT),
         },
-        code: err
-            .code
-            .as_deref()
-            .map(|c| NumberOrString::String(c.to_string())),
+        code: err.code.map(|c| NumberOrString::String(c.to_string())),
         code_description: None,
         source: Some("cwtools".to_string()),
         message: err.message.clone(),
@@ -245,16 +242,16 @@ impl Backend {
     /// `ast = None` (e.g. a file that failed to parse) clears the set, so the
     /// sweep treats the doc as "unknown" and always includes it.
     pub(crate) fn update_doc_tokens(&self, uri: &str, ast: Option<&Arc<ParsedFile>>) {
-        let mut tokens = self.state.doc_tokens.write();
+        // Build the token set BEFORE taking the write lock. collect_doc_tokens
+        // walks the whole arena; holding doc_tokens.write() across it blocks the
+        // dependent sweep's readers (doc_tokens.read()) for the whole walk.
         match ast {
             Some(ast) => {
-                tokens.insert(
-                    uri.to_string(),
-                    collect_doc_tokens(ast, &self.state.string_table),
-                );
+                let toks = collect_doc_tokens(ast, &self.state.string_table);
+                self.state.doc_tokens.write().insert(uri.to_string(), toks);
             }
             None => {
-                tokens.remove(uri);
+                self.state.doc_tokens.write().remove(uri);
             }
         }
     }
@@ -515,10 +512,11 @@ impl Backend {
                         let mut pending = self.state.pending_changed_names.lock();
                         pending.extend(names.iter().cloned());
                     }
-                    // None means "revalidate everything" — mark with a sentinel
-                    // by draining to empty (the next sweep sees an empty pending
-                    // set and, combined with a `None` scope, covers all dependents).
-                    return;
+                    // Stop computing further dependents, but fall through to
+                    // publish the ones already validated this sweep instead of
+                    // discarding them. The newer sweep (draining
+                    // pending_changed_names) covers the rest.
+                    break;
                 }
                 let diagnostics = match rules_guard.ruleset.as_ref() {
                     Some(ruleset) => self.validate_parsed_prebuilt(
@@ -566,14 +564,14 @@ impl Backend {
         let mut diagnostics = Vec::new();
 
         // Localisation files are parsed and validated as loc, not config.
-        if uri.ends_with(".yml") || uri.ends_with(".yaml") || uri.ends_with(".csv") {
+        if crate::paths::is_loc_file(uri) {
             let path = uri_to_path_str(uri);
             // Names a `$ref$` may resolve to besides loc keys (`$modifier$` /
             // `$idea$` embeds). Built before the loc_index guard to honour the
             // info_service -> loc_index lock order.
             let extra_valid_refs: HashSet<String> = {
                 // Lock order: rules -> info_service.
-                let mut extra = self.state.rules.read().modifier_keys.clone();
+                let mut extra = (*self.state.rules.read().modifier_keys).clone();
                 let info = self.state.info_service.read();
                 for (_uri, inst) in info.type_index.instances("idea") {
                     extra.insert(inst.name.to_lowercase());

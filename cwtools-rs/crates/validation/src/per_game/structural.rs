@@ -101,7 +101,7 @@ fn push(
         line: r.start.line,
         col: r.start.col,
         file: file.to_string(),
-        code: Some(code.id.to_string()),
+        code: Some(code.id),
     });
 }
 

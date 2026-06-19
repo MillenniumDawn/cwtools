@@ -32,7 +32,10 @@ fn codes_hoi4(cwt: &str, script: &str) -> Vec<String> {
             var_checks: false,
         },
     );
-    errors.into_iter().filter_map(|e| e.code).collect()
+    errors
+        .into_iter()
+        .filter_map(|e| e.code.map(String::from))
+        .collect()
 }
 
 /// `foo` validates at the default country scope. A `## scope = state` trigger
@@ -197,7 +200,10 @@ foo = {
             var_checks: false,
         },
     );
-    let codes: Vec<String> = errors.into_iter().filter_map(|e| e.code).collect();
+    let codes: Vec<String> = errors
+        .into_iter()
+        .filter_map(|e| e.code.map(String::from))
+        .collect();
     assert!(codes.contains(&"CW235".to_string()), "got: {:?}", codes);
 }
 
@@ -238,6 +244,9 @@ foo = {
             var_checks: false,
         },
     );
-    let codes: Vec<String> = errors.into_iter().filter_map(|e| e.code).collect();
+    let codes: Vec<String> = errors
+        .into_iter()
+        .filter_map(|e| e.code.map(String::from))
+        .collect();
     assert!(!codes.contains(&"CW235".to_string()), "got: {:?}", codes);
 }

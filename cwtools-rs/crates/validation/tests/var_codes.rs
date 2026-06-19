@@ -52,7 +52,10 @@ fn codes(script: &str, vars: &[&str]) -> Vec<String> {
             var_checks: true,
         },
     );
-    errors.into_iter().filter_map(|e| e.code).collect()
+    errors
+        .into_iter()
+        .filter_map(|e| e.code.map(String::from))
+        .collect()
 }
 
 #[test]

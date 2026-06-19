@@ -1,3 +1,26 @@
+# 1.6.0
+
+## Bug Fixes
+- Stellaris if/else and event checks now detect mixed-case keys (e.g. `IF`, `Trigger`, `Mean_Time_To_Happen`); the ambiguous-if/else and every-tick-event checks (CW236/CW237/CW238/CW107) were silently skipped whenever a key wasn't already lowercase
+- Hover, go-to-definition, and completion treat `.yaml` and `.csv` localisation files the same as `.yml`; previously hover and go-to-definition only recognised `.yml`, so `$KEY$` resolution silently skipped the other two
+- `.mod` descriptor values with a trailing comment or a quoted `=` parse correctly (e.g. `replace_path = "common/ideas" # keep`); the old parser left the closing quote attached, so the directory failed to override vanilla
+- While typing, diagnostics already computed for open dependent files are published instead of discarded when a newer edit arrives mid-pass
+- Two game installs that can't be fingerprinted (no launcher file, unreadable mtime) no longer share one vanilla-cache key; the install path is hashed in as a tiebreaker
+
+## Performance
+- Glob matching (file include/exclude, run for every file and directory) uses a single rolling DP row instead of allocating an (m+1)x(n+1) grid per match
+- Validation error codes are stored as `&'static` references instead of allocating a `String` per finding
+- LSP: a burst of keystrokes coalesces to one pending validation task per file instead of stacking a debounced task per keystroke, the shared modifier-key set is snapshotted by refcount instead of deep-copied per scan, and the per-document token lock is no longer held across the full arena walk that rebuilds the set
+
+## Changed
+- The CLI exits with distinct codes so CI can tell an operational failure from validation findings: 3 = file discovery failed, 2 = report write failed, 1 = validation found errors, 0 = clean. Previously all three returned 1
+
+## Developer
+- A `.cwt` link that lists an unknown input scope is now logged (naming the link and the bad scope) instead of being silently treated as any-scope
+- Filesystem read errors during index building are logged instead of silently producing an incomplete index, and `write_cache` propagates a `create_dir_all` failure instead of swallowing it
+- Added a criterion benchmark harness for hot-path functions (glob matching, scope resolution, parsing, string interning, localisation parsing)
+- Added a code-review findings spec mapping the reviewed issues to the 1.6/1.7/1.8 releases
+
 # 1.5.0
 
 ## Bug Fixes

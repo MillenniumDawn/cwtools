@@ -197,6 +197,22 @@ fn print_ruleset_summary(ruleset: &cwtools_rules::rules_types::RuleSet) {
     println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
 }
 
+/// Map a run's outcome to a process exit code. Operational failures (couldn't
+/// discover the files, couldn't write the report) are distinct from validation
+/// finding errors, so CI can tell "the tool couldn't run" apart from "validation
+/// found problems". 0 = clean run, no errors.
+fn exit_code(total_errors: usize, discovery_failed: bool, write_failed: bool) -> i32 {
+    if discovery_failed {
+        3
+    } else if write_failed {
+        2
+    } else if total_errors > 0 {
+        1
+    } else {
+        0
+    }
+}
+
 fn main() {
     // Quiet by default; set RUST_LOG or CWTOOLS_PROFILE to turn on logging /
     // profiling. See PROFILING.md and `cwtools_profiling`.
@@ -480,7 +496,7 @@ fn main() {
                 .flat_map(|(path, errors)| {
                     let file_str = path.to_str().unwrap_or("").to_string();
                     errors.into_iter().filter_map(move |err| {
-                        let code = err.code.clone().unwrap_or_default();
+                        let code = err.code.unwrap_or_default().to_string();
                         let hash = diag_hash(&file_str, &code, &err.message, err.line);
                         if ignored_ref.contains(&hash) {
                             return None;
@@ -688,8 +704,9 @@ fn main() {
                 }
             }
 
-            if total_errors > 0 || session.discovery_failed || write_failed {
-                std::process::exit(1);
+            let code = exit_code(total_errors, session.discovery_failed, write_failed);
+            if code != 0 {
+                std::process::exit(code);
             }
         }
         Commands::CacheVanilla {
@@ -770,5 +787,21 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exit_code;
+
+    #[test]
+    fn exit_code_separates_operational_from_validation() {
+        assert_eq!(exit_code(0, false, false), 0); // clean
+        assert_eq!(exit_code(5, false, false), 1); // validation errors
+        assert_eq!(exit_code(0, false, true), 2); // report write failed
+        assert_eq!(exit_code(0, true, false), 3); // discovery failed
+        // operational failures take precedence over validation errors
+        assert_eq!(exit_code(5, false, true), 2);
+        assert_eq!(exit_code(5, true, true), 3);
     }
 }

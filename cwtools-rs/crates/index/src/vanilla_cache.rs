@@ -127,7 +127,10 @@ pub fn fingerprint(dir: &Path) -> String {
     {
         return format!("mtime-{}", dur.as_secs());
     }
-    "unknown".to_string()
+    // No version file and no readable mtime: hash the install path so two
+    // different unreadable installs don't collide on one "unknown" cache key.
+    let h = fnv1a(dir.to_string_lossy().as_bytes(), 0xcbf2_9ce4_8422_2325u64);
+    format!("unknown-{h:016x}")
 }
 
 /// FNV-1a over `bytes`, continuing from `hash`. A stable, dependency-free hash
@@ -237,7 +240,7 @@ fn write_cache(
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache).map_err(std::io::Error::other)?;
     let compressed = zstd::encode_all(&bytes[..], ZSTD_LEVEL)?;
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
     let mut file = std::fs::File::create(path)?;
     file.write_all(MAGIC)?;
@@ -344,6 +347,19 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_distinguishes_unreadable_installs() {
+        // Two installs with no launcher file and no readable mtime must not
+        // collide on a single "unknown" cache key (#9).
+        let a = fingerprint(Path::new("/nonexistent/install/alpha"));
+        let b = fingerprint(Path::new("/nonexistent/install/beta"));
+        assert_ne!(
+            a, b,
+            "distinct unreadable installs need distinct fingerprints"
+        );
+        assert_ne!(a, "unknown");
+    }
 
     #[test]
     fn round_trip_preserves_instances() {

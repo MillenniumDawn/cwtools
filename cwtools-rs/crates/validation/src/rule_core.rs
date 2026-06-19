@@ -594,7 +594,7 @@ pub(crate) fn validate_children(
                             line: leaf.pos.start.line,
                             col: leaf.pos.start.col,
                             file: file_path.to_string(),
-                            code: Some(code.id.to_string()),
+                            code: Some(code.id),
                         });
                     }
                 } else {
@@ -789,7 +789,7 @@ pub(crate) fn validate_children(
                                 line: block_line,
                                 col: block_col,
                                 file: file_path.to_string(),
-                                code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
+                                code: Some(error_codes::CW242_WRONG_NUMBER.id),
                             });
                         }
                         if count > kmax {
@@ -802,7 +802,7 @@ pub(crate) fn validate_children(
                                 line: block_line,
                                 col: block_col,
                                 file: file_path.to_string(),
-                                code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
+                                code: Some(error_codes::CW242_WRONG_NUMBER.id),
                             });
                         }
                     }
@@ -827,7 +827,7 @@ pub(crate) fn validate_children(
                         line: block_line,
                         col: block_col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
+                        code: Some(error_codes::CW242_WRONG_NUMBER.id),
                     });
                 }
                 if count > opts.max {
@@ -840,7 +840,7 @@ pub(crate) fn validate_children(
                         line: block_line,
                         col: block_col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
+                        code: Some(error_codes::CW242_WRONG_NUMBER.id),
                     });
                 }
             }
@@ -857,7 +857,7 @@ pub(crate) fn validate_children(
                         line: block_line,
                         col: block_col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
+                        code: Some(error_codes::CW242_WRONG_NUMBER.id),
                     });
                 }
                 if count > opts.max {
@@ -870,7 +870,7 @@ pub(crate) fn validate_children(
                         line: block_line,
                         col: block_col,
                         file: file_path.to_string(),
-                        code: Some(error_codes::CW242_WRONG_NUMBER.id.to_string()),
+                        code: Some(error_codes::CW242_WRONG_NUMBER.id),
                     });
                 }
             }
@@ -1357,7 +1357,7 @@ fn alias_mismatch_error(
         line,
         col,
         file: file_path.to_string(),
-        code: Some(code.id.to_string()),
+        code: Some(code.id),
     }
 }
 
@@ -1517,7 +1517,7 @@ fn validate_leaf(
                         line: leaf.pos.start.line,
                         col: leaf.pos.start.col,
                         file: file_path.to_string(),
-                        code: Some(code.id.to_string()),
+                        code: Some(code.id),
                     });
                 }
             }

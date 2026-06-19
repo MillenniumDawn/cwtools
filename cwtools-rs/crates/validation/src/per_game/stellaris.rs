@@ -85,7 +85,7 @@ fn walk_if_else(
                 line,
                 col,
                 file: file_path.to_string(),
-                code: Some(error_codes::CW253_DEPRECATED_SET_NAME.id.to_string()),
+                code: Some(error_codes::CW253_DEPRECATED_SET_NAME.id),
             });
         }
 
@@ -108,7 +108,7 @@ fn walk_if_else(
                     line,
                     col,
                     file: file_path.to_string(),
-                    code: Some(error_codes::CW236_DEPRECATED_ELSE.id.to_string()),
+                    code: Some(error_codes::CW236_DEPRECATED_ELSE.id),
                 });
             }
 
@@ -122,7 +122,7 @@ fn walk_if_else(
                     line,
                     col,
                     file: file_path.to_string(),
-                    code: Some(error_codes::CW237_AMBIGUOUS_IF_ELSE.id.to_string()),
+                    code: Some(error_codes::CW237_AMBIGUOUS_IF_ELSE.id),
                 });
             }
 
@@ -147,7 +147,7 @@ fn walk_if_else(
                             line,
                             col,
                             file: file_path.to_string(),
-                            code: Some(error_codes::CW238_IF_ELSE_ORDER.id.to_string()),
+                            code: Some(error_codes::CW238_IF_ELSE_ORDER.id),
                         });
                         break;
                     }
@@ -192,7 +192,7 @@ fn validate_event(
             line: event_line,
             col: 0,
             file: file_path.to_string(),
-            code: Some(error_codes::CW107_EVENT_EVERY_TICK.id.to_string()),
+            code: Some(error_codes::CW107_EVENT_EVERY_TICK.id),
         });
     }
 
@@ -241,7 +241,7 @@ fn validate_event(
                     line: child_line(tc, ast),
                     col: 0,
                     file: file_path.to_string(),
-                    code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id.to_string()),
+                    code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id),
                 });
             }
         }
@@ -279,7 +279,7 @@ fn child_key_eq(child: &Child, ast: &ParsedFile, table: &StringTable, expected: 
         Child::Leaf(idx) => {
             let leaf = &ast.arena.leaves[*idx as usize];
             table
-                .with_string(leaf.key.normal, |k| k == expected)
+                .with_string(leaf.key.normal, |k| k.eq_ignore_ascii_case(expected))
                 .unwrap_or(false)
         }
         _ => false,
@@ -377,7 +377,7 @@ fn check_loc_key_pair(
             line,
             col: 0,
             file: file_path.to_string(),
-            code: Some(error_codes::CW100_MISSING_LOCALISATION.id.to_string()),
+            code: Some(error_codes::CW100_MISSING_LOCALISATION.id),
         });
     }
     let desc_key = format!("{}_desc", name);
@@ -391,7 +391,7 @@ fn check_loc_key_pair(
             line,
             col: 0,
             file: file_path.to_string(),
-            code: Some(error_codes::CW100_MISSING_LOCALISATION.id.to_string()),
+            code: Some(error_codes::CW100_MISSING_LOCALISATION.id),
         });
     }
 }
@@ -418,4 +418,33 @@ pub fn validate_stellaris_loc(
     check_key_and_desc(ast, table, file_path, loc_keys, &["technology"], errors);
     // Policy localisation check
     check_key_and_desc(ast, table, file_path, loc_keys, &["policy"], errors);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cwtools_parser::parser::parse_string;
+
+    #[test]
+    fn child_key_eq_is_case_insensitive() {
+        // Paradox keys are case-insensitive, so mixed-case children must match
+        // their lowercase expected keys (#4).
+        let table = StringTable::new();
+        let ast = parse_string("root = {\n IF = {}\n Trigger = {}\n}\n", &table).unwrap();
+        let block = as_block(&ast.root_children[0], &ast).expect("root is a block");
+        assert!(
+            block
+                .children
+                .iter()
+                .any(|c| child_key_eq(c, &ast, &table, "if")),
+            "`IF` should match expected `if`"
+        );
+        assert!(
+            block
+                .children
+                .iter()
+                .any(|c| child_key_eq(c, &ast, &table, "trigger")),
+            "`Trigger` should match expected `trigger`"
+        );
+    }
 }

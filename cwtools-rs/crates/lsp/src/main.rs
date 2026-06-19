@@ -118,8 +118,10 @@ pub(crate) struct RuleData {
     /// matches the ruleset it was derived from. `None` until the first load.
     pub(crate) scope_registry: Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>,
     /// cached modifier-key set; rebuilt after ruleset load and after each full
-    /// workspace scan when the type index is complete.
-    pub(crate) modifier_keys: HashSet<String>,
+    /// workspace scan when the type index is complete. `Arc` so the workspace
+    /// scan snapshots it with a cheap refcount bump instead of deep-copying the
+    /// whole set (#78).
+    pub(crate) modifier_keys: Arc<HashSet<String>>,
 }
 
 impl RuleData {
@@ -127,7 +129,7 @@ impl RuleData {
         Self {
             ruleset: None,
             scope_registry: None,
-            modifier_keys: HashSet::new(),
+            modifier_keys: Arc::new(HashSet::new()),
         }
     }
 }
@@ -221,6 +223,10 @@ struct DocumentState {
     /// is dropped to eliminate double residency; this flag prevents
     /// `ensure_vanilla_index` from re-running on subsequent workspace scans.
     vanilla_merged: std::sync::atomic::AtomicBool,
+    /// Per-URI debounce task handle. `did_change` aborts the previous sleeper for
+    /// the same file before spawning a new one, so a burst of keystrokes coalesces
+    /// to a single pending task instead of stacking hundreds of sleepers.
+    debounce_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 pub(crate) struct ParsedDoc {
@@ -252,6 +258,7 @@ impl DocumentState {
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
             pending_changed_names: Mutex::new(HashSet::new()),
             vanilla_merged: std::sync::atomic::AtomicBool::new(false),
+            debounce_handles: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -709,11 +716,20 @@ impl LanguageServer for Backend {
         // immediately (no per-keystroke re-parse lag).
         let client = self.client.clone();
         let state = self.state.clone();
-        tokio::spawn(async move {
+        let task_uri = uri.clone();
+        let handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(DEBOUNCE_MS)).await;
             let backend = Backend { client, state };
-            backend.debounced_validate(uri, version, generation).await;
+            backend
+                .debounced_validate(task_uri, version, generation)
+                .await;
         });
+        // Replace and abort any pending sleeper for this file so a burst of
+        // keystrokes can't stack hundreds of debounce tasks (#47). The handle map
+        // is keyed by URI, so it stays bounded by the number of open files.
+        if let Some(prev) = self.state.debounce_handles.lock().insert(uri, handle) {
+            prev.abort();
+        }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -735,6 +751,10 @@ impl LanguageServer for Backend {
         {
             let mut docs = self.state.documents.lock();
             docs.remove(&uri);
+        }
+        // Drop any pending debounce task for the closed file (#47).
+        if let Some(handle) = self.state.debounce_handles.lock().remove(&uri) {
+            handle.abort();
         }
         // Release the closed file's entries from the global indexes. Without
         // this, opening then closing a file leaves its type instances,

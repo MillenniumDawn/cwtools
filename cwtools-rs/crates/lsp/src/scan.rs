@@ -127,7 +127,7 @@ impl Backend {
             }
             None => HashSet::new(),
         };
-        rules.modifier_keys = keys;
+        rules.modifier_keys = Arc::new(keys);
     }
 
     /// Scan the entire workspace for relevant game files and validate them all.
@@ -380,7 +380,7 @@ impl Backend {
         let (scan_ruleset, scan_registry, modifier_keys_snap): (
             Option<Arc<RuleSet>>,
             _,
-            HashSet<String>,
+            Arc<HashSet<String>>,
         ) = {
             let rules = self.state.rules.read();
             (
@@ -616,7 +616,7 @@ impl Backend {
         // would flag CW225.
         let extra_valid_refs: HashSet<String> = {
             // Lock order: rules -> info_service.
-            let mut extra = self.state.rules.read().modifier_keys.clone();
+            let mut extra = (*self.state.rules.read().modifier_keys).clone();
             let info = self.state.info_service.read();
             // Dynamic modifiers, ideas, other game-object names + defined
             // variables a `$ref$` can bind to (mirrors the CLI/driver path).

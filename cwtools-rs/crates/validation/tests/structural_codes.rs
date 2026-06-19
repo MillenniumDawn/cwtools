@@ -28,7 +28,10 @@ fn codes(game: Game, script: &str) -> Vec<String> {
         None,
         None,
     );
-    errors.into_iter().filter_map(|e| e.code).collect()
+    errors
+        .into_iter()
+        .filter_map(|e| e.code.map(String::from))
+        .collect()
 }
 
 #[test]
@@ -67,7 +70,7 @@ fn cw223_message_is_game_specific() {
             None,
         )
         .into_iter()
-        .find(|e| e.code.as_deref() == Some("CW223"))
+        .find(|e| e.code == Some("CW223"))
         .map(|e| e.message)
         .unwrap_or_default()
     };

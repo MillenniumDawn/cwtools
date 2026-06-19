@@ -11,3 +11,8 @@ cwtools_string_table = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "parse"
+harness = false

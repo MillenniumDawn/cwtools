@@ -72,7 +72,7 @@ fn walk(
                 line: block.range.start.line,
                 col: block.range.start.col,
                 file: file_path.to_string(),
-                code: Some(error_codes::CW280_REDUNDANT_DEFAULT_FIELD.id.to_string()),
+                code: Some(error_codes::CW280_REDUNDANT_DEFAULT_FIELD.id),
             });
         }
 
@@ -109,7 +109,7 @@ mod tests {
     fn flags_redundant_allowed_civil_war() {
         let errors = run("my_idea = {\n allowed_civil_war = { always = no }\n}\n");
         assert_eq!(errors.len(), 1, "expected one CW280");
-        assert_eq!(errors[0].code.as_deref(), Some("CW280"));
+        assert_eq!(errors[0].code, Some("CW280"));
     }
 
     #[test]

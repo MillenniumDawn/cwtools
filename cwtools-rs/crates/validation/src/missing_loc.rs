@@ -111,7 +111,7 @@ thing = { x = scalar }
             msgs
         );
         assert!(errs[0].message.contains("my_thing_desc"), "got: {:?}", msgs);
-        assert_eq!(errs[0].code.as_deref(), Some("CW100"));
+        assert_eq!(errs[0].code, Some("CW100"));
     }
 
     #[test]
