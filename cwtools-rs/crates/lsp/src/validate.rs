@@ -59,7 +59,7 @@ pub(crate) fn loc_diag_to_validation_error(
         line: d.line as u32,
         col: d.col.saturating_sub(1) as u16,
         file: d.file.clone(),
-        code: Some(d.code.to_string()),
+        code: Some(d.code),
     }
 }
 
@@ -171,10 +171,7 @@ pub(crate) fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnosti
             cwtools_validation::ErrorSeverity::Information => Some(DiagnosticSeverity::INFORMATION),
             cwtools_validation::ErrorSeverity::Hint => Some(DiagnosticSeverity::HINT),
         },
-        code: err
-            .code
-            .as_deref()
-            .map(|c| NumberOrString::String(c.to_string())),
+        code: err.code.map(|c| NumberOrString::String(c.to_string())),
         code_description: None,
         source: Some("cwtools".to_string()),
         message: err.message.clone(),

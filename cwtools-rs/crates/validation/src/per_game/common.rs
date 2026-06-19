@@ -84,7 +84,7 @@ pub fn validate_common(
                     line,
                     col,
                     file: file_path.to_string(),
-                    code: Some(code.id.to_string()),
+                    code: Some(code.id),
                 });
             }
         }

@@ -85,7 +85,7 @@ fn walk_if_else(
                 line,
                 col,
                 file: file_path.to_string(),
-                code: Some(error_codes::CW253_DEPRECATED_SET_NAME.id.to_string()),
+                code: Some(error_codes::CW253_DEPRECATED_SET_NAME.id),
             });
         }
 
@@ -108,7 +108,7 @@ fn walk_if_else(
                     line,
                     col,
                     file: file_path.to_string(),
-                    code: Some(error_codes::CW236_DEPRECATED_ELSE.id.to_string()),
+                    code: Some(error_codes::CW236_DEPRECATED_ELSE.id),
                 });
             }
 
@@ -122,7 +122,7 @@ fn walk_if_else(
                     line,
                     col,
                     file: file_path.to_string(),
-                    code: Some(error_codes::CW237_AMBIGUOUS_IF_ELSE.id.to_string()),
+                    code: Some(error_codes::CW237_AMBIGUOUS_IF_ELSE.id),
                 });
             }
 
@@ -147,7 +147,7 @@ fn walk_if_else(
                             line,
                             col,
                             file: file_path.to_string(),
-                            code: Some(error_codes::CW238_IF_ELSE_ORDER.id.to_string()),
+                            code: Some(error_codes::CW238_IF_ELSE_ORDER.id),
                         });
                         break;
                     }
@@ -192,7 +192,7 @@ fn validate_event(
             line: event_line,
             col: 0,
             file: file_path.to_string(),
-            code: Some(error_codes::CW107_EVENT_EVERY_TICK.id.to_string()),
+            code: Some(error_codes::CW107_EVENT_EVERY_TICK.id),
         });
     }
 
@@ -241,7 +241,7 @@ fn validate_event(
                     line: child_line(tc, ast),
                     col: 0,
                     file: file_path.to_string(),
-                    code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id.to_string()),
+                    code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id),
                 });
             }
         }
@@ -377,7 +377,7 @@ fn check_loc_key_pair(
             line,
             col: 0,
             file: file_path.to_string(),
-            code: Some(error_codes::CW100_MISSING_LOCALISATION.id.to_string()),
+            code: Some(error_codes::CW100_MISSING_LOCALISATION.id),
         });
     }
     let desc_key = format!("{}_desc", name);
@@ -391,7 +391,7 @@ fn check_loc_key_pair(
             line,
             col: 0,
             file: file_path.to_string(),
-            code: Some(error_codes::CW100_MISSING_LOCALISATION.id.to_string()),
+            code: Some(error_codes::CW100_MISSING_LOCALISATION.id),
         });
     }
 }

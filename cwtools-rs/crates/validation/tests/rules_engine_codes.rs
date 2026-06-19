@@ -21,7 +21,10 @@ fn codes_for(cwt: &str, script: &str) -> Vec<String> {
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let parsed = parse_string(script, &table).unwrap();
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
-    errors.into_iter().filter_map(|e| e.code).collect()
+    errors
+        .into_iter()
+        .filter_map(|e| e.code.map(String::from))
+        .collect()
 }
 
 /// A required field carrying `## severity = error` must report its missing-field
@@ -45,7 +48,7 @@ foo = {
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     let cw242 = errors
         .iter()
-        .find(|e| e.code.as_deref() == Some("CW242"))
+        .find(|e| e.code == Some("CW242"))
         .expect("CW242 for missing required field");
     assert_eq!(
         cw242.severity,

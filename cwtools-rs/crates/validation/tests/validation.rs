@@ -255,10 +255,7 @@ event = {
         Some(&idx),
         None,
     );
-    let type_errs: Vec<_> = errs_b
-        .iter()
-        .filter(|e| e.code.as_deref() == Some("CW500"))
-        .collect();
+    let type_errs: Vec<_> = errs_b.iter().filter(|e| e.code == Some("CW500")).collect();
     assert!(
         !type_errs.is_empty(),
         "Expected CW500 for bogus type ref, got: {:?}",
@@ -276,9 +273,7 @@ event = {
         None,
     );
     assert!(
-        errs_no_idx
-            .iter()
-            .all(|e| e.code.as_deref() != Some("CW500")),
+        errs_no_idx.iter().all(|e| e.code != Some("CW500")),
         "Expected no CW500 without index, got: {:?}",
         errs_no_idx
     );
@@ -403,17 +398,14 @@ alias[ai_strategy_rule:ai_strategy] = {
         None,
         None,
     );
-    let cw267: Vec<_> = errors
-        .iter()
-        .filter(|e| e.code.as_deref() == Some("CW267"))
-        .collect();
+    let cw267: Vec<_> = errors.iter().filter(|e| e.code == Some("CW267")).collect();
     assert!(
         !cw267.is_empty(),
         "Expected a CW267 alias mismatch, got: {:?}",
         errors
     );
     assert!(
-        errors.iter().all(|e| e.code.as_deref() != Some("CW240")),
+        errors.iter().all(|e| e.code != Some("CW240")),
         "CW240 must not be emitted for an alias shape mismatch, got: {:?}",
         errors
     );
@@ -762,7 +754,7 @@ guiTypes = {
     );
     let type_errs: Vec<_> = errs_valid
         .iter()
-        .filter(|e| e.code.as_deref() == Some("CW500"))
+        .filter(|e| e.code == Some("CW500"))
         .collect();
     assert!(
         type_errs.is_empty(),
@@ -791,7 +783,7 @@ guiTypes = {
     );
     let type_errs_bad: Vec<_> = errs_bad
         .iter()
-        .filter(|e| e.code.as_deref() == Some("CW500"))
+        .filter(|e| e.code == Some("CW500"))
         .collect();
     assert!(
         !type_errs_bad.is_empty(),
@@ -917,7 +909,7 @@ types = {
         None,
     );
     assert!(
-        errs.iter().all(|e| e.code.as_deref() != Some("CW500")),
+        errs.iter().all(|e| e.code != Some("CW500")),
         "scripted-loc [..] value must not flag CW500, got: {:?}",
         errs
     );

@@ -496,7 +496,7 @@ fn main() {
                 .flat_map(|(path, errors)| {
                     let file_str = path.to_str().unwrap_or("").to_string();
                     errors.into_iter().filter_map(move |err| {
-                        let code = err.code.clone().unwrap_or_default();
+                        let code = err.code.unwrap_or_default().to_string();
                         let hash = diag_hash(&file_str, &code, &err.message, err.line);
                         if ignored_ref.contains(&hash) {
                             return None;
