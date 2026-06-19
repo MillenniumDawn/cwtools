@@ -278,30 +278,16 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         let elements = parse_loc_elements(desc);
         let mut refs: Vec<String> = Vec::new();
         let mut commands: Vec<String> = Vec::new();
-        let mut jomini_commands: Vec<Vec<crate::commands::JominiCommand>> = Vec::new();
+        let mut jomini_commands: Vec<Vec<crate::loc_string::JominiCommand>> = Vec::new();
         for e in &elements {
             match e {
                 crate::loc_string::LocElement::Ref(s) => refs.push(s.to_string()),
                 crate::loc_string::LocElement::Command(s) => commands.push(s.to_string()),
-                crate::loc_string::LocElement::JominiCommand(cmds) => jomini_commands.push(
-                    cmds.iter()
-                        .map(|c| crate::commands::JominiCommand {
-                            key: c.key.clone(),
-                            params: c
-                                .params
-                                .iter()
-                                .map(|p| match p {
-                                    crate::loc_string::JominiParam::Literal(s) => {
-                                        crate::commands::JominiParam::Literal(s.clone())
-                                    }
-                                    crate::loc_string::JominiParam::Commands(_) => {
-                                        crate::commands::JominiParam::Literal("nested".to_string())
-                                    }
-                                })
-                                .collect(),
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                // Store the parsed chain directly — one JominiCommand type now, so
+                // nested command params are preserved rather than flattened away.
+                crate::loc_string::LocElement::JominiCommand(cmds) => {
+                    jomini_commands.push(cmds.clone())
+                }
                 crate::loc_string::LocElement::Chars(_) => {}
             }
         }

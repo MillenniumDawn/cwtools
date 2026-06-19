@@ -5,7 +5,8 @@
 //! when a chain is invalid.  Unknown commands are accepted leniently so missing
 //! entries don't produce false positives.
 
-use crate::commands::{Game, JominiCommand, LocEntry};
+use crate::commands::{Game, LocEntry};
+use crate::loc_string::JominiCommand;
 use cwtools_game::constants::Game as EngineGame;
 use cwtools_game::scope_engine::{SCOPE_ANY, ScopeContext, ScopeId, ScopeResult};
 use cwtools_game::scope_registry::ScopeRegistry;
@@ -375,7 +376,8 @@ fn is_terminal_command(lower: &str, terminal_set: &HashSet<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Game, JominiCommand, LocEntry, Position};
+    use crate::commands::{Game, LocEntry, Position};
+    use crate::loc_string::JominiCommand;
 
     fn make_entry_with_commands(commands: Vec<String>) -> LocEntry {
         LocEntry {

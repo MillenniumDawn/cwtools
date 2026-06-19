@@ -232,7 +232,7 @@ pub struct LocEntry {
     /// Each inner Vec is one `[...]` bracket's command chain.
     /// `[overlord.owner.GetName]` → `vec![vec!["overlord", "owner", "GetName"]]`.
     /// Multiple brackets produce multiple inner Vecs.
-    pub jomini_commands: Vec<Vec<JominiCommand>>,
+    pub jomini_commands: Vec<Vec<crate::loc_string::JominiCommand>>,
 }
 
 /// Position in a source file.
@@ -253,20 +253,6 @@ impl Position {
             column,
         }
     }
-}
-
-/// A Jomini command chain (CK3/VIC3).
-#[derive(Debug, Clone, PartialEq)]
-pub struct JominiCommand {
-    pub key: String,
-    pub params: Vec<JominiParam>,
-}
-
-/// A Jomini parameter.
-#[derive(Debug, Clone, PartialEq)]
-pub enum JominiParam {
-    Literal(String),
-    Commands(Vec<String>),
 }
 
 /// A line-level parse failure recorded during lenient recovery.
