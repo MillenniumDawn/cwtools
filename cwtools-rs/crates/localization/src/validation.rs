@@ -10,6 +10,7 @@
 
 use crate::commands::{LocEntry, LocFile};
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// The kind of a loc-entry validation error.
 ///
@@ -54,11 +55,29 @@ pub fn validate_loc_file(
     extra_valid_refs: &HashSet<String>,
     hardcoded_localisation: &[impl AsRef<str>],
 ) -> Vec<LocValidationError> {
-    let mut errors = Vec::new();
     let hardcoded: HashSet<String> = hardcoded_localisation
         .iter()
         .map(|s| s.as_ref().to_lowercase())
         .collect();
+    validate_loc_file_with_hardcoded(file, all_keys, extra_valid_refs, &hardcoded)
+}
+
+/// Lowercased [`HARDCODED_LOC`], built once. The project-validation hot path
+/// reuses this instead of re-lowercasing + re-collecting the list per file.
+pub fn hardcoded_loc_set() -> &'static HashSet<String> {
+    static SET: OnceLock<HashSet<String>> = OnceLock::new();
+    SET.get_or_init(|| HARDCODED_LOC.iter().map(|s| s.to_lowercase()).collect())
+}
+
+/// As [`validate_loc_file`], but takes the already-lowercased hardcoded set so
+/// the caller can build it once outside a per-file loop.
+pub fn validate_loc_file_with_hardcoded(
+    file: &LocFile,
+    all_keys: &HashSet<String>,
+    extra_valid_refs: &HashSet<String>,
+    hardcoded: &HashSet<String>,
+) -> Vec<LocValidationError> {
+    let mut errors = Vec::new();
 
     for entry in &file.entries {
         // ---- Invalid characters ----

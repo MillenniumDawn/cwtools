@@ -134,68 +134,50 @@ impl StringTable {
             }
         }
 
-        // A lone `"` satisfies both starts_with and ends_with (same character),
-        // so require at least 2 chars for the quoted detection.
-        let quoted = s.len() >= 2 && s.starts_with('"') && s.ends_with('"');
-        let lower_key = s.to_lowercase();
-
         let mut inner = self.inner.write();
+        intern_locked(&mut inner, s)
+    }
 
-        // Re-check after upgrading to the write lock: another thread may have
-        // interned this exact string in the gap (double-checked locking).
-        if let Some(&existing) = inner.exact_map.get(s) {
-            return existing;
+    /// Intern many strings under a single write-lock acquisition.
+    ///
+    /// Returns one [`StringTokens`] per input, in order. The result for each
+    /// string is byte-for-byte identical to calling [`intern`](Self::intern) on
+    /// it individually (same ID assignment order, same lower-companion
+    /// interning, same `quoted` flag) — this just amortizes the lock and
+    /// double-checked-locking overhead across the whole batch, which matters on
+    /// cache load where every string is a fresh miss.
+    pub fn intern_batch<'a, I>(&self, it: I) -> Vec<StringTokens>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let it = it.into_iter();
+        let mut out = Vec::with_capacity(it.size_hint().0);
+        let mut inner = self.inner.write();
+        for s in it {
+            // Mirror `intern`: the empty string maps to slot-0 without locking a
+            // fresh id, and `intern_locked` assumes a non-empty input.
+            if s.is_empty() {
+                out.push(StringTokens {
+                    lower: StringId(0),
+                    normal: StringId(0),
+                    quoted: false,
+                });
+            } else {
+                out.push(intern_locked(&mut inner, s));
+            }
         }
+        out
+    }
 
-        // Fast path 2: lower key exists → allocate new normal variant.
-        if let Some(&existing_lower) = inner.lower_map.get(lower_key.as_str()) {
-            let normal_id = inner.next_id;
-            inner.next_id += 1;
-            let normal_arc: Arc<str> = Arc::from(s);
-            inner.id_to_string.push(Arc::clone(&normal_arc));
-            let meta = inner.id_to_metadata[existing_lower.lower.0 as usize];
-            inner.id_to_metadata.push(meta);
-            let token = StringTokens {
-                lower: existing_lower.lower,
-                normal: StringId(normal_id),
-                quoted,
-            };
-            inner.exact_map.insert(normal_arc, token);
-            return token;
-        }
-
-        // Slow path: brand‑new lower key.
-        let normal_id = inner.next_id;
-        let lower_id = normal_id + 1;
-        inner.next_id = lower_id + 1;
-
-        let metadata = compute_metadata(&lower_key);
-
-        // Allocate each string once; share the same Arc between id_to_string and
-        // the corresponding map key so there is only one heap allocation per string.
-        let normal_arc: Arc<str> = Arc::from(s);
-        let lower_arc: Arc<str> = Arc::from(lower_key.as_str());
-
-        inner.id_to_string.reserve_exact(2);
-        inner.id_to_string.push(Arc::clone(&normal_arc)); // normal_id
-        inner.id_to_string.push(Arc::clone(&lower_arc)); // lower_id
-        inner.id_to_metadata.push(metadata); // normal_id
-        inner.id_to_metadata.push(metadata); // lower_id
-
-        let lower_token = StringTokens {
-            lower: StringId(lower_id),
-            normal: StringId(lower_id),
-            quoted: false,
-        };
-        let normal_token = StringTokens {
-            lower: StringId(lower_id),
-            normal: StringId(normal_id),
-            quoted,
-        };
-
-        inner.lower_map.insert(lower_arc, lower_token);
-        inner.exact_map.insert(normal_arc, normal_token);
-        normal_token
+    /// Run `f` while holding the read lock once, giving it a [`StringResolver`]
+    /// that resolves `StringId`s to `&str` without per-call locking or cloning.
+    ///
+    /// Prefer this over many [`get_string`](Self::get_string) calls on hot paths
+    /// (e.g. cache serialization) that resolve a large batch of ids: the read
+    /// lock is acquired a single time for the whole closure.
+    pub fn with_read<R>(&self, f: impl FnOnce(StringResolver<'_>) -> R) -> R {
+        let inner = self.inner.read();
+        f(StringResolver { inner: &inner })
     }
 
     /// Retrieve the original (case‑preserving) text for a `StringId`.
@@ -276,6 +258,90 @@ impl StringTableStats {
     }
 }
 
+/// Borrowed resolver handed to [`StringTable::with_read`]. Holds the read lock
+/// for its lifetime so a batch of id lookups pays the locking cost once.
+pub struct StringResolver<'a> {
+    inner: &'a Inner,
+}
+
+impl StringResolver<'_> {
+    /// Resolve a `StringId` to its borrowed text, or `None` if out of range.
+    pub fn get(&self, id: StringId) -> Option<&str> {
+        self.inner
+            .id_to_string
+            .get(id.0 as usize)
+            .map(|s| s.as_ref())
+    }
+}
+
+/// Core interning logic, run with the write lock already held. Assumes `s` is
+/// non-empty (the empty-string slot-0 case is handled before locking) and that
+/// the exact-string fast path has already been checked under a read lock —
+/// it re-checks `exact_map` here so it is also correct when called directly
+/// under the write lock (double-checked locking / batch interning).
+fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
+    // Re-check after acquiring the write lock: another thread may have interned
+    // this exact string in the gap (double-checked locking).
+    if let Some(&existing) = inner.exact_map.get(s) {
+        return existing;
+    }
+
+    // A lone `"` satisfies both starts_with and ends_with (same character),
+    // so require at least 2 chars for the quoted detection.
+    let quoted = s.len() >= 2 && s.starts_with('"') && s.ends_with('"');
+    let lower_key = s.to_lowercase();
+
+    // Fast path 2: lower key exists → allocate new normal variant.
+    if let Some(&existing_lower) = inner.lower_map.get(lower_key.as_str()) {
+        let normal_id = inner.next_id;
+        inner.next_id += 1;
+        let normal_arc: Arc<str> = Arc::from(s);
+        inner.id_to_string.push(Arc::clone(&normal_arc));
+        let meta = inner.id_to_metadata[existing_lower.lower.0 as usize];
+        inner.id_to_metadata.push(meta);
+        let token = StringTokens {
+            lower: existing_lower.lower,
+            normal: StringId(normal_id),
+            quoted,
+        };
+        inner.exact_map.insert(normal_arc, token);
+        return token;
+    }
+
+    // Slow path: brand‑new lower key.
+    let normal_id = inner.next_id;
+    let lower_id = normal_id + 1;
+    inner.next_id = lower_id + 1;
+
+    let metadata = compute_metadata(&lower_key);
+
+    // Allocate each string once; share the same Arc between id_to_string and
+    // the corresponding map key so there is only one heap allocation per string.
+    let normal_arc: Arc<str> = Arc::from(s);
+    let lower_arc: Arc<str> = Arc::from(lower_key.as_str());
+
+    inner.id_to_string.reserve_exact(2);
+    inner.id_to_string.push(Arc::clone(&normal_arc)); // normal_id
+    inner.id_to_string.push(Arc::clone(&lower_arc)); // lower_id
+    inner.id_to_metadata.push(metadata); // normal_id
+    inner.id_to_metadata.push(metadata); // lower_id
+
+    let lower_token = StringTokens {
+        lower: StringId(lower_id),
+        normal: StringId(lower_id),
+        quoted: false,
+    };
+    let normal_token = StringTokens {
+        lower: StringId(lower_id),
+        normal: StringId(normal_id),
+        quoted,
+    };
+
+    inner.lower_map.insert(lower_arc, lower_token);
+    inner.exact_map.insert(normal_arc, normal_token);
+    normal_token
+}
+
 fn compute_metadata(s: &str) -> StringMetadata {
     if s.is_empty() {
         return StringMetadata::default();
@@ -354,6 +420,40 @@ mod tests {
         let meta = table.get_metadata(t.normal).unwrap();
         assert!(meta.starts_with_amp);
         assert!(meta.contains_pipe);
+    }
+
+    #[test]
+    fn intern_batch_matches_per_string() {
+        // A fresh table built via intern_batch must hand out byte-identical
+        // tokens (same ids, same order) to one built with per-string intern.
+        let inputs = [
+            "foo", "FOO", "foo", "bar", "Bar", "", "\"q\"", "baz", "FOO", "bar",
+        ];
+
+        let single = StringTable::new();
+        let want: Vec<_> = inputs.iter().map(|s| single.intern(s)).collect();
+
+        let batch = StringTable::new();
+        let got = batch.intern_batch(inputs.iter().copied());
+
+        assert_eq!(want, got);
+        // And the resolved text agrees for every id.
+        for (a, b) in want.iter().zip(got.iter()) {
+            assert_eq!(single.get_string(a.normal), batch.get_string(b.normal));
+            assert_eq!(single.get_string(a.lower), batch.get_string(b.lower));
+        }
+    }
+
+    #[test]
+    fn with_read_resolves_without_per_call_lock() {
+        let table = StringTable::new();
+        let a = table.intern("hello");
+        let b = table.intern("WORLD");
+        table.with_read(|r| {
+            assert_eq!(r.get(a.normal), Some("hello"));
+            assert_eq!(r.get(b.normal), Some("WORLD"));
+            assert_eq!(r.get(StringId(9_999)), None);
+        });
     }
 
     #[test]

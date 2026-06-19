@@ -156,6 +156,18 @@ pub struct AliasCategoryIndex {
     pub scope_field_idx: Option<usize>,
 }
 
+/// Normalize a `.cwt` path pattern to its lowercase lookup key:
+/// `\` -> `/`, strip surrounding `/`, lowercase. Produces exactly the same string
+/// as `p.replace('\\', "/").trim_matches('/').to_lowercase()` but skips the
+/// `replace` allocation on the common (Linux) no-backslash case.
+fn normalize_path_lower(p: &str) -> String {
+    if p.contains('\\') {
+        p.replace('\\', "/").trim_matches('/').to_lowercase()
+    } else {
+        p.trim_matches('/').to_lowercase()
+    }
+}
+
 impl Default for RuleSet {
     fn default() -> Self {
         Self::new()
@@ -210,7 +222,7 @@ impl RuleSet {
                 }
             }
         }
-        for (name, (rule, _)) in &self.aliases {
+        for (i, (name, (rule, _))) in self.aliases.iter().enumerate() {
             if let Some((cat, key)) = name.split_once(':')
                 && (cat == "effect" || cat == "trigger")
                 && let Some(ns) = first_value_set_ns(rule)
@@ -219,8 +231,6 @@ impl RuleSet {
                     .entry(key.to_ascii_lowercase())
                     .or_insert_with(|| ns.to_string());
             }
-        }
-        for (i, (name, _)) in self.aliases.iter().enumerate() {
             // Store under the original category+key AND the all-lowercase variant
             // so that game-file keys like `instantTextboxType` (mixed case) match
             // rule alias keys like `instantTextBoxType` (camelCase). Paradox
@@ -257,7 +267,7 @@ impl RuleSet {
                 .path_options
                 .paths
                 .iter()
-                .map(|p| p.replace('\\', "/").trim_matches('/').to_lowercase())
+                .map(|p| normalize_path_lower(p))
                 .collect();
             td.path_options.path_file_lower = td
                 .path_options
@@ -274,7 +284,7 @@ impl RuleSet {
                 .path_options
                 .paths
                 .iter()
-                .map(|p| p.replace('\\', "/").trim_matches('/').to_lowercase())
+                .map(|p| normalize_path_lower(p))
                 .collect();
             ce.path_options.path_file_lower = ce
                 .path_options

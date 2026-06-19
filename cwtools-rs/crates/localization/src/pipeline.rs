@@ -9,7 +9,7 @@
 
 use crate::commands::{Game, Lang, LocFile};
 use crate::service::LocService;
-use crate::validation::{HARDCODED_LOC, LocErrorKind, validate_loc_file};
+use crate::validation::{LocErrorKind, hardcoded_loc_set, validate_loc_file_with_hardcoded};
 use crate::yaml_parser::{LangHeaderDiagnostic, check_loc_file_lang, parse_loc_text};
 use std::collections::HashSet;
 
@@ -169,21 +169,27 @@ pub fn validate_loc_project_scoped(
     langs: Option<&[Lang]>,
     extra_valid_refs: &HashSet<String>,
 ) -> Vec<LocDiagnostic> {
+    use rayon::prelude::*;
+
     // Union of keys across all languages, to resolve `$ref$` existence.
     // Borrowed from the service's single owned copy — no second copy of any loc
     // file is ever materialized (a full clone OOMs on large projects like MD).
-    let mut union: HashSet<String> = HashSet::new();
-    for file in service.files() {
-        for e in &file.entries {
-            union.insert(e.key.to_lowercase());
-        }
-    }
+    // Built in parallel: on large projects (~2M entries) the sequential
+    // lowercase+insert dominated. Same case-folding (`to_lowercase`) as before;
+    // the resulting set is identical regardless of insert order.
+    let union: HashSet<String> = service
+        .files()
+        .par_iter()
+        .flat_map_iter(|file| file.entries.iter().map(|e| e.key.to_lowercase()))
+        .collect();
 
     // Each file validates independently against the read-only key union, so the
     // per-file pass runs in parallel. `par_iter` over the indexed `files` slice
     // collects in input order — output matches the sequential version.
-    use rayon::prelude::*;
     let union_ref = &union;
+    // Lowercased hardcoded-loc set, built once and shared read-only across the
+    // per-file parallel pass (was re-lowercased + re-collected per file).
+    let hardcoded = hardcoded_loc_set();
     service
         .files()
         .par_iter()
@@ -231,7 +237,9 @@ pub fn validate_loc_project_scoped(
                 });
             }
 
-            for err in validate_loc_file(file, union_ref, extra_valid_refs, HARDCODED_LOC) {
+            for err in
+                validate_loc_file_with_hardcoded(file, union_ref, extra_valid_refs, hardcoded)
+            {
                 out.push(LocDiagnostic {
                     file: path.clone(),
                     line: err.line,
@@ -278,7 +286,8 @@ pub fn validate_loc_file_text(
         });
     }
 
-    for err in validate_loc_file(&file, union, extra_valid_refs, HARDCODED_LOC) {
+    for err in validate_loc_file_with_hardcoded(&file, union, extra_valid_refs, hardcoded_loc_set())
+    {
         out.push(LocDiagnostic {
             file: path.to_string(),
             line: err.line,

@@ -10,6 +10,7 @@
 //! walk never false-flags a definition; it only fires on a *referenced* name
 //! that no definition provides.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use cwtools_parser::ast::{Child, ParsedFile, Value};
@@ -28,10 +29,25 @@ pub fn validate_ruleset_references(
     ruleset: &RuleSet,
     table: &StringTable,
 ) -> Vec<RuleParseError> {
+    // Defined single_alias names, indexed once for O(1) `is_defined` lookups
+    // instead of a linear scan per referenced single_alias in the walk.
+    let single_alias_names: HashSet<&str> = ruleset
+        .single_aliases
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect();
     let mut errors = Vec::new();
     for (path, ast) in files {
         for child in &ast.root_children {
-            walk_child(child, ast, table, ruleset, path, &mut errors);
+            walk_child(
+                child,
+                ast,
+                table,
+                ruleset,
+                &single_alias_names,
+                path,
+                &mut errors,
+            );
         }
     }
     errors
@@ -42,6 +58,7 @@ fn walk_child(
     ast: &ParsedFile,
     table: &StringTable,
     ruleset: &RuleSet,
+    single_alias_names: &HashSet<&str>,
     path: &Path,
     errors: &mut Vec<RuleParseError>,
 ) {
@@ -51,11 +68,19 @@ fn walk_child(
             let pos = &leaf.pos.start;
             // The key may itself be a reference (`<character> = { … }`).
             let key = table.get_string(leaf.key.normal).unwrap_or_default();
-            check_field(&key, pos.line, pos.col, ruleset, path, errors);
+            check_field(
+                &key,
+                pos.line,
+                pos.col,
+                ruleset,
+                single_alias_names,
+                path,
+                errors,
+            );
             match &leaf.value {
                 Value::Clause(children) => {
                     for ch in children {
-                        walk_child(ch, ast, table, ruleset, path, errors);
+                        walk_child(ch, ast, table, ruleset, single_alias_names, path, errors);
                     }
                 }
                 other => check_field(
@@ -63,6 +88,7 @@ fn walk_child(
                     pos.line,
                     pos.col,
                     ruleset,
+                    single_alias_names,
                     path,
                     errors,
                 ),
@@ -74,7 +100,7 @@ fn walk_child(
             match &lv.value {
                 Value::Clause(children) => {
                     for ch in children {
-                        walk_child(ch, ast, table, ruleset, path, errors);
+                        walk_child(ch, ast, table, ruleset, single_alias_names, path, errors);
                     }
                 }
                 other => check_field(
@@ -82,6 +108,7 @@ fn walk_child(
                     pos.line,
                     pos.col,
                     ruleset,
+                    single_alias_names,
                     path,
                     errors,
                 ),
@@ -89,7 +116,7 @@ fn walk_child(
         }
         Child::ValueClause(idx) => {
             for ch in &ast.arena.value_clauses[*idx as usize].children {
-                walk_child(ch, ast, table, ruleset, path, errors);
+                walk_child(ch, ast, table, ruleset, single_alias_names, path, errors);
             }
         }
         Child::Comment(_) => {}
@@ -101,11 +128,12 @@ fn check_field(
     line: u32,
     col: u16,
     ruleset: &RuleSet,
+    single_alias_names: &HashSet<&str>,
     path: &Path,
     errors: &mut Vec<RuleParseError>,
 ) {
     if let Some((kind, name)) = referenced_name(&field_from_string(s))
-        && !is_defined(ruleset, kind, &name)
+        && !is_defined(ruleset, single_alias_names, kind, &name)
     {
         errors.push(RuleParseError {
             file: path.to_path_buf(),
@@ -163,14 +191,19 @@ fn base_type(name: &str) -> &str {
     name.split('.').next().unwrap_or(name)
 }
 
-fn is_defined(ruleset: &RuleSet, kind: RefKind, name: &str) -> bool {
+fn is_defined(
+    ruleset: &RuleSet,
+    single_alias_names: &HashSet<&str>,
+    kind: RefKind,
+    name: &str,
+) -> bool {
     match kind {
         RefKind::Type => ruleset.type_by_name.contains_key(name),
         RefKind::Enum => {
             ruleset.enum_by_name.contains_key(name)
                 || ruleset.complex_enums.iter().any(|c| c.name == name)
         }
-        RefKind::SingleAlias => ruleset.single_aliases.iter().any(|(k, _)| k == name),
+        RefKind::SingleAlias => single_alias_names.contains(name),
     }
 }
 

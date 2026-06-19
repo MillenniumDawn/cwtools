@@ -29,6 +29,28 @@ pub fn leaf_value_string(value: &Value, table: &StringTable) -> String {
     }
 }
 
+/// Call `f` with the leaf value as a `&str`. String-typed values borrow straight
+/// from the string table (no allocation); numeric/bool values are formatted into
+/// a scratch buffer that is owned by this call. Clauses yield `""`. Internal
+/// allocation-free counterpart to [`leaf_value_string`] for the index collectors.
+fn with_leaf_value_str<R>(value: &Value, table: &StringTable, f: impl FnOnce(&str) -> R) -> R {
+    match value {
+        Value::String(t) | Value::QString(t) => {
+            // `Some` already invoked `f`; a `None` (out-of-range id) maps to `""`,
+            // matching `get_string(..).unwrap_or_default()`.
+            let mut f = Some(f);
+            match table.with_string(t.normal, |s| (f.take().unwrap())(s)) {
+                Some(r) => r,
+                None => (f.take().unwrap())(""),
+            }
+        }
+        Value::Float(n) => f(&n.to_string()),
+        Value::Int(i) => f(&i.to_string()),
+        Value::Bool(b) => f(&b.to_string()),
+        Value::Clause(_) => f(""),
+    }
+}
+
 // ── Source location ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -102,14 +124,24 @@ impl FileIndex {
     /// slashes collapsed — the engine treats `gfx//interface` as `gfx/interface`,
     /// and some mod files write the doubled form).
     pub fn contains(&self, path: &str) -> bool {
-        let cleaned = path.trim().replace('\\', "/");
-        let norm = cleaned
-            .split('/')
-            .filter(|seg| !seg.is_empty())
-            .collect::<Vec<_>>()
-            .join("/")
-            .to_ascii_lowercase();
-        self.files.contains(&norm)
+        thread_local! {
+            static NORM_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        NORM_BUF.with(|buf| {
+            let mut norm = buf.borrow_mut();
+            norm.clear();
+            // Single pass: split on both separators, drop empty segments
+            // (collapsing repeated/leading slashes), join with '/', lowercase ASCII.
+            let mut first = true;
+            for seg in path.trim().split(['/', '\\']).filter(|s| !s.is_empty()) {
+                if !first {
+                    norm.push('/');
+                }
+                first = false;
+                norm.extend(seg.chars().map(|c| c.to_ascii_lowercase()));
+            }
+            self.files.contains(norm.as_str())
+        })
     }
 
     /// Add already-normalized relative paths (the vanilla-cache restore path).
@@ -154,11 +186,21 @@ impl VarIndex {
     /// before any `?`/`^` selector. Mirrors F# `getVariableFromString` plus the
     /// read-side dot-split in `changeScope`.
     pub fn normalize(raw: &str) -> String {
+        let mut buf = String::new();
+        Self::normalize_into(raw, &mut buf);
+        buf
+    }
+
+    /// Like [`normalize`](Self::normalize) but writes the canonical key into a
+    /// reusable buffer (cleared first), avoiding a per-call allocation on the hot
+    /// `contains` path. Identifiers are ASCII, so the lowercase fold is ASCII.
+    pub fn normalize_into(raw: &str, buf: &mut String) {
         let s = raw.trim().trim_matches('"');
         let before_amp = s.split('@').next().unwrap_or(s);
         let last_seg = before_amp.rsplit('.').next().unwrap_or(before_amp);
         let core = last_seg.split(['?', '^']).next().unwrap_or(last_seg);
-        core.trim().to_ascii_lowercase()
+        buf.clear();
+        buf.extend(core.trim().chars().map(|c| c.to_ascii_lowercase()));
     }
 
     pub fn add_name(&mut self, raw: &str) {
@@ -183,7 +225,14 @@ impl VarIndex {
 
     /// Whether a raw reference resolves to a known defined variable.
     pub fn contains(&self, raw: &str) -> bool {
-        self.names.contains_key(&Self::normalize(raw))
+        thread_local! {
+            static NORM_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        NORM_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            Self::normalize_into(raw, &mut buf);
+            self.names.contains_key(buf.as_str())
+        })
     }
 
     /// Fold another index's names into this one (e.g. base-game variables into
@@ -271,10 +320,26 @@ impl TypeIndex {
     pub fn loc_bindable_names(&self) -> impl Iterator<Item = String> + '_ {
         // `name_counts` keys and `var_index` names are already lowercased /
         // normalised, matching the loc validator's case-insensitive lookup.
+        self.loc_bindable_names_iter().map(str::to_string)
+    }
+
+    /// Borrowing form of [`loc_bindable_names`](Self::loc_bindable_names): yields
+    /// each bindable name by reference, no per-name allocation. Use this when the
+    /// caller only needs to read the names (membership, iteration) rather than own
+    /// them.
+    pub fn loc_bindable_names_iter(&self) -> impl Iterator<Item = &str> + '_ {
         self.name_counts
             .keys()
-            .cloned()
-            .chain(self.var_index.names().cloned())
+            .map(String::as_str)
+            .chain(self.var_index.names().map(String::as_str))
+    }
+
+    /// Whether `name` is a loc-bindable name (a type-instance name or defined
+    /// variable). `name` is matched against the already-lowercased index keys, so
+    /// the caller must pass a lowercased name (as the loc validator does). O(1)
+    /// instead of building/scanning the whole bindable-name set.
+    pub fn contains_loc_bindable(&self, name: &str) -> bool {
+        self.name_counts.contains_key(name) || self.var_index.names.contains_key(name)
     }
 
     /// Every `(type_name, instance)` defined in `file_uri`. Scans the whole
@@ -501,7 +566,13 @@ fn type_key_filter_matches(td: &TypeDefinition, key: &str) -> bool {
 fn starts_with_matches(td: &TypeDefinition, key: &str) -> bool {
     match &td.starts_with {
         None => true,
-        Some(prefix) => key.to_lowercase().starts_with(&prefix.to_lowercase()),
+        // Paradox keys/prefixes are ASCII identifiers; an ASCII case-insensitive
+        // prefix test matches `to_lowercase().starts_with(to_lowercase())` without
+        // allocating a lowercased copy of either string per call.
+        Some(prefix) => {
+            key.len() >= prefix.len()
+                && key.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        }
     }
 }
 
@@ -718,31 +789,38 @@ pub fn collect_defined_variables_from_rules(
         }
     }
 
+    // Index the root TypeRules by name once so the per-type lookup is O(1) instead
+    // of an O(types × root_rules) linear scan. A type name can carry more than one
+    // TypeRule, so group them (each matching rule is still scanned, preserving the
+    // original multiplicity).
+    let mut type_rules: HashMap<&str, Vec<&RuleType>> = HashMap::new();
+    for root_rule in &ruleset.root_rules {
+        if let cwtools_rules::rules_types::RootRule::TypeRule(name, (rule_type, _opts)) = root_rule
+        {
+            type_rules.entry(name.as_str()).or_default().push(rule_type);
+        }
+    }
+
     // Walk type instances (path-filtered) and scan their rules for VariableSetField
     for td in &ruleset.types {
         if !check_path_dir(&td.path_options, logical_path) {
             continue;
         }
-        // Find the TypeRule for this typedef in root_rules
-        for root_rule in &ruleset.root_rules {
-            if let cwtools_rules::rules_types::RootRule::TypeRule(name, (rule_type, _opts)) =
-                root_rule
-            {
-                if name != &td.name {
-                    continue;
-                }
-                if let RuleType::NodeRule { rules, .. } = rule_type {
-                    // Scan each root instance's children against these rules.
-                    for child in &file.root_children {
-                        if let Some(kc) = file.arena.keyed_clause(child) {
-                            scan_children_for_varset(
-                                kc.children,
-                                &file.arena,
-                                table,
-                                rules,
-                                &mut result,
-                            );
-                        }
+        let Some(rules_for_type) = type_rules.get(td.name.as_str()) else {
+            continue;
+        };
+        for rule_type in rules_for_type {
+            if let RuleType::NodeRule { rules, .. } = rule_type {
+                // Scan each root instance's children against these rules.
+                for child in &file.root_children {
+                    if let Some(kc) = file.arena.keyed_clause(child) {
+                        scan_children_for_varset(
+                            kc.children,
+                            &file.arena,
+                            table,
+                            rules,
+                            &mut result,
+                        );
                     }
                 }
             }
@@ -826,6 +904,11 @@ fn scan_children_for_varset(
     for child in children {
         // A keyed clause (`key = { ... }`) takes the NodeRule path.
         if let Some(kc) = arena.keyed_clause(child) {
+            // Resolve the clause key with `get_string` (which releases the table
+            // lock) rather than holding `with_string` across the recursive
+            // `scan_children_for_varset` calls below — those re-acquire the table
+            // lock, which would risk a re-entrant read-lock deadlock under writer
+            // contention during parallel indexing.
             let child_key = table.get_string(kc.key.normal).unwrap_or_default();
             for (rule_type, _) in rules {
                 // NodeRule(VariableSetField): the clause's key IS the defined
@@ -869,6 +952,9 @@ fn scan_children_for_varset(
         match child {
             Child::Leaf(li) => {
                 let leaf = &arena.leaves[*li as usize];
+                // Resolve key and value sequentially (each releases the table lock)
+                // rather than nesting two `with_string` borrows, which would risk a
+                // re-entrant read-lock deadlock under writer contention.
                 let key = table.get_string(leaf.key.normal).unwrap_or_default();
                 let val = leaf_value_string(&leaf.value, table);
                 for (rule_type, _opts) in rules {
@@ -918,25 +1004,26 @@ fn scan_children_for_varset(
             // defined variable name (F# InfoService fLeafValue).
             Child::LeafValue(lvi) => {
                 let lv = &arena.leaf_values[*lvi as usize];
-                let val = leaf_value_string(&lv.value, table);
-                if !val.is_empty() {
-                    for (rule_type, _opts) in rules {
-                        if let RuleType::LeafValueRule {
-                            right: NewField::VariableSetField(ns),
-                        } = rule_type
-                        {
-                            out.entry(ns.clone()).or_default().push(DefinedVariable {
-                                name: val.clone(),
-                                namespace: Some(ns.clone()),
-                                location: SourceLocation {
-                                    line: lv.pos.start.line,
-                                    col: lv.pos.start.col,
-                                },
-                                value: None,
-                            });
+                with_leaf_value_str(&lv.value, table, |val| {
+                    if !val.is_empty() {
+                        for (rule_type, _opts) in rules {
+                            if let RuleType::LeafValueRule {
+                                right: NewField::VariableSetField(ns),
+                            } = rule_type
+                            {
+                                out.entry(ns.clone()).or_default().push(DefinedVariable {
+                                    name: val.to_string(),
+                                    namespace: Some(ns.clone()),
+                                    location: SourceLocation {
+                                        line: lv.pos.start.line,
+                                        col: lv.pos.start.col,
+                                    },
+                                    value: None,
+                                });
+                            }
                         }
                     }
-                }
+                });
             }
             _ => {}
         }
@@ -1064,10 +1151,10 @@ pub fn collect_set_variable_defs(
                 }
                 _ => continue,
             };
-            if !matches!(
-                key.to_ascii_lowercase().as_str(),
-                "value" | "tooltip" | "var" | "variable" | "amount" | "which"
-            ) {
+            const SKIP_KEYS: &[&str] = &["value", "tooltip", "var", "variable", "amount", "which"];
+            // Case-insensitive compare without allocating a lowercased copy of the
+            // key just to probe the skip-list (paradox keys are ASCII).
+            if !SKIP_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k)) {
                 out.push(def(key, value, line, col));
             }
         }

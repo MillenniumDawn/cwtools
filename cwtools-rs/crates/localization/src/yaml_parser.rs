@@ -176,25 +176,27 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     // Some real files in the wild carry a doubled BOM (`\u{FEFF}\u{FEFF}`);
     // F# tolerates it via a substring match, so strip every leading BOM.
     let text = text.trim_start_matches('\u{feff}');
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
+    // Stream the lines as `(0-based index, &str)`. `i` only ever increments
+    // (no backtracking), so a single forward pass over `text.lines()` replaces
+    // the previous `Vec<&str>` collection.
+    let mut lines = text.lines().enumerate();
 
-    // 1.  Skip leading blank lines and comments
-    while i < lines.len() {
-        let trimmed = lines[i].trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            i += 1;
-        } else {
-            break;
+    // 1.  Skip leading blank lines and comments, then take the language header.
+    let header_line = loop {
+        match lines.next() {
+            Some((_, line)) => {
+                let trimmed = line.trim_start();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                break line;
+            }
+            None => return Err("empty file after stripping comments".to_string()),
         }
-    }
-
-    if i >= lines.len() {
-        return Err("empty file after stripping comments".to_string());
-    }
+    };
 
     // 2.  Language header:  `l_english:`  (colon required)
-    let header = lines[i];
+    let header = header_line;
     let colon = header
         .find(':')
         .ok_or_else(|| format!("missing ':' in language header: {header:?}"))?;
@@ -203,7 +205,6 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     // leading space and fail the exact `key_to_language` lookup.
     let language_key = header[..colon].trim();
     let lang = key_to_language(language_key);
-    i += 1;
 
     let mut entries = Vec::new();
     let mut parse_errors: Vec<LocParseError> = Vec::new();
@@ -212,27 +213,22 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     //      key:123 "desc text"       (with version)
     //      key: "desc text"          (without version)
     //      key: "desc text"#comment  (comment is part of desc)
-    while i < lines.len() {
-        let line = lines[i];
+    for (i, line) in lines {
         let trimmed = line.trim_start();
 
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            i += 1;
             continue;
         }
 
-        let colon_pos = trimmed.find(':');
-        if colon_pos.is_none() {
+        let Some(colon_pos) = trimmed.find(':') else {
             // Malformed line: no colon separator. Record a CW001 parse error and
             // continue recovering (lenient parser; mirrors F# `Failure` path).
             parse_errors.push(LocParseError {
                 line: i + 1,
                 message: format!("unexpected content (no ':' separator): {:?}", trimmed),
             });
-            i += 1;
             continue;
-        }
-        let colon_pos = colon_pos.unwrap();
+        };
         let key = trimmed[..colon_pos].trim_end();
 
         // remainder after the colon
@@ -241,12 +237,11 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         // optional version number (digits right after colon with no space)
         let version =
             if !remainder.is_empty() && remainder.starts_with(|c: char| c.is_ascii_digit()) {
-                let digit_str: String = remainder
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                let v = digit_str.parse::<u32>().ok();
-                remainder = &remainder[digit_str.len()..];
+                // Count leading ASCII-digit bytes (== char count; digits are ASCII)
+                // and parse the slice in place, no intermediate String.
+                let digit_len = remainder.bytes().take_while(|b| b.is_ascii_digit()).count();
+                let v = remainder[..digit_len].parse::<u32>().ok();
+                remainder = &remainder[digit_len..];
                 v
             } else {
                 None
@@ -276,26 +271,19 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
             Position::new(Arc::clone(&stream_name), i + 1, col)
         });
 
-        // Lazy-parse loc elements (refs, commands, etc.)
+        // Lazy-parse loc elements (refs, commands, etc.). One pass over the
+        // elements extends all three collections instead of three filter_map
+        // passes. The JominiCommand clone stays — it bridges the loc_string and
+        // commands type boundary, which is unified separately.
         let elements = parse_loc_elements(desc);
-        let refs: Vec<String> = elements
-            .iter()
-            .filter_map(|e| match e {
-                crate::loc_string::LocElement::Ref(s) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-        let commands: Vec<String> = elements
-            .iter()
-            .filter_map(|e| match e {
-                crate::loc_string::LocElement::Command(s) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-        let jomini_commands: Vec<Vec<crate::commands::JominiCommand>> = elements
-            .iter()
-            .filter_map(|e| match e {
-                crate::loc_string::LocElement::JominiCommand(cmds) => Some(
+        let mut refs: Vec<String> = Vec::new();
+        let mut commands: Vec<String> = Vec::new();
+        let mut jomini_commands: Vec<Vec<crate::commands::JominiCommand>> = Vec::new();
+        for e in &elements {
+            match e {
+                crate::loc_string::LocElement::Ref(s) => refs.push(s.to_string()),
+                crate::loc_string::LocElement::Command(s) => commands.push(s.to_string()),
+                crate::loc_string::LocElement::JominiCommand(cmds) => jomini_commands.push(
                     cmds.iter()
                         .map(|c| crate::commands::JominiCommand {
                             key: c.key.clone(),
@@ -314,9 +302,9 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
                         })
                         .collect::<Vec<_>>(),
                 ),
-                _ => None,
-            })
-            .collect();
+                crate::loc_string::LocElement::Chars(_) => {}
+            }
+        }
 
         entries.push(LocEntry {
             key: key.to_string(),
@@ -328,8 +316,6 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
             commands,
             jomini_commands,
         });
-
-        i += 1;
     }
 
     // Collect file-level diagnostics: header/filename lang validation

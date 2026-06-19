@@ -67,6 +67,99 @@ fn roundtrip_real_file() {
     }
 }
 
+/// The batched `cached_to_arena` must produce a StringTable identical to one
+/// built by interning each string individually in traversal order: same ids,
+/// same resolved text for every node.
+#[test]
+fn cached_to_arena_matches_per_string_interning() {
+    use cwtools_parser::ast::Value;
+
+    let input = r#"
+foo = bar
+FOO = Bar
+empty = ""
+nested = {
+    a = 1
+    b = "hello"
+    c = yes
+    nope = no
+}
+key_a key_b = { x = 1 }
+"#;
+    let table = StringTable::new();
+    let parsed = parse_string(input, &table).unwrap();
+    let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
+
+    // Batched path.
+    let batch_table = StringTable::new();
+    let (batch_arena, _) = convert::cached_to_arena(&cached, &batch_table);
+
+    // Reference path: intern every string by hand, same traversal order as
+    // cached_to_arena (leaves, then leaf_values, then value_clauses).
+    let ref_table = StringTable::new();
+    let mut expected = Vec::new();
+    for l in &cached.leaves {
+        expected.push(ref_table.intern(&l.key));
+        push_value(&l.value, &ref_table, &mut expected);
+    }
+    for lv in &cached.leaf_values {
+        push_value(&lv.value, &ref_table, &mut expected);
+    }
+    for vc in &cached.value_clauses {
+        for k in &vc.keys {
+            expected.push(ref_table.intern(k));
+        }
+    }
+
+    // Collect the batched arena's tokens in the identical order and compare.
+    let mut actual = Vec::new();
+    for l in &batch_arena.leaves {
+        actual.push(l.key);
+        collect_arena_value(&l.value, &mut actual);
+    }
+    for lv in &batch_arena.leaf_values {
+        collect_arena_value(&lv.value, &mut actual);
+    }
+    for vc in &batch_arena.value_clauses {
+        for k in &vc.keys {
+            actual.push(*k);
+        }
+    }
+
+    assert_eq!(expected, actual, "batched tokens diverge from per-string");
+    for tok in &actual {
+        assert_eq!(
+            batch_table.get_string(tok.normal),
+            ref_table.get_string(tok.normal)
+        );
+        assert_eq!(
+            batch_table.get_string(tok.lower),
+            ref_table.get_string(tok.lower)
+        );
+    }
+
+    fn push_value(
+        v: &cwtools_cache::cache_format::CachedValue,
+        t: &StringTable,
+        out: &mut Vec<cwtools_string_table::string_table::StringTokens>,
+    ) {
+        use cwtools_cache::cache_format::CachedValue;
+        match v {
+            CachedValue::String(s) | CachedValue::QString(s) => out.push(t.intern(s)),
+            _ => {}
+        }
+    }
+    fn collect_arena_value(
+        v: &Value,
+        out: &mut Vec<cwtools_string_table::string_table::StringTokens>,
+    ) {
+        match v {
+            Value::String(t) | Value::QString(t) => out.push(*t),
+            _ => {}
+        }
+    }
+}
+
 /// Gate: Cache round-trip verified for all 63 test files.
 #[test]
 fn roundtrip_all_performancetest_files() {
