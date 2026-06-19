@@ -5,6 +5,7 @@ use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use cwtools_info::vanilla_cache;
@@ -136,11 +137,11 @@ fn diag_hash(file: &str, code: &str, message: &str, line: u32) -> String {
 }
 
 /// Escape a field for CSV output.
-fn csv_escape(s: &str) -> String {
+fn csv_escape(s: &str) -> Cow<'_, str> {
     if s.contains([',', '"', '\n']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+        Cow::Owned(format!("\"{}\"", s.replace('"', "\"\"")))
     } else {
-        s.to_string()
+        Cow::Borrowed(s)
     }
 }
 
