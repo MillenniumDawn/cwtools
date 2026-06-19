@@ -282,9 +282,9 @@ impl Backend {
         if let Some(folders) = &params.workspace_folders
             && let Some(first) = folders.first()
         {
-            self.state.config.write().workspace_uri = Some(first.uri.to_string());
+            self.state.config.write().workspace_uri = Some(first.uri.to_string().into());
         } else if let Some(root_uri) = &params.root_uri {
-            self.state.config.write().workspace_uri = Some(root_uri.to_string());
+            self.state.config.write().workspace_uri = Some(root_uri.to_string().into());
         }
 
         // Per-workspace ignore globs from the extension. The extension

@@ -224,6 +224,12 @@ pub(crate) fn completions_from_rules(
     registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
+    // Per-request memo so a repeated enum is only collected/sorted once (#46).
+    let mut enum_cache: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    // Built (sort + clone) at most once per call even if several scope rules
+    // appear in this block (#44).
+    let mut scope_names: Option<Vec<String>> = None;
 
     for (rule_type, opts) in rules {
         match rule_type {
@@ -299,7 +305,7 @@ pub(crate) fn completions_from_rules(
                     NewField::ValueField(ValueType::Bool) => "${1|yes,no|}".to_string(),
                     _ => "${1}".to_string(),
                 };
-                for v in all_enum_values(ruleset, info, e) {
+                for v in all_enum_values_cached(&mut enum_cache, ruleset, info, e) {
                     items.push(CompletionItem {
                         label: v.clone(),
                         kind: Some(CompletionItemKind::FIELD),
@@ -314,7 +320,7 @@ pub(crate) fn completions_from_rules(
                 left: NewField::ValueField(ValueType::Enum(e)),
                 ..
             } => {
-                for v in all_enum_values(ruleset, info, e) {
+                for v in all_enum_values_cached(&mut enum_cache, ruleset, info, e) {
                     items.push(CompletionItem {
                         label: v.clone(),
                         kind: Some(CompletionItemKind::STRUCT),
@@ -356,9 +362,9 @@ pub(crate) fn completions_from_rules(
             RuleType::LeafValueRule {
                 right: NewField::ValueField(ValueType::Enum(e)),
             } => {
-                for v in all_enum_values(ruleset, info, e) {
+                for v in all_enum_values_cached(&mut enum_cache, ruleset, info, e) {
                     items.push(CompletionItem {
-                        label: v,
+                        label: v.clone(),
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
                         detail: Some(format!("enum {}", e)),
                         ..Default::default()
@@ -448,9 +454,11 @@ pub(crate) fn completions_from_rules(
             | RuleType::LeafValueRule {
                 right: NewField::ScopeField(_),
             } => {
-                for name in scope_completion_names(language, registry) {
+                let names =
+                    scope_names.get_or_insert_with(|| scope_completion_names(language, registry));
+                for name in names.iter() {
                     items.push(CompletionItem {
-                        label: name,
+                        label: name.clone(),
                         kind: Some(CompletionItemKind::VALUE),
                         detail: Some("scope".to_string()),
                         ..Default::default()
@@ -477,11 +485,11 @@ pub(crate) fn completions_from_rules(
     items
 }
 
-pub(crate) fn enum_values_for(ruleset: &RuleSet, enum_name: &str) -> Vec<String> {
+pub(crate) fn enum_values_for<'a>(ruleset: &'a RuleSet, enum_name: &str) -> &'a [String] {
     if let Some(&idx) = ruleset.enum_by_name.get(enum_name) {
-        return ruleset.enums[idx].values.clone();
+        return &ruleset.enums[idx].values;
     }
-    Vec::new()
+    &[]
 }
 
 /// Enum members from the static definition AND the collected complex-enum
@@ -493,7 +501,7 @@ pub(crate) fn all_enum_values(
     info: &InfoService,
     enum_name: &str,
 ) -> Vec<String> {
-    let mut vals = enum_values_for(ruleset, enum_name);
+    let mut vals = enum_values_for(ruleset, enum_name).to_vec();
     vals.extend(
         info.type_index
             .complex_enum_values
@@ -503,6 +511,21 @@ pub(crate) fn all_enum_values(
     vals.sort_unstable();
     vals.dedup();
     vals
+}
+
+/// Per-request memo for [`all_enum_values`]: one completion request can hit the
+/// same enum across several match arms (e.g. multiple `LeafValueRule`s sharing
+/// `equipment_stat`), and `all_enum_values` re-collects + sorts + dedups each
+/// time. Cache by enum name within a single call so it only happens once.
+fn all_enum_values_cached<'c>(
+    cache: &'c mut std::collections::HashMap<String, Vec<String>>,
+    ruleset: &RuleSet,
+    info: &InfoService,
+    enum_name: &str,
+) -> &'c [String] {
+    cache
+        .entry(enum_name.to_string())
+        .or_insert_with(|| all_enum_values(ruleset, info, enum_name))
 }
 
 /// Completion items for a leaf VALUE position: enumerate what the matched
@@ -518,6 +541,12 @@ pub(crate) fn value_completions(
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // Per-request memo so a repeated enum is only collected/sorted once (#46).
+    let mut enum_cache: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    // Built (sort + clone) at most once per call even if several scope-typed
+    // value rules arrive here (#44).
+    let mut scope_names: Option<Vec<String>> = None;
     let mut push = |label: String,
                     kind: CompletionItemKind,
                     detail: String,
@@ -564,9 +593,9 @@ pub(crate) fn value_completions(
                 }
             }
             NewField::ValueField(ValueType::Enum(e)) => {
-                for v in all_enum_values(ruleset, info, e) {
+                for v in all_enum_values_cached(&mut enum_cache, ruleset, info, e) {
                     push(
-                        v,
+                        v.clone(),
                         CompletionItemKind::ENUM_MEMBER,
                         format!("enum {}", e),
                         &mut items,
@@ -586,9 +615,11 @@ pub(crate) fn value_completions(
             NewField::ScopeField(_)
             | NewField::ValueScopeField { .. }
             | NewField::ValueScopeMarkerField { .. } => {
-                for name in scope_completion_names(language, registry) {
+                let names =
+                    scope_names.get_or_insert_with(|| scope_completion_names(language, registry));
+                for name in names.iter() {
                     push(
-                        name,
+                        name.clone(),
                         CompletionItemKind::VALUE,
                         "scope".to_string(),
                         &mut items,
@@ -793,15 +824,23 @@ pub(crate) fn loc_completions(
     language: &str,
     registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
 ) -> Vec<CompletionItem> {
-    // Collect all top-level keys from all files as potential loc keys
+    // Collect all top-level keys from all files as potential loc keys. Dedup by
+    // borrowing &str (not cloning every key into the set) — this walks every
+    // workspace file per request, so the per-key String clone was the cost.
+    //
+    // NOTE: a cross-request cache (#20) is intentionally skipped. The obvious
+    // freshness key, `edit_generation`, is not bumped by all the mutations that
+    // change `info.files` (the initial scan, `did_close`, and validate's
+    // `clear_file` all mutate it without a bump), so keying on it would serve
+    // stale completions. The fix would have to live outside completion.rs.
     let mut items: Vec<CompletionItem> = info
         .files
         .values()
-        .flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.clone()))
-        .collect::<std::collections::HashSet<_>>()
+        .flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.as_str()))
+        .collect::<std::collections::HashSet<&str>>()
         .into_iter()
         .map(|k| CompletionItem {
-            label: k.clone(),
+            label: k.to_string(),
             kind: Some(CompletionItemKind::TEXT),
             detail: Some("loc key".to_string()),
             ..Default::default()

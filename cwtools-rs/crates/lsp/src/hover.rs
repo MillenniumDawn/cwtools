@@ -134,7 +134,13 @@ impl Backend {
     fn loc_ref_hover(&self, uri: &str, pos: Position) -> Option<Hover> {
         let (key, start, end) = self.loc_ref_at_cursor_doc(uri, pos)?;
         let loc_text = self.state.loc_text.read();
-        let translations = loc_text.get(&key.to_lowercase())?;
+        // The map is keyed by ASCII-lowercased loc keys. Avoid the temp String
+        // when the key is already lowercase (the common case).
+        let translations = if key.bytes().any(|b| b.is_ascii_uppercase()) {
+            loc_text.get(&key.to_lowercase())?
+        } else {
+            loc_text.get(key.as_str())?
+        };
         let mut md = format!("**Localisation key** `{}`", key);
         for (lang, text) in translations {
             md.push_str(&format!("\n- {}: {}", lang_display_name(*lang), text));

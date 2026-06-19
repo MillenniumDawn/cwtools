@@ -224,20 +224,6 @@ pub(crate) fn collect_doc_tokens(
 }
 
 impl Backend {
-    /// Parse a file and add it to the symbol + info (type) indexes WITHOUT
-    /// validating. The first pass of a full-workspace scan calls this for every
-    /// file so cross-file references (scripted triggers/effects, type instances,
-    /// templated modifiers) resolve before ANY file is validated. Without this,
-    /// a file validated early can't see definitions that live in later files.
-    ///
-    /// This is synchronous — the original async wrapper was removed because the
-    /// body never `.await`s and `block_in_place` callers need a sync variant.
-    pub(crate) fn index_document_sync(&self, uri: &str, text: &str) -> Option<ParsedFile> {
-        let parsed = parse_string(text, &self.state.string_table).ok()?;
-        self.index_parsed_file(uri, &parsed);
-        Some(parsed)
-    }
-
     /// Refresh the per-document token set used to scope the dependent sweep.
     /// `ast = None` (e.g. a file that failed to parse) clears the set, so the
     /// sweep treats the doc as "unknown" and always includes it.
@@ -573,8 +559,22 @@ impl Backend {
                 // Lock order: rules -> info_service.
                 let mut extra = (*self.state.rules.read().modifier_keys).clone();
                 let info = self.state.info_service.read();
-                for (_uri, inst) in info.type_index.instances("idea") {
-                    extra.insert(inst.name.to_lowercase());
+                let ideas = info.type_index.instances("idea");
+                extra.reserve(ideas.len());
+                for (_uri, inst) in ideas {
+                    // Idea names are ASCII identifiers; skip the lowercasing alloc
+                    // when the name is already lowercase ASCII (the common case).
+                    // Fall back to `to_lowercase` for anything uppercase or
+                    // non-ASCII so the case-folding result is unchanged.
+                    let needs_fold = inst
+                        .name
+                        .bytes()
+                        .any(|b| b.is_ascii_uppercase() || !b.is_ascii());
+                    if needs_fold {
+                        extra.insert(inst.name.to_lowercase());
+                    } else {
+                        extra.insert(inst.name.clone());
+                    }
                 }
                 extra
             };

@@ -21,7 +21,7 @@ cwtools_localization = { workspace = true }
 cwtools_cache = { workspace = true }
 cwtools_profiling = { workspace = true }
 tower-lsp = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["time", "fs"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
