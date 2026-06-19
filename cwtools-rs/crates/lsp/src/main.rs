@@ -118,8 +118,10 @@ pub(crate) struct RuleData {
     /// matches the ruleset it was derived from. `None` until the first load.
     pub(crate) scope_registry: Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>,
     /// cached modifier-key set; rebuilt after ruleset load and after each full
-    /// workspace scan when the type index is complete.
-    pub(crate) modifier_keys: HashSet<String>,
+    /// workspace scan when the type index is complete. `Arc` so the workspace
+    /// scan snapshots it with a cheap refcount bump instead of deep-copying the
+    /// whole set (#78).
+    pub(crate) modifier_keys: Arc<HashSet<String>>,
 }
 
 impl RuleData {
@@ -127,7 +129,7 @@ impl RuleData {
         Self {
             ruleset: None,
             scope_registry: None,
-            modifier_keys: HashSet::new(),
+            modifier_keys: Arc::new(HashSet::new()),
         }
     }
 }

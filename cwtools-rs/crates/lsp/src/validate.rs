@@ -571,7 +571,7 @@ impl Backend {
             // info_service -> loc_index lock order.
             let extra_valid_refs: HashSet<String> = {
                 // Lock order: rules -> info_service.
-                let mut extra = self.state.rules.read().modifier_keys.clone();
+                let mut extra = (*self.state.rules.read().modifier_keys).clone();
                 let info = self.state.info_service.read();
                 for (_uri, inst) in info.type_index.instances("idea") {
                     extra.insert(inst.name.to_lowercase());
