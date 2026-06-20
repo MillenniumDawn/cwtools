@@ -453,12 +453,15 @@ impl Backend {
                     if open_uris.contains(&uri) {
                         return None;
                     }
+                    // Workspace scan covers files not open in an editor (open
+                    // ones are skipped above), so there's no squiggle to widen —
+                    // pass no line info and keep the cheap single-char range.
                     let diagnostics = match &prepared {
-                        Some(prepared) => validate_parsed_with_indexes(&uri, parsed, prepared),
+                        Some(prepared) => validate_parsed_with_indexes(&uri, parsed, prepared, &[]),
                         None => parsed
                             .errors
                             .iter()
-                            .map(parse_error_to_diagnostic)
+                            .map(|e| parse_error_to_diagnostic(e, &[]))
                             .collect(),
                     };
                     Some((uri, diagnostics))
@@ -680,10 +683,12 @@ impl Backend {
                         continue;
                     }
                     let ve = loc_diag_to_validation_error(&d);
+                    // Project-wide loc scan feeds the Problems panel; open files
+                    // get whole-line squiggles when re-validated on open.
                     by_file
                         .entry(d.file.clone())
                         .or_default()
-                        .push(validation_error_to_diagnostic(&ve));
+                        .push(validation_error_to_diagnostic(&ve, &[]));
                 }
                 // Extract per-key display text for hover and a representative
                 // definition site (for goto) before dropping the service.

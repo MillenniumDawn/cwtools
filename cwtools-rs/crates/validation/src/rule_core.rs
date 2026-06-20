@@ -795,14 +795,25 @@ pub(crate) fn validate_children(
                             });
                         }
                         if count > kmax {
+                            // Anchor the over-count on the first actual
+                            // occurrence of this key rather than the block's
+                            // first child — the squiggle belongs on the field
+                            // being flagged, not on whatever happens to sit at
+                            // the top of the block. (The under-count case has no
+                            // occurrence to point at, so it stays on the block.)
+                            let (line, col) = children
+                                .iter()
+                                .find(|c| child_key_matches(c, ast, table, &lkey))
+                                .and_then(|c| child_start_pos(c, ast))
+                                .unwrap_or((block_line, block_col));
                             errors.push(ValidationError {
                                 message: format!(
                                     "Field '{}' appears {} time(s), expected at most {}",
                                     key, count, kmax
                                 ),
                                 severity: max_sev,
-                                line: block_line,
-                                col: block_col,
+                                line,
+                                col,
                                 file: file_path.to_string(),
                                 code: Some(error_codes::CW242_WRONG_NUMBER.id),
                             });

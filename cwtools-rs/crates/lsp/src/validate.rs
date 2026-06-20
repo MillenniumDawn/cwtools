@@ -96,11 +96,12 @@ pub(crate) fn validate_parsed_with_indexes(
     uri: &str,
     parsed: &ParsedFile,
     prepared: &Prepared,
+    line_ends: &[u32],
 ) -> Vec<Diagnostic> {
     let mut diagnostics: Vec<Diagnostic> = parsed
         .errors
         .iter()
-        .map(parse_error_to_diagnostic)
+        .map(|e| parse_error_to_diagnostic(e, line_ends))
         .collect();
     let mut errs = validate_prepared(parsed, uri, prepared);
     // CW100: objects defined here whose `## required` localisation keys aren't
@@ -121,12 +122,34 @@ pub(crate) fn validate_parsed_with_indexes(
     }
     truncate_validation_errors(&mut errs, uri);
     for err in &errs {
-        diagnostics.push(validation_error_to_diagnostic(err));
+        diagnostics.push(validation_error_to_diagnostic(err, line_ends));
     }
     diagnostics
 }
 
-pub(crate) fn parse_error_to_diagnostic(e: &ParseError) -> Diagnostic {
+/// Trimmed char-length of each line in `text`, indexed by 0-based line number.
+/// Used to widen a 1-column diagnostic so the squiggle covers the whole
+/// statement instead of a single character at the start. Counts chars (not
+/// bytes) to match the parser's column unit.
+pub(crate) fn line_end_cols(text: &str) -> Vec<u32> {
+    text.lines()
+        .map(|l| l.trim_end().chars().count() as u32)
+        .collect()
+}
+
+/// End column for a diagnostic starting at `col` on 0-based `line`: the end of
+/// that line's content, but always at least one past `col` so the range is
+/// never empty. With no line info (`line_ends` empty or line out of range),
+/// falls back to a single-character span.
+fn diag_end_col(line_ends: &[u32], line: u32, col: u32) -> u32 {
+    line_ends
+        .get(line as usize)
+        .copied()
+        .unwrap_or(0)
+        .max(col + 1)
+}
+
+pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Diagnostic {
     let (line, col, msg) = match e {
         ParseError::Pos(_f, line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
         ParseError::General(msg) => (0, 0, msg.clone()),
@@ -139,7 +162,7 @@ pub(crate) fn parse_error_to_diagnostic(e: &ParseError) -> Diagnostic {
             },
             end: Position {
                 line,
-                character: col + 1,
+                character: diag_end_col(line_ends, line, col),
             },
         },
         severity: Some(DiagnosticSeverity::ERROR),
@@ -153,16 +176,21 @@ pub(crate) fn parse_error_to_diagnostic(e: &ParseError) -> Diagnostic {
     }
 }
 
-pub(crate) fn validation_error_to_diagnostic(err: &ValidationError) -> Diagnostic {
+pub(crate) fn validation_error_to_diagnostic(
+    err: &ValidationError,
+    line_ends: &[u32],
+) -> Diagnostic {
+    let line = err.line.saturating_sub(1);
+    let col = err.col as u32;
     Diagnostic {
         range: Range {
             start: Position {
-                line: err.line.saturating_sub(1),
-                character: err.col as u32,
+                line,
+                character: col,
             },
             end: Position {
-                line: err.line.saturating_sub(1),
-                character: err.col as u32 + 1,
+                line,
+                character: diag_end_col(line_ends, line, col),
             },
         },
         severity: match err.severity {
@@ -272,6 +300,7 @@ impl Backend {
     /// index, with the ruleset already locked and the per-run scope registry
     /// prebuilt by the caller. Multi-file callers (the workspace scan, the
     /// dependent sweep) build those ONCE outside their loop and reuse them.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn validate_parsed_prebuilt(
         &self,
         uri: &str,
@@ -280,6 +309,7 @@ impl Backend {
         ruleset: &RuleSet,
         game: Option<cwtools_game::constants::Game>,
         registry: Option<&std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
+        line_ends: &[u32],
     ) -> Vec<Diagnostic> {
         let info_guard = self.state.info_service.read();
         let loc_guard = self.state.loc_index.read();
@@ -298,7 +328,7 @@ impl Backend {
             scope_checks,
             var_checks,
         );
-        validate_parsed_with_indexes(uri, parsed, &prepared)
+        validate_parsed_with_indexes(uri, parsed, &prepared, line_ends)
     }
 
     /// Publish diagnostics, but suppress them (publish an empty set) until the
@@ -453,7 +483,10 @@ impl Backend {
         // need re-parsing or re-indexing — only re-validation against the
         // now-updated global index. When `changed_names` is `Some`, skip docs
         // whose token set references none of the changed names.
-        let others: Vec<(String, i32, Arc<ParsedFile>)> = {
+        // Capture each dependent's per-line end columns while the docs lock is
+        // held (cheaper than cloning the whole text) so the republished
+        // diagnostics get whole-line squiggles, same as the edited file.
+        let others: Vec<(String, i32, Arc<ParsedFile>, Vec<u32>)> = {
             let tokens = self.state.doc_tokens.read();
             let docs = self.state.documents.lock();
             docs.iter()
@@ -467,7 +500,11 @@ impl Backend {
                         Some(doc_set) => names.iter().any(|n| doc_set.contains(n)),
                     },
                 })
-                .filter_map(|(u, d)| d.ast.clone().map(|ast| (u.clone(), d.version, ast)))
+                .filter_map(|(u, d)| {
+                    d.ast
+                        .clone()
+                        .map(|ast| (u.clone(), d.version, ast, line_end_cols(&d.text)))
+                })
                 .collect()
         };
         if others.is_empty() {
@@ -488,7 +525,7 @@ impl Backend {
         let validated: Vec<(String, i32, Vec<Diagnostic>)> = {
             let rules_guard = self.state.rules.read();
             let mut out = Vec::with_capacity(others.len());
-            for (uri, snapshot_version, ast) in others {
+            for (uri, snapshot_version, ast, line_ends) in others {
                 // Preempt: a newer edit arrived. Save our changed_names into the
                 // shared pending set so the newer sweep drains and covers them;
                 // without this, dependents of the preempted edit stay stale.
@@ -512,8 +549,13 @@ impl Backend {
                         ruleset,
                         game,
                         rules_guard.scope_registry.as_ref(),
+                        &line_ends,
                     ),
-                    None => ast.errors.iter().map(parse_error_to_diagnostic).collect(),
+                    None => ast
+                        .errors
+                        .iter()
+                        .map(|e| parse_error_to_diagnostic(e, &line_ends))
+                        .collect(),
                 };
                 out.push((uri, snapshot_version, diagnostics));
             }
@@ -548,6 +590,9 @@ impl Backend {
         text: &str,
     ) -> (Vec<Diagnostic>, Option<ParsedFile>) {
         let mut diagnostics = Vec::new();
+        // Per-line end columns so every squiggle spans the whole statement line
+        // rather than a single character at its start.
+        let line_ends = line_end_cols(text);
 
         // Localisation files are parsed and validated as loc, not config.
         if crate::paths::is_loc_file(uri) {
@@ -590,7 +635,7 @@ impl Backend {
                 cwtools_localization::validate_loc_file_text(text, &path, union, &extra_valid_refs)
             {
                 let ve = loc_diag_to_validation_error(&d);
-                diagnostics.push(validation_error_to_diagnostic(&ve));
+                diagnostics.push(validation_error_to_diagnostic(&ve, &line_ends));
             }
             return (diagnostics, None);
         }
@@ -600,7 +645,7 @@ impl Backend {
         match parse_string(text, &self.state.string_table) {
             Ok(parsed) => {
                 for parse_err in &parsed.errors {
-                    diagnostics.push(parse_error_to_diagnostic(parse_err));
+                    diagnostics.push(parse_error_to_diagnostic(parse_err, &line_ends));
                 }
 
                 // Update symbol index
@@ -681,7 +726,7 @@ impl Backend {
                 }
 
                 for err in &errors {
-                    diagnostics.push(validation_error_to_diagnostic(err));
+                    diagnostics.push(validation_error_to_diagnostic(err, &line_ends));
                 }
                 (diagnostics, Some(parsed))
             }
@@ -703,5 +748,57 @@ impl Backend {
                 (diagnostics, None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod whole_line_range_tests {
+    use super::*;
+    use cwtools_validation::ErrorSeverity;
+
+    #[test]
+    fn line_end_cols_reports_trimmed_char_lengths() {
+        let text = "abc\n  hello world  \n";
+        let ends = line_end_cols(text);
+        assert_eq!(ends[0], 3, "\"abc\" has 3 chars");
+        assert_eq!(
+            ends[1], 13,
+            "\"  hello world\" (trailing ws trimmed) has 13 chars"
+        );
+    }
+
+    #[test]
+    fn diagnostic_spans_from_field_to_end_of_line() {
+        let text = "decision = {\n    custom_cost_text = a\n}\n";
+        let ends = line_end_cols(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 2, // 1-based: the custom_cost_text line
+            col: 4,  // start of the field, after the indentation
+            file: "f".into(),
+            code: Some("CW242"),
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.start.line, 1);
+        assert_eq!(diag.range.start.character, 4);
+        assert_eq!(diag.range.end.line, 1);
+        // "    custom_cost_text = a" is 24 chars.
+        assert_eq!(diag.range.end.character, 24);
+    }
+
+    #[test]
+    fn diagnostic_falls_back_to_one_char_without_line_info() {
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 5,
+            col: 2,
+            file: "f".into(),
+            code: None,
+        };
+        let diag = validation_error_to_diagnostic(&err, &[]);
+        assert_eq!(diag.range.start.character, 2);
+        assert_eq!(diag.range.end.character, 3);
     }
 }
