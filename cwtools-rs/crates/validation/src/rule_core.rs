@@ -666,13 +666,10 @@ pub(crate) fn validate_children(
                             if let NewField::VariableGetField(_) = right {
                                 let raw = leaf_value_to_string(&lv.value, table);
                                 check_variable_get(
+                                    ctx,
                                     &raw,
-                                    ruleset,
-                                    type_index,
-                                    file_path,
                                     lv.pos.start.line,
                                     lv.pos.start.col,
-                                    ctx.var_checks,
                                     errors,
                                 );
                             }
@@ -941,8 +938,10 @@ fn looks_like_scope_command(key: &str) -> bool {
 }
 
 /// Whether `key` can open a scope in an effect/trigger block: a scope command
-/// (ROOT/FROM/tag/id/chain) OR an instance of any type — HOI4 from-data scope
-/// links let an instance (character, state, ideology, ...) open its own scope.
+/// (ROOT/FROM/tag/id/chain), an instance of any type, or a member of a value-set
+/// that a `from_data` scope link draws from. HOI4 from-data scope links let an
+/// instance (character, state, ideology, ...) — or a dynamically-defined token
+/// (`generate_character`'s `token_base`) — open its own scope.
 fn is_scope_key(
     key: &str,
     ruleset: &RuleSet,
@@ -950,7 +949,41 @@ fn is_scope_key(
 ) -> bool {
     looks_like_scope_command(key)
         || scope_links_contains(ruleset, key)
-        || type_index.is_some_and(|idx| idx.is_any_instance(key))
+        || type_index.is_some_and(|idx| {
+            idx.is_any_instance(key) || is_from_data_value_set_member(key, ruleset, idx)
+        })
+}
+
+/// Whether `key` is a member of a value-set that a `from_data` scope link draws
+/// from (`links.cwt`: `data_source = value[<set>]`). Such a link makes any of that
+/// set's members a valid scope-opening key (e.g. the `character_token` link's
+/// `data_source = value[character_token]` lets a `generate_character` token open a
+/// `character` scope). Checked last because it scans `link_inputs`; only reached
+/// when the cheaper scope-command / link-name / type-instance checks all miss.
+fn is_from_data_value_set_member(
+    key: &str,
+    ruleset: &RuleSet,
+    type_index: &cwtools_index::TypeIndex,
+) -> bool {
+    if type_index.value_set_values.is_empty() {
+        return false;
+    }
+    ruleset
+        .link_inputs
+        .iter()
+        .filter(|li| li.from_data)
+        .flat_map(|li| li.data_source.iter())
+        .filter_map(|src| value_set_name(src))
+        .any(|set| type_index.value_set_values.values(set).any(|m| m == key))
+}
+
+/// Extract `<set>` from a `data_source = value[<set>]` entry; `None` for any other
+/// data-source shape (`<type>`, `enum[..]`, a bare scalar).
+fn value_set_name(data_source: &str) -> Option<&str> {
+    data_source
+        .strip_prefix("value[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .map(str::trim)
 }
 
 /// Case-insensitive membership in `ruleset.scope_links` (a lowercase `String`
@@ -1183,6 +1216,70 @@ pub(crate) fn alias_overloads<'a>(
     overloads
 }
 
+/// The implicit default temp-variable name a loop-effect field declares when it
+/// is omitted: `value` → `v`, `index` → `i`, `break` → `break` (HOI4
+/// `for_each_loop` & friends, documented in effects.cwt). Any other key is not a
+/// loop-variable binding.
+fn loop_var_default(key: &str) -> Option<&'static str> {
+    match key {
+        "value" => Some("v"),
+        "index" => Some("i"),
+        "break" => Some("break"),
+        _ => None,
+    }
+}
+
+/// Collect the loop-local variable names a loop-effect block exposes to its body,
+/// normalized for the variable index.
+///
+/// A loop effect (`for_each_loop`, `while_loop`, `every_country`, …) is detected
+/// purely from its rule shape: a `value`/`index`/`break` field bound to
+/// `value_set[variable]`. For each such field we seed its implicit default name
+/// (`v`/`i`/`break`) and, when the block explicitly rebinds it (`value = my_elem`),
+/// the explicit name too. Seeding both is the lenient choice and matches the
+/// `var:NAME` form already accepted. Returns empty for any non-loop block.
+fn collect_loop_vars(
+    alias_inner: &[(RuleType, Options)],
+    children: &[Child],
+    ast: &cwtools_parser::ast::ParsedFile,
+    table: &StringTable,
+) -> Vec<String> {
+    // Which keys this alias declares as `<key> = value_set[variable]`.
+    let mut seeded: Vec<String> = Vec::new();
+    for (rule, _) in alias_inner {
+        let RuleType::LeafRule {
+            left: NewField::SpecificField(key),
+            right: NewField::VariableSetField(_),
+        } = rule
+        else {
+            continue;
+        };
+        let Some(default) = loop_var_default(key.as_str()) else {
+            continue;
+        };
+        // Default name (used when the key is omitted).
+        seeded.push(cwtools_index::VarIndex::normalize(default));
+        // Explicit rebinding, if the block provides `<key> = NAME`.
+        for child in children {
+            let Child::Leaf(idx) = child else { continue };
+            let leaf = &ast.arena.leaves[*idx as usize];
+            let matches_key = table
+                .with_string(leaf.key.normal, |s| {
+                    unquote_key(s).eq_ignore_ascii_case(key)
+                })
+                .unwrap_or(false);
+            if matches_key {
+                let name = leaf_value_to_string(&leaf.value, table);
+                let norm = cwtools_index::VarIndex::normalize(&name);
+                if !norm.is_empty() {
+                    seeded.push(norm);
+                }
+            }
+        }
+    }
+    seeded
+}
+
 /// Validate an aliased usage (`alias_name[cat] = ...`) against EVERY overload
 /// declared as `alias[cat:key]`.
 ///
@@ -1316,6 +1413,15 @@ fn validate_alias_usage(
                     if let Some(sc) = scope_context.as_mut() {
                         enter_block_scope(sc, key, opts, ctx.game);
                     }
+                    // Seed loop-local variables: a `for_each_loop`-style block
+                    // exposes `value`/`index`/`break` temp variables its body can
+                    // read bare. Push them for the body only and truncate back
+                    // after, so they don't leak to siblings/parents.
+                    let loop_var_base = ctx.loop_vars.borrow().len();
+                    let seeded = collect_loop_vars(alias_inner, children, ctx.ast, table);
+                    if !seeded.is_empty() {
+                        ctx.loop_vars.borrow_mut().extend(seeded);
+                    }
                     validate_children(
                         ctx,
                         children,
@@ -1325,6 +1431,7 @@ fn validate_alias_usage(
                             .unwrap_or(fallback_pos),
                         &mut temp,
                     );
+                    ctx.loop_vars.borrow_mut().truncate(loop_var_base);
                     if let (Some(saved), Some(sc)) = (saved, scope_context.as_mut()) {
                         sc.restore(saved);
                     }
@@ -1401,18 +1508,14 @@ fn is_builtin_variable(ruleset: &RuleSet, token: &str) -> bool {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn check_variable_get(
+    ctx: &ValidationCtx,
     raw: &str,
-    ruleset: &RuleSet,
-    type_index: Option<&cwtools_index::TypeIndex>,
-    file_path: &str,
     line: u32,
     col: u16,
-    var_checks: bool,
     errors: &mut Vec<ValidationError>,
 ) {
-    if !var_checks {
+    if !ctx.var_checks {
         return;
     }
     let v = raw.trim_matches('"').trim();
@@ -1430,14 +1533,15 @@ fn check_variable_get(
     if core.is_empty() {
         return;
     }
-    if !is_builtin_variable(ruleset, core)
-        && let Some(idx) = type_index
+    if !is_builtin_variable(ctx.ruleset, core)
+        && !ctx.is_loop_var(core)
+        && let Some(idx) = ctx.type_index
         && !idx.var_index.is_empty()
         && !idx.var_index.contains(core)
     {
         errors.push(ValidationError::from_code(
             &error_codes::CW246_UNSET_VARIABLE,
-            file_path,
+            ctx.file_path,
             line,
             col,
             &[core],
@@ -1647,11 +1751,12 @@ fn validate_leaf(
                     // keyword/link and isn't in the project variable index.
                     let single_token = !core.contains('.') && !core.contains(':');
                     let is_scopeish = scope_context
-                        .map(|ctx| resolves_as_scope_key(ctx, core))
+                        .map(|sc| resolves_as_scope_key(sc, core))
                         .unwrap_or(false);
                     if single_token
                         && !is_scopeish
                         && !is_builtin_variable(ctx.ruleset, core)
+                        && !ctx.is_loop_var(core)
                         && let Some(idx) = type_index
                         && !idx.var_index.is_empty()
                         && !idx.var_index.contains(core)
@@ -1676,16 +1781,7 @@ fn validate_leaf(
         // variable index) so empty-index setups don't false-positive.
         if let NewField::VariableGetField(_) = right {
             let raw = leaf_value_to_string(&leaf.value, table);
-            check_variable_get(
-                &raw,
-                ctx.ruleset,
-                type_index,
-                file_path,
-                leaf.pos.start.line,
-                leaf.pos.start.col,
-                ctx.var_checks,
-                errors,
-            );
+            check_variable_get(ctx, &raw, leaf.pos.start.line, leaf.pos.start.col, errors);
             return;
         }
 

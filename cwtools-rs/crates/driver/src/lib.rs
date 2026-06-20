@@ -187,6 +187,7 @@ impl Session {
         type PerFileResult = (
             HashMap<String, Vec<cwtools_index::TypeInstance>>,
             Vec<String>,
+            HashMap<String, Vec<String>>,
         );
         let var_effects = variable_defining_effects(&ruleset);
         let per_file: Vec<PerFileResult> = parsed
@@ -196,16 +197,28 @@ impl Session {
                     collect_type_instances(&ruleset, &src.parsed, &src.logical_path, &rules_table);
                 let mut var_names: Vec<String> = Vec::new();
                 collect_set_variable_names(&src.parsed, &rules_table, &var_effects, &mut var_names);
-                (instances, var_names)
+                // Value-set members defined in mod files (flags, character tokens,
+                // …). The vanilla path collects these too; without this mod-defined
+                // members are missing from `value_set_values`, so a from-data scope
+                // link can't recognise its own instances (e.g. a `generate_character`
+                // token used as `<token> = { ... }`). Completion-only otherwise.
+                let value_sets = cwtools_index::dynamic_values::collect_value_set_members(
+                    &ruleset,
+                    &src.parsed,
+                    &rules_table,
+                );
+                (instances, var_names, value_sets)
             })
             .collect();
 
         let mut type_index = TypeIndex::new();
-        for (src, (instances, var_names)) in parsed.iter().zip(per_file) {
-            type_index.merge(src.path.to_str().unwrap_or(""), instances);
+        for (src, (instances, var_names, value_sets)) in parsed.iter().zip(per_file) {
+            let file_uri = src.path.to_str().unwrap_or("");
+            type_index.merge(file_uri, instances);
             for n in &var_names {
                 type_index.var_index.add_name(n);
             }
+            type_index.value_set_values.merge_file(file_uri, value_sets);
         }
 
         // Vanilla data: from a pre-generated cache when given (skips walking the

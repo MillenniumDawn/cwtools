@@ -334,6 +334,7 @@ pub fn validate_prepared(
         loc_index,
         scope_checks,
         var_checks,
+        loop_vars: std::cell::RefCell::new(Vec::new()),
     };
 
     // Pre-compute path-based type match (most specific wins).

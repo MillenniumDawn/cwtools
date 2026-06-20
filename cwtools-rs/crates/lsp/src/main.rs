@@ -405,17 +405,36 @@ impl Backend {
         };
         // Current scope at the cursor (the scope the containing block evaluates
         // in), so a hover shows where you are regardless of whether the rule
-        // declares a required scope. Suppress the wildcards (`any`/`invalid`) and
-        // the unnamed-scope fallback (`scope_N`, when no config scope is loaded):
-        // showing those is noise.
-        let current_scope = rctx.scope.as_ref().and_then(|sc| {
-            let id = sc.current()?;
+        // declares a required scope. The related scopes (ROOT/PREV and the FROM
+        // chain) come along for the hover scope table. In every case suppress the
+        // wildcards (`any`/`invalid`) and the unnamed-scope fallback (`scope_N`,
+        // when no config scope is loaded): showing those is noise.
+        let resolve_scope = |sc: &cwtools_game::scope_engine::ScopeContext,
+                             id: cwtools_game::ScopeId| {
             let name = sc.registry.name_of(id);
             let placeholder = name == "any"
                 || name == "invalid"
                 || name.strip_prefix("scope_").and_then(|s| s.parse().ok()) == Some(id.0);
             (!placeholder).then_some(name)
-        });
+        };
+        let (current_scope, root_scope, prev_scope, from_scopes) = match rctx.scope.as_ref() {
+            Some(sc) => {
+                let current = sc.current().and_then(|id| resolve_scope(sc, id));
+                let root = resolve_scope(sc, sc.root);
+                // PREV is the scope one level out: the second-from-top of the stack.
+                let prev = (sc.scopes.len() >= 2)
+                    .then(|| sc.scopes[sc.scopes.len() - 2])
+                    .and_then(|id| resolve_scope(sc, id));
+                // FROM chain: [0] = FROM, [1] = FROM.FROM, …; drop placeholders.
+                let from = sc
+                    .from
+                    .iter()
+                    .filter_map(|id| resolve_scope(sc, *id))
+                    .collect();
+                (current, root, prev, from)
+            }
+            None => (None, None, None, Vec::new()),
+        };
         Some(RuleCursorInfo {
             element,
             hint,
@@ -423,6 +442,9 @@ impl Backend {
             description,
             required_scopes: scopes,
             current_scope,
+            root_scope,
+            prev_scope,
+            from_scopes,
         })
     }
 }
@@ -456,6 +478,13 @@ pub(crate) struct RuleCursorInfo {
     /// The scope context at the cursor (the scope the block evaluates in), for
     /// the hover. `None` when no registry or the scope is the `any` wildcard.
     pub(crate) current_scope: Option<String>,
+    /// Related scopes at the cursor, for the hover scope table. ROOT is the
+    /// outermost block's scope; PREV is the enclosing scope (one level out).
+    /// Each is `None` when absent or a suppressed placeholder.
+    pub(crate) root_scope: Option<String>,
+    pub(crate) prev_scope: Option<String>,
+    /// The FROM chain: `[0]` = FROM, `[1]` = FROM.FROM, … (placeholders dropped).
+    pub(crate) from_scopes: Vec<String>,
 }
 
 /// Map a matched leaf rule's right-hand field to a [`ReferenceHint`] for the
