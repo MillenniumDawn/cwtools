@@ -1,3 +1,6 @@
+# 1.7.1 
+- Fixes the squiggle placement in the cwtools
+
 # 1.7.0
 
 ## Bug Fixes
