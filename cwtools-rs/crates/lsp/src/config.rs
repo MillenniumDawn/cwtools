@@ -189,6 +189,18 @@ impl Backend {
             // Load .cwt rules from rulesCache if provided
             if let Some(cache) = opts.get("rulesCache").and_then(|v| v.as_str()) {
                 let cache_path = std::path::Path::new(cache);
+                // Surface a missing rules dir explicitly. The client may hand us a
+                // path that doesn't resolve here (e.g. a Windows `rules_folder`
+                // that didn't normalise), which otherwise degrades silently to a
+                // generic "no rules loaded" with an empty error list.
+                if !cache_path.is_dir() {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("`rulesCache` dir does not exist: {}", cache),
+                        )
+                        .await;
+                }
                 let (combined_ruleset, parse_errors) =
                     load_ruleset_from_dir(cache_path, &self.state.string_table);
 

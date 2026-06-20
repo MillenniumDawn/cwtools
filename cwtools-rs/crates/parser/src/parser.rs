@@ -188,6 +188,13 @@ impl<'a> Parser<'a> {
         } else {
             let start = self.byte_pos();
             while let Some(c) = self.peek() {
+                // A `?` belongs to the key when it is a `?<default>` null-coalescing
+                // selector (`my_var?150 = ...`, the TAOG form), but NOT when it is
+                // the `?=` QuestionEqual operator — stop before `?=` so the operator
+                // still lexes. `^` carries no such ambiguity (no `^=` operator).
+                if c == '?' && self.peek2() == Some('=') {
+                    break;
+                }
                 if is_key_char(c) {
                     self.advance();
                 } else {
@@ -728,8 +735,10 @@ const fn ascii_class(extra: &[u8]) -> [bool; 128] {
 static VALUE_CHAR: [bool; 128] = ascii_class(b"_.-:;'[]@+`%/!,<>?$\\|^*&()");
 
 /// ASCII members of the unquoted-key char class. Non-ASCII alphanumerics are
-/// handled separately in [`is_key_char`].
-static KEY_CHAR: [bool; 128] = ascii_class(b"_:@.\"-'[]!<>$^&|()");
+/// handled separately in [`is_key_char`]. A `?` is included for the
+/// `my_var?<default>` null-coalescing selector; `parse_key` separately stops
+/// before a `?=` so the QuestionEqual operator still lexes.
+static KEY_CHAR: [bool; 128] = ascii_class(b"_:@.\"-'[]!<>$^&|()?");
 
 fn is_value_char(c: char) -> bool {
     if c.is_ascii() {
@@ -1119,5 +1128,111 @@ mod tests {
             !result.errors.is_empty(),
             "expected a parse error for an unclosed string at EOF"
         );
+    }
+
+    // A `?<default>` (and `^`) null-coalescing selector on a variable-defining
+    // key (`my_var?150 = { ... }`, the TAOG form) must lex as ONE key, not split
+    // at the `?` into a bare value + orphaned clause. `^` was already a key char;
+    // `?` was not, so the selector form was mis-parsed.
+
+    fn keyed_clause_key(result: &ParsedFile, table: &StringTable, idx: usize) -> String {
+        match &result.root_children[idx] {
+            Child::Leaf(i) => {
+                let leaf = &result.arena.leaves[*i as usize];
+                assert!(
+                    matches!(leaf.value, Value::Clause(_)),
+                    "expected a keyed clause, got {:?}",
+                    leaf.value
+                );
+                table.get_string(leaf.key.normal).unwrap_or_default()
+            }
+            other => panic!("expected a keyed-clause Leaf, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn question_selector_key_is_one_keyed_clause() {
+        let table = StringTable::new();
+        let result =
+            parse_string("war_propaganda_decision_cost?150 = { value = 150 }", &table).unwrap();
+        assert_eq!(
+            result.root_children.len(),
+            1,
+            "the `?150` selector must not split the key from its clause: {:?}",
+            result.root_children
+        );
+        assert_eq!(
+            keyed_clause_key(&result, &table, 0),
+            "war_propaganda_decision_cost?150"
+        );
+    }
+
+    #[test]
+    fn question_selector_key_pretaog_leaf_form() {
+        // The pre-TAOG `my_var?150 = 100` form: one key=value leaf, not a bare
+        // value plus an orphan `= 100`.
+        let table = StringTable::new();
+        let result = parse_string("war_propaganda_decision_cost?150 = 100", &table).unwrap();
+        assert_eq!(result.root_children.len(), 1, "{:?}", result.root_children);
+        match &result.root_children[0] {
+            Child::Leaf(i) => {
+                let leaf = &result.arena.leaves[*i as usize];
+                assert_eq!(
+                    table.get_string(leaf.key.normal).unwrap_or_default(),
+                    "war_propaganda_decision_cost?150"
+                );
+            }
+            other => panic!("expected a single key=value Leaf, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn caret_selector_key_is_one_keyed_clause() {
+        // The `^` variant was already a key char; lock it in as a sibling case.
+        let table = StringTable::new();
+        let result =
+            parse_string("war_propaganda_decision_cost^foo = { value = 150 }", &table).unwrap();
+        assert_eq!(result.root_children.len(), 1, "{:?}", result.root_children);
+        assert_eq!(
+            keyed_clause_key(&result, &table, 0),
+            "war_propaganda_decision_cost^foo"
+        );
+    }
+
+    #[test]
+    fn question_equal_operator_still_parses() {
+        // `?=` is the QuestionEqual operator. Folding `?` into the key char set
+        // must NOT break it: `key ?= value` and the no-space `key?= value` both
+        // stay a single key=value leaf whose op is QuestionEqual, not a key with
+        // a trailing `?`.
+        for src in ["foo ?= bar", "foo?= bar"] {
+            let table = StringTable::new();
+            let result = parse_string(src, &table).unwrap();
+            assert_eq!(
+                result.root_children.len(),
+                1,
+                "`{}` must be one statement: {:?}",
+                src,
+                result.root_children
+            );
+            match &result.root_children[0] {
+                Child::Leaf(i) => {
+                    let leaf = &result.arena.leaves[*i as usize];
+                    assert_eq!(
+                        table.get_string(leaf.key.normal).unwrap_or_default(),
+                        "foo",
+                        "`{}` key must be `foo`, not carry the `?`",
+                        src
+                    );
+                    assert_eq!(
+                        leaf.op,
+                        Operator::QuestionEqual,
+                        "`{}` must keep the `?=` operator",
+                        src
+                    );
+                }
+                other => panic!("`{}`: expected a Leaf, got {:?}", src, other),
+            }
+        }
     }
 }

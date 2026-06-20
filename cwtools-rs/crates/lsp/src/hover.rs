@@ -45,6 +45,9 @@ impl Backend {
                 description: desc,
                 required_scopes: scopes,
                 current_scope,
+                root_scope,
+                prev_scope,
+                from_scopes,
             }) = self.rule_info_at_cursor(&uri, pos, &logical_path)
             {
                 let debug = self
@@ -57,7 +60,12 @@ impl Backend {
                     category.as_deref(),
                     desc.as_deref(),
                     &scopes,
-                    current_scope.as_deref(),
+                    ScopeTable {
+                        current: current_scope.as_deref(),
+                        root: root_scope.as_deref(),
+                        prev: prev_scope.as_deref(),
+                        from: &from_scopes,
+                    },
                     debug,
                 );
                 // For a variable read, append the known assigned value(s) so the
@@ -164,6 +172,21 @@ impl Backend {
     }
 }
 
+/// The scope context at the cursor, rendered as the hover scope table. Mirrors
+/// the small ROOT/PREV/FROM table the F# build showed. Names are already
+/// resolved and placeholder-filtered by `rule_info_at_cursor`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ScopeTable<'a> {
+    /// The scope the containing block evaluates in (current scope).
+    pub current: Option<&'a str>,
+    /// The outermost block's scope.
+    pub root: Option<&'a str>,
+    /// The enclosing scope, one level out from current.
+    pub prev: Option<&'a str>,
+    /// The FROM chain: `[0]` = FROM, `[1]` = FROM.FROM, ….
+    pub from: &'a [String],
+}
+
 /// Build a Markdown hover string from the classified element + the matched
 /// rule's category, description, and required scopes (from
 /// `rule_info_at_cursor`).
@@ -179,7 +202,7 @@ pub(crate) fn build_hover_markdown(
     category: Option<&str>,
     rule_desc: Option<&str>,
     rule_scopes: &[String],
-    current_scope: Option<&str>,
+    scopes: ScopeTable<'_>,
     debug: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -232,9 +255,28 @@ pub(crate) fn build_hover_markdown(
     }
 
     // Append the current scope at the cursor — shows where you are for anything
-    // hovered in a scoped block, independent of the rule's required scope.
-    if let Some(scope) = current_scope {
-        parts.push(format!("\n**Scope**: {}", scope));
+    // hovered in a scoped block, independent of the rule's required scope. The
+    // related scopes (ROOT/PREV and the FROM chain) follow on consecutive lines,
+    // restoring the small scope table the F# build showed. Root/Prev are
+    // suppressed when identical to the current scope (noise); FROM/FROM.FROM are
+    // always shown when present.
+    if let Some(scope) = scopes.current {
+        let mut scope_lines = vec![format!("**Scope**: {}", scope)];
+        if let Some(root) = scopes.root.filter(|r| Some(*r) != scopes.current) {
+            scope_lines.push(format!("**Root**: {}", root));
+        }
+        if let Some(prev) = scopes.prev.filter(|p| Some(*p) != scopes.current) {
+            scope_lines.push(format!("**Prev**: {}", prev));
+        }
+        if let Some(from) = scopes.from.first() {
+            scope_lines.push(format!("**From**: {}", from));
+        }
+        if let Some(fromfrom) = scopes.from.get(1) {
+            scope_lines.push(format!("**From.From**: {}", fromfrom));
+        }
+        // Markdown collapses single newlines, so join the table rows with a hard
+        // line break; lead with `\n` to match the spacing the lone Scope line had.
+        parts.push(format!("\n{}", scope_lines.join("  \n")));
     }
 
     parts.join("\n\n")
@@ -294,7 +336,7 @@ mod tests {
             None,
             None,
             &[],
-            None,
+            ScopeTable::default(),
             true,
         );
         assert!(md.contains("Type reference"), "got: {}", md);
@@ -318,7 +360,7 @@ mod tests {
             None,
             Some("Pick an ethos"),
             &["country".to_string()],
-            None,
+            ScopeTable::default(),
             false,
         );
         assert!(!md.contains("Type reference"), "should hide debug: {}", md);
@@ -340,7 +382,7 @@ mod tests {
             None,
             None,
             &[],
-            None,
+            ScopeTable::default(),
             true,
         );
         assert!(md.contains("Enum value"), "got: {}", md);
@@ -359,7 +401,7 @@ mod tests {
             None,
             None,
             &[],
-            None,
+            ScopeTable::default(),
             true,
         );
         assert!(md.contains("foo") && md.contains("bar"), "got: {}", md);
@@ -379,7 +421,7 @@ mod tests {
             None,
             Some("The kind of this thing"),
             &["country".to_string()],
-            None,
+            ScopeTable::default(),
             false,
         );
         assert!(md.contains("The kind of this thing"), "got: {}", md);
@@ -399,9 +441,68 @@ mod tests {
             Some("effect"),
             None,
             &[],
-            Some("country"),
+            ScopeTable {
+                current: Some("country"),
+                ..Default::default()
+            },
             false,
         );
         assert!(md.contains("**Scope**: country"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_shows_related_scopes() {
+        // Root, Prev and the FROM chain render after the current scope so the
+        // modder sees the whole scope table the F# build used to show.
+        let md = build_hover_markdown(
+            &PositionElement::Leaf {
+                key: "set_country_flag".to_string(),
+                value: "my_flag".to_string(),
+            },
+            &ReferenceHint::Unknown,
+            Some("effect"),
+            None,
+            &[],
+            ScopeTable {
+                current: Some("state"),
+                root: Some("country"),
+                prev: Some("unit_leader"),
+                from: &["combat".to_string(), "operation".to_string()],
+            },
+            false,
+        );
+        assert!(md.contains("**Scope**: state"), "got: {}", md);
+        assert!(md.contains("**Root**: country"), "got: {}", md);
+        assert!(md.contains("**Prev**: unit_leader"), "got: {}", md);
+        assert!(md.contains("**From**: combat"), "got: {}", md);
+        assert!(md.contains("**From.From**: operation"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_omits_absent_and_duplicate_scopes() {
+        // Root/Prev are suppressed when missing or identical to the current scope
+        // (noise), but FROM is always shown when the chain has it.
+        let md = build_hover_markdown(
+            &PositionElement::Leaf {
+                key: "set_country_flag".to_string(),
+                value: "my_flag".to_string(),
+            },
+            &ReferenceHint::Unknown,
+            Some("effect"),
+            None,
+            &[],
+            ScopeTable {
+                current: Some("country"),
+                root: Some("country"), // Root == Scope, should be omitted
+                prev: None,            // Prev absent, should be omitted
+                from: &["country".to_string()], // From == Scope, but FROM always shown
+            },
+            false,
+        );
+        assert!(md.contains("**Scope**: country"), "got: {}", md);
+        assert!(!md.contains("**Root**"), "got: {}", md);
+        assert!(!md.contains("**Prev**"), "got: {}", md);
+        assert!(md.contains("**From**: country"), "got: {}", md);
+        assert!(!md.contains("**From.From**"), "got: {}", md);
     }
 }

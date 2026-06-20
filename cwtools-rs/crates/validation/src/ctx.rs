@@ -12,6 +12,7 @@ use cwtools_localization::LocIndex;
 use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 /// Immutable shared context for one file's validation pass. Holds only borrows,
@@ -27,4 +28,21 @@ pub(crate) struct ValidationCtx<'a> {
     pub(crate) loc_index: Option<&'a LocIndex>,
     pub(crate) scope_checks: bool,
     pub(crate) var_checks: bool,
+    /// Stack of implicit/explicit loop-variable names (normalized) in scope for
+    /// the block currently being validated. Loop effects (`for_each_loop`, …)
+    /// expose `value`/`index`/`break` temp variables their body can read bare;
+    /// entering such a block pushes the names here and leaving truncates them, so
+    /// a bare read in the body isn't flagged CW246 without leaking the names to
+    /// sibling/parent blocks. The single `ValidationCtx` is shared by `&`, so
+    /// this uses interior mutability.
+    pub(crate) loop_vars: RefCell<Vec<String>>,
+}
+
+impl ValidationCtx<'_> {
+    /// Whether `name`, normalized the same way the variable index is, currently
+    /// names a loop-local variable in scope.
+    pub(crate) fn is_loop_var(&self, name: &str) -> bool {
+        let norm = cwtools_index::VarIndex::normalize(name);
+        self.loop_vars.borrow().contains(&norm)
+    }
 }

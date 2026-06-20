@@ -307,22 +307,61 @@ fn collect_value_sets_in(
                 }
             }
             (Value::Clause(sub), Some(ns)) => {
-                // Block form: the member lives in a well-known child.
-                const NAME_KEYS: &[&str] = &["flag", "name", "token", "var", "variable"];
-                for c in sub {
-                    let Child::Leaf(cidx) = c else { continue };
-                    let cl = &ast.arena.leaves[*cidx as usize];
-                    let is_name_key = table
-                        .with_string(cl.key.normal, |s| {
-                            NAME_KEYS.iter().any(|k| s.eq_ignore_ascii_case(k))
+                // Block form: the member is the value of the child bound to
+                // `value_set[ns]` in the rules (e.g. `flag`, `token_base`, `id`).
+                let bindings = table
+                    .with_string(leaf.key.normal, |s| {
+                        LOWER_BUF.with(|buf| {
+                            let mut key = buf.borrow_mut();
+                            key.clear();
+                            key.extend(s.chars().map(|c| c.to_ascii_lowercase()));
+                            ruleset.value_set_effect_fields.get(key.as_str()).cloned()
                         })
-                        .unwrap_or(false);
-                    if is_name_key
-                        && let Value::String(t) | Value::QString(t) = &cl.value
-                        && let Some(v) = table.get_string(t.normal)
-                    {
-                        push_member(out, ns.clone(), v);
-                        break;
+                    })
+                    .flatten();
+                if let Some(bindings) = bindings.filter(|b| !b.is_empty()) {
+                    // Capture every binding field's value into its declared set.
+                    // A single block can bind several sets (different keys → sets).
+                    for c in sub {
+                        let Child::Leaf(cidx) = c else { continue };
+                        let cl = &ast.arena.leaves[*cidx as usize];
+                        let (Value::String(t) | Value::QString(t)) = &cl.value else {
+                            continue;
+                        };
+                        let field_ns = table
+                            .with_string(cl.key.normal, |s| {
+                                bindings
+                                    .iter()
+                                    .find(|(fk, _)| s.eq_ignore_ascii_case(fk))
+                                    .map(|(_, n)| n.clone())
+                            })
+                            .flatten();
+                        if let Some(field_ns) = field_ns
+                            && field_ns != "variable"
+                            && let Some(v) = table.get_string(t.normal)
+                        {
+                            push_member(out, field_ns, v);
+                        }
+                    }
+                } else {
+                    // No binding-field info — fall back to the fixed-key heuristic
+                    // for the common flag/name/token block shapes.
+                    const NAME_KEYS: &[&str] = &["flag", "name", "token", "var", "variable"];
+                    for c in sub {
+                        let Child::Leaf(cidx) = c else { continue };
+                        let cl = &ast.arena.leaves[*cidx as usize];
+                        let is_name_key = table
+                            .with_string(cl.key.normal, |s| {
+                                NAME_KEYS.iter().any(|k| s.eq_ignore_ascii_case(k))
+                            })
+                            .unwrap_or(false);
+                        if is_name_key
+                            && let Value::String(t) | Value::QString(t) = &cl.value
+                            && let Some(v) = table.get_string(t.normal)
+                        {
+                            push_member(out, ns.clone(), v);
+                            break;
+                        }
                     }
                 }
                 collect_value_sets_in(sub, ast, ruleset, table, out);
@@ -468,6 +507,42 @@ alias[effect:set_country_flag] = {
         assert!(vals.contains(&"simple_flag".to_string()), "got {:?}", vals);
         assert!(vals.contains(&"stamped_flag".to_string()));
         assert!(vals.contains(&"block_flag".to_string()));
+    }
+
+    #[test]
+    fn value_set_member_under_nonobvious_block_key() {
+        // The member lives under `token_base`, which is NOT one of the fixed
+        // NAME_KEYS guesses. The collector must read the field actually bound
+        // to `value_set[character_token]` in the rules, and must NOT capture the
+        // sibling `name = localisation` value as a token.
+        let table = StringTable::new();
+        let mut rs = ruleset_from(
+            r#"
+alias[effect:generate_character] = {
+    token_base = value_set[character_token]
+    name = localisation
+}
+"#,
+            &table,
+        );
+        rs.reindex();
+        let file = parse_string(
+            "my_effect = {\n\tgenerate_character = {\n\t\ttoken_base = empowered_legislative\n\t\tname = NAME_x\n\t}\n}\n",
+            &table,
+        )
+        .unwrap();
+        let got = collect_value_set_members(&rs, &file, &table);
+        let tokens = got
+            .get("character_token")
+            .expect("character_token collected");
+        assert!(
+            tokens.contains(&"empowered_legislative".to_string()),
+            "token_base value must be collected, got {tokens:?}",
+        );
+        assert!(
+            !tokens.contains(&"NAME_x".to_string()),
+            "the name= sibling must not be collected as a token, got {tokens:?}",
+        );
     }
 
     #[test]

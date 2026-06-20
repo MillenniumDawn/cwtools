@@ -101,6 +101,7 @@ pub fn rules_at_pos(
         loc_index: prepared.loc_index,
         scope_checks: prepared.scope_checks,
         var_checks: prepared.var_checks,
+        loop_vars: std::cell::RefCell::new(Vec::new()),
     };
 
     // type_per_file: the whole file is one instance; root children are its body.

@@ -55,6 +55,14 @@ pub struct RuleSet {
     /// tokens, …) for completion. Aliases declaring multiple namespaces keep
     /// the first found.
     pub value_set_effects: std::collections::HashMap<String, String>,
+    /// Built by `reindex()`: lowercased effect/trigger alias key -> the
+    /// `(binding_field_key, namespace)` pairs declared by a NESTED field in its
+    /// block body (e.g. `generate_character` -> `[("token_base", "character_token")]`,
+    /// `set_country_flag` -> `[("flag", "country_flag")]`). Lets the value-set
+    /// collector capture the value of the exact field bound to `value_set[ns]`
+    /// instead of guessing from a fixed key list, so members under non-obvious keys
+    /// (`token_base`, `id`, `legacy_id`, `array`, …) are still collected.
+    pub value_set_effect_fields: std::collections::HashMap<String, Vec<(String, String)>>,
 }
 
 /// Scope/link config inputs (`scopes.cwt` / `links.cwt`). The types live in the
@@ -195,6 +203,7 @@ impl RuleSet {
             enum_by_name: std::collections::HashMap::new(),
             type_rules_idx: std::collections::HashMap::new(),
             value_set_effects: std::collections::HashMap::new(),
+            value_set_effect_fields: std::collections::HashMap::new(),
         }
     }
 
@@ -204,6 +213,7 @@ impl RuleSet {
         self.alias_exact.clear();
         self.alias_categories.clear();
         self.value_set_effects.clear();
+        self.value_set_effect_fields.clear();
         // Which value_set namespace (if any) a rule tree declares.
         fn first_value_set_ns(rule: &RuleType) -> Option<&str> {
             fn of_field(f: &NewField) -> Option<&str> {
@@ -222,14 +232,54 @@ impl RuleSet {
                 }
             }
         }
+        // Every `<specific_key> = value_set[ns]` binding reachable in a rule tree,
+        // as `(key, ns)` pairs (see `value_set_effect_fields`).
+        fn collect_binding_fields(rule: &RuleType, out: &mut Vec<(String, String)>) {
+            match rule {
+                RuleType::LeafRule {
+                    left: NewField::SpecificField(key),
+                    right: NewField::VariableSetField(ns),
+                } => out.push((key.to_ascii_lowercase(), ns.clone())),
+                RuleType::NodeRule { left, rules } => {
+                    if let NewField::SpecificField(key) = left {
+                        for (rt, _) in rules {
+                            if let RuleType::LeafValueRule {
+                                right: NewField::VariableSetField(ns),
+                            } = rt
+                            {
+                                out.push((key.to_ascii_lowercase(), ns.clone()));
+                            }
+                        }
+                    }
+                    for (rt, _) in rules {
+                        collect_binding_fields(rt, out);
+                    }
+                }
+                RuleType::ValueClauseRule { rules } | RuleType::SubtypeRule { rules, .. } => {
+                    for (rt, _) in rules {
+                        collect_binding_fields(rt, out);
+                    }
+                }
+                _ => {}
+            }
+        }
         for (i, (name, (rule, _))) in self.aliases.iter().enumerate() {
             if let Some((cat, key)) = name.split_once(':')
                 && (cat == "effect" || cat == "trigger")
-                && let Some(ns) = first_value_set_ns(rule)
             {
-                self.value_set_effects
-                    .entry(key.to_ascii_lowercase())
-                    .or_insert_with(|| ns.to_string());
+                if let Some(ns) = first_value_set_ns(rule) {
+                    self.value_set_effects
+                        .entry(key.to_ascii_lowercase())
+                        .or_insert_with(|| ns.to_string());
+                }
+                let mut fields = Vec::new();
+                collect_binding_fields(rule, &mut fields);
+                if !fields.is_empty() {
+                    self.value_set_effect_fields
+                        .entry(key.to_ascii_lowercase())
+                        .or_default()
+                        .extend(fields);
+                }
             }
             // Store under the original category+key AND the all-lowercase variant
             // so that game-file keys like `instantTextboxType` (mixed case) match

@@ -914,3 +914,126 @@ types = {
         errs
     );
 }
+
+/// Regression (issue #29): a character created by `generate_character` via
+/// `token_base = <name>` is collected into the `character_token` value-set, and a
+/// `from_data` scope link (`character_token`, `data_source = value[character_token]`)
+/// lets that name open its own scope. So `<name> = { set_character_flag = ... }`
+/// must NOT flag CW262 "Unexpected block". The trigger form `has_character = <name>`
+/// was never flagged; only the scope use was.
+#[test]
+fn test_value_set_member_is_valid_scope_key() {
+    // Mirrors the real HOI4 config: generate_character binds `token_base` to the
+    // `character_token` value-set, and links.cwt declares a from-data scope link
+    // whose data_source is `value[character_token]`.
+    let cwt = r#"
+links = {
+    character_token = {
+        output_scope = character
+        input_scopes = country
+        from_data = yes
+        data_source = value[character_token]
+    }
+}
+
+types = {
+    type[evt] = {
+        path = "game/events"
+    }
+}
+
+evt = {
+    effect = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+}
+
+alias[effect:scope_field] = {
+    alias_name[effect] = alias_match_left[effect]
+}
+
+alias[effect:generate_character] = {
+    token_base = value_set[character_token]
+}
+
+alias[effect:set_character_flag] = value_set[character_flag]
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let mut ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    ruleset.reindex();
+
+    // (a) Collect the value-set member from `token_base = empowered_legislative`,
+    // exactly as the indexing pass feeds TypeIndex.value_set_values at runtime.
+    let define = parse_string(
+        "evt = { effect = { generate_character = { token_base = empowered_legislative } } }\n",
+        &table,
+    )
+    .unwrap();
+    let members =
+        cwtools_index::dynamic_values::collect_value_set_members(&ruleset, &define, &table);
+    assert!(
+        members
+            .get("character_token")
+            .is_some_and(|v| v.iter().any(|m| m == "empowered_legislative")),
+        "expected `empowered_legislative` collected into the `character_token` \
+         value-set, got: {members:?}",
+    );
+
+    let mut idx = TypeIndex::new();
+    idx.value_set_values
+        .merge_file("file://define.txt", members);
+
+    // (b) The scope use `empowered_legislative = { ... }` must validate (no CW262).
+    let script = r#"
+evt = {
+    effect = {
+        empowered_legislative = {
+            set_character_flag = is_generic
+        }
+    }
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errors = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/events/test.txt",
+        Some(cwtools_game::constants::Game::Hoi4),
+        Some(&idx),
+        None,
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|e| e.message.contains("empowered_legislative") || e.code == Some("CW262")),
+        "value-set member used as a scope key must not flag, got: {errors:?}",
+    );
+
+    // (c) Negative: a key that is NOT a value-set member, scope command, link, or
+    // type instance still flags as an unexpected block.
+    let bad = r#"
+evt = {
+    effect = {
+        notathing = {
+            set_character_flag = is_generic
+        }
+    }
+}
+"#;
+    let parsed_bad = parse_string(bad, &table).unwrap();
+    let errors_bad = validate_ast(
+        &parsed_bad,
+        &ruleset,
+        &table,
+        "game/events/test.txt",
+        Some(cwtools_game::constants::Game::Hoi4),
+        Some(&idx),
+        None,
+    );
+    assert!(
+        errors_bad.iter().any(|e| e.message.contains("notathing")),
+        "a truly unknown scope key must still flag, got: {errors_bad:?}",
+    );
+}

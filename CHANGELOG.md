@@ -1,3 +1,16 @@
+# 1.7.0
+
+## Bug Fixes
+- A variable carrying a null-coalescing default selector (`my_var?150`) lexes as one key instead of splitting at the `?`; the `my_var?150 = { ... }` and `my_var?150 = 100` forms are no longer reported as an unexpected value plus an orphan block (CW264/CW265)
+- A character created by `generate_character` (`token_base = ...`) can be used as a scope (`<token> = { ... }`) instead of being flagged (CW262); value-sets defined in mod files are now collected (previously vanilla-only) and read from the field the rule actually binds rather than a fixed key guess
+- Loop effects (`for_each_loop` and friends) seed their implicit `v`/`i`/`break` temp variables, and any explicitly named `value`/`index`/`break`, so the body can read them without being flagged as unset (CW246)
+
+## Changed
+- Hover shows ROOT, PREV, FROM, and FROM.FROM next to the current scope, restoring the scope table
+
+## Developer
+- The language server warns when the rules directory it is given does not exist, mirroring the vanilla-dir check, which helps diagnose an unresolved Windows `rules_folder`
+
 # 1.6.0
 
 ## Bug Fixes
