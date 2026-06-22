@@ -227,7 +227,10 @@ pub(crate) fn parse_replace_scopes_from_comments(comments: &[String]) -> Option<
         let Some(value) = tokens.next() else {
             break;
         };
-        match key {
+        // Keys are case-insensitive: HOI4 config writes them uppercase
+        // (`THIS = state ROOT = state`, operations.cwt) while other rules use
+        // lowercase (`this = state`, state-history).
+        match key.to_ascii_lowercase().as_str() {
             "this" => this = Some(value.to_string()),
             "root" => root = Some(value.to_string()),
             "from" => {
