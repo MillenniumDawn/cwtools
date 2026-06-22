@@ -61,7 +61,7 @@ parking_lot = "0.12"
 rayon = "1.10"
 rustc-hash = "2.1"
 smallvec = { version = "1", features = ["union"] }
-criterion = "0.5"
+criterion = "0.8"
 
 # Strip symbols and run fat LTO on release builds. Smaller, less "packed-looking"
 # binaries draw fewer antivirus false positives (the server exe is unsigned), and
