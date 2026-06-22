@@ -143,6 +143,15 @@ fn is_loc_dir_name(name: &str) -> bool {
     lower == "localisation" || lower == "localization"
 }
 
+/// Tooling / VCS directories that never hold game loc. Skipped during the walk so
+/// a mirror of the mod tree (e.g. a `.claude/worktrees/<wt>/localisation`, a
+/// `.git` checkout, or `node_modules`) isn't loaded and double-counted. Mirrors
+/// the intent of `FileManager`'s `exclude_dirs` for the separate loc walker. Any
+/// dot-directory is skipped, covering `.git`/`.claude`/`.vscode`/`.idea`/`.vs`.
+fn is_excluded_loc_dir(name: &str) -> bool {
+    name.starts_with('.') || matches!(name, "node_modules" | "target")
+}
+
 fn walk_folder(folder: &std::path::Path) -> Vec<WalkedFile> {
     // Only files under a `localisation` (or `localization`) directory are loc —
     // that's what the game and F# load. Scanning every `.yml` in the tree pulls
@@ -160,11 +169,11 @@ fn walk_folder_inner(folder: &std::path::Path, in_loc: bool) -> Vec<WalkedFile> 
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            let child_in_loc = in_loc
-                || path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(is_loc_dir_name);
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if is_excluded_loc_dir(dir_name) {
+                continue;
+            }
+            let child_in_loc = in_loc || is_loc_dir_name(dir_name);
             files.extend(walk_folder_inner(&path, child_in_loc));
         } else if in_loc
             && matches!(
@@ -189,4 +198,28 @@ fn walk_folder_inner(folder: &std::path::Path, in_loc: bool) -> Vec<WalkedFile> 
     }
 
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excluded_loc_dirs_skip_tooling_not_content() {
+        // Tooling / VCS / mirror dirs are skipped so a duplicated mod tree under
+        // them isn't double-counted; real content dirs are kept.
+        for skip in [
+            ".claude",
+            ".git",
+            ".vscode",
+            ".idea",
+            "node_modules",
+            "target",
+        ] {
+            assert!(is_excluded_loc_dir(skip), "{skip} should be skipped");
+        }
+        for keep in ["localisation", "localization", "common", "english"] {
+            assert!(!is_excluded_loc_dir(keep), "{keep} should be walked");
+        }
+    }
 }

@@ -225,6 +225,10 @@ impl Default for FileManagerConfig {
             ],
             exclude_dirs: vec![
                 ".git".into(),
+                // Claude Code tooling dir. Holds git worktrees that mirror the
+                // whole mod tree; walking it double-counts every file (e.g. the
+                // loc set), so skip it like .git. Never game content.
+                ".claude".into(),
                 "target".into(),
                 ".vs".into(),
                 "node_modules".into(),
