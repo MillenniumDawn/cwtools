@@ -1656,7 +1656,7 @@ fn validate_leaf(
             // subtype-reference validation would need full membership, as F#'s
             // invertedTypeMap has.)
             if let Some(idx) = type_index
-                && !type_name.contains('.')
+                && !cwtools_index::is_subtype_key(type_name)
             {
                 // Only flag when the index is complete (vanilla loaded) AND we have
                 // known instances for this type AND the reference doesn't resolve.

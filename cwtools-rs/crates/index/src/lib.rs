@@ -282,6 +282,18 @@ impl VarIndex {
     }
 }
 
+/// Whether an index key is a subtype-qualified membership key (`"type.subtype"`,
+/// produced by [`SubtypeCollector`]) rather than a plain `type` key. The `.`
+/// separator is the discriminator: CWT `type[...]` names are bare identifiers and
+/// never contain a dot, so any key with one is a subtype membership entry. Such
+/// keys feed `contains` (so `<type.subtype>` references resolve) but are kept out
+/// of `name_counts` / document-symbol output. This invariant is relied on in
+/// `merge`, `remove_file`, `instances_in_file`, and the validator's CW500 check,
+/// so it lives here in one place.
+pub fn is_subtype_key(type_name: &str) -> bool {
+    type_name.contains('.')
+}
+
 #[derive(Debug, Default)]
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
@@ -384,7 +396,7 @@ impl TypeIndex {
             // Skip subtype-qualified membership keys: the instance already
             // appears under its base `type`, so listing it again would duplicate
             // the outline / document-symbol entry.
-            if type_name.contains('.') {
+            if is_subtype_key(type_name) {
                 continue;
             }
             for (uri, inst) in entries {
@@ -407,12 +419,12 @@ impl TypeIndex {
     pub fn merge(&mut self, file_uri: &str, per_type: HashMap<String, Vec<TypeInstance>>) {
         let uri: Arc<str> = Arc::from(file_uri);
         for (type_name, instances) in per_type {
-            let is_subtype_key = type_name.contains('.');
+            let subtype_key = is_subtype_key(&type_name);
             let set = self.instance_sets.entry(type_name.clone()).or_default();
             let entry = self.map.entry(type_name).or_default();
             for inst in instances {
                 let lower = inst.name.to_ascii_lowercase();
-                if !is_subtype_key {
+                if !subtype_key {
                     *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
                 }
                 *set.entry(lower).or_insert(0) += 1;
@@ -428,12 +440,12 @@ impl TypeIndex {
         for (type_name, v) in self.map.iter_mut() {
             // Subtype-qualified keys never contributed to `name_counts` (see
             // `merge`), so they must not decrement it here.
-            let is_subtype_key = type_name.contains('.');
+            let subtype_key = is_subtype_key(type_name);
             v.retain(|(uri, inst)| {
                 let keep = uri.as_ref() != file_uri;
                 if !keep {
                     let lower = inst.name.to_ascii_lowercase();
-                    if !is_subtype_key && let Some(count) = self.name_counts.get_mut(&lower) {
+                    if !subtype_key && let Some(count) = self.name_counts.get_mut(&lower) {
                         *count -= 1;
                         if *count == 0 {
                             self.name_counts.remove(&lower);
@@ -717,14 +729,21 @@ fn collect_skip_root_child(
 pub type SubtypeCollector =
     fn(&RuleSet, &ParsedFile, &str, &StringTable) -> HashMap<String, Vec<TypeInstance>>;
 
-/// Visit every type *instance node* in `file`, invoking `f` with the matched
-/// type, the resolved instance name, the node's own key, and the node's clause
-/// children. Mirrors [`collect_type_instances`]'s navigation (path filter +
-/// skip_root_key + type_key_filter + name_field) but exposes the node body so a
-/// caller can compute per-instance facts (e.g. which subtypes are active).
+/// Visit every type *instance node* in `file` whose type declares subtypes,
+/// invoking `f` with the matched type, the resolved instance name, the node's own
+/// key, and the node's clause children. Mirrors [`collect_type_instances`]'s
+/// navigation (path filter + skip_root_key + type_key_filter + name_field) but
+/// exposes the node body so a caller can compute per-instance facts (e.g. which
+/// subtypes are active).
 ///
-/// `type_per_file` types are skipped — the file *is* the instance, so there is no
-/// node body to inspect for subtypes.
+/// Types with no subtypes are skipped: the sole purpose here is computing
+/// subtype membership, so walking (and resolving the name of) instances that can
+/// have no subtype facts is wasted work — and most types declare no subtypes, so
+/// the skip avoids a second full instance navigation across the corpus on top of
+/// [`collect_type_instances`].
+///
+/// `type_per_file` types are also skipped — the file *is* the instance, so there
+/// is no node body to inspect for subtypes.
 pub fn for_each_instance_node<F>(
     ruleset: &RuleSet,
     file: &ParsedFile,
@@ -735,7 +754,10 @@ pub fn for_each_instance_node<F>(
     F: FnMut(&TypeDefinition, &str, &str, &[Child], SourceLocation),
 {
     for td in &ruleset.types {
-        if td.type_per_file || !check_path_dir(&td.path_options, logical_path) {
+        if td.type_per_file
+            || td.subtypes.is_empty()
+            || !check_path_dir(&td.path_options, logical_path)
+        {
             continue;
         }
         for child in &file.root_children {

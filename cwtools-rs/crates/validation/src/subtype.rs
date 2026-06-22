@@ -34,9 +34,7 @@ pub fn collect_subtype_instances(
         logical_path,
         table,
         &mut |td, name, node_key, children, location| {
-            if td.subtypes.is_empty() {
-                return;
-            }
+            // `for_each_instance_node` only visits types that declare subtypes.
             for st in &td.subtypes {
                 if subtype_matches(st, children, file, table, ruleset, Some(node_key), None) {
                     out.entry(format!("{}.{}", td.name, st.name))
