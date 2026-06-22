@@ -360,14 +360,14 @@ pub fn is_loc_value_char(c: char) -> bool {
     || (0x0020..=0x007E).contains(&u)
     // U+00A0–U+024F  (Latin Extended)
     || (0x00A0..=0x024F).contains(&u)
-    // U+0401–U+045F  (Cyrillic)
-    || (0x0401..=0x045F).contains(&u)
-    // U+0490–U+0491  (Cyrillic supplement)
-    || (0x0490..=0x0491).contains(&u)
+    // U+0400–U+052F  (Cyrillic + Cyrillic Supplement: Komi, Kazakh, Abkhaz, …)
+    || (0x0400..=0x052F).contains(&u)
     // U+1E00–U+1EFF  (Latin Extended Additional)
     || (0x1E00..=0x1EFF).contains(&u)
-    // U+2013–U+2044  (General Punctuation subset)
-    || (0x2013..=0x2044).contains(&u)
+    // U+2010–U+2044  (General Punctuation: hyphens/dashes/quotes. Lower bound is
+    // U+2010 on purpose — the invisible U+2007 figure space and U+200B–200F
+    // format marks sit below it and stay flagged as junk.)
+    || (0x2010..=0x2044).contains(&u)
     // U+2460–U+24FF  (Enclosed Alphanumerics)
     || (0x2460..=0x24FF).contains(&u)
     // U+4E00–U+9FFF  (CJK Unified Ideographs)
@@ -397,6 +397,29 @@ pub fn is_loc_value_char(c: char) -> bool {
     || (0xFB50..=0xFDFF).contains(&u)
     // U+FE70–U+FEFF  (Arabic Presentation Forms-B)
     || (0xFE70..=0xFEFF).contains(&u)
+    // ── Further scripts/symbols the game renders but the original ranges missed
+    // (CW275 false positives in real loc). None of these overlap the invisible
+    // junk above, so genuine zero-width/format characters stay flagged. ──
+    // U+0250–U+02FF  (IPA Extensions + Spacing Modifier Letters: ə, ʼ, half-rings)
+    || (0x0250..=0x02FF).contains(&u)
+    // U+0300–U+036F  (Combining Diacritical Marks)
+    || (0x0300..=0x036F).contains(&u)
+    // U+0370–U+03FF  (Greek and Coptic)
+    || (0x0370..=0x03FF).contains(&u)
+    // U+0531–U+058F  (Armenian)
+    || (0x0531..=0x058F).contains(&u)
+    // U+0900–U+097F  (Devanagari)
+    || (0x0900..=0x097F).contains(&u)
+    // U+1200–U+137F  (Ethiopic)
+    || (0x1200..=0x137F).contains(&u)
+    // U+20A0–U+20CF  (Currency Symbols: €)
+    || (0x20A0..=0x20CF).contains(&u)
+    // U+2100–U+218F  (Letterlike Symbols + Number Forms: №, Roman numerals)
+    || (0x2100..=0x218F).contains(&u)
+    // U+2190–U+21FF  (Arrows: →)
+    || (0x2190..=0x21FF).contains(&u)
+    // U+2D30–U+2D7F  (Tifinagh)
+    || (0x2D30..=0x2D7F).contains(&u)
 }
 
 /// Scan `desc` for the first character that fails `is_loc_value_char`.
@@ -434,6 +457,57 @@ mod tests {
             assert!(
                 is_loc_value_char(c),
                 "char {c:?} (U+{:04X}) should be valid",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn loc_value_char_accepts_additional_legit_scripts_and_symbols() {
+        // Real scripts/symbols the game renders that were missing from the
+        // allow-list (CW275 false positives in the MD corpus).
+        for c in [
+            '\u{2116}', // № numero sign
+            '\u{2192}', // → rightwards arrow
+            '\u{20AC}', // € euro sign
+            '\u{2011}', // non-breaking hyphen
+            '\u{2161}', // Ⅱ roman numeral two
+            '\u{0301}', // combining acute accent
+            '\u{0307}', // combining dot above
+            '\u{0259}', // ə latin schwa (IPA)
+            '\u{02BC}', // ʼ modifier letter apostrophe
+            '\u{02BF}', // modifier letter left half ring
+            '\u{0540}', // Հ Armenian
+            '\u{0531}', // Ա Armenian
+            '\u{03BF}', // ο Greek
+            '\u{050C}', // Ԍ Cyrillic (Komi)
+            '\u{049B}', // қ Cyrillic (Kazakh)
+            '\u{2D63}', // Tifinagh yaz
+            '\u{12E8}', // Ethiopic
+            '\u{0915}', // क Devanagari ka
+        ] {
+            assert!(
+                is_loc_value_char(c),
+                "char U+{:04X} should be valid",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn loc_value_char_still_rejects_invisible_junk() {
+        // Invisible / control characters pasted from web sources stay flagged —
+        // widening the allow-list must not let these through.
+        for c in [
+            '\u{200B}', // zero width space
+            '\u{2007}', // figure space
+            '\u{200E}', // left-to-right mark
+            '\u{0009}', // tab
+            '\u{FFFD}', // replacement char (mojibake)
+        ] {
+            assert!(
+                !is_loc_value_char(c),
+                "char U+{:04X} should remain invalid",
                 c as u32
             );
         }

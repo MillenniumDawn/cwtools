@@ -8,6 +8,50 @@ use rustc_hash::FxHashMap;
 use crate::common::child_key_matches;
 use crate::rule_core::field_matches_value;
 
+/// Derive a file's subtype-qualified membership: for every type instance, which
+/// of its subtypes are active, keyed `"type.subtype" -> [instances]`. Merged into
+/// the [`cwtools_index::TypeIndex`] so `<type.subtype>` references (e.g.
+/// `archetype = <equipment.naval_equip>`) resolve.
+///
+/// Membership is computed from each instance's *own* discriminators with no
+/// type index (`type_index = None`), so a subtype that only activates via a
+/// `<type.subtype>` back-reference is intentionally NOT recorded here: an
+/// archetype self-determines from a direct discriminator (`type = enum[...]`,
+/// `is_archetype = yes`), and that is exactly what a referencing variant needs to
+/// resolve its `archetype = <type.subtype>` at validation time. Plugged into
+/// [`cwtools_index::index_discovered_files`] as a [`cwtools_index::SubtypeCollector`].
+pub fn collect_subtype_instances(
+    ruleset: &RuleSet,
+    file: &ParsedFile,
+    logical_path: &str,
+    table: &StringTable,
+) -> std::collections::HashMap<String, Vec<cwtools_index::TypeInstance>> {
+    let mut out: std::collections::HashMap<String, Vec<cwtools_index::TypeInstance>> =
+        Default::default();
+    cwtools_index::for_each_instance_node(
+        ruleset,
+        file,
+        logical_path,
+        table,
+        &mut |td, name, node_key, children, location| {
+            if td.subtypes.is_empty() {
+                return;
+            }
+            for st in &td.subtypes {
+                if subtype_matches(st, children, file, table, ruleset, Some(node_key), None) {
+                    out.entry(format!("{}.{}", td.name, st.name))
+                        .or_default()
+                        .push(cwtools_index::TypeInstance {
+                            name: name.to_string(),
+                            location,
+                        });
+                }
+            }
+        },
+    );
+    out
+}
+
 /// Test whether a subtype's rules are satisfied by an entity's children.
 ///
 /// A subtype is active unless one of its rules is violated:

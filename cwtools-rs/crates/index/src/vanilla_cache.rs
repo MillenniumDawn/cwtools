@@ -36,7 +36,11 @@ const MAGIC: &[u8; 4] = b"CWV\x00";
 // and adds loc keys, file paths, and variable names. Older JSON files fail the
 // magic check and are treated as a cache miss (rebuilt).
 // v5 adds complex-enum members and value_set members (completion data).
-const CACHE_VERSION: u8 = 5;
+// v6 adds subtype-qualified membership keys (`type.subtype`) to the cached
+// instances so `<type.subtype>` references into base-game content resolve. v5
+// caches lack them, so they must rebuild (else e.g. naval equipment variants
+// referencing a vanilla archetype lose their subtype).
+const CACHE_VERSION: u8 = 6;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CachedInstance {

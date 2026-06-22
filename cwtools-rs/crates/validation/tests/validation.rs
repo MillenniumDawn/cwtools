@@ -183,6 +183,199 @@ event = {
 }
 
 #[test]
+fn empty_string_typefield_value_is_not_flagged() {
+    // `soundeffect = ""` / `textureFile = ""` in vanilla + mods — the game treats
+    // an empty value as "none", so an empty TypeField value must not be checked
+    // against the instance set (CW500 false positive).
+    let cwt = r#"
+event = {
+    ## cardinality = 0..inf
+    requires_technology = <technology>
+}
+types = {
+    type[event] = {
+        path = "game/events"
+    }
+    type[technology] = {
+        path = "game/common/technology"
+    }
+}
+"#;
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+
+    let mut idx = TypeIndex::new();
+    let mut map = HashMap::new();
+    map.insert(
+        "technology".to_string(),
+        vec![TypeInstance {
+            name: "my_tech_alpha".to_string(),
+            location: SourceLocation { line: 1, col: 0 },
+        }],
+    );
+    idx.merge("file://tech.txt", map);
+    idx.complete = true;
+
+    let script_empty = r#"
+event = {
+    requires_technology = ""
+}
+"#;
+    let parsed = parse_string(script_empty, &table).unwrap();
+    let errs = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/events/test.txt",
+        None,
+        Some(&idx),
+        None,
+    );
+    let type_errs: Vec<_> = errs.iter().filter(|e| e.code == Some("CW500")).collect();
+    assert!(
+        type_errs.is_empty(),
+        "empty-string value must not be flagged as a missing type instance, got: {:?}",
+        errs
+    );
+}
+
+const TEXTURE_CWT: &str = r#"
+spriteType = {
+    texturefile = filepath
+    secondfile = filepath
+}
+types = {
+    type[spriteType] = {
+        path = "game/interface"
+    }
+}
+"#;
+
+#[test]
+fn texture_reference_resolves_via_sibling_extension() {
+    // The engine resolves textures by stem: a `.tga` reference is satisfied by a
+    // shipped `.dds` and vice versa (vanilla `core.gfx` points at `.tga` files
+    // while only the `.dds` ships). CW113 must not fire when the sibling exists.
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table).unwrap(), &table);
+
+    let mut idx = TypeIndex::new();
+    idx.file_index.add_paths([
+        "gfx/test/button.dds".to_string(),
+        "gfx/test/icon.tga".to_string(),
+    ]);
+
+    let script = r#"
+spriteType = {
+    texturefile = "gfx/test/button.tga"
+    secondfile = "gfx/test/icon.dds"
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errs = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/interface/test.gfx",
+        Some(cwtools_validation::Game::Hoi4),
+        Some(&idx),
+        None,
+    );
+    let cw113: Vec<_> = errs.iter().filter(|e| e.code == Some("CW113")).collect();
+    assert!(
+        cw113.is_empty(),
+        "texture references should resolve via their sibling extension, got: {:?}",
+        cw113
+    );
+}
+
+#[test]
+fn missing_texture_with_no_sibling_still_flagged() {
+    // Regression guard against blanket-suppressing texture CW113: a reference with
+    // neither extension present on disk (genuinely missing asset) must still flag.
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table).unwrap(), &table);
+
+    let mut idx = TypeIndex::new();
+    idx.file_index
+        .add_paths(["gfx/test/button.dds".to_string()]);
+
+    let script = r#"
+spriteType = {
+    texturefile = "gfx/test/ghost.tga"
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errs = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/interface/test.gfx",
+        Some(cwtools_validation::Game::Hoi4),
+        Some(&idx),
+        None,
+    );
+    let cw113: Vec<_> = errs.iter().filter(|e| e.code == Some("CW113")).collect();
+    assert_eq!(
+        cw113.len(),
+        1,
+        "a texture missing in both extensions must still be flagged, got: {:?}",
+        errs
+    );
+}
+
+#[test]
+fn sound_asset_file_resolves_beside_the_asset() {
+    // A sound `.asset` `file =` resolves relative to the .asset's own directory,
+    // not the field's `sound/` root prefix (CW113 false positive).
+    let cwt = r#"
+sound = {
+    name = scalar
+    file = filepath[sound/]
+}
+types = {
+    type[sound] = {
+        path = "game/sound"
+    }
+}
+"#;
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(cwt, &table).unwrap(), &table);
+
+    let mut idx = TypeIndex::new();
+    // The .asset itself is indexed (so its root-relative dir can be recovered)
+    // and the referenced .wav lives beside it — but NOT under bare `sound/`.
+    idx.file_index.add_paths([
+        "sound/zom/zom_vo.asset".to_string(),
+        "sound/zom/zom_idle_001.wav".to_string(),
+    ]);
+
+    let script = r#"
+sound = {
+    name = "zom_idle_001"
+    file = "zom_idle_001.wav"
+}
+"#;
+    let parsed = parse_string(script, &table).unwrap();
+    let errs = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "/game/root/sound/zom/zom_vo.asset",
+        Some(cwtools_validation::Game::Hoi4),
+        Some(&idx),
+        None,
+    );
+    let cw113: Vec<_> = errs.iter().filter(|e| e.code == Some("CW113")).collect();
+    assert!(
+        cw113.is_empty(),
+        "sound file beside the .asset should resolve, got: {:?}",
+        cw113
+    );
+}
+
+#[test]
 fn test_type_index_checking() {
     // Rules: simple type reference field
     let cwt = r#"

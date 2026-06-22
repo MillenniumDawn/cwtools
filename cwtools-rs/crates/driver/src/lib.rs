@@ -193,8 +193,20 @@ impl Session {
         let per_file: Vec<PerFileResult> = parsed
             .par_iter()
             .map(|src| {
-                let instances =
+                let mut instances =
                     collect_type_instances(&ruleset, &src.parsed, &src.logical_path, &rules_table);
+                // Subtype-qualified membership (`equipment.naval_equip` …) so
+                // `<type.subtype>` references resolve. Archetypes self-determine
+                // from direct discriminators; referencing variants resolve through
+                // them at validation time.
+                for (k, v) in cwtools_validation::collect_subtype_instances(
+                    &ruleset,
+                    &src.parsed,
+                    &src.logical_path,
+                    &rules_table,
+                ) {
+                    instances.entry(k).or_default().extend(v);
+                }
                 let mut var_names: Vec<String> = Vec::new();
                 collect_set_variable_names(&src.parsed, &rules_table, &var_effects, &mut var_names);
                 // Value-set members defined in mod files (flags, character tokens,
@@ -536,7 +548,13 @@ pub fn index_game_dir(
         Ok(f) => f,
         Err(_) => return TypeIndex::new(),
     };
-    index_discovered_files(files, ruleset, table, Some(var_effects))
+    index_discovered_files(
+        files,
+        ruleset,
+        table,
+        Some(var_effects),
+        Some(cwtools_validation::collect_subtype_instances),
+    )
 }
 
 /// Override the engine's built-in folder list with the config's `folders.cwt`

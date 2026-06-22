@@ -78,7 +78,7 @@ fn loc_error_message(kind: &LocErrorKind, key: &str, lang: Option<Lang>) -> Stri
             key
         ),
         LocErrorKind::LocInvalidChars => format!(
-            "Localisation key {} contains unexpected characters, and may not render correctly",
+            "Localisation value for {} contains unexpected characters, and may not render correctly",
             key
         ),
     }
@@ -381,6 +381,25 @@ mod tests {
         let cw234: Vec<_> = diags.iter().filter(|d| d.code == "CW234").collect();
         assert_eq!(cw234.len(), 1, "got: {:?}", diags);
         assert_eq!(cw234[0].severity, LocSeverity::Information);
+    }
+
+    #[test]
+    fn invalid_chars_message_attributes_problem_to_value() {
+        // The offending characters live in the loc VALUE, not the key; the message
+        // must say so (CW275). A zero-width space (U+200B) is genuine invisible junk
+        // that stays flagged even after the allow-list is widened for real scripts.
+        let svc = service_from(&[(
+            "a_l_english.yml",
+            "l_english:\n bad_loc_entry: \"hello\u{200b}world\"\n",
+        )]);
+        let diags = validate_loc_project(&svc, Game::HOI4);
+        let cw275: Vec<_> = diags.iter().filter(|d| d.code == "CW275").collect();
+        assert_eq!(cw275.len(), 1, "got: {:?}", diags);
+        let msg = &cw275[0].message;
+        assert!(
+            msg.contains("value") && msg.contains("bad_loc_entry"),
+            "CW275 should attribute the bad characters to the value of the entry, got: {msg}"
+        );
     }
 
     fn service_with_encoding(files: &[(&str, &str, Option<FileEncoding>)]) -> LocService {

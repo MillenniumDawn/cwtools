@@ -153,6 +153,39 @@ impl FileIndex {
     pub fn paths(&self) -> impl Iterator<Item = &String> {
         self.files.iter()
     }
+
+    /// Resolve `value` as a reference made relative to `referencing_file`'s own
+    /// directory (the engine resolves a `.asset` `file =` beside the .asset, not
+    /// under a fixed root prefix). `referencing_file` is the absolute on-disk
+    /// path; its root-relative directory is recovered as the longest path-suffix
+    /// that is itself an indexed file. Returns true when the directory-relative
+    /// `value` resolves to an indexed path.
+    pub fn resolve_relative(&self, referencing_file: &str, value: &str) -> bool {
+        let segs: Vec<String> = referencing_file
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        if segs.len() < 2 {
+            return false;
+        }
+        // Longest suffix first: the first suffix that is an indexed file is the
+        // referencing file's own root-relative path. Everything before its
+        // directory is the (un-indexed) root prefix.
+        for start in 0..segs.len() - 1 {
+            let self_path = segs[start..].join("/");
+            if self.files.contains(&self_path) {
+                let dir = &segs[start..segs.len() - 1];
+                let sibling = if dir.is_empty() {
+                    value.to_string()
+                } else {
+                    format!("{}/{}", dir.join("/"), value)
+                };
+                return self.contains(&sibling);
+            }
+        }
+        false
+    }
 }
 
 /// Project-wide set of defined script-variable names (every `value_set[...]`
@@ -348,6 +381,12 @@ impl TypeIndex {
     pub fn instances_in_file<'a>(&'a self, file_uri: &str) -> Vec<(&'a str, &'a TypeInstance)> {
         let mut out = Vec::new();
         for (type_name, entries) in &self.map {
+            // Skip subtype-qualified membership keys: the instance already
+            // appears under its base `type`, so listing it again would duplicate
+            // the outline / document-symbol entry.
+            if type_name.contains('.') {
+                continue;
+            }
             for (uri, inst) in entries {
                 if uri.as_ref() == file_uri {
                     out.push((type_name.as_str(), inst));
@@ -358,14 +397,24 @@ impl TypeIndex {
     }
 
     /// Merge per-file results into the index.
+    ///
+    /// A subtype-qualified key (`"type.subtype"`, recognised by the `.`) is a
+    /// membership entry produced by [`SubtypeCollector`]. Such entries feed
+    /// `contains` (so `<type.subtype>` references resolve) but are deliberately
+    /// kept out of `name_counts` — they share the instance's name with the base
+    /// `type` entry, and double-counting would skew `is_any_instance` refcounts
+    /// and document-symbol output without adding a distinct definition.
     pub fn merge(&mut self, file_uri: &str, per_type: HashMap<String, Vec<TypeInstance>>) {
         let uri: Arc<str> = Arc::from(file_uri);
         for (type_name, instances) in per_type {
+            let is_subtype_key = type_name.contains('.');
             let set = self.instance_sets.entry(type_name.clone()).or_default();
             let entry = self.map.entry(type_name).or_default();
             for inst in instances {
                 let lower = inst.name.to_ascii_lowercase();
-                *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
+                if !is_subtype_key {
+                    *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
+                }
                 *set.entry(lower).or_insert(0) += 1;
                 entry.push((Arc::clone(&uri), inst));
             }
@@ -377,11 +426,14 @@ impl TypeIndex {
         self.complex_enum_values.remove_file(file_uri);
         self.value_set_values.remove_file(file_uri);
         for (type_name, v) in self.map.iter_mut() {
+            // Subtype-qualified keys never contributed to `name_counts` (see
+            // `merge`), so they must not decrement it here.
+            let is_subtype_key = type_name.contains('.');
             v.retain(|(uri, inst)| {
                 let keep = uri.as_ref() != file_uri;
                 if !keep {
                     let lower = inst.name.to_ascii_lowercase();
-                    if let Some(count) = self.name_counts.get_mut(&lower) {
+                    if !is_subtype_key && let Some(count) = self.name_counts.get_mut(&lower) {
                         *count -= 1;
                         if *count == 0 {
                             self.name_counts.remove(&lower);
@@ -651,6 +703,79 @@ fn collect_skip_root_child(
             if skip_root_key_matches(head, key) {
                 for inner_child in clause_children {
                     collect_skip_root_child(td, tail, inner_child, arena, table, out);
+                }
+            }
+        }
+    });
+}
+
+/// A function that derives a file's subtype-qualified instances
+/// (`"type.subtype" -> [instances]`) from its parsed AST. Implemented in the
+/// `validation` crate (it needs the subtype matcher) and injected into
+/// [`index_discovered_files`] so the index crate stays free of a validation
+/// dependency.
+pub type SubtypeCollector =
+    fn(&RuleSet, &ParsedFile, &str, &StringTable) -> HashMap<String, Vec<TypeInstance>>;
+
+/// Visit every type *instance node* in `file`, invoking `f` with the matched
+/// type, the resolved instance name, the node's own key, and the node's clause
+/// children. Mirrors [`collect_type_instances`]'s navigation (path filter +
+/// skip_root_key + type_key_filter + name_field) but exposes the node body so a
+/// caller can compute per-instance facts (e.g. which subtypes are active).
+///
+/// `type_per_file` types are skipped — the file *is* the instance, so there is no
+/// node body to inspect for subtypes.
+pub fn for_each_instance_node<F>(
+    ruleset: &RuleSet,
+    file: &ParsedFile,
+    logical_path: &str,
+    table: &StringTable,
+    f: &mut F,
+) where
+    F: FnMut(&TypeDefinition, &str, &str, &[Child], SourceLocation),
+{
+    for td in &ruleset.types {
+        if td.type_per_file || !check_path_dir(&td.path_options, logical_path) {
+            continue;
+        }
+        for child in &file.root_children {
+            walk_instance_node(td, &td.skip_root_key, child, &file.arena, table, f);
+        }
+    }
+}
+
+fn walk_instance_node<F>(
+    td: &TypeDefinition,
+    skip_stack: &[SkipRootKey],
+    child: &Child,
+    arena: &Arena,
+    table: &StringTable,
+    f: &mut F,
+) where
+    F: FnMut(&TypeDefinition, &str, &str, &[Child], SourceLocation),
+{
+    let Some(kc) = arena.keyed_clause(child) else {
+        return;
+    };
+    let clause_children = kc.children;
+    let location = SourceLocation {
+        line: kc.pos.start.line,
+        col: kc.pos.start.col,
+    };
+    table.with_string(kc.key.normal, |key| match skip_stack {
+        [] => {
+            if type_key_filter_matches(td, key)
+                && starts_with_matches(td, key)
+                && let Some(name) =
+                    instance_name_from_children(td, key, clause_children, arena, table)
+            {
+                f(td, &name, key, clause_children, location);
+            }
+        }
+        [head, tail @ ..] => {
+            if skip_root_key_matches(head, key) {
+                for inner_child in clause_children {
+                    walk_instance_node(td, tail, inner_child, arena, table, f);
                 }
             }
         }
@@ -1196,11 +1321,17 @@ pub fn collect_set_variable_defs(
 /// When `var_effects` is `Some(non_empty)`, base-game variable definitions are
 /// also folded into `index.var_index` (so a mod referencing a vanilla variable
 /// isn't flagged as unset, CW246). Pass `None` to skip variable collection.
+///
+/// When `subtype_collector` is `Some`, each file's subtype-qualified membership
+/// (`"type.subtype" -> instances`) is also merged, so `<type.subtype>` references
+/// into base-game content resolve. The collector lives in the `validation` crate
+/// (it needs the subtype matcher); see [`SubtypeCollector`].
 pub fn index_discovered_files(
     files: impl IntoIterator<Item = cwtools_file_manager::file_manager::ParsedFile>,
     ruleset: &RuleSet,
     table: &StringTable,
     var_effects: Option<&HashSet<String>>,
+    subtype_collector: Option<SubtypeCollector>,
 ) -> TypeIndex {
     use rayon::prelude::*;
 
@@ -1229,7 +1360,12 @@ pub fn index_discovered_files(
                 root_children: file.root_children,
                 errors: vec![],
             };
-            let instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
+            let mut instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
+            if let Some(collect_subtypes) = subtype_collector {
+                for (k, v) in collect_subtypes(ruleset, &pf, &file.logical_path, table) {
+                    instances.entry(k).or_default().extend(v);
+                }
+            }
             let mut var_names: Vec<String> = Vec::new();
             if let Some(effects) = var_effects {
                 collect_set_variable_names(&pf, table, effects, &mut var_names);
@@ -1317,6 +1453,33 @@ mod tests {
             names.contains("my_variable"),
             "defined variables (lowercased) must be bindable, got {:?}",
             names
+        );
+    }
+
+    #[test]
+    fn file_index_resolves_reference_relative_to_asset_dir() {
+        // A sound `.asset` `file =` resolves beside the .asset, not under the
+        // field's `sound/` root prefix. The referencing file's path is absolute;
+        // its root-relative dir is recovered as the longest indexed path-suffix.
+        let mut fi = FileIndex::new();
+        fi.add_paths([
+            "sound/zom/zom_vo.asset".to_string(),
+            "sound/zom/zom_idle_001.wav".to_string(),
+        ]);
+
+        assert!(
+            fi.resolve_relative(
+                "/home/user/Millennium-Dawn/sound/zom/zom_vo.asset",
+                "zom_idle_001.wav"
+            ),
+            "a sibling beside the .asset should resolve"
+        );
+        assert!(
+            !fi.resolve_relative(
+                "/home/user/Millennium-Dawn/sound/zom/zom_vo.asset",
+                "ku_move_007.wav"
+            ),
+            "a genuinely-missing sibling must not resolve"
         );
     }
 }
