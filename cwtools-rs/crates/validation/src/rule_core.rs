@@ -1560,6 +1560,23 @@ fn check_variable_get(
     }
 }
 
+/// The engine resolves textures by stem: a `.dds` reference is satisfied by a
+/// shipped `.tga` and vice versa (e.g. vanilla `core.gfx` points at
+/// `sort_button_83x29.tga` while only the `.dds` ships). Returns true when the
+/// candidate is a texture whose sibling-extension file exists in the index, so
+/// CW113 only fires when neither extension is present.
+fn texture_sibling_exists(candidate: &str, file_index: &cwtools_index::FileIndex) -> bool {
+    let lower = candidate.to_ascii_lowercase();
+    let sibling = if let Some(stem) = lower.strip_suffix(".dds") {
+        format!("{stem}.tga")
+    } else if let Some(stem) = lower.strip_suffix(".tga") {
+        format!("{stem}.dds")
+    } else {
+        return false;
+    };
+    file_index.contains(&sibling)
+}
+
 fn validate_leaf(
     ctx: &ValidationCtx,
     leaf: &cwtools_parser::ast::Leaf,
@@ -1589,6 +1606,11 @@ fn validate_leaf(
                 .and_then(|s| s.strip_suffix('"'))
                 .unwrap_or(&raw_value)
                 .to_string();
+            // An empty value (`soundeffect = ""`, `textureFile = ""`) is the
+            // engine's "none" — there's nothing to resolve, so don't flag it.
+            if value_str.is_empty() {
+                return;
+            }
             // A `[...]` value is inline scripted localisation / a defined_text
             // reference (e.g. `picture = "[GetCivilWarVictorPicture]"`) that the
             // engine resolves at runtime, so it can't be checked against a literal
@@ -1624,7 +1646,18 @@ fn validate_leaf(
                 }
                 _ => (value_str.clone(), Vec::new()),
             };
-            if let Some(idx) = type_index {
+            // Subtype-qualified references (`<type.subtype>`, e.g.
+            // `<event.country_event>` / `<equipment.naval_equip>`) resolve
+            // permissively. The index's `type.subtype` membership is derived from
+            // each instance's own discriminators for subtype *activation* and is
+            // intentionally incomplete for *references*: a variant that inherits a
+            // subtype through `archetype = <type.subtype>` isn't listed, so a
+            // strict check would false-flag valid references to it. (Precise
+            // subtype-reference validation would need full membership, as F#'s
+            // invertedTypeMap has.)
+            if let Some(idx) = type_index
+                && !cwtools_index::is_subtype_key(type_name)
+            {
                 // Only flag when the index is complete (vanilla loaded) AND we have
                 // known instances for this type AND the reference doesn't resolve.
                 let resolved = idx.contains(type_name, &lookup_value)
@@ -1673,25 +1706,38 @@ fn validate_leaf(
                     || value.contains('[')
                     || value.contains('<');
                 if !dynamic {
-                    let mut candidate = match prefix {
+                    // The reference with the field's configured extension applied
+                    // (if any), without the root prefix. Used for the root-prefixed
+                    // lookup and the `.asset`-relative fallback below.
+                    let mut rel_value = value.to_string();
+                    if let Some(ext) = extension
+                        && !ext.is_empty()
+                        && !rel_value
+                            .to_ascii_lowercase()
+                            .ends_with(&ext.to_ascii_lowercase())
+                    {
+                        rel_value.push_str(ext);
+                    }
+                    let candidate = match prefix {
                         Some(p)
                             if !value
                                 .to_ascii_lowercase()
                                 .starts_with(&p.to_ascii_lowercase()) =>
                         {
-                            format!("{}{}", p, value)
+                            format!("{}{}", p, rel_value)
                         }
-                        _ => value.to_string(),
+                        _ => rel_value.clone(),
                     };
-                    if let Some(ext) = extension
-                        && !ext.is_empty()
-                        && !candidate
-                            .to_ascii_lowercase()
-                            .ends_with(&ext.to_ascii_lowercase())
+                    // A `.asset` `file =` (sound/entity assets) resolves relative
+                    // to the .asset's own directory, not the field's root prefix
+                    // (e.g. `sound/zom/zom_vo.asset` -> `zom_idle_001.wav` beside
+                    // it). Genuinely-missing siblings still fail to resolve.
+                    let asset_relative = file_path.to_ascii_lowercase().ends_with(".asset")
+                        && idx.file_index.resolve_relative(file_path, &rel_value);
+                    if !idx.file_index.contains(&candidate)
+                        && !texture_sibling_exists(&candidate, &idx.file_index)
+                        && !asset_relative
                     {
-                        candidate.push_str(ext);
-                    }
-                    if !idx.file_index.contains(&candidate) {
                         let code = &error_codes::CW113_MISSING_FILE;
                         errors.push(ValidationError::from_code(
                             code,

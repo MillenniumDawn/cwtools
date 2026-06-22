@@ -293,6 +293,18 @@ impl Backend {
                 ruleset,
                 &logical_path,
             );
+            // Subtype-qualified membership (`equipment.naval_equip` …) so
+            // `<type.subtype>` references resolve. Re-run on every (re)index so an
+            // edit to an archetype keeps its subtype tag fresh.
+            info.type_index.merge(
+                uri,
+                cwtools_validation::collect_subtype_instances(
+                    ruleset,
+                    parsed,
+                    &logical_path,
+                    &self.state.string_table,
+                ),
+            );
         }
     }
 

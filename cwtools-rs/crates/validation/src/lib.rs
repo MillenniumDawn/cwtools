@@ -1,4 +1,4 @@
-use cwtools_game::constants::Game;
+pub use cwtools_game::constants::Game;
 use cwtools_game::scope_engine::{SCOPE_ANY, ScopeContext, ScopeId};
 use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_localization::LocIndex;
@@ -22,6 +22,7 @@ mod subtype;
 
 pub use common::{ErrorSeverity, ValidationError, error_hash};
 pub use loc_field::build_modifier_keys;
+pub use subtype::collect_subtype_instances;
 
 use common::{leaf_value_to_string, path_contains_segment};
 use ctx::ValidationCtx;

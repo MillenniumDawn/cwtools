@@ -383,7 +383,7 @@ pub const CW268_LOC_MISSING_QUOTE: ErrorCode = ErrorCode {
 pub const CW275_LOC_INVALID_CHARS: ErrorCode = ErrorCode {
     id: "CW275",
     severity: ErrorSeverity::Warning,
-    message_template: "Localisation key {} contains unexpected characters, and may not render correctly",
+    message_template: "Localisation value for {} contains unexpected characters, and may not render correctly",
 };
 
 /// Event may fire every tick (performance hint). F# `EventEveryTick`.

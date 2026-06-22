@@ -1,3 +1,20 @@
+# 1.7.2
+
+## Bug Fixes
+- An empty type-reference value (`soundeffect = ""`, `textureFile = ""`) is no longer flagged as a missing instance (CW500); the engine treats an empty value as "none"
+- Texture references resolve via their sibling extension: a `.tga` reference is satisfied by a shipped `.dds` and vice versa (vanilla `core.gfx` points at `.tga` files while only the `.dds` ships), so CW113 only fires when neither extension is present
+- A sound/entity `.asset` `file =` resolves relative to the `.asset`'s own directory instead of the field's root prefix (e.g. `zom_idle_001.wav` beside `sound/zom/zom_vo.asset`), instead of reporting CW113
+- A naval equipment variant that inherits its subtype through `archetype = <equipment.naval_equip>` now activates `naval_equip`, so its `model =` is accepted instead of being flagged (CW267); `<type.subtype>` references resolve against a subtype-membership index
+- `## replace_scope = { THIS = state ROOT = state }` written with uppercase keys (as HOI4's operations.cwt does) is parsed; the keys are now case-insensitive, so scope checks on nested block rules no longer false-positive (CW104/CW105)
+- The CW275 message now attributes the unexpected characters to the localisation value rather than the key, and the allow-list is widened to cover scripts and symbols the game renders (fuller Cyrillic, Greek, Armenian, Devanagari, Ethiopic, Tifinagh, IPA, combining marks, currency, arrows, number/letterlike forms) while invisible and format junk (zero-width space, figure space, bidi marks) still flags
+- Tooling directories (`.claude` git-worktree mirrors, `node_modules`) are skipped during file and localisation discovery, so a mirrored copy of the mod tree no longer double-counts files and loc entries
+
+## Performance
+- Subtype-membership collection skips types that declare no subtypes, avoiding a second full instance-navigation pass over the corpus during indexing
+
+## Developer
+- Added regression tests for empty type-reference values, texture sibling-extension resolution, `.asset`-relative file resolution, naval-equip subtype membership, uppercase `replace_scope` keys, the widened and still-rejected localisation character sets, and tooling-dir skipping
+
 # 1.7.1 
 - Fixes the squiggle placement in the cwtools
 
