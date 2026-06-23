@@ -26,6 +26,11 @@ pub(crate) struct ValidationCtx<'a> {
     pub(crate) type_index: Option<&'a cwtools_index::TypeIndex>,
     pub(crate) modifier_keys: Option<&'a HashSet<String>>,
     pub(crate) loc_index: Option<&'a LocIndex>,
+    /// Extra loc keys to treat as existing, on top of `loc_index` — the LSP's
+    /// live overlay of unsaved keys in open `.yml` files, so a key just typed
+    /// resolves immediately without waiting for a full rescan (#36). Lowercased,
+    /// like the keys the existence checks compare against.
+    pub(crate) extra_loc_keys: Option<&'a HashSet<String>>,
     pub(crate) scope_checks: bool,
     pub(crate) var_checks: bool,
     /// Stack of implicit/explicit loop-variable names (normalized) in scope for

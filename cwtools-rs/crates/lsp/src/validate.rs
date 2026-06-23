@@ -19,6 +19,7 @@ pub(crate) fn make_prepared<'a>(
     type_index: &'a cwtools_info::TypeIndex,
     modifier_keys: &'a std::collections::HashSet<String>,
     loc_index: Option<&'a cwtools_localization::LocIndex>,
+    extra_loc_keys: Option<&'a std::collections::HashSet<String>>,
     registry: Option<&'a std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
     scope_checks: bool,
     var_checks: bool,
@@ -30,6 +31,7 @@ pub(crate) fn make_prepared<'a>(
         type_index: Some(type_index),
         modifier_keys: Some(modifier_keys),
         loc_index,
+        extra_loc_keys,
         registry,
         scope_checks,
         var_checks,
@@ -125,13 +127,14 @@ pub(crate) fn validate_parsed_with_indexes(
     if let Some(loc) = prepared.loc_index
         && !loc.union().is_empty()
     {
+        let overlay = prepared.extra_loc_keys;
         errs.extend(cwtools_validation::missing_loc::check_missing_localisation(
             parsed,
             uri,
             uri,
             prepared.ruleset,
             prepared.table,
-            |k| loc.exists_any(k),
+            |k| loc.exists_any(k) || overlay.is_some_and(|o| o.contains(k)),
         ));
     }
     truncate_validation_errors(&mut errs, uri);
@@ -368,6 +371,9 @@ impl Backend {
         registry: Option<&std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
         line_ends: &[u32],
     ) -> Vec<Diagnostic> {
+        // Overlay computed before the other guards (its lock is independent and
+        // never nested inside info/loc — see validate_loc_text).
+        let overlay = self.loc_overlay_keys();
         let info_guard = self.state.info_service.read();
         let loc_guard = self.state.loc_index.read();
         let (scope_checks, var_checks) = {
@@ -381,6 +387,7 @@ impl Backend {
             &info_guard.type_index,
             modifier_keys,
             loc_guard.as_ref(),
+            Some(&overlay),
             registry,
             scope_checks,
             var_checks,
@@ -648,6 +655,18 @@ impl Backend {
         }
     }
 
+    /// Flatten the live loc overlay (per-open-`.yml` key sets) into one set of
+    /// lowercased keys, for the game-file loc-existence checks (CW100/CW122) so a
+    /// key just typed into an open `.yml` resolves without a full rescan (#36).
+    /// Bounded by the number of open loc files; returns empty when none are open.
+    pub(crate) fn loc_overlay_keys(&self) -> HashSet<String> {
+        let mut keys = HashSet::new();
+        for set in self.state.loc_live_overlay.read().values() {
+            keys.extend(set.iter().cloned());
+        }
+        keys
+    }
+
     /// Validate one loc file's text into diagnostics. Builds the set of names a
     /// `$ref$` may resolve to — modifier keys, idea names, and the live loc
     /// overlay (the current keys of every open `.yml`) — then checks against the
@@ -747,8 +766,18 @@ impl Backend {
             // A change to this file's key set can fix or break `$ref$` checks in
             // other open loc files, so refresh them — that's the cross-file part
             // of the index that previously only updated on a window reload.
+            // It can also fix or break a missing-localisation (CW100/CW122)
+            // diagnostic on open GAME files that reference the added/removed key
+            // (e.g. a new event option's loc), so re-validate those too — the
+            // overlay now feeds the game-file loc checks, so they resolve the new
+            // key without a full rescan. (#36)
             if changed {
                 self.revalidate_other_open_loc_files(uri).await;
+                let generation = self
+                    .state
+                    .edit_generation
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                self.revalidate_open_dependents(uri, generation, None).await;
             }
             return (diagnostics, None);
         }
@@ -835,6 +864,11 @@ impl Backend {
                 // Validation. Lock order: rules -> info_service -> loc_index.
                 let (errors, log_msg) = {
                     let game = self.state.config.read().game();
+                    // Live overlay of unsaved loc keys in open `.yml` files, so a
+                    // key just added there resolves in this file's loc checks
+                    // (CW100/CW122) without a full rescan (#36). Computed before
+                    // the other guards (independent lock).
+                    let overlay = self.loc_overlay_keys();
                     let rules_guard = self.state.rules.read();
                     if let Some(ruleset) = rules_guard.ruleset.as_ref() {
                         let start = std::time::Instant::now();
@@ -855,6 +889,7 @@ impl Backend {
                             type_index,
                             &rules_guard.modifier_keys,
                             loc_guard.as_ref(),
+                            Some(&overlay),
                             rules_guard.scope_registry.as_ref(),
                             scope_checks,
                             var_checks,

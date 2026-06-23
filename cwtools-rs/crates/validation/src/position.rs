@@ -99,6 +99,7 @@ pub fn rules_at_pos(
         type_index: prepared.type_index,
         modifier_keys: prepared.modifier_keys,
         loc_index: prepared.loc_index,
+        extra_loc_keys: prepared.extra_loc_keys,
         scope_checks: prepared.scope_checks,
         var_checks: prepared.var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),
