@@ -1,3 +1,11 @@
+# 1.8.3
+
+## Improvements
+- Autocomplete for effects and triggers now inserts a usable snippet instead of just the bare keyword. A block effect/trigger (`if`, `random`, `every_state`, …) completes to `key = { … }` with its required child fields pre-filled and tab stops — e.g. `if` expands to `if = { limit = { } }`. A value effect/trigger (`add_political_power`, `set_country_flag`, …) completes to `key = ` with the cursor after the `=`, ready for the value. Modifier keys in `modifier`/`equipment_bonus` blocks likewise complete with `= `.
+
+## Developer
+- Added completion tests covering the alias (effect/trigger) snippet shapes: a block alias pre-fills its required child, a value alias inserts `key = <placeholder>` on a single line
+
 # 1.8.2
 
 ## Bug Fixes
