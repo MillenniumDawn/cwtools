@@ -32,7 +32,6 @@ nested = {
     // Verify structure counts match
     assert_eq!(arena2.leaves.len(), parsed.arena.leaves.len());
     assert_eq!(arena2.leaf_values.len(), parsed.arena.leaf_values.len());
-    assert_eq!(arena2.value_clauses.len(), parsed.arena.value_clauses.len());
     assert_eq!(arena2.comments.len(), parsed.arena.comments.len());
     assert_eq!(root2.len(), parsed.root_children.len());
 }
@@ -95,7 +94,7 @@ key_a key_b = { x = 1 }
     let (batch_arena, _) = convert::cached_to_arena(&cached, &batch_table);
 
     // Reference path: intern every string by hand, same traversal order as
-    // cached_to_arena (leaves, then leaf_values, then value_clauses).
+    // cached_to_arena (leaves, then leaf_values).
     let ref_table = StringTable::new();
     let mut expected = Vec::new();
     for l in &cached.leaves {
@@ -104,11 +103,6 @@ key_a key_b = { x = 1 }
     }
     for lv in &cached.leaf_values {
         push_value(&lv.value, &ref_table, &mut expected);
-    }
-    for vc in &cached.value_clauses {
-        for k in &vc.keys {
-            expected.push(ref_table.intern(k));
-        }
     }
 
     // Collect the batched arena's tokens in the identical order and compare.
@@ -119,11 +113,6 @@ key_a key_b = { x = 1 }
     }
     for lv in &batch_arena.leaf_values {
         collect_arena_value(&lv.value, &mut actual);
-    }
-    for vc in &batch_arena.value_clauses {
-        for k in &vc.keys {
-            actual.push(*k);
-        }
     }
 
     assert_eq!(expected, actual, "batched tokens diverge from per-string");
@@ -202,12 +191,6 @@ fn roundtrip_all_performancetest_files() {
             arena2.leaf_values.len(),
             parsed.arena.leaf_values.len(),
             "LeafValue count mismatch for {}",
-            parsed.path.display()
-        );
-        assert_eq!(
-            arena2.value_clauses.len(),
-            parsed.arena.value_clauses.len(),
-            "ValueClause count mismatch for {}",
             parsed.path.display()
         );
         assert_eq!(

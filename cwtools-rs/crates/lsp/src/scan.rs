@@ -167,7 +167,7 @@ impl Backend {
             }
         };
 
-        let extensions: Vec<&str> = vec!["txt", "gui", "gfx", "sfx", "asset", "map"];
+        let extensions = cwtools_file_manager::file_manager::SCRIPT_EXTENSIONS;
 
         // Snapshot the user-configured ignore globs once for the whole walk.
         // The engine's hard-coded baseline (Changelog.txt, README.*, *.md)
@@ -187,7 +187,7 @@ impl Backend {
         let files_to_validate = tokio::task::block_in_place(|| {
             cwtools_file_manager::file_manager::walk_workspace_files(
                 &root_path,
-                &extensions,
+                extensions,
                 &extra_file_globs,
                 &extra_dir_globs,
             )

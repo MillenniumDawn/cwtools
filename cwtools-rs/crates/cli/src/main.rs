@@ -239,7 +239,6 @@ fn main() {
                         println!("  Logical path:  {}", parsed.logical_path);
                         println!("  Leaves:        {}", parsed.arena.leaves.len());
                         println!("  Values:        {}", parsed.arena.leaf_values.len());
-                        println!("  Clauses:       {}", parsed.arena.value_clauses.len());
                         println!("  Comments:      {}", parsed.arena.comments.len());
                         println!("  Root children: {}", parsed.root_children.len());
                     }
@@ -311,7 +310,6 @@ fn main() {
                 println!("Deserialized from {}", input.display());
                 println!("  Leaves:   {}", arena.leaves.len());
                 println!("  Values:   {}", arena.leaf_values.len());
-                println!("  Clauses:  {}", arena.value_clauses.len());
                 println!("  Comments: {}", arena.comments.len());
                 println!("  Root children: {}", root.len());
             }
@@ -586,25 +584,22 @@ fn main() {
                 }
                 let st = rules_table.stats();
                 eprintln!(
-                    "  [profile]   string_table: {} ({} entries, strings {}, keys {}, meta {})",
+                    "  [profile]   string_table: {} ({} entries, strings {}, keys {})",
                     mib(st.total_bytes()),
                     st.entries,
                     mib(st.id_to_string_bytes),
                     mib(st.map_key_bytes),
-                    mib(st.metadata_bytes),
                 );
-                let (mut leaves, mut values, mut clauses) = (0usize, 0, 0);
+                let (mut leaves, mut values) = (0usize, 0);
                 for src in parsed {
                     leaves += src.parsed.arena.leaves.len();
                     values += src.parsed.arena.leaf_values.len();
-                    clauses += src.parsed.arena.value_clauses.len();
                 }
                 let type_instances: usize = type_index.map.values().map(|v| v.len()).sum();
                 eprintln!(
-                    "  [profile]   arenas: {} leaves, {} values, {} clauses across {} files",
+                    "  [profile]   arenas: {} leaves, {} values across {} files",
                     leaves,
                     values,
-                    clauses,
                     parsed.len()
                 );
                 eprintln!(

@@ -636,7 +636,7 @@ pub fn search_config_for(directory: &Path) -> FileManagerConfig {
     let dir_name = directory.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     // If this directory itself contains script files, search it directly.
-    let script_exts = ["txt", "gui", "gfx", "sfx", "asset", "map"];
+    let script_exts = cwtools_file_manager::file_manager::SCRIPT_EXTENSIONS;
     let has_script_files = std::fs::read_dir(directory)
         .ok()
         .is_some_and(|mut entries| {

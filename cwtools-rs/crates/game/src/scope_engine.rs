@@ -2,9 +2,9 @@ use crate::constants::Game;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
-/// Opaque scope id — a thin newtype over the same u32 used by `Scope`.
-/// Keeping them separate lets the validation crate import `ScopeId` without
-/// pulling the full `Scope` symbol, matching the original public API.
+/// Opaque scope id — a thin `u32` newtype identifying a scope (country, state,
+/// character, …). Used by both the live engine and the const scope tables in
+/// `constants.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScopeId(pub u32);
 
@@ -92,10 +92,9 @@ pub struct ScopeContext {
 pub struct ScopeLink {
     /// Scopes the command is valid in (empty = valid in all).
     pub valid_scopes: Vec<ScopeId>,
-    /// Scope produced by the link.  None = value-only (no scope change).
+    /// Scope produced by the link.  None = value-only (no scope change), so
+    /// `target.is_some()` is exactly "does this link change scope".
     pub target: Option<ScopeId>,
-    /// Whether this link actually changes scope (true) or is a value trigger.
-    pub is_scope_change: bool,
     /// Keys to ignore inside the child block.
     pub ignore_keys: Vec<String>,
 }
@@ -128,10 +127,12 @@ impl ScopeContext {
 
     // ── Stack accessors ──────────────────────────────────────────────────────
 
-    /// Current active scope (top of stack).  Returns `root` if the stack is
-    /// somehow empty.
-    pub fn current(&self) -> Option<ScopeId> {
-        self.scopes.last().copied()
+    /// Current active scope (top of stack). The stack is invariantly non-empty
+    /// (seeded with `root`; `apply_prev` never pops the last entry), so this
+    /// always returns a real scope — `root` is only a defensive fallback.
+    pub fn current(&self) -> ScopeId {
+        debug_assert!(!self.scopes.is_empty(), "scope stack must never be empty");
+        self.scopes.last().copied().unwrap_or(self.root)
     }
 
     /// Depth of the scope stack. Used by callers to detect whether a
@@ -204,11 +205,11 @@ impl ScopeContext {
             self.root = r;
         }
         if let Some(t) = this_id {
-            // "this" becomes the new current scope (push on top)
+            // "this" replaces the current scope (top of stack). The stack is
+            // invariantly non-empty, so `last_mut` always succeeds.
+            debug_assert!(!self.scopes.is_empty(), "scope stack must never be empty");
             if let Some(last) = self.scopes.last_mut() {
                 *last = t;
-            } else {
-                self.scopes.push(t);
             }
         }
         if !from_ids.is_empty() {
@@ -259,8 +260,7 @@ impl ScopeContext {
         // value/data prefix (`var:`, `event_target:`) opens ANY.
         for (prefix, link) in &self.registry.prefix_links {
             if lower.starts_with(prefix.as_str()) {
-                if link.is_scope_change {
-                    let target = link.target.unwrap_or(SCOPE_ANY);
+                if let Some(target) = link.target {
                     self.scopes.push(target);
                     return ScopeResult::NewScope {
                         scope: target,
@@ -332,82 +332,8 @@ impl ScopeContext {
             return ScopeResult::VarFound;
         }
 
-        match lower {
-            // ── this / self ──────────────────────────────────────────────
-            "this" | "self" => {
-                let cur = self.scopes.last().copied().unwrap_or(self.root);
-                self.scopes.push(cur);
-                return ScopeResult::NewScope {
-                    scope: cur,
-                    ignore_keys: vec![],
-                };
-            }
-            // ── root ─────────────────────────────────────────────────────
-            "root" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return ScopeResult::NewScope {
-                    scope: r,
-                    ignore_keys: vec![],
-                };
-            }
-            // ── prev chain ───────────────────────────────────────────────
-            "prev" => {
-                return self.apply_prev(1);
-            }
-            "prevprev" | "prev_prev" => {
-                return self.apply_prev(2);
-            }
-            "prevprevprev" | "prev_prev_prev" => {
-                return self.apply_prev(3);
-            }
-            "prevprevprevprev" | "prev_prev_prev_prev" => {
-                return self.apply_prev(4);
-            }
-            // ── from chain ───────────────────────────────────────────────
-            "from" => {
-                return self.apply_from(1);
-            }
-            "fromfrom" => {
-                return self.apply_from(2);
-            }
-            "fromfromfrom" => {
-                return self.apply_from(3);
-            }
-            "fromfromfromfrom" => {
-                return self.apply_from(4);
-            }
-            // ── root_from composites ─────────────────────────────────────
-            "root_from" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return self.apply_from(1);
-            }
-            "root_fromfrom" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return self.apply_from(2);
-            }
-            "root_fromfromfrom" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return self.apply_from(3);
-            }
-            "root_fromfromfromfrom" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return self.apply_from(4);
-            }
-            // ── logical/boolean keywords (pass-through) ──────────────────
-            "and" | "or" | "not" | "nor" | "nand" | "if" | "else" | "else_if" | "hidden_effect"
-            | "hidden_trigger" | "limit" | "trigger_if" | "trigger_else" | "trigger_else_if" => {
-                let cur = self.scopes.last().copied().unwrap_or(self.root);
-                return ScopeResult::NewScope {
-                    scope: cur,
-                    ignore_keys: vec![],
-                };
-            }
-            _ => {}
+        if let Some(result) = self.resolve_meta_keyword(lower) {
+            return result;
         }
 
         // Game-specific named link lookup — borrow rather than clone the whole
@@ -426,8 +352,7 @@ impl ScopeContext {
                     .any(|s| self.registry.is_subscope_or_eq(current, *s));
 
             if valid {
-                if link.is_scope_change {
-                    let target = link.target.unwrap_or(SCOPE_ANY);
+                if let Some(target) = link.target {
                     let ignore_keys = link.ignore_keys.clone();
                     self.scopes.push(target);
                     return ScopeResult::NewScope {
@@ -449,6 +374,75 @@ impl ScopeContext {
         }
 
         ScopeResult::NotFound
+    }
+
+    /// Resolve a meta keyword (`this`/`self`, `root`, the `prev`/`from` chains,
+    /// their `root_from` composites, and the logical/boolean pass-through
+    /// keywords). Returns `None` when `lower` is not a meta keyword, leaving the
+    /// caller to fall through to the named-link lookup.
+    fn resolve_meta_keyword(&mut self, lower: &str) -> Option<ScopeResult> {
+        let result = match lower {
+            // ── this / self ──────────────────────────────────────────────
+            "this" | "self" => {
+                let cur = self.scopes.last().copied().unwrap_or(self.root);
+                self.scopes.push(cur);
+                ScopeResult::NewScope {
+                    scope: cur,
+                    ignore_keys: vec![],
+                }
+            }
+            // ── root ─────────────────────────────────────────────────────
+            "root" => {
+                let r = self.root;
+                self.scopes.push(r);
+                ScopeResult::NewScope {
+                    scope: r,
+                    ignore_keys: vec![],
+                }
+            }
+            // ── prev chain ───────────────────────────────────────────────
+            "prev" => self.apply_prev(1),
+            "prevprev" | "prev_prev" => self.apply_prev(2),
+            "prevprevprev" | "prev_prev_prev" => self.apply_prev(3),
+            "prevprevprevprev" | "prev_prev_prev_prev" => self.apply_prev(4),
+            // ── from chain ───────────────────────────────────────────────
+            "from" => self.apply_from(1),
+            "fromfrom" => self.apply_from(2),
+            "fromfromfrom" => self.apply_from(3),
+            "fromfromfromfrom" => self.apply_from(4),
+            // ── root_from composites ─────────────────────────────────────
+            "root_from" => {
+                let r = self.root;
+                self.scopes.push(r);
+                self.apply_from(1)
+            }
+            "root_fromfrom" => {
+                let r = self.root;
+                self.scopes.push(r);
+                self.apply_from(2)
+            }
+            "root_fromfromfrom" => {
+                let r = self.root;
+                self.scopes.push(r);
+                self.apply_from(3)
+            }
+            "root_fromfromfromfrom" => {
+                let r = self.root;
+                self.scopes.push(r);
+                self.apply_from(4)
+            }
+            // ── logical/boolean keywords (pass-through) ──────────────────
+            "and" | "or" | "not" | "nor" | "nand" | "if" | "else" | "else_if" | "hidden_effect"
+            | "hidden_trigger" | "limit" | "trigger_if" | "trigger_else" | "trigger_else_if" => {
+                let cur = self.scopes.last().copied().unwrap_or(self.root);
+                ScopeResult::NewScope {
+                    scope: cur,
+                    ignore_keys: vec![],
+                }
+            }
+            _ => return None,
+        };
+        Some(result)
     }
 
     // ── prev / from helpers ───────────────────────────────────────────────────
@@ -504,7 +498,6 @@ fn sc(valid: &[u32], target: u32) -> ScopeLink {
     ScopeLink {
         valid_scopes: valid.iter().copied().map(ScopeId).collect(),
         target: Some(ScopeId(target)),
-        is_scope_change: true,
         ignore_keys: vec![],
     }
 }
@@ -513,6 +506,15 @@ fn sc(valid: &[u32], target: u32) -> ScopeLink {
 fn insert_aliases(links: &mut HashMap<String, ScopeLink>, names: &[&str], link: ScopeLink) {
     for name in names {
         links.insert(name.to_string(), link.clone());
+    }
+}
+
+/// Register every `(aliases, valid_scopes, target)` entry as a scope-change
+/// link. Shared by the per-game `load_*_links` tables, whose loop bodies were
+/// byte-identical.
+fn load_entries(links: &mut HashMap<String, ScopeLink>, entries: &[(&[&str], &[u32], u32)]) {
+    for (aliases, valid, target) in entries {
+        insert_aliases(links, aliases, sc(valid, *target));
     }
 }
 
@@ -872,9 +874,7 @@ fn load_stellaris_links(links: &mut HashMap<String, ScopeLink>) {
         (&["pop_faction"], &[POP], POP_FACTION),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── EU4 ──────────────────────────────────────────────────────────────────────
@@ -1036,9 +1036,7 @@ fn load_eu4_links(links: &mut HashMap<String, ScopeLink>) {
         (&["culture"], &[PROVINCE, COUNTRY], CULTURE),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── CK2 ──────────────────────────────────────────────────────────────────────
@@ -1244,9 +1242,7 @@ fn load_ck2_links(links: &mut HashMap<String, ScopeLink>) {
         ),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── CK3 ──────────────────────────────────────────────────────────────────────
@@ -1440,9 +1436,7 @@ fn load_ck3_links(links: &mut HashMap<String, ScopeLink>) {
         ),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── VIC2 ─────────────────────────────────────────────────────────────────────
@@ -1554,9 +1548,7 @@ fn load_vic2_links(links: &mut HashMap<String, ScopeLink>) {
         (&["location"], &[CHARACTER, UNIT], PROVINCE),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── IR (Imperator: Rome) ─────────────────────────────────────────────────────
@@ -1755,9 +1747,7 @@ fn load_ir_links(links: &mut HashMap<String, ScopeLink>) {
         (&["culture"], &[CHARACTER, PROVINCE, COUNTRY], CULTURE),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── VIC3 / EU5 ────────────────────────────────────────────────────────────────
@@ -1801,7 +1791,7 @@ mod tests {
             }
         );
         // Stack after PREV: [200, 200] (hopped back to 200)
-        assert_eq!(ctx.current(), Some(ScopeId(200)));
+        assert_eq!(ctx.current(), ScopeId(200));
     }
 
     #[test]
@@ -2036,7 +2026,7 @@ mod tests {
         let saved = ctx.save();
         ctx.push_scope(ScopeId(204));
         ctx.restore(saved);
-        assert_eq!(ctx.current(), Some(ScopeId(203)));
+        assert_eq!(ctx.current(), ScopeId(203));
         assert_eq!(ctx.from, vec![ScopeId(202)]);
     }
 
@@ -2053,7 +2043,6 @@ mod tests {
             ScopeLink {
                 valid_scopes: vec![ScopeId(101)],
                 target: Some(ScopeId(100)),
-                is_scope_change: true,
                 ignore_keys: vec![],
             },
         );

@@ -167,7 +167,7 @@ impl Backend {
         drop(rules_guard);
 
         let info = self.state.info_service.read();
-        for var in &info.all_variables {
+        for var in info.variable_counts.keys() {
             if items.len() >= FALLBACK_CAP {
                 break;
             }
@@ -178,7 +178,7 @@ impl Backend {
                 ..Default::default()
             });
         }
-        for et in &info.all_event_targets {
+        for et in info.event_target_counts.keys() {
             if items.len() >= FALLBACK_CAP {
                 break;
             }
@@ -248,100 +248,22 @@ pub(crate) fn completions_from_rules(
             RuleType::LeafRule {
                 left: NewField::SpecificField(k),
                 right,
-            } => {
-                let snippet = match right {
-                    NewField::ValueField(ValueType::Bool) => {
-                        // Insert a yes/no placeholder
-                        Some(format!("{} = ${{1|yes,no|}}", k))
-                    }
-                    NewField::ValueField(ValueType::Enum(e)) => {
-                        // Inline enum values if the list is short enough
-                        let vals = enum_values_for(ruleset, e);
-                        if !vals.is_empty() && vals.len() <= 20 {
-                            let choices = vals.join(",");
-                            Some(format!("{} = ${{1|{}|}}", k, choices))
-                        } else {
-                            // Long enum: still complete the `key = ` and let the
-                            // value be typed/triggered.
-                            Some(format!("{} = $0", k))
-                        }
-                    }
-                    // Any other value kind (scalar, int, float, type ref, …):
-                    // complete `key = ` with the cursor after the `=`, rather than
-                    // a bare `key` with no operator (cwtools-vscode#16).
-                    _ => Some(format!("{} = $0", k)),
-                };
-                items.push(CompletionItem {
-                    label: k.clone(),
-                    kind: Some(CompletionItemKind::FIELD),
-                    detail: opts.description.clone(),
-                    insert_text: snippet.clone(),
-                    insert_text_format: if snippet.is_some() {
-                        Some(InsertTextFormat::SNIPPET)
-                    } else {
-                        None
-                    },
-                    ..Default::default()
-                });
-            }
+            } => push_specific_leaf_key(&mut items, k, right, opts, ruleset),
             // A node block key — generate snippet with required child fields pre-populated
             RuleType::NodeRule {
                 left: NewField::SpecificField(k),
                 rules: inner,
-            } => {
-                let snippet = generate_node_snippet(k, inner, ruleset);
-                // Scope-aware sortText: if rule has required_scopes push it earlier (lower sort key).
-                let sort = if !opts.required_scopes.is_empty() {
-                    format!("0_{}", k)
-                } else {
-                    format!("1_{}", k)
-                };
-                items.push(CompletionItem {
-                    label: k.clone(),
-                    kind: Some(CompletionItemKind::STRUCT),
-                    detail: opts.description.clone(),
-                    insert_text: Some(snippet),
-                    insert_text_format: Some(InsertTextFormat::SNIPPET),
-                    sort_text: Some(sort),
-                    ..Default::default()
-                });
-            }
+            } => push_specific_node_key(&mut items, k, inner, opts, ruleset),
             // An enum-keyed field: every member of the enum is a valid key here
             // (e.g. MIO `equipment_bonus = { enum[equipment_stat] = variable_field }`).
             RuleType::LeafRule {
                 left: NewField::ValueField(ValueType::Enum(e)),
                 right,
-            } => {
-                let snippet_value = match right {
-                    NewField::ValueField(ValueType::Bool) => "${1|yes,no|}".to_string(),
-                    _ => "${1}".to_string(),
-                };
-                for v in all_enum_values_cached(&mut enum_cache, ruleset, info, e) {
-                    items.push(CompletionItem {
-                        label: v.clone(),
-                        kind: Some(CompletionItemKind::FIELD),
-                        detail: Some(format!("enum {}", e)),
-                        insert_text: Some(format!("{} = {}", v, snippet_value)),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        ..Default::default()
-                    });
-                }
-            }
+            } => push_enum_keyed_leaf(&mut items, &mut enum_cache, ruleset, info, e, right),
             RuleType::NodeRule {
                 left: NewField::ValueField(ValueType::Enum(e)),
                 ..
-            } => {
-                for v in all_enum_values_cached(&mut enum_cache, ruleset, info, e) {
-                    items.push(CompletionItem {
-                        label: v.clone(),
-                        kind: Some(CompletionItemKind::STRUCT),
-                        detail: Some(format!("enum {}", e)),
-                        insert_text: Some(format!("{} = {{\n\t$0\n}}", v)),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        ..Default::default()
-                    });
-                }
-            }
+            } => push_enum_keyed_node(&mut items, &mut enum_cache, ruleset, info, e),
             // A typed key: every instance of the type is a valid key here
             // (e.g. `equipment_type = { <equipment_group> }` blocks, or
             // `<equipment> = { ... }` entries).
@@ -353,35 +275,17 @@ pub(crate) fn completions_from_rules(
                 left: NewField::TypeField(TypeType::Simple(t)),
                 ..
             } => {
-                let is_node = matches!(rule_type, RuleType::NodeRule { .. });
-                for (_, inst) in info.type_index.instances(t) {
-                    items.push(CompletionItem {
-                        label: inst.name.clone(),
-                        kind: Some(CompletionItemKind::STRUCT),
-                        detail: Some(format!("{} instance", t)),
-                        insert_text: Some(if is_node {
-                            format!("{} = {{\n\t$0\n}}", inst.name)
-                        } else {
-                            format!("{} = ${{1}}", inst.name)
-                        }),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        ..Default::default()
-                    });
-                }
+                let style = if matches!(rule_type, RuleType::NodeRule { .. }) {
+                    TypeInstanceStyle::NodeKey
+                } else {
+                    TypeInstanceStyle::LeafKey
+                };
+                push_type_instances(&mut items, info, t, style);
             }
             // An enum value at the leaf level
             RuleType::LeafValueRule {
                 right: NewField::ValueField(ValueType::Enum(e)),
-            } => {
-                for v in all_enum_values_cached(&mut enum_cache, ruleset, info, e) {
-                    items.push(CompletionItem {
-                        label: v.clone(),
-                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                        detail: Some(format!("enum {}", e)),
-                        ..Default::default()
-                    });
-                }
-            }
+            } => push_enum_leaf_values(&mut items, &mut enum_cache, ruleset, info, e),
             // A bare type reference value
             RuleType::LeafValueRule {
                 right: NewField::TypeField(TypeType::Simple(t)),
@@ -389,16 +293,7 @@ pub(crate) fn completions_from_rules(
             | RuleType::LeafRule {
                 right: NewField::TypeField(TypeType::Simple(t)),
                 ..
-            } => {
-                for (_, inst) in info.type_index.instances(t) {
-                    items.push(CompletionItem {
-                        label: inst.name.clone(),
-                        kind: Some(CompletionItemKind::REFERENCE),
-                        detail: Some(format!("{} instance", t)),
-                        ..Default::default()
-                    });
-                }
-            }
+            } => push_type_instances(&mut items, info, t, TypeInstanceStyle::Reference),
             // An alias expansion
             RuleType::LeafRule {
                 right: NewField::AliasField(cat),
@@ -410,70 +305,7 @@ pub(crate) fn completions_from_rules(
             | RuleType::NodeRule {
                 left: NewField::AliasField(cat),
                 ..
-            } => {
-                // Emit the keys of all alias:<cat> entries, labelled with the
-                // category (trigger/effect/…) and carrying the alias's ###
-                // docs. Overloads collapse onto one item (first description wins).
-                let prefix = format!("{}:", cat);
-                let mut seen: std::collections::HashMap<&str, usize> =
-                    std::collections::HashMap::new();
-                for (alias_name, (rule, opts)) in &ruleset.aliases {
-                    let Some(k) = alias_name.strip_prefix(&prefix) else {
-                        continue;
-                    };
-                    if k == "scope_field" {
-                        continue;
-                    }
-                    if let Some(&idx) = seen.get(k) {
-                        let item: &mut CompletionItem = &mut items[idx];
-                        if item.documentation.is_none()
-                            && let Some(d) = &opts.description
-                        {
-                            item.documentation = Some(Documentation::String(d.clone()));
-                        }
-                        // First overload wins the snippet; adopt a later one only
-                        // if the first had no resolvable shape.
-                        if item.insert_text.is_none()
-                            && let Some(snip) = alias_completion_snippet(k, rule, ruleset)
-                        {
-                            item.insert_text = Some(snip);
-                            item.insert_text_format = Some(InsertTextFormat::SNIPPET);
-                        }
-                        continue;
-                    }
-                    seen.insert(k, items.len());
-                    // A block effect/trigger (`if`, `random`, …) completes to
-                    // `key = { …required fields… }`; a value one
-                    // (`add_political_power`) to `key = <placeholder>` so the
-                    // cursor lands after the `=`, ready for the value.
-                    let snippet = alias_completion_snippet(k, rule, ruleset);
-                    items.push(CompletionItem {
-                        label: k.to_string(),
-                        kind: Some(CompletionItemKind::KEYWORD),
-                        detail: Some(cat.to_string()),
-                        documentation: opts.description.clone().map(Documentation::String),
-                        insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
-                        insert_text: snippet,
-                        ..Default::default()
-                    });
-                }
-                // The `modifier` category has no alias entries — modifiers live
-                // in the expanded modifier-key set (modifiers.cwt + templated
-                // names like production_speed_<building>_factor). This is the
-                // MIO `equipment_bonus` / idea `modifier` block case.
-                if cat == "modifier" {
-                    for m in modifier_keys {
-                        items.push(CompletionItem {
-                            label: m.clone(),
-                            kind: Some(CompletionItemKind::FIELD),
-                            detail: Some("modifier".to_string()),
-                            insert_text: Some(format!("{} = $0", m)),
-                            insert_text_format: Some(InsertTextFormat::SNIPPET),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
+            } => push_alias_keys(&mut items, ruleset, modifier_keys, cat),
             // Scope names
             RuleType::LeafRule {
                 right: NewField::ScopeField(_),
@@ -484,33 +316,296 @@ pub(crate) fn completions_from_rules(
             } => {
                 let names =
                     scope_names.get_or_insert_with(|| scope_completion_names(language, registry));
-                for name in names.iter() {
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(CompletionItemKind::VALUE),
-                        detail: Some("scope".to_string()),
-                        ..Default::default()
-                    });
-                }
+                push_scope_names(&mut items, names);
             }
             // Boolean field at leaf value level
             RuleType::LeafValueRule {
                 right: NewField::ValueField(ValueType::Bool),
-            } => {
-                for v in &["yes", "no"] {
-                    items.push(CompletionItem {
-                        label: v.to_string(),
-                        kind: Some(CompletionItemKind::KEYWORD),
-                        detail: Some("bool".to_string()),
-                        ..Default::default()
-                    });
-                }
-            }
+            } => push_bool_leaf_values(&mut items),
             _ => {}
         }
     }
 
     items
+}
+
+/// A concrete leaf key (`key = <value>`): one `FIELD` item completing to
+/// `key = ` with a value-shaped placeholder (yes/no for bools, inline choices
+/// for short enums, a bare tab stop otherwise — cwtools-vscode#16).
+fn push_specific_leaf_key(
+    items: &mut Vec<CompletionItem>,
+    k: &str,
+    right: &NewField,
+    opts: &cwtools_rules::rules_types::Options,
+    ruleset: &RuleSet,
+) {
+    let snippet = match right {
+        NewField::ValueField(ValueType::Bool) => {
+            // Insert a yes/no placeholder
+            Some(format!("{} = ${{1|yes,no|}}", k))
+        }
+        NewField::ValueField(ValueType::Enum(e)) => {
+            // Inline enum values if the list is short enough
+            let vals = enum_values_for(ruleset, e);
+            if !vals.is_empty() && vals.len() <= 20 {
+                let choices = vals.join(",");
+                Some(format!("{} = ${{1|{}|}}", k, choices))
+            } else {
+                // Long enum: still complete the `key = ` and let the
+                // value be typed/triggered.
+                Some(format!("{} = $0", k))
+            }
+        }
+        // Any other value kind (scalar, int, float, type ref, …):
+        // complete `key = ` with the cursor after the `=`, rather than
+        // a bare `key` with no operator (cwtools-vscode#16).
+        _ => Some(format!("{} = $0", k)),
+    };
+    items.push(CompletionItem {
+        label: k.to_string(),
+        kind: Some(CompletionItemKind::FIELD),
+        detail: opts.description.clone(),
+        insert_text: snippet.clone(),
+        insert_text_format: if snippet.is_some() {
+            Some(InsertTextFormat::SNIPPET)
+        } else {
+            None
+        },
+        ..Default::default()
+    });
+}
+
+/// A node block key (`key = { … }`): one `STRUCT` item whose snippet pre-fills
+/// the block's required child fields. Rules carrying `required_scopes` sort
+/// ahead of the rest.
+fn push_specific_node_key(
+    items: &mut Vec<CompletionItem>,
+    k: &str,
+    inner: &[(RuleType, cwtools_rules::rules_types::Options)],
+    opts: &cwtools_rules::rules_types::Options,
+    ruleset: &RuleSet,
+) {
+    let snippet = generate_node_snippet(k, inner, ruleset);
+    // Scope-aware sortText: if rule has required_scopes push it earlier (lower sort key).
+    let sort = if !opts.required_scopes.is_empty() {
+        format!("0_{}", k)
+    } else {
+        format!("1_{}", k)
+    };
+    items.push(CompletionItem {
+        label: k.to_string(),
+        kind: Some(CompletionItemKind::STRUCT),
+        detail: opts.description.clone(),
+        insert_text: Some(snippet),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        sort_text: Some(sort),
+        ..Default::default()
+    });
+}
+
+/// Enum members as leaf keys (`enum[stat] = variable_field`): each member is a
+/// valid key completing to `member = <value>`, the value placeholder shaped by
+/// the rule's right-hand side.
+fn push_enum_keyed_leaf(
+    items: &mut Vec<CompletionItem>,
+    enum_cache: &mut std::collections::HashMap<String, Vec<String>>,
+    ruleset: &RuleSet,
+    info: &InfoService,
+    e: &str,
+    right: &NewField,
+) {
+    let snippet_value = match right {
+        NewField::ValueField(ValueType::Bool) => "${1|yes,no|}".to_string(),
+        _ => "${1}".to_string(),
+    };
+    for v in all_enum_values_cached(enum_cache, ruleset, info, e) {
+        items.push(CompletionItem {
+            label: v.clone(),
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(format!("enum {}", e)),
+            insert_text: Some(format!("{} = {}", v, snippet_value)),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        });
+    }
+}
+
+/// Enum members as node-block keys (`enum[x] = { … }`): each member completes to
+/// `member = { $0 }`.
+fn push_enum_keyed_node(
+    items: &mut Vec<CompletionItem>,
+    enum_cache: &mut std::collections::HashMap<String, Vec<String>>,
+    ruleset: &RuleSet,
+    info: &InfoService,
+    e: &str,
+) {
+    for v in all_enum_values_cached(enum_cache, ruleset, info, e) {
+        items.push(CompletionItem {
+            label: v.clone(),
+            kind: Some(CompletionItemKind::STRUCT),
+            detail: Some(format!("enum {}", e)),
+            insert_text: Some(format!("{} = {{\n\t$0\n}}", v)),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..Default::default()
+        });
+    }
+}
+
+/// Enum members as bare leaf values: one `ENUM_MEMBER` item per member, no
+/// insert-text (the value is the label itself).
+fn push_enum_leaf_values(
+    items: &mut Vec<CompletionItem>,
+    enum_cache: &mut std::collections::HashMap<String, Vec<String>>,
+    ruleset: &RuleSet,
+    info: &InfoService,
+    e: &str,
+) {
+    for v in all_enum_values_cached(enum_cache, ruleset, info, e) {
+        items.push(CompletionItem {
+            label: v.clone(),
+            kind: Some(CompletionItemKind::ENUM_MEMBER),
+            detail: Some(format!("enum {}", e)),
+            ..Default::default()
+        });
+    }
+}
+
+/// How a `<type>` reference is offered: as a key (with a `key = …` snippet) or
+/// as a bare value reference (just the label).
+enum TypeInstanceStyle {
+    /// `<type> = { … }` key — completes to `name = { $0 }`.
+    NodeKey,
+    /// `<type> = value` key — completes to `name = ${1}`.
+    LeafKey,
+    /// A bare `<type>` value reference — the label is the instance name.
+    Reference,
+}
+
+/// Emit one completion item per known instance of `t`. Shared by the typed-key
+/// arms (which complete to `name = …` snippets) and the bare type-reference
+/// value arm (which offers the instance name directly).
+fn push_type_instances(
+    items: &mut Vec<CompletionItem>,
+    info: &InfoService,
+    t: &str,
+    style: TypeInstanceStyle,
+) {
+    for (_, inst) in info.type_index.instances(t) {
+        let (kind, insert_text) = match style {
+            TypeInstanceStyle::NodeKey => (
+                CompletionItemKind::STRUCT,
+                Some(format!("{} = {{\n\t$0\n}}", inst.name)),
+            ),
+            TypeInstanceStyle::LeafKey => (
+                CompletionItemKind::STRUCT,
+                Some(format!("{} = ${{1}}", inst.name)),
+            ),
+            TypeInstanceStyle::Reference => (CompletionItemKind::REFERENCE, None),
+        };
+        items.push(CompletionItem {
+            label: inst.name.clone(),
+            kind: Some(kind),
+            detail: Some(format!("{} instance", t)),
+            insert_text_format: insert_text.as_ref().map(|_| InsertTextFormat::SNIPPET),
+            insert_text,
+            ..Default::default()
+        });
+    }
+}
+
+/// Emit the keys of all `alias:<cat>` entries, labelled with the category
+/// (trigger/effect/…) and carrying the alias's ### docs. Overloads collapse
+/// onto one item (first description and first resolvable snippet win). The
+/// `modifier` category has no alias entries, so its keys come from the expanded
+/// modifier-key set instead.
+fn push_alias_keys(
+    items: &mut Vec<CompletionItem>,
+    ruleset: &RuleSet,
+    modifier_keys: &HashSet<String>,
+    cat: &str,
+) {
+    let prefix = format!("{}:", cat);
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (alias_name, (rule, opts)) in &ruleset.aliases {
+        let Some(k) = alias_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if k == "scope_field" {
+            continue;
+        }
+        if let Some(&idx) = seen.get(k) {
+            let item: &mut CompletionItem = &mut items[idx];
+            if item.documentation.is_none()
+                && let Some(d) = &opts.description
+            {
+                item.documentation = Some(Documentation::String(d.clone()));
+            }
+            // First overload wins the snippet; adopt a later one only
+            // if the first had no resolvable shape.
+            if item.insert_text.is_none()
+                && let Some(snip) = alias_completion_snippet(k, rule, ruleset)
+            {
+                item.insert_text = Some(snip);
+                item.insert_text_format = Some(InsertTextFormat::SNIPPET);
+            }
+            continue;
+        }
+        seen.insert(k, items.len());
+        // A block effect/trigger (`if`, `random`, …) completes to
+        // `key = { …required fields… }`; a value one
+        // (`add_political_power`) to `key = <placeholder>` so the
+        // cursor lands after the `=`, ready for the value.
+        let snippet = alias_completion_snippet(k, rule, ruleset);
+        items.push(CompletionItem {
+            label: k.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            detail: Some(cat.to_string()),
+            documentation: opts.description.clone().map(Documentation::String),
+            insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
+            insert_text: snippet,
+            ..Default::default()
+        });
+    }
+    // The `modifier` category has no alias entries — modifiers live
+    // in the expanded modifier-key set (modifiers.cwt + templated
+    // names like production_speed_<building>_factor). This is the
+    // MIO `equipment_bonus` / idea `modifier` block case.
+    if cat == "modifier" {
+        for m in modifier_keys {
+            items.push(CompletionItem {
+                label: m.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some("modifier".to_string()),
+                insert_text: Some(format!("{} = $0", m)),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+/// Scope names (`scope[country]` positions): one `VALUE` item per name.
+fn push_scope_names(items: &mut Vec<CompletionItem>, names: &[String]) {
+    for name in names {
+        items.push(CompletionItem {
+            label: name.clone(),
+            kind: Some(CompletionItemKind::VALUE),
+            detail: Some("scope".to_string()),
+            ..Default::default()
+        });
+    }
+}
+
+/// Boolean leaf value: the `yes`/`no` keywords.
+fn push_bool_leaf_values(items: &mut Vec<CompletionItem>) {
+    for v in &["yes", "no"] {
+        items.push(CompletionItem {
+            label: v.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            detail: Some("bool".to_string()),
+            ..Default::default()
+        });
+    }
 }
 
 pub(crate) fn enum_values_for<'a>(ruleset: &'a RuleSet, enum_name: &str) -> &'a [String] {
@@ -660,8 +755,8 @@ pub(crate) fn value_completions(
             // set; reads (`value[x]`) want exactly these. Same source either way.
             NewField::VariableGetField(ns) | NewField::VariableSetField(ns) => {
                 let source: Vec<String> = match ns.as_str() {
-                    "event_target" => info.all_event_targets.iter().cloned().collect(),
-                    "variable" => info.all_variables.iter().cloned().collect(),
+                    "event_target" => info.event_target_counts.keys().cloned().collect(),
+                    "variable" => info.variable_counts.keys().cloned().collect(),
                     // Flags/tokens/…: config-declared values plus the members
                     // collected from mod+vanilla effects (set_country_flag etc.).
                     other => {
@@ -686,7 +781,7 @@ pub(crate) fn value_completions(
                 }
             }
             NewField::VariableField { .. } => {
-                for v in &info.all_variables {
+                for v in info.variable_counts.keys() {
                     push(
                         v.clone(),
                         CompletionItemKind::CONSTANT,

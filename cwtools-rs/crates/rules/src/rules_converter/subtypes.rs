@@ -66,7 +66,7 @@ fn build_subtype(
     children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
-    ruleset: &mut RuleSet,
+    _ruleset: &mut RuleSet,
     comments: &[String],
 ) -> SubTypeDefinition {
     // Parse metadata from comments preceding the subtype[] declaration
@@ -106,7 +106,7 @@ fn build_subtype(
         .collect();
 
     // Convert children using full children_to_rules for proper typing
-    let rules = children_to_rules(&filtered_children, ast, table, ruleset);
+    let rules = children_to_rules(&filtered_children, ast, table);
 
     SubTypeDefinition {
         name,

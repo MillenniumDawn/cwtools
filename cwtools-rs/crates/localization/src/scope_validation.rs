@@ -163,7 +163,13 @@ fn game_to_engine(game: Game) -> EngineGame {
         Game::IR => EngineGame::Ir,
         Game::VIC3 => EngineGame::Vic3,
         Game::EU5 => EngineGame::Eu5,
-        Game::Generic | Game::Custom => EngineGame::Hoi4, // fallback: lenient
+        Game::Generic | Game::Custom => {
+            tracing::warn!(
+                "localization game {:?} has no engine mapping; defaulting to Hoi4",
+                game
+            );
+            EngineGame::Hoi4 // fallback: lenient
+        }
     }
 }
 
@@ -177,6 +183,82 @@ fn is_bypass_prefix(lower: &str, data: &LocScopeData) -> bool {
         || lower.starts_with("scope:")
         || (data.parameter_variables && lower.starts_with("parameter:"))
         || (data.question_mark_variable && lower.starts_with('?'))
+}
+
+/// Per-segment pre-check shared by both chain validators: decide whether the
+/// segment bypasses scope checks, terminates the chain, or needs a scope change.
+///
+/// `seg_lower` is the already-lowercased segment; `is_last` marks the final
+/// segment of the chain.
+enum SegmentPre {
+    /// `event_target:` / `parameter:` / `?…` etc. — push `SCOPE_ANY` and continue.
+    Bypass,
+    /// Terminal getter (`Get…` or in the terminal list) as the final segment —
+    /// the chain is accepted, stop walking.
+    TerminalStop,
+    /// Ordinary segment: attempt `ctx.change_scope` and classify the result.
+    ScopeChange { looks_terminal: bool },
+}
+
+fn classify_segment(
+    seg_lower: &str,
+    is_last: bool,
+    data: &LocScopeData,
+    terminal_set: &HashSet<String>,
+) -> SegmentPre {
+    if is_bypass_prefix(seg_lower, data) {
+        return SegmentPre::Bypass;
+    }
+    let looks_terminal = is_terminal_command(seg_lower, terminal_set);
+    if is_last && looks_terminal {
+        return SegmentPre::TerminalStop;
+    }
+    SegmentPre::ScopeChange { looks_terminal }
+}
+
+/// Neutral classification of a `ScopeResult` for the scope-change arm, shared by
+/// both chain validators. The two callers differ only in how they treat
+/// `Unknown` on the final segment and how they track lenient intermediates, so
+/// those decisions stay in the callers; everything else is shared here.
+enum ScopeOutcome {
+    /// Scope advanced normally (`NewScope` / `VarFound`); keep walking.
+    Advanced,
+    /// `AnyScope` — advanced leniently (callers may note an "any" intermediate).
+    AnyScope,
+    /// `ValueFound` at the end of the chain — accept and stop.
+    ValueEnd,
+    /// `ValueFound` mid-chain — lenient stop-continue (no scope progress, but the
+    /// chain is accepted as-is; F# would error, we don't).
+    ValueMid,
+    /// A scope-change link used from an incompatible scope; carries the data to
+    /// build the `WrongScope` diagnostic (the caller formats the `command`).
+    Wrong {
+        command: String,
+        current: ScopeId,
+        expected: Vec<ScopeId>,
+    },
+    /// `NotFound` / `VarNotFound` — unknown segment; caller decides final vs.
+    /// intermediate policy.
+    Unknown,
+}
+
+fn classify_scope_result(result: ScopeResult, is_last: bool) -> ScopeOutcome {
+    match result {
+        ScopeResult::NewScope { .. } | ScopeResult::VarFound => ScopeOutcome::Advanced,
+        ScopeResult::AnyScope => ScopeOutcome::AnyScope,
+        ScopeResult::ValueFound if is_last => ScopeOutcome::ValueEnd,
+        ScopeResult::ValueFound => ScopeOutcome::ValueMid,
+        ScopeResult::WrongScope {
+            command,
+            current,
+            expected,
+        } => ScopeOutcome::Wrong {
+            command,
+            current,
+            expected,
+        },
+        ScopeResult::NotFound | ScopeResult::VarNotFound(_) => ScopeOutcome::Unknown,
+    }
 }
 
 /// Validate a legacy dot-delimited command string, e.g. `THIS.Owner.GetName`.
@@ -203,35 +285,24 @@ fn validate_command_string(
         // Lowercase once per segment; shared by the bypass and terminal checks.
         let seg_lower = seg.to_ascii_lowercase();
 
-        // Bypass prefixes in any segment
-        if is_bypass_prefix(&seg_lower, data) {
-            ctx.push_scope(SCOPE_ANY);
-            continue;
-        }
-
-        // Check if this looks like a terminal getter (starts with "Get" or
-        // is in the explicit terminal-commands list)
-        let looks_terminal = is_terminal_command(&seg_lower, terminal_set);
-
-        if is_last && looks_terminal {
+        let looks_terminal = match classify_segment(&seg_lower, is_last, data, terminal_set) {
+            SegmentPre::Bypass => {
+                ctx.push_scope(SCOPE_ANY);
+                continue;
+            }
             // Terminal command — no scope check needed; accept.
-            break;
-        }
+            SegmentPre::TerminalStop => break,
+            SegmentPre::ScopeChange { looks_terminal } => looks_terminal,
+        };
 
-        // Attempt scope change via the engine
-        let result = ctx.change_scope(seg);
-        match result {
-            ScopeResult::NewScope { .. } | ScopeResult::AnyScope | ScopeResult::VarFound => {
-                // Scope changed successfully; continue the chain.
-            }
-            ScopeResult::ValueFound if is_last => {
-                // Value-only trigger at the end: valid.
-            }
-            ScopeResult::ValueFound => {
-                // Value-only trigger in the middle: chain cannot continue.
-                // Treat as terminal (lenient — F# would error but we accept).
-            }
-            ScopeResult::WrongScope {
+        match classify_scope_result(ctx.change_scope(seg), is_last) {
+            // Scope changed (incl. AnyScope) or a value-only trigger: this path
+            // does not track lenient intermediates, so all of these just continue.
+            ScopeOutcome::Advanced
+            | ScopeOutcome::AnyScope
+            | ScopeOutcome::ValueEnd
+            | ScopeOutcome::ValueMid => {}
+            ScopeOutcome::Wrong {
                 command,
                 current,
                 expected,
@@ -244,7 +315,7 @@ fn validate_command_string(
                 // Short-circuit: further segments are meaningless
                 return;
             }
-            ScopeResult::NotFound | ScopeResult::VarNotFound(_) => {
+            ScopeOutcome::Unknown => {
                 // Unknown command.  If it's the final segment and we have no
                 // terminal-commands list, accept it (lenient); if we have a
                 // non-empty list and it didn't match, warn.
@@ -302,30 +373,28 @@ fn validate_jomini_chain(
         // Lowercase once per segment; shared by the bypass and terminal checks.
         let seg_lower = seg.to_ascii_lowercase();
 
-        if is_bypass_prefix(&seg_lower, data) {
-            ctx.push_scope(SCOPE_ANY);
-            if !is_last {
-                had_lenient_intermediate = true;
+        let looks_terminal = match classify_segment(&seg_lower, is_last, data, terminal_set) {
+            SegmentPre::Bypass => {
+                ctx.push_scope(SCOPE_ANY);
+                if !is_last {
+                    had_lenient_intermediate = true;
+                }
+                continue;
             }
-            continue;
-        }
+            // terminal — accepted without scope check
+            SegmentPre::TerminalStop => return,
+            SegmentPre::ScopeChange { looks_terminal } => looks_terminal,
+        };
 
-        let looks_terminal = is_terminal_command(&seg_lower, terminal_set);
-        if is_last && looks_terminal {
-            return; // terminal — accepted without scope check
-        }
-
-        let result = ctx.change_scope(seg);
-        match result {
-            ScopeResult::AnyScope => {
+        match classify_scope_result(ctx.change_scope(seg), is_last) {
+            ScopeOutcome::AnyScope => {
                 if !is_last {
                     had_lenient_intermediate = true;
                 }
             }
-            ScopeResult::NewScope { .. } | ScopeResult::VarFound => {}
-            ScopeResult::ValueFound if is_last => return,
-            ScopeResult::ValueFound => {}
-            ScopeResult::WrongScope {
+            ScopeOutcome::Advanced | ScopeOutcome::ValueMid => {}
+            ScopeOutcome::ValueEnd => return,
+            ScopeOutcome::Wrong {
                 command,
                 current,
                 expected,
@@ -337,7 +406,7 @@ fn validate_jomini_chain(
                 });
                 return; // short-circuit
             }
-            ScopeResult::NotFound | ScopeResult::VarNotFound(_) => {
+            ScopeOutcome::Unknown => {
                 if is_last
                     && data.registry.is_some()
                     && !looks_terminal
@@ -427,7 +496,6 @@ mod tests {
                 ScopeLink {
                     valid_scopes: vec![ScopeId(101)], // state only
                     target: Some(ScopeId(100)),       // -> country
-                    is_scope_change: true,
                     ignore_keys: vec![],
                 },
             );

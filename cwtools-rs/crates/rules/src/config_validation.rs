@@ -114,11 +114,6 @@ fn walk_child(
                 ),
             }
         }
-        Child::ValueClause(idx) => {
-            for ch in &ast.arena.value_clauses[*idx as usize].children {
-                walk_child(ch, ast, table, ruleset, single_alias_names, path, errors);
-            }
-        }
         Child::Comment(_) => {}
     }
 }

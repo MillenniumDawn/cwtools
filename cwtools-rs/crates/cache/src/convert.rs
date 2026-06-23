@@ -1,6 +1,6 @@
 use crate::cache_format::*;
 use cwtools_parser::ast::{
-    Arena, Child, Comment, Leaf, LeafValue, Operator, SourcePos, SourceRange, Value, ValueClause,
+    Arena, Child, Comment, Leaf, LeafValue, Operator, SourcePos, SourceRange, Value,
 };
 use cwtools_string_table::string_table::{StringResolver, StringTable, StringTokens};
 
@@ -23,11 +23,6 @@ pub fn arena_to_cached(
             .iter()
             .map(|lv| leaf_value_to_cached(lv, &table))
             .collect(),
-        value_clauses: arena
-            .value_clauses
-            .iter()
-            .map(|vc| value_clause_to_cached(vc, &table))
-            .collect(),
         comments: arena.comments.iter().map(comment_to_cached).collect(),
     })
 }
@@ -43,7 +38,7 @@ pub fn arena_to_cached(
 /// The token assignment is identical to per-string interning.
 pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Arena, Vec<Child>) {
     // Pass 1: collect every string slice in the same order `intern` is reached
-    // when building leaves, then leaf_values, then value_clauses.
+    // when building leaves, then leaf_values.
     let mut to_intern: Vec<&str> = Vec::new();
     for l in &cached.leaves {
         to_intern.push(&l.key);
@@ -52,17 +47,15 @@ pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Aren
     for lv in &cached.leaf_values {
         collect_value_strings(&lv.value, &mut to_intern);
     }
-    for vc in &cached.value_clauses {
-        for k in &vc.keys {
-            to_intern.push(k);
-        }
-    }
 
     // Batch-intern under one write lock; tokens come back in collection order.
     let tokens = string_table.intern_batch(to_intern.iter().copied());
     let mut tokens = tokens.into_iter();
 
     // Pass 2: rebuild the arena, drawing tokens in the identical order.
+    // The asserts confirm each push returns the index matching its position in
+    // collection order, so the cached `Child` indices still address the right
+    // elements in the rebuilt arena (a layout mismatch would corrupt the tree).
     let mut arena = Arena::new();
     for l in &cached.leaves {
         let idx = arena.push_leaf(cached_leaf_to_leaf(l, &mut tokens));
@@ -71,10 +64,6 @@ pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Aren
     for lv in &cached.leaf_values {
         let idx = arena.push_leaf_value(cached_leaf_value_to_leaf_value(lv, &mut tokens));
         assert_eq!(idx as usize, arena.leaf_values.len() - 1);
-    }
-    for vc in &cached.value_clauses {
-        let idx = arena.push_value_clause(cached_value_clause_to_value_clause(vc, &mut tokens));
-        assert_eq!(idx as usize, arena.value_clauses.len() - 1);
     }
     for c in &cached.comments {
         let idx = arena.push_comment(cached_comment_to_comment(c));
@@ -100,7 +89,7 @@ fn collect_value_strings<'a>(v: &'a CachedValue, out: &mut Vec<&'a str>) {
 
 // ---- helpers ----
 
-fn string_token_to_str(token: &StringTokens, table: &StringResolver<'_>) -> String {
+fn string_token_to_owned(token: &StringTokens, table: &StringResolver<'_>) -> String {
     table.get(token.normal).unwrap_or_default().to_string()
 }
 
@@ -134,7 +123,6 @@ fn children_to_cached(children: &[Child]) -> Vec<CachedChild> {
         .map(|c| match c {
             Child::Leaf(i) => CachedChild::Leaf(*i),
             Child::LeafValue(i) => CachedChild::LeafValue(*i),
-            Child::ValueClause(i) => CachedChild::ValueClause(*i),
             Child::Comment(i) => CachedChild::Comment(*i),
         })
         .collect()
@@ -146,7 +134,6 @@ fn children_from_cached(children: &[CachedChild]) -> Vec<Child> {
         .map(|c| match c {
             CachedChild::Leaf(i) => Child::Leaf(*i),
             CachedChild::LeafValue(i) => Child::LeafValue(*i),
-            CachedChild::ValueClause(i) => Child::ValueClause(*i),
             CachedChild::Comment(i) => Child::Comment(*i),
         })
         .collect()
@@ -155,7 +142,7 @@ fn children_from_cached(children: &[CachedChild]) -> Vec<Child> {
 fn leaf_to_cached(l: &Leaf, table: &StringResolver<'_>) -> CachedLeaf {
     let (sl, sc, el, ec) = range_to_cached(&l.pos);
     CachedLeaf {
-        key: string_token_to_str(&l.key, table),
+        key: string_token_to_owned(&l.key, table),
         value: value_to_cached(&l.value, table),
         op: op_to_cached(&l.op),
         start_line: sl,
@@ -195,33 +182,6 @@ fn cached_leaf_value_to_leaf_value(
     }
 }
 
-fn value_clause_to_cached(vc: &ValueClause, table: &StringResolver<'_>) -> CachedValueClause {
-    let (sl, sc, el, ec) = range_to_cached(&vc.pos);
-    CachedValueClause {
-        keys: vc
-            .keys
-            .iter()
-            .map(|k| string_token_to_str(k, table))
-            .collect(),
-        children: children_to_cached(&vc.children),
-        start_line: sl,
-        start_col: sc,
-        end_line: el,
-        end_col: ec,
-    }
-}
-
-fn cached_value_clause_to_value_clause(
-    vc: &CachedValueClause,
-    tokens: &mut impl Iterator<Item = StringTokens>,
-) -> ValueClause {
-    ValueClause {
-        keys: vc.keys.iter().map(|_| next_token(tokens)).collect(),
-        children: children_from_cached(&vc.children),
-        pos: cached_to_range(vc.start_line, vc.start_col, vc.end_line, vc.end_col),
-    }
-}
-
 fn comment_to_cached(c: &Comment) -> CachedComment {
     let (sl, sc, el, ec) = range_to_cached(&c.pos);
     CachedComment {
@@ -242,8 +202,8 @@ fn cached_comment_to_comment(c: &CachedComment) -> Comment {
 
 fn value_to_cached(v: &Value, table: &StringResolver<'_>) -> CachedValue {
     match v {
-        Value::String(t) => CachedValue::String(string_token_to_str(t, table)),
-        Value::QString(t) => CachedValue::QString(string_token_to_str(t, table)),
+        Value::String(t) => CachedValue::String(string_token_to_owned(t, table)),
+        Value::QString(t) => CachedValue::QString(string_token_to_owned(t, table)),
         Value::Float(f) => CachedValue::Float(*f),
         Value::Int(i) => CachedValue::Int(*i),
         Value::Bool(b) => CachedValue::Bool(*b),

@@ -34,54 +34,76 @@ pub struct LocDiagnostic {
     pub message: String,
 }
 
-/// The F# numeric code for a scope-independent loc-entry error.
-pub fn loc_error_code(kind: &LocErrorKind) -> &'static str {
-    match kind {
-        LocErrorKind::UndefinedLocReference { .. } => "CW225",
-        LocErrorKind::RecursiveLocRef => "CW259",
-        LocErrorKind::ReplaceMe => "CW234",
-        LocErrorKind::LocMissingQuote => "CW268",
-        LocErrorKind::LocInvalidChars => "CW275",
-    }
-}
-
-/// The severity for a scope-independent loc-entry error.
-pub fn loc_error_severity(kind: &LocErrorKind) -> LocSeverity {
-    match kind {
-        LocErrorKind::UndefinedLocReference { .. } | LocErrorKind::RecursiveLocRef => {
-            LocSeverity::Error
-        }
-        LocErrorKind::ReplaceMe => LocSeverity::Information,
-        LocErrorKind::LocMissingQuote | LocErrorKind::LocInvalidChars => LocSeverity::Warning,
-    }
-}
-
-/// Build the human-readable message, matching the F# `ErrorCodes` text.
-fn loc_error_message(kind: &LocErrorKind, key: &str, lang: Option<Lang>) -> String {
+/// Single source of truth for a scope-independent loc-entry error's code,
+/// severity, and human-readable message (matching the F# `ErrorCodes` text).
+///
+/// Adding a `LocErrorKind` variant only needs one new arm here; the public
+/// `loc_error_code` / `loc_error_severity` accessors and the message used by the
+/// emission paths all derive from this.
+fn loc_error_parts(
+    kind: &LocErrorKind,
+    key: &str,
+    lang: Option<Lang>,
+) -> (&'static str, LocSeverity, String) {
     let lang_label = lang
         .map(|l| l.to_string())
         .unwrap_or_else(|| "?".to_string());
     match kind {
-        LocErrorKind::UndefinedLocReference { other_key } => format!(
-            "Localisation key \"{}\" references \"{}\" which doesn't exist in {}",
-            key, other_key, lang_label
+        LocErrorKind::UndefinedLocReference { other_key } => (
+            "CW225",
+            LocSeverity::Error,
+            format!(
+                "Localisation key \"{}\" references \"{}\" which doesn't exist in {}",
+                key, other_key, lang_label
+            ),
         ),
-        LocErrorKind::RecursiveLocRef => "This localisation string refers to itself".to_string(),
-        LocErrorKind::ReplaceMe => {
+        LocErrorKind::RecursiveLocRef => (
+            "CW259",
+            LocSeverity::Error,
+            "This localisation string refers to itself".to_string(),
+        ),
+        LocErrorKind::ReplaceMe => (
+            "CW234",
+            LocSeverity::Information,
             format!(
                 "Localisation key {} is a placeholder for {}",
                 key, lang_label
-            )
-        }
-        LocErrorKind::LocMissingQuote => format!(
-            "Localisation key {} doesn't start and end with double quotes",
-            key
+            ),
         ),
-        LocErrorKind::LocInvalidChars => format!(
-            "Localisation value for {} contains unexpected characters, and may not render correctly",
-            key
+        LocErrorKind::LocMissingQuote => (
+            "CW268",
+            LocSeverity::Warning,
+            format!(
+                "Localisation key {} doesn't start and end with double quotes",
+                key
+            ),
+        ),
+        LocErrorKind::LocInvalidChars => (
+            "CW275",
+            LocSeverity::Warning,
+            format!(
+                "Localisation value for {} contains unexpected characters, and may not render correctly",
+                key
+            ),
         ),
     }
+}
+
+/// The F# numeric code for a scope-independent loc-entry error.
+pub fn loc_error_code(kind: &LocErrorKind) -> &'static str {
+    // key/lang don't affect the code; pass placeholders.
+    loc_error_parts(kind, "", None).0
+}
+
+/// The severity for a scope-independent loc-entry error.
+pub fn loc_error_severity(kind: &LocErrorKind) -> LocSeverity {
+    // key/lang don't affect the severity; pass placeholders.
+    loc_error_parts(kind, "", None).1
+}
+
+/// Build the human-readable message, matching the F# `ErrorCodes` text.
+fn loc_error_message(kind: &LocErrorKind, key: &str, lang: Option<Lang>) -> String {
+    loc_error_parts(kind, key, lang).2
 }
 
 /// F# `STLLang` case name, used to reproduce the CW257 message (`%A`).
@@ -148,6 +170,85 @@ fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
     })
 }
 
+/// Build the per-file diagnostics for one parsed loc file, in the fixed F# order:
+/// CW255/256/257 (lang header) → CW254 (encoding) → CW001 (parse errors) →
+/// CW225/234/259/268/275 (loc-entry checks).
+///
+/// `file_path` is the path used for every diagnostic's `file` field (the project
+/// path passes `&file.path`; the single-file path passes its `path` argument —
+/// both are the same string the file was parsed under).
+///
+/// `emit_cw254` controls the one DELIBERATE divergence between the two callers:
+/// the project (directory-loading) path knows the on-disk encoding and passes
+/// `true` only when the file is `Utf8NoBom`/`NonUtf8`; the single-file text path
+/// has no on-disk bytes to inspect and always passes `false`, so it never emits
+/// CW254. Do not flip this without changing the corpus.
+fn build_diagnostics(
+    file: &LocFile,
+    file_path: &str,
+    union: &HashSet<String>,
+    extra_valid_refs: &HashSet<String>,
+    hardcoded: &HashSet<String>,
+    emit_cw254: bool,
+) -> Vec<LocDiagnostic> {
+    let lang = file.lang;
+    let mut out: Vec<LocDiagnostic> = Vec::new();
+
+    // CW255/256/257: file name vs language header.
+    if let Some(d) = lang_header_diagnostic(file) {
+        out.push(d);
+    }
+
+    // CW254: localisation files must be UTF-8 with BOM. Only enforced when the
+    // on-disk encoding is known (the directory-loading path); the caller has
+    // already resolved that condition into `emit_cw254`.
+    if emit_cw254 {
+        out.push(LocDiagnostic {
+            file: file_path.to_string(),
+            line: 1,
+            col: 1,
+            code: cwtools_error_codes::CW254_WRONG_ENCODING.id,
+            severity: LocSeverity::Error,
+            message: "Localisation files must be UTF-8 BOM, this file is not".to_string(),
+        });
+    }
+
+    // CW001: line-level parse errors collected during lenient recovery.
+    for pe in &file.parse_errors {
+        out.push(LocDiagnostic {
+            file: file_path.to_string(),
+            line: pe.line,
+            col: 1,
+            code: cwtools_error_codes::CW001_PARSE_ERROR.id,
+            severity: LocSeverity::Error,
+            message: cwtools_error_codes::CW001_PARSE_ERROR.format(&[pe.message.as_str()]),
+        });
+    }
+
+    for err in validate_loc_file_with_hardcoded(file, union, extra_valid_refs, hardcoded) {
+        out.push(LocDiagnostic {
+            file: file_path.to_string(),
+            line: err.line,
+            col: err.col,
+            code: loc_error_code(&err.kind),
+            severity: loc_error_severity(&err.kind),
+            message: loc_error_message(&err.kind, &err.key, lang),
+        });
+    }
+    out
+}
+
+/// Whether CW254 (wrong encoding) should fire for a file, given its detected
+/// on-disk encoding. Only the directory-loading path populates `encoding`; the
+/// text-only path leaves it `None`, which is correctly treated as "don't fire".
+fn should_emit_cw254(file: &LocFile) -> bool {
+    matches!(
+        file.encoding,
+        Some(cwtools_file_manager::FileEncoding::Utf8NoBom)
+            | Some(cwtools_file_manager::FileEncoding::NonUtf8)
+    )
+}
+
 /// Validate every loaded loc file and return normalized diagnostics.
 pub fn validate_loc_project(service: &LocService, game: Game) -> Vec<LocDiagnostic> {
     validate_loc_project_scoped(service, game, None, &HashSet::new())
@@ -199,57 +300,17 @@ pub fn validate_loc_project_scoped(
             None => true,
         })
         .flat_map_iter(|file| {
-            let lang = file.lang;
-            let path = &file.path;
-            let mut out: Vec<LocDiagnostic> = Vec::new();
-
-            // CW255/256/257: file name vs language header.
-            if let Some(d) = lang_header_diagnostic(file) {
-                out.push(d);
-            }
-
-            // CW254: localisation files must be UTF-8 with BOM. Only enforced
-            // when the on-disk encoding is known (the directory-loading path).
-            if matches!(
-                file.encoding,
-                Some(cwtools_file_manager::FileEncoding::Utf8NoBom)
-                    | Some(cwtools_file_manager::FileEncoding::NonUtf8)
-            ) {
-                out.push(LocDiagnostic {
-                    file: path.clone(),
-                    line: 1,
-                    col: 1,
-                    code: cwtools_error_codes::CW254_WRONG_ENCODING.id,
-                    severity: LocSeverity::Error,
-                    message: "Localisation files must be UTF-8 BOM, this file is not".to_string(),
-                });
-            }
-
-            // CW001: line-level parse errors collected during lenient recovery.
-            for pe in &file.parse_errors {
-                out.push(LocDiagnostic {
-                    file: path.clone(),
-                    line: pe.line,
-                    col: 1,
-                    code: cwtools_error_codes::CW001_PARSE_ERROR.id,
-                    severity: LocSeverity::Error,
-                    message: cwtools_error_codes::CW001_PARSE_ERROR.format(&[pe.message.as_str()]),
-                });
-            }
-
-            for err in
-                validate_loc_file_with_hardcoded(file, union_ref, extra_valid_refs, hardcoded)
-            {
-                out.push(LocDiagnostic {
-                    file: path.clone(),
-                    line: err.line,
-                    col: err.col,
-                    code: loc_error_code(&err.kind),
-                    severity: loc_error_severity(&err.kind),
-                    message: loc_error_message(&err.kind, &err.key, lang),
-                });
-            }
-            out.into_iter()
+            // Directory-loading path: CW254 fires when the detected on-disk
+            // encoding is missing/wrong BOM.
+            build_diagnostics(
+                file,
+                &file.path,
+                union_ref,
+                extra_valid_refs,
+                hardcoded,
+                should_emit_cw254(file),
+            )
+            .into_iter()
         })
         .collect()
 }
@@ -266,38 +327,16 @@ pub fn validate_loc_file_text(
     let Ok(file) = parse_loc_text(text, path) else {
         return Vec::new();
     };
-    let lang = file.lang;
-    let mut out: Vec<LocDiagnostic> = Vec::new();
-
-    // CW255/256/257: file name vs language header.
-    if let Some(d) = lang_header_diagnostic(&file) {
-        out.push(d);
-    }
-
-    // CW001: line-level parse errors from lenient recovery.
-    for pe in &file.parse_errors {
-        out.push(LocDiagnostic {
-            file: path.to_string(),
-            line: pe.line,
-            col: 1,
-            code: cwtools_error_codes::CW001_PARSE_ERROR.id,
-            severity: LocSeverity::Error,
-            message: cwtools_error_codes::CW001_PARSE_ERROR.format(&[pe.message.as_str()]),
-        });
-    }
-
-    for err in validate_loc_file_with_hardcoded(&file, union, extra_valid_refs, hardcoded_loc_set())
-    {
-        out.push(LocDiagnostic {
-            file: path.to_string(),
-            line: err.line,
-            col: err.col,
-            code: loc_error_code(&err.kind),
-            severity: loc_error_severity(&err.kind),
-            message: loc_error_message(&err.kind, &err.key, lang),
-        });
-    }
-    out
+    // Text-only path: no on-disk bytes to inspect, so CW254 never fires here.
+    // This is the deliberate divergence from the project path — do not change it.
+    build_diagnostics(
+        &file,
+        path,
+        union,
+        extra_valid_refs,
+        hardcoded_loc_set(),
+        false,
+    )
 }
 
 #[cfg(test)]

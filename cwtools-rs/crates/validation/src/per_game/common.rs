@@ -2,7 +2,7 @@ use crate::{ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 use cwtools_string_table::string_table::{StringId, StringTable};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// A `key = { ... }` block (a `Leaf` whose value is a `Clause`), normalised so
 /// the per-game structural walkers share one `Value::Clause` extraction. The key
@@ -50,7 +50,7 @@ pub fn validate_common(
     file_path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    let mut type_counts: HashMap<String, usize> = HashMap::new();
+    let mut type_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     for child in &ast.root_children {
         let (key, line, col) = match child {
@@ -59,7 +59,7 @@ pub fn validate_common(
                 let k = table.get_string(leaf.key.normal).unwrap_or_default();
                 (k, leaf.pos.start.line, leaf.pos.start.col)
             }
-            Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => continue,
+            Child::LeafValue(_) | Child::Comment(_) => continue,
         };
         *type_counts.entry(key.clone()).or_insert(0) += 1;
 

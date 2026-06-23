@@ -127,62 +127,25 @@ pub(crate) fn process_type_node(
                         "unique" if leaf_value_string(l, table) == "yes" => {
                             def.unique = true;
                         }
+                        // The `should_be_used` directive maps onto the
+                        // `should_be_referenced` field (the field is named for
+                        // the cross-file "is this type ever referenced?" check
+                        // it feeds, but the directive that enables it is spelled
+                        // `should_be_used`). Field is shared across crates, so
+                        // it is not renamed here (#204).
                         "should_be_used" if leaf_value_string(l, table) == "yes" => {
                             def.should_be_referenced = true;
                         }
                         "skip_root_key" => {
                             if let Value::Clause(block_children) = &l.value {
-                                // Block form: skip_root_key = { A B }
-                                // Each element is a separate nested level (F#
-                                // RulesParser.fs:1031-1035 maps each to its own layer).
-                                // `any` becomes AnyKey; anything else becomes SpecificKey.
-                                for block_child in block_children {
-                                    if let Child::LeafValue(lvidx) = block_child {
-                                        let lv = &ast.arena.leaf_values[*lvidx as usize];
-                                        let v = value_to_string(&lv.value, table);
-                                        if v.is_empty() {
-                                            continue;
-                                        }
-                                        if v == "any" {
-                                            def.skip_root_key.push(SkipRootKey::AnyKey);
-                                        } else {
-                                            def.skip_root_key.push(SkipRootKey::SpecificKey(v));
-                                        }
-                                    }
-                                }
+                                parse_skip_root_key_block(
+                                    block_children,
+                                    ast,
+                                    table,
+                                    &mut def.skip_root_key,
+                                );
                             } else {
-                                let op = l.op;
-                                let v = leaf_value_string(l, table);
-                                if v == "any" {
-                                    def.skip_root_key.push(SkipRootKey::AnyKey);
-                                } else {
-                                    let should_match = op == cwtools_parser::ast::Operator::Equals;
-                                    if def.skip_root_key.is_empty() {
-                                        def.skip_root_key.push(SkipRootKey::SpecificKey(v));
-                                    } else {
-                                        // Multiple leaves: promote to MultipleKeys, using
-                                        // the first entry's operator (F# parity).
-                                        let first_should_match = match &def.skip_root_key[0] {
-                                            SkipRootKey::MultipleKeys(_, sm) => *sm,
-                                            _ => should_match,
-                                        };
-                                        let mut all_keys: Vec<String> = Vec::new();
-                                        for existing in def.skip_root_key.drain(..) {
-                                            match existing {
-                                                SkipRootKey::SpecificKey(k) => all_keys.push(k),
-                                                SkipRootKey::MultipleKeys(mut ks, _) => {
-                                                    all_keys.append(&mut ks)
-                                                }
-                                                SkipRootKey::AnyKey => {}
-                                            }
-                                        }
-                                        all_keys.push(v);
-                                        def.skip_root_key.push(SkipRootKey::MultipleKeys(
-                                            all_keys,
-                                            first_should_match,
-                                        ));
-                                    }
-                                }
+                                parse_skip_root_key_leaf(l, table, &mut def.skip_root_key);
                             }
                         }
                         _ => {}
@@ -223,6 +186,83 @@ pub(crate) fn process_type_node(
     def
 }
 
+/// Block form: `skip_root_key = { A B }`.
+/// Each element is a separate nested level (F# RulesParser.fs:1031-1035 maps
+/// each to its own layer). `any` becomes `AnyKey`; anything else becomes
+/// `SpecificKey`. Appends to `out`.
+fn parse_skip_root_key_block(
+    block_children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    out: &mut Vec<SkipRootKey>,
+) {
+    for block_child in block_children {
+        if let Child::LeafValue(lvidx) = block_child {
+            let lv = &ast.arena.leaf_values[*lvidx as usize];
+            let v = value_to_string(&lv.value, table);
+            if v.is_empty() {
+                continue;
+            }
+            if v == "any" {
+                out.push(SkipRootKey::AnyKey);
+            } else {
+                out.push(SkipRootKey::SpecificKey(v));
+            }
+        }
+    }
+}
+
+/// Leaf form: `skip_root_key = A`.
+/// `any` becomes `AnyKey`. A first named key becomes `SpecificKey`; subsequent
+/// named leaves (multiple `skip_root_key = ...` directives) promote the prior
+/// entries into a single `MultipleKeys` alternative, using the first entry's
+/// operator (F# parity). Appends to / rewrites `out`.
+fn parse_skip_root_key_leaf(
+    l: &cwtools_parser::ast::Leaf,
+    table: &StringTable,
+    out: &mut Vec<SkipRootKey>,
+) {
+    let op = l.op;
+    let v = leaf_value_string(l, table);
+    if v == "any" {
+        out.push(SkipRootKey::AnyKey);
+    } else if out.is_empty() {
+        out.push(SkipRootKey::SpecificKey(v));
+    } else {
+        // Multiple leaves: promote to MultipleKeys, using the first entry's
+        // operator (F# parity).
+        let should_match = op == cwtools_parser::ast::Operator::Equals;
+        let first_match_kind = match &out[0] {
+            SkipRootKey::MultipleKeys(_, mk) => *mk,
+            _ => MatchKind::from_equals(should_match),
+        };
+        // Flatten the existing entries (SpecificKey / MultipleKeys) plus the
+        // new key into one alternative list. AnyKey carries no key text.
+        let mut all_keys: Vec<String> = out
+            .drain(..)
+            .flat_map(|existing| match existing {
+                SkipRootKey::SpecificKey(k) => vec![k],
+                SkipRootKey::MultipleKeys(ks, _) => ks,
+                SkipRootKey::AnyKey => Vec::new(),
+            })
+            .collect();
+        all_keys.push(v);
+        out.push(SkipRootKey::MultipleKeys(all_keys, first_match_kind));
+    }
+}
+
+/// Split a brace-wrapped list `{ a b c }` into its whitespace-separated items,
+/// dropping empties. The braces must already be confirmed by the caller via
+/// `rhs.starts_with('{') && rhs.ends_with('}')`; only the inner text is split.
+fn split_brace_list(rhs: &str) -> Vec<String> {
+    let inner = rhs.trim_matches(|c| c == '{' || c == '}');
+    inner
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 pub(crate) fn parse_type_key_filter_from_comments(
     comments: &[String],
 ) -> Option<(Vec<String>, bool)> {
@@ -247,12 +287,7 @@ pub(crate) fn parse_type_key_filter_from_comments(
             continue;
         };
         let values = if rhs.starts_with('{') && rhs.ends_with('}') {
-            let inner = rhs.trim_matches(|c| c == '{' || c == '}');
-            inner
-                .split_whitespace()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
+            split_brace_list(rhs)
         } else {
             vec![rhs.to_string()]
         };
@@ -264,17 +299,39 @@ pub(crate) fn parse_type_key_filter_from_comments(
 fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
     if let Some(rhs) = find_directive(comments, "graph_related_types") {
         if rhs.starts_with('{') && rhs.ends_with('}') {
-            let inner = rhs.trim_matches(|c| c == '{' || c == '}');
-            return inner
-                .split_whitespace()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect();
+            return split_brace_list(rhs);
         } else if !rhs.is_empty() {
             return vec![rhs.to_string()];
         }
     }
     Vec::new()
+}
+
+/// Walk the leaf children of a localisation/modifier sub-block, invoking `f`
+/// with `(child_comments, key, value)` for each `Child::Leaf` whose key is not a
+/// `subtype[...]` sub-block (those carry Leaf+Clause children handled elsewhere).
+///
+/// Shared skeleton for `parse_localisation_block` / `parse_modifiers_block`,
+/// which differ only in the directives they read and the struct they build.
+fn for_each_block_leaf(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    mut f: impl FnMut(&[String], String, String),
+) {
+    let precomputed = precompute_comments(children, ast, table);
+    for (cidx, child) in children.iter().enumerate() {
+        let child_comments = &precomputed[cidx];
+        if let Child::Leaf(lidx) = child {
+            let l = &ast.arena.leaves[*lidx as usize];
+            let key = table.get_string(l.key.normal).unwrap_or_default();
+            if key.starts_with("subtype[") {
+                continue;
+            }
+            let value = value_to_string(&l.value, table);
+            f(child_comments, key, value);
+        }
+    }
 }
 
 pub(crate) fn parse_localisation_block(
@@ -283,51 +340,39 @@ pub(crate) fn parse_localisation_block(
     table: &StringTable,
 ) -> Vec<TypeLocalisation> {
     let mut out = Vec::new();
-    let precomputed = precompute_comments(children, ast, table);
-    for (cidx, child) in children.iter().enumerate() {
-        let child_comments = &precomputed[cidx];
-        if let Child::Leaf(lidx) = child {
-            let l = &ast.arena.leaves[*lidx as usize];
-            let key = table.get_string(l.key.normal).unwrap_or_default();
-            // Skip subtype[] sub-blocks (Leaf+Clause children, handled by
-            // parse_subtype_localisation)
-            if key.starts_with("subtype[") {
-                continue;
-            }
-            let value = value_to_string(&l.value, table);
-            let required = has_directive(child_comments, "required");
-            let optional = has_directive(child_comments, "optional");
-            let primary = has_directive(child_comments, "primary");
-            let replace_scopes = parse_replace_scopes_from_comments(child_comments);
+    for_each_block_leaf(children, ast, table, |child_comments, key, value| {
+        let required = has_directive(child_comments, "required");
+        let optional = has_directive(child_comments, "optional");
+        let primary = has_directive(child_comments, "primary");
+        let replace_scopes = parse_replace_scopes_from_comments(child_comments);
 
-            let loc = if let Some(dollar_idx) = value.find('$') {
-                let prefix = value[..dollar_idx].to_string();
-                let suffix = value[dollar_idx + 1..].to_string();
-                TypeLocalisation {
-                    name: key,
-                    prefix,
-                    suffix,
-                    required,
-                    optional,
-                    explicit_field: None,
-                    replace_scopes,
-                    primary,
-                }
-            } else {
-                TypeLocalisation {
-                    name: key,
-                    prefix: String::new(),
-                    suffix: String::new(),
-                    required,
-                    optional,
-                    explicit_field: Some(value),
-                    replace_scopes,
-                    primary,
-                }
-            };
-            out.push(loc);
-        }
-    }
+        let loc = if let Some(dollar_idx) = value.find('$') {
+            let prefix = value[..dollar_idx].to_string();
+            let suffix = value[dollar_idx + 1..].to_string();
+            TypeLocalisation {
+                name: key,
+                prefix,
+                suffix,
+                required,
+                optional,
+                explicit_field: None,
+                replace_scopes,
+                primary,
+            }
+        } else {
+            TypeLocalisation {
+                name: key,
+                prefix: String::new(),
+                suffix: String::new(),
+                required,
+                optional,
+                explicit_field: Some(value),
+                replace_scopes,
+                primary,
+            }
+        };
+        out.push(loc);
+    });
     out
 }
 
@@ -337,45 +382,35 @@ pub(crate) fn parse_modifiers_block(
     table: &StringTable,
 ) -> Vec<TypeModifier> {
     let mut out = Vec::new();
-    let precomputed = precompute_comments(children, ast, table);
-    for (cidx, child) in children.iter().enumerate() {
-        let child_comments = &precomputed[cidx];
-        if let Child::Leaf(lidx) = child {
-            let l = &ast.arena.leaves[*lidx as usize];
-            let key = table.get_string(l.key.normal).unwrap_or_default();
-            if key.starts_with("subtype[") {
-                continue;
-            }
-            let value = value_to_string(&l.value, table);
-            let explicit = has_directive(child_comments, "explicit");
-            // Documentation is the first exactly-### line (not ##, which is directives).
-            let documentation = child_comments
-                .iter()
-                .find(|s| s.starts_with("###"))
-                .map(|s| s.trim_start_matches('#').trim().to_string());
+    for_each_block_leaf(children, ast, table, |child_comments, key, value| {
+        let explicit = has_directive(child_comments, "explicit");
+        // Documentation is the first exactly-### line (not ##, which is directives).
+        let documentation = child_comments
+            .iter()
+            .find(|s| s.starts_with("###"))
+            .map(|s| s.trim_start_matches('#').trim().to_string());
 
-            let modifier = if let Some(dollar_idx) = value.find('$') {
-                let prefix = value[..dollar_idx].to_string();
-                let suffix = value[dollar_idx + 1..].to_string();
-                TypeModifier {
-                    prefix,
-                    suffix,
-                    category: key,
-                    documentation,
-                    explicit,
-                }
-            } else {
-                TypeModifier {
-                    prefix: String::new(),
-                    suffix: String::new(),
-                    category: key,
-                    documentation,
-                    explicit,
-                }
-            };
-            out.push(modifier);
-        }
-    }
+        let modifier = if let Some(dollar_idx) = value.find('$') {
+            let prefix = value[..dollar_idx].to_string();
+            let suffix = value[dollar_idx + 1..].to_string();
+            TypeModifier {
+                prefix,
+                suffix,
+                category: key,
+                documentation,
+                explicit,
+            }
+        } else {
+            TypeModifier {
+                prefix: String::new(),
+                suffix: String::new(),
+                category: key,
+                documentation,
+                explicit,
+            }
+        };
+        out.push(modifier);
+    });
     out
 }
 
@@ -384,7 +419,10 @@ mod skip_root_key_tests {
     use cwtools_parser::parser::parse_string;
     use cwtools_string_table::string_table::StringTable;
 
-    use crate::{rules_converter::ast_to_ruleset, rules_types::SkipRootKey};
+    use crate::{
+        rules_converter::ast_to_ruleset,
+        rules_types::{MatchKind, SkipRootKey},
+    };
 
     fn parse_type(cwt: &str) -> Vec<SkipRootKey> {
         let table = StringTable::new();
@@ -456,7 +494,7 @@ mod skip_root_key_tests {
         );
         assert_eq!(srk.len(), 1, "multiple leaves must collapse to ONE entry");
         match &srk[0] {
-            SkipRootKey::MultipleKeys(keys, true) => {
+            SkipRootKey::MultipleKeys(keys, MatchKind::Equals) => {
                 assert!(keys.contains(&"a".to_string()));
                 assert!(keys.contains(&"b".to_string()));
             }

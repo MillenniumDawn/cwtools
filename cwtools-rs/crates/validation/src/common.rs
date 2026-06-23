@@ -102,10 +102,6 @@ pub(crate) fn child_start_pos(child: &Child, ast: &ParsedFile) -> Option<(u32, u
             let lv = &ast.arena.leaf_values[*i as usize];
             Some((lv.pos.start.line, lv.pos.start.col))
         }
-        Child::ValueClause(i) => {
-            let vc = &ast.arena.value_clauses[*i as usize];
-            Some((vc.pos.start.line, vc.pos.start.col))
-        }
         _ => None,
     }
 }
@@ -176,6 +172,17 @@ pub(crate) fn is_datetime_shape(s: &str) -> bool {
     }
 }
 
+/// Size heuristic shared by every enum-membership check: a populated enum is
+/// treated as authoritative only when it is small (≤ 5 members). Larger enums
+/// are likely incomplete game-data catalogues (equipment_categories, tech
+/// folders, idea tokens, …) that the CWT rules rarely enumerate in full, so an
+/// unlisted value is accepted rather than flagged. Keep this in one place so the
+/// `enum_contains` / `parsed_pattern_matches` / `field_matches_key` sites stay
+/// in agreement.
+pub(crate) fn enum_is_authoritative(def: &EnumDefinition) -> bool {
+    def.values.len() > 5
+}
+
 /// Enum membership test. An absent or empty enum (members come from game data
 /// that isn't statically loaded — provinces, ship_units, ...) is permissive.
 ///
@@ -209,7 +216,7 @@ pub(crate) fn enum_contains(
             // non-empty value rather than flag every unlisted member.
             // Small enums (≤ 5 members) are authoritative; an unlisted value is
             // a genuine error.
-            if def.values.len() > 5 {
+            if enum_is_authoritative(def) {
                 return !value.is_empty();
             }
             false

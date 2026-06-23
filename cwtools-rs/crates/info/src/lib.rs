@@ -157,15 +157,13 @@ pub struct InfoService {
     pub all_type_defs: HashMap<String, Vec<(String, SourceLocation)>>,
     /// Cross-file type-instance index.
     pub type_index: TypeIndex,
-    pub all_event_targets: HashSet<String>,
-    pub all_variables: HashSet<String>,
-    pub all_inline_scripts: HashSet<String>,
-    /// Refcount maps so `clear_file` can remove a symbol in O(1) instead of
-    /// scanning all remaining files. Each map counts how many files define the
-    /// symbol; the symbol is removed from the public set when its count hits 0.
-    event_target_counts: HashMap<String, usize>,
-    variable_counts: HashMap<String, usize>,
-    inline_script_counts: HashMap<String, usize>,
+    /// Refcount maps over the cross-file symbols. Each map counts how many files
+    /// define the symbol; a key exists iff at least one file still defines it, so
+    /// the keys double as the membership set (use [`HashMap::contains_key`] /
+    /// [`HashMap::keys`]). `clear_file` removes the key when its count hits 0.
+    pub event_target_counts: HashMap<String, usize>,
+    pub variable_counts: HashMap<String, usize>,
+    pub inline_script_counts: HashMap<String, usize>,
     /// Effect/trigger names that DEFINE a `value_set[variable]` (e.g.
     /// `set_variable`). Cached so per-file indexing can scan `set_variable`
     /// blocks for defined names (and their values) without recomputing it from
@@ -186,9 +184,6 @@ impl InfoService {
             files: HashMap::new(),
             all_type_defs: HashMap::new(),
             type_index: TypeIndex::new(),
-            all_event_targets: HashSet::new(),
-            all_variables: HashSet::new(),
-            all_inline_scripts: HashSet::new(),
             event_target_counts: HashMap::new(),
             variable_counts: HashMap::new(),
             inline_script_counts: HashMap::new(),
@@ -212,8 +207,8 @@ impl InfoService {
             self.files.len(),
             cross_file,
             self.type_index.map.len(),
-            self.all_variables.len(),
-            self.all_event_targets.len(),
+            self.variable_counts.len(),
+            self.event_target_counts.len(),
             self.all_type_defs.len(),
         )
     }
@@ -338,12 +333,10 @@ impl InfoService {
         }
         for et in &info.saved_event_targets {
             *self.event_target_counts.entry(et.clone()).or_insert(0) += 1;
-            self.all_event_targets.insert(et.clone());
         }
         for (ns, vars) in &info.defined_variables_ns {
             for v in vars {
                 *self.variable_counts.entry(v.name.clone()).or_insert(0) += 1;
-                self.all_variables.insert(v.name.clone());
                 // Feed value_set[variable] names into the project-wide var index
                 // that CW246 / VariableGetField consult. @-vars are excluded:
                 // reads bypass them, and they'd pollute the unset-variable check.
@@ -354,7 +347,6 @@ impl InfoService {
         }
         for script in info.inline_scripts.keys() {
             *self.inline_script_counts.entry(script.clone()).or_insert(0) += 1;
-            self.all_inline_scripts.insert(script.clone());
         }
 
         self.files.insert(uri.to_string(), info);
@@ -428,7 +420,6 @@ impl InfoService {
                     *count -= 1;
                     if *count == 0 {
                         self.event_target_counts.remove(et);
-                        self.all_event_targets.remove(et);
                     }
                 }
             }
@@ -439,7 +430,6 @@ impl InfoService {
                         *count -= 1;
                         if *count == 0 {
                             self.variable_counts.remove(&v.name);
-                            self.all_variables.remove(&v.name);
                         }
                     }
                     if ns != "@" {
@@ -453,7 +443,6 @@ impl InfoService {
                     *count -= 1;
                     if *count == 0 {
                         self.inline_script_counts.remove(script);
-                        self.all_inline_scripts.remove(script);
                     }
                 }
             }
@@ -540,38 +529,11 @@ impl InfoService {
             let leaf = &arena.leaves[*idx as usize];
             let key = table.get_string(leaf.key.normal).unwrap_or_default();
 
-            if let Value::Clause(_) = &leaf.value {
-                info.top_level_keys.push((
-                    key.clone(),
-                    SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    },
-                ));
-
-                if type_names.contains_key(&key) {
-                    info.type_definitions
-                        .entry(key.clone())
-                        .or_default()
-                        .push(SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        });
-                }
-            }
+            Self::record_top_level_key(leaf, &key, type_names, info);
 
             let value_str = leaf_value_string(&leaf.value, table);
 
-            if value_str.starts_with('<') && value_str.ends_with('>') {
-                let inner = &value_str[1..value_str.len() - 1];
-                info.type_references
-                    .entry(inner.to_string())
-                    .or_default()
-                    .push(SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    });
-            }
+            Self::record_type_reference(leaf, &value_str, info);
 
             if let Value::Clause(children) = &leaf.value {
                 for c in children {
@@ -579,75 +541,155 @@ impl InfoService {
                 }
             }
 
-            if key.starts_with("event_target:") {
-                let target = key.strip_prefix("event_target:").unwrap_or("");
-                if !target.is_empty() {
-                    info.saved_event_targets.insert(target.to_string());
-                }
-            }
-
-            if (key == "save_event_target_as" || key == "save_global_event_target_as")
-                && !value_str.is_empty()
-            {
-                info.saved_event_targets_detailed.push(SavedEventTarget {
-                    name: value_str.clone(),
-                    location: SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    },
-                    is_global: key == "save_global_event_target_as",
-                });
-            }
-
-            if key == "inline_script"
-                && let Value::Clause(children) = &leaf.value
-            {
-                for c in children {
-                    if let Child::Leaf(script_idx) = c {
-                        let script_leaf = &arena.leaves[*script_idx as usize];
-                        let script_key =
-                            table.get_string(script_leaf.key.normal).unwrap_or_default();
-                        if script_key == "script" {
-                            let script_name = leaf_value_string(&script_leaf.value, table);
-                            if !script_name.is_empty() {
-                                info.inline_scripts.insert(
-                                    script_name,
-                                    SourceLocation {
-                                        line: script_leaf.pos.start.line,
-                                        col: script_leaf.pos.start.col,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            if key == "effect" || key.ends_with("_effect") {
-                info.effect_blocks.push(SourceLocation {
-                    line: leaf.pos.start.line,
-                    col: leaf.pos.start.col,
-                });
-            }
-            if key == "trigger" || key.ends_with("_trigger") {
-                info.trigger_blocks.push(SourceLocation {
-                    line: leaf.pos.start.line,
-                    col: leaf.pos.start.col,
-                });
-            }
+            Self::record_saved_event_target(leaf, &key, &value_str, info);
+            Self::record_inline_script(leaf, arena, table, &key, info);
+            Self::record_effect_trigger_block(leaf, &key, info);
 
             // Owned consumer last so `key` moves in rather than clones. An
             // `@`-prefixed key never matches any of the borrow-only checks above,
             // so position is behavior-neutral.
-            if key.starts_with('@') {
-                info.defined_variables.insert(
-                    key,
-                    SourceLocation {
+            Self::record_defined_variable(leaf, key, info);
+        }
+    }
+
+    /// Record a clause leaf as a top-level key, and as a type definition when
+    /// its key names a known type.
+    fn record_top_level_key(
+        leaf: &cwtools_parser::ast::Leaf,
+        key: &str,
+        type_names: &HashMap<String, usize>,
+        info: &mut FileInfo,
+    ) {
+        if let Value::Clause(_) = &leaf.value {
+            info.top_level_keys.push((
+                key.to_string(),
+                SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                },
+            ));
+
+            if type_names.contains_key(key) {
+                info.type_definitions
+                    .entry(key.to_string())
+                    .or_default()
+                    .push(SourceLocation {
                         line: leaf.pos.start.line,
                         col: leaf.pos.start.col,
-                    },
-                );
+                    });
             }
+        }
+    }
+
+    /// Record a `<type>` value as a reference to that type.
+    fn record_type_reference(
+        leaf: &cwtools_parser::ast::Leaf,
+        value_str: &str,
+        info: &mut FileInfo,
+    ) {
+        if value_str.starts_with('<') && value_str.ends_with('>') {
+            let inner = &value_str[1..value_str.len() - 1];
+            info.type_references
+                .entry(inner.to_string())
+                .or_default()
+                .push(SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                });
+        }
+    }
+
+    /// Record saved event targets: the `event_target:` prefix form into the
+    /// name set, and the `save_(global_)event_target_as` form with full detail.
+    fn record_saved_event_target(
+        leaf: &cwtools_parser::ast::Leaf,
+        key: &str,
+        value_str: &str,
+        info: &mut FileInfo,
+    ) {
+        if key.starts_with("event_target:") {
+            let target = key.strip_prefix("event_target:").unwrap_or("");
+            if !target.is_empty() {
+                info.saved_event_targets.insert(target.to_string());
+            }
+        }
+
+        if (key == "save_event_target_as" || key == "save_global_event_target_as")
+            && !value_str.is_empty()
+        {
+            info.saved_event_targets_detailed.push(SavedEventTarget {
+                name: value_str.to_string(),
+                location: SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                },
+                is_global: key == "save_global_event_target_as",
+            });
+        }
+    }
+
+    /// Record the `script` referenced by an `inline_script` clause.
+    fn record_inline_script(
+        leaf: &cwtools_parser::ast::Leaf,
+        arena: &Arena,
+        table: &StringTable,
+        key: &str,
+        info: &mut FileInfo,
+    ) {
+        if key == "inline_script"
+            && let Value::Clause(children) = &leaf.value
+        {
+            for c in children {
+                if let Child::Leaf(script_idx) = c {
+                    let script_leaf = &arena.leaves[*script_idx as usize];
+                    let script_key = table.get_string(script_leaf.key.normal).unwrap_or_default();
+                    if script_key == "script" {
+                        let script_name = leaf_value_string(&script_leaf.value, table);
+                        if !script_name.is_empty() {
+                            info.inline_scripts.insert(
+                                script_name,
+                                SourceLocation {
+                                    line: script_leaf.pos.start.line,
+                                    col: script_leaf.pos.start.col,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record `effect`/`*_effect` and `trigger`/`*_trigger` block positions.
+    fn record_effect_trigger_block(
+        leaf: &cwtools_parser::ast::Leaf,
+        key: &str,
+        info: &mut FileInfo,
+    ) {
+        if key == "effect" || key.ends_with("_effect") {
+            info.effect_blocks.push(SourceLocation {
+                line: leaf.pos.start.line,
+                col: leaf.pos.start.col,
+            });
+        }
+        if key == "trigger" || key.ends_with("_trigger") {
+            info.trigger_blocks.push(SourceLocation {
+                line: leaf.pos.start.line,
+                col: leaf.pos.start.col,
+            });
+        }
+    }
+
+    /// Record an `@`-prefixed key as a defined variable.
+    fn record_defined_variable(leaf: &cwtools_parser::ast::Leaf, key: String, info: &mut FileInfo) {
+        if key.starts_with('@') {
+            info.defined_variables.insert(
+                key,
+                SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                },
+            );
         }
     }
 }
@@ -1134,12 +1176,12 @@ alias[effect:set_temp_variable] = {
         assert_eq!(shorthand.value.as_deref(), Some("5"));
     }
 
-    // ── Item 2.7 — value_set var removed from all_variables on clear_file ────
+    // ── Item 2.7 — value_set var removed from variable_counts on clear_file ──
 
     #[test]
     fn value_set_var_cleared_on_file_clear() {
         // Manually inject a non-@-var into a file's defined_variables and confirm
-        // that clear_file removes it from all_variables (the 2.7 inversion fix).
+        // that clear_file removes it from variable_counts (the 2.7 inversion fix).
         let mut svc = InfoService::new();
         let uri = "file://test.txt";
 
@@ -1160,17 +1202,17 @@ alias[effect:set_temp_variable] = {
             }],
         );
         svc.files.insert(uri.to_string(), file_info);
-        svc.all_variables.insert("my_var".to_string());
-        // Mirror the refcount that index_file_with_path would have set.
+        // Mirror the refcount that index_file_with_path would have set; the key's
+        // presence in variable_counts is the membership signal.
         svc.variable_counts.insert("my_var".to_string(), 1);
 
         // Before clear: variable must be present.
-        assert!(svc.all_variables.contains("my_var"));
+        assert!(svc.variable_counts.contains_key("my_var"));
 
         // Clear the file: variable must be removed.
         svc.clear_file(uri);
         assert!(
-            !svc.all_variables.contains("my_var"),
+            !svc.variable_counts.contains_key("my_var"),
             "my_var should be gone after clear_file"
         );
     }

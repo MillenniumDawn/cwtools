@@ -44,7 +44,6 @@ fn dump(label: &str, input: &str) {
                     }
                 }
                 Child::Comment(_) => println!("{:indent$}comment", "", indent = depth * 2),
-                other => println!("{:indent$}{other:?}", "", indent = depth * 2),
             }
         }
     }

@@ -139,7 +139,7 @@ impl ScopeRegistry {
     pub fn from_hardcoded(game: Game) -> Self {
         let mut reg = ScopeRegistry::default();
         for def in game.scope_defs() {
-            let id = ScopeId(def.id.0);
+            let id = def.id;
             reg.by_name.insert(def.name.to_ascii_lowercase(), id);
             for a in def.aliases {
                 reg.by_name.insert(a.to_ascii_lowercase(), id);
@@ -149,7 +149,7 @@ impl ScopeRegistry {
                 ScopeDefOwned {
                     name: def.name.to_string(),
                     aliases: def.aliases.iter().map(|s| s.to_string()).collect(),
-                    subscope_of: def.subscope_of.iter().map(|s| ScopeId(s.0)).collect(),
+                    subscope_of: def.subscope_of.to_vec(),
                 },
             );
         }
@@ -238,7 +238,6 @@ impl ScopeRegistry {
             let link = ScopeLink {
                 valid_scopes: valid,
                 target,
-                is_scope_change: target.is_some(),
                 ignore_keys: Vec::new(),
             };
             match &li.prefix {
@@ -269,7 +268,6 @@ impl ScopeRegistry {
                     .or_insert(ScopeLink {
                         valid_scopes: Vec::new(),
                         target: Some(id),
-                        is_scope_change: true,
                         ignore_keys: Vec::new(),
                     });
             }
@@ -357,7 +355,6 @@ fn backfill_hardcoded(reg: &mut ScopeRegistry, game: Game, next_id: &mut u32) {
             ScopeLink {
                 valid_scopes: link.valid_scopes.iter().map(|s| remap(*s)).collect(),
                 target: link.target.map(remap),
-                is_scope_change: link.is_scope_change,
                 ignore_keys: link.ignore_keys.clone(),
             },
         );
@@ -371,7 +368,6 @@ fn backfill_hardcoded(reg: &mut ScopeRegistry, game: Game, next_id: &mut u32) {
             ScopeLink {
                 valid_scopes: link.valid_scopes.iter().map(|s| remap(*s)).collect(),
                 target: link.target.map(remap),
-                is_scope_change: link.is_scope_change,
                 ignore_keys: link.ignore_keys.clone(),
             },
         ));

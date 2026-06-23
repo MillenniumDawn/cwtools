@@ -14,6 +14,8 @@
 //! NOT cached: the only consumer is the scope-aware command check on vanilla's
 //! own content, which we never validate.
 
+// zstd level for the cache body — shared with the `.cwb` parse cache.
+use cwtools_cache::io::ZSTD_LEVEL;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -159,7 +161,7 @@ pub fn ruleset_shape_hash(ruleset: &RuleSet) -> String {
     let skip_str = |s: &SkipRootKey| match s {
         SkipRootKey::SpecificKey(k) => format!("s:{k}"),
         SkipRootKey::AnyKey => "any".to_string(),
-        SkipRootKey::MultipleKeys(ks, b) => format!("m:{}:{b}", ks.join(",")),
+        SkipRootKey::MultipleKeys(ks, mk) => format!("m:{}:{}", ks.join(","), mk.is_equals()),
     };
     let mut parts: Vec<String> = ruleset
         .types
@@ -219,9 +221,6 @@ pub fn ruleset_shape_hash(ruleset: &RuleSet) -> String {
 pub fn combined_fingerprint(dir: &Path, ruleset: &RuleSet) -> String {
     format!("{}|rs:{}", fingerprint(dir), ruleset_shape_hash(ruleset))
 }
-
-/// zstd level for the cache body — matches the `.cwb` parse cache.
-const ZSTD_LEVEL: i32 = 3;
 
 fn write_cache(
     instances: Vec<CachedInstance>,

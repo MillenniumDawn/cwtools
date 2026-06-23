@@ -2,7 +2,7 @@ use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
 use cwtools_rules::rules_types::{
     NewField, PathOptions, RuleSet, RuleType, SkipRootKey, TypeDefinition,
 };
-use cwtools_string_table::string_table::StringTable;
+use cwtools_string_table::string_table::{StringId, StringTable};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -11,17 +11,53 @@ pub mod vanilla_cache;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-/// Strip one layer of surrounding double-quotes, if present.
-fn unquote(s: &str) -> &str {
+/// Strip one layer of surrounding double-quotes, if present. A lone `"` (no
+/// matching pair) is left untouched, since `strip_suffix` finds no closing
+/// quote in the already-stripped remainder.
+pub(crate) fn unquote(s: &str) -> &str {
     s.strip_prefix('"')
         .and_then(|t| t.strip_suffix('"'))
         .unwrap_or(s)
 }
 
+/// Decrement a refcount entry in `map`, removing it when the count reaches 0.
+/// Does nothing if the key is absent. Shared by every refcounted name/value
+/// index so re-indexing a file drops only its last contribution.
+pub(crate) fn dec_ref<K, Q>(map: &mut HashMap<K, usize>, key: &Q)
+where
+    K: std::hash::Hash + Eq + std::borrow::Borrow<Q>,
+    Q: std::hash::Hash + Eq + ?Sized,
+{
+    if let Some(count) = map.get_mut(key) {
+        *count -= 1;
+        if *count == 0 {
+            map.remove(key);
+        }
+    }
+}
+
+/// Resolve a `StringId` to its owned text, returning `""` when interning lost
+/// it. For a `StringId` taken from a parsed AST this should never miss, so a
+/// debug build trips an assertion to surface the bug; release behaves exactly
+/// like the prior `get_string(id).unwrap_or_default()`.
+#[inline]
+fn get_string_or_empty(table: &StringTable, id: StringId) -> String {
+    match table.get_string(id) {
+        Some(s) => s,
+        None => {
+            debug_assert!(
+                false,
+                "get_string returned None for a StringId from a parsed AST"
+            );
+            String::new()
+        }
+    }
+}
+
 /// Extract a plain string from a leaf value.
 pub fn leaf_value_string(value: &Value, table: &StringTable) -> String {
     match value {
-        Value::String(t) | Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
+        Value::String(t) | Value::QString(t) => get_string_or_empty(table, t.normal),
         Value::Float(f) => f.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Bool(b) => b.to_string(),
@@ -254,12 +290,7 @@ impl VarIndex {
     /// variables instead of leaking the old set.
     pub fn remove_name(&mut self, raw: &str) {
         let n = Self::normalize(raw);
-        if let Some(count) = self.names.get_mut(&n) {
-            *count -= 1;
-            if *count == 0 {
-                self.names.remove(&n);
-            }
-        }
+        dec_ref(&mut self.names, n.as_str());
     }
 
     /// Whether a raw reference resolves to a known defined variable.
@@ -475,19 +506,11 @@ impl TypeIndex {
                 let keep = uri.as_ref() != file_uri;
                 if !keep {
                     let lower = inst.name.to_ascii_lowercase();
-                    if !subtype_key && let Some(count) = self.name_counts.get_mut(&lower) {
-                        *count -= 1;
-                        if *count == 0 {
-                            self.name_counts.remove(&lower);
-                        }
+                    if !subtype_key {
+                        dec_ref(&mut self.name_counts, lower.as_str());
                     }
-                    if let Some(set) = self.instance_sets.get_mut(type_name)
-                        && let Some(count) = set.get_mut(&lower)
-                    {
-                        *count -= 1;
-                        if *count == 0 {
-                            set.remove(&lower);
-                        }
+                    if let Some(set) = self.instance_sets.get_mut(type_name) {
+                        dec_ref(set, lower.as_str());
                     }
                 }
                 keep
@@ -637,8 +660,8 @@ pub fn skip_root_key_matches(srk: &SkipRootKey, key: &str) -> bool {
     match srk {
         SkipRootKey::SpecificKey(k) => k.eq_ignore_ascii_case(key),
         SkipRootKey::AnyKey => true,
-        SkipRootKey::MultipleKeys(keys, should_match) => {
-            keys.iter().any(|k| k.eq_ignore_ascii_case(key)) == *should_match
+        SkipRootKey::MultipleKeys(keys, match_kind) => {
+            keys.iter().any(|k| k.eq_ignore_ascii_case(key)) == match_kind.is_equals()
         }
     }
 }
@@ -1045,7 +1068,7 @@ fn collect_at_vars(
     for child in children {
         if let Child::Leaf(idx) = child {
             let leaf = &arena.leaves[*idx as usize];
-            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            let key = get_string_or_empty(table, leaf.key.normal);
             if key.starts_with('@') {
                 let value = leaf_value_string(&leaf.value, table);
                 out.entry("@".to_string())
@@ -1115,7 +1138,7 @@ fn scan_children_for_varset(
             // `scan_children_for_varset` calls below — those re-acquire the table
             // lock, which would risk a re-entrant read-lock deadlock under writer
             // contention during parallel indexing.
-            let child_key = table.get_string(kc.key.normal).unwrap_or_default();
+            let child_key = get_string_or_empty(table, kc.key.normal);
             for (rule_type, _) in rules {
                 // NodeRule(VariableSetField): the clause's key IS the defined
                 // variable name (F# InfoService fNode).
@@ -1161,7 +1184,7 @@ fn scan_children_for_varset(
                 // Resolve key and value sequentially (each releases the table lock)
                 // rather than nesting two `with_string` borrows, which would risk a
                 // re-entrant read-lock deadlock under writer contention.
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                let key = get_string_or_empty(table, leaf.key.normal);
                 let val = leaf_value_string(&leaf.value, table);
                 for (rule_type, _opts) in rules {
                     match rule_type {
@@ -1346,7 +1369,7 @@ pub fn collect_set_variable_defs(
             let (key, value, line, col) = match child {
                 Child::Leaf(li) => {
                     let leaf = &arena.leaves[*li as usize];
-                    let k = table.get_string(leaf.key.normal).unwrap_or_default();
+                    let k = get_string_or_empty(table, leaf.key.normal);
                     let v = leaf_value_string(&leaf.value, table);
                     (
                         k,

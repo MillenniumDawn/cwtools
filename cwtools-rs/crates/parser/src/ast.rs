@@ -50,7 +50,6 @@ pub struct SourceRange {
 // Arena indices
 pub type LeafIdx = u32;
 pub type LeafValueIdx = u32;
-pub type ValueClauseIdx = u32;
 pub type CommentIdx = u32;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,7 +69,6 @@ pub enum Value {
 pub enum Child {
     Leaf(LeafIdx),
     LeafValue(LeafValueIdx),
-    ValueClause(ValueClauseIdx),
     Comment(CommentIdx),
 }
 
@@ -86,12 +84,6 @@ pub struct LeafValue {
     pub pos: SourceRange,
 }
 
-pub struct ValueClause {
-    pub keys: Vec<StringTokens>,
-    pub children: Vec<Child>,
-    pub pos: SourceRange,
-}
-
 pub struct Comment {
     pub text: String,
     pub pos: SourceRange,
@@ -100,7 +92,6 @@ pub struct Comment {
 pub struct Arena {
     pub leaves: Vec<Leaf>,
     pub leaf_values: Vec<LeafValue>,
-    pub value_clauses: Vec<ValueClause>,
     pub comments: Vec<Comment>,
 }
 
@@ -115,7 +106,6 @@ impl Arena {
         Self {
             leaves: Vec::new(),
             leaf_values: Vec::new(),
-            value_clauses: Vec::new(),
             comments: Vec::new(),
         }
     }
@@ -129,12 +119,6 @@ impl Arena {
     pub fn push_leaf_value(&mut self, lv: LeafValue) -> LeafValueIdx {
         let idx = self.leaf_values.len() as u32;
         self.leaf_values.push(lv);
-        idx
-    }
-
-    pub fn push_value_clause(&mut self, vc: ValueClause) -> ValueClauseIdx {
-        let idx = self.value_clauses.len() as u32;
-        self.value_clauses.push(vc);
         idx
     }
 

@@ -86,7 +86,6 @@ impl InlineRegistry {
 /// tracking which script names are currently on the call stack.
 pub fn expand_inline_script(
     leaf: &Leaf,
-    _leaf_idx: u32,
     arena: &Arena,
     table: &StringTable,
     registry: &InlineRegistry,
@@ -267,30 +266,8 @@ fn clone_and_expand_child_r(
     call_stack: &mut Vec<String>,
 ) -> Result<Child, String> {
     match child {
-        Child::Leaf(idx) => {
-            // Handled by the caller (clone_and_expand_children) for inline_script detection;
-            // here we just do a normal clone.
-            let src_leaf = &src_arena.leaves[*idx as usize];
-            let new_key = clone_tokens(&src_leaf.key, src_table, dst_table, params);
-            let new_value = clone_value_r(
-                &src_leaf.value,
-                src_arena,
-                src_table,
-                dst_arena,
-                dst_table,
-                params,
-                registry,
-                call_stack,
-            )?;
-            let new_leaf = Leaf {
-                key: new_key,
-                value: new_value,
-                op: src_leaf.op,
-                pos: src_leaf.pos,
-            };
-            let new_idx = dst_arena.leaves.len() as u32;
-            dst_arena.leaves.push(new_leaf);
-            Ok(Child::Leaf(new_idx))
+        Child::Leaf(_) => {
+            unreachable!("Child::Leaf is handled directly by clone_and_expand_children")
         }
         Child::Comment(idx) => {
             let c = &src_arena.comments[*idx as usize];
@@ -314,32 +291,6 @@ fn clone_and_expand_child_r(
             let new_idx = dst_arena.leaf_values.len() as u32;
             dst_arena.leaf_values.push(new_lv);
             Ok(Child::LeafValue(new_idx))
-        }
-        Child::ValueClause(idx) => {
-            let vc = &src_arena.value_clauses[*idx as usize];
-            let new_children = clone_and_expand_children(
-                &vc.children,
-                src_arena,
-                src_table,
-                dst_arena,
-                dst_table,
-                params,
-                registry,
-                call_stack,
-            )?;
-            let new_keys: Vec<StringTokens> = vc
-                .keys
-                .iter()
-                .map(|k| clone_tokens(k, src_table, dst_table, params))
-                .collect();
-            let new_vc = cwtools_parser::ast::ValueClause {
-                keys: new_keys,
-                children: new_children,
-                pos: vc.pos,
-            };
-            let new_idx = dst_arena.value_clauses.len() as u32;
-            dst_arena.value_clauses.push(new_vc);
-            Ok(Child::ValueClause(new_idx))
         }
     }
 }
@@ -502,7 +453,6 @@ mod tests {
         let mut tgt_arena = Arena::default();
         let result = expand_inline_script(
             leaf,
-            leaf_idx,
             &outer_parsed.arena,
             &outer_table,
             &registry,
@@ -539,7 +489,6 @@ mod tests {
         let mut tgt_arena = Arena::default();
         let result = expand_inline_script(
             leaf,
-            leaf_idx,
             &outer_parsed.arena,
             &outer_table,
             &registry,
