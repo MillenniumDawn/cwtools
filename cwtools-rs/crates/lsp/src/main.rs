@@ -185,6 +185,14 @@ struct DocumentState {
     /// `localisation` reference jumps to the `.yml` entry. One representative
     /// (primary-language) location per key is enough for navigation.
     loc_locations: parking_lot::RwLock<HashMap<String, (String, u32)>>,
+    /// Live per-file loc keys (lowercased) for currently-open loc files, keyed by
+    /// URI. Overlays the scanned `loc_index` so a key added to (or present in) an
+    /// open `.yml` resolves immediately in `$ref$` checks without waiting for a
+    /// full rescan (#36). Bounded by the number of open loc files, so it stays
+    /// tiny next to the global index. A key only removed from disk still resolves
+    /// against the baseline `loc_index` until the next scan — the overlay only
+    /// adds keys, it can't subtract from the baseline union.
+    loc_live_overlay: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
     /// When `false` (the default), hover shows localisation for the primary
     /// language only (the first of `config.loc_languages`, else English) and the
     /// `loc_text` map only stores that language. Set via the
@@ -252,6 +260,7 @@ impl DocumentState {
             loc_index: parking_lot::RwLock::new(None),
             loc_text: parking_lot::RwLock::new(HashMap::new()),
             loc_locations: parking_lot::RwLock::new(HashMap::new()),
+            loc_live_overlay: parking_lot::RwLock::new(HashMap::new()),
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
@@ -813,6 +822,8 @@ impl LanguageServer for Backend {
             info.clear_file(&uri);
         }
         self.state.doc_tokens.write().remove(&uri);
+        // Drop the closed loc file's live overlay contribution (#36).
+        self.state.loc_live_overlay.write().remove(&uri);
         cwtools_profiling::trim_memory();
         cwtools_profiling::log_rss("did_close");
         self.client
