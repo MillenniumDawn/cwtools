@@ -1,6 +1,6 @@
 use crate::cache_format::*;
 use cwtools_parser::ast::{
-    Arena, Child, Comment, Leaf, LeafValue, Operator, SourcePos, SourceRange, Value, ValueClause,
+    Arena, Child, Comment, Leaf, LeafValue, Operator, SourcePos, SourceRange, Value,
 };
 use cwtools_string_table::string_table::{StringResolver, StringTable, StringTokens};
 
@@ -23,11 +23,6 @@ pub fn arena_to_cached(
             .iter()
             .map(|lv| leaf_value_to_cached(lv, &table))
             .collect(),
-        value_clauses: arena
-            .value_clauses
-            .iter()
-            .map(|vc| value_clause_to_cached(vc, &table))
-            .collect(),
         comments: arena.comments.iter().map(comment_to_cached).collect(),
     })
 }
@@ -43,7 +38,7 @@ pub fn arena_to_cached(
 /// The token assignment is identical to per-string interning.
 pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Arena, Vec<Child>) {
     // Pass 1: collect every string slice in the same order `intern` is reached
-    // when building leaves, then leaf_values, then value_clauses.
+    // when building leaves, then leaf_values.
     let mut to_intern: Vec<&str> = Vec::new();
     for l in &cached.leaves {
         to_intern.push(&l.key);
@@ -51,11 +46,6 @@ pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Aren
     }
     for lv in &cached.leaf_values {
         collect_value_strings(&lv.value, &mut to_intern);
-    }
-    for vc in &cached.value_clauses {
-        for k in &vc.keys {
-            to_intern.push(k);
-        }
     }
 
     // Batch-intern under one write lock; tokens come back in collection order.
@@ -74,10 +64,6 @@ pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Aren
     for lv in &cached.leaf_values {
         let idx = arena.push_leaf_value(cached_leaf_value_to_leaf_value(lv, &mut tokens));
         assert_eq!(idx as usize, arena.leaf_values.len() - 1);
-    }
-    for vc in &cached.value_clauses {
-        let idx = arena.push_value_clause(cached_value_clause_to_value_clause(vc, &mut tokens));
-        assert_eq!(idx as usize, arena.value_clauses.len() - 1);
     }
     for c in &cached.comments {
         let idx = arena.push_comment(cached_comment_to_comment(c));
@@ -137,7 +123,6 @@ fn children_to_cached(children: &[Child]) -> Vec<CachedChild> {
         .map(|c| match c {
             Child::Leaf(i) => CachedChild::Leaf(*i),
             Child::LeafValue(i) => CachedChild::LeafValue(*i),
-            Child::ValueClause(i) => CachedChild::ValueClause(*i),
             Child::Comment(i) => CachedChild::Comment(*i),
         })
         .collect()
@@ -149,7 +134,6 @@ fn children_from_cached(children: &[CachedChild]) -> Vec<Child> {
         .map(|c| match c {
             CachedChild::Leaf(i) => Child::Leaf(*i),
             CachedChild::LeafValue(i) => Child::LeafValue(*i),
-            CachedChild::ValueClause(i) => Child::ValueClause(*i),
             CachedChild::Comment(i) => Child::Comment(*i),
         })
         .collect()
@@ -195,33 +179,6 @@ fn cached_leaf_value_to_leaf_value(
     LeafValue {
         value: cached_value_to_value(&lv.value, tokens),
         pos: cached_to_range(lv.start_line, lv.start_col, lv.end_line, lv.end_col),
-    }
-}
-
-fn value_clause_to_cached(vc: &ValueClause, table: &StringResolver<'_>) -> CachedValueClause {
-    let (sl, sc, el, ec) = range_to_cached(&vc.pos);
-    CachedValueClause {
-        keys: vc
-            .keys
-            .iter()
-            .map(|k| string_token_to_owned(k, table))
-            .collect(),
-        children: children_to_cached(&vc.children),
-        start_line: sl,
-        start_col: sc,
-        end_line: el,
-        end_col: ec,
-    }
-}
-
-fn cached_value_clause_to_value_clause(
-    vc: &CachedValueClause,
-    tokens: &mut impl Iterator<Item = StringTokens>,
-) -> ValueClause {
-    ValueClause {
-        keys: vc.keys.iter().map(|_| next_token(tokens)).collect(),
-        children: children_from_cached(&vc.children),
-        pos: cached_to_range(vc.start_line, vc.start_col, vc.end_line, vc.end_col),
     }
 }
 

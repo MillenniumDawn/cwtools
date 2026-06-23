@@ -59,7 +59,7 @@ pub fn validate_common(
                 let k = table.get_string(leaf.key.normal).unwrap_or_default();
                 (k, leaf.pos.start.line, leaf.pos.start.col)
             }
-            Child::LeafValue(_) | Child::ValueClause(_) | Child::Comment(_) => continue,
+            Child::LeafValue(_) | Child::Comment(_) => continue,
         };
         *type_counts.entry(key.clone()).or_insert(0) += 1;
 

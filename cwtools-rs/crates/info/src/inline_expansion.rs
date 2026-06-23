@@ -292,32 +292,6 @@ fn clone_and_expand_child_r(
             dst_arena.leaf_values.push(new_lv);
             Ok(Child::LeafValue(new_idx))
         }
-        Child::ValueClause(idx) => {
-            let vc = &src_arena.value_clauses[*idx as usize];
-            let new_children = clone_and_expand_children(
-                &vc.children,
-                src_arena,
-                src_table,
-                dst_arena,
-                dst_table,
-                params,
-                registry,
-                call_stack,
-            )?;
-            let new_keys: Vec<StringTokens> = vc
-                .keys
-                .iter()
-                .map(|k| clone_tokens(k, src_table, dst_table, params))
-                .collect();
-            let new_vc = cwtools_parser::ast::ValueClause {
-                keys: new_keys,
-                children: new_children,
-                pos: vc.pos,
-            };
-            let new_idx = dst_arena.value_clauses.len() as u32;
-            dst_arena.value_clauses.push(new_vc);
-            Ok(Child::ValueClause(new_idx))
-        }
     }
 }
 

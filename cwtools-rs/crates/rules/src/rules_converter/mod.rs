@@ -266,13 +266,6 @@ pub(crate) fn children_to_rules(
                     rules.push((RuleType::LeafValueRule { right: field }, opts));
                 }
             }
-            Child::ValueClause(vcidx) => {
-                // Anonymous {…} parsed as a true ValueClause node (some parser versions).
-                let vc = &ast.arena.value_clauses[*vcidx as usize];
-                let opts = options_from_comments(comments, false);
-                let inner = children_to_rules(&vc.children, ast, table);
-                rules.push((RuleType::ValueClauseRule { rules: inner }, opts));
-            }
             _ => {}
         }
     }

@@ -529,13 +529,6 @@ pub(crate) fn validate_children(
                     }
                 }
             }
-            Child::ValueClause(_) => {
-                for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
-                    if matches!(rule_type, RuleType::ValueClauseRule { .. }) {
-                        valueclause_counts[rule_idx] += 1;
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -689,34 +682,6 @@ pub(crate) fn validate_children(
                             &[&format!("Unexpected bare value '{}'", val_str)],
                         ));
                     }
-                }
-            }
-            // Item 5: ValueClause validation
-            Child::ValueClause(vcidx) => {
-                let vc = &ast.arena.value_clauses[*vcidx as usize];
-                let mut matched = false;
-                for (rule_type, _opts) in rules {
-                    if let RuleType::ValueClauseRule { rules: vc_rules } = rule_type {
-                        matched = true;
-                        validate_children(
-                            ctx,
-                            &vc.children,
-                            vc_rules,
-                            scope_context,
-                            (vc.pos.start.line, vc.pos.start.col),
-                            errors,
-                        );
-                        break;
-                    }
-                }
-                if !matched {
-                    errors.push(ValidationError::from_code(
-                        &error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE,
-                        file_path,
-                        vc.pos.start.line,
-                        vc.pos.start.col,
-                        &["Unexpected value clause '{...}'"],
-                    ));
                 }
             }
             _ => {}

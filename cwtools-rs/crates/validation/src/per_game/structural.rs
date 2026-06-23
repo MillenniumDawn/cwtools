@@ -81,7 +81,7 @@ fn is_empty_if(children: &[Child], ast: &ParsedFile, kw: &Keywords) -> bool {
                     return false;
                 }
             }
-            Child::LeafValue(_) | Child::ValueClause(_) => return false,
+            Child::LeafValue(_) => return false,
             Child::Comment(_) => {}
         }
     }

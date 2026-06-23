@@ -102,10 +102,6 @@ pub(crate) fn child_start_pos(child: &Child, ast: &ParsedFile) -> Option<(u32, u
             let lv = &ast.arena.leaf_values[*i as usize];
             Some((lv.pos.start.line, lv.pos.start.col))
         }
-        Child::ValueClause(i) => {
-            let vc = &ast.arena.value_clauses[*i as usize];
-            Some((vc.pos.start.line, vc.pos.start.col))
-        }
         _ => None,
     }
 }

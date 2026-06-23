@@ -291,11 +291,6 @@ pub(crate) fn collect_doc_tokens(
             push(t.lower, &mut tokens);
         }
     }
-    for vc in &arena.value_clauses {
-        for k in &vc.keys {
-            push(k.lower, &mut tokens);
-        }
-    }
     tokens
 }
 

@@ -130,9 +130,6 @@ pub fn rules_at_pos(
     let child = ast.root_children.iter().find(|c| match c {
         Child::Leaf(idx) => pos_in_range(line, col, &ast.arena.leaves[*idx as usize].pos),
         Child::LeafValue(idx) => pos_in_range(line, col, &ast.arena.leaf_values[*idx as usize].pos),
-        Child::ValueClause(idx) => {
-            pos_in_range(line, col, &ast.arena.value_clauses[*idx as usize].pos)
-        }
         _ => false,
     })?;
 
@@ -525,20 +522,6 @@ fn descend(
                     }),
                     scope: scope_context.clone(),
                 };
-            }
-            Child::ValueClause(idx) => {
-                let vc = &ctx.ast.arena.value_clauses[*idx as usize];
-                if !pos_in_range(line, col, &vc.pos) {
-                    continue;
-                }
-                let next = valueclause_bodies(rules);
-                if next.is_empty() {
-                    return RuleContext {
-                        scope: scope_context.clone(),
-                        ..Default::default()
-                    };
-                }
-                return descend(ctx, &vc.children, &next, scope_context, line, col);
             }
             _ => {}
         }
