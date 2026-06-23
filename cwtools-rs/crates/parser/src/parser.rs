@@ -212,9 +212,10 @@ impl<'a> Parser<'a> {
 
     /// Parse a value. `leafvalue` is true when the value is a bare value in a
     /// clause (e.g. a namelist name), false when it is the RHS of `key = value`.
-    /// Only leafvalues may carry interior quotes; a key's RHS quoted string
-    /// closes strictly at the first `"` so that one-line `a = "x" b = "y"` pairs
-    /// (history/units, version_name, ...) parse as separate statements.
+    /// A quoted string closes strictly at the first unescaped `"` in both cases,
+    /// so one-line `a = "x" b = "y"` pairs and namelists mixing quoted and bare
+    /// entries (`{ "Sunshine" Demon }`) parse as separate values (matches the
+    /// game, which splits a name at its first interior quote).
     fn parse_value(&mut self, leafvalue: bool) -> Option<Value> {
         self.skip_whitespace();
         // Skip any comments that appear before the actual value (e.g. value on next line).
@@ -263,53 +264,25 @@ impl<'a> Parser<'a> {
                     }
                     continue;
                 } else if c == '"' {
-                    if !leafvalue {
-                        // Key-RHS quoted string: `"` always closes (strict). Keeps
-                        // one-line `a = "x" b = "y"` as separate statements.
-                        self.advance();
-                        closed = true;
-                        break;
-                    }
-                    // Decide: real terminator or interior literal quote. Paradox
-                    // namelists embed quotes inside a name, e.g.
-                    //   1 = { "Division "Castillejos"" }
-                    //   2 = { "Grupo de Operaciones Especiales "Granada" II" }
-                    // Rules, applied to the just-closed `"`:
-                    //   - immediately followed by another `"` (no gap): an interior
-                    //     `""` pair — keep one literal quote, let the next `"` be
-                    //     judged on its own.
-                    //   - otherwise look past whitespace to the next significant
-                    //     char: a delimiter (`{ } = #`), another opening `"`, or EOF
-                    //     closes the string; bare content means this `"` was an
-                    //     interior quote and the name continues.
-                    // This intentionally diverges from F#/Clausewitz (which split the
-                    // name at the first interior quote) so the Rust engine accepts
-                    // all valid game configuration as the F# engine is retired.
-                    self.advance(); // consume the `"`
-                    if self.peek() == Some('"') {
-                        s.push('"');
-                        continue;
-                    }
-                    // Look past same-line whitespace (space/tab/CR) ONLY. A newline
-                    // always ends the string: interior quotes appear within a single
-                    // line, so the close `"` of a normal `key = "value"` followed by a
-                    // newline must terminate (not swallow the next line).
-                    let next_sig = {
-                        let mut it = self.chars.clone();
-                        let mut nc = it.next();
-                        while matches!(nc, Some(' ') | Some('\t') | Some('\r')) {
-                            nc = it.next();
-                        }
-                        nc
-                    };
-                    match next_sig {
-                        None | Some('\n') | Some('}') | Some('{') | Some('=') | Some('#')
-                        | Some('"') => break,
-                        _ => {
-                            s.push('"');
-                            continue;
-                        }
-                    }
+                    // A quoted string closes at the first unescaped `"`, for both a
+                    // key's RHS and a leafvalue (a namelist entry). This matches
+                    // Clausewitz, which splits a name at its first interior quote.
+                    //
+                    // A previous leafvalue-only heuristic tried to keep namelist
+                    // entries that embed quotes (`"Division "Castillejos""`) as one
+                    // value by treating a `"` followed by bare content as an interior
+                    // quote. But `"X" Y` is ambiguous — `"Granada" II` (one name with
+                    // an interior quote) is indistinguishable from `"Sunshine" Demon`
+                    // (two separate values) — and the heuristic kept consuming past
+                    // the close, swallowing the rest of the line including the
+                    // clause's `}` and corrupting everything after it. A real HOI4
+                    // common/names file (`callsigns = { "Sunshine" Demon }`) tripped
+                    // this and dropped the whole file with a bogus "unclosed clause"
+                    // (cwtools-vscode#42). Escaped quotes (`\"`) are handled above and
+                    // still join the string.
+                    self.advance();
+                    closed = true;
+                    break;
                 }
                 s.push(c);
                 self.advance();
@@ -787,7 +760,10 @@ mod tests {
         // Regression for cwtools-vscode#42: a HOI4 common/names file (quoted
         // names with apostrophes and non-ASCII, nested name_list clauses) must
         // parse with no errors — it was flagged "unclosed clause: expected '}'
-        // before end of file" despite balanced braces on older builds.
+        // before end of file" despite balanced braces on older builds. The real
+        // trigger is a callsigns clause mixing quoted and BARE values
+        // (`"Adler" Demon`): the bare value after a quoted one made the parser
+        // swallow the clause's `}` and cascade to EOF.
         let src = "\
 GER = {
     male = {
@@ -797,7 +773,7 @@ GER = {
         names = { \"Anna\" \"María\" }
     }
     surnames = { \"Müller\" \"D'Angelo\" \"Schröder\" }
-    callsigns = { \"Falke\" \"Adler\" }
+    callsigns = { \"Falke\" \"Adler\" Demon }
 }
 ENG = {
     male = { names = { \"John\" \"Jack\" } }
@@ -1029,28 +1005,40 @@ ENG = {
             .collect()
     }
 
-    // Paradox namelists embed quotes inside a single name. Each entry must parse
-    // as exactly ONE leafvalue with the interior quotes preserved (intentional
-    // divergence from F#, which splits the name at the first interior quote).
+    // A quoted string closes at the first interior quote, like the game. A name
+    // that embeds quotes therefore splits into several values — but critically it
+    // never swallows the clause's `}`. `"X" Y` (a quoted value then a bare value)
+    // is the common namelist/callsign shape and MUST parse cleanly; an earlier
+    // "keep interior quotes as one value" heuristic ate the `}` and corrupted the
+    // rest of the file (cwtools-vscode#42).
     #[test]
-    fn qstr_interior_quotes_parse_as_single_value() {
+    fn qstr_interior_quotes_split_and_never_swallow_brace() {
         let table = StringTable::new();
-        let cases = [
-            (
-                r#"n = { "Division "Castillejos"" }"#,
-                r#"Division "Castillejos""#,
-            ),
-            (
-                r#"n = { "Grupo de Operaciones Especiales "Granada" II" }"#,
-                r#"Grupo de Operaciones Especiales "Granada" II"#,
-            ),
-        ];
-        for (input, expected) in cases {
-            let result = parse_string(input, &table).unwrap();
-            let lvs = clause_leafvalues(&result, &table);
-            assert_eq!(lvs.len(), 1, "input {:?} should be ONE leafvalue", input);
-            assert_eq!(lvs[0], expected, "input {:?}", input);
-        }
+        // The real trigger: a quoted value followed by a bare value. Two values,
+        // one clause, no parse error.
+        let result = parse_string(r#"callsigns = { "Sunshine" Demon }"#, &table).unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "quoted-then-bare must not error: {:?}",
+            result.errors
+        );
+        assert_eq!(
+            clause_leafvalues(&result, &table),
+            vec!["Sunshine", "Demon"],
+            "quoted value then bare value are two separate entries"
+        );
+        // A name embedding quotes splits at the first interior quote (game
+        // behaviour) rather than being kept whole — and still no error.
+        let result = parse_string(r#"n = { "Division "Castillejos"" }"#, &table).unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "interior-quote name must not error: {:?}",
+            result.errors
+        );
+        assert!(
+            clause_leafvalues(&result, &table).len() > 1,
+            "interior-quote name splits into multiple values"
+        );
     }
 
     // Whitespace-separated quoted strings must STILL split into separate values
