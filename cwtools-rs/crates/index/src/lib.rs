@@ -380,13 +380,11 @@ impl TypeIndex {
     /// `type_name` (e.g. an event's `title` loc key), if any. Lets hover show the
     /// localised title for a reference. Case-insensitive on the instance name.
     pub fn primary_loc_key(&self, type_name: &str, name: &str) -> Option<&str> {
-        self.map.get(type_name)?.iter().find_map(|(_, inst)| {
-            if inst.name.eq_ignore_ascii_case(name) {
-                inst.primary_loc_key.as_deref()
-            } else {
-                None
-            }
-        })
+        self.map
+            .get(type_name)?
+            .iter()
+            .filter(|(_, inst)| inst.name.eq_ignore_ascii_case(name))
+            .find_map(|(_, inst)| inst.primary_loc_key.as_deref())
     }
 
     /// Names a loc `$ref$` may bind to besides loc keys: every type-instance
@@ -686,8 +684,8 @@ fn primary_explicit_loc_field(td: &TypeDefinition) -> Option<&str> {
 }
 
 /// Read the value of the child leaf whose key equals `field_name` (case-
-/// insensitive), unquoted. Mirrors the `name_field` extraction in
-/// [`instance_name_from_children`].
+/// insensitive), unquoted. The shared lookup behind `name_field` and primary
+/// explicit-field localisation.
 fn field_value_from_children(
     field_name: &str,
     children: &[Child],
@@ -723,27 +721,10 @@ fn instance_name_from_children(
 ) -> Option<String> {
     match &td.name_field {
         None => Some(unquote(node_key).to_string()),
-        Some(field_name) => {
-            // The instance name comes from a child leaf whose key equals `name_field`.
-            // Quoted values (e.g. spriteType `name = "GFX_x"`) are stored with their
-            // quotes, so strip them to match unquoted references like `icon = GFX_x`.
-            for child in children {
-                if let Child::Leaf(li) = child {
-                    let leaf = &arena.leaves[*li as usize];
-                    let matches = table
-                        .with_string(leaf.key.normal, |k| k.eq_ignore_ascii_case(field_name))
-                        .unwrap_or(false);
-                    if matches {
-                        let v = leaf_value_string(&leaf.value, table);
-                        let v = unquote(&v);
-                        if !v.is_empty() {
-                            return Some(v.to_string());
-                        }
-                    }
-                }
-            }
-            None
-        }
+        // The instance name comes from a child leaf whose key equals `name_field`.
+        // Quoted values (e.g. spriteType `name = "GFX_x"`) are stored with their
+        // quotes, so strip them to match unquoted references like `icon = GFX_x`.
+        Some(field_name) => field_value_from_children(field_name, children, arena, table),
     }
 }
 
