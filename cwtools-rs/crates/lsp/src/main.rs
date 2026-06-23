@@ -454,16 +454,21 @@ impl Backend {
         // a clone of the cursor's context. For a scope-changing link (`owner`) or
         // a meta keyword (`FROM`/`ROOT`/`PREV`) this is the target scope; for
         // anything that doesn't change scope it stays the ambient one (and is
-        // suppressed below when it matches). Computed unconditionally; the hover
-        // only shows it when the `resolved` setting is on. (#37)
-        let resolved_scope = match (rctx.scope.as_ref(), &element) {
-            (Some(sc), PositionElement::Leaf { key, .. }) if !key.is_empty() => {
-                let mut probe = sc.clone();
-                probe.change_scope(key);
-                probe.current().and_then(|id| resolve_scope(&probe, id))
-            }
-            _ => None,
-        };
+        // suppressed at display when it matches). Only computed when the
+        // `hover.scopeDisplay = "resolved"` setting is on. (#37)
+        let resolved_scope = self
+            .state
+            .hover_resolved_scope
+            .load(Ordering::Relaxed)
+            .then(|| match (rctx.scope.as_ref(), &element) {
+                (Some(sc), PositionElement::Leaf { key, .. }) if !key.is_empty() => {
+                    let mut probe = sc.clone();
+                    probe.change_scope(key);
+                    probe.current().and_then(|id| resolve_scope(&probe, id))
+                }
+                _ => None,
+            })
+            .flatten();
         Some(RuleCursorInfo {
             element,
             hint,

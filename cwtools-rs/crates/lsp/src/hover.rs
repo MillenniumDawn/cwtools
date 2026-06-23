@@ -60,13 +60,8 @@ impl Backend {
                     .state
                     .hover_debug
                     .load(std::sync::atomic::Ordering::Relaxed);
-                // Only surface the resolved/target scope when the user opted in.
-                let resolved = self
-                    .state
-                    .hover_resolved_scope
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .then_some(resolved_scope.as_deref())
-                    .flatten();
+                // `resolved_scope` is already `None` unless the resolved setting
+                // is on (computed in rule_info_at_cursor).
                 let mut md = build_hover_markdown(
                     &element,
                     &hint,
@@ -78,7 +73,7 @@ impl Backend {
                         root: root_scope.as_deref(),
                         prev: prev_scope.as_deref(),
                         from: &from_scopes,
-                        resolved,
+                        resolved: resolved_scope.as_deref(),
                     },
                     debug,
                 );
