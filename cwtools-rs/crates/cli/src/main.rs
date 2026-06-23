@@ -586,12 +586,11 @@ fn main() {
                 }
                 let st = rules_table.stats();
                 eprintln!(
-                    "  [profile]   string_table: {} ({} entries, strings {}, keys {}, meta {})",
+                    "  [profile]   string_table: {} ({} entries, strings {}, keys {})",
                     mib(st.total_bytes()),
                     st.entries,
                     mib(st.id_to_string_bytes),
                     mib(st.map_key_bytes),
-                    mib(st.metadata_bytes),
                 );
                 let (mut leaves, mut values, mut clauses) = (0usize, 0, 0);
                 for src in parsed {

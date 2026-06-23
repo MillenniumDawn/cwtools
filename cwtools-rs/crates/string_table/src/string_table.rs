@@ -23,18 +23,6 @@ pub struct StringTokens {
     pub quoted: bool,
 }
 
-/// Metadata computed once per canonical (lower‑cased) string.
-/// Used by the rules / scope engines to avoid re‑scanning strings.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StringMetadata {
-    pub starts_with_amp: bool,
-    pub contains_double_dollar: bool,
-    pub contains_question_mark: bool,
-    pub contains_hat: bool,
-    pub starts_with_square_bracket: bool,
-    pub contains_pipe: bool,
-}
-
 struct Inner {
     /// Lower‑cased key → the canonical lower token (`lower == normal`).
     /// `Arc<str>` key shares the allocation with `id_to_string[lower_id]`.
@@ -47,8 +35,6 @@ struct Inner {
     /// so each string is stored once on the heap regardless of how many maps
     /// reference it.
     id_to_string: Vec<Arc<str>>,
-    /// Dense array: ID → metadata (both normal and lower slots share the same metadata).
-    id_to_metadata: Vec<StringMetadata>,
     /// Next free ID.  IDs are handed out consecutively starting at 1 (0 is the empty string).
     next_id: u32,
 }
@@ -60,18 +46,21 @@ struct Inner {
 /// * Two IDs per logical entry: a *normal* ID (exact text) and a *lower* ID
 ///   (canonical lower‑cased form).  Multiple normal strings may share the same
 ///   lower ID.
-/// * `StringMetadata` is attached to the canonical lower form and copied to
-///   every normal variant.
 /// * `quoted` is tracked per‑normal variant.
 pub struct StringTable {
     // RwLock (not Mutex): validation is read-only on the table (only
-    // `get_string`/`get_metadata`), so once parsing has interned everything the
+    // `get_string`), so once parsing has interned everything the
     // validation threads read concurrently. Interning (`intern`) still takes the
     // write lock, so parse-time interning stays serialized.
     inner: Arc<RwLock<Inner>>,
 }
 
 impl Clone for StringTable {
+    /// NOTE: this is an *aliasing* clone, not a deep copy. The clone shares the
+    /// same underlying interner (`Arc<RwLock<Inner>>`) as the original, so a
+    /// string interned through one handle is visible through the other. This is
+    /// intentional (see the `shared_table` test) — cloning a `StringTable` just
+    /// hands out another handle to the one process-wide table.
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -88,18 +77,15 @@ impl Default for StringTable {
 impl StringTable {
     pub fn new() -> Self {
         let mut id_to_string = Vec::with_capacity(1024);
-        let mut id_to_metadata = Vec::with_capacity(1024);
         // Slot 0 = empty string (never returned by intern, but keeps the
         // array 1-based so that `StringId(0)` is safe to index).
         id_to_string.push(Arc::from(""));
-        id_to_metadata.push(StringMetadata::default());
 
         Self {
             inner: Arc::new(RwLock::new(Inner {
                 lower_map: HashMap::new(),
                 exact_map: HashMap::new(),
                 id_to_string,
-                id_to_metadata,
                 next_id: 1,
             })),
         }
@@ -201,12 +187,6 @@ impl StringTable {
         inner.id_to_string.get(id.0 as usize).map(|s| f(s.as_ref()))
     }
 
-    /// Retrieve the metadata for a `StringId`.
-    pub fn get_metadata(&self, id: StringId) -> Option<StringMetadata> {
-        let inner = self.inner.read();
-        inner.id_to_metadata.get(id.0 as usize).copied()
-    }
-
     /// Number of unique lower‑cased strings (not counting normal variants).
     pub fn len(&self) -> usize {
         let inner = self.inner.read();
@@ -232,7 +212,6 @@ impl StringTable {
         StringTableStats {
             entries: inner.id_to_string.len(),
             id_to_string_bytes,
-            metadata_bytes: inner.id_to_metadata.len() * std::mem::size_of::<StringMetadata>(),
             map_key_bytes,
         }
     }
@@ -245,8 +224,6 @@ pub struct StringTableStats {
     pub entries: usize,
     /// Total bytes of the interned string payloads.
     pub id_to_string_bytes: usize,
-    /// Bytes held by the metadata array.
-    pub metadata_bytes: usize,
     /// Total bytes of the lower_map + exact_map key payloads.
     pub map_key_bytes: usize,
 }
@@ -254,7 +231,7 @@ pub struct StringTableStats {
 impl StringTableStats {
     /// Sum of all counted byte fields (a lower bound on heap use).
     pub fn total_bytes(&self) -> usize {
-        self.id_to_string_bytes + self.metadata_bytes + self.map_key_bytes
+        self.id_to_string_bytes + self.map_key_bytes
     }
 }
 
@@ -293,12 +270,14 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
 
     // Fast path 2: lower key exists → allocate new normal variant.
     if let Some(&existing_lower) = inner.lower_map.get(lower_key.as_str()) {
+        debug_assert!(
+            inner.next_id < u32::MAX,
+            "StringTable id space exhausted (would collide with StringId::NULL)"
+        );
         let normal_id = inner.next_id;
         inner.next_id += 1;
         let normal_arc: Arc<str> = Arc::from(s);
         inner.id_to_string.push(Arc::clone(&normal_arc));
-        let meta = inner.id_to_metadata[existing_lower.lower.0 as usize];
-        inner.id_to_metadata.push(meta);
         let token = StringTokens {
             lower: existing_lower.lower,
             normal: StringId(normal_id),
@@ -309,11 +288,13 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
     }
 
     // Slow path: brand‑new lower key.
+    debug_assert!(
+        inner.next_id < u32::MAX - 1,
+        "StringTable id space exhausted (would collide with StringId::NULL)"
+    );
     let normal_id = inner.next_id;
     let lower_id = normal_id + 1;
     inner.next_id = lower_id + 1;
-
-    let metadata = compute_metadata(&lower_key);
 
     // Allocate each string once; share the same Arc between id_to_string and
     // the corresponding map key so there is only one heap allocation per string.
@@ -323,8 +304,6 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
     inner.id_to_string.reserve_exact(2);
     inner.id_to_string.push(Arc::clone(&normal_arc)); // normal_id
     inner.id_to_string.push(Arc::clone(&lower_arc)); // lower_id
-    inner.id_to_metadata.push(metadata); // normal_id
-    inner.id_to_metadata.push(metadata); // lower_id
 
     let lower_token = StringTokens {
         lower: StringId(lower_id),
@@ -340,29 +319,6 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
     inner.lower_map.insert(lower_arc, lower_token);
     inner.exact_map.insert(normal_arc, normal_token);
     normal_token
-}
-
-fn compute_metadata(s: &str) -> StringMetadata {
-    if s.is_empty() {
-        return StringMetadata::default();
-    }
-    let starts_with_amp = s.starts_with('@');
-    let contains_question_mark = s.contains('?');
-    let contains_hat = s.contains('^');
-    let first_dollar = s.find('$');
-    let last_dollar = s.rfind('$');
-    let contains_double_dollar = first_dollar.is_some() && first_dollar != last_dollar;
-    let starts_with_square_bracket = s.starts_with('[') || s.starts_with(']');
-    let contains_pipe = s.contains('|');
-
-    StringMetadata {
-        starts_with_amp,
-        contains_double_dollar,
-        contains_question_mark,
-        contains_hat,
-        starts_with_square_bracket,
-        contains_pipe,
-    }
 }
 
 #[cfg(test)]
@@ -411,15 +367,6 @@ mod tests {
         let b = table.intern("foo");
         assert!(a.quoted);
         assert!(!b.quoted);
-    }
-
-    #[test]
-    fn metadata() {
-        let table = StringTable::new();
-        let t = table.intern("@event_target|foo");
-        let meta = table.get_metadata(t.normal).unwrap();
-        assert!(meta.starts_with_amp);
-        assert!(meta.contains_pipe);
     }
 
     #[test]
