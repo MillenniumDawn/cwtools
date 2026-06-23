@@ -208,9 +208,14 @@ impl Backend {
         if items.is_empty() {
             Ok(None)
         } else {
-            let is_incomplete = items.len() >= FALLBACK_CAP;
+            // Always flag the fallback `is_incomplete` so the client re-requests
+            // on each keystroke. Otherwise VS Code caches this generic dump and
+            // keeps filtering it client-side even after the parse recovers and a
+            // real rule context becomes available — the "stuck on abc suggestions"
+            // symptom. With is_incomplete, the next keystroke re-queries and the
+            // context-aware list replaces it. (#41)
             Ok(Some(CompletionResponse::List(CompletionList {
-                is_incomplete,
+                is_incomplete: true,
                 items,
             })))
         }

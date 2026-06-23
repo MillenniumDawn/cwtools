@@ -451,7 +451,15 @@ impl Backend {
             if let Some(d) = docs.get_mut(&uri)
                 && d.version == expected_version
             {
-                d.ast = ast;
+                // Preserve the last good AST on a transient parse failure (None):
+                // a fatal mid-edit syntax error shouldn't wipe the tree that
+                // completion/hover/goto resolve context from, or they collapse to
+                // a generic word list until the next clean parse. The parse error
+                // is still published. (#41) Loc/.cwt files always parse to None
+                // here, so their (absent) AST is unaffected.
+                if ast.is_some() {
+                    d.ast = ast;
+                }
             } else {
                 // Doc closed (or version changed) — discard results entirely.
                 return;
