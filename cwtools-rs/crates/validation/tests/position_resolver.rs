@@ -143,6 +143,56 @@ decision = {
     );
 }
 
+/// Two trigger overloads match `oil`: the `<resource>` type pattern (scope
+/// country/state) and an empty game-derived `enum[equipment_category]` that only
+/// matches via the permissive fallback. When the resource IS indexed, the
+/// resource overload must come first so hover shows its description/scopes rather
+/// than the unrelated equipment_category one (cwtools-vscode resource-trigger
+/// hover bug — the real fix is indexing `common/resources`, this guards the
+/// resolver ordering it relies on).
+const RESOURCE_OVERLOAD_RULES: &str = r#"
+types = {
+    type[scripted_trigger] = { path = "game/common/scripted_triggers" }
+    type[resource] = { path = "game/common/resources" }
+}
+enums = { enum[equipment_category] = { } }
+scripted_trigger = {
+    alias_name[trigger] = alias_match_left[trigger]
+}
+### Check amount of resource state or country has.
+## scope = { country state }
+alias[trigger:<resource>] = int
+### Check ratio of this type of unit for commander.
+## scope = { unit_leader combat }
+alias[trigger:enum[equipment_category]] = variable_field
+"#;
+
+#[test]
+fn indexed_resource_trigger_resolves_to_resource_overload() {
+    let script = "my_trig = {\n\toil > 5\n}\n";
+    let idx = type_index(&[("resource", "oil")]);
+    let ctx = resolve(
+        RESOURCE_OVERLOAD_RULES,
+        script,
+        "game/common/scripted_triggers/test.txt",
+        "oil > 5",
+        Some(&idx),
+    )
+    .expect("context");
+    // The first matched overload (what hover surfaces) must be the resource one.
+    let (_, opts) = ctx.value_rules.first().expect("a matched overload");
+    assert_eq!(
+        opts.description.as_deref(),
+        Some("Check amount of resource state or country has."),
+        "resource overload should win; got value_rules: {:?}",
+        ctx.value_rules
+            .iter()
+            .map(|(_, o)| (&o.description, &o.required_scopes))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(opts.required_scopes, vec!["country", "state"]);
+}
+
 #[test]
 fn trigger_block_insert_position_offers_trigger_alias() {
     // Cursor at an empty insert position inside `allowed = { ... }`: the block's

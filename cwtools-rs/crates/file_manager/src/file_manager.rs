@@ -185,6 +185,11 @@ pub struct FileManagerConfig {
     /// entry is a glob (`*`, `?`) matched against the directory's basename.
     /// Layers on top of `exclude_dirs` — both lists are checked.
     pub exclude_dir_patterns: Vec<String>,
+    /// Directory names skipped ONLY at the workspace root (exact, case-insensitive).
+    /// Use for names that are dev-scratch at the top level but a real game folder
+    /// when nested — e.g. a root `resources/` is scratch, but `common/resources/`
+    /// defines the `resource` type (oil, steel, …) and must be indexed.
+    pub exclude_root_dirs: Vec<String>,
     /// Skip files larger than this (bytes). 0 = no limit.
     pub max_file_size: u64,
 }
@@ -238,10 +243,12 @@ impl Default for FileManagerConfig {
                 "obj".into(),
                 ".idea".into(),
                 ".vscode".into(),
-                // developer scratch area in many mods, not loaded by the game
-                "resources".into(),
             ],
             exclude_dir_patterns: vec![],
+            // A top-level `resources/` is dev scratch the game never loads; skip it
+            // only at the root so the real `common/resources/` (resource defs) still
+            // indexes. A bare name-exclude would drop both.
+            exclude_root_dirs: vec!["resources".into()],
             max_file_size: 2 * 1024 * 1024, // 2 MB
         }
     }
@@ -356,6 +363,18 @@ impl FileManager {
                     .exclude_dir_patterns
                     .iter()
                     .any(|pat| glob_match(pat, dir_name))
+                {
+                    continue;
+                }
+                // Root-anchored excludes: only when this dir is a direct child of
+                // the workspace root (its relative path has no separator).
+                let rel = compute_logical_path_with_root(&path, root_prefix);
+                if !rel.contains('/')
+                    && self
+                        .config
+                        .exclude_root_dirs
+                        .iter()
+                        .any(|ex| dir_name.eq_ignore_ascii_case(ex))
                 {
                     continue;
                 }
@@ -718,9 +737,11 @@ pub fn walk_workspace_files(
     extra_dir_globs: &[String],
 ) -> Vec<PathBuf> {
     let cfg = FileManagerConfig::default();
+    let root_prefix = normalize_root_prefix(root);
     let mut out = Vec::new();
     walk_workspace_inner(
         root,
+        &root_prefix,
         extensions,
         &cfg,
         extra_file_globs,
@@ -732,6 +753,7 @@ pub fn walk_workspace_files(
 
 fn walk_workspace_inner(
     dir: &Path,
+    root_prefix: &str,
     extensions: &[&str],
     cfg: &FileManagerConfig,
     extra_file_globs: &[String],
@@ -750,6 +772,9 @@ fn walk_workspace_inner(
     for (_name, path) in entries {
         if path.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Root-anchored excludes apply only to direct children of the root.
+            let rel = compute_logical_path_with_root(&path, root_prefix);
+            let root_level = !rel.contains('/');
             let skip = cfg
                 .exclude_dirs
                 .iter()
@@ -758,10 +783,16 @@ fn walk_workspace_inner(
                     .exclude_dir_patterns
                     .iter()
                     .any(|pat| glob_match(pat, name))
-                || extra_dir_globs.iter().any(|pat| glob_match(pat, name));
+                || extra_dir_globs.iter().any(|pat| glob_match(pat, name))
+                || (root_level
+                    && cfg
+                        .exclude_root_dirs
+                        .iter()
+                        .any(|ex| name.eq_ignore_ascii_case(ex)));
             if !skip {
                 walk_workspace_inner(
                     &path,
+                    root_prefix,
                     extensions,
                     cfg,
                     extra_file_globs,
@@ -1027,6 +1058,56 @@ mod tests {
         assert!(
             !names.iter().any(|n| n.ends_with("notes/Changelog.txt")),
             "Changelog.txt should be skipped by default exclude_patterns"
+        );
+    }
+
+    /// A root-level `resources/` is dev scratch the game never loads, but
+    /// `common/resources/` defines the `resource` type (oil, steel, …). The
+    /// default excludes must skip the former and keep the latter, on BOTH the
+    /// CLI (`collect_paths`) and LSP (`walk_workspace_files`) discovery paths.
+    #[test]
+    fn root_resources_skipped_but_common_resources_indexed() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        for rel in ["common/resources/00_resources.txt", "resources/scratch.txt"] {
+            fs::create_dir_all(root.join(Path::new(rel).parent().unwrap())).unwrap();
+            fs::write(root.join(rel), "").unwrap();
+        }
+
+        // CLI path.
+        let fm = FileManager::new(FileManagerConfig {
+            root: root.to_path_buf(),
+            include_dirs: vec![".".into()],
+            ..Default::default()
+        });
+        let mut paths = Vec::new();
+        fm.collect_paths(root, &mut paths).unwrap();
+        let cli: Vec<String> = paths.iter().map(|(_, lp)| lp.clone()).collect();
+        assert!(
+            cli.iter()
+                .any(|n| n.ends_with("common/resources/00_resources.txt")),
+            "common/resources must be indexed: {cli:?}"
+        );
+        assert!(
+            !cli.iter().any(|n| n.ends_with("resources/scratch.txt")),
+            "root resources/ must be skipped: {cli:?}"
+        );
+
+        // LSP whole-tree path.
+        let lsp = walk_workspace_files(root, &["txt"], &[], &[]);
+        let lsp: Vec<String> = lsp
+            .iter()
+            .map(|p| normalize_slashes(p.to_string_lossy()).into_owned())
+            .collect();
+        assert!(
+            lsp.iter()
+                .any(|n| n.ends_with("common/resources/00_resources.txt")),
+            "common/resources must be walked: {lsp:?}"
+        );
+        assert!(
+            !lsp.iter().any(|n| n.ends_with("resources/scratch.txt")),
+            "root resources/ must be skipped by whole-tree walk: {lsp:?}"
         );
     }
 

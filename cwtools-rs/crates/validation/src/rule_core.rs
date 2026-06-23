@@ -1397,7 +1397,14 @@ fn validate_alias_usage(
     // scope through every scope-change effect/trigger link (`random_owned_state`,
     // leader abilities, iterators). With the config-driven scope/link registry
     // that tracking is now in place, so this runs by default.
+    //
+    // Modifiers are exempt: a modifier's `## scope` denotes its CATEGORY (where it
+    // takes effect), not where it may be written. A country idea/national-spirit
+    // `modifier = {}` block legitimately carries state-category modifiers
+    // (`state_resource_cost_<resource>`) that cascade to the country's owned
+    // states. Scope-checking them like a trigger/effect is a false positive.
     if ctx.scope_checks
+        && category != "modifier"
         && let Some(sc) = scope_context.as_ref()
         && let Some(current) = sc.current()
     {
