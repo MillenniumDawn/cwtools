@@ -18,6 +18,11 @@ impl Backend {
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
 
+        // `.cwt` rule files aren't game content — no rule-driven completion. (#43)
+        if crate::paths::is_cwt_file(&uri) {
+            return Ok(None);
+        }
+
         let lsp_line = pos.line + 1;
         let lsp_col = pos.character as u16;
 

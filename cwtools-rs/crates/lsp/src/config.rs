@@ -216,26 +216,12 @@ impl Backend {
                     self.client
                         .log_message(MessageType::ERROR, err.to_string())
                         .await;
-                    let line0 = err.line.saturating_sub(1);
+                    // Shared with the live per-file CWT lint (#43). No file text
+                    // here to widen the squiggle, so pass empty line-ends.
                     diags_by_file
                         .entry(crate::paths::path_to_uri(&err.file))
                         .or_default()
-                        .push(Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line: line0,
-                                    character: err.col as u32,
-                                },
-                                end: Position {
-                                    line: line0,
-                                    character: err.col as u32,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            source: Some("cwtools-rules".to_string()),
-                            message: err.message.clone(),
-                            ..Default::default()
-                        });
+                        .push(crate::validate::rule_parse_error_to_diagnostic(err, &[]));
                 }
                 for (uri, diags) in diags_by_file {
                     if let Ok(url) = uri.parse() {

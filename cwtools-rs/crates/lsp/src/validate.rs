@@ -176,6 +176,37 @@ pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Di
     }
 }
 
+/// Convert a `.cwt` rule-config error (parse or structural reference) into an LSP
+/// diagnostic. `RuleParseError.line` is 1-based; `col` is a 0-based character.
+/// Shared by the load-time path (`config.rs`) and the live per-file CWT lint.
+pub(crate) fn rule_parse_error_to_diagnostic(
+    err: &cwtools_rules::ruleset_loader::RuleParseError,
+    line_ends: &[u32],
+) -> Diagnostic {
+    let line = err.line.saturating_sub(1);
+    let col = err.col as u32;
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line,
+                character: col,
+            },
+            end: Position {
+                line,
+                character: diag_end_col(line_ends, line, col),
+            },
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: None,
+        code_description: None,
+        source: Some("cwtools-rules".to_string()),
+        message: err.message.clone(),
+        related_information: None,
+        tags: None,
+        data: None,
+    }
+}
+
 pub(crate) fn validation_error_to_diagnostic(
     err: &ValidationError,
     line_ends: &[u32],
@@ -648,6 +679,50 @@ impl Backend {
             {
                 let ve = loc_diag_to_validation_error(&d);
                 diagnostics.push(validation_error_to_diagnostic(&ve, &line_ends));
+            }
+            return (diagnostics, None);
+        }
+
+        // `.cwt` rule-config files are the schema the engine is built from, not
+        // game content. Lint them structurally — parse errors plus references to
+        // undefined types/enums/single_aliases — against the loaded merged
+        // ruleset, rather than running the game-script validator (which would
+        // flag every rule field as unknown). See #43.
+        if crate::paths::is_cwt_file(uri) {
+            match parse_string(text, &self.state.string_table) {
+                Ok(parsed) => {
+                    for parse_err in &parsed.errors {
+                        diagnostics.push(parse_error_to_diagnostic(parse_err, &line_ends));
+                    }
+                    // Structural reference check against the merged ruleset. Only
+                    // runs once rules are loaded; before then there's nothing to
+                    // resolve references against (and everything would falsely
+                    // report undefined).
+                    let rules_guard = self.state.rules.read();
+                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
+                        let path = std::path::PathBuf::from(uri_to_path_str(uri));
+                        let files = [(path, parsed)];
+                        for err in cwtools_rules::config_validation::validate_ruleset_references(
+                            &files,
+                            ruleset,
+                            &self.state.string_table,
+                        ) {
+                            diagnostics.push(rule_parse_error_to_diagnostic(&err, &line_ends));
+                        }
+                    }
+                }
+                Err(e) => {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position::default(),
+                            end: Position::default(),
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        source: Some("cwtools-rules".to_string()),
+                        message: format!("Parse error: {}", e),
+                        ..Default::default()
+                    });
+                }
             }
             return (diagnostics, None);
         }

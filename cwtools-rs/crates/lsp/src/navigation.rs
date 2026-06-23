@@ -72,6 +72,11 @@ impl Backend {
             return Ok(self.loc_ref_goto(&uri, pos, fallback));
         }
 
+        // `.cwt` rule files aren't game content — no goto into rule definitions. (#43)
+        if crate::paths::is_cwt_file(&uri) {
+            return Ok(None);
+        }
+
         // Rule-aware lookup via the position resolver. The classified hint tells
         // us how to find the definition; mirror the kinds hover handles.
         if let Some(info) = self.rule_info_at_cursor(&uri, pos, &logical_path) {

@@ -27,6 +27,11 @@ impl Backend {
             return Ok(self.loc_ref_hover(&uri, pos));
         }
 
+        // `.cwt` rule files aren't game content — no rule-walk hover. (#43)
+        if crate::paths::is_cwt_file(&uri) {
+            return Ok(None);
+        }
+
         // Snapshot the AST (a cheap `Arc` clone) and drop the documents guard
         // before taking ruleset, so hover never co-holds documents + ruleset and
         // its documents window stays tiny.
