@@ -514,6 +514,15 @@ fn insert_aliases(links: &mut HashMap<String, ScopeLink>, names: &[&str], link: 
     }
 }
 
+/// Register every `(aliases, valid_scopes, target)` entry as a scope-change
+/// link. Shared by the per-game `load_*_links` tables, whose loop bodies were
+/// byte-identical.
+fn load_entries(links: &mut HashMap<String, ScopeLink>, entries: &[(&[&str], &[u32], u32)]) {
+    for (aliases, valid, target) in entries {
+        insert_aliases(links, aliases, sc(valid, *target));
+    }
+}
+
 // ── Stellaris ────────────────────────────────────────────────────────────────
 
 // Scope IDs:
@@ -870,9 +879,7 @@ fn load_stellaris_links(links: &mut HashMap<String, ScopeLink>) {
         (&["pop_faction"], &[POP], POP_FACTION),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── EU4 ──────────────────────────────────────────────────────────────────────
@@ -1034,9 +1041,7 @@ fn load_eu4_links(links: &mut HashMap<String, ScopeLink>) {
         (&["culture"], &[PROVINCE, COUNTRY], CULTURE),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── CK2 ──────────────────────────────────────────────────────────────────────
@@ -1242,9 +1247,7 @@ fn load_ck2_links(links: &mut HashMap<String, ScopeLink>) {
         ),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── CK3 ──────────────────────────────────────────────────────────────────────
@@ -1438,9 +1441,7 @@ fn load_ck3_links(links: &mut HashMap<String, ScopeLink>) {
         ),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── VIC2 ─────────────────────────────────────────────────────────────────────
@@ -1552,9 +1553,7 @@ fn load_vic2_links(links: &mut HashMap<String, ScopeLink>) {
         (&["location"], &[CHARACTER, UNIT], PROVINCE),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── IR (Imperator: Rome) ─────────────────────────────────────────────────────
@@ -1753,9 +1752,7 @@ fn load_ir_links(links: &mut HashMap<String, ScopeLink>) {
         (&["culture"], &[CHARACTER, PROVINCE, COUNTRY], CULTURE),
     ];
 
-    for (aliases, valid, target) in entries {
-        insert_aliases(links, aliases, sc(valid, *target));
-    }
+    load_entries(links, entries);
 }
 
 // ── VIC3 / EU5 ────────────────────────────────────────────────────────────────
