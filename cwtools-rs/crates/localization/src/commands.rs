@@ -82,6 +82,20 @@ pub fn key_to_language(prefix: &str) -> Option<Lang> {
 }
 
 /// Game identifier for per-game language restriction.
+///
+/// Deliberately separate from `cwtools_game::constants::Game`. That engine enum
+/// names every supported title (including CK2/VIC2, which have no distinct loc
+/// language set here) but has no `Generic` variant. This loc enum drops the
+/// titles that don't restrict languages and adds two catch-alls that drive
+/// `languages_for_game` / `key_to_language_for_game`:
+///
+/// - `Generic`: accept all known languages. Engine games without a loc variant
+///   (CK2, VIC2) and the unknown/`None` case map here via `from_engine`.
+/// - `Custom`: the user-defined-game language set (narrower than `Generic`).
+///
+/// Both carry distinct accepted-language lists, so they can't be folded into the
+/// engine enum without changing which `l_xxx` tokens validate. Use `from_engine`
+/// to convert from the engine `Game`; that's the single source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Game {
     Stellaris,

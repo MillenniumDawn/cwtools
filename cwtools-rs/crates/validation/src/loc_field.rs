@@ -132,7 +132,7 @@ pub(crate) fn validate_localisation_field(
     // referenced loc string's `[command]` chains against the scope of THIS field.
     if exists && let Some(entry) = idx.entry(&key_lower) {
         let initial = scope_context
-            .and_then(|c| c.current())
+            .map(|c| c.current())
             .unwrap_or(cwtools_game::scope_engine::SCOPE_ANY);
         let data = cwtools_localization::LocScopeData {
             game: cwtools_localization::Game::from_engine(game),

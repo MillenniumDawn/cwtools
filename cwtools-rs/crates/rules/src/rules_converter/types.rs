@@ -162,9 +162,9 @@ pub(crate) fn process_type_node(
                                     } else {
                                         // Multiple leaves: promote to MultipleKeys, using
                                         // the first entry's operator (F# parity).
-                                        let first_should_match = match &def.skip_root_key[0] {
-                                            SkipRootKey::MultipleKeys(_, sm) => *sm,
-                                            _ => should_match,
+                                        let first_match_kind = match &def.skip_root_key[0] {
+                                            SkipRootKey::MultipleKeys(_, mk) => *mk,
+                                            _ => MatchKind::from_equals(should_match),
                                         };
                                         let mut all_keys: Vec<String> = Vec::new();
                                         for existing in def.skip_root_key.drain(..) {
@@ -179,7 +179,7 @@ pub(crate) fn process_type_node(
                                         all_keys.push(v);
                                         def.skip_root_key.push(SkipRootKey::MultipleKeys(
                                             all_keys,
-                                            first_should_match,
+                                            first_match_kind,
                                         ));
                                     }
                                 }
@@ -384,7 +384,10 @@ mod skip_root_key_tests {
     use cwtools_parser::parser::parse_string;
     use cwtools_string_table::string_table::StringTable;
 
-    use crate::{rules_converter::ast_to_ruleset, rules_types::SkipRootKey};
+    use crate::{
+        rules_converter::ast_to_ruleset,
+        rules_types::{MatchKind, SkipRootKey},
+    };
 
     fn parse_type(cwt: &str) -> Vec<SkipRootKey> {
         let table = StringTable::new();
@@ -456,7 +459,7 @@ mod skip_root_key_tests {
         );
         assert_eq!(srk.len(), 1, "multiple leaves must collapse to ONE entry");
         match &srk[0] {
-            SkipRootKey::MultipleKeys(keys, true) => {
+            SkipRootKey::MultipleKeys(keys, MatchKind::Equals) => {
                 assert!(keys.contains(&"a".to_string()));
                 assert!(keys.contains(&"b".to_string()));
             }

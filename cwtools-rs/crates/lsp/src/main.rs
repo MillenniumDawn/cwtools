@@ -435,7 +435,7 @@ impl Backend {
         };
         let (current_scope, root_scope, prev_scope, from_scopes) = match rctx.scope.as_ref() {
             Some(sc) => {
-                let current = sc.current().and_then(|id| resolve_scope(sc, id));
+                let current = resolve_scope(sc, sc.current());
                 let root = resolve_scope(sc, sc.root);
                 // PREV is the scope one level out: the second-from-top of the stack.
                 let prev = (sc.scopes.len() >= 2)
@@ -465,7 +465,7 @@ impl Backend {
                 (Some(sc), PositionElement::Leaf { key, .. }) if !key.is_empty() => {
                     let mut probe = sc.clone();
                     probe.change_scope(key);
-                    probe.current().and_then(|id| resolve_scope(&probe, id))
+                    resolve_scope(&probe, probe.current())
                 }
                 _ => None,
             })

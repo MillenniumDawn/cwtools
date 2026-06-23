@@ -655,8 +655,8 @@ pub fn skip_root_key_matches(srk: &SkipRootKey, key: &str) -> bool {
     match srk {
         SkipRootKey::SpecificKey(k) => k.eq_ignore_ascii_case(key),
         SkipRootKey::AnyKey => true,
-        SkipRootKey::MultipleKeys(keys, should_match) => {
-            keys.iter().any(|k| k.eq_ignore_ascii_case(key)) == *should_match
+        SkipRootKey::MultipleKeys(keys, match_kind) => {
+            keys.iter().any(|k| k.eq_ignore_ascii_case(key)) == match_kind.is_equals()
         }
     }
 }

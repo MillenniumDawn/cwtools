@@ -159,7 +159,7 @@ pub fn ruleset_shape_hash(ruleset: &RuleSet) -> String {
     let skip_str = |s: &SkipRootKey| match s {
         SkipRootKey::SpecificKey(k) => format!("s:{k}"),
         SkipRootKey::AnyKey => "any".to_string(),
-        SkipRootKey::MultipleKeys(ks, b) => format!("m:{}:{b}", ks.join(",")),
+        SkipRootKey::MultipleKeys(ks, mk) => format!("m:{}:{}", ks.join(","), mk.is_equals()),
     };
     let mut parts: Vec<String> = ruleset
         .types

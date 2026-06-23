@@ -268,10 +268,10 @@ fn validate_leaf_against_rule(
         return;
     }
     if let Some(sc) = scope_context.as_ref()
-        && let Some(current) = sc.current()
         && !opts.required_scopes.is_empty()
-        && !scope_matches_required(current, sc.registry.as_ref(), &opts.required_scopes)
+        && !scope_matches_required(sc.current(), sc.registry.as_ref(), &opts.required_scopes)
     {
+        let current = sc.current();
         // F# `ConfigRulesRuleWrongScope` (CW247): a trigger/effect/modifier rule
         // used in a scope it doesn't support. (Was the Rust-invented CW400.)
         let code = &error_codes::CW247_RULE_WRONG_SCOPE;
@@ -1371,9 +1371,9 @@ fn validate_alias_usage(
     if ctx.scope_checks
         && category != "modifier"
         && let Some(sc) = scope_context.as_ref()
-        && let Some(current) = sc.current()
     {
         let reg = sc.registry.as_ref();
+        let current = sc.current();
         // Only fire on overloads we matched confidently: a permissive match
         // against an unpopulated game-derived enum/value (or an unindexed type,
         // e.g. `oil` when vanilla resources aren't indexed) must not contribute

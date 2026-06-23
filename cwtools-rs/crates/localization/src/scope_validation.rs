@@ -163,7 +163,13 @@ fn game_to_engine(game: Game) -> EngineGame {
         Game::IR => EngineGame::Ir,
         Game::VIC3 => EngineGame::Vic3,
         Game::EU5 => EngineGame::Eu5,
-        Game::Generic | Game::Custom => EngineGame::Hoi4, // fallback: lenient
+        Game::Generic | Game::Custom => {
+            tracing::warn!(
+                "localization game {:?} has no engine mapping; defaulting to Hoi4",
+                game
+            );
+            EngineGame::Hoi4 // fallback: lenient
+        }
     }
 }
 
@@ -427,7 +433,6 @@ mod tests {
                 ScopeLink {
                     valid_scopes: vec![ScopeId(101)], // state only
                     target: Some(ScopeId(100)),       // -> country
-                    is_scope_change: true,
                     ignore_keys: vec![],
                 },
             );

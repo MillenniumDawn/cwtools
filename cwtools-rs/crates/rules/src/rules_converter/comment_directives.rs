@@ -165,11 +165,11 @@ pub(crate) fn options_from_comments(comments: &[String], is_comparison: bool) ->
     // reference_details: from exactly-## lines.
     let reference_details = directives
         .get("outgoingReferenceLabel")
-        .map(|v| (true, v.to_string()))
+        .map(|v| ReferenceDetail::Outgoing(v.to_string()))
         .or_else(|| {
             directives
                 .get("incomingReferenceLabel")
-                .map(|v| (false, v.to_string()))
+                .map(|v| ReferenceDetail::Incoming(v.to_string()))
         });
 
     // error_if_only_match: from exactly-## lines.

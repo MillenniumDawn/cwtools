@@ -416,11 +416,36 @@ pub struct SubTypeDefinition {
     pub type_key_filter: Vec<String>,
 }
 
+/// Whether a `SkipRootKey::MultipleKeys` rule matches when the root key IS one
+/// of the listed keys (`Equals`, from a `==` directive) or is NOT (`NotEquals`,
+/// from `<>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    Equals,
+    NotEquals,
+}
+
+impl MatchKind {
+    /// Build from the old "should_match" bool: `==` (true) -> Equals, else NotEquals.
+    pub fn from_equals(is_equals: bool) -> Self {
+        if is_equals {
+            MatchKind::Equals
+        } else {
+            MatchKind::NotEquals
+        }
+    }
+
+    /// Whether this is the `Equals` (`==`) kind.
+    pub fn is_equals(self) -> bool {
+        matches!(self, MatchKind::Equals)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkipRootKey {
     SpecificKey(String),
     AnyKey,
-    MultipleKeys(Vec<String>, bool),
+    MultipleKeys(Vec<String>, MatchKind),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -555,6 +580,14 @@ pub enum Marker {
     IrCountryTag,
 }
 
+/// The label and direction of a reference declared via `## outgoingReferenceLabel`
+/// (`Outgoing`) or `## incomingReferenceLabel` (`Incoming`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReferenceDetail {
+    Outgoing(String),
+    Incoming(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Options {
     pub min: i32,
@@ -567,7 +600,7 @@ pub struct Options {
     pub severity: Option<Severity>,
     pub required_scopes: Vec<String>,
     pub comparison: bool,
-    pub reference_details: Option<(bool, String)>,
+    pub reference_details: Option<ReferenceDetail>,
     // key_required_quotes, value_required_quotes, type_hint removed:
     // always default-valued, no readers (quoted-key enforcement unimplemented).
     pub error_if_only_match: Option<String>,

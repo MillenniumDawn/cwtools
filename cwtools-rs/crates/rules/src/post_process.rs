@@ -53,7 +53,7 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
         let map = build_alias_index(&snapshot);
         let mut changed = false;
         for (_, rule) in ruleset.single_aliases.iter_mut() {
-            inline_single_alias_rule(rule, &map, &mut changed);
+            changed |= inline_single_alias_rule(rule, &map);
         }
         if !changed {
             break;
@@ -75,22 +75,22 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
     let map = build_alias_index(&snapshot);
     for root in ruleset.root_rules.iter_mut() {
         match root {
-            RootRule::TypeRule(_, rule) => inline_single_alias_rule(rule, &map, &mut true),
-            RootRule::AliasRule(_, rule) => inline_single_alias_rule(rule, &map, &mut true),
-            RootRule::SingleAliasRule(_, rule) => inline_single_alias_rule(rule, &map, &mut true),
-        }
+            RootRule::TypeRule(_, rule) => inline_single_alias_rule(rule, &map),
+            RootRule::AliasRule(_, rule) => inline_single_alias_rule(rule, &map),
+            RootRule::SingleAliasRule(_, rule) => inline_single_alias_rule(rule, &map),
+        };
     }
     for (_, rule) in ruleset.aliases.iter_mut() {
-        inline_single_alias_rule(rule, &map, &mut true);
+        inline_single_alias_rule(rule, &map);
     }
     for (_, rule) in ruleset.single_aliases.iter_mut() {
-        inline_single_alias_rule(rule, &map, &mut true);
+        inline_single_alias_rule(rule, &map);
     }
 }
 
 /// Recursively walk `rule` and replace any `SingleAliasField` references with
-/// the body from `map`. Sets `changed` to true if any rewrite occurs.
-fn inline_single_alias_rule(rule: &mut NewRule, map: &AliasIndex, changed: &mut bool) {
+/// the body from `map`. Returns `true` if any rewrite occurred.
+fn inline_single_alias_rule(rule: &mut NewRule, map: &AliasIndex) -> bool {
     // A body that is *itself* a single_alias reference, e.g.
     // `alias[effect:every_country] = single_alias_right[every_effect_clause]`.
     // Resolve it in place so the alias body becomes the referenced rules and is
@@ -113,27 +113,22 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &AliasIndex, changed: &mut 
                 }
                 _ => {}
             }
-            *changed = true;
+            return true;
         }
-        return;
+        return false;
     }
     match &mut rule.0 {
-        RuleType::NodeRule { rules, .. } => {
-            inline_rules_list(rules, map, changed);
-        }
-        RuleType::ValueClauseRule { rules } => {
-            inline_rules_list(rules, map, changed);
-        }
-        RuleType::SubtypeRule { rules, .. } => {
-            inline_rules_list(rules, map, changed);
-        }
-        _ => {}
+        RuleType::NodeRule { rules, .. } => inline_rules_list(rules, map),
+        RuleType::ValueClauseRule { rules } => inline_rules_list(rules, map),
+        RuleType::SubtypeRule { rules, .. } => inline_rules_list(rules, map),
+        _ => false,
     }
 }
 
 /// Walk a `Vec<NewRule>` in place, replacing SingleAliasField entries by
 /// substituting the resolved body and recursing into nested rules.
-fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex, changed: &mut bool) {
+/// Returns `true` if any rewrite occurred.
+fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex) -> bool {
     let needs_rewrite = rules.iter().any(|r| {
         matches!(
             r.0,
@@ -144,11 +139,13 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex, changed: &mut b
         )
     });
     if !needs_rewrite {
+        let mut changed = false;
         for rule in rules.iter_mut() {
-            inline_single_alias_rule(rule, map, changed);
+            changed |= inline_single_alias_rule(rule, map);
         }
-        return;
+        return changed;
     }
+    let mut changed = false;
     let original = std::mem::take(rules);
     for mut rule in original {
         match &rule.0 {
@@ -160,7 +157,7 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex, changed: &mut b
                 let name = name.clone();
                 let opts = rule.1.clone();
                 if let Some(resolved) = lookup_single_alias(&name, map) {
-                    *changed = true;
+                    changed = true;
                     match resolved.0 {
                         RuleType::LeafRule { right: ar, .. } => {
                             rules.push((
@@ -192,15 +189,15 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex, changed: &mut b
             }
             // Recurse into nested rule containers
             RuleType::NodeRule { .. } => {
-                inline_single_alias_rule(&mut rule, map, changed);
+                changed |= inline_single_alias_rule(&mut rule, map);
                 rules.push(rule);
             }
             RuleType::ValueClauseRule { .. } => {
-                inline_single_alias_rule(&mut rule, map, changed);
+                changed |= inline_single_alias_rule(&mut rule, map);
                 rules.push(rule);
             }
             RuleType::SubtypeRule { .. } => {
-                inline_single_alias_rule(&mut rule, map, changed);
+                changed |= inline_single_alias_rule(&mut rule, map);
                 rules.push(rule);
             }
             _ => {
@@ -208,6 +205,7 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex, changed: &mut b
             }
         }
     }
+    changed
 }
 
 fn lookup_single_alias(name: &str, map: &AliasIndex) -> Option<NewRule> {
