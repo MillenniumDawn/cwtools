@@ -1,3 +1,14 @@
+# 1.8.4
+
+## Bug Fixes
+- Resource definitions (`common/resources/`) are now indexed, so a resource trigger (`oil`, `steel`, …) resolves to its real rule. File discovery excluded every directory named `resources` (meant to skip a top-level dev-scratch `resources/` folder) and that also dropped the game's `common/resources/`, so `oil` was never a known `<resource>`. Its hover then fell through to an unrelated overload, showing "Check ratio of this type of unit for commander" with scopes `unit_leader`/`combat` instead of "Check amount of resource state or country has" with scopes `country`/`state`. The `resources` exclusion is now anchored to the workspace root: a top-level `resources/` is still skipped, the nested `common/resources/` is indexed. This is the root cause behind the 1.8.2 resource-trigger scope false positive (the validator worked around it; now resources resolve for real).
+- A `state`-category modifier in a country idea or national-spirit `modifier = { }` block (`state_resource_cost_<resource>`, …) is no longer flagged "used in incorrect scope … expected state". A modifier's `## scope` is its category (where it takes effect), not where it may be written; a country idea legitimately carries state-category modifiers that cascade to its owned states. The CW104/105/106 scope check now exempts the `modifier` category (it still applies to triggers and effects).
+
+## Developer
+- Added a file-discovery regression test: a top-level `resources/` is skipped while `common/resources/` is indexed, on both the CLI (`collect_paths`) and LSP (`walk_workspace_files`) paths
+- Added a position-resolver test that an indexed resource key resolves to the `<resource>` overload (the hover ordering it depends on) ahead of a coincidental empty-enum match
+- Added scope regression tests: a state-category modifier in country scope isn't CW106, while a same-scoped trigger still is CW104
+
 # 1.8.3
 
 ## Improvements

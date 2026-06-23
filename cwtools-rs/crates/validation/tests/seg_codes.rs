@@ -291,6 +291,40 @@ fn confident_literal_trigger_still_cw104() {
     assert!(c.contains(&"CW104".to_string()), "got: {:?}", c);
 }
 
+/// A modifier's `## scope` is its CATEGORY (where it takes effect), not a
+/// write-location constraint: a country idea/national-spirit `modifier = {}`
+/// block legitimately carries state-category modifiers that cascade to the
+/// country's owned states. So a `## scope = state` modifier used in a country
+/// scope must NOT fire CW106 — unlike a same-scoped trigger, which still does.
+const MODIFIER_SCOPE_RULES: &str = r#"
+scopes = {
+    Country = { aliases = { country } }
+    State = { aliases = { state } }
+}
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    alias_name[modifier] = alias_match_left[modifier]
+    alias_name[trigger] = alias_match_left[trigger]
+}
+## scope = state
+alias[modifier:state_only_mod] = int
+## scope = state
+alias[trigger:state_only_trig] = bool
+"#;
+
+#[test]
+fn state_modifier_in_country_scope_is_not_cw106() {
+    let c = codes_hoi4(MODIFIER_SCOPE_RULES, "foo = { state_only_mod = 5 }");
+    assert!(!c.contains(&"CW106".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn state_trigger_in_country_scope_still_cw104() {
+    // The modifier exemption must not leak into trigger scope checking.
+    let c = codes_hoi4(MODIFIER_SCOPE_RULES, "foo = { state_only_trig = yes }");
+    assert!(c.contains(&"CW104".to_string()), "got: {:?}", c);
+}
+
 /// A bare integer scope block (`129 = { ... }`) is a HOI4 state scope, so a
 /// state-only trigger inside it is clean and a country-only one is CW104. A
 /// numeric key matched as an explicit `int` field (random_list weight) keeps the
