@@ -417,7 +417,7 @@ pub(crate) fn completions_from_rules(
                 let prefix = format!("{}:", cat);
                 let mut seen: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
-                for (alias_name, (_, opts)) in &ruleset.aliases {
+                for (alias_name, (rule, opts)) in &ruleset.aliases {
                     let Some(k) = alias_name.strip_prefix(&prefix) else {
                         continue;
                     };
@@ -431,14 +431,29 @@ pub(crate) fn completions_from_rules(
                         {
                             item.documentation = Some(Documentation::String(d.clone()));
                         }
+                        // First overload wins the snippet; adopt a later one only
+                        // if the first had no resolvable shape.
+                        if item.insert_text.is_none()
+                            && let Some(snip) = alias_completion_snippet(k, rule, ruleset)
+                        {
+                            item.insert_text = Some(snip);
+                            item.insert_text_format = Some(InsertTextFormat::SNIPPET);
+                        }
                         continue;
                     }
                     seen.insert(k, items.len());
+                    // A block effect/trigger (`if`, `random`, …) completes to
+                    // `key = { …required fields… }`; a value one
+                    // (`add_political_power`) to `key = <placeholder>` so the
+                    // cursor lands after the `=`, ready for the value.
+                    let snippet = alias_completion_snippet(k, rule, ruleset);
                     items.push(CompletionItem {
                         label: k.to_string(),
                         kind: Some(CompletionItemKind::KEYWORD),
                         detail: Some(cat.to_string()),
                         documentation: opts.description.clone().map(Documentation::String),
+                        insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
+                        insert_text: snippet,
                         ..Default::default()
                     });
                 }
@@ -452,6 +467,8 @@ pub(crate) fn completions_from_rules(
                             label: m.clone(),
                             kind: Some(CompletionItemKind::FIELD),
                             detail: Some("modifier".to_string()),
+                            insert_text: Some(format!("{} = $0", m)),
+                            insert_text_format: Some(InsertTextFormat::SNIPPET),
                             ..Default::default()
                         });
                     }
@@ -739,6 +756,24 @@ pub(crate) fn generate_node_snippet(
     } else {
         let body = required_parts.join("\n");
         format!("{} = {{\n{}\n}}", key, body)
+    }
+}
+
+/// Build the snippet body for an alias (effect/trigger) completion item from the
+/// alias's rule shape. A block alias (`if`, `random`, `every_state`) expands to
+/// `key = { …required fields… }` via [`generate_node_snippet`] (so e.g. `if`
+/// pre-fills its required `limit = { }`); a value alias (`add_political_power`,
+/// `set_country_flag`) expands to `key = <placeholder>` so the cursor lands after
+/// the `=`, ready for the value. Returns `None` for shapes that have no snippet.
+fn alias_completion_snippet(key: &str, rule: &RuleType, ruleset: &RuleSet) -> Option<String> {
+    match rule {
+        RuleType::NodeRule { rules, .. } => Some(generate_node_snippet(key, rules, ruleset)),
+        RuleType::LeafRule { right, .. } => Some(format!(
+            "{} = {}",
+            key,
+            leaf_right_placeholder(right, 0, ruleset)
+        )),
+        _ => None,
     }
 }
 
@@ -1215,6 +1250,119 @@ mod tests {
             "should not have optional: {}",
             snippet
         );
+    }
+
+    // ── alias (effect/trigger) snippet tests ─────────────────────────────────
+
+    /// A ruleset with two effect aliases: `if` (a block effect with a required
+    /// `limit` child) and `add_political_power` (a value effect).
+    fn alias_effect_ruleset() -> RuleSet {
+        let mut rs = RuleSet::new();
+        // alias[effect:if] = { limit = { } alias_name[effect] = ... }
+        rs.aliases.push((
+            "effect:if".to_string(),
+            (
+                RuleType::NodeRule {
+                    left: NewField::SpecificField("alias[effect:if]".to_string()),
+                    rules: vec![
+                        // `limit` has no ## cardinality -> required (1..1).
+                        (
+                            RuleType::NodeRule {
+                                left: NewField::SpecificField("limit".to_string()),
+                                rules: vec![],
+                            },
+                            Options {
+                                min: 1,
+                                ..Options::default()
+                            },
+                        ),
+                        // The effect-recursion alias child is not a SpecificField,
+                        // so it must not appear in the snippet.
+                        (
+                            RuleType::LeafRule {
+                                left: NewField::AliasField("effect".to_string()),
+                                right: NewField::AliasField("effect".to_string()),
+                            },
+                            Options::default(),
+                        ),
+                    ],
+                },
+                Options::default(),
+            ),
+        ));
+        // alias[effect:add_political_power] = variable_field
+        rs.aliases.push((
+            "effect:add_political_power".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[effect:add_political_power]".to_string()),
+                    right: NewField::ScalarField,
+                },
+                Options::default(),
+            ),
+        ));
+        rs.reindex();
+        rs
+    }
+
+    /// The rule context inside an effect block: a single `alias_name[effect]`
+    /// usage, which drives the alias-expansion arm for category `effect`.
+    fn effect_alias_usage() -> Vec<NewRule> {
+        vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField("effect".to_string()),
+                right: NewField::AliasField("effect".to_string()),
+            },
+            Options::default(),
+        )]
+    }
+
+    #[test]
+    fn alias_block_effect_completes_to_block_with_required_child() {
+        // `if` should tab-complete to a block that pre-fills its required
+        // `limit = { }` with proper tab stops (cwtools-vscode autocomplete ask).
+        let rs = alias_effect_ruleset();
+        let info = cwtools_info::InfoService::new();
+        let rules = effect_alias_usage();
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+
+        let if_item = items
+            .iter()
+            .find(|i| i.label == "if")
+            .expect("'if' completion");
+        assert_eq!(if_item.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        let snip = if_item.insert_text.as_deref().unwrap_or("");
+        assert!(snip.starts_with("if = {"), "if snippet: {}", snip);
+        assert!(
+            snip.contains("limit ="),
+            "if snippet missing limit: {}",
+            snip
+        );
+    }
+
+    #[test]
+    fn alias_value_effect_completes_with_equals() {
+        // `add_political_power` should tab-complete to `add_political_power = `
+        // with the cursor after the `=`, ready for the value.
+        let rs = alias_effect_ruleset();
+        let info = cwtools_info::InfoService::new();
+        let rules = effect_alias_usage();
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+
+        let appp = items
+            .iter()
+            .find(|i| i.label == "add_political_power")
+            .expect("'add_political_power' completion");
+        assert_eq!(appp.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        let snip = appp.insert_text.as_deref().unwrap_or("");
+        assert!(
+            snip.starts_with("add_political_power = "),
+            "value-effect snippet: {}",
+            snip
+        );
+        // A value effect is a single line, not a `{ … }` block.
+        assert!(!snip.contains('\n'), "should not be a block: {}", snip);
+        assert!(!snip.contains("= {"), "should not open a clause: {}", snip);
     }
 
     // ── root-type snippets tests ─────────────────────────────────────────────

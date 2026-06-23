@@ -1,6 +1,7 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::StringTable;
+use std::hint::black_box;
 
 // Representative Paradox script: nested clauses, quoted strings, numbers,
 // bool keywords, comments, @-variables. Exercises the parser/interner hot path.

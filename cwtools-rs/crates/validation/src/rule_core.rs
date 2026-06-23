@@ -325,7 +325,9 @@ fn validate_leaf_against_rule(
             } else if let Value::Clause(clause_children) = &leaf.value {
                 let saved = scope_context.as_ref().map(|sc| sc.save());
                 if let Some(sc) = scope_context.as_mut() {
-                    enter_block_scope(sc, key, opts, ctx.game);
+                    // Explicit field rule (e.g. `int = {}` random_list weight): a
+                    // numeric key here is NOT a state scope, so `numeric_state_ok=false`.
+                    enter_block_scope(sc, key, opts, ctx.game, false);
                 }
                 validate_children(
                     ctx,
@@ -1015,11 +1017,18 @@ fn scope_links_contains(ruleset: &RuleSet, key: &str) -> bool {
 /// The pattern was already split into (prefix, kind, placeholder_name, suffix)
 /// at ruleset build time by `ParsedAliasPattern::parse`; this function only
 /// does the per-call key-matching work (prefix/suffix strip + membership test).
+/// `permissive` controls the fallback when a pattern's backing data is absent or
+/// empty (a game-derived `enum[..]`/`value[..]` that wasn't populated, e.g. when
+/// vanilla isn't indexed). `true` accepts the key (the key-existence checks want
+/// this, to avoid flooding "unknown key" errors); `false` rejects it, so the
+/// scope check only trusts a match it can actually verify and never inherits an
+/// unrelated alias's `## scope` from a coincidental empty-enum match.
 fn parsed_pattern_matches(
     pat: &ParsedAliasPattern,
     key: &str,
     ruleset: &RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
+    permissive: bool,
 ) -> bool {
     let pre = pat.prefix.as_str();
     let suf = pat.suffix.as_str();
@@ -1043,11 +1052,11 @@ fn parsed_pattern_matches(
                     || def.values.iter().any(|v| v.starts_with('@'))
                     || def.values.len() > 5
             }
-            _ => true, // enum absent/empty (game-derived) — permissive
+            _ => permissive, // enum absent/empty (game-derived)
         },
         PatternKind::Value => match ruleset.values.get(name) {
             Some(vs) if !vs.is_empty() => vs.iter().any(|v| v == middle),
-            _ => true, // value set not collected — permissive
+            _ => permissive, // value set not collected
         },
     }
 }
@@ -1095,7 +1104,7 @@ pub(crate) fn field_matches_key(
                 None => true,
                 Some(cat) => {
                     for pat in &cat.parsed_patterns {
-                        if parsed_pattern_matches(pat, key, ruleset, type_index) {
+                        if parsed_pattern_matches(pat, key, ruleset, type_index, true) {
                             return true;
                         }
                     }
@@ -1188,6 +1197,31 @@ pub(crate) fn alias_overloads<'a>(
     category: &str,
     key: &str,
 ) -> Vec<&'a (RuleType, Options)> {
+    alias_overloads_impl(ruleset, type_index, category, key, true)
+}
+
+/// As [`alias_overloads`], but pattern matches `confident`ly: an `enum[..]` /
+/// `value[..]` / `<type>` pattern matches only when its backing data is actually
+/// populated, never via the empty/absent permissive fallback. Used by the scope
+/// check so a coincidental match against an unpopulated game-derived enum (e.g.
+/// `oil` against an empty `enum[equipment_category]` when vanilla isn't indexed)
+/// doesn't drag in that alias's unrelated `## scope` and flag a false CW104.
+pub(crate) fn confident_alias_overloads<'a>(
+    ruleset: &'a RuleSet,
+    type_index: Option<&cwtools_index::TypeIndex>,
+    category: &str,
+    key: &str,
+) -> Vec<&'a (RuleType, Options)> {
+    alias_overloads_impl(ruleset, type_index, category, key, false)
+}
+
+fn alias_overloads_impl<'a>(
+    ruleset: &'a RuleSet,
+    type_index: Option<&cwtools_index::TypeIndex>,
+    category: &str,
+    key: &str,
+    permissive: bool,
+) -> Vec<&'a (RuleType, Options)> {
     // Gather candidate overloads via the precomputed alias index (O(1) exact +
     // O(patterns)) rather than scanning every alias.
     let mut overloads: Vec<&(RuleType, Options)> = Vec::new();
@@ -1214,7 +1248,7 @@ pub(crate) fn alias_overloads<'a>(
     }
     if let Some(cat) = ruleset.alias_categories.get(category) {
         for pat in &cat.parsed_patterns {
-            if parsed_pattern_matches(pat, key, ruleset, type_index) {
+            if parsed_pattern_matches(pat, key, ruleset, type_index, permissive) {
                 overloads.push(&ruleset.aliases[pat.alias_idx].1);
             }
         }
@@ -1368,11 +1402,18 @@ fn validate_alias_usage(
         && let Some(current) = sc.current()
     {
         let reg = sc.registry.as_ref();
-        let any_ok = overloads
-            .iter()
-            .any(|(_, opts)| scope_matches_required(current, reg, &opts.required_scopes));
+        // Only fire on overloads we matched confidently: a permissive match
+        // against an unpopulated game-derived enum/value (or an unindexed type,
+        // e.g. `oil` when vanilla resources aren't indexed) must not contribute
+        // its unrelated `## scope`. With no confident overload the key's real
+        // alias is unverifiable here, so stay lenient and skip the check.
+        let confident = confident_alias_overloads(ctx.ruleset, ctx.type_index, category, key);
+        let any_ok = confident.is_empty()
+            || confident
+                .iter()
+                .any(|(_, opts)| scope_matches_required(current, reg, &opts.required_scopes));
         if !any_ok {
-            let mut expected: Vec<String> = overloads
+            let mut expected: Vec<String> = confident
                 .iter()
                 .flat_map(|(_, o)| o.required_scopes.iter().cloned())
                 .collect();
@@ -1422,7 +1463,9 @@ fn validate_alias_usage(
                 if let Some(children) = children {
                     let saved = scope_context.as_ref().map(|sc| sc.save());
                     if let Some(sc) = scope_context.as_mut() {
-                        enter_block_scope(sc, key, opts, ctx.game);
+                        // Effect/trigger alias usage: a bare integer block key here
+                        // is a HOI4 state-id scope (`129 = {}`), so allow numeric→state.
+                        enter_block_scope(sc, key, opts, ctx.game, true);
                     }
                     // Seed loop-local variables: a `for_each_loop`-style block
                     // exposes `value`/`index`/`break` temp variables its body can

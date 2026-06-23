@@ -181,11 +181,18 @@ pub(crate) fn push_named_scope(ctx: &mut ScopeContext, push: &str) {
 ///    (`sp:foo`, `state:5`, any `prefix:data`), enter ANY scope so inner
 ///    effects aren't falsely scope-checked. Plain effect blocks keep the
 ///    current scope unchanged.
+///
+/// `numeric_state_ok` lets a bare integer block key resolve to the `state` scope
+/// in HOI4 (`129 = { ... }` scopes to state 129). It must be `true` ONLY when the
+/// block was matched as an effect/trigger alias usage (a real scope block), and
+/// `false` when it was matched as an explicit `int = { ... }` field — e.g. a
+/// `random_list` weight bucket, whose body runs in the current scope, not state.
 pub(crate) fn enter_block_scope(
     ctx: &mut ScopeContext,
     key: &str,
     opts: &Options,
     game: Option<Game>,
+    numeric_state_ok: bool,
 ) {
     if key.contains(':') {
         // A `prefix:data` key (`var:x`, `event_target:y`, `sp:z`) is resolved by
@@ -206,12 +213,23 @@ pub(crate) fn enter_block_scope(
         ctx.change_scope(key);
         // change_scope didn't recognise the key, but a from-data reference used
         // as a block key DOES change scope to whatever it resolves to: a numeric
-        // state/province id (`857 = {...}`) or a country tag (`GER = {...}`). We
-        // can't pin the exact scope here without the full data index, so enter
-        // ANY — lenient, so the block's body isn't validated against the (wrong)
-        // outer scope.
+        // state/province id (`857 = {...}`) or a country tag (`GER = {...}`).
         if ctx.scope_depth() == before && looks_like_data_ref(key) {
-            ctx.push_scope(SCOPE_ANY);
+            // HOI4: a bare integer scope block is a state (`129 = {...}`), so push
+            // `state` rather than the lenient ANY — the body's resource/state
+            // triggers then resolve against the right scope and hover shows it.
+            // Only for genuine scope blocks (`numeric_state_ok`); a `random_list`
+            // `int = {}` weight bucket keeps the current scope.
+            let state_id = if numeric_state_ok
+                && game == Some(Game::Hoi4)
+                && !key.is_empty()
+                && key.bytes().all(|b| b.is_ascii_digit())
+            {
+                ctx.registry.id_of("state")
+            } else {
+                None
+            };
+            ctx.push_scope(state_id.unwrap_or(SCOPE_ANY));
         }
     }
     if let Some(ref replace) = opts.replace_scopes {

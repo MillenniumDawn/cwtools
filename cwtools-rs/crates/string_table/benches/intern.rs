@@ -1,5 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use cwtools_string_table::string_table::StringTable;
+use std::hint::black_box;
 
 // Distinct tokens — interning these into a FRESH table each iteration measures
 // the cold-load path (#28/#76): write-lock + Arc::from per miss.

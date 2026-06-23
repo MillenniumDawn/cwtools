@@ -427,6 +427,12 @@ fn descend(
                     );
                     let mut next: Vec<(RuleType, Options)> = Vec::new();
                     let mut entered: Option<&Options> = None;
+                    // Whether `entered` was first set via an effect/trigger alias
+                    // (a real scope block) vs an explicit field rule (`int = {}`
+                    // weight). Mirrors the validator's two enter_block_scope sites
+                    // so a numeric key resolves to state only for genuine scope
+                    // blocks (`129 = {}`), not random_list weights.
+                    let mut entered_via_alias = false;
                     for (rule_type, opts) in &candidates {
                         match rule_type {
                             RuleType::NodeRule {
@@ -442,6 +448,9 @@ fn descend(
                                 {
                                     if let RuleType::NodeRule { rules: body, .. } = ort {
                                         next.extend(body.iter().cloned());
+                                        if entered.is_none() {
+                                            entered_via_alias = true;
+                                        }
                                         entered.get_or_insert(oopts);
                                     }
                                 }
@@ -463,7 +472,7 @@ fn descend(
                         };
                     }
                     if let (Some(sc), Some(opts)) = (scope_context.as_mut(), entered) {
-                        enter_block_scope(sc, &key, opts, ctx.game);
+                        enter_block_scope(sc, &key, opts, ctx.game, entered_via_alias);
                     }
                     return descend(ctx, clause_children, &next, scope_context, line, col);
                 }

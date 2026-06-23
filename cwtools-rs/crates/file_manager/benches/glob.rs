@@ -1,5 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use cwtools_file_manager::file_manager::glob_match;
+use std::hint::black_box;
 
 // Patterns with embedded wildcards bypass the *.ext / prefix* fast paths and
 // hit the general DP (#17). Mix of matching and non-matching, realistic lengths.

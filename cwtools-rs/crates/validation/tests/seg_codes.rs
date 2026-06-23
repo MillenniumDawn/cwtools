@@ -253,3 +253,109 @@ foo = {
         .collect();
     assert!(!codes.contains(&"CW235".to_string()), "got: {:?}", codes);
 }
+
+/// A trigger that matches a key ONLY via an unpopulated game-derived enum must
+/// not inherit that alias's `## scope`. Regression for the resource-in-state
+/// false positive: `oil` matched an empty `enum[equipment_category]` (scope
+/// unit_leader/combat) when resources weren't indexed, flagging a bogus CW104.
+const EMPTY_ENUM_RULES: &str = r#"
+scopes = {
+    Country = { aliases = { country } }
+    State = { aliases = { state } }
+    "Unit Leader" = { aliases = { unit_leader } }
+}
+enums = { enum[empty_e] = { } }
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    alias_name[trigger] = alias_match_left[trigger]
+}
+## scope = { unit_leader }
+alias[trigger:enum[empty_e]] = int
+## scope = { unit_leader }
+alias[trigger:skill] = int
+"#;
+
+#[test]
+fn empty_enum_only_match_does_not_cw104() {
+    // `oil` matches only the empty enum (permissively) -> no confident overload
+    // -> no scope check -> no false CW104 in country scope.
+    let c = codes_hoi4(EMPTY_ENUM_RULES, "foo = { oil = 1 }");
+    assert!(!c.contains(&"CW104".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn confident_literal_trigger_still_cw104() {
+    // `skill` is an exact (confident) unit_leader trigger; in country scope it
+    // must still fire CW104 — the fix only suppresses uncertain matches.
+    let c = codes_hoi4(EMPTY_ENUM_RULES, "foo = { skill = 1 }");
+    assert!(c.contains(&"CW104".to_string()), "got: {:?}", c);
+}
+
+/// A bare integer scope block (`129 = { ... }`) is a HOI4 state scope, so a
+/// state-only trigger inside it is clean and a country-only one is CW104. A
+/// numeric key matched as an explicit `int` field (random_list weight) keeps the
+/// current scope instead.
+const NUMERIC_STATE_RULES: &str = r#"
+scopes = {
+    Country = { aliases = { country } }
+    State = { aliases = { state } }
+}
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    alias_name[effect] = alias_match_left[effect]
+}
+alias[effect:scope_field] = {
+    alias_name[trigger] = alias_match_left[trigger]
+    alias_name[effect] = alias_match_left[effect]
+}
+alias[effect:random_list] = {
+    int = {
+        alias_name[trigger] = alias_match_left[trigger]
+        alias_name[effect] = alias_match_left[effect]
+    }
+}
+## scope = state
+alias[trigger:state_only] = bool
+## scope = country
+alias[trigger:country_only] = bool
+"#;
+
+#[test]
+fn numeric_block_is_state_scope() {
+    // 129 -> state, so a state-only trigger inside is clean.
+    let c = codes_hoi4(NUMERIC_STATE_RULES, "foo = { 129 = { state_only = yes } }");
+    assert!(
+        !c.contains(&"CW104".to_string()),
+        "state_only in 129 should be clean: {:?}",
+        c
+    );
+}
+
+#[test]
+fn country_trigger_in_numeric_state_block_is_cw104() {
+    // 129 -> state, so a country-only trigger inside is wrong-scope.
+    let c = codes_hoi4(
+        NUMERIC_STATE_RULES,
+        "foo = { 129 = { country_only = yes } }",
+    );
+    assert!(
+        c.contains(&"CW104".to_string()),
+        "country_only in state 129 should be CW104: {:?}",
+        c
+    );
+}
+
+#[test]
+fn random_list_weight_keeps_current_scope() {
+    // The int weight bucket is NOT a state scope; a country-only trigger inside
+    // stays valid at the country root.
+    let c = codes_hoi4(
+        NUMERIC_STATE_RULES,
+        "foo = { random_list = { 10 = { country_only = yes } } }",
+    );
+    assert!(
+        !c.contains(&"CW104".to_string()),
+        "country_only in random_list weight should be clean: {:?}",
+        c
+    );
+}

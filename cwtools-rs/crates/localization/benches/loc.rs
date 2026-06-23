@@ -1,5 +1,6 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use cwtools_localization::yaml_parser::parse_loc_text;
+use std::hint::black_box;
 
 // A localisation .yml with a language header and entries carrying plain text,
 // $refs$, [commands], and nested formatting. Exercises parse_loc_text (#24) and
