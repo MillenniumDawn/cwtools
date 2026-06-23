@@ -2,9 +2,12 @@
 
 ## Bug Fixes
 - A quoted value followed by a bare value in the same clause (a HOI4 `common/names` callsign list like `{ "Sunshine" Demon }`) no longer makes the parser swallow the clause's closing `}` and cascade a bogus "unclosed clause: expected '}'" to end of file, dropping the rest of the file. A quoted string now closes at the first interior quote for namelist values too, matching the game (Clausewitz splits a name at its first interior quote). Names that embed quotes (`"Division "Castillejos""`) therefore split into multiple values, exactly as the game reads them, instead of being kept whole.
+- A resource trigger (`oil`, `steel`, …) in a state scope is no longer falsely flagged "used in incorrect scope … expected combat or unit_leader". The scope check matched the key against an unpopulated game-derived `enum[..]` (which matches anything when empty, e.g. when vanilla isn't indexed) and inherited that alias's scope; it now only trusts a match it can verify (exact key, or a pattern whose backing enum/value/type is populated)
+- A bare integer scope block (`129 = { ... }`) now resolves to the `state` scope in HOI4, so triggers/effects inside it (and the hover) see state instead of an opaque "any". `random_list`/`random` weight buckets (`int = { ... }`) keep the current scope, so their bodies aren't falsely scope-checked
 
 ## Developer
 - The names-file parse regression test now covers a callsigns clause mixing quoted and bare values (the real trigger), not just quoted names with apostrophes/non-ASCII
+- Added scope regression tests: a key matching only an empty enum isn't scope-checked, a confident literal trigger still is, and a numeric block resolves to state while a random_list weight doesn't
 
 # 1.8.1
 
