@@ -363,6 +363,19 @@ impl TypeIndex {
         self.map.get(type_name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Every definition site of an instance named `name` (case-insensitive),
+    /// across all types. Used by goto-definition's fallback for dotted ids
+    /// (events, decisions) that the heuristic def index keys by node-key rather
+    /// than by the instance id. Scans the index (rare interactive path).
+    pub fn instance_locations(&self, name: &str) -> Vec<(Arc<str>, SourceLocation)> {
+        self.map
+            .values()
+            .flatten()
+            .filter(|(_, inst)| inst.name.eq_ignore_ascii_case(name))
+            .map(|(uri, inst)| (uri.clone(), inst.location))
+            .collect()
+    }
+
     /// The explicit-field primary loc key captured for `name`'s instance of
     /// `type_name` (e.g. an event's `title` loc key), if any. Lets hover show the
     /// localised title for a reference. Case-insensitive on the instance name.
@@ -1514,6 +1527,27 @@ mod tests {
             "double-slash reference must resolve"
         );
         assert!(idx.contains("gfx/interface/x.dds"));
+    }
+
+    #[test]
+    fn instance_locations_finds_dotted_id_case_insensitive() {
+        // goto-definition (#39): an event/decision reference resolves by its
+        // dotted id (the instance name), case-insensitively.
+        let mut idx = TypeIndex::new();
+        let mut map = HashMap::new();
+        map.insert(
+            "event".to_string(),
+            vec![TypeInstance {
+                name: "GER_some.1".to_string(),
+                location: SourceLocation { line: 7, col: 4 },
+                primary_loc_key: None,
+            }],
+        );
+        idx.merge("file://e.txt", map);
+        let locs = idx.instance_locations("ger_some.1");
+        assert_eq!(locs.len(), 1, "should resolve case-insensitively");
+        assert_eq!(locs[0].1.line, 7);
+        assert!(idx.instance_locations("nope.1").is_empty());
     }
 
     #[test]
