@@ -135,8 +135,6 @@ pub enum FileError {
     Io(#[from] std::io::Error),
     #[error("Parse error: {0}")]
     Parse(String),
-    #[error("Pattern error: {0}")]
-    Pattern(String),
 }
 
 /// A discovered script file with its parsed AST.

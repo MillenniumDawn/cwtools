@@ -88,8 +88,8 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
     }
 }
 
-/// Recursively walk `rule` and replace any `SingleAliasField` / `SingleAliasClauseField`
-/// references with the body from `map`. Sets `changed` to true if any rewrite occurs.
+/// Recursively walk `rule` and replace any `SingleAliasField` references with
+/// the body from `map`. Sets `changed` to true if any rewrite occurs.
 fn inline_single_alias_rule(rule: &mut NewRule, map: &AliasIndex, changed: &mut bool) {
     // A body that is *itself* a single_alias reference, e.g.
     // `alias[effect:every_country] = single_alias_right[every_effect_clause]`.
@@ -117,7 +117,6 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &AliasIndex, changed: &mut 
         }
         return;
     }
-    // SingleAliasClauseField removed (variant deleted; was never constructed).
     match &mut rule.0 {
         RuleType::NodeRule { rules, .. } => {
             inline_rules_list(rules, map, changed);
@@ -215,8 +214,8 @@ fn lookup_single_alias(name: &str, map: &AliasIndex) -> Option<NewRule> {
     map.get(name).map(|r| (*r).clone())
 }
 
-/// Count the total number of `SingleAliasField` / `SingleAliasClauseField` leaf
-/// references remaining in the single_aliases bodies. Used for cycle detection:
+/// Count the total number of `SingleAliasField` leaf references remaining in the
+/// single_aliases bodies. Used for cycle detection:
 /// if a fixpoint round didn't reduce this count, expansion has stalled.
 fn count_single_alias_refs(single_aliases: &[(String, NewRule)]) -> usize {
     fn count_rule(rule: &NewRule) -> usize {

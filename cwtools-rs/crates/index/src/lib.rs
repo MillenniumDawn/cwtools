@@ -2,7 +2,7 @@ use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
 use cwtools_rules::rules_types::{
     NewField, PathOptions, RuleSet, RuleType, SkipRootKey, TypeDefinition,
 };
-use cwtools_string_table::string_table::StringTable;
+use cwtools_string_table::string_table::{StringId, StringTable};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -18,10 +18,28 @@ fn unquote(s: &str) -> &str {
         .unwrap_or(s)
 }
 
+/// Resolve a `StringId` to its owned text, returning `""` when interning lost
+/// it. For a `StringId` taken from a parsed AST this should never miss, so a
+/// debug build trips an assertion to surface the bug; release behaves exactly
+/// like the prior `get_string(id).unwrap_or_default()`.
+#[inline]
+fn get_string_or_empty(table: &StringTable, id: StringId) -> String {
+    match table.get_string(id) {
+        Some(s) => s,
+        None => {
+            debug_assert!(
+                false,
+                "get_string returned None for a StringId from a parsed AST"
+            );
+            String::new()
+        }
+    }
+}
+
 /// Extract a plain string from a leaf value.
 pub fn leaf_value_string(value: &Value, table: &StringTable) -> String {
     match value {
-        Value::String(t) | Value::QString(t) => table.get_string(t.normal).unwrap_or_default(),
+        Value::String(t) | Value::QString(t) => get_string_or_empty(table, t.normal),
         Value::Float(f) => f.to_string(),
         Value::Int(i) => i.to_string(),
         Value::Bool(b) => b.to_string(),
@@ -1045,7 +1063,7 @@ fn collect_at_vars(
     for child in children {
         if let Child::Leaf(idx) = child {
             let leaf = &arena.leaves[*idx as usize];
-            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            let key = get_string_or_empty(table, leaf.key.normal);
             if key.starts_with('@') {
                 let value = leaf_value_string(&leaf.value, table);
                 out.entry("@".to_string())
@@ -1115,7 +1133,7 @@ fn scan_children_for_varset(
             // `scan_children_for_varset` calls below — those re-acquire the table
             // lock, which would risk a re-entrant read-lock deadlock under writer
             // contention during parallel indexing.
-            let child_key = table.get_string(kc.key.normal).unwrap_or_default();
+            let child_key = get_string_or_empty(table, kc.key.normal);
             for (rule_type, _) in rules {
                 // NodeRule(VariableSetField): the clause's key IS the defined
                 // variable name (F# InfoService fNode).
@@ -1161,7 +1179,7 @@ fn scan_children_for_varset(
                 // Resolve key and value sequentially (each releases the table lock)
                 // rather than nesting two `with_string` borrows, which would risk a
                 // re-entrant read-lock deadlock under writer contention.
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
+                let key = get_string_or_empty(table, leaf.key.normal);
                 let val = leaf_value_string(&leaf.value, table);
                 for (rule_type, _opts) in rules {
                     match rule_type {
@@ -1346,7 +1364,7 @@ pub fn collect_set_variable_defs(
             let (key, value, line, col) = match child {
                 Child::Leaf(li) => {
                     let leaf = &arena.leaves[*li as usize];
-                    let k = table.get_string(leaf.key.normal).unwrap_or_default();
+                    let k = get_string_or_empty(table, leaf.key.normal);
                     let v = leaf_value_string(&leaf.value, table);
                     (
                         k,

@@ -71,7 +71,7 @@ impl Backend {
         self.client
             .log_message(
                 MessageType::INFO,
-                "★ CWTools RUST LSP server — build: two-pass-index + modifier-keys (rust-2025-06b)",
+                format!("★ CWTools Rust LSP server v{}", env!("CARGO_PKG_VERSION")),
             )
             .await;
         // Store language from init options

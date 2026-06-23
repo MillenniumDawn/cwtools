@@ -72,7 +72,7 @@ pub struct RuleSet {
 pub use cwtools_game::scope_registry::{LinkInput, ScopeInput};
 
 /// What kind of placeholder a parsed alias pattern contains.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PatternKind {
     /// `<type>` or `<type.subtype>` — an instance of that type (subtype
     /// is advisory; only the base name is checked against the type index).
@@ -139,7 +139,7 @@ impl ParsedAliasPattern {
                 let close = inner + rest[inner..].find(']')?;
                 let earlier = found.as_ref().is_none_or(|&(o, ..)| open < o);
                 if earlier {
-                    found = Some((open, inner, close, close + 1, kind.clone()));
+                    found = Some((open, inner, close, close + 1, *kind));
                 }
             }
         }

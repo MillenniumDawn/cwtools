@@ -138,18 +138,18 @@ fn process_root_leaf(
     if key.starts_with("alias[") {
         if let Some((category, _alias_name)) = get_alias_settings(&key, "alias") {
             let full_name = format!("{}:{}", category, _alias_name);
-            let rule = leaf_to_rule(leaf, ast, table, ruleset);
+            let rule = leaf_to_rule(leaf, ast, table);
             let opts = options_from_comments(comments, leaf_is_eqeq(leaf));
             ruleset.aliases.push((full_name, (rule, opts)));
         }
     } else if key.starts_with("single_alias[") {
         if let Some(alias_name) = get_setting_from_string(&key, "single_alias") {
-            let rule = leaf_to_rule(leaf, ast, table, ruleset);
+            let rule = leaf_to_rule(leaf, ast, table);
             let opts = options_from_comments(comments, leaf_is_eqeq(leaf));
             ruleset.single_aliases.push((alias_name, (rule, opts)));
         }
     } else {
-        let rule = leaf_to_rule(leaf, ast, table, ruleset);
+        let rule = leaf_to_rule(leaf, ast, table);
         let opts = options_from_comments(comments, leaf_is_eqeq(leaf));
         ruleset
             .root_rules
@@ -165,11 +165,10 @@ fn leaf_to_rule(
     leaf: &cwtools_parser::ast::Leaf,
     ast: &ParsedFile,
     table: &StringTable,
-    ruleset: &mut RuleSet,
 ) -> RuleType {
     match &leaf.value {
         Value::Clause(children) => {
-            let inner = children_to_rules(children, ast, table, ruleset);
+            let inner = children_to_rules(children, ast, table);
             RuleType::NodeRule {
                 left: NewField::SpecificField(
                     table.get_string(leaf.key.normal).unwrap_or_default(),
@@ -186,14 +185,10 @@ fn leaf_to_rule(
     }
 }
 
-// `ruleset` is threaded so nested rules can register types/enums as the engine
-// grows; today only the recursive descent forwards it.
-#[allow(clippy::only_used_in_recursion)]
 pub(crate) fn children_to_rules(
     children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
-    ruleset: &mut RuleSet,
 ) -> Vec<NewRule> {
     let mut rules = Vec::new();
     let precomputed = precompute_comments(children, ast, table);
@@ -213,7 +208,7 @@ pub(crate) fn children_to_rules(
                             st_name[1..].to_string()
                         };
                         let inner = match &leaf.value {
-                            Value::Clause(ch) => children_to_rules(ch, ast, table, ruleset),
+                            Value::Clause(ch) => children_to_rules(ch, ast, table),
                             _ => Vec::new(),
                         };
                         rules.push((
@@ -232,7 +227,7 @@ pub(crate) fn children_to_rules(
                 let opts = options_from_comments(comments, is_eqeq);
                 let rule = match &leaf.value {
                     Value::Clause(ch) => {
-                        let inner = children_to_rules(ch, ast, table, ruleset);
+                        let inner = children_to_rules(ch, ast, table);
                         RuleType::NodeRule {
                             left: field_from_string(&key),
                             rules: inner,
@@ -261,7 +256,7 @@ pub(crate) fn children_to_rules(
                 if let Value::Clause(clause_ch) = &lv.value {
                     // Anonymous {…} block in a rule definition — same as F# ValueClauseC.
                     let opts = options_from_comments(comments, false);
-                    let inner = children_to_rules(clause_ch, ast, table, ruleset);
+                    let inner = children_to_rules(clause_ch, ast, table);
                     rules.push((RuleType::ValueClauseRule { rules: inner }, opts));
                 } else {
                     let val_str = value_to_string(&lv.value, table);
@@ -275,7 +270,7 @@ pub(crate) fn children_to_rules(
                 // Anonymous {…} parsed as a true ValueClause node (some parser versions).
                 let vc = &ast.arena.value_clauses[*vcidx as usize];
                 let opts = options_from_comments(comments, false);
-                let inner = children_to_rules(&vc.children, ast, table, ruleset);
+                let inner = children_to_rules(&vc.children, ast, table);
                 rules.push((RuleType::ValueClauseRule { rules: inner }, opts));
             }
             _ => {}

@@ -945,7 +945,7 @@ fn main() {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .unwrap()
+        .expect("failed to build tokio runtime")
         .block_on(async {
             let state = Arc::new(DocumentState::new());
             let (stdin, stdout) = (tokio::io::stdin(), tokio::io::stdout());

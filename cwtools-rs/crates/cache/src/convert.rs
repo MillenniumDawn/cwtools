@@ -63,6 +63,9 @@ pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Aren
     let mut tokens = tokens.into_iter();
 
     // Pass 2: rebuild the arena, drawing tokens in the identical order.
+    // The asserts confirm each push returns the index matching its position in
+    // collection order, so the cached `Child` indices still address the right
+    // elements in the rebuilt arena (a layout mismatch would corrupt the tree).
     let mut arena = Arena::new();
     for l in &cached.leaves {
         let idx = arena.push_leaf(cached_leaf_to_leaf(l, &mut tokens));
@@ -100,7 +103,7 @@ fn collect_value_strings<'a>(v: &'a CachedValue, out: &mut Vec<&'a str>) {
 
 // ---- helpers ----
 
-fn string_token_to_str(token: &StringTokens, table: &StringResolver<'_>) -> String {
+fn string_token_to_owned(token: &StringTokens, table: &StringResolver<'_>) -> String {
     table.get(token.normal).unwrap_or_default().to_string()
 }
 
@@ -155,7 +158,7 @@ fn children_from_cached(children: &[CachedChild]) -> Vec<Child> {
 fn leaf_to_cached(l: &Leaf, table: &StringResolver<'_>) -> CachedLeaf {
     let (sl, sc, el, ec) = range_to_cached(&l.pos);
     CachedLeaf {
-        key: string_token_to_str(&l.key, table),
+        key: string_token_to_owned(&l.key, table),
         value: value_to_cached(&l.value, table),
         op: op_to_cached(&l.op),
         start_line: sl,
@@ -201,7 +204,7 @@ fn value_clause_to_cached(vc: &ValueClause, table: &StringResolver<'_>) -> Cache
         keys: vc
             .keys
             .iter()
-            .map(|k| string_token_to_str(k, table))
+            .map(|k| string_token_to_owned(k, table))
             .collect(),
         children: children_to_cached(&vc.children),
         start_line: sl,
@@ -242,8 +245,8 @@ fn cached_comment_to_comment(c: &CachedComment) -> Comment {
 
 fn value_to_cached(v: &Value, table: &StringResolver<'_>) -> CachedValue {
     match v {
-        Value::String(t) => CachedValue::String(string_token_to_str(t, table)),
-        Value::QString(t) => CachedValue::QString(string_token_to_str(t, table)),
+        Value::String(t) => CachedValue::String(string_token_to_owned(t, table)),
+        Value::QString(t) => CachedValue::QString(string_token_to_owned(t, table)),
         Value::Float(f) => CachedValue::Float(*f),
         Value::Int(i) => CachedValue::Int(*i),
         Value::Bool(b) => CachedValue::Bool(*b),
