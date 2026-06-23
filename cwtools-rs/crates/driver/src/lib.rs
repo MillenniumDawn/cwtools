@@ -353,6 +353,8 @@ impl Session {
             type_index: Some(&self.type_index),
             modifier_keys: Some(&self.modifier_keys),
             loc_index: Some(&self.loc_index),
+            // The CLI/driver loads loc from disk; no live-edit overlay.
+            extra_loc_keys: None,
             registry: self.registry.as_ref(),
             scope_checks,
             var_checks,

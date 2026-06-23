@@ -173,6 +173,58 @@ fn loc_pipeline_codes_match_error_catalog() {
 }
 
 #[test]
+fn overlay_key_resolves_missing_loc() {
+    // Regression for cwtools-vscode#36: a loc key absent from the scanned index
+    // but present in the live overlay (just typed into an open `.yml`) must NOT
+    // warn CW100, so adding a key clears the diagnostic without a full rescan.
+    use cwtools_validation::{Prepared, validate_prepared};
+    use std::collections::HashSet;
+
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(CWT, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let parsed = parse_string("mytype = {\n name = just_added_key\n}\n", &table).unwrap();
+    // Index lacks the key.
+    let idx = loc_index(&[("a_l_english.yml", "l_english:\n other: \"hi\"\n")]);
+
+    let base = Prepared {
+        ruleset: &ruleset,
+        table: &table,
+        game: None,
+        type_index: None,
+        modifier_keys: None,
+        loc_index: Some(&idx),
+        extra_loc_keys: None,
+        registry: None,
+        scope_checks: false,
+        var_checks: false,
+    };
+    // No overlay → the key is missing → CW100.
+    let errs = validate_prepared(&parsed, "test.txt", &base);
+    assert_eq!(
+        cw100s(&errs),
+        1,
+        "missing key without overlay → CW100: {:?}",
+        errs
+    );
+
+    // Overlay carries the (lowercased) key → resolved, no CW100.
+    let mut overlay = HashSet::new();
+    overlay.insert("just_added_key".to_string());
+    let with_overlay = Prepared {
+        extra_loc_keys: Some(&overlay),
+        ..base
+    };
+    let errs = validate_prepared(&parsed, "test.txt", &with_overlay);
+    assert_eq!(
+        cw100s(&errs),
+        0,
+        "overlay key resolves → no CW100: {:?}",
+        errs
+    );
+}
+
+#[test]
 fn no_loc_index_is_lenient() {
     let table = StringTable::new();
     let parsed_cwt = parse_string(CWT, &table).unwrap();

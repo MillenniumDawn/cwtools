@@ -84,7 +84,11 @@ pub(crate) fn validate_localisation_field(
         return;
     };
     let key_lower = key_raw.to_lowercase();
-    let exists = idx.exists_any(&key_lower);
+    // A key present in the live overlay (just typed into an open `.yml`, not yet
+    // rescanned) counts as existing — keeps live editing from flagging a key the
+    // user already added. (#36)
+    let in_overlay = ctx.extra_loc_keys.is_some_and(|e| e.contains(&key_lower));
+    let exists = idx.exists_any(&key_lower) || in_overlay;
 
     let push_missing = |errors: &mut Vec<ValidationError>, lang: &str| {
         let code = &error_codes::CW100_MISSING_LOCALISATION;
@@ -114,8 +118,9 @@ pub(crate) fn validate_localisation_field(
             (false, true) => {} // unquoted + exists → ok
             (false, false) => push_missing(errors, "any language"),
         }
-    } else if synced {
-        // Must exist in every language the project ships loc data for.
+    } else if synced && !in_overlay {
+        // Must exist in every language the project ships loc data for. A key in
+        // the live overlay is accepted leniently (no per-language data there).
         for lang in idx.missing_synced_languages(&key_lower) {
             push_missing(errors, &lang.to_string());
         }

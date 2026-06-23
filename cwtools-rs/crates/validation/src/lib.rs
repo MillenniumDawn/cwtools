@@ -213,6 +213,7 @@ pub fn validate_ast_with_loc(
             type_index,
             modifier_keys,
             loc_index,
+            extra_loc_keys: None,
             registry: registry.as_ref(),
             scope_checks,
             var_checks,
@@ -260,6 +261,9 @@ pub struct Prepared<'a> {
     pub type_index: Option<&'a cwtools_index::TypeIndex>,
     pub modifier_keys: Option<&'a HashSet<String>>,
     pub loc_index: Option<&'a LocIndex>,
+    /// Extra loc keys to treat as existing (the LSP live overlay of unsaved keys
+    /// in open `.yml` files). Lowercased. `None` outside the LSP single-file path.
+    pub extra_loc_keys: Option<&'a HashSet<String>>,
     pub registry: Option<&'a std::sync::Arc<ScopeRegistry>>,
     pub scope_checks: bool,
     pub var_checks: bool,
@@ -316,6 +320,7 @@ pub fn validate_prepared(
         type_index,
         modifier_keys,
         loc_index,
+        extra_loc_keys,
         registry,
         scope_checks,
         var_checks,
@@ -333,6 +338,7 @@ pub fn validate_prepared(
         type_index,
         modifier_keys,
         loc_index,
+        extra_loc_keys,
         scope_checks,
         var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),

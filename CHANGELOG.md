@@ -1,3 +1,12 @@
+# 1.8.1
+
+## Bug Fixes
+- Adding a localisation key in an open `.yml` now clears the missing-localisation warning (CW100/CW122) on the open game files that reference it — e.g. a new event option's loc key — without waiting for a full rescan: the live overlay now feeds the game-file loc checks, and editing a `.yml` re-validates the open game files that depend on it
+- The "Indexing workspace…" status bar always clears now; an absent/empty workspace or a panic mid-scan previously left it spinning forever
+
+## Developer
+- Added a regression test for the live localisation overlay resolving an otherwise-missing key on a game file
+
 # 1.8.0
 
 ## Features

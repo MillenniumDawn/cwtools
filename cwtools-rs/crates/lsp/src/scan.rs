@@ -131,9 +131,20 @@ impl Backend {
         rules.modifier_keys = Arc::new(keys);
     }
 
+    /// Public entry to the workspace scan. Runs the scan and ALWAYS clears the
+    /// status-bar loading indicator on return, regardless of which internal path
+    /// exited — including the early returns for an absent/empty workspace, which
+    /// previously left the bar spinning on "Indexing workspace…" forever. A
+    /// panic inside the scan is handled separately by the watcher in
+    /// `initialized`, which clears the bar too.
+    pub(crate) async fn validate_entire_workspace(&self) {
+        self.validate_entire_workspace_inner().await;
+        self.send_loading_bar(false, "").await;
+    }
+
     /// Scan the entire workspace for relevant game files and validate them all.
     #[tracing::instrument(skip_all)]
-    pub(crate) async fn validate_entire_workspace(&self) {
+    async fn validate_entire_workspace_inner(&self) {
         cwtools_profiling::log_rss("workspace_scan_start");
         self.send_loading_bar(true, "Indexing workspace…").await;
 
@@ -436,6 +447,9 @@ impl Backend {
                     type_index,
                     &modifier_keys_snap,
                     loc_index,
+                    // Full scan skips open docs, so the unsaved-key overlay is
+                    // irrelevant here.
+                    None,
                     registry,
                     scope_checks,
                     var_checks,
@@ -558,8 +572,9 @@ impl Backend {
         // file) shows as "not found" until a manual re-save. Now that the index is
         // complete, re-run them so those stale diagnostics clear on their own.
         self.revalidate_all_open_docs().await;
-
-        self.send_loading_bar(false, "").await;
+        // The status bar is cleared by the `validate_entire_workspace` wrapper on
+        // return, so every exit path (this one and the early returns above) clears
+        // it uniformly.
     }
 
     /// Re-validate every currently-open document against the current (complete)

@@ -338,6 +338,7 @@ impl Backend {
             &info_guard.type_index,
             &rules_guard.modifier_keys,
             None,
+            None,
             rules_guard.scope_registry.as_ref(),
             scope_checks,
             var_checks,
@@ -682,6 +683,7 @@ impl LanguageServer for Backend {
         let client = self.client.clone();
         let state = self.state.clone();
         let watch_state = self.state.clone();
+        let watch_client = self.client.clone();
         let handle = tokio::spawn(async move {
             let backend = Backend { client, state };
             backend.validate_entire_workspace().await;
@@ -698,6 +700,10 @@ impl LanguageServer for Backend {
                 watch_state
                     .index_ready
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                // The panic also skipped the wrapper's bar-off, so the status bar
+                // would spin on "Indexing workspace…" forever. Clear it here.
+                let payload = serde_json::json!({ "enable": false, "value": "" });
+                watch_client.send_notification::<LoadingBar>(payload).await;
             }
         });
     }

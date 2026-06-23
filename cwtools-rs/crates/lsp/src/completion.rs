@@ -74,6 +74,7 @@ impl Backend {
                     &info_guard.type_index,
                     &rules_guard.modifier_keys,
                     None,
+                    None,
                     rules_guard.scope_registry.as_ref(),
                     scope_checks,
                     var_checks,
