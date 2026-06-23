@@ -119,6 +119,15 @@ impl Backend {
                     .store(dbg, std::sync::atomic::Ordering::Relaxed);
             }
 
+            // Scope display: "resolved" adds a `Resolves to` line (the scope the
+            // hovered link/keyword evaluates to); "context" (default) shows only
+            // the ambient current scope. (#37)
+            if let Some(mode) = opts.get("hoverScopeDisplay").and_then(|v| v.as_str()) {
+                self.state
+                    .hover_resolved_scope
+                    .store(mode == "resolved", std::sync::atomic::Ordering::Relaxed);
+            }
+
             // Persistent cache directory for the base-game index (so it isn't
             // re-parsed every startup). The client should pass its global
             // storage path; we fall back to an OS cache dir otherwise.

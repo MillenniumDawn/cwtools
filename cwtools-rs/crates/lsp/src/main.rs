@@ -203,6 +203,11 @@ struct DocumentState {
     /// includes the raw rule classification (field/type/scope) lines; off by
     /// default so users see only localisation, description, and required scopes.
     hover_debug: std::sync::atomic::AtomicBool,
+    /// When `true` (the `hover.scopeDisplay = "resolved"` setting), hover adds a
+    /// `Resolves to` line showing the scope the hovered link/keyword evaluates to
+    /// (run through `change_scope`), alongside the ambient current scope. Off by
+    /// default — the ambient scope is shown alone. (#37)
+    hover_resolved_scope: std::sync::atomic::AtomicBool,
     /// `false` until the first full workspace scan has finished building the
     /// index. While `false`, per-file validation still parses and indexes, but
     /// suppresses published diagnostics (clears instead) so the user never sees
@@ -263,6 +268,7 @@ impl DocumentState {
             loc_live_overlay: parking_lot::RwLock::new(HashMap::new()),
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
+            hover_resolved_scope: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
@@ -444,6 +450,20 @@ impl Backend {
             }
             None => (None, None, None, Vec::new()),
         };
+        // The scope the hovered key resolves TO: run it through `change_scope` on
+        // a clone of the cursor's context. For a scope-changing link (`owner`) or
+        // a meta keyword (`FROM`/`ROOT`/`PREV`) this is the target scope; for
+        // anything that doesn't change scope it stays the ambient one (and is
+        // suppressed below when it matches). Computed unconditionally; the hover
+        // only shows it when the `resolved` setting is on. (#37)
+        let resolved_scope = match (rctx.scope.as_ref(), &element) {
+            (Some(sc), PositionElement::Leaf { key, .. }) if !key.is_empty() => {
+                let mut probe = sc.clone();
+                probe.change_scope(key);
+                probe.current().and_then(|id| resolve_scope(&probe, id))
+            }
+            _ => None,
+        };
         Some(RuleCursorInfo {
             element,
             hint,
@@ -454,6 +474,7 @@ impl Backend {
             root_scope,
             prev_scope,
             from_scopes,
+            resolved_scope,
         })
     }
 }
@@ -494,6 +515,10 @@ pub(crate) struct RuleCursorInfo {
     pub(crate) prev_scope: Option<String>,
     /// The FROM chain: `[0]` = FROM, `[1]` = FROM.FROM, … (placeholders dropped).
     pub(crate) from_scopes: Vec<String>,
+    /// The scope the hovered key resolves to (run through `change_scope`). Shown
+    /// as a `Resolves to` line only when the `hover.scopeDisplay = "resolved"`
+    /// setting is on and it differs from the current scope. (#37)
+    pub(crate) resolved_scope: Option<String>,
 }
 
 /// Map a matched leaf rule's right-hand field to a [`ReferenceHint`] for the

@@ -34,6 +34,7 @@ fn type_index(entries: &[(&str, &str)]) -> TypeIndex {
             .push(TypeInstance {
                 name: instance.to_string(),
                 location: SourceLocation { line: 1, col: 0 },
+                primary_loc_key: None,
             });
     }
     idx.merge("test_defs.txt", per_type);

@@ -894,6 +894,7 @@ mod tests {
             vec![TypeInstance {
                 name: "my_event".to_string(),
                 location: SourceLocation { line: 1, col: 0 },
+                primary_loc_key: None,
             }],
         );
         idx.merge("file://test.txt", map);
@@ -913,6 +914,7 @@ mod tests {
             vec![TypeInstance {
                 name: "ev1".to_string(),
                 location: SourceLocation { line: 1, col: 0 },
+                primary_loc_key: None,
             }],
         );
         idx.merge("file://a.txt", map.clone());
@@ -937,6 +939,7 @@ mod tests {
             vec![TypeInstance {
                 name: "GER_some_char".to_string(),
                 location: SourceLocation { line: 1, col: 0 },
+                primary_loc_key: None,
             }],
         );
         idx.merge("file://a.txt", map.clone());
@@ -964,6 +967,7 @@ mod tests {
             vec![TypeInstance {
                 name: "LBA_ai_behavior".to_string(),
                 location: SourceLocation { line: 1, col: 0 },
+                primary_loc_key: None,
             }],
         );
         idx.merge("file://a.txt", map);

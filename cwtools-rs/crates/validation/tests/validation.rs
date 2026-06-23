@@ -212,6 +212,7 @@ types = {
         vec![TypeInstance {
             name: "my_tech_alpha".to_string(),
             location: SourceLocation { line: 1, col: 0 },
+            primary_loc_key: None,
         }],
     );
     idx.merge("file://tech.txt", map);
@@ -415,6 +416,7 @@ event = {
         vec![TypeInstance {
             name: "my_tech_alpha".to_string(),
             location: SourceLocation { line: 1, col: 0 },
+            primary_loc_key: None,
         }],
     );
     idx.merge("file://tech.txt", map);
@@ -921,6 +923,7 @@ widget = {
         vec![TypeInstance {
             name: "GFX_my_icon".to_string(),
             location: SourceLocation { line: 1, col: 0 },
+            primary_loc_key: None,
         }],
     );
     idx.merge("game/interface/sprites.gfx", map);
@@ -1085,6 +1088,7 @@ types = {
         vec![TypeInstance {
             name: "my_tech_alpha".to_string(),
             location: SourceLocation { line: 1, col: 0 },
+            primary_loc_key: None,
         }],
     );
     idx.merge("file://tech.txt", map);

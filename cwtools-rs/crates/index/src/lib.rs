@@ -70,6 +70,12 @@ pub struct TypeInstance {
     pub name: String,
     /// Where the definition starts in the source file.
     pub location: SourceLocation,
+    /// The loc key for the type's `## primary` localisation when it is taken from
+    /// an explicit field (e.g. an event's `title = <key>`), captured here so hover
+    /// can show the localised title for a reference in another file without
+    /// re-reading the definition. `None` when the type has no primary
+    /// explicit-field localisation (name-derived keys are computed on demand).
+    pub primary_loc_key: Option<String>,
 }
 
 /// Holds all known instances for every type, aggregated across files.
@@ -357,6 +363,19 @@ impl TypeIndex {
         self.map.get(type_name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// The explicit-field primary loc key captured for `name`'s instance of
+    /// `type_name` (e.g. an event's `title` loc key), if any. Lets hover show the
+    /// localised title for a reference. Case-insensitive on the instance name.
+    pub fn primary_loc_key(&self, type_name: &str, name: &str) -> Option<&str> {
+        self.map.get(type_name)?.iter().find_map(|(_, inst)| {
+            if inst.name.eq_ignore_ascii_case(name) {
+                inst.primary_loc_key.as_deref()
+            } else {
+                None
+            }
+        })
+    }
+
     /// Names a loc `$ref$` may bind to besides loc keys: every type-instance
     /// name (dynamic modifiers, ideas, buildings, …) and every defined variable,
     /// lowercased. The caller unions modifiers / vanilla loc keys on top. Lets
@@ -642,6 +661,44 @@ fn starts_with_matches(td: &TypeDefinition, key: &str) -> bool {
 
 // ── Collect instances from a single node under skip_root_key navigation ──────
 
+/// The field name an instance's `## primary` localisation is taken from, when it
+/// is an explicit field (e.g. an event's `title = title` → `Some("title")`).
+/// `None` for name-derived (`$`-pattern) primary keys or types with no primary
+/// localisation — those need nothing captured at index time.
+fn primary_explicit_loc_field(td: &TypeDefinition) -> Option<&str> {
+    td.localisation
+        .iter()
+        .find(|l| l.primary && l.explicit_field.is_some())
+        .and_then(|l| l.explicit_field.as_deref())
+}
+
+/// Read the value of the child leaf whose key equals `field_name` (case-
+/// insensitive), unquoted. Mirrors the `name_field` extraction in
+/// [`instance_name_from_children`].
+fn field_value_from_children(
+    field_name: &str,
+    children: &[Child],
+    arena: &Arena,
+    table: &StringTable,
+) -> Option<String> {
+    for child in children {
+        if let Child::Leaf(li) = child {
+            let leaf = &arena.leaves[*li as usize];
+            let matches = table
+                .with_string(leaf.key.normal, |k| k.eq_ignore_ascii_case(field_name))
+                .unwrap_or(false);
+            if matches {
+                let v = leaf_value_string(&leaf.value, table);
+                let v = unquote(&v);
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Extract the instance name from a clause-typed element (honours `name_field`).
 /// `children` is the list of children inside the clause.
 fn instance_name_from_children(
@@ -701,12 +758,18 @@ fn collect_skip_root_child(
                 && let Some(name) =
                     instance_name_from_children(td, key, clause_children, arena, table)
             {
+                // Capture the explicit-field primary loc key (e.g. an event's
+                // `title`) so hover can resolve the localised title cross-file.
+                let primary_loc_key = primary_explicit_loc_field(td).and_then(|field| {
+                    field_value_from_children(field, clause_children, arena, table)
+                });
                 out.push(TypeInstance {
                     name,
                     location: SourceLocation {
                         line: start_line,
                         col: start_col,
                     },
+                    primary_loc_key,
                 });
             }
         }
@@ -868,6 +931,8 @@ pub fn collect_type_instances(
             instances.push(TypeInstance {
                 name,
                 location: SourceLocation { line: 1, col: 0 },
+                // type_per_file types have no node body to read a field from.
+                primary_loc_key: None,
             });
         } else {
             // Walk the file's top-level keyed clauses.
@@ -1460,6 +1525,7 @@ mod tests {
             vec![TypeInstance {
                 name: "Education_Dynamic_Modifier".to_string(),
                 location: SourceLocation { line: 1, col: 0 },
+                primary_loc_key: None,
             }],
         );
         idx.merge("common/lns/x.txt", per_type);

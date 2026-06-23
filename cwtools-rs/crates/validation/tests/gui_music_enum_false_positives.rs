@@ -406,6 +406,7 @@ types = {
         vec![TypeInstance {
             name: "GFX_idea_research_bonus".to_string(),
             location: SourceLocation { line: 1, col: 1 },
+            primary_loc_key: None,
         }],
     );
     index.merge("interface/ideas.gfx", per_type);
