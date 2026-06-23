@@ -783,6 +783,39 @@ mod tests {
     }
 
     #[test]
+    fn names_file_has_no_false_unclosed_clause() {
+        // Regression for cwtools-vscode#42: a HOI4 common/names file (quoted
+        // names with apostrophes and non-ASCII, nested name_list clauses) must
+        // parse with no errors — it was flagged "unclosed clause: expected '}'
+        // before end of file" despite balanced braces on older builds.
+        let src = "\
+GER = {
+    male = {
+        names = { \"Hans\" \"Jürgen\" \"O'Brien\" \"José\" }
+    }
+    female = {
+        names = { \"Anna\" \"María\" }
+    }
+    surnames = { \"Müller\" \"D'Angelo\" \"Schröder\" }
+    callsigns = { \"Falke\" \"Adler\" }
+}
+ENG = {
+    male = { names = { \"John\" \"Jack\" } }
+    female = { names = { \"Mary\" } }
+    surnames = { \"Smith\" }
+}
+";
+        let table = StringTable::new();
+        let result = parse_string(src, &table).expect("names file should parse");
+        assert!(
+            result.errors.is_empty(),
+            "expected no parse errors, got: {:?}",
+            result.errors
+        );
+        assert_eq!(result.root_children.len(), 2, "two country blocks");
+    }
+
+    #[test]
     fn parse_real_file() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
