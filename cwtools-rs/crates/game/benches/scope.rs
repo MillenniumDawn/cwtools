@@ -1,6 +1,7 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use cwtools_game::constants::Game;
 use cwtools_game::scope_engine::{ScopeContext, ScopeId};
+use std::hint::black_box;
 
 // Stellaris has a populated hardcoded link table (HOI4 links come from config),
 // so it exercises the real resolve path. Root = Country (200), matching the
