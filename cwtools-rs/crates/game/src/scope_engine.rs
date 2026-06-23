@@ -332,82 +332,8 @@ impl ScopeContext {
             return ScopeResult::VarFound;
         }
 
-        match lower {
-            // ── this / self ──────────────────────────────────────────────
-            "this" | "self" => {
-                let cur = self.scopes.last().copied().unwrap_or(self.root);
-                self.scopes.push(cur);
-                return ScopeResult::NewScope {
-                    scope: cur,
-                    ignore_keys: vec![],
-                };
-            }
-            // ── root ─────────────────────────────────────────────────────
-            "root" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return ScopeResult::NewScope {
-                    scope: r,
-                    ignore_keys: vec![],
-                };
-            }
-            // ── prev chain ───────────────────────────────────────────────
-            "prev" => {
-                return self.apply_prev(1);
-            }
-            "prevprev" | "prev_prev" => {
-                return self.apply_prev(2);
-            }
-            "prevprevprev" | "prev_prev_prev" => {
-                return self.apply_prev(3);
-            }
-            "prevprevprevprev" | "prev_prev_prev_prev" => {
-                return self.apply_prev(4);
-            }
-            // ── from chain ───────────────────────────────────────────────
-            "from" => {
-                return self.apply_from(1);
-            }
-            "fromfrom" => {
-                return self.apply_from(2);
-            }
-            "fromfromfrom" => {
-                return self.apply_from(3);
-            }
-            "fromfromfromfrom" => {
-                return self.apply_from(4);
-            }
-            // ── root_from composites ─────────────────────────────────────
-            "root_from" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return self.apply_from(1);
-            }
-            "root_fromfrom" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return self.apply_from(2);
-            }
-            "root_fromfromfrom" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return self.apply_from(3);
-            }
-            "root_fromfromfromfrom" => {
-                let r = self.root;
-                self.scopes.push(r);
-                return self.apply_from(4);
-            }
-            // ── logical/boolean keywords (pass-through) ──────────────────
-            "and" | "or" | "not" | "nor" | "nand" | "if" | "else" | "else_if" | "hidden_effect"
-            | "hidden_trigger" | "limit" | "trigger_if" | "trigger_else" | "trigger_else_if" => {
-                let cur = self.scopes.last().copied().unwrap_or(self.root);
-                return ScopeResult::NewScope {
-                    scope: cur,
-                    ignore_keys: vec![],
-                };
-            }
-            _ => {}
+        if let Some(result) = self.resolve_meta_keyword(lower) {
+            return result;
         }
 
         // Game-specific named link lookup — borrow rather than clone the whole
@@ -448,6 +374,75 @@ impl ScopeContext {
         }
 
         ScopeResult::NotFound
+    }
+
+    /// Resolve a meta keyword (`this`/`self`, `root`, the `prev`/`from` chains,
+    /// their `root_from` composites, and the logical/boolean pass-through
+    /// keywords). Returns `None` when `lower` is not a meta keyword, leaving the
+    /// caller to fall through to the named-link lookup.
+    fn resolve_meta_keyword(&mut self, lower: &str) -> Option<ScopeResult> {
+        let result = match lower {
+            // ── this / self ──────────────────────────────────────────────
+            "this" | "self" => {
+                let cur = self.scopes.last().copied().unwrap_or(self.root);
+                self.scopes.push(cur);
+                ScopeResult::NewScope {
+                    scope: cur,
+                    ignore_keys: vec![],
+                }
+            }
+            // ── root ─────────────────────────────────────────────────────
+            "root" => {
+                let r = self.root;
+                self.scopes.push(r);
+                ScopeResult::NewScope {
+                    scope: r,
+                    ignore_keys: vec![],
+                }
+            }
+            // ── prev chain ───────────────────────────────────────────────
+            "prev" => self.apply_prev(1),
+            "prevprev" | "prev_prev" => self.apply_prev(2),
+            "prevprevprev" | "prev_prev_prev" => self.apply_prev(3),
+            "prevprevprevprev" | "prev_prev_prev_prev" => self.apply_prev(4),
+            // ── from chain ───────────────────────────────────────────────
+            "from" => self.apply_from(1),
+            "fromfrom" => self.apply_from(2),
+            "fromfromfrom" => self.apply_from(3),
+            "fromfromfromfrom" => self.apply_from(4),
+            // ── root_from composites ─────────────────────────────────────
+            "root_from" => {
+                let r = self.root;
+                self.scopes.push(r);
+                self.apply_from(1)
+            }
+            "root_fromfrom" => {
+                let r = self.root;
+                self.scopes.push(r);
+                self.apply_from(2)
+            }
+            "root_fromfromfrom" => {
+                let r = self.root;
+                self.scopes.push(r);
+                self.apply_from(3)
+            }
+            "root_fromfromfromfrom" => {
+                let r = self.root;
+                self.scopes.push(r);
+                self.apply_from(4)
+            }
+            // ── logical/boolean keywords (pass-through) ──────────────────
+            "and" | "or" | "not" | "nor" | "nand" | "if" | "else" | "else_if" | "hidden_effect"
+            | "hidden_trigger" | "limit" | "trigger_if" | "trigger_else" | "trigger_else_if" => {
+                let cur = self.scopes.last().copied().unwrap_or(self.root);
+                ScopeResult::NewScope {
+                    scope: cur,
+                    ignore_keys: vec![],
+                }
+            }
+            _ => return None,
+        };
+        Some(result)
     }
 
     // ── prev / from helpers ───────────────────────────────────────────────────

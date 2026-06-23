@@ -461,12 +461,6 @@ pub(crate) fn validate_children(
     block_pos: (u32, u16),
     errors: &mut Vec<ValidationError>,
 ) {
-    let ast = ctx.ast;
-    let table = ctx.table;
-    let file_path = ctx.file_path;
-    let ruleset = ctx.ruleset;
-    let type_index = ctx.type_index;
-    let modifier_keys = ctx.modifier_keys;
     // Nested subtype blocks (a `subtype[x] = {...}` not at the entity root) carry
     // their fields inside SubtypeRule entries that the candidate matcher below
     // doesn't see. Flatten them in — but only pay the clone when any are present,
@@ -482,7 +476,40 @@ pub(crate) fn validate_children(
         rules
     };
 
-    // Track occurrence counts for cardinality checking.
+    // Phase 1: count occurrences of all children kinds (for cardinality).
+    let (key_counts, leafvalue_counts, valueclause_counts) = count_children(ctx, children, rules);
+
+    // Phase 2: validate each child.
+    validate_each_child(ctx, children, rules, scope_context, errors);
+
+    // Phase 3: cardinality enforcement against the phase-1 counts.
+    enforce_cardinality(
+        ctx,
+        children,
+        rules,
+        block_pos,
+        &key_counts,
+        &leafvalue_counts,
+        &valueclause_counts,
+        errors,
+    );
+}
+
+/// Phase 1 of [`validate_children`]: count occurrences of every child kind so
+/// the cardinality pass can check min/max. Returns the three count maps that
+/// phase 3 ([`enforce_cardinality`]) consumes:
+/// - `key_counts`: lowercased key string -> count (Leaf/Node children),
+/// - `leafvalue_counts`: per-rule count of matching `LeafValueRule`s,
+/// - `valueclause_counts`: per-rule count of anonymous `{ ... }` clauses.
+fn count_children(
+    ctx: &ValidationCtx,
+    children: &[Child],
+    rules: &[(RuleType, Options)],
+) -> (FxHashMap<String, usize>, Vec<usize>, Vec<usize>) {
+    let ast = ctx.ast;
+    let table = ctx.table;
+    let ruleset = ctx.ruleset;
+
     // Keyed children (Leaf/Node): key string -> count.
     let mut key_counts: FxHashMap<String, usize> =
         FxHashMap::with_capacity_and_hasher(children.len(), Default::default());
@@ -491,7 +518,6 @@ pub(crate) fn validate_children(
     // Item 5: ValueClause — count per ValueClauseRule index.
     let mut valueclause_counts: Vec<usize> = vec![0usize; rules.len()];
 
-    // First pass: count occurrences of all children kinds.
     for child in children {
         match child {
             Child::Leaf(idx) => {
@@ -533,7 +559,26 @@ pub(crate) fn validate_children(
         }
     }
 
-    // Second pass: validate each child.
+    (key_counts, leafvalue_counts, valueclause_counts)
+}
+
+/// Phase 2 of [`validate_children`]: validate each child against the matching
+/// rules, emitting unexpected-property and per-rule diagnostics. Recurses into
+/// nested blocks via [`validate_children`].
+fn validate_each_child(
+    ctx: &ValidationCtx,
+    children: &[Child],
+    rules: &[(RuleType, Options)],
+    scope_context: &mut Option<ScopeContext>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let ast = ctx.ast;
+    let table = ctx.table;
+    let file_path = ctx.file_path;
+    let ruleset = ctx.ruleset;
+    let type_index = ctx.type_index;
+    let modifier_keys = ctx.modifier_keys;
+
     for child in children {
         match child {
             Child::Leaf(idx) => {
@@ -687,6 +732,25 @@ pub(crate) fn validate_children(
             _ => {}
         }
     }
+}
+
+/// Phase 3 of [`validate_children`]: enforce cardinality (min/max occurrence)
+/// against the counts gathered by [`count_children`]. Reads `key_counts`,
+/// `leafvalue_counts`, and `valueclause_counts`; emits CW242 diagnostics.
+#[allow(clippy::too_many_arguments)]
+fn enforce_cardinality(
+    ctx: &ValidationCtx,
+    children: &[Child],
+    rules: &[(RuleType, Options)],
+    block_pos: (u32, u16),
+    key_counts: &FxHashMap<String, usize>,
+    leafvalue_counts: &[usize],
+    valueclause_counts: &[usize],
+    errors: &mut Vec<ValidationError>,
+) {
+    let ast = ctx.ast;
+    let table = ctx.table;
+    let file_path = ctx.file_path;
 
     // Cardinality enforcement. Report at the block's own location (its first
     // child) rather than line 0 — a missing required field belongs to THIS
@@ -1015,7 +1079,7 @@ fn parsed_pattern_matches(
                 let def = &ruleset.enums[idx];
                 def.values.iter().any(|v| v.eq_ignore_ascii_case(middle))
                     || def.values.iter().any(|v| v.starts_with('@'))
-                    || def.values.len() > 5
+                    || enum_is_authoritative(def)
             }
             _ => permissive, // enum absent/empty (game-derived)
         },
@@ -1103,7 +1167,7 @@ pub(crate) fn field_matches_key(
                     if def.values.iter().any(|v| v.starts_with('@')) {
                         return true;
                     }
-                    def.values.len() > 5
+                    enum_is_authoritative(def)
                 }
                 None => true,
             }

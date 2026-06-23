@@ -127,62 +127,25 @@ pub(crate) fn process_type_node(
                         "unique" if leaf_value_string(l, table) == "yes" => {
                             def.unique = true;
                         }
+                        // The `should_be_used` directive maps onto the
+                        // `should_be_referenced` field (the field is named for
+                        // the cross-file "is this type ever referenced?" check
+                        // it feeds, but the directive that enables it is spelled
+                        // `should_be_used`). Field is shared across crates, so
+                        // it is not renamed here (#204).
                         "should_be_used" if leaf_value_string(l, table) == "yes" => {
                             def.should_be_referenced = true;
                         }
                         "skip_root_key" => {
                             if let Value::Clause(block_children) = &l.value {
-                                // Block form: skip_root_key = { A B }
-                                // Each element is a separate nested level (F#
-                                // RulesParser.fs:1031-1035 maps each to its own layer).
-                                // `any` becomes AnyKey; anything else becomes SpecificKey.
-                                for block_child in block_children {
-                                    if let Child::LeafValue(lvidx) = block_child {
-                                        let lv = &ast.arena.leaf_values[*lvidx as usize];
-                                        let v = value_to_string(&lv.value, table);
-                                        if v.is_empty() {
-                                            continue;
-                                        }
-                                        if v == "any" {
-                                            def.skip_root_key.push(SkipRootKey::AnyKey);
-                                        } else {
-                                            def.skip_root_key.push(SkipRootKey::SpecificKey(v));
-                                        }
-                                    }
-                                }
+                                parse_skip_root_key_block(
+                                    block_children,
+                                    ast,
+                                    table,
+                                    &mut def.skip_root_key,
+                                );
                             } else {
-                                let op = l.op;
-                                let v = leaf_value_string(l, table);
-                                if v == "any" {
-                                    def.skip_root_key.push(SkipRootKey::AnyKey);
-                                } else {
-                                    let should_match = op == cwtools_parser::ast::Operator::Equals;
-                                    if def.skip_root_key.is_empty() {
-                                        def.skip_root_key.push(SkipRootKey::SpecificKey(v));
-                                    } else {
-                                        // Multiple leaves: promote to MultipleKeys, using
-                                        // the first entry's operator (F# parity).
-                                        let first_match_kind = match &def.skip_root_key[0] {
-                                            SkipRootKey::MultipleKeys(_, mk) => *mk,
-                                            _ => MatchKind::from_equals(should_match),
-                                        };
-                                        let mut all_keys: Vec<String> = Vec::new();
-                                        for existing in def.skip_root_key.drain(..) {
-                                            match existing {
-                                                SkipRootKey::SpecificKey(k) => all_keys.push(k),
-                                                SkipRootKey::MultipleKeys(mut ks, _) => {
-                                                    all_keys.append(&mut ks)
-                                                }
-                                                SkipRootKey::AnyKey => {}
-                                            }
-                                        }
-                                        all_keys.push(v);
-                                        def.skip_root_key.push(SkipRootKey::MultipleKeys(
-                                            all_keys,
-                                            first_match_kind,
-                                        ));
-                                    }
-                                }
+                                parse_skip_root_key_leaf(l, table, &mut def.skip_root_key);
                             }
                         }
                         _ => {}
@@ -221,6 +184,71 @@ pub(crate) fn process_type_node(
     }
 
     def
+}
+
+/// Block form: `skip_root_key = { A B }`.
+/// Each element is a separate nested level (F# RulesParser.fs:1031-1035 maps
+/// each to its own layer). `any` becomes `AnyKey`; anything else becomes
+/// `SpecificKey`. Appends to `out`.
+fn parse_skip_root_key_block(
+    block_children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    out: &mut Vec<SkipRootKey>,
+) {
+    for block_child in block_children {
+        if let Child::LeafValue(lvidx) = block_child {
+            let lv = &ast.arena.leaf_values[*lvidx as usize];
+            let v = value_to_string(&lv.value, table);
+            if v.is_empty() {
+                continue;
+            }
+            if v == "any" {
+                out.push(SkipRootKey::AnyKey);
+            } else {
+                out.push(SkipRootKey::SpecificKey(v));
+            }
+        }
+    }
+}
+
+/// Leaf form: `skip_root_key = A`.
+/// `any` becomes `AnyKey`. A first named key becomes `SpecificKey`; subsequent
+/// named leaves (multiple `skip_root_key = ...` directives) promote the prior
+/// entries into a single `MultipleKeys` alternative, using the first entry's
+/// operator (F# parity). Appends to / rewrites `out`.
+fn parse_skip_root_key_leaf(
+    l: &cwtools_parser::ast::Leaf,
+    table: &StringTable,
+    out: &mut Vec<SkipRootKey>,
+) {
+    let op = l.op;
+    let v = leaf_value_string(l, table);
+    if v == "any" {
+        out.push(SkipRootKey::AnyKey);
+    } else if out.is_empty() {
+        out.push(SkipRootKey::SpecificKey(v));
+    } else {
+        // Multiple leaves: promote to MultipleKeys, using the first entry's
+        // operator (F# parity).
+        let should_match = op == cwtools_parser::ast::Operator::Equals;
+        let first_match_kind = match &out[0] {
+            SkipRootKey::MultipleKeys(_, mk) => *mk,
+            _ => MatchKind::from_equals(should_match),
+        };
+        // Flatten the existing entries (SpecificKey / MultipleKeys) plus the
+        // new key into one alternative list. AnyKey carries no key text.
+        let mut all_keys: Vec<String> = out
+            .drain(..)
+            .flat_map(|existing| match existing {
+                SkipRootKey::SpecificKey(k) => vec![k],
+                SkipRootKey::MultipleKeys(ks, _) => ks,
+                SkipRootKey::AnyKey => Vec::new(),
+            })
+            .collect();
+        all_keys.push(v);
+        out.push(SkipRootKey::MultipleKeys(all_keys, first_match_kind));
+    }
 }
 
 pub(crate) fn parse_type_key_filter_from_comments(

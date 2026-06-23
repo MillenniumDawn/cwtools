@@ -540,38 +540,11 @@ impl InfoService {
             let leaf = &arena.leaves[*idx as usize];
             let key = table.get_string(leaf.key.normal).unwrap_or_default();
 
-            if let Value::Clause(_) = &leaf.value {
-                info.top_level_keys.push((
-                    key.clone(),
-                    SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    },
-                ));
-
-                if type_names.contains_key(&key) {
-                    info.type_definitions
-                        .entry(key.clone())
-                        .or_default()
-                        .push(SourceLocation {
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                        });
-                }
-            }
+            Self::record_top_level_key(leaf, &key, type_names, info);
 
             let value_str = leaf_value_string(&leaf.value, table);
 
-            if value_str.starts_with('<') && value_str.ends_with('>') {
-                let inner = &value_str[1..value_str.len() - 1];
-                info.type_references
-                    .entry(inner.to_string())
-                    .or_default()
-                    .push(SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    });
-            }
+            Self::record_type_reference(leaf, &value_str, info);
 
             if let Value::Clause(children) = &leaf.value {
                 for c in children {
@@ -579,75 +552,155 @@ impl InfoService {
                 }
             }
 
-            if key.starts_with("event_target:") {
-                let target = key.strip_prefix("event_target:").unwrap_or("");
-                if !target.is_empty() {
-                    info.saved_event_targets.insert(target.to_string());
-                }
-            }
-
-            if (key == "save_event_target_as" || key == "save_global_event_target_as")
-                && !value_str.is_empty()
-            {
-                info.saved_event_targets_detailed.push(SavedEventTarget {
-                    name: value_str.clone(),
-                    location: SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    },
-                    is_global: key == "save_global_event_target_as",
-                });
-            }
-
-            if key == "inline_script"
-                && let Value::Clause(children) = &leaf.value
-            {
-                for c in children {
-                    if let Child::Leaf(script_idx) = c {
-                        let script_leaf = &arena.leaves[*script_idx as usize];
-                        let script_key =
-                            table.get_string(script_leaf.key.normal).unwrap_or_default();
-                        if script_key == "script" {
-                            let script_name = leaf_value_string(&script_leaf.value, table);
-                            if !script_name.is_empty() {
-                                info.inline_scripts.insert(
-                                    script_name,
-                                    SourceLocation {
-                                        line: script_leaf.pos.start.line,
-                                        col: script_leaf.pos.start.col,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            if key == "effect" || key.ends_with("_effect") {
-                info.effect_blocks.push(SourceLocation {
-                    line: leaf.pos.start.line,
-                    col: leaf.pos.start.col,
-                });
-            }
-            if key == "trigger" || key.ends_with("_trigger") {
-                info.trigger_blocks.push(SourceLocation {
-                    line: leaf.pos.start.line,
-                    col: leaf.pos.start.col,
-                });
-            }
+            Self::record_saved_event_target(leaf, &key, &value_str, info);
+            Self::record_inline_script(leaf, arena, table, &key, info);
+            Self::record_effect_trigger_block(leaf, &key, info);
 
             // Owned consumer last so `key` moves in rather than clones. An
             // `@`-prefixed key never matches any of the borrow-only checks above,
             // so position is behavior-neutral.
-            if key.starts_with('@') {
-                info.defined_variables.insert(
-                    key,
-                    SourceLocation {
+            Self::record_defined_variable(leaf, key, info);
+        }
+    }
+
+    /// Record a clause leaf as a top-level key, and as a type definition when
+    /// its key names a known type.
+    fn record_top_level_key(
+        leaf: &cwtools_parser::ast::Leaf,
+        key: &str,
+        type_names: &HashMap<String, usize>,
+        info: &mut FileInfo,
+    ) {
+        if let Value::Clause(_) = &leaf.value {
+            info.top_level_keys.push((
+                key.to_string(),
+                SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                },
+            ));
+
+            if type_names.contains_key(key) {
+                info.type_definitions
+                    .entry(key.to_string())
+                    .or_default()
+                    .push(SourceLocation {
                         line: leaf.pos.start.line,
                         col: leaf.pos.start.col,
-                    },
-                );
+                    });
             }
+        }
+    }
+
+    /// Record a `<type>` value as a reference to that type.
+    fn record_type_reference(
+        leaf: &cwtools_parser::ast::Leaf,
+        value_str: &str,
+        info: &mut FileInfo,
+    ) {
+        if value_str.starts_with('<') && value_str.ends_with('>') {
+            let inner = &value_str[1..value_str.len() - 1];
+            info.type_references
+                .entry(inner.to_string())
+                .or_default()
+                .push(SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                });
+        }
+    }
+
+    /// Record saved event targets: the `event_target:` prefix form into the
+    /// name set, and the `save_(global_)event_target_as` form with full detail.
+    fn record_saved_event_target(
+        leaf: &cwtools_parser::ast::Leaf,
+        key: &str,
+        value_str: &str,
+        info: &mut FileInfo,
+    ) {
+        if key.starts_with("event_target:") {
+            let target = key.strip_prefix("event_target:").unwrap_or("");
+            if !target.is_empty() {
+                info.saved_event_targets.insert(target.to_string());
+            }
+        }
+
+        if (key == "save_event_target_as" || key == "save_global_event_target_as")
+            && !value_str.is_empty()
+        {
+            info.saved_event_targets_detailed.push(SavedEventTarget {
+                name: value_str.to_string(),
+                location: SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                },
+                is_global: key == "save_global_event_target_as",
+            });
+        }
+    }
+
+    /// Record the `script` referenced by an `inline_script` clause.
+    fn record_inline_script(
+        leaf: &cwtools_parser::ast::Leaf,
+        arena: &Arena,
+        table: &StringTable,
+        key: &str,
+        info: &mut FileInfo,
+    ) {
+        if key == "inline_script"
+            && let Value::Clause(children) = &leaf.value
+        {
+            for c in children {
+                if let Child::Leaf(script_idx) = c {
+                    let script_leaf = &arena.leaves[*script_idx as usize];
+                    let script_key = table.get_string(script_leaf.key.normal).unwrap_or_default();
+                    if script_key == "script" {
+                        let script_name = leaf_value_string(&script_leaf.value, table);
+                        if !script_name.is_empty() {
+                            info.inline_scripts.insert(
+                                script_name,
+                                SourceLocation {
+                                    line: script_leaf.pos.start.line,
+                                    col: script_leaf.pos.start.col,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record `effect`/`*_effect` and `trigger`/`*_trigger` block positions.
+    fn record_effect_trigger_block(
+        leaf: &cwtools_parser::ast::Leaf,
+        key: &str,
+        info: &mut FileInfo,
+    ) {
+        if key == "effect" || key.ends_with("_effect") {
+            info.effect_blocks.push(SourceLocation {
+                line: leaf.pos.start.line,
+                col: leaf.pos.start.col,
+            });
+        }
+        if key == "trigger" || key.ends_with("_trigger") {
+            info.trigger_blocks.push(SourceLocation {
+                line: leaf.pos.start.line,
+                col: leaf.pos.start.col,
+            });
+        }
+    }
+
+    /// Record an `@`-prefixed key as a defined variable.
+    fn record_defined_variable(leaf: &cwtools_parser::ast::Leaf, key: String, info: &mut FileInfo) {
+        if key.starts_with('@') {
+            info.defined_variables.insert(
+                key,
+                SourceLocation {
+                    line: leaf.pos.start.line,
+                    col: leaf.pos.start.col,
+                },
+            );
         }
     }
 }

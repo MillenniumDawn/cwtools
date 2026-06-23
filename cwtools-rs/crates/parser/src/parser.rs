@@ -153,7 +153,7 @@ impl<'a> Parser<'a> {
 
     fn parse_key(&mut self) -> Option<StringTokens> {
         if self.peek() == Some('"') {
-            // Quoted key — same escape rules as quoted values (F# SharedParsers.fs:183-186).
+            // Quoted key — same escape rules as quoted values.
             self.advance();
             // Build with surrounding quotes directly to avoid a format!("\"{}\"", s) copy.
             let mut s = String::from('"');
@@ -229,79 +229,7 @@ impl<'a> Parser<'a> {
         }
 
         if self.peek() == Some('"') {
-            let quote_start = self.pos();
-            self.advance();
-            // Build with surrounding quotes directly to avoid a format!("\"{}\"", s) copy.
-            let mut s = String::from('"');
-            let mut closed = false;
-            while let Some(c) = self.peek() {
-                if c == '\n' {
-                    // Never span lines in a quoted string. For a key-RHS string
-                    // (`a = “oops`) this is an unclosed quote; for a leafvalue
-                    // the interior-quote heuristic stays single-line already
-                    // (this matches the prior `leafvalue && c == '\n'` behavior
-                    // and extends it to key-RHS, fixing spec item 3.5).
-                    break;
-                }
-                if c == '\\' {
-                    self.advance(); // consume '\'
-                    match self.peek() {
-                        Some('"') => {
-                            // \" -> " (unescape)
-                            self.advance();
-                            s.push('"');
-                        }
-                        Some('\\') => {
-                            // \\ -> \ (unescape)
-                            self.advance();
-                            s.push('\\');
-                        }
-                        _ => {
-                            // Any other \X: keep the backslash and let the loop
-                            // pick up the next char naturally (matches F# behaviour).
-                            s.push('\\');
-                        }
-                    }
-                    continue;
-                } else if c == '"' {
-                    // A quoted string closes at the first unescaped `"`, for both a
-                    // key's RHS and a leafvalue (a namelist entry). This matches
-                    // Clausewitz, which splits a name at its first interior quote.
-                    //
-                    // A previous leafvalue-only heuristic tried to keep namelist
-                    // entries that embed quotes (`"Division "Castillejos""`) as one
-                    // value by treating a `"` followed by bare content as an interior
-                    // quote. But `"X" Y` is ambiguous — `"Granada" II` (one name with
-                    // an interior quote) is indistinguishable from `"Sunshine" Demon`
-                    // (two separate values) — and the heuristic kept consuming past
-                    // the close, swallowing the rest of the line including the
-                    // clause's `}` and corrupting everything after it. A real HOI4
-                    // common/names file (`callsigns = { "Sunshine" Demon }`) tripped
-                    // this and dropped the whole file with a bogus "unclosed clause"
-                    // (cwtools-vscode#42). Escaped quotes (`\"`) are handled above and
-                    // still join the string.
-                    self.advance();
-                    closed = true;
-                    break;
-                }
-                s.push(c);
-                self.advance();
-            }
-            if !leafvalue && !closed {
-                self.errors.push(ParseError::Pos(
-                    "".to_string(),
-                    quote_start.line,
-                    quote_start.col,
-                    format!(
-                        "unclosed quoted string starting at line {}",
-                        quote_start.line
-                    ),
-                ));
-            }
-            s.push('"');
-            self.skip_whitespace();
-            let tokens = self.table.intern(&s);
-            return Some(Value::QString(tokens));
+            return Some(self.parse_quoted_value(leafvalue));
         }
 
         // Peek ahead for numbers / booleans / rgb / hsv / metaprogramming
@@ -367,6 +295,104 @@ impl<'a> Parser<'a> {
                 self.restore(saved);
             }
         }
+        if let Some(b) = self.parse_bool_keyword(&peek7, peek7_len) {
+            return Some(b);
+        }
+        // F# metaprogramming prefix is "@\[" (at, backslash, open-bracket): the
+        // 3-char literal @\[.
+        if peek7_len >= 3 && peek7[0] == '@' && peek7[1] == '\\' && peek7[2] == '[' {
+            return self.parse_metaprogramming();
+        }
+
+        self.parse_number_or_string()
+    }
+
+    /// Parse a `"`-delimited string value (cursor is positioned at the opening
+    /// quote). `leafvalue` mirrors [`Parser::parse_value`]: it suppresses the
+    /// "unclosed quoted string" error for bare clause entries. A quoted string
+    /// closes strictly at the first unescaped `"` and never spans lines, in both
+    /// modes (see [`Parser::parse_value`] for why).
+    fn parse_quoted_value(&mut self, leafvalue: bool) -> Value {
+        let quote_start = self.pos();
+        self.advance();
+        // Build with surrounding quotes directly to avoid a format!("\"{}\"", s) copy.
+        let mut s = String::from('"');
+        let mut closed = false;
+        while let Some(c) = self.peek() {
+            if c == '\n' {
+                // Never span lines in a quoted string. For a key-RHS string
+                // (`a = “oops`) this is an unclosed quote; for a leafvalue
+                // the interior-quote heuristic stays single-line already
+                // (this matches the prior `leafvalue && c == '\n'` behavior
+                // and extends it to key-RHS, fixing spec item 3.5).
+                break;
+            }
+            if c == '\\' {
+                self.advance(); // consume '\'
+                match self.peek() {
+                    Some('"') => {
+                        // \" -> " (unescape)
+                        self.advance();
+                        s.push('"');
+                    }
+                    Some('\\') => {
+                        // \\ -> \ (unescape)
+                        self.advance();
+                        s.push('\\');
+                    }
+                    _ => {
+                        // Any other \X: keep the backslash and let the loop
+                        // pick up the next char naturally (matches F# behaviour).
+                        s.push('\\');
+                    }
+                }
+                continue;
+            } else if c == '"' {
+                // A quoted string closes at the first unescaped `"`, for both a
+                // key's RHS and a leafvalue (a namelist entry). This matches
+                // Clausewitz, which splits a name at its first interior quote.
+                //
+                // A previous leafvalue-only heuristic tried to keep namelist
+                // entries that embed quotes (`"Division "Castillejos""`) as one
+                // value by treating a `"` followed by bare content as an interior
+                // quote. But `"X" Y` is ambiguous — `"Granada" II` (one name with
+                // an interior quote) is indistinguishable from `"Sunshine" Demon`
+                // (two separate values) — and the heuristic kept consuming past
+                // the close, swallowing the rest of the line including the
+                // clause's `}` and corrupting everything after it. A real HOI4
+                // common/names file (`callsigns = { "Sunshine" Demon }`) tripped
+                // this and dropped the whole file with a bogus "unclosed clause"
+                // (cwtools-vscode#42). Escaped quotes (`\"`) are handled above and
+                // still join the string.
+                self.advance();
+                closed = true;
+                break;
+            }
+            s.push(c);
+            self.advance();
+        }
+        if !leafvalue && !closed {
+            self.errors.push(ParseError::Pos(
+                "".to_string(),
+                quote_start.line,
+                quote_start.col,
+                format!(
+                    "unclosed quoted string starting at line {}",
+                    quote_start.line
+                ),
+            ));
+        }
+        s.push('"');
+        self.skip_whitespace();
+        let tokens = self.table.intern(&s);
+        Value::QString(tokens)
+    }
+
+    /// Recognize a standalone `yes`/`no` boolean keyword from the pre-peeked
+    /// buffer. Returns `None` (leaving the cursor untouched) when the token is
+    /// not a bare `yes`/`no`, so the caller falls through to the number/string
+    /// paths.
+    fn parse_bool_keyword(&mut self, peek7: &[char; 7], peek7_len: usize) -> Option<Value> {
         if peek7_len >= 3 && peek7[0] == 'y' && peek7[1] == 'e' && peek7[2] == 's' {
             let saved = self.save();
             for _ in 0..3 {
@@ -401,12 +427,13 @@ impl<'a> Parser<'a> {
             // Not a standalone "no" — backtrack
             self.restore(saved);
         }
-        // F# metaprogramming prefix is "@\[" (at, backslash, open-bracket).
-        // SharedParsers.fs:244 uses pstring "@\\[" which is the 3-char literal @\[.
-        if peek7_len >= 3 && peek7[0] == '@' && peek7[1] == '\\' && peek7[2] == '[' {
-            return self.parse_metaprogramming();
-        }
+        None
+    }
 
+    /// Parse a numeric literal (int then float) and fall back to a plain string
+    /// when the token isn't a clean number. Returns `None` only when no value
+    /// chars are available (empty token).
+    fn parse_number_or_string(&mut self) -> Option<Value> {
         // Try integer then float.
         //
         // F# uses `attempt valueInt` then `attempt valueFloat` with backtracking.
@@ -626,7 +653,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_metaprogramming(&mut self) -> Option<Value> {
-        // F# prefix is "@\[" (at, backslash, open-bracket) — SharedParsers.fs:244.
+        // F# prefix is "@\[" (at, backslash, open-bracket).
         // metaprogrammingCharSnippet accepts everything except ']' and '\'.
         // The closing char is ']' (consumed by `ch ']'`).
         // Result token includes the prefix "@\[" and the closing ']'.
