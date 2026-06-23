@@ -21,6 +21,26 @@ fn build_alias_index(snapshot: &[(String, NewRule)]) -> AliasIndex<'_> {
     map
 }
 
+/// Apply `f` to every root rule in a RuleSet, in the order each pass relies on:
+/// `root_rules` (Type/Alias/SingleAlias arms, each carrying a `NewRule`), then
+/// `aliases`, then `single_aliases`. Centralises the 3-way traversal shared by
+/// the marker/colour/single-alias passes so they can't drift apart.
+fn for_each_root_rule_mut(ruleset: &mut RuleSet, mut f: impl FnMut(&mut NewRule)) {
+    for root in ruleset.root_rules.iter_mut() {
+        match root {
+            RootRule::TypeRule(_, rule) => f(rule),
+            RootRule::AliasRule(_, rule) => f(rule),
+            RootRule::SingleAliasRule(_, rule) => f(rule),
+        }
+    }
+    for (_, rule) in ruleset.aliases.iter_mut() {
+        f(rule);
+    }
+    for (_, rule) in ruleset.single_aliases.iter_mut() {
+        f(rule);
+    }
+}
+
 /// Run all four post-processing passes over `ruleset` in the same order as F#.
 #[tracing::instrument(skip_all)]
 pub fn post_process(ruleset: &mut RuleSet) {
@@ -73,19 +93,9 @@ fn replace_single_aliases(ruleset: &mut RuleSet) {
     // mutates `single_aliases` while reading the map, so snapshot once and index it.
     let snapshot: Vec<(String, NewRule)> = ruleset.single_aliases.clone();
     let map = build_alias_index(&snapshot);
-    for root in ruleset.root_rules.iter_mut() {
-        match root {
-            RootRule::TypeRule(_, rule) => inline_single_alias_rule(rule, &map),
-            RootRule::AliasRule(_, rule) => inline_single_alias_rule(rule, &map),
-            RootRule::SingleAliasRule(_, rule) => inline_single_alias_rule(rule, &map),
-        };
-    }
-    for (_, rule) in ruleset.aliases.iter_mut() {
+    for_each_root_rule_mut(ruleset, |rule| {
         inline_single_alias_rule(rule, &map);
-    }
-    for (_, rule) in ruleset.single_aliases.iter_mut() {
-        inline_single_alias_rule(rule, &map);
-    }
+    });
 }
 
 /// Recursively walk `rule` and replace any `SingleAliasField` references with
@@ -251,19 +261,7 @@ fn extract_leaf_left(rt: &RuleType) -> NewField {
 /// syntax handled at conversion time in `rules_converter::build_colour_rules`
 /// (different ranges by design, not a duplicate).
 fn replace_colour_field(ruleset: &mut RuleSet) {
-    for root in ruleset.root_rules.iter_mut() {
-        match root {
-            RootRule::TypeRule(_, rule) => expand_colour_in_rule(rule),
-            RootRule::AliasRule(_, rule) => expand_colour_in_rule(rule),
-            RootRule::SingleAliasRule(_, rule) => expand_colour_in_rule(rule),
-        }
-    }
-    for (_, rule) in ruleset.aliases.iter_mut() {
-        expand_colour_in_rule(rule);
-    }
-    for (_, rule) in ruleset.single_aliases.iter_mut() {
-        expand_colour_in_rule(rule);
-    }
+    for_each_root_rule_mut(ruleset, expand_colour_in_rule);
 }
 
 fn expand_colour_in_rule(rule: &mut NewRule) {
@@ -444,19 +442,7 @@ fn extract_leaf_right(rt: &RuleType) -> NewField {
 /// `ValueScopeField { is_int, min, max }` everywhere it appears.
 /// This is the base rewrite without the optional formula/range expansion.
 fn replace_value_marker_fields(ruleset: &mut RuleSet) {
-    for root in ruleset.root_rules.iter_mut() {
-        match root {
-            RootRule::TypeRule(_, rule) => rewrite_vsm_in_rule(rule),
-            RootRule::AliasRule(_, rule) => rewrite_vsm_in_rule(rule),
-            RootRule::SingleAliasRule(_, rule) => rewrite_vsm_in_rule(rule),
-        }
-    }
-    for (_, rule) in ruleset.aliases.iter_mut() {
-        rewrite_vsm_in_rule(rule);
-    }
-    for (_, rule) in ruleset.single_aliases.iter_mut() {
-        rewrite_vsm_in_rule(rule);
-    }
+    for_each_root_rule_mut(ruleset, rewrite_vsm_in_rule);
 }
 
 fn rewrite_vsm_in_rule(rule: &mut NewRule) {
@@ -505,19 +491,7 @@ fn rewrite_vsm_field(field: &mut NewField) {
 /// Replace `LeafRule(field, IgnoreMarkerField)` with
 /// `NodeRule(IgnoreField(Box::new(field)), [])`.
 fn replace_ignore_marker_fields(ruleset: &mut RuleSet) {
-    for root in ruleset.root_rules.iter_mut() {
-        match root {
-            RootRule::TypeRule(_, rule) => expand_ignore_in_rule(rule),
-            RootRule::AliasRule(_, rule) => expand_ignore_in_rule(rule),
-            RootRule::SingleAliasRule(_, rule) => expand_ignore_in_rule(rule),
-        }
-    }
-    for (_, rule) in ruleset.aliases.iter_mut() {
-        expand_ignore_in_rule(rule);
-    }
-    for (_, rule) in ruleset.single_aliases.iter_mut() {
-        expand_ignore_in_rule(rule);
-    }
+    for_each_root_rule_mut(ruleset, expand_ignore_in_rule);
 }
 
 fn expand_ignore_in_rule(rule: &mut NewRule) {

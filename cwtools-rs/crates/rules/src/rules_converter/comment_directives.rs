@@ -22,30 +22,36 @@ pub(crate) fn extract_description_from_comments(comments: &[String]) -> Option<S
     }
 }
 
+/// Iterate the bodies of exactly-`##` directive lines, newest-first.
+///
+/// Yields each comment line that begins with exactly `##` (not `#` or `###`),
+/// with the `##` prefix stripped and leading whitespace trimmed. Iterating in
+/// reverse gives newest-match-wins to the first caller that returns.
+fn directive_bodies(comments: &[String]) -> impl Iterator<Item = &str> {
+    comments.iter().rev().filter_map(|c| {
+        let rest = c.strip_prefix("##")?;
+        // Exclude `###` lines — those are documentation.
+        if rest.starts_with('#') {
+            return None;
+        }
+        Some(rest.trim_start())
+    })
+}
+
 /// True when a bare `## key` or `## key = ...` directive appears in exactly-`##` comment lines.
 ///
 /// Used for boolean flags (`## required`, `## optional`, `## primary`) that may
 /// appear without an `= value` suffix.
 pub(crate) fn has_directive(comments: &[String], key: &str) -> bool {
-    for c in comments.iter().rev() {
-        let Some(rest) = c.strip_prefix("##") else {
-            continue;
-        };
-        if rest.starts_with('#') {
-            continue;
-        }
-        let rest = rest.trim_start();
+    directive_bodies(comments).any(|rest| {
         // Matches bare `## key` or `## key = ...` or `## key_something` — use
         // word-boundary logic: key must be followed by end-of-string, '=', or whitespace.
-        if let Some(after) = rest.strip_prefix(key)
-            && (after.is_empty()
+        rest.strip_prefix(key).is_some_and(|after| {
+            after.is_empty()
                 || after.starts_with('=')
-                || after.starts_with(|c: char| c.is_whitespace()))
-        {
-            return true;
-        }
-    }
-    false
+                || after.starts_with(|c: char| c.is_whitespace())
+        })
+    })
 }
 
 /// Return the value of a `key = value` directive from exactly-`##` comment lines.
@@ -57,25 +63,11 @@ pub(crate) fn has_directive(comments: &[String], key: &str) -> bool {
 ///
 /// Returns the RHS string (trimmed) when found, `None` otherwise.
 pub(crate) fn find_directive<'a>(comments: &'a [String], key: &str) -> Option<&'a str> {
-    for c in comments.iter().rev() {
-        let Some(rest) = c.strip_prefix("##") else {
-            continue;
-        };
-        // Exclude `###` lines — those are documentation.
-        if rest.starts_with('#') {
-            continue;
-        }
-        let rest = rest.trim_start();
-        let Some(after_key) = rest.strip_prefix(key) else {
-            continue;
-        };
-        let after_key = after_key.trim_start();
-        let Some(rhs) = after_key.strip_prefix('=') else {
-            continue;
-        };
-        return Some(rhs.trim());
-    }
-    None
+    directive_bodies(comments).find_map(|rest| {
+        let after_key = rest.strip_prefix(key)?.trim_start();
+        let rhs = after_key.strip_prefix('=')?;
+        Some(rhs.trim())
+    })
 }
 
 /// Collect every `## key = value` directive into a map in a single pass.

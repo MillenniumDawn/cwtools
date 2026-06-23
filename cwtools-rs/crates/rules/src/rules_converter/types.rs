@@ -251,6 +251,18 @@ fn parse_skip_root_key_leaf(
     }
 }
 
+/// Split a brace-wrapped list `{ a b c }` into its whitespace-separated items,
+/// dropping empties. The braces must already be confirmed by the caller via
+/// `rhs.starts_with('{') && rhs.ends_with('}')`; only the inner text is split.
+fn split_brace_list(rhs: &str) -> Vec<String> {
+    let inner = rhs.trim_matches(|c| c == '{' || c == '}');
+    inner
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 pub(crate) fn parse_type_key_filter_from_comments(
     comments: &[String],
 ) -> Option<(Vec<String>, bool)> {
@@ -275,12 +287,7 @@ pub(crate) fn parse_type_key_filter_from_comments(
             continue;
         };
         let values = if rhs.starts_with('{') && rhs.ends_with('}') {
-            let inner = rhs.trim_matches(|c| c == '{' || c == '}');
-            inner
-                .split_whitespace()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
+            split_brace_list(rhs)
         } else {
             vec![rhs.to_string()]
         };
@@ -292,17 +299,39 @@ pub(crate) fn parse_type_key_filter_from_comments(
 fn parse_graph_related_types_from_comments(comments: &[String]) -> Vec<String> {
     if let Some(rhs) = find_directive(comments, "graph_related_types") {
         if rhs.starts_with('{') && rhs.ends_with('}') {
-            let inner = rhs.trim_matches(|c| c == '{' || c == '}');
-            return inner
-                .split_whitespace()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect();
+            return split_brace_list(rhs);
         } else if !rhs.is_empty() {
             return vec![rhs.to_string()];
         }
     }
     Vec::new()
+}
+
+/// Walk the leaf children of a localisation/modifier sub-block, invoking `f`
+/// with `(child_comments, key, value)` for each `Child::Leaf` whose key is not a
+/// `subtype[...]` sub-block (those carry Leaf+Clause children handled elsewhere).
+///
+/// Shared skeleton for `parse_localisation_block` / `parse_modifiers_block`,
+/// which differ only in the directives they read and the struct they build.
+fn for_each_block_leaf(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    mut f: impl FnMut(&[String], String, String),
+) {
+    let precomputed = precompute_comments(children, ast, table);
+    for (cidx, child) in children.iter().enumerate() {
+        let child_comments = &precomputed[cidx];
+        if let Child::Leaf(lidx) = child {
+            let l = &ast.arena.leaves[*lidx as usize];
+            let key = table.get_string(l.key.normal).unwrap_or_default();
+            if key.starts_with("subtype[") {
+                continue;
+            }
+            let value = value_to_string(&l.value, table);
+            f(child_comments, key, value);
+        }
+    }
 }
 
 pub(crate) fn parse_localisation_block(
@@ -311,51 +340,39 @@ pub(crate) fn parse_localisation_block(
     table: &StringTable,
 ) -> Vec<TypeLocalisation> {
     let mut out = Vec::new();
-    let precomputed = precompute_comments(children, ast, table);
-    for (cidx, child) in children.iter().enumerate() {
-        let child_comments = &precomputed[cidx];
-        if let Child::Leaf(lidx) = child {
-            let l = &ast.arena.leaves[*lidx as usize];
-            let key = table.get_string(l.key.normal).unwrap_or_default();
-            // Skip subtype[] sub-blocks (Leaf+Clause children, handled by
-            // parse_subtype_localisation)
-            if key.starts_with("subtype[") {
-                continue;
-            }
-            let value = value_to_string(&l.value, table);
-            let required = has_directive(child_comments, "required");
-            let optional = has_directive(child_comments, "optional");
-            let primary = has_directive(child_comments, "primary");
-            let replace_scopes = parse_replace_scopes_from_comments(child_comments);
+    for_each_block_leaf(children, ast, table, |child_comments, key, value| {
+        let required = has_directive(child_comments, "required");
+        let optional = has_directive(child_comments, "optional");
+        let primary = has_directive(child_comments, "primary");
+        let replace_scopes = parse_replace_scopes_from_comments(child_comments);
 
-            let loc = if let Some(dollar_idx) = value.find('$') {
-                let prefix = value[..dollar_idx].to_string();
-                let suffix = value[dollar_idx + 1..].to_string();
-                TypeLocalisation {
-                    name: key,
-                    prefix,
-                    suffix,
-                    required,
-                    optional,
-                    explicit_field: None,
-                    replace_scopes,
-                    primary,
-                }
-            } else {
-                TypeLocalisation {
-                    name: key,
-                    prefix: String::new(),
-                    suffix: String::new(),
-                    required,
-                    optional,
-                    explicit_field: Some(value),
-                    replace_scopes,
-                    primary,
-                }
-            };
-            out.push(loc);
-        }
-    }
+        let loc = if let Some(dollar_idx) = value.find('$') {
+            let prefix = value[..dollar_idx].to_string();
+            let suffix = value[dollar_idx + 1..].to_string();
+            TypeLocalisation {
+                name: key,
+                prefix,
+                suffix,
+                required,
+                optional,
+                explicit_field: None,
+                replace_scopes,
+                primary,
+            }
+        } else {
+            TypeLocalisation {
+                name: key,
+                prefix: String::new(),
+                suffix: String::new(),
+                required,
+                optional,
+                explicit_field: Some(value),
+                replace_scopes,
+                primary,
+            }
+        };
+        out.push(loc);
+    });
     out
 }
 
@@ -365,45 +382,35 @@ pub(crate) fn parse_modifiers_block(
     table: &StringTable,
 ) -> Vec<TypeModifier> {
     let mut out = Vec::new();
-    let precomputed = precompute_comments(children, ast, table);
-    for (cidx, child) in children.iter().enumerate() {
-        let child_comments = &precomputed[cidx];
-        if let Child::Leaf(lidx) = child {
-            let l = &ast.arena.leaves[*lidx as usize];
-            let key = table.get_string(l.key.normal).unwrap_or_default();
-            if key.starts_with("subtype[") {
-                continue;
-            }
-            let value = value_to_string(&l.value, table);
-            let explicit = has_directive(child_comments, "explicit");
-            // Documentation is the first exactly-### line (not ##, which is directives).
-            let documentation = child_comments
-                .iter()
-                .find(|s| s.starts_with("###"))
-                .map(|s| s.trim_start_matches('#').trim().to_string());
+    for_each_block_leaf(children, ast, table, |child_comments, key, value| {
+        let explicit = has_directive(child_comments, "explicit");
+        // Documentation is the first exactly-### line (not ##, which is directives).
+        let documentation = child_comments
+            .iter()
+            .find(|s| s.starts_with("###"))
+            .map(|s| s.trim_start_matches('#').trim().to_string());
 
-            let modifier = if let Some(dollar_idx) = value.find('$') {
-                let prefix = value[..dollar_idx].to_string();
-                let suffix = value[dollar_idx + 1..].to_string();
-                TypeModifier {
-                    prefix,
-                    suffix,
-                    category: key,
-                    documentation,
-                    explicit,
-                }
-            } else {
-                TypeModifier {
-                    prefix: String::new(),
-                    suffix: String::new(),
-                    category: key,
-                    documentation,
-                    explicit,
-                }
-            };
-            out.push(modifier);
-        }
-    }
+        let modifier = if let Some(dollar_idx) = value.find('$') {
+            let prefix = value[..dollar_idx].to_string();
+            let suffix = value[dollar_idx + 1..].to_string();
+            TypeModifier {
+                prefix,
+                suffix,
+                category: key,
+                documentation,
+                explicit,
+            }
+        } else {
+            TypeModifier {
+                prefix: String::new(),
+                suffix: String::new(),
+                category: key,
+                documentation,
+                explicit,
+            }
+        };
+        out.push(modifier);
+    });
     out
 }
 
