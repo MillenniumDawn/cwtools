@@ -115,6 +115,11 @@ pub enum FileKind {
     Resource,
 }
 
+/// File extensions treated as Paradox script (the set discovered and validated).
+/// The single source of truth for "what's a script file" — workspace discovery
+/// in the LSP and the CLI driver both filter by this list.
+pub const SCRIPT_EXTENSIONS: &[&str] = &["txt", "gui", "gfx", "sfx", "asset", "map"];
+
 /// Classify a file by its extension, matching F# FileManager.fs:215-273.
 pub fn classify_extension(path: &Path) -> FileKind {
     let ext = path
@@ -122,10 +127,12 @@ pub fn classify_extension(path: &Path) -> FileKind {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    match ext.as_str() {
-        "txt" | "gui" | "gfx" | "asset" | "sfx" | "map" => FileKind::Script,
-        "yml" | "yaml" | "csv" => FileKind::Localisation,
-        _ => FileKind::Resource,
+    if SCRIPT_EXTENSIONS.contains(&ext.as_str()) {
+        FileKind::Script
+    } else if matches!(ext.as_str(), "yml" | "yaml" | "csv") {
+        FileKind::Localisation
+    } else {
+        FileKind::Resource
     }
 }
 
@@ -207,14 +214,7 @@ impl Default for FileManagerConfig {
                 "sound".into(),
                 "music".into(),
             ],
-            file_patterns: vec![
-                "*.txt".into(),
-                "*.gui".into(),
-                "*.gfx".into(),
-                "*.sfx".into(),
-                "*.asset".into(),
-                "*.map".into(),
-            ],
+            file_patterns: SCRIPT_EXTENSIONS.iter().map(|e| format!("*.{e}")).collect(),
             exclude_patterns: vec![
                 // Free-form text/markdown files that aren't Paradox script —
                 // matching `*.txt` would otherwise send them through the full

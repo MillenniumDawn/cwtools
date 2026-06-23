@@ -11,11 +11,29 @@ pub mod vanilla_cache;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-/// Strip one layer of surrounding double-quotes, if present.
-fn unquote(s: &str) -> &str {
+/// Strip one layer of surrounding double-quotes, if present. A lone `"` (no
+/// matching pair) is left untouched, since `strip_suffix` finds no closing
+/// quote in the already-stripped remainder.
+pub(crate) fn unquote(s: &str) -> &str {
     s.strip_prefix('"')
         .and_then(|t| t.strip_suffix('"'))
         .unwrap_or(s)
+}
+
+/// Decrement a refcount entry in `map`, removing it when the count reaches 0.
+/// Does nothing if the key is absent. Shared by every refcounted name/value
+/// index so re-indexing a file drops only its last contribution.
+pub(crate) fn dec_ref<K, Q>(map: &mut HashMap<K, usize>, key: &Q)
+where
+    K: std::hash::Hash + Eq + std::borrow::Borrow<Q>,
+    Q: std::hash::Hash + Eq + ?Sized,
+{
+    if let Some(count) = map.get_mut(key) {
+        *count -= 1;
+        if *count == 0 {
+            map.remove(key);
+        }
+    }
 }
 
 /// Resolve a `StringId` to its owned text, returning `""` when interning lost
@@ -272,12 +290,7 @@ impl VarIndex {
     /// variables instead of leaking the old set.
     pub fn remove_name(&mut self, raw: &str) {
         let n = Self::normalize(raw);
-        if let Some(count) = self.names.get_mut(&n) {
-            *count -= 1;
-            if *count == 0 {
-                self.names.remove(&n);
-            }
-        }
+        dec_ref(&mut self.names, n.as_str());
     }
 
     /// Whether a raw reference resolves to a known defined variable.
@@ -493,19 +506,11 @@ impl TypeIndex {
                 let keep = uri.as_ref() != file_uri;
                 if !keep {
                     let lower = inst.name.to_ascii_lowercase();
-                    if !subtype_key && let Some(count) = self.name_counts.get_mut(&lower) {
-                        *count -= 1;
-                        if *count == 0 {
-                            self.name_counts.remove(&lower);
-                        }
+                    if !subtype_key {
+                        dec_ref(&mut self.name_counts, lower.as_str());
                     }
-                    if let Some(set) = self.instance_sets.get_mut(type_name)
-                        && let Some(count) = set.get_mut(&lower)
-                    {
-                        *count -= 1;
-                        if *count == 0 {
-                            set.remove(&lower);
-                        }
+                    if let Some(set) = self.instance_sets.get_mut(type_name) {
+                        dec_ref(set, lower.as_str());
                     }
                 }
                 keep

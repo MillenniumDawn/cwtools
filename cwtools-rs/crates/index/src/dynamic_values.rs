@@ -11,6 +11,7 @@
 //! behavior for absent/large enums and uncollected sets, so collecting these
 //! changes no diagnostics.
 
+use crate::{dec_ref, unquote};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -71,12 +72,7 @@ impl NamedValueIndex {
         };
         for (name, v) in flat {
             if let Some(vals) = self.by_name.get_mut(name.as_ref()) {
-                if let Some(c) = vals.get_mut(v.as_ref()) {
-                    *c -= 1;
-                    if *c == 0 {
-                        vals.remove(v.as_ref());
-                    }
-                }
+                dec_ref(vals, v.as_ref());
                 if vals.is_empty() {
                     self.by_name.remove(name.as_ref());
                 }
@@ -148,19 +144,11 @@ pub fn collect_complex_enum_values(
     out
 }
 
-fn unquote(s: String) -> String {
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s
-    }
-}
-
 /// Push a value-set member, stripping an `@datestamp` suffix
 /// (`my_flag@1936.1.1` sets `my_flag`). Empty bases are skipped.
 fn push_member(out: &mut HashMap<String, Vec<String>>, ns: String, raw: String) {
-    let v = unquote(raw);
-    let base = v.split('@').next().unwrap_or(&v);
+    let v = unquote(&raw);
+    let base = v.split('@').next().unwrap_or(v);
     if !base.is_empty() {
         out.entry(ns).or_default().push(base.to_string());
     }
@@ -168,7 +156,7 @@ fn push_member(out: &mut HashMap<String, Vec<String>>, ns: String, raw: String) 
 
 fn push_unquoted_key(out: &mut Vec<String>, table: &StringTable, id: StringId) {
     if let Some(k) = table.get_string(id) {
-        out.push(unquote(k));
+        out.push(unquote(&k).to_string());
     }
 }
 
@@ -230,7 +218,7 @@ fn walk_name_tree(
                             && let Value::String(t) | Value::QString(t) = &leaf.value
                             && let Some(v) = table.get_string(t.normal)
                         {
-                            out.push(unquote(v));
+                            out.push(unquote(&v).to_string());
                         }
                     } else if key == "enum_name" {
                         // `enum_name = scalar`: each scalar leaf's KEY.
@@ -247,7 +235,7 @@ fn walk_name_tree(
                     if let Value::String(t) | Value::QString(t) = &lv.value
                         && let Some(v) = table.get_string(t.normal)
                     {
-                        out.push(unquote(v));
+                        out.push(unquote(&v).to_string());
                     }
                 }
             }

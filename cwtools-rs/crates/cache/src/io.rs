@@ -24,7 +24,10 @@ pub enum CacheError {
     Compression(#[source] std::io::Error),
 }
 
-const ZSTD_LEVEL: i32 = 3;
+/// zstd compression level for cache bodies. Shared by the `.cwb` parse cache
+/// (here) and the vanilla index cache (`cwtools_index::vanilla_cache`) so both
+/// caches compress identically.
+pub const ZSTD_LEVEL: i32 = 3;
 
 /// Magic bytes at the start of every `.cwb` file. Lets `deserialize_from_file`
 /// reject files written by an incompatible layout before rkyv gets confused.

@@ -167,7 +167,7 @@ impl Backend {
         drop(rules_guard);
 
         let info = self.state.info_service.read();
-        for var in &info.all_variables {
+        for var in info.variable_counts.keys() {
             if items.len() >= FALLBACK_CAP {
                 break;
             }
@@ -178,7 +178,7 @@ impl Backend {
                 ..Default::default()
             });
         }
-        for et in &info.all_event_targets {
+        for et in info.event_target_counts.keys() {
             if items.len() >= FALLBACK_CAP {
                 break;
             }
@@ -755,8 +755,8 @@ pub(crate) fn value_completions(
             // set; reads (`value[x]`) want exactly these. Same source either way.
             NewField::VariableGetField(ns) | NewField::VariableSetField(ns) => {
                 let source: Vec<String> = match ns.as_str() {
-                    "event_target" => info.all_event_targets.iter().cloned().collect(),
-                    "variable" => info.all_variables.iter().cloned().collect(),
+                    "event_target" => info.event_target_counts.keys().cloned().collect(),
+                    "variable" => info.variable_counts.keys().cloned().collect(),
                     // Flags/tokens/…: config-declared values plus the members
                     // collected from mod+vanilla effects (set_country_flag etc.).
                     other => {
@@ -781,7 +781,7 @@ pub(crate) fn value_completions(
                 }
             }
             NewField::VariableField { .. } => {
-                for v in &info.all_variables {
+                for v in info.variable_counts.keys() {
                     push(
                         v.clone(),
                         CompletionItemKind::CONSTANT,

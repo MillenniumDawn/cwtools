@@ -157,15 +157,13 @@ pub struct InfoService {
     pub all_type_defs: HashMap<String, Vec<(String, SourceLocation)>>,
     /// Cross-file type-instance index.
     pub type_index: TypeIndex,
-    pub all_event_targets: HashSet<String>,
-    pub all_variables: HashSet<String>,
-    pub all_inline_scripts: HashSet<String>,
-    /// Refcount maps so `clear_file` can remove a symbol in O(1) instead of
-    /// scanning all remaining files. Each map counts how many files define the
-    /// symbol; the symbol is removed from the public set when its count hits 0.
-    event_target_counts: HashMap<String, usize>,
-    variable_counts: HashMap<String, usize>,
-    inline_script_counts: HashMap<String, usize>,
+    /// Refcount maps over the cross-file symbols. Each map counts how many files
+    /// define the symbol; a key exists iff at least one file still defines it, so
+    /// the keys double as the membership set (use [`HashMap::contains_key`] /
+    /// [`HashMap::keys`]). `clear_file` removes the key when its count hits 0.
+    pub event_target_counts: HashMap<String, usize>,
+    pub variable_counts: HashMap<String, usize>,
+    pub inline_script_counts: HashMap<String, usize>,
     /// Effect/trigger names that DEFINE a `value_set[variable]` (e.g.
     /// `set_variable`). Cached so per-file indexing can scan `set_variable`
     /// blocks for defined names (and their values) without recomputing it from
@@ -186,9 +184,6 @@ impl InfoService {
             files: HashMap::new(),
             all_type_defs: HashMap::new(),
             type_index: TypeIndex::new(),
-            all_event_targets: HashSet::new(),
-            all_variables: HashSet::new(),
-            all_inline_scripts: HashSet::new(),
             event_target_counts: HashMap::new(),
             variable_counts: HashMap::new(),
             inline_script_counts: HashMap::new(),
@@ -212,8 +207,8 @@ impl InfoService {
             self.files.len(),
             cross_file,
             self.type_index.map.len(),
-            self.all_variables.len(),
-            self.all_event_targets.len(),
+            self.variable_counts.len(),
+            self.event_target_counts.len(),
             self.all_type_defs.len(),
         )
     }
@@ -338,12 +333,10 @@ impl InfoService {
         }
         for et in &info.saved_event_targets {
             *self.event_target_counts.entry(et.clone()).or_insert(0) += 1;
-            self.all_event_targets.insert(et.clone());
         }
         for (ns, vars) in &info.defined_variables_ns {
             for v in vars {
                 *self.variable_counts.entry(v.name.clone()).or_insert(0) += 1;
-                self.all_variables.insert(v.name.clone());
                 // Feed value_set[variable] names into the project-wide var index
                 // that CW246 / VariableGetField consult. @-vars are excluded:
                 // reads bypass them, and they'd pollute the unset-variable check.
@@ -354,7 +347,6 @@ impl InfoService {
         }
         for script in info.inline_scripts.keys() {
             *self.inline_script_counts.entry(script.clone()).or_insert(0) += 1;
-            self.all_inline_scripts.insert(script.clone());
         }
 
         self.files.insert(uri.to_string(), info);
@@ -428,7 +420,6 @@ impl InfoService {
                     *count -= 1;
                     if *count == 0 {
                         self.event_target_counts.remove(et);
-                        self.all_event_targets.remove(et);
                     }
                 }
             }
@@ -439,7 +430,6 @@ impl InfoService {
                         *count -= 1;
                         if *count == 0 {
                             self.variable_counts.remove(&v.name);
-                            self.all_variables.remove(&v.name);
                         }
                     }
                     if ns != "@" {
@@ -453,7 +443,6 @@ impl InfoService {
                     *count -= 1;
                     if *count == 0 {
                         self.inline_script_counts.remove(script);
-                        self.all_inline_scripts.remove(script);
                     }
                 }
             }
@@ -1187,12 +1176,12 @@ alias[effect:set_temp_variable] = {
         assert_eq!(shorthand.value.as_deref(), Some("5"));
     }
 
-    // ── Item 2.7 — value_set var removed from all_variables on clear_file ────
+    // ── Item 2.7 — value_set var removed from variable_counts on clear_file ──
 
     #[test]
     fn value_set_var_cleared_on_file_clear() {
         // Manually inject a non-@-var into a file's defined_variables and confirm
-        // that clear_file removes it from all_variables (the 2.7 inversion fix).
+        // that clear_file removes it from variable_counts (the 2.7 inversion fix).
         let mut svc = InfoService::new();
         let uri = "file://test.txt";
 
@@ -1213,17 +1202,17 @@ alias[effect:set_temp_variable] = {
             }],
         );
         svc.files.insert(uri.to_string(), file_info);
-        svc.all_variables.insert("my_var".to_string());
-        // Mirror the refcount that index_file_with_path would have set.
+        // Mirror the refcount that index_file_with_path would have set; the key's
+        // presence in variable_counts is the membership signal.
         svc.variable_counts.insert("my_var".to_string(), 1);
 
         // Before clear: variable must be present.
-        assert!(svc.all_variables.contains("my_var"));
+        assert!(svc.variable_counts.contains_key("my_var"));
 
         // Clear the file: variable must be removed.
         svc.clear_file(uri);
         assert!(
-            !svc.all_variables.contains("my_var"),
+            !svc.variable_counts.contains_key("my_var"),
             "my_var should be gone after clear_file"
         );
     }

@@ -214,94 +214,11 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     //      key: "desc text"          (without version)
     //      key: "desc text"#comment  (comment is part of desc)
     for (i, line) in lines {
-        let trimmed = line.trim_start();
-
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        match parse_entry(line, i, &stream_name) {
+            Ok(Some(entry)) => entries.push(entry),
+            Ok(None) => continue, // blank / comment line
+            Err(pe) => parse_errors.push(pe),
         }
-
-        let Some(colon_pos) = trimmed.find(':') else {
-            // Malformed line: no colon separator. Record a CW001 parse error and
-            // continue recovering (lenient parser; mirrors F# `Failure` path).
-            parse_errors.push(LocParseError {
-                line: i + 1,
-                message: format!("unexpected content (no ':' separator): {:?}", trimmed),
-            });
-            continue;
-        };
-        let key = trimmed[..colon_pos].trim_end();
-
-        // remainder after the colon
-        let mut remainder = &trimmed[colon_pos + 1..];
-
-        // optional version number (digits right after colon with no space)
-        let version =
-            if !remainder.is_empty() && remainder.starts_with(|c: char| c.is_ascii_digit()) {
-                // Count leading ASCII-digit bytes (== char count; digits are ASCII)
-                // and parse the slice in place, no intermediate String.
-                let digit_len = remainder.bytes().take_while(|b| b.is_ascii_digit()).count();
-                let v = remainder[..digit_len].parse::<u32>().ok();
-                remainder = &remainder[digit_len..];
-                v
-            } else {
-                None
-            };
-
-        // strip one leading space (the convention after `:`)
-        // but keep everything else including # comments,
-        // because in F# `#` is a valid `isLocValueChar`.
-        let desc = remainder.strip_prefix(' ').unwrap_or(remainder);
-
-        let position = Position::new(Arc::clone(&stream_name), i + 1, 1); // 1-based line numbers
-
-        // Compute the column offset of `desc`'s start within the full line.
-        // The key + colon + version + optional space are all ASCII, so byte
-        // offset == char offset for that prefix.
-        let leading_ws = line.len() - trimmed.len();
-        // desc starts at (trimmed.len() - desc.len()) bytes into trimmed.
-        let desc_col_offset = leading_ws + (trimmed.len() - desc.len());
-
-        // Check for chars outside the allowed loc-value Unicode ranges.
-        // Mirrors F# parser `desc` production which stops at the first
-        // char where `isLocValueChar` returns false, then records the
-        // position of that char as `errorRange`.
-        let error_range = find_invalid_loc_char(desc).map(|byte_off| {
-            // Column within desc (0-based) + prefix offset gives the line column.
-            let col = desc_col_offset + desc[..byte_off].chars().count() + 1;
-            Position::new(Arc::clone(&stream_name), i + 1, col)
-        });
-
-        // Lazy-parse loc elements (refs, commands, etc.). One pass over the
-        // elements extends all three collections instead of three filter_map
-        // passes. The JominiCommand clone stays — it bridges the loc_string and
-        // commands type boundary, which is unified separately.
-        let elements = parse_loc_elements(desc);
-        let mut refs: Vec<String> = Vec::new();
-        let mut commands: Vec<String> = Vec::new();
-        let mut jomini_commands: Vec<Vec<crate::loc_string::JominiCommand>> = Vec::new();
-        for e in &elements {
-            match e {
-                crate::loc_string::LocElement::Ref(s) => refs.push(s.to_string()),
-                crate::loc_string::LocElement::Command(s) => commands.push(s.to_string()),
-                // Store the parsed chain directly — one JominiCommand type now, so
-                // nested command params are preserved rather than flattened away.
-                crate::loc_string::LocElement::JominiCommand(cmds) => {
-                    jomini_commands.push(cmds.clone())
-                }
-                crate::loc_string::LocElement::Chars(_) => {}
-            }
-        }
-
-        entries.push(LocEntry {
-            key: key.to_string(),
-            value: version,
-            desc: desc.to_string(),
-            position,
-            error_range, // set by isLocValueChar check above
-            refs,
-            commands,
-            jomini_commands,
-        });
     }
 
     // Collect file-level diagnostics: header/filename lang validation
@@ -345,6 +262,109 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         // raw bytes are available.
         encoding: None,
     })
+}
+
+/// Parse one entry line into a `LocEntry`.
+///
+/// `line_idx` is the 0-based stream index (so the 1-based source line is
+/// `line_idx + 1`); `stream_name` is the shared file-path `Arc`.
+///
+/// Returns:
+/// * `Ok(None)` — blank or comment line, skip it.
+/// * `Ok(Some(entry))` — a parsed entry to push.
+/// * `Err(parse_error)` — a malformed line (no `:` separator); the caller
+///   records the CW001 parse error and continues recovering (lenient parser).
+fn parse_entry(
+    line: &str,
+    line_idx: usize,
+    stream_name: &Arc<str>,
+) -> Result<Option<LocEntry>, LocParseError> {
+    let trimmed = line.trim_start();
+
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return Ok(None);
+    }
+
+    let Some(colon_pos) = trimmed.find(':') else {
+        // Malformed line: no colon separator. Record a CW001 parse error and
+        // continue recovering (lenient parser; mirrors F# `Failure` path).
+        return Err(LocParseError {
+            line: line_idx + 1,
+            message: format!("unexpected content (no ':' separator): {:?}", trimmed),
+        });
+    };
+    let key = trimmed[..colon_pos].trim_end();
+
+    // remainder after the colon
+    let mut remainder = &trimmed[colon_pos + 1..];
+
+    // optional version number (digits right after colon with no space)
+    let version = if !remainder.is_empty() && remainder.starts_with(|c: char| c.is_ascii_digit()) {
+        // Count leading ASCII-digit bytes (== char count; digits are ASCII)
+        // and parse the slice in place, no intermediate String.
+        let digit_len = remainder.bytes().take_while(|b| b.is_ascii_digit()).count();
+        let v = remainder[..digit_len].parse::<u32>().ok();
+        remainder = &remainder[digit_len..];
+        v
+    } else {
+        None
+    };
+
+    // strip one leading space (the convention after `:`)
+    // but keep everything else including # comments,
+    // because in F# `#` is a valid `isLocValueChar`.
+    let desc = remainder.strip_prefix(' ').unwrap_or(remainder);
+
+    let position = Position::new(Arc::clone(stream_name), line_idx + 1, 1); // 1-based line numbers
+
+    // Compute the column offset of `desc`'s start within the full line.
+    // The key + colon + version + optional space are all ASCII, so byte
+    // offset == char offset for that prefix.
+    let leading_ws = line.len() - trimmed.len();
+    // desc starts at (trimmed.len() - desc.len()) bytes into trimmed.
+    let desc_col_offset = leading_ws + (trimmed.len() - desc.len());
+
+    // Check for chars outside the allowed loc-value Unicode ranges.
+    // Mirrors F# parser `desc` production which stops at the first
+    // char where `isLocValueChar` returns false, then records the
+    // position of that char as `errorRange`.
+    let error_range = find_invalid_loc_char(desc).map(|byte_off| {
+        // Column within desc (0-based) + prefix offset gives the line column.
+        let col = desc_col_offset + desc[..byte_off].chars().count() + 1;
+        Position::new(Arc::clone(stream_name), line_idx + 1, col)
+    });
+
+    // Lazy-parse loc elements (refs, commands, etc.). One pass over the
+    // elements extends all three collections instead of three filter_map
+    // passes. The JominiCommand clone stays — it bridges the loc_string and
+    // commands type boundary, which is unified separately.
+    let elements = parse_loc_elements(desc);
+    let mut refs: Vec<String> = Vec::new();
+    let mut commands: Vec<String> = Vec::new();
+    let mut jomini_commands: Vec<Vec<crate::loc_string::JominiCommand>> = Vec::new();
+    for e in &elements {
+        match e {
+            crate::loc_string::LocElement::Ref(s) => refs.push(s.to_string()),
+            crate::loc_string::LocElement::Command(s) => commands.push(s.to_string()),
+            // Store the parsed chain directly — one JominiCommand type now, so
+            // nested command params are preserved rather than flattened away.
+            crate::loc_string::LocElement::JominiCommand(cmds) => {
+                jomini_commands.push(cmds.clone())
+            }
+            crate::loc_string::LocElement::Chars(_) => {}
+        }
+    }
+
+    Ok(Some(LocEntry {
+        key: key.to_string(),
+        value: version,
+        desc: desc.to_string(),
+        position,
+        error_range, // set by isLocValueChar check above
+        refs,
+        commands,
+        jomini_commands,
+    }))
 }
 
 // ---- isLocValueChar --------------------------------------------------------
