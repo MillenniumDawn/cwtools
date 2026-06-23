@@ -42,6 +42,9 @@ pub fn collect_subtype_instances(
                         .push(cwtools_index::TypeInstance {
                             name: name.to_string(),
                             location,
+                            // Hover resolves the primary loc key via the base-type
+                            // instances; subtype-qualified entries don't need it.
+                            primary_loc_key: None,
                         });
                 }
             }

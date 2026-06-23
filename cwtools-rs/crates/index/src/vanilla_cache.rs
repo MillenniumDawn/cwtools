@@ -332,6 +332,9 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
                 line: ci.l,
                 col: ci.c,
             },
+            // The vanilla cache doesn't store primary loc keys; hover for vanilla
+            // instances falls back to name-derived keys.
+            primary_loc_key: None,
         });
     }
     Ok((
@@ -375,10 +378,12 @@ mod tests {
                 TypeInstance {
                     name: "GFX_a".into(),
                     location: SourceLocation { line: 2, col: 1 },
+                    primary_loc_key: None,
                 },
                 TypeInstance {
                     name: "GFX_b".into(),
                     location: SourceLocation { line: 5, col: 3 },
+                    primary_loc_key: None,
                 },
             ],
         );

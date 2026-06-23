@@ -63,6 +63,20 @@ pub(crate) fn loc_diag_to_validation_error(
     }
 }
 
+/// Lowercased loc keys defined in a single loc file's text. A cheap single-file
+/// parse used to keep the live overlay current on edit (#36).
+fn loc_keys_of(text: &str, path: &str) -> HashSet<String> {
+    let svc =
+        cwtools_localization::LocService::from_files(vec![(path.to_string(), text.to_string())]);
+    let mut keys = HashSet::new();
+    for file in svc.files() {
+        for entry in &file.entries {
+            keys.insert(entry.key.to_lowercase());
+        }
+    }
+    keys
+}
+
 /// Cap a file's validation errors at [`MAX_FILE_ERRORS`], appending a summary
 /// marker for the remainder. Returns the pre-truncation total (for logging).
 /// Shared by the batch and single-file paths so the cap stays consistent.
@@ -170,6 +184,37 @@ pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Di
         code_description: None,
         source: Some("cwtools".to_string()),
         message: msg,
+        related_information: None,
+        tags: None,
+        data: None,
+    }
+}
+
+/// Convert a `.cwt` rule-config error (parse or structural reference) into an LSP
+/// diagnostic. `RuleParseError.line` is 1-based; `col` is a 0-based character.
+/// Shared by the load-time path (`config.rs`) and the live per-file CWT lint.
+pub(crate) fn rule_parse_error_to_diagnostic(
+    err: &cwtools_rules::ruleset_loader::RuleParseError,
+    line_ends: &[u32],
+) -> Diagnostic {
+    let line = err.line.saturating_sub(1);
+    let col = err.col as u32;
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line,
+                character: col,
+            },
+            end: Position {
+                line,
+                character: diag_end_col(line_ends, line, col),
+            },
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: None,
+        code_description: None,
+        source: Some("cwtools-rules".to_string()),
+        message: err.message.clone(),
         related_information: None,
         tags: None,
         data: None,
@@ -406,7 +451,15 @@ impl Backend {
             if let Some(d) = docs.get_mut(&uri)
                 && d.version == expected_version
             {
-                d.ast = ast;
+                // Preserve the last good AST on a transient parse failure (None):
+                // a fatal mid-edit syntax error shouldn't wipe the tree that
+                // completion/hover/goto resolve context from, or they collapse to
+                // a generic word list until the next clean parse. The parse error
+                // is still published. (#41) Loc/.cwt files always parse to None
+                // here, so their (absent) AST is unaffected.
+                if ast.is_some() {
+                    d.ast = ast;
+                }
             } else {
                 // Doc closed (or version changed) — discard results entirely.
                 return;
@@ -595,6 +648,74 @@ impl Backend {
         }
     }
 
+    /// Validate one loc file's text into diagnostics. Builds the set of names a
+    /// `$ref$` may resolve to — modifier keys, idea names, and the live loc
+    /// overlay (the current keys of every open `.yml`) — then checks against the
+    /// scanned union. Pure: it neither updates the overlay nor triggers any
+    /// cross-file work, so the cross-file sweep can call it safely (#36).
+    fn validate_loc_text(&self, path: &str, text: &str, line_ends: &[u32]) -> Vec<Diagnostic> {
+        // Lock order: rules -> info_service -> loc_index. The overlay lock is
+        // independent and taken between, never nested inside the others.
+        let mut extra: HashSet<String> = (*self.state.rules.read().modifier_keys).clone();
+        {
+            let info = self.state.info_service.read();
+            let ideas = info.type_index.instances("idea");
+            extra.reserve(ideas.len());
+            for (_uri, inst) in ideas {
+                // Idea names are ASCII identifiers; skip the lowercasing alloc
+                // when already lowercase ASCII (the common case).
+                let needs_fold = inst
+                    .name
+                    .bytes()
+                    .any(|b| b.is_ascii_uppercase() || !b.is_ascii());
+                if needs_fold {
+                    extra.insert(inst.name.to_lowercase());
+                } else {
+                    extra.insert(inst.name.clone());
+                }
+            }
+        }
+        // Live overlay: every open loc file's current keys. Lets a key just added
+        // to an open `.yml` resolve immediately, in this file and cross-file.
+        for keys in self.state.loc_live_overlay.read().values() {
+            extra.extend(keys.iter().cloned());
+        }
+        // Hold the read guard across the validate call to avoid cloning the full
+        // loc-key union (~2M Strings on Millennium Dawn).
+        let loc_guard = self.state.loc_index.read();
+        let empty_union: HashSet<String> = HashSet::new();
+        let union: &HashSet<String> = loc_guard
+            .as_ref()
+            .map(|idx| idx.union())
+            .unwrap_or(&empty_union);
+        cwtools_localization::validate_loc_file_text(text, path, union, &extra)
+            .iter()
+            .map(|d| validation_error_to_diagnostic(&loc_diag_to_validation_error(d), line_ends))
+            .collect()
+    }
+
+    /// Re-validate and republish every OTHER open loc file. Called when an edited
+    /// loc file's key set changed, so a `$ref$` to a key that was just added or
+    /// removed updates in the other open `.yml` files without a reload (#36).
+    /// Bounded by the number of open loc files.
+    async fn revalidate_other_open_loc_files(&self, except_uri: &str) {
+        let targets: Vec<(String, String)> = {
+            let docs = self.state.documents.lock();
+            docs.iter()
+                .filter(|(u, _)| u.as_str() != except_uri && crate::paths::is_loc_file(u))
+                .map(|(u, d)| (u.clone(), d.text.clone()))
+                .collect()
+        };
+        for (u, text) in targets {
+            let path = uri_to_path_str(&u);
+            let line_ends = line_end_cols(&text);
+            let diags = self.validate_loc_text(&path, &text, &line_ends);
+            if let Ok(obj) = Url::parse(&u) {
+                self.publish_gated(obj, diags, None).await;
+            }
+        }
+    }
+
     #[tracing::instrument(skip_all, fields(uri = %uri, bytes = text.len()))]
     pub(crate) async fn parse_and_validate(
         &self,
@@ -609,45 +730,69 @@ impl Backend {
         // Localisation files are parsed and validated as loc, not config.
         if crate::paths::is_loc_file(uri) {
             let path = uri_to_path_str(uri);
-            // Names a `$ref$` may resolve to besides loc keys (`$modifier$` /
-            // `$idea$` embeds). Built before the loc_index guard to honour the
-            // info_service -> loc_index lock order.
-            let extra_valid_refs: HashSet<String> = {
-                // Lock order: rules -> info_service.
-                let mut extra = (*self.state.rules.read().modifier_keys).clone();
-                let info = self.state.info_service.read();
-                let ideas = info.type_index.instances("idea");
-                extra.reserve(ideas.len());
-                for (_uri, inst) in ideas {
-                    // Idea names are ASCII identifiers; skip the lowercasing alloc
-                    // when the name is already lowercase ASCII (the common case).
-                    // Fall back to `to_lowercase` for anything uppercase or
-                    // non-ASCII so the case-folding result is unchanged.
-                    let needs_fold = inst
-                        .name
-                        .bytes()
-                        .any(|b| b.is_ascii_uppercase() || !b.is_ascii());
-                    if needs_fold {
-                        extra.insert(inst.name.to_lowercase());
-                    } else {
-                        extra.insert(inst.name.clone());
+            // Keep the live overlay current so this file's own keys (and any just
+            // added) resolve immediately in `$ref$` checks, without waiting for a
+            // full rescan. Record whether the key set actually changed. (#36)
+            let changed = {
+                let new_keys = loc_keys_of(text, &path);
+                let mut overlay = self.state.loc_live_overlay.write();
+                let changed = overlay
+                    .get(uri)
+                    .map(|prev| prev != &new_keys)
+                    .unwrap_or(true);
+                overlay.insert(uri.to_string(), new_keys);
+                changed
+            };
+            let diagnostics = self.validate_loc_text(&path, text, &line_ends);
+            // A change to this file's key set can fix or break `$ref$` checks in
+            // other open loc files, so refresh them — that's the cross-file part
+            // of the index that previously only updated on a window reload.
+            if changed {
+                self.revalidate_other_open_loc_files(uri).await;
+            }
+            return (diagnostics, None);
+        }
+
+        // `.cwt` rule-config files are the schema the engine is built from, not
+        // game content. Lint them structurally — parse errors plus references to
+        // undefined types/enums/single_aliases — against the loaded merged
+        // ruleset, rather than running the game-script validator (which would
+        // flag every rule field as unknown). See #43.
+        if crate::paths::is_cwt_file(uri) {
+            match parse_string(text, &self.state.string_table) {
+                Ok(parsed) => {
+                    for parse_err in &parsed.errors {
+                        diagnostics.push(parse_error_to_diagnostic(parse_err, &line_ends));
+                    }
+                    // Structural reference check against the merged ruleset. Only
+                    // runs once rules are loaded; before then there's nothing to
+                    // resolve references against (and everything would falsely
+                    // report undefined).
+                    let rules_guard = self.state.rules.read();
+                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
+                        let path = std::path::PathBuf::from(uri_to_path_str(uri));
+                        let files = [(path, parsed)];
+                        for err in cwtools_rules::config_validation::validate_ruleset_references(
+                            &files,
+                            ruleset,
+                            &self.state.string_table,
+                        ) {
+                            diagnostics.push(rule_parse_error_to_diagnostic(&err, &line_ends));
+                        }
                     }
                 }
-                extra
-            };
-            // Hold the read guard across the validate call to avoid cloning the
-            // full loc-key union (~2M Strings on Millennium Dawn).
-            let loc_guard = self.state.loc_index.read();
-            let empty_union: HashSet<String> = HashSet::new();
-            let union: &HashSet<String> = loc_guard
-                .as_ref()
-                .map(|idx| idx.union())
-                .unwrap_or(&empty_union);
-            for d in
-                cwtools_localization::validate_loc_file_text(text, &path, union, &extra_valid_refs)
-            {
-                let ve = loc_diag_to_validation_error(&d);
-                diagnostics.push(validation_error_to_diagnostic(&ve, &line_ends));
+                Err(e) => {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position::default(),
+                            end: Position::default(),
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        source: Some("cwtools-rules".to_string()),
+                        message: format!("Parse error: {}", e),
+                        ..Default::default()
+                    });
+                }
             }
             return (diagnostics, None);
         }
@@ -767,6 +912,19 @@ impl Backend {
 mod whole_line_range_tests {
     use super::*;
     use cwtools_validation::ErrorSeverity;
+
+    #[test]
+    fn loc_keys_of_extracts_lowercased_keys() {
+        // Live-overlay key extraction for #36: keys are lowercased to match the
+        // case-insensitive union the `$ref$` check resolves against.
+        let keys = loc_keys_of(
+            "l_english:\n MY_Key: \"hi\"\n other_key: \"x\"\n",
+            "a_l_english.yml",
+        );
+        assert!(keys.contains("my_key"), "got: {:?}", keys);
+        assert!(keys.contains("other_key"), "got: {:?}", keys);
+        assert!(!keys.contains("absent"));
+    }
 
     #[test]
     fn line_end_cols_reports_trimmed_char_lengths() {

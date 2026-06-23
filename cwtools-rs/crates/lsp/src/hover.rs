@@ -27,6 +27,11 @@ impl Backend {
             return Ok(self.loc_ref_hover(&uri, pos));
         }
 
+        // `.cwt` rule files aren't game content — no rule-walk hover. (#43)
+        if crate::paths::is_cwt_file(&uri) {
+            return Ok(None);
+        }
+
         // Snapshot the AST (a cheap `Arc` clone) and drop the documents guard
         // before taking ruleset, so hover never co-holds documents + ruleset and
         // its documents window stays tiny.
@@ -48,12 +53,15 @@ impl Backend {
                 root_scope,
                 prev_scope,
                 from_scopes,
+                resolved_scope,
             }) = self.rule_info_at_cursor(&uri, pos, &logical_path)
             {
                 let debug = self
                     .state
                     .hover_debug
                     .load(std::sync::atomic::Ordering::Relaxed);
+                // `resolved_scope` is already `None` unless the resolved setting
+                // is on (computed in rule_info_at_cursor).
                 let mut md = build_hover_markdown(
                     &element,
                     &hint,
@@ -65,6 +73,7 @@ impl Backend {
                         root: root_scope.as_deref(),
                         prev: prev_scope.as_deref(),
                         from: &from_scopes,
+                        resolved: resolved_scope.as_deref(),
                     },
                     debug,
                 );
@@ -86,6 +95,25 @@ impl Backend {
                 // Append localisation translations. A reference resolves by leaf
                 // value; a definition key (idea/decision) resolves by its key.
                 append_localisation(&mut md, &element, &self.state.loc_text.read());
+                // A reference to a type with a primary localisation (an event id,
+                // …) shows the localised title, resolved from the captured
+                // explicit-field key or a name-derived key. (#40)
+                if let ReferenceHint::TypeRef { type_name, value } = &hint {
+                    // Lock order: rules -> info_service -> loc_text.
+                    let rules_guard = self.state.rules.read();
+                    let info_guard = self.state.info_service.read();
+                    let loc_text = self.state.loc_text.read();
+                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
+                        append_type_localisation(
+                            &mut md,
+                            type_name,
+                            value,
+                            &info_guard.type_index,
+                            ruleset,
+                            &loc_text,
+                        );
+                    }
+                }
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -185,6 +213,9 @@ pub(crate) struct ScopeTable<'a> {
     pub prev: Option<&'a str>,
     /// The FROM chain: `[0]` = FROM, `[1]` = FROM.FROM, ….
     pub from: &'a [String],
+    /// The scope the hovered key resolves to (`hover.scopeDisplay = "resolved"`).
+    /// Shown as a `Resolves to` line when set and different from `current`. (#37)
+    pub resolved: Option<&'a str>,
 }
 
 /// Build a Markdown hover string from the classified element + the matched
@@ -205,10 +236,10 @@ pub(crate) fn build_hover_markdown(
     scopes: ScopeTable<'_>,
     debug: bool,
 ) -> String {
-    let mut parts: Vec<String> = Vec::new();
-
-    // Header: which alias category the key resolves through, so a trigger
-    // reads as a trigger and an effect as an effect at a glance.
+    // Section 1 — identity + documentation ("what it is"): the alias-category
+    // header (so a trigger reads as a trigger), the raw classification when
+    // debug is on, and the rule description.
+    let mut info: Vec<String> = Vec::new();
     if let (Some(cat), PositionElement::Leaf { key, .. }) = (category, element) {
         let label = match cat {
             "trigger" => "Trigger",
@@ -216,10 +247,8 @@ pub(crate) fn build_hover_markdown(
             "modifier" => "Modifier",
             other => other,
         };
-        parts.push(format!("**{}** `{}`", label, key));
+        info.push(format!("**{}** `{}`", label, key));
     }
-
-    // Raw rule classification — developer detail, off by default.
     if debug {
         let line = match hint {
             ReferenceHint::TypeRef { type_name, value } => {
@@ -241,27 +270,28 @@ pub(crate) fn build_hover_markdown(
                 PositionElement::LeafValue { value } => format!("**Value** — `{}`", value),
             },
         };
-        parts.push(line);
+        info.push(line);
     }
-
-    // Append rule description if found
     if let Some(desc) = rule_desc {
-        parts.push(format!("\n{}", desc));
+        info.push(desc.to_string());
     }
 
-    // Append required scopes if any
-    if !rule_scopes.is_empty() {
-        parts.push(format!("\n**Required scopes**: {}", rule_scopes.join(", ")));
-    }
+    // Section 2 — required scopes ("where it's allowed").
+    let required = (!rule_scopes.is_empty())
+        .then(|| format!("**Required scopes**: {}", rule_scopes.join(", ")));
 
-    // Append the current scope at the cursor — shows where you are for anything
-    // hovered in a scoped block, independent of the rule's required scope. The
-    // related scopes (ROOT/PREV and the FROM chain) follow on consecutive lines,
-    // restoring the small scope table the F# build showed. Root/Prev are
-    // suppressed when identical to the current scope (noise); FROM/FROM.FROM are
-    // always shown when present.
-    if let Some(scope) = scopes.current {
+    // Section 3 — the current scope at the cursor ("where you are"), independent
+    // of the rule's required scope. Related scopes (ROOT/PREV and the FROM chain)
+    // follow on consecutive hard-break lines, restoring the small scope table the
+    // F# build showed. Root/Prev are suppressed when identical to the current
+    // scope (noise); FROM/FROM.FROM are always shown when present.
+    let scope_table = scopes.current.map(|scope| {
         let mut scope_lines = vec![format!("**Scope**: {}", scope)];
+        // The scope the hovered link/keyword resolves to, when the setting asks
+        // for it and it actually differs from the ambient scope. (#37)
+        if let Some(resolved) = scopes.resolved.filter(|r| Some(*r) != scopes.current) {
+            scope_lines.push(format!("**Resolves to**: {}", resolved));
+        }
         if let Some(root) = scopes.root.filter(|r| Some(*r) != scopes.current) {
             scope_lines.push(format!("**Root**: {}", root));
         }
@@ -274,12 +304,20 @@ pub(crate) fn build_hover_markdown(
         if let Some(fromfrom) = scopes.from.get(1) {
             scope_lines.push(format!("**From.From**: {}", fromfrom));
         }
-        // Markdown collapses single newlines, so join the table rows with a hard
-        // line break; lead with `\n` to match the spacing the lone Scope line had.
-        parts.push(format!("\n{}", scope_lines.join("  \n")));
-    }
+        // Markdown collapses single newlines, so join the rows with a hard break.
+        scope_lines.join("  \n")
+    });
 
-    parts.join("\n\n")
+    // Join the logical sections with a horizontal rule so documentation, required
+    // scope, and current scope read as distinct blocks instead of one run-on
+    // paragraph (matches the F#/Tboby hover layout). (#38)
+    let mut sections: Vec<String> = Vec::new();
+    if !info.is_empty() {
+        sections.push(info.join("\n\n"));
+    }
+    sections.extend(required);
+    sections.extend(scope_table);
+    sections.join("\n\n---\n\n")
 }
 
 /// Append localisation translations for the hovered element to `md`.
@@ -311,10 +349,50 @@ pub(crate) fn append_localisation(
         }
     };
     if let Some(nk) = name_key {
-        emit(&nk, "\n\n**Localisation**:");
+        emit(&nk, "\n\n---\n\n**Localisation**:");
     }
     if let Some(dk) = desc_key {
         emit(&dk, "\n\n**Description**:");
+    }
+}
+
+/// Append the localised primary text (e.g. an event's title) for a reference to
+/// a type that declares a primary localisation. Two resolution paths, matching
+/// how the config models loc keys: an explicit-field binding (`title = title`)
+/// uses the key captured from the instance's field at index time, while a
+/// name-derived binding (`title = "$.t"`) builds `prefix + id + suffix`. The
+/// first key that resolves to loc text is shown. Fixes the missing event title
+/// the F# build showed (#40).
+pub(crate) fn append_type_localisation(
+    md: &mut String,
+    type_name: &str,
+    value: &str,
+    type_index: &cwtools_info::TypeIndex,
+    ruleset: &cwtools_rules::rules_types::RuleSet,
+    loc_text: &HashMap<String, Vec<(cwtools_localization::Lang, String)>>,
+) {
+    let value = value.trim_matches('"');
+    let mut keys: Vec<String> = Vec::new();
+    // Explicit-field key captured per instance (events: the `title` value).
+    if let Some(k) = type_index.primary_loc_key(type_name, value) {
+        keys.push(k.to_ascii_lowercase());
+    }
+    // Name-derived primary/required keys from the type's localisation config.
+    if let Some(&i) = ruleset.type_by_name.get(type_name) {
+        for loc in &ruleset.types[i].localisation {
+            if loc.explicit_field.is_none() && (loc.primary || loc.required) {
+                keys.push(format!("{}{}{}", loc.prefix, value, loc.suffix).to_ascii_lowercase());
+            }
+        }
+    }
+    for key in keys {
+        if let Some(translations) = loc_text.get(&key) {
+            md.push_str("\n\n---\n\n**Localisation**:");
+            for (lang, text) in translations {
+                md.push_str(&format!("\n- {}: {}", lang_display_name(*lang), text));
+            }
+            return;
+        }
     }
 }
 
@@ -468,6 +546,7 @@ mod tests {
                 root: Some("country"),
                 prev: Some("unit_leader"),
                 from: &["combat".to_string(), "operation".to_string()],
+                resolved: None,
             },
             false,
         );
@@ -476,6 +555,60 @@ mod tests {
         assert!(md.contains("**Prev**: unit_leader"), "got: {}", md);
         assert!(md.contains("**From**: combat"), "got: {}", md);
         assert!(md.contains("**From.From**: operation"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_separates_sections() {
+        // #38: a horizontal rule divides description, required scope, and the
+        // current-scope table so they don't read as one run-on block.
+        let md = build_hover_markdown(
+            &PositionElement::Leaf {
+                key: "set_country_flag".to_string(),
+                value: "my_flag".to_string(),
+            },
+            &ReferenceHint::Unknown,
+            Some("effect"),
+            Some("Sets a flag"),
+            &["country".to_string()],
+            ScopeTable {
+                current: Some("country"),
+                root: None,
+                prev: None,
+                from: &[],
+                resolved: None,
+            },
+            false,
+        );
+        assert!(
+            md.contains("---"),
+            "expected a section separator, got: {}",
+            md
+        );
+    }
+
+    #[test]
+    fn test_hover_resolved_scope_line() {
+        // #37: when a resolved/target scope is supplied and differs from the
+        // current scope, a `Resolves to` line is shown.
+        let md = build_hover_markdown(
+            &PositionElement::Leaf {
+                key: "owner".to_string(),
+                value: String::new(),
+            },
+            &ReferenceHint::Unknown,
+            None,
+            None,
+            &[],
+            ScopeTable {
+                current: Some("state"),
+                root: None,
+                prev: None,
+                from: &[],
+                resolved: Some("country"),
+            },
+            false,
+        );
+        assert!(md.contains("**Resolves to**: country"), "got: {}", md);
     }
 
     #[test]
@@ -496,6 +629,7 @@ mod tests {
                 root: Some("country"), // Root == Scope, should be omitted
                 prev: None,            // Prev absent, should be omitted
                 from: &["country".to_string()], // From == Scope, but FROM always shown
+                resolved: None,
             },
             false,
         );

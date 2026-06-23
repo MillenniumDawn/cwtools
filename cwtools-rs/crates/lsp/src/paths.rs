@@ -98,6 +98,15 @@ pub(crate) fn is_loc_file(uri: &str) -> bool {
     lower.ends_with(".yml") || lower.ends_with(".yaml") || lower.ends_with(".csv")
 }
 
+/// Whether a URI is a `.cwt` rule-config file. These are the schema the rules
+/// engine is built from, not game content, so they get their own structural
+/// linting (undefined type/enum/single_alias refs + parse errors) rather than
+/// the game-script validator. One predicate so validate/hover/completion/goto
+/// all agree on what counts as a rule file.
+pub(crate) fn is_cwt_file(uri: &str) -> bool {
+    uri.to_ascii_lowercase().ends_with(".cwt")
+}
+
 /// Locate the `$KEY$` loc-reference token under the cursor in a localisation
 /// line. `col` is the LSP (UTF-16) character offset. Returns the referenced key
 /// plus the token's `[start, end)` range in UTF-16 columns (for the editor to
@@ -256,6 +265,14 @@ mod tests {
         // not loc
         assert!(!is_loc_file("file:///mod/common/ideas/foo.txt"));
         assert!(!is_loc_file("file:///mod/gfx/foo.gfx"));
+    }
+
+    #[test]
+    fn is_cwt_file_matches_only_cwt() {
+        assert!(is_cwt_file("file:///rules/Config/events.cwt"));
+        assert!(is_cwt_file("file:///RULES/FOO.CWT")); // case-insensitive (Windows)
+        assert!(!is_cwt_file("file:///mod/common/ideas/foo.txt"));
+        assert!(!is_cwt_file("file:///mod/localisation/foo_l_english.yml"));
     }
 
     #[test]

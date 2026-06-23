@@ -372,6 +372,20 @@ mod tests {
         assert_eq!(find_directive(&comments, "cardinality"), None);
     }
 
+    // ── parse_replace_scopes_from_comments ────────────────────────────────────
+
+    #[test]
+    fn replace_scope_keys_are_case_insensitive() {
+        // HOI4 config writes replace_scope keys uppercase (operations.cwt etc.).
+        // They must parse the same as lowercase so ROOT/THIS/PREV apply and the
+        // hover scope table shows them (cwtools-vscode#35).
+        let comments = s(&["## replace_scope = { THIS = state ROOT = country PREV = state }"]);
+        let rs = parse_replace_scopes_from_comments(&comments).expect("should parse");
+        assert_eq!(rs.this.as_deref(), Some("state"));
+        assert_eq!(rs.root.as_deref(), Some("country"));
+        assert_eq!(rs.prevs.first().map(String::as_str), Some("state"));
+    }
+
     // ── parse_required_scopes ─────────────────────────────────────────────────
 
     #[test]

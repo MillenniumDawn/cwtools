@@ -185,6 +185,14 @@ struct DocumentState {
     /// `localisation` reference jumps to the `.yml` entry. One representative
     /// (primary-language) location per key is enough for navigation.
     loc_locations: parking_lot::RwLock<HashMap<String, (String, u32)>>,
+    /// Live per-file loc keys (lowercased) for currently-open loc files, keyed by
+    /// URI. Overlays the scanned `loc_index` so a key added to (or present in) an
+    /// open `.yml` resolves immediately in `$ref$` checks without waiting for a
+    /// full rescan (#36). Bounded by the number of open loc files, so it stays
+    /// tiny next to the global index. A key only removed from disk still resolves
+    /// against the baseline `loc_index` until the next scan — the overlay only
+    /// adds keys, it can't subtract from the baseline union.
+    loc_live_overlay: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
     /// When `false` (the default), hover shows localisation for the primary
     /// language only (the first of `config.loc_languages`, else English) and the
     /// `loc_text` map only stores that language. Set via the
@@ -195,6 +203,11 @@ struct DocumentState {
     /// includes the raw rule classification (field/type/scope) lines; off by
     /// default so users see only localisation, description, and required scopes.
     hover_debug: std::sync::atomic::AtomicBool,
+    /// When `true` (the `hover.scopeDisplay = "resolved"` setting), hover adds a
+    /// `Resolves to` line showing the scope the hovered link/keyword evaluates to
+    /// (run through `change_scope`), alongside the ambient current scope. Off by
+    /// default — the ambient scope is shown alone. (#37)
+    hover_resolved_scope: std::sync::atomic::AtomicBool,
     /// `false` until the first full workspace scan has finished building the
     /// index. While `false`, per-file validation still parses and indexes, but
     /// suppresses published diagnostics (clears instead) so the user never sees
@@ -252,8 +265,10 @@ impl DocumentState {
             loc_index: parking_lot::RwLock::new(None),
             loc_text: parking_lot::RwLock::new(HashMap::new()),
             loc_locations: parking_lot::RwLock::new(HashMap::new()),
+            loc_live_overlay: parking_lot::RwLock::new(HashMap::new()),
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
+            hover_resolved_scope: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
@@ -435,6 +450,25 @@ impl Backend {
             }
             None => (None, None, None, Vec::new()),
         };
+        // The scope the hovered key resolves TO: run it through `change_scope` on
+        // a clone of the cursor's context. For a scope-changing link (`owner`) or
+        // a meta keyword (`FROM`/`ROOT`/`PREV`) this is the target scope; for
+        // anything that doesn't change scope it stays the ambient one (and is
+        // suppressed at display when it matches). Only computed when the
+        // `hover.scopeDisplay = "resolved"` setting is on. (#37)
+        let resolved_scope = self
+            .state
+            .hover_resolved_scope
+            .load(Ordering::Relaxed)
+            .then(|| match (rctx.scope.as_ref(), &element) {
+                (Some(sc), PositionElement::Leaf { key, .. }) if !key.is_empty() => {
+                    let mut probe = sc.clone();
+                    probe.change_scope(key);
+                    probe.current().and_then(|id| resolve_scope(&probe, id))
+                }
+                _ => None,
+            })
+            .flatten();
         Some(RuleCursorInfo {
             element,
             hint,
@@ -445,6 +479,7 @@ impl Backend {
             root_scope,
             prev_scope,
             from_scopes,
+            resolved_scope,
         })
     }
 }
@@ -485,6 +520,10 @@ pub(crate) struct RuleCursorInfo {
     pub(crate) prev_scope: Option<String>,
     /// The FROM chain: `[0]` = FROM, `[1]` = FROM.FROM, … (placeholders dropped).
     pub(crate) from_scopes: Vec<String>,
+    /// The scope the hovered key resolves to (run through `change_scope`). Shown
+    /// as a `Resolves to` line only when the `hover.scopeDisplay = "resolved"`
+    /// setting is on and it differs from the current scope. (#37)
+    pub(crate) resolved_scope: Option<String>,
 }
 
 /// Map a matched leaf rule's right-hand field to a [`ReferenceHint`] for the
@@ -813,6 +852,8 @@ impl LanguageServer for Backend {
             info.clear_file(&uri);
         }
         self.state.doc_tokens.write().remove(&uri);
+        // Drop the closed loc file's live overlay contribution (#36).
+        self.state.loc_live_overlay.write().remove(&uri);
         cwtools_profiling::trim_memory();
         cwtools_profiling::log_rss("did_close");
         self.client

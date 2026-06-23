@@ -72,6 +72,11 @@ impl Backend {
             return Ok(self.loc_ref_goto(&uri, pos, fallback));
         }
 
+        // `.cwt` rule files aren't game content — no goto into rule definitions. (#43)
+        if crate::paths::is_cwt_file(&uri) {
+            return Ok(None);
+        }
+
         // Rule-aware lookup via the position resolver. The classified hint tells
         // us how to find the definition; mirror the kinds hover handles.
         if let Some(info) = self.rule_info_at_cursor(&uri, pos, &logical_path) {
@@ -102,7 +107,12 @@ impl Backend {
             }
         }
 
-        // Fallback: heuristic symbol-based lookup
+        // Fallback: heuristic symbol-based lookup. Try the leaf VALUE before the
+        // key — an event/decision reference like `id = some.1` or
+        // `trigger_event = some.1` resolves by its dotted id (the instance name),
+        // which the rule-aware path misses when the field is typed `scalar`. The
+        // key is tried second so a definition node (e.g. `decision = { … }`)
+        // still resolves. (#39)
         let docs = self.state.documents.lock();
         if let Some(doc) = docs.get(&uri)
             && let Some(ast) = &doc.ast
@@ -113,32 +123,33 @@ impl Backend {
                 &self.state.string_table,
             )
         {
-            let symbol = match &element {
-                PositionElement::Leaf { key, .. } => key.clone(),
-                PositionElement::LeafValue { value } => value.clone(),
+            let candidates: Vec<String> = match &element {
+                PositionElement::Leaf { key, value } if !value.is_empty() => {
+                    vec![unquote(value).to_string(), key.clone()]
+                }
+                PositionElement::Leaf { key, .. } => vec![key.clone()],
+                PositionElement::LeafValue { value } => vec![unquote(value).to_string()],
             };
             drop(docs);
             let info = self.state.info_service.read();
-            if let Some(defs) = info.find_definitions(&symbol) {
-                let locations: Vec<Location> = defs
-                    .iter()
-                    .map(|(file_uri, loc)| Location {
-                        uri: parse_uri(
-                            file_uri,
-                            &params.text_document_position_params.text_document.uri,
-                        ),
-                        range: Range {
-                            start: Position {
-                                line: loc.line.saturating_sub(1),
-                                character: loc.col as u32,
-                            },
-                            end: Position {
-                                line: loc.line.saturating_sub(1),
-                                character: (loc.col + symbol.len() as u16) as u32,
-                            },
-                        },
-                    })
-                    .collect();
+            for symbol in candidates {
+                // Type-instance index first: events/decisions are keyed by id.
+                let pairs = info.type_index.instance_locations(&symbol);
+                let mut locations = locations_at(
+                    pairs.iter().map(|(u, l)| (u.as_ref(), *l)),
+                    &symbol,
+                    fallback,
+                );
+                // Then the heuristic node-key def index (type-name definitions).
+                if locations.is_empty()
+                    && let Some(defs) = info.find_definitions(&symbol)
+                {
+                    locations = locations_at(
+                        defs.iter().map(|(u, l)| (u.as_str(), *l)),
+                        &symbol,
+                        fallback,
+                    );
+                }
                 if !locations.is_empty() {
                     return Ok(Some(GotoDefinitionResponse::Array(locations)));
                 }

@@ -1,3 +1,21 @@
+# 1.8.0
+
+## Features
+- `.cwt` rule config files get their own structural linting instead of being validated as game script: opening a rule file no longer floods it with field errors or hangs on "indexing workspace", and a rule that references an undefined type, enum, or single_alias is flagged on the offending line, live as you edit
+- Hovering an event or decision id shows its localised title, resolved from the definition's `title` field (or a name-derived loc key) so it works across files
+- New `hover.scopeDisplay` setting: in `resolved` mode hover adds a `Resolves to` line showing the scope a link or FROM/ROOT/PREV keyword evaluates to, alongside the ambient current scope (`context`, the default, shows the current scope alone)
+
+## Bug Fixes
+- Localisation diagnostics update as you type instead of only after a window reload: a `$ref$` to a key you just added in an open `.yml` resolves immediately, and the change propagates to other open localisation files
+- Go-to-definition resolves events and decisions by their dotted id (`namespace.1`), including the `id = ...` references the rule walk types as a plain scalar; it previously looked up the field key and failed
+- Autocomplete recovers after a partial edit instead of sticking on generic suggestions: the fallback list is marked incomplete so the editor re-queries as you type, and a transient parse error no longer wipes the last good parse that completion, hover, and go-to-definition resolve context from
+
+## Changed
+- Hover tooltips separate documentation, required scope, and the current-scope table with a horizontal rule instead of running them together
+
+## Developer
+- Added regression tests for names-file parsing (no false unclosed-clause error), case-insensitive `replace_scope` keys, dotted-id instance lookup, and the live localisation overlay
+
 # 1.7.2
 
 ## Bug Fixes
