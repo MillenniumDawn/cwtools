@@ -241,6 +241,39 @@ struct DocumentState {
     /// the same file before spawning a new one, so a burst of keystrokes coalesces
     /// to a single pending task instead of stacking hundreds of sleepers.
     debounce_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Monotonic counter bumped on every mutation of `info_service` or
+    /// `rules` (the two state sources the loc/fallback completion caches
+    /// depend on). The completion handler reads this on each request; when
+    /// the value matches a cached entry, it can return the cached list
+    /// without walking `info.files` again. Hot in the half-typed case: the
+    /// user is in a state where the AST is stale and every completion
+    /// falls through to the fallback, but info/rules haven't moved since
+    /// the last build, so the cache hit saves a full workspace walk.
+    info_revision: AtomicU64,
+    /// Cached loc-completion list (`loc_completions`). Workspace-wide, not
+    /// per-URI, so a single entry covers every open `.yml`. The language
+    /// field disambiguates games with different scope-chain casing.
+    loc_cache: parking_lot::Mutex<Option<CompletionCacheEntry>>,
+    /// Cached fallback list (the flat type/enum/var dump reached when
+    /// context-aware matching returns nothing). Same shape as `loc_cache`.
+    fallback_cache: parking_lot::Mutex<Option<CompletionCacheEntry>>,
+    /// Per-URI generation counter for in-flight completion requests. Each new
+    /// `completion` request for a URI increments this and captures the value;
+    /// the request checks the counter before doing any heavy work and bails
+    /// if a newer request for the same URI has already started. Avoids
+    /// stacking N parallel AST walks when the user types fast — only the
+    /// latest one matters, the rest are wasted work.
+    completion_generation: parking_lot::Mutex<HashMap<String, u64>>,
+}
+
+/// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
+/// completion handler can swap a freshly built list in on cache miss without
+/// holding any other lock. `items` is an `Arc` so the per-request clone is a
+/// refcount bump, not a deep copy of every item.
+pub(crate) struct CompletionCacheEntry {
+    pub(crate) revision: u64,
+    pub(crate) language: String,
+    pub(crate) items: std::sync::Arc<Vec<CompletionItem>>,
 }
 
 pub(crate) struct ParsedDoc {
@@ -275,6 +308,10 @@ impl DocumentState {
             pending_changed_names: Mutex::new(HashSet::new()),
             vanilla_merged: std::sync::atomic::AtomicBool::new(false),
             debounce_handles: Mutex::new(HashMap::new()),
+            info_revision: AtomicU64::new(0),
+            loc_cache: parking_lot::Mutex::new(None),
+            fallback_cache: parking_lot::Mutex::new(None),
+            completion_generation: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -298,6 +335,18 @@ const DEBOUNCE_MS: u64 = 250;
 //     extension side is ported.
 
 impl Backend {
+    /// Bump the info-revision counter. Called from every site that mutates
+    /// `info_service` or `rules` (the two state sources the loc/fallback
+    /// completion caches depend on), so the completion cache invalidates
+    /// exactly when the inputs change. `Relaxed` is enough — the only
+    /// consumer is a single-threaded `load` that tolerates missing an
+    /// in-flight bump (the next request picks it up).
+    pub(crate) fn bump_info_revision(&self) {
+        self.state
+            .info_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Called when the VS Code extension tells us the user switched to a file.
     /// We receive it but don't act on it yet.
     async fn on_did_focus_file(&self, _params: Value) {
@@ -857,6 +906,7 @@ impl LanguageServer for Backend {
             let mut info = self.state.info_service.write();
             info.clear_file(&uri);
         }
+        self.bump_info_revision();
         self.state.doc_tokens.write().remove(&uri);
         // Drop the closed loc file's live overlay contribution (#36).
         self.state.loc_live_overlay.write().remove(&uri);

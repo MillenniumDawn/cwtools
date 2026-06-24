@@ -349,6 +349,9 @@ impl Backend {
                 ),
             );
         }
+        drop(info);
+        drop(rules_guard);
+        self.bump_info_revision();
     }
 
     /// Validate an already-parsed document against the (already-built) workspace
@@ -854,6 +857,9 @@ impl Backend {
                             &logical_path,
                         );
                     }
+                    drop(info);
+                    drop(rules_guard);
+                    self.bump_info_revision();
                 }
 
                 // Validation. Lock order: rules -> info_service -> loc_index.

@@ -90,6 +90,8 @@ impl Backend {
         info.type_index
             .value_set_values
             .merge_file("<vanilla-dynamic>", value_sets.into_iter().collect());
+        drop(info);
+        self.bump_info_revision();
     }
 
     /// Merge a pending `vanilla_index` (from the cache or a live index) into
@@ -113,6 +115,8 @@ impl Backend {
             // `vanilla_index` is now None — mark it merged so
             // ensure_vanilla_index does not re-run on the next scan.
             self.state.vanilla_merged.store(true, Ordering::SeqCst);
+            drop(info_guard);
+            self.bump_info_revision();
         }
     }
 
@@ -129,6 +133,8 @@ impl Backend {
             None => HashSet::new(),
         };
         rules.modifier_keys = Arc::new(keys);
+        drop(rules);
+        self.bump_info_revision();
     }
 
     /// Public entry to the workspace scan. Runs the scan and ALWAYS clears the
