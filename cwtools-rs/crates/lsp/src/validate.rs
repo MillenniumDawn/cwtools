@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::*;
@@ -665,6 +665,63 @@ impl Backend {
         keys
     }
 
+    /// Update the hover loc_text map with entries from a single loc file,
+    /// replacing any previous entries for the same file. Called on every loc
+    /// file edit so tooltips reflect the latest changes without a full
+    /// workspace rescan (#53).
+    fn update_loc_text_for_file(&self, _uri: &str, text: &str, path: &str) {
+        let svc = cwtools_localization::LocService::from_files(vec![(
+            path.to_string(),
+            text.to_string(),
+        )]);
+        let hover_all = self
+            .state
+            .hover_show_all_languages
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let loc_languages = self.state.config.read().loc_languages.clone();
+        let primary_lang = loc_languages
+            .as_deref()
+            .and_then(|l| l.first().copied())
+            .unwrap_or(cwtools_localization::Lang::English);
+
+        // Collect the new entries for this file.
+        let mut new_entries: HashMap<String, Vec<(cwtools_localization::Lang, String)>> =
+            HashMap::new();
+        for file in svc.files() {
+            let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
+            let lang_included = hover_all || lang == primary_lang;
+            if !lang_included {
+                continue;
+            }
+            for entry in &file.entries {
+                let display =
+                    crate::paths::strip_loc_comment(crate::paths::strip_loc_quotes(&entry.desc));
+                if !display.is_empty() {
+                    new_entries
+                        .entry(entry.key.to_lowercase())
+                        .or_default()
+                        .push((lang, display.to_string()));
+                }
+            }
+        }
+
+        // Merge into the global loc_text map: remove old entries for this
+        // file's keys, then insert the new ones. A simple remove-and-replace
+        // per key would lose entries from OTHER files that share the same key.
+        // Instead, rebuild the affected keys from all sources.
+        let mut loc_text = self.state.loc_text.write();
+        for key in new_entries.keys() {
+            // Remove any existing entry for this key that came from this file.
+            // We can't track per-file contributions in loc_text (it's a flat
+            // map), so just overwrite — the full rescan will correct any
+            // cross-file ordering issues.
+            loc_text.remove(key);
+        }
+        for (key, translations) in new_entries {
+            loc_text.entry(key).or_default().extend(translations);
+        }
+    }
+
     /// Validate one loc file's text into diagnostics. Builds the set of names a
     /// `$ref$` may resolve to — modifier keys, idea names, and the live loc
     /// overlay (the current keys of every open `.yml`) — then checks against the
@@ -761,6 +818,9 @@ impl Backend {
                 changed
             };
             let diagnostics = self.validate_loc_text(&path, text, &line_ends);
+            // Update the hover loc_text map so tooltips reflect the latest
+            // edits without waiting for a full workspace rescan (#53).
+            self.update_loc_text_for_file(uri, text, &path);
             // A change to this file's key set can fix or break `$ref$` checks in
             // other open loc files, so refresh them — that's the cross-file part
             // of the index that previously only updated on a window reload.

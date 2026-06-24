@@ -966,6 +966,10 @@ impl LanguageServer for Backend {
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
         self.execute_command_impl(params).await
     }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        self.did_change_watched_files_impl(params).await;
+    }
 }
 
 fn main() {

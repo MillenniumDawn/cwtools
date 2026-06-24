@@ -9,8 +9,8 @@ use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::build_modifier_keys;
 
 use crate::paths::{
-    default_cache_dir, discover_vanilla_dir, logical_path_from_uri, path_to_uri, strip_loc_quotes,
-    uri_to_path_str,
+    default_cache_dir, discover_vanilla_dir, logical_path_from_uri, path_to_uri, strip_loc_comment,
+    strip_loc_quotes, uri_to_path_str,
 };
 use crate::validate::{
     loc_diag_to_validation_error, make_prepared, parse_error_to_diagnostic,
@@ -623,13 +623,13 @@ impl Backend {
         let game = self.state.config.read().game();
         let loc_game = cwtools_localization::Game::from_engine(game);
 
-        // Cached vanilla loc keys (from the vanilla cache) stand in for walking
-        // the install's loc files — only the workspace is walked then.
+        // Cached vanilla loc keys (from the vanilla cache) supplement the key
+        // index, but the hover text map needs the actual loc text from the files.
+        // Always load the vanilla loc files when the dir is available so hover
+        // shows translations for keys that exist only in the base game (#51).
         let cached_vanilla_loc = self.state.vanilla_loc_keys.lock().clone();
         let mut loc_dirs: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
-        if cached_vanilla_loc.is_none()
-            && let Some(v) = self.state.config.read().vanilla_dir.clone()
-        {
+        if let Some(v) = self.state.config.read().vanilla_dir.clone() {
             loc_dirs.push(v);
         }
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
@@ -737,7 +737,7 @@ impl Backend {
                         if !lang_included {
                             continue;
                         }
-                        let display = strip_loc_quotes(&entry.desc);
+                        let display = strip_loc_comment(strip_loc_quotes(&entry.desc));
                         if !display.is_empty() {
                             lt.entry(entry.key.to_lowercase())
                                 .or_default()
@@ -990,6 +990,62 @@ impl Backend {
                 .collect()
         };
         Some(base.join(format!("vanilla-{}-{}.cwv", safe(game), safe(fingerprint))))
+    }
+
+    /// Handle external file changes (create, modify, delete) from the file
+    /// system — e.g. a git checkout, file move in the OS explorer, or rename
+    /// outside the editor. Without this handler the index keeps stale entries
+    /// for deleted/moved files until a window reload (#52).
+    #[tracing::instrument(skip_all)]
+    pub(crate) async fn did_change_watched_files_impl(&self, params: DidChangeWatchedFilesParams) {
+        for event in params.changes {
+            let uri = event.uri.to_string();
+            match event.typ {
+                FileChangeType::DELETED => {
+                    tracing::debug!(%uri, "watched file deleted");
+                    {
+                        let mut index = self.state.symbol_index.lock();
+                        index.clear_document(&uri);
+                    }
+                    {
+                        let mut info = self.state.info_service.write();
+                        info.clear_file(&uri);
+                    }
+                    self.state.loc_live_overlay.write().remove(&uri);
+                    self.bump_info_revision();
+                    self.client
+                        .publish_diagnostics(event.uri, vec![], None)
+                        .await;
+                }
+                FileChangeType::CHANGED | FileChangeType::CREATED => {
+                    let is_open = {
+                        let docs = self.state.documents.lock();
+                        docs.contains_key(&uri)
+                    };
+                    if is_open {
+                        continue;
+                    }
+                    tracing::debug!(%uri, "watched file changed/created");
+                    let path = uri_to_path_str(&uri);
+                    match tokio::fs::read_to_string(&path).await {
+                        Ok(text) => {
+                            let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
+                            if let Some(parsed) = parsed {
+                                let ast = Arc::new(parsed);
+                                self.update_doc_tokens(&uri, Some(&ast));
+                            }
+                            if let Ok(uri_obj) = Url::parse(&uri) {
+                                self.publish_gated(uri_obj, diagnostics, None).await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("could not read watched file {}: {}", path, e);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 

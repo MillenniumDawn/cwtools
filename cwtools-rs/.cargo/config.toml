@@ -1,0 +1,14 @@
+# Cargo configuration for cwtools-rs.
+#
+# Platform-specific overrides live under [target.<triple>] sections.
+# Shared settings (e.g. target-dir) go at the top level.
+
+# Windows: use LLVM's linker (rust-lld.exe) instead of MSVC link.exe.
+# rust-lld is dramatically faster at LTO linking, which is the dominant
+# cost on Windows given our fat-LTO + codegen-units=1 release profile.
+# Requires the `rust-lld` component (shipped with the Rust toolchain).
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+
+# macOS: use the system linker (default). No override needed.
+# Linux: use the system linker (default). No override needed.

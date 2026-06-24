@@ -231,6 +231,29 @@ pub(crate) fn strip_loc_quotes(s: &str) -> &str {
     }
 }
 
+/// Strip an inline `#` comment from a loc desc string for hover display.
+/// `"value" # comment` → `"value"`, `"value"` → `"value"`.
+/// The `#` inside a quoted string is data, not a comment — only the LAST
+/// unescaped `#` after the closing quote is stripped.
+pub(crate) fn strip_loc_comment(s: &str) -> &str {
+    // Find the last `"` in the string. If there is one, only strip `#` after it.
+    if let Some(last_quote) = s.rfind('"') {
+        let after = &s[last_quote + 1..];
+        if let Some(hash) = after.find('#') {
+            &s[..last_quote + 1 + hash]
+        } else {
+            s
+        }
+    } else {
+        // No quotes at all — strip the first `#`.
+        if let Some(hash) = s.find('#') {
+            &s[..hash]
+        } else {
+            s
+        }
+    }
+}
+
 /// Human-readable language name for hover display.
 pub(crate) fn lang_display_name(lang: cwtools_localization::Lang) -> &'static str {
     match lang {
