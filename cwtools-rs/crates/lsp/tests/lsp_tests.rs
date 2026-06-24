@@ -337,6 +337,127 @@ fn test_completion_on_blank_line_after_field() {
 }
 
 #[test]
+fn test_completion_response_marks_incomplete() {
+    // Context-aware completions must be flagged `is_incomplete` so the client
+    // re-queries on every keystroke. Without it, VS Code caches the list and
+    // filters client-side — the "popup sticks on a half-typed prefix"
+    // symptom when the user returns to a file with stale context.
+    let resp = completion_response(
+        "common/decisions/test.txt",
+        "my_decision = {\n    cost = 5\n}\n",
+        1,
+        4,
+    );
+    let is_incomplete = resp["result"]["isIncomplete"]
+        .as_bool()
+        .or_else(|| resp["result"]["is_incomplete"].as_bool());
+    assert_eq!(
+        is_incomplete,
+        Some(true),
+        "context-aware completion must be marked is_incomplete, got: {}",
+        resp
+    );
+}
+
+#[test]
+fn test_completion_in_half_typed_state() {
+    // User scenario: type a partial block, walk away, come back, start
+    // typing more. The parser fails on the partial text, so the last good
+    // AST is None and `rules_at_pos` has nothing to walk. Completion must
+    // still return SOMETHING (the cached fallback, the loc list, or a
+    // re-parsed AST) and flag `is_incomplete` so the popup re-engages on
+    // the next keystroke. Regression for the "super unresponsive when you
+    // come back to a half-typed file" complaint.
+    let text =
+        "my_decision = {\n    allowed = {\n        has_completed_focus = \n    }\n    cost = 5\n";
+    let resp = completion_response("common/decisions/test.txt", text, 3, 32);
+    // Either a context-aware list (from the re-parsed AST) or the fallback
+    // list (if even the re-parse failed) — both are valid, but the
+    // response must not be empty and must be marked incomplete.
+    let items = resp["result"]["items"]
+        .as_array()
+        .or_else(|| resp["result"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !items.is_empty(),
+        "half-typed state must return some completions, got: {}",
+        resp
+    );
+    let is_incomplete = resp["result"]["isIncomplete"]
+        .as_bool()
+        .or_else(|| resp["result"]["is_incomplete"].as_bool());
+    assert_eq!(
+        is_incomplete,
+        Some(true),
+        "half-typed completion must be marked is_incomplete, got: {}",
+        resp
+    );
+}
+
+fn completion_response(rel_path: &str, text: &str, line0: u32, char0: u32) -> serde_json::Value {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), COMPLETION_RULES).unwrap();
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    let body = jsonrpc_notification(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": doc_uri,
+                "languageId": "hoi4",
+                "version": 1,
+                "text": text,
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    wait_for_diagnostics(&mut reader, rel_path);
+
+    let body = jsonrpc_request(
+        2,
+        "textDocument/completion",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "position": { "line": line0, "character": char0 },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let resp_str = read_response(&mut reader).expect("no completion response");
+    child.kill().ok();
+    serde_json::from_str(&resp_str).unwrap()
+}
+
+#[test]
 fn test_completion_modifiers_in_mio_equipment_bonus() {
     let text = "my_org = {\n    name = org\n    equipment_bonus = {\n        some_equipment = {\n            \n        }\n    }\n}\n";
     // Cursor on the blank line inside the equipment block (line 4, col 12).

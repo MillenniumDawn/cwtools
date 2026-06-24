@@ -1,14 +1,26 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
 use cwtools_info::InfoService;
+use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType, ValueType};
 use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 
 use crate::Backend;
+use crate::CompletionCacheEntry;
 use crate::paths::{line_value_key, logical_path_from_uri};
+
+/// Snapshotted ruleset-derived state for one completion request. The `Arc`s
+/// carry the lifetime across the request so the helpers can take borrows
+/// without holding the rules read guard.
+type RulesSnapshot = (
+    Option<Arc<RuleSet>>,
+    Arc<HashSet<String>>,
+    Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>,
+);
 
 impl Backend {
     pub(crate) async fn completion_impl(
@@ -20,6 +32,24 @@ impl Backend {
 
         // `.cwt` rule files aren't game content — no rule-driven completion. (#43)
         if crate::paths::is_cwt_file(&uri) {
+            return Ok(None);
+        }
+
+        // Fast-typing cancel: each new request for the same URI bumps the
+        // per-URI generation. The request captures the value at entry and
+        // re-checks it before doing any heavy work; if a newer request has
+        // already started, this one returns `None` so the runtime can drop
+        // the work. Stops a burst of N keystrokes from stacking N parallel
+        // AST walks when only the latest one matters.
+        let my_generation = {
+            let mut gens = self.state.completion_generation.lock();
+            let g = gens.entry(uri.clone()).or_insert(0);
+            *g += 1;
+            *g
+        };
+        let is_stale =
+            || self.state.completion_generation.lock().get(&uri).copied() > Some(my_generation);
+        if is_stale() {
             return Ok(None);
         }
 
@@ -40,46 +70,120 @@ impl Backend {
         };
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-        // Localisation file — offer loc-key / data-function completions.
-        if crate::paths::is_loc_file(&uri) {
+        // Snapshot the doc text + AST into owned data, then drop the
+        // `documents` guard before any heavy work. `documents.lock()` is the
+        // only exclusive lock in the LSP state, so holding it across the whole
+        // completion blocks `did_open`/`did_change`/`did_close` and the
+        // debounced validate's AST update for the duration — the worst case
+        // being the user typing into a file whose previous validate is still
+        // running. The same pattern for the rules guard: clone the Arcs and
+        // drop the guard. The helpers below take borrows, so the Arcs carry
+        // the lifetime across the work without holding the lock.
+        let (doc_text, doc_ast): (String, Option<Arc<ParsedFile>>) = {
+            let docs = self.state.documents.lock();
+            docs.get(&uri)
+                .map(|d| (d.text.clone(), d.ast.clone()))
+                .unwrap_or_default()
+        };
+        let (ruleset_arc, modifier_keys_arc, scope_registry_arc): RulesSnapshot = {
             let rules_guard = self.state.rules.read();
-            let info_guard = self.state.info_service.read();
-            let items = loc_completions(
-                &info_guard,
-                &language,
-                rules_guard.scope_registry.as_deref(),
-            );
-            if !items.is_empty() {
-                return Ok(Some(CompletionResponse::Array(items)));
+            (
+                rules_guard.ruleset.clone(),
+                rules_guard.modifier_keys.clone(),
+                rules_guard.scope_registry.clone(),
+            )
+        };
+        // Drop the read guard before the heavy work. Bump the generation
+        // check here too — the rule-snapshot block is cheap, but we want the
+        // staleness gate to cover the full body of the function from here.
+        if is_stale() {
+            return Ok(None);
+        }
+
+        // Localisation file — offer loc-key / data-function completions. The
+        // list is workspace-wide (every open `.yml` shares the same set), so
+        // cache it keyed by (info_revision, language) — a hit skips the
+        // `info.files` walk and the per-request scope-name build, both of
+        // which are expensive on a large mod and fire on every keystroke in
+        // the half-typed state.
+        if crate::paths::is_loc_file(&uri) {
+            let revision = self
+                .state
+                .info_revision
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(cached) = self.state.loc_cache.lock().as_ref()
+                && cached.revision == revision
+                && cached.language == language
+            {
+                let items = (*cached.items).clone();
+                if !items.is_empty() {
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: true,
+                        items,
+                    })));
+                }
+            } else {
+                let info_guard = self.state.info_service.read();
+                let items = loc_completions(&info_guard, &language, scope_registry_arc.as_deref());
+                if !items.is_empty() {
+                    *self.state.loc_cache.lock() = Some(CompletionCacheEntry {
+                        revision,
+                        language: language.clone(),
+                        items: std::sync::Arc::new(items.clone()),
+                    });
+                    return Ok(Some(CompletionResponse::List(CompletionList {
+                        is_incomplete: true,
+                        items,
+                    })));
+                }
             }
         }
 
         // `Some(items)` = the rule context resolved (items may still be empty:
         // an unknown block where suggestions from any other level would be
         // wrong). `None` = no doc/ruleset/AST — fall through to the flat list.
-        let context_items: Option<Vec<CompletionItem>> = {
-            // Lock order: documents -> rules -> info_service (see DocumentState).
-            let docs = self.state.documents.lock();
-            let rules_guard = self.state.rules.read();
-            let info_guard = self.state.info_service.read();
-
-            if let (Some(doc), Some(rs)) = (docs.get(&uri), rules_guard.ruleset.as_ref())
-                && let Some(ast) = &doc.ast
-            {
+        //
+        // Re-parse on demand when the AST is missing: the last parse failed
+        // (the user typed something unparseable), so `doc.ast` is None. Try
+        // a fresh parse for THIS request only — if the user has since added a
+        // `}` or fixed the syntax, the new AST is closer to the live text
+        // and `rules_at_pos` finds a useful context. The fresh AST is not
+        // written back; the debounced validate still owns the long-term one.
+        // Wrapped in `block_in_place` so the parse doesn't stall the async
+        // executor for slow large files.
+        let effective_ast: Option<Arc<ParsedFile>> = match doc_ast {
+            Some(ast) => Some(ast),
+            None => {
+                let text = doc_text.clone();
+                let table = self.state.string_table.clone();
+                tokio::task::block_in_place(|| {
+                    cwtools_parser::parser::parse_string(&text, &table)
+                        .ok()
+                        .map(Arc::new)
+                })
+            }
+        };
+        let context_items: Option<Vec<CompletionItem>> = match (effective_ast, ruleset_arc.as_ref())
+        {
+            (Some(ast), Some(rs)) => {
+                if is_stale() {
+                    return Ok(None);
+                }
+                let info_guard = self.state.info_service.read();
                 let game = cwtools_game::constants::Game::from_str(&language);
                 let prepared = crate::validate::make_prepared(
                     rs,
                     &self.state.string_table,
                     game,
                     &info_guard.type_index,
-                    &rules_guard.modifier_keys,
+                    &modifier_keys_arc,
                     None,
                     None,
-                    rules_guard.scope_registry.as_ref(),
+                    scope_registry_arc.as_ref(),
                     scope_checks,
                     var_checks,
                 );
-                match rules_at_pos(ast, &logical_path, &prepared, lsp_line, lsp_col) {
+                match rules_at_pos(&ast, &logical_path, &prepared, lsp_line, lsp_col) {
                     // Outside any known entity — offer root-type snippets.
                     None => Some(root_type_snippets(rs, &logical_path)),
                     Some(rctx) => {
@@ -88,10 +192,10 @@ impl Backend {
                                 &rctx.value_rules,
                                 rs,
                                 &info_guard,
-                                rules_guard.scope_registry.as_deref(),
+                                scope_registry_arc.as_deref(),
                                 &language,
                             )
-                        } else if let Some(key) = line_value_key(&doc.text, pos.line, pos.character)
+                        } else if let Some(key) = line_value_key(&doc_text, pos.line, pos.character)
                         {
                             // Mid-edit `key = |`: the last good parse has no such
                             // leaf yet; resolve the value rules from the live line.
@@ -105,7 +209,7 @@ impl Backend {
                                 &vr,
                                 rs,
                                 &info_guard,
-                                rules_guard.scope_registry.as_deref(),
+                                scope_registry_arc.as_deref(),
                                 &language,
                             )
                         } else {
@@ -114,20 +218,30 @@ impl Backend {
                                 rs,
                                 &info_guard,
                                 &language,
-                                &rules_guard.modifier_keys,
-                                rules_guard.scope_registry.as_deref(),
+                                &modifier_keys_arc,
+                                scope_registry_arc.as_deref(),
                             )
                         };
                         Some(items)
                     }
                 }
-            } else {
-                None
             }
+            _ => None,
         };
 
-        if let Some(items) = context_items {
-            return Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)));
+        if let Some(items) = context_items
+            && !items.is_empty()
+        {
+            // `is_incomplete` so the client re-queries on every keystroke.
+            // Without it, VS Code caches the list and filters client-side —
+            // which feels right until the half-typed state recovers (a new
+            // block, a recovered parse) and the cached list stays stuck on
+            // the wrong context. The re-query is cheap: the server returns
+            // the same items for a stable cursor.
+            return Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items,
+            })));
         }
 
         // Fallback: flat global list (original behavior) when context-aware
@@ -136,11 +250,32 @@ impl Backend {
         // like `check_variable = { … }`). On a large mod the workspace has tens
         // of thousands of variables/targets/keys, so cap the dump and flag the
         // result `is_incomplete` — the client re-requests as the user narrows.
+        //
+        // Cached by info revision: a hit skips the `info.files` walk that
+        // dominates the build time on a 7k-file mod. This is the case that
+        // fires on every keystroke in the half-typed state — the user is in a
+        // position the AST doesn't know about, context-aware returns None,
+        // and the fallback is the only thing returned. Without the cache,
+        // every keystroke re-walks every file's top-level keys.
+        let revision = self
+            .state
+            .info_revision
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(cached) = self.state.fallback_cache.lock().as_ref()
+            && cached.revision == revision
+        {
+            let items = (*cached.items).clone();
+            if !items.is_empty() {
+                return Ok(Some(CompletionResponse::List(CompletionList {
+                    is_incomplete: true,
+                    items,
+                })));
+            }
+        }
         const FALLBACK_CAP: usize = 2000;
         let mut items = Vec::new();
 
-        let rules_guard = self.state.rules.read();
-        if let Some(rules) = rules_guard.ruleset.as_ref() {
+        if let Some(rules) = ruleset_arc.as_ref() {
             for t in &rules.types {
                 if items.len() >= FALLBACK_CAP {
                     break;
@@ -164,7 +299,6 @@ impl Backend {
                 });
             }
         }
-        drop(rules_guard);
 
         let info = self.state.info_service.read();
         for var in info.variable_counts.keys() {
@@ -215,6 +349,11 @@ impl Backend {
             // real rule context becomes available — the "stuck on abc suggestions"
             // symptom. With is_incomplete, the next keystroke re-queries and the
             // context-aware list replaces it. (#41)
+            *self.state.fallback_cache.lock() = Some(CompletionCacheEntry {
+                revision,
+                language: String::new(),
+                items: std::sync::Arc::new(items.clone()),
+            });
             Ok(Some(CompletionResponse::List(CompletionList {
                 is_incomplete: true,
                 items,
