@@ -331,10 +331,24 @@ mod tests {
     use super::*;
     use cwtools_parser::parser::parse_string;
 
+    fn codes(script: &str) -> Vec<(String, u32, u16)> {
+        let table = StringTable::new();
+        let ast = parse_string(script, &table).unwrap();
+        let ruleset = RuleSet::new();
+        let mut errors = Vec::new();
+        validate_stellaris(&ast, &ruleset, &table, "test.txt", &mut errors);
+        errors
+            .into_iter()
+            .filter_map(|e| e.code.map(|c| (c.to_string(), e.line, e.col)))
+            .collect()
+    }
+
+    fn has_code(codes: &[(String, u32, u16)], code: &str) -> bool {
+        codes.iter().any(|(c, _, _)| c == code)
+    }
+
     #[test]
     fn child_key_eq_is_case_insensitive() {
-        // Paradox keys are case-insensitive, so mixed-case children must match
-        // their lowercase expected keys (#4).
         let table = StringTable::new();
         let ast = parse_string("root = {\n IF = {}\n Trigger = {}\n}\n", &table).unwrap();
         let block = as_block(&ast.root_children[0], &ast).expect("root is a block");
@@ -352,5 +366,133 @@ mod tests {
                 .any(|c| child_key_eq(c, &ast, &table, "trigger")),
             "`Trigger` should match expected `trigger`"
         );
+    }
+
+    // ── Event validation (CW107) ──────────────────────────────────────────────
+
+    #[test]
+    fn event_without_mtth_or_trigger_is_cw107() {
+        let c = codes("my_event = { }\n");
+        assert!(
+            has_code(&c, "CW107"),
+            "event with no MTTH/trigger/once should emit CW107, got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn event_with_mtth_is_clean() {
+        let c = codes("my_event = { mean_time_to_happen = { years = 5 } }\n");
+        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_is_triggered_only_is_clean() {
+        let c = codes("my_event = { is_triggered_only = yes }\n");
+        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_fire_only_once_is_clean() {
+        let c = codes("my_event = { fire_only_once = yes }\n");
+        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_trigger_always_no_is_clean() {
+        let c = codes("my_event = { trigger = { always = no } }\n");
+        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_trigger_always_yes_still_cw107() {
+        // `trigger = { always = yes }` does NOT suppress CW107; only always=no does.
+        let c = codes("my_event = { trigger = { always = yes } }\n");
+        assert!(has_code(&c, "CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn non_event_root_is_not_cw107() {
+        // The CW107 check is scoped to *_event / event keys only.
+        let c = codes("foo = { }\n");
+        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
+    }
+
+    // ── Pre-trigger placement (CW301) ───────────────────────────────────────
+
+    #[test]
+    fn pre_trigger_inside_trigger_is_cw301() {
+        let c = codes(
+            "my_event = {\n\
+             mean_time_to_happen = { years = 5 }\n\
+             trigger = { is_ai = yes }\n\
+             }\n",
+        );
+        assert!(
+            has_code(&c, "CW301"),
+            "pre-trigger inside trigger block should emit CW301, got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn pre_trigger_at_root_is_clean() {
+        // `is_ai` at the event root is the preferred (pre-trigger) location.
+        let c = codes(
+            "my_event = {\n\
+             mean_time_to_happen = { years = 5 }\n\
+             is_ai = yes\n\
+             }\n",
+        );
+        assert!(!has_code(&c, "CW301"), "got: {:?}", c);
+    }
+
+    // ── Deprecated set_name (CW253) ───────────────────────────────────────────
+
+    #[test]
+    fn set_empire_name_is_cw253() {
+        let c = codes("foo = { set_empire_name = { key = \"X\" } }\n");
+        assert!(has_code(&c, "CW253"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn set_planet_name_is_cw253() {
+        let c = codes("foo = { set_planet_name = { key = \"Y\" } }\n");
+        assert!(has_code(&c, "CW253"), "got: {:?}", c);
+    }
+
+    // ── If/else structural hints (CW236/CW237/CW238) ──────────────────────────
+
+    #[test]
+    fn deprecated_nested_else_is_cw236() {
+        // Old Stellaris style: if = { else = { ... } } without an inner if.
+        let c = codes("foo = { if = { limit = { } else = { a = 1 } } }\n");
+        assert!(has_code(&c, "CW236"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn ambiguous_if_with_else_and_inner_if_is_cw237() {
+        // `if = { if ... else }` is ambiguous nesting.
+        let c = codes("foo = { if = { limit = { } if = { a = 1 } else = { b = 2 } } }\n");
+        assert!(has_code(&c, "CW237"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn else_without_preceding_if_is_cw238() {
+        let c = codes("foo = { else = { a = 1 } }\n");
+        assert!(has_code(&c, "CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn properly_ordered_if_else_if_is_clean() {
+        let c = codes("foo = { if = { limit = { } a = 1 } else_if = { limit = { } b = 2 } }\n");
+        assert!(!has_code(&c, "CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn nested_limit_and_modifier_do_not_false_positive() {
+        // `limit` and `modifier` blocks are excluded from the if/else order walk.
+        let c = codes("foo = { limit = { } modifier = { } }\n");
+        assert!(!has_code(&c, "CW236") && !has_code(&c, "CW237") && !has_code(&c, "CW238"));
     }
 }

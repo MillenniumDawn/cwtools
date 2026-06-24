@@ -415,4 +415,31 @@ mod tests {
         assert!(reg.id_of("country").is_some());
         assert!(reg.id_of("planet").is_none(), "no hardcoded HOI4 backfill");
     }
+
+    /// #184: the redundant mixed-case "Alliance" alias was dropped from the
+    /// Stellaris Federation scope. It was redundant because `id_of` already
+    /// lowercases on its uppercase-fallback path, so `Alliance` resolves through
+    /// the `alliance` alias. This pins that all three forms still map to the one
+    /// Federation id after the removal.
+    #[test]
+    fn stellaris_federation_resolves_via_alliance_alias() {
+        let reg = ScopeRegistry::from_hardcoded(Game::Stellaris);
+        let fed = reg.id_of("federation").expect("federation scope resolves");
+        assert_eq!(
+            reg.id_of("alliance"),
+            Some(fed),
+            "the lowercase `alliance` alias maps to Federation",
+        );
+        assert_eq!(
+            reg.id_of("Alliance"),
+            Some(fed),
+            "mixed-case `Alliance` resolves via id_of's uppercase fallback, so the \
+             explicit `Alliance` alias entry was redundant",
+        );
+        assert_eq!(
+            reg.id_of("Federation"),
+            Some(fed),
+            "the mixed-case scope name resolves too",
+        );
+    }
 }

@@ -254,6 +254,70 @@ foo = {
     assert!(!codes.contains(&"CW235".to_string()), "got: {:?}", codes);
 }
 
+/// Validate `script` against a content-free `foo` type with `modifiers` as the
+/// dynamic-modifier set. Returns the emitted codes. The modifier set is the
+/// lowercase canonical form the loader builds.
+fn modifier_codes(modifiers: &[&str], script: &str) -> Vec<String> {
+    let table = StringTable::new();
+    let cwt = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    dummy = scalar
+}
+"#;
+    let ruleset = ast_to_ruleset(&parse_string(cwt, &table).unwrap(), &table);
+    let mods: HashSet<String> = modifiers.iter().map(|m| m.to_string()).collect();
+    let parsed = parse_string(script, &table).unwrap();
+    let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
+    validate_prepared(
+        &parsed,
+        "game/common/foo/test.txt",
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(Game::Hoi4),
+            type_index: None,
+            modifier_keys: Some(&mods),
+            loc_index: None,
+            extra_loc_keys: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: false,
+        },
+    )
+    .into_iter()
+    .filter_map(|e| e.code.map(String::from))
+    .collect()
+}
+
+#[test]
+fn mixed_case_modifier_key_accepted_silently() {
+    // The modifier set is lowercase; a mixed-case leaf key with no candidate rule
+    // must be lowercased before the membership test. After `key_lower` went lazy
+    // (computed only in the no-candidate branch), a mixed-case key would flag
+    // CW262/CW263 if the lowercasing were dropped — so this pins it.
+    let c = modifier_codes(&["attack_factor"], "foo = { Attack_Factor = 0.05 }");
+    assert!(
+        !c.contains(&"CW263".to_string()) && !c.contains(&"CW262".to_string()),
+        "a mixed-case known modifier must be accepted silently (lazy key_lower must \
+         still lowercase), got: {:?}",
+        c
+    );
+}
+
+#[test]
+fn mixed_case_zero_modifier_still_fires_cw235() {
+    // CW235 fires on a confirmed modifier set to 0. With a mixed-case key this only
+    // works if the lazy lowercase form is matched against the (lowercase) modifier
+    // set — proving the lowercase path survived the lazy refactor.
+    let c = modifier_codes(&["attack_factor"], "foo = { Attack_Factor = 0 }");
+    assert!(
+        c.contains(&"CW235".to_string()),
+        "a mixed-case zero modifier must still fire CW235, got: {:?}",
+        c
+    );
+}
+
 /// A trigger that matches a key ONLY via an unpopulated game-derived enum must
 /// not inherit that alias's `## scope`. Regression for the resource-in-state
 /// false positive: `oil` matched an empty `enum[equipment_category]` (scope

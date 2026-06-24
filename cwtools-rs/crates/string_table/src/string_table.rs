@@ -15,12 +15,10 @@ impl StringId {
 /// Mirrors the F# `StringTokens` struct.
 /// `lower`  → ID of the lower‑cased canonical form.
 /// `normal` → ID of the exact (case‑preserving) string.
-/// `quoted` → whether the original was surrounded by `"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StringTokens {
     pub lower: StringId,
     pub normal: StringId,
-    pub quoted: bool,
 }
 
 struct Inner {
@@ -46,7 +44,6 @@ struct Inner {
 /// * Two IDs per logical entry: a *normal* ID (exact text) and a *lower* ID
 ///   (canonical lower‑cased form).  Multiple normal strings may share the same
 ///   lower ID.
-/// * `quoted` is tracked per‑normal variant.
 pub struct StringTable {
     // RwLock (not Mutex): validation is read-only on the table (only
     // `get_string`), so once parsing has interned everything the
@@ -106,7 +103,6 @@ impl StringTable {
             return StringTokens {
                 lower: StringId(0),
                 normal: StringId(0),
-                quoted: false,
             };
         }
 
@@ -129,9 +125,9 @@ impl StringTable {
     /// Returns one [`StringTokens`] per input, in order. The result for each
     /// string is byte-for-byte identical to calling [`intern`](Self::intern) on
     /// it individually (same ID assignment order, same lower-companion
-    /// interning, same `quoted` flag) — this just amortizes the lock and
-    /// double-checked-locking overhead across the whole batch, which matters on
-    /// cache load where every string is a fresh miss.
+    /// interning) — this just amortizes the lock and double-checked-locking
+    /// overhead across the whole batch, which matters on cache load where every
+    /// string is a fresh miss.
     pub fn intern_batch<'a, I>(&self, it: I) -> Vec<StringTokens>
     where
         I: IntoIterator<Item = &'a str>,
@@ -146,7 +142,6 @@ impl StringTable {
                 out.push(StringTokens {
                     lower: StringId(0),
                     normal: StringId(0),
-                    quoted: false,
                 });
             } else {
                 out.push(intern_locked(&mut inner, s));
@@ -263,9 +258,6 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
         return existing;
     }
 
-    // A lone `"` satisfies both starts_with and ends_with (same character),
-    // so require at least 2 chars for the quoted detection.
-    let quoted = s.len() >= 2 && s.starts_with('"') && s.ends_with('"');
     let lower_key = s.to_lowercase();
 
     // Fast path 2: lower key exists → allocate new normal variant.
@@ -281,7 +273,6 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
         let token = StringTokens {
             lower: existing_lower.lower,
             normal: StringId(normal_id),
-            quoted,
         };
         inner.exact_map.insert(normal_arc, token);
         return token;
@@ -308,12 +299,10 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
     let lower_token = StringTokens {
         lower: StringId(lower_id),
         normal: StringId(lower_id),
-        quoted: false,
     };
     let normal_token = StringTokens {
         lower: StringId(lower_id),
         normal: StringId(normal_id),
-        quoted,
     };
 
     inner.lower_map.insert(lower_arc, lower_token);
@@ -358,15 +347,6 @@ mod tests {
             table.with_string(a.normal, |s| s.to_string()),
             table.get_string(a.normal)
         );
-    }
-
-    #[test]
-    fn quoted_flag() {
-        let table = StringTable::new();
-        let a = table.intern("\"foo\"");
-        let b = table.intern("foo");
-        assert!(a.quoted);
-        assert!(!b.quoted);
     }
 
     #[test]

@@ -206,8 +206,6 @@ mod tests {
 
     #[test]
     fn excluded_loc_dirs_skip_tooling_not_content() {
-        // Tooling / VCS / mirror dirs are skipped so a duplicated mod tree under
-        // them isn't double-counted; real content dirs are kept.
         for skip in [
             ".claude",
             ".git",
@@ -221,5 +219,260 @@ mod tests {
         for keep in ["localisation", "localization", "common", "english"] {
             assert!(!is_excluded_loc_dir(keep), "{keep} should be walked");
         }
+    }
+
+    #[test]
+    fn from_files_parses_yaml_and_records_language() {
+        let svc = LocService::from_files(vec![(
+            "mod/localisation/english/test_l_english.yml".to_string(),
+            r#"l_english:
+ my_key:0 "value"
+"#
+            .to_string(),
+        )]);
+        assert!(svc.errors().is_empty(), "{:?}", svc.errors());
+        let files = svc.files();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].lang, Some(Lang::English));
+        assert_eq!(files[0].entries.len(), 1);
+        assert_eq!(files[0].entries[0].key, "my_key");
+        assert!(files[0].entries[0].desc.contains("value"));
+    }
+
+    #[test]
+    fn from_files_merges_keys_from_multiple_files_same_language() {
+        let svc = LocService::from_files(vec![
+            (
+                "a_l_english.yml".to_string(),
+                r#"l_english:
+ first:0 "A"
+"#
+                .to_string(),
+            ),
+            (
+                "b_l_english.yml".to_string(),
+                r#"l_english:
+ second:0 "B"
+ first:0 "A2"
+"#
+                .to_string(),
+            ),
+        ]);
+        assert!(svc.errors().is_empty(), "{:?}", svc.errors());
+        let english: Vec<&LocFile> = svc
+            .files()
+            .iter()
+            .filter(|f| f.lang == Some(Lang::English))
+            .collect();
+        assert_eq!(english.len(), 2);
+        let all_keys: Vec<&str> = english
+            .iter()
+            .flat_map(|f| f.entries.iter().map(|e| e.key.as_str()))
+            .collect();
+        assert!(all_keys.contains(&"first"));
+        assert!(all_keys.contains(&"second"));
+        assert_eq!(english[0].entries[0].desc, "\"A\"");
+    }
+
+    #[test]
+    fn from_files_preserves_file_order() {
+        let svc = LocService::from_files(vec![
+            (
+                "z_l_english.yml".to_string(),
+                r#"l_english:
+ z:0 "Z"
+"#
+                .to_string(),
+            ),
+            (
+                "a_l_english.yml".to_string(),
+                r#"l_english:
+ a:0 "A"
+"#
+                .to_string(),
+            ),
+        ]);
+        assert_eq!(svc.files()[0].path, "z_l_english.yml");
+        assert_eq!(svc.files()[1].path, "a_l_english.yml");
+    }
+
+    #[test]
+    fn from_files_reports_parse_errors_without_panicking() {
+        let svc = LocService::from_files(vec![(
+            "broken_l_english.yml".to_string(),
+            "this is not a valid loc file\n".to_string(),
+        )]);
+        assert!(
+            !svc.errors().is_empty(),
+            "parse errors should be collected, not panic"
+        );
+        assert_eq!(svc.files().len(), 0);
+    }
+
+    #[test]
+    fn from_files_with_encoding_records_bom_status() {
+        let svc = LocService::from_files_with_encoding(vec![(
+            "bom_l_english.yml".to_string(),
+            r#"l_english:
+ key:0 "v"
+"#
+            .to_string(),
+            Some(cwtools_file_manager::FileEncoding::Utf8Bom),
+        )]);
+        assert_eq!(svc.files().len(), 1);
+        assert_eq!(
+            svc.files()[0].encoding,
+            Some(cwtools_file_manager::FileEncoding::Utf8Bom)
+        );
+    }
+
+    #[test]
+    fn from_folder_skips_non_localisation_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("not_loc")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("localisation")).unwrap();
+        std::fs::write(
+            tmp.path().join("not_loc").join("bad_l_english.yml"),
+            r#"l_english:
+ key:0 "v"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("localisation").join("good_l_english.yml"),
+            r#"l_english:
+ key:0 "v"
+"#,
+        )
+        .unwrap();
+
+        let svc = LocService::from_folder(tmp.path());
+        assert_eq!(svc.files().len(), 1);
+        assert!(
+            svc.files()[0]
+                .path
+                .ends_with("localisation/good_l_english.yml")
+        );
+    }
+
+    #[test]
+    fn from_folder_skips_excluded_dot_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude").join("localisation")).unwrap();
+        std::fs::write(
+            tmp.path()
+                .join(".claude")
+                .join("localisation")
+                .join("dup_l_english.yml"),
+            r#"l_english:
+ key:0 "v"
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("localisation")).unwrap();
+        std::fs::write(
+            tmp.path().join("localisation").join("good_l_english.yml"),
+            r#"l_english:
+ key:0 "v"
+"#,
+        )
+        .unwrap();
+
+        let svc = LocService::from_folder(tmp.path());
+        assert_eq!(svc.files().len(), 1);
+        assert!(
+            svc.files()[0]
+                .path
+                .ends_with("localisation/good_l_english.yml")
+        );
+    }
+
+    #[test]
+    fn from_files_routes_csv_to_csv_parser() {
+        let csv = "#CODE;English;French;German;;Spanish\nKEY_A;Hello;Bonjour;Hallo;;Hola\n";
+        let svc = LocService::from_files(vec![(
+            "mod/localisation/localisation.csv".to_string(),
+            csv.to_string(),
+        )]);
+        assert!(svc.errors().is_empty(), "{:?}", svc.errors());
+        let langs = svc.languages();
+        assert!(langs.contains(&Lang::English), "got: {:?}", langs);
+        assert!(langs.contains(&Lang::French), "got: {:?}", langs);
+        assert!(
+            svc.files().iter().any(|f| {
+                f.path.ends_with("localisation.csv")
+                    && f.lang == Some(Lang::English)
+                    && f.entries
+                        .iter()
+                        .any(|e| e.key == "KEY_A" && e.desc == "Hello")
+            }),
+            "CSV should produce English LocFile with KEY_A: {:?}",
+            svc.files()
+        );
+    }
+
+    #[test]
+    fn from_folders_merges_multiple_roots() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(a.path().join("localisation")).unwrap();
+        std::fs::create_dir_all(b.path().join("localisation")).unwrap();
+        std::fs::write(
+            a.path().join("localisation").join("a_l_english.yml"),
+            r#"l_english:
+ a:0 "A"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            b.path().join("localisation").join("b_l_english.yml"),
+            r#"l_english:
+ b:0 "B"
+"#,
+        )
+        .unwrap();
+
+        let svc = LocService::from_folders(&[a.path(), b.path()]);
+        let paths: Vec<&str> = svc.files().iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            paths.iter().any(|p| p.contains("a_l_english.yml")),
+            "folder a missing: {:?}",
+            paths
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("b_l_english.yml")),
+            "folder b missing: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn languages_returns_unique_langs() {
+        let svc = LocService::from_files(vec![
+            (
+                "a_l_english.yml".to_string(),
+                r#"l_english:
+ a:0 "A"
+"#
+                .to_string(),
+            ),
+            (
+                "b_l_english.yml".to_string(),
+                r#"l_english:
+ b:0 "B"
+"#
+                .to_string(),
+            ),
+            (
+                "c_l_french.yml".to_string(),
+                r#"l_french:
+ c:0 "C"
+"#
+                .to_string(),
+            ),
+        ]);
+        let mut langs = svc.languages();
+        langs.sort_by_key(|l| format!("{l}"));
+        assert_eq!(langs, vec![Lang::English, Lang::French]);
     }
 }

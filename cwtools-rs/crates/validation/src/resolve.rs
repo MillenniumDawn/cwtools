@@ -328,6 +328,148 @@ pub(crate) fn find_grandchild_type<'a>(
     generic
 }
 
+/// Whether a type has its own validation rules, rather than being an index-only
+/// `type[x]` declaration (path/name_field with no rule body) that exists solely
+/// to register instances.
+pub(crate) fn type_has_content(td: &TypeDefinition, rules: &[(RuleType, Options)]) -> bool {
+    !rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty())
+}
+
+/// The best path candidate that carries an actual rule body, ignoring index-only
+/// types. Used as a navigation fallback when the top path+key match is a
+/// rule-less skip wrapper whose content is validated by a sibling base type
+/// (e.g. the `on_action` base owns the rules that `on_weekly`/`on_daily`
+/// instances under `on_actions = { }` are checked against).
+pub(crate) fn best_content_type<'a>(
+    candidates: &[PathCandidate<'a>],
+    root_key: &str,
+    ruleset: &'a RuleSet,
+) -> Option<&'a TypeDefinition> {
+    let filtered: Vec<PathCandidate<'a>> = candidates
+        .iter()
+        .filter(|c| type_has_content(c.type_def, find_rules_by_name(&c.type_def.name, ruleset)))
+        .map(|c| PathCandidate {
+            type_def: c.type_def,
+            base_weight: c.base_weight,
+        })
+        .collect();
+    find_type_from_candidates(&filtered, Some(root_key))
+}
+
+/// What a root key resolves to, shared by the validator (`validate_prepared`)
+/// and the editor navigator (`rules_at_pos`). The two callers must agree on
+/// which `TypeDefinition` owns a node — see [`resolve_root_child`].
+pub(crate) enum ResolvedType<'a> {
+    /// Validate / enter the node itself as an instance of `type_def`.
+    Entity {
+        type_def: &'a TypeDefinition,
+        inner_rules: &'a [(RuleType, Options)],
+    },
+    /// The node is a `skip_root_key` wrapper; its children are the instances.
+    /// Descend through it rather than treating the node as content.
+    Wrapper {
+        type_def: &'a TypeDefinition,
+        inner_rules: &'a [(RuleType, Options)],
+        skip_tail: &'a [SkipRootKey],
+    },
+    /// No type applies, or the match is index-only (no rule body) — skip.
+    None,
+}
+
+/// Inputs shared across per-root-child resolution. `path_candidates` is computed
+/// once per file (it depends only on the path, not the key) and reused for every
+/// child.
+pub(crate) struct DispatchInput<'a> {
+    pub ruleset: &'a RuleSet,
+    pub file_path: &'a str,
+    pub path_candidates: &'a [PathCandidate<'a>],
+    /// When true (navigation), a path match that is an index-only skip wrapper
+    /// falls back to the best content-bearing sibling type so the cursor can
+    /// still descend (e.g. `on_actions` -> `on_action`). The validator passes
+    /// false: it skips such roots rather than content-validating them.
+    pub allow_content_fallback: bool,
+}
+
+/// Resolve which type owns a root node, given its key. The dispatch tree that
+/// `validate_prepared` and `rules_at_pos` previously each carried a copy of:
+/// exact root-key match first, then path-based fallback. The only behavioral
+/// difference between the two callers is `allow_content_fallback` (see
+/// [`DispatchInput`]); keeping one copy here removes the drift risk that the two
+/// trees fall out of step.
+pub(crate) fn resolve_root_child<'a>(
+    input: &DispatchInput<'a>,
+    root_key: &str,
+) -> ResolvedType<'a> {
+    let ruleset = input.ruleset;
+
+    // 1. Exact root-key match (e.g. `ai_strategy_plan = { ... }`).
+    if let Some((td, inner_rules)) =
+        find_type_and_rules_for_file(root_key, input.file_path, ruleset)
+    {
+        // A type gated by skip_root_key only applies when the matched key is one
+        // of its skip keys (the key IS the wrapper). If it declares skip_root_key
+        // but this key matches none, the name-match is spurious — fall through to
+        // path matching so another type whose skip_root_key IS this key can own it.
+        let skips = should_skip_root_key(root_key, td);
+        let skip_gate_ok = td.skip_root_key.is_empty() || skips;
+        // Only content-validate when the matched type actually has rules; a
+        // type[x] declared solely for instance indexing must not flag its fields.
+        if type_has_content(td, inner_rules) && skip_gate_ok {
+            return if skips {
+                ResolvedType::Wrapper {
+                    type_def: td,
+                    inner_rules,
+                    skip_tail: skip_root_key_tail(td),
+                }
+            } else {
+                ResolvedType::Entity {
+                    type_def: td,
+                    inner_rules,
+                }
+            };
+        }
+        // matched by name but instance-only / skip-gate mismatch: fall through.
+    }
+
+    // 2. Path-based fallback. Re-query with the actual root key so a type with a
+    // matching skip_root_key can beat a longer-path type that lacks one.
+    let Some(mut td) = find_type_from_candidates(input.path_candidates, Some(root_key)) else {
+        return ResolvedType::None;
+    };
+    let mut inner_rules = find_rules_by_name(&td.name, ruleset);
+    if !type_has_content(td, inner_rules) {
+        // Index-only `type[x]` (path/name_field, no rule body): its instances are
+        // not content-validated. The validator skips; navigation falls back to a
+        // content-bearing sibling type so the cursor can still descend.
+        if !input.allow_content_fallback {
+            return ResolvedType::None;
+        }
+        let Some(better) = best_content_type(input.path_candidates, root_key, ruleset) else {
+            return ResolvedType::None;
+        };
+        td = better;
+        inner_rules = find_rules_by_name(&td.name, ruleset);
+    }
+    if should_skip_root_key(root_key, td) {
+        // skip_root_key = ...: the node is a WRAPPER — descend into its children.
+        return ResolvedType::Wrapper {
+            type_def: td,
+            inner_rules,
+            skip_tail: skip_root_key_tail(td),
+        };
+    }
+    if !td.skip_root_key.is_empty() {
+        // skip_root_key gate: the type declares skip keys but this root matches
+        // none, so the type does not apply to this root.
+        return ResolvedType::None;
+    }
+    // No skip_root_key — the root node itself is the instance.
+    ResolvedType::Entity {
+        type_def: td,
+        inner_rules,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
