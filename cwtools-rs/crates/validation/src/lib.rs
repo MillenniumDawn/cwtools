@@ -27,8 +27,8 @@ pub use subtype::collect_subtype_instances;
 use common::{leaf_value_to_string, path_contains_segment};
 use ctx::ValidationCtx;
 use resolve::{
-    find_grandchild_type, find_rules_by_name, find_type_and_rules_for_file, find_type_by_path,
-    find_type_from_candidates, path_candidates_for_file, should_skip_root_key, skip_root_key_tail,
+    DispatchInput, ResolvedType, find_grandchild_type, find_rules_by_name, find_type_by_path,
+    path_candidates_for_file, resolve_root_child, type_has_content,
 };
 use rule_core::validate_with_type;
 use scope::build_scope_registry;
@@ -121,11 +121,9 @@ fn validate_wrapper_grandchildren(
             match find_grandchild_type(file_path, wrapper_root_key, &gc_key, ruleset) {
                 Some(t) => {
                     let r = find_rules_by_name(&t.name, ruleset);
-                    let has_content =
-                        !r.is_empty() || t.subtypes.iter().any(|st| !st.rules.is_empty());
                     // Resolved to an index-only type (no rule body): its fields
                     // are not content-validated, so don't flag them.
-                    if !has_content {
+                    if !type_has_content(t, r) {
                         continue;
                     }
                     (t, r)
@@ -359,9 +357,7 @@ pub fn validate_prepared(
         && td.type_per_file
     {
         let inner_rules = find_rules_by_name(&td.name, ruleset);
-        let has_content_rules =
-            !inner_rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty());
-        if has_content_rules {
+        if type_has_content(td, inner_rules) {
             validate_with_type(
                 &ctx,
                 td,
@@ -379,156 +375,55 @@ pub fn validate_prepared(
         return errors;
     }
 
+    // Resolve each root child's owning type (exact root-key match, then path
+    // fallback) via the shared dispatch, then validate accordingly. The navigator
+    // (`rules_at_pos`) runs the identical resolution; `allow_content_fallback` is
+    // the one place they differ — the validator never content-validates an
+    // index-only path match (it skips), so it passes false.
+    let dispatch = DispatchInput {
+        ruleset,
+        file_path,
+        path_candidates: &path_candidates,
+        allow_content_fallback: false,
+    };
     for child in &ast.root_children {
-        // 1. Try exact root key match (e.g. ai_strategy_plan = { ... })
-        let exact_match = match child {
-            Child::Leaf(leaf_idx) => {
-                let leaf = &ast.arena.leaves[*leaf_idx as usize];
-                let key = table.get_string(leaf.key.normal).unwrap_or_default();
-                let pos = (leaf.pos.start.line, leaf.pos.start.col);
-                if let Value::Clause(children) = &leaf.value {
-                    find_type_and_rules_for_file(&key, file_path, ruleset)
-                        .map(|(td, rules)| (key.clone(), td, children.as_slice(), rules, pos))
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        let Child::Leaf(leaf_idx) = child else {
+            continue;
         };
-
-        if let Some((type_key, type_def, children, inner_rules, node_pos)) = exact_match {
-            // Only content-validate when the matched type actually has rules; a
-            // type[x] declared solely for instance indexing (path/name_field, no
-            // rule body) must not flag its instance fields as unexpected.
-            let has_content_rules =
-                !inner_rules.is_empty() || type_def.subtypes.iter().any(|st| !st.rules.is_empty());
-            // A type gated by skip_root_key only applies when the matched key is one
-            // of its skip keys (i.e. the key IS the wrapper). If it declares
-            // skip_root_key(s) but this key matches none, the name-match is spurious:
-            // the type's instances live nested under its wrapper, not at a root key
-            // equal to the type name (F# RulesHelpers.fs:98-112 only descends through
-            // the skip wrapper, never treats a name-matching root as an instance).
-            // Fall through to path matching so another type whose skip_root_key IS
-            // this key (e.g. `terrain={}` -> graphical_terrain) can own it.
-            let skip_gate_ok =
-                type_def.skip_root_key.is_empty() || should_skip_root_key(&type_key, type_def);
-            if has_content_rules && skip_gate_ok {
-                // When the matched key is itself a skip_root_key wrapper for this
-                // type (e.g. `ability = { force_attack = { ... } }` where the type
-                // is `ability` AND skip_root_key = ability), the key is a wrapper,
-                // not an instance: its children are the instances. Validate them as
-                // grandchildren instead of treating them as the type's content.
-                if should_skip_root_key(&type_key, type_def) {
-                    validate_wrapper_grandchildren(
-                        &ctx,
-                        children,
-                        type_def,
-                        &type_key,
-                        inner_rules,
-                        skip_root_key_tail(type_def),
-                        &mut scope_context,
-                        &mut errors,
-                    );
-                } else {
-                    validate_with_type(
-                        &ctx,
-                        type_def,
-                        children,
-                        inner_rules,
-                        &mut scope_context,
-                        Some(&type_key),
-                        node_pos,
-                        &mut errors,
-                    );
-                }
-                continue;
-            }
-            // matched by name but instance-only: fall through to path matching
-        }
-
-        // 2. Fallback: path-based matching.
-        // Re-query with the actual root key so that a type with a matching
-        // skip_root_key can beat a longer-path type that has no such
-        // relationship (e.g. `pdxmesh { skip_root_key = objectTypes }` should
-        // win over `light { path = gfx/entities }` for an objectTypes node).
-        let child_root_key = match child {
-            Child::Leaf(leaf_idx) => table
-                .get_string(ast.arena.leaves[*leaf_idx as usize].key.normal)
-                .unwrap_or_default(),
-            _ => String::new(),
+        let leaf = &ast.arena.leaves[*leaf_idx as usize];
+        let Value::Clause(children) = &leaf.value else {
+            continue;
         };
-        let path_type_for_child =
-            find_type_from_candidates(&path_candidates, Some(&child_root_key));
-        if let Some(type_def) = path_type_for_child {
-            let inner_rules = find_rules_by_name(&type_def.name, ruleset);
-
-            // A `type[x] = { path = ... name_field = ... }` with no associated rule
-            // body exists only to index instances of that type; its instances are
-            // not content-validated. Skip when there is nothing to
-            // validate against, otherwise every field reads as "unexpected".
-            let has_content_rules =
-                !inner_rules.is_empty() || type_def.subtypes.iter().any(|st| !st.rules.is_empty());
-            if !has_content_rules {
-                continue;
-            }
-
-            // If skip_root_key = any, the root node is a WRAPPER — validate its children individually.
-            // A wrapper is ONLY signalled by skip_root_key. A subtype whose name
-            // equals the root key is NOT a wrapper — that's the type_key_filter
-            // discriminator pattern (e.g. `country_event = { ... }` selects the
-            // `country_event` subtype of `event`); the node is the instance and
-            // its children are the content, not a wrapper layer to skip.
-            if should_skip_root_key(&child_root_key, type_def) {
-                let grandchildren: &[Child] = match child {
-                    Child::Leaf(leaf_idx) => {
-                        let leaf = &ast.arena.leaves[*leaf_idx as usize];
-                        if let Value::Clause(ref ch) = leaf.value {
-                            ch.as_slice()
-                        } else {
-                            &[]
-                        }
-                    }
-                    _ => &[],
-                };
-                validate_wrapper_grandchildren(
-                    &ctx,
-                    grandchildren,
-                    type_def,
-                    &child_root_key,
-                    inner_rules,
-                    skip_root_key_tail(type_def),
-                    &mut scope_context,
-                    &mut errors,
-                );
-                continue;
-            }
-
-            // The type declares skip_root_key(s) but this root matches none of them:
-            // the type does not apply to this root (skip_root_key gate). Skip it
-            // rather than validating the root directly — otherwise an unrelated file
-            // sharing the path (e.g. `leader_skills` under common/unit_leader, where
-            // the only type is `unit_leader_trait` with skip_root_key = leader_traits)
-            // gets its children flagged as unexpected.
-            if !type_def.skip_root_key.is_empty() {
-                continue;
-            }
-
-            // No skip_root_key — validate the root node itself normally
-            if let Child::Leaf(leaf_idx) = child {
-                let leaf = &ast.arena.leaves[*leaf_idx as usize];
-                if let Value::Clause(children) = &leaf.value {
-                    validate_with_type(
-                        &ctx,
-                        type_def,
-                        children.as_slice(),
-                        inner_rules,
-                        &mut scope_context,
-                        Some(&child_root_key),
-                        (leaf.pos.start.line, leaf.pos.start.col),
-                        &mut errors,
-                    );
-                }
-            }
+        let root_key = table.get_string(leaf.key.normal).unwrap_or_default();
+        match resolve_root_child(&dispatch, &root_key) {
+            ResolvedType::Entity {
+                type_def,
+                inner_rules,
+            } => validate_with_type(
+                &ctx,
+                type_def,
+                children.as_slice(),
+                inner_rules,
+                &mut scope_context,
+                Some(&root_key),
+                (leaf.pos.start.line, leaf.pos.start.col),
+                &mut errors,
+            ),
+            ResolvedType::Wrapper {
+                type_def,
+                inner_rules,
+                skip_tail,
+            } => validate_wrapper_grandchildren(
+                &ctx,
+                children.as_slice(),
+                type_def,
+                &root_key,
+                inner_rules,
+                skip_tail,
+                &mut scope_context,
+                &mut errors,
+            ),
+            ResolvedType::None => {}
         }
     }
 

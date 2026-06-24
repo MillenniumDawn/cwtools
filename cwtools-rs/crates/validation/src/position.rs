@@ -17,9 +17,8 @@ use cwtools_rules::rules_types::*;
 use crate::common::{leaf_value_to_string, unquote_key};
 use crate::ctx::ValidationCtx;
 use crate::resolve::{
-    PathCandidate, find_grandchild_type, find_rules_by_name, find_type_and_rules_for_file,
-    find_type_by_path, find_type_from_candidates, path_candidates_for_file, should_skip_root_key,
-    skip_root_key_tail,
+    DispatchInput, ResolvedType, find_grandchild_type, find_rules_by_name, find_type_by_path,
+    path_candidates_for_file, resolve_root_child, type_has_content,
 };
 use crate::rule_core::{
     alias_overloads, flatten_nested_subtype_rules, matching_candidates, merged_rules_for_type,
@@ -150,109 +149,50 @@ pub fn rules_at_pos(
         return None;
     }
 
-    // 1. Exact root-key match — mirrors validate_prepared.
-    if let Some((td, inner_rules)) = find_type_and_rules_for_file(&root_key, file_path, ruleset) {
-        let has_content = type_has_content(td, inner_rules);
-        let skips = should_skip_root_key(&root_key, td);
-        let skip_gate_ok = td.skip_root_key.is_empty() || skips;
-        if has_content && skip_gate_ok {
-            if skips {
-                return descend_wrapper(
-                    &ctx,
-                    children,
-                    td,
-                    &root_key,
-                    inner_rules,
-                    skip_root_key_tail(td),
-                    &mut scope_context,
-                    line,
-                    col,
-                );
-            }
-            return Some(enter_entity(
-                &ctx,
-                td,
-                children,
-                inner_rules,
-                Some(&root_key),
-                &mut scope_context,
-                line,
-                col,
-            ));
-        }
-    }
-
-    // 2. Path-based fallback — mirrors validate_prepared.
+    // Resolve which type owns this root node (exact root-key match, then path
+    // fallback) via the shared dispatch, then descend toward the cursor.
+    // Navigation opts into the content-bearing fallback (`allow_content_fallback`)
+    // so the cursor can still descend through a rule-less skip wrapper whose body
+    // lives in a sibling base type (e.g. `on_actions` -> `on_action`).
     let file_path_lower = file_path.to_lowercase();
-    let candidates = path_candidates_for_file(&file_path_lower, ruleset);
-    let mut td = find_type_from_candidates(&candidates, Some(&root_key))?;
-    let mut inner_rules = find_rules_by_name(&td.name, ruleset);
-    // The top path+key match can be an index-only skip wrapper whose rule body
-    // lives in a sibling base type. `on_actions` resolves to the `on_weekly`
-    // wrapper (skip_root_key = on_actions, no rules) over the `on_action` base
-    // type that actually carries `on_weekly = single_alias_right[...]`. The
-    // validator simply skips such a root; for navigation, fall back to the best
-    // content-bearing type on this path so the cursor can still descend into the
-    // effect block and resolve scripted-effect calls.
-    if !type_has_content(td, inner_rules) {
-        td = best_content_type(&candidates, &root_key, ruleset)?;
-        inner_rules = find_rules_by_name(&td.name, ruleset);
-    }
-    if should_skip_root_key(&root_key, td) {
-        return descend_wrapper(
-            &ctx,
-            children,
-            td,
-            &root_key,
+    let path_candidates = path_candidates_for_file(&file_path_lower, ruleset);
+    let dispatch = DispatchInput {
+        ruleset,
+        file_path,
+        path_candidates: &path_candidates,
+        allow_content_fallback: true,
+    };
+    match resolve_root_child(&dispatch, &root_key) {
+        ResolvedType::Entity {
+            type_def,
             inner_rules,
-            skip_root_key_tail(td),
+        } => Some(enter_entity(
+            &ctx,
+            type_def,
+            children,
+            inner_rules,
+            Some(&root_key),
             &mut scope_context,
             line,
             col,
-        );
+        )),
+        ResolvedType::Wrapper {
+            type_def,
+            inner_rules,
+            skip_tail,
+        } => descend_wrapper(
+            &ctx,
+            children,
+            type_def,
+            &root_key,
+            inner_rules,
+            skip_tail,
+            &mut scope_context,
+            line,
+            col,
+        ),
+        ResolvedType::None => None,
     }
-    if !td.skip_root_key.is_empty() {
-        // skip_root_key gate: the type doesn't apply to this root.
-        return None;
-    }
-    Some(enter_entity(
-        &ctx,
-        td,
-        children,
-        inner_rules,
-        Some(&root_key),
-        &mut scope_context,
-        line,
-        col,
-    ))
-}
-
-/// Whether a type has its own validation rules, rather than being an index-only
-/// `type[x]` declaration (path/name_field with no rule body) that exists solely
-/// to register instances.
-fn type_has_content(td: &TypeDefinition, rules: &[(RuleType, Options)]) -> bool {
-    !rules.is_empty() || td.subtypes.iter().any(|st| !st.rules.is_empty())
-}
-
-/// The best path candidate that carries an actual rule body, ignoring index-only
-/// types. Used as a navigation fallback when the top path+key match is a
-/// rule-less skip wrapper whose content is validated by a sibling base type
-/// (e.g. the `on_action` base owns the rules that `on_weekly`/`on_daily`
-/// instances under `on_actions = { }` are checked against).
-fn best_content_type<'a>(
-    candidates: &[PathCandidate<'a>],
-    root_key: &str,
-    ruleset: &'a RuleSet,
-) -> Option<&'a TypeDefinition> {
-    let filtered: Vec<PathCandidate<'a>> = candidates
-        .iter()
-        .filter(|c| type_has_content(c.type_def, find_rules_by_name(&c.type_def.name, ruleset)))
-        .map(|c| PathCandidate {
-            type_def: c.type_def,
-            base_weight: c.base_weight,
-        })
-        .collect();
-    find_type_from_candidates(&filtered, Some(root_key))
 }
 
 /// Descend through a skip_root_key wrapper to the grandchild containing the
@@ -311,9 +251,7 @@ fn descend_wrapper(
             match find_grandchild_type(ctx.file_path, wrapper_root_key, &gc_key, ctx.ruleset) {
                 Some(t) => {
                     let r = find_rules_by_name(&t.name, ctx.ruleset);
-                    let has_content =
-                        !r.is_empty() || t.subtypes.iter().any(|st| !st.rules.is_empty());
-                    if !has_content {
+                    if !type_has_content(t, r) {
                         return None;
                     }
                     (t, r)
