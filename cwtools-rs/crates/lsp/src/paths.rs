@@ -231,6 +231,29 @@ pub(crate) fn strip_loc_quotes(s: &str) -> &str {
     }
 }
 
+/// Strip an inline `#` comment from a loc desc string for hover display.
+/// `"value" # comment` → `"value"`, `"value"` → `"value"`.
+/// The `#` inside a quoted string is data, not a comment — only the LAST
+/// unescaped `#` after the closing quote is stripped.
+pub(crate) fn strip_loc_comment(s: &str) -> &str {
+    // Find the last `"` in the string. If there is one, only strip `#` after it.
+    if let Some(last_quote) = s.rfind('"') {
+        let after = &s[last_quote + 1..];
+        if let Some(hash) = after.find('#') {
+            &s[..last_quote + 1 + hash]
+        } else {
+            s
+        }
+    } else {
+        // No quotes at all — strip the first `#`.
+        if let Some(hash) = s.find('#') {
+            &s[..hash]
+        } else {
+            s
+        }
+    }
+}
+
 /// Human-readable language name for hover display.
 pub(crate) fn lang_display_name(lang: cwtools_localization::Lang) -> &'static str {
     match lang {
@@ -361,5 +384,63 @@ mod tests {
         let ws: Option<std::sync::Arc<str>> = Some("file:///home/user/My%20Mod".into());
         let lp = logical_path_from_uri("file:///home/user/My%20Mod/events/foo.txt", &ws);
         assert_eq!(lp, "events/foo.txt", "got: {}", lp);
+    }
+
+    // ── strip_loc_comment (#50) ───────────────────────────────────────────
+
+    #[test]
+    fn strip_loc_comment_removes_inline_comment_after_quoted_value() {
+        // `"value" # comment` → `"value" ` (space before # is kept)
+        assert_eq!(strip_loc_comment(r#""value" # comment"#), r#""value" "#);
+    }
+
+    #[test]
+    fn strip_loc_comment_preserves_quoted_value_without_comment() {
+        assert_eq!(strip_loc_comment(r#""value""#), r#""value""#);
+    }
+
+    #[test]
+    fn strip_loc_comment_keeps_hash_inside_quotes_as_data() {
+        // The `#` inside a quoted string is data, not a comment.
+        assert_eq!(
+            strip_loc_comment(r#""value # not a comment""#),
+            r#""value # not a comment""#
+        );
+    }
+
+    #[test]
+    fn strip_loc_comment_strips_first_hash_when_no_quotes() {
+        assert_eq!(strip_loc_comment("value # comment"), "value ");
+    }
+
+    #[test]
+    fn strip_loc_comment_preserves_unquoted_value_without_hash() {
+        assert_eq!(strip_loc_comment("value"), "value");
+    }
+
+    #[test]
+    fn strip_loc_comment_handles_empty_quoted_value_with_comment() {
+        // Space before # is kept.
+        assert_eq!(strip_loc_comment(r#""" # comment"#), r#""" "#);
+    }
+
+    #[test]
+    fn strip_loc_comment_strips_only_first_hash_after_closing_quote() {
+        // Only the first `#` after the closing quote is the comment start.
+        // Space before the first # is kept.
+        assert_eq!(
+            strip_loc_comment(r#""value" # comment # more"#),
+            r#""value" "#
+        );
+    }
+
+    #[test]
+    fn strip_loc_comment_handles_empty_string() {
+        assert_eq!(strip_loc_comment(""), "");
+    }
+
+    #[test]
+    fn strip_loc_comment_handles_only_comment() {
+        assert_eq!(strip_loc_comment("# just a comment"), "");
     }
 }

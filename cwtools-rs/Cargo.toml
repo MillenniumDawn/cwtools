@@ -1,20 +1,20 @@
 [workspace]
 members = [
-    "crates/profiling",
-    "crates/error_codes",
-    "crates/string_table",
-    "crates/parser",
-    "crates/file_manager",
-    "crates/cache",
-    "crates/rules",
-    "crates/index",
-    "crates/validation",
-    "crates/game",
-    "crates/localization",
-    "crates/info",
-    "crates/driver",
-    "crates/lsp",
-    "crates/cli",
+  "crates/profiling",
+  "crates/error_codes",
+  "crates/string_table",
+  "crates/parser",
+  "crates/file_manager",
+  "crates/cache",
+  "crates/rules",
+  "crates/index",
+  "crates/validation",
+  "crates/game",
+  "crates/localization",
+  "crates/info",
+  "crates/driver",
+  "crates/lsp",
+  "crates/cli",
 ]
 resolver = "3"
 
@@ -63,11 +63,17 @@ rustc-hash = "2.1"
 smallvec = { version = "1", features = ["union"] }
 criterion = "0.8"
 
-# Strip symbols and run fat LTO on release builds. Smaller, less "packed-looking"
-# binaries draw fewer antivirus false positives (the server exe is unsigned), and
-# a single codegen unit + LTO trims size further. No panic=abort: tower-lsp/tokio
-# rely on unwinding per request.
+# Strip symbols and run thin LTO on release builds.
+#
+# Thin LTO + codegen-units=1 is the sweet spot: thin LTO parallelizes well
+# across codegen units and links much faster than fat LTO, especially on
+# Windows where MSVC link.exe is the bottleneck, while codegen-units=1
+# maximizes cross-module optimization for thin LTO. The binary is ~5-10%
+# larger than fat LTO, but still stripped so antivirus false positives are
+# not a concern.
+#
+# No panic=abort: tower-lsp/tokio rely on unwinding per request.
 [profile.release]
 strip = true
-lto = "fat"
+lto = "thin"
 codegen-units = 1

@@ -1,5 +1,10 @@
 # Profiling
 
+See `docs/ARCHITECTURE.md` for the loc system architecture and `BUILD.md`
+for build instructions.
+
+## Runtime profiling
+
 The workspace is instrumented with [`tracing`](https://docs.rs/tracing). The
 subscriber is off by default and only turns on when `RUST_LOG` is set, so normal
 runs stay quiet.
@@ -36,7 +41,7 @@ args aren't formatted), and make sure the crate has `tracing` in its
 `Cargo.toml` (`tracing = { workspace = true }`). It shows up under
 `RUST_LOG=<crate>=info` automatically.
 
-## What to look for
+## What to look for (runtime)
 
 - A `parse_string` or `validate_ast_with_loc` span that dominates total time points at a
   pathological file (huge or deeply nested).
