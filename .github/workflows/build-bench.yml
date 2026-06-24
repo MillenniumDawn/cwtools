@@ -40,14 +40,6 @@ jobs:
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      # Windows: install rust-lld (LLVM linker) which is much faster at LTO
-      # linking than MSVC link.exe.  The .cargo/config.toml sets it as the
-      # default linker for x86_64-pc-windows-msvc.
-      - name: Install rust-lld (Windows)
-        if: runner.os == 'Windows'
-        run: rustup component add rust-lld
-        shell: pwsh
-
       # ── Registry cache (rarely changes, separate from target) ──────────
       - name: Cache cargo registry
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
