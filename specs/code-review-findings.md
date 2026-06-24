@@ -45,6 +45,47 @@ the LSP scan caps to `workspace_cache.rs`.
 
 ---
 
+## Tier 5 disposition (PR 1.9) — finishing the deferred items
+
+The 1.6–1.8 sweeps captured the high-value work. The remaining deferred items
+(#159, #161, #178, #108) and the cross-cutting perf themes were finished or
+closed here, each verified corpus-byte-identical on Kaiserreich (the static
+guard) with the full suite green and clippy/fmt clean.
+
+**Shipped:**
+- **#161** — the two drifted copies of the type-resolution dispatch
+  (`validate_prepared`, `rules_at_pos`) are unified behind
+  `crates/validation/src/resolve.rs` (`ResolvedType` + `resolve_root_child`).
+  The navigator's `best_content_type` fallback is now an explicit
+  `allow_content_fallback` flag the validator passes `false` (byte-identical),
+  removing the drift risk. The four duplicated has-content predicates collapse to
+  `type_has_content`.
+- **Theme A (one instance)** — `validate_each_child` computed `key_lower` per
+  leaf though only the no-candidate branch uses it; now lazy.
+- **#178 (partial)** — the vestigial `quoted` bool on `StringTokens` is removed
+  (only a test read it; the `String`/`QString` variant already encodes
+  quotedness). Dead-code removal, not a size win: padding leaves `Leaf`/`Value`
+  unchanged. The quote-in-stored-text half stays (entangled with parser/cache).
+- **#184** — redundant mixed-case `"Alliance"` Stellaris alias dropped.
+
+**Closed as measured dead-ends (do not re-open as "optimizations"):**
+- **#108** — boxing `Value::Clause(Vec<Child>)` to `Box<[Child]>` was implemented
+  then reverted: `size_of::<Value>()` stays 24 (the discriminant can't niche into
+  the boxed-slice fat pointer, `16+8=24`, exactly what the `Vec` gave), so `Leaf`
+  stays 56 and peak RSS was unchanged within noise.
+- **#159** — the per-game scope/link tables already share
+  `load_entries`/`sc()`/`insert_aliases`; the remaining ~1200 lines are
+  irreducible data. A macro trades ~100 boilerplate lines for greppability.
+- **Theme B (`.lower` reuse)** — `.lower` is the Unicode-folded *quoted* token;
+  the validation maps key on `to_ascii_lowercase` of the *unquoted* key, so reuse
+  risks a byte difference and still allocates the map key. No payoff.
+- **#183** — not a mislabel: `Value`/`Bool`/`Flag`/`Color` *are* defined as CK3
+  scopes (500–503), consistent with VIC2/IR.
+- **#181 / #185** — already emit `tracing::warn`. **#176** — the F# parity
+  comments stay until F# is actually retired.
+
+---
+
 ## Tier 3 — Over-Engineering / Design  — **PR 1.7**
 
 ### 107. Dead `ValueClause` arena slab  — **[PARTIAL → PR 1.7]**
