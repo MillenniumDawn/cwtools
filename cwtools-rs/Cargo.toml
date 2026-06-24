@@ -65,12 +65,15 @@ criterion = "0.8"
 
 # Strip symbols and run thin LTO on release builds.
 #
-# Thin LTO is the sweet spot: it parallelizes well across codegen units and links
-# much faster than fat LTO, especially on Windows where MSVC link.exe is the
-# bottleneck. The binary is ~5-10% larger than fat LTO + codegen-units=1, but
-# still stripped so antivirus false positives are not a concern.
+# Thin LTO + codegen-units=1 is the sweet spot: thin LTO parallelizes well
+# across codegen units and links much faster than fat LTO, especially on
+# Windows where MSVC link.exe is the bottleneck, while codegen-units=1
+# maximizes cross-module optimization for thin LTO. The binary is ~5-10%
+# larger than fat LTO, but still stripped so antivirus false positives are
+# not a concern.
 #
 # No panic=abort: tower-lsp/tokio rely on unwinding per request.
 [profile.release]
 strip = true
 lto = "thin"
+codegen-units = 1
