@@ -583,19 +583,18 @@ fn validate_each_child(
         match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-                let (key, key_lower) = table
-                    .with_string(leaf.key.normal, |s| {
-                        let k = unquote_key(s).to_string();
-                        let kl = k.to_lowercase();
-                        (k, kl)
-                    })
+                let key = table
+                    .with_string(leaf.key.normal, |s| unquote_key(s).to_string())
                     .unwrap_or_default();
                 let candidates =
                     matching_candidates(rules, &key, ruleset, type_index, rule_matches_leaf_key);
                 if candidates.is_empty() {
                     // Item 5: dynamic modifier keys — if provided and this key is a
                     // known modifier, accept silently (modifier context mechanism).
-                    // The modifier set is built lowercase; compare lowercase.
+                    // The modifier set is built lowercase; compare lowercase. Compute
+                    // the lowercase form lazily here — only the no-candidate branch
+                    // needs it, and most leaves match a candidate.
+                    let key_lower = key.to_lowercase();
                     let is_modifier = modifier_keys
                         .map(|mk| mk.contains(key_lower.as_str()))
                         .unwrap_or(false);

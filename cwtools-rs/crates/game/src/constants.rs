@@ -153,7 +153,7 @@ const STELLARIS_SCOPES: &[ScopeDef] = &[
     },
     ScopeDef {
         name: "Federation",
-        aliases: &["alliance", "federation", "Alliance"],
+        aliases: &["alliance", "federation"],
         id: ScopeId(211),
         subscope_of: &[],
     },
