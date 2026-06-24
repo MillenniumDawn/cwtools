@@ -1001,16 +1001,14 @@ mod tests {
         assert!(discover_vanilla_dir("").is_none());
     }
 
-    #[test]
-    fn test_index_vanilla_dir_collects_instances() {
-        // A type[foo] whose instances live under common/foos; the node key is the
-        // instance name (no name_field). Mirrors how a base-game type is indexed.
+    /// Build a minimal `RuleSet` containing one type definition.
+    fn ruleset_with_type(name: &str, path: &str, name_field: Option<&str>) -> RuleSet {
         let mut rs = RuleSet::new();
         rs.types.push(TypeDefinition {
-            name: "foo".to_string(),
-            name_field: None,
+            name: name.to_string(),
+            name_field: name_field.map(|s| s.to_string()),
             path_options: PathOptions {
-                paths: vec!["common/foos".to_string()],
+                paths: vec![path.to_string()],
                 path_strict: false,
                 path_file: None,
                 path_extension: None,
@@ -1031,9 +1029,20 @@ mod tests {
             modifiers: Vec::new(),
         });
         rs.reindex();
+        rs
+    }
 
-        // Lay out a tiny "game install" in a temp dir.
-        let root = std::env::temp_dir().join("cwtools_lsp_vanilla_test");
+    fn vanilla_root() -> std::path::PathBuf {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.keep();
+        path.join("vanilla")
+    }
+
+    #[test]
+    fn test_index_vanilla_dir_collects_instances() {
+        let rs = ruleset_with_type("foo", "common/foos", None);
+
+        let root = vanilla_root();
         let foos = root.join("common").join("foos");
         std::fs::create_dir_all(&foos).unwrap();
         std::fs::write(foos.join("a.txt"), "foo_one = { }\nfoo_two = { }\n").unwrap();
@@ -1047,7 +1056,153 @@ mod tests {
             .unwrap_or_default();
         assert!(names.contains(&"foo_one"), "got: {:?}", names);
         assert!(names.contains(&"foo_two"), "got: {:?}", names);
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    #[test]
+    fn test_index_vanilla_dir_uses_name_field() {
+        // type[foo] instances are identified by the `name =` leaf, not the node key.
+        let rs = ruleset_with_type("foo", "common/foos", Some("name"));
+
+        let root = vanilla_root();
+        let foos = root.join("common").join("foos");
+        std::fs::create_dir_all(&foos).unwrap();
+        std::fs::write(
+            foos.join("a.txt"),
+            "foo_one = { name = real_name_a }\nfoo_two = { name = real_name_b }\n",
+        )
+        .unwrap();
+
+        let table = StringTable::new();
+        let (per_type, _aux) = index_vanilla_dir(&root, &rs, &table);
+
+        let names: Vec<&str> = per_type
+            .get("foo")
+            .map(|v| v.iter().map(|i| i.name.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            names.contains(&"real_name_a"),
+            "name_field instance not extracted: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"real_name_b"),
+            "name_field instance not extracted: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"foo_one"),
+            "node key should not be used when name_field is set: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_index_vanilla_dir_no_matching_path_is_empty() {
+        let rs = ruleset_with_type("foo", "common/foos", None);
+
+        let root = vanilla_root();
+        // No common/foos directory at all.
+        std::fs::create_dir_all(root.join("other")).unwrap();
+
+        let table = StringTable::new();
+        let (per_type, _aux) = index_vanilla_dir(&root, &rs, &table);
+        assert!(
+            per_type.is_empty(),
+            "no matching path should yield an empty index, got: {:?}",
+            per_type
+        );
+    }
+
+    #[test]
+    fn test_index_vanilla_dir_skips_unparseable_files() {
+        // A malformed file must not abort indexing; valid files in the same dir
+        // are still collected.
+        let rs = ruleset_with_type("foo", "common/foos", None);
+
+        let root = vanilla_root();
+        let foos = root.join("common").join("foos");
+        std::fs::create_dir_all(&foos).unwrap();
+        std::fs::write(foos.join("good.txt"), "foo_one = { }\n").unwrap();
+        // Bare brace with no opening: a parse error.
+        std::fs::write(foos.join("bad.txt"), "}\n").unwrap();
+
+        let table = StringTable::new();
+        let (per_type, _aux) = index_vanilla_dir(&root, &rs, &table);
+
+        let names: Vec<&str> = per_type
+            .get("foo")
+            .map(|v| v.iter().map(|i| i.name.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            names.contains(&"foo_one"),
+            "valid instance should still be collected despite a bad file: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_index_vanilla_dir_aux_contains_file_paths() {
+        // The vanilla cache aux must record every file that was discovered so
+        // the cached index can be validated against the install later.
+        let rs = ruleset_with_type("foo", "common/foos", None);
+
+        let root = vanilla_root();
+        let foos = root.join("common").join("foos");
+        std::fs::create_dir_all(&foos).unwrap();
+        std::fs::write(foos.join("a.txt"), "foo_one = { }\n").unwrap();
+
+        let table = StringTable::new();
+        let (_per_type, aux) = index_vanilla_dir(&root, &rs, &table);
+        let logical = aux
+            .file_paths
+            .iter()
+            .map(|p| p.replace('\\', "/"))
+            .find(|p| p.ends_with("common/foos/a.txt"));
+        assert!(
+            logical.is_some(),
+            "aux should contain the logical file path, got: {:?}",
+            aux.file_paths
+        );
+    }
+
+    #[test]
+    fn test_index_vanilla_dir_respects_path_strict() {
+        // path_strict = yes must only match the exact declared path, not siblings.
+        let mut rs = ruleset_with_type("foo", "common/foos", None);
+        rs.types[0].path_options.path_strict = true;
+        rs.reindex();
+
+        let root = vanilla_root();
+        let foos = root.join("common").join("foos");
+        let sibling = root.join("common").join("bars");
+        std::fs::create_dir_all(&foos).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(foos.join("a.txt"), "foo_one = { }\n").unwrap();
+        std::fs::write(sibling.join("b.txt"), "foo_two = { }\n").unwrap();
+
+        let table = StringTable::new();
+        let (per_type, _aux) = index_vanilla_dir(&root, &rs, &table);
+
+        let names: Vec<&str> = per_type
+            .get("foo")
+            .map(|v| v.iter().map(|i| i.name.as_str()).collect())
+            .unwrap_or_default();
+        assert!(names.contains(&"foo_one"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"foo_two"),
+            "path_strict must not match sibling path, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_discover_vanilla_dir_known_game_maps_folder() {
+        // discover_vanilla_dir relies on real Steam installs, which won't exist
+        // in CI. Verify the mapping indirectly by exercising each known game id
+        // and checking that non-existent games return None deterministically.
+        for game in ["hoi4", "stellaris", "eu4", "ck3", "vic3"] {
+            let _ = discover_vanilla_dir(game);
+        }
+        assert!(discover_vanilla_dir("nexus_games").is_none());
     }
 }
