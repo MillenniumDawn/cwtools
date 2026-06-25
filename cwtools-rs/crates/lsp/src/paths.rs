@@ -223,14 +223,6 @@ pub(crate) fn discover_vanilla_dir(game: &str) -> Option<std::path::PathBuf> {
 
 /// Strip matching outer double quotes from a loc desc string for hover display.
 /// `"Hello"` → `Hello`, `Hello` → `Hello`, `""` → `` (empty).
-pub(crate) fn strip_loc_quotes(s: &str) -> &str {
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    }
-}
-
 /// Strip an inline `#` comment from a loc desc string for hover display.
 /// `"value" # comment` → `"value"`, `"value"` → `"value"`.
 /// The `#` inside a quoted string is data, not a comment — only the LAST
@@ -252,6 +244,26 @@ pub(crate) fn strip_loc_comment(s: &str) -> &str {
             s
         }
     }
+}
+
+/// Extract the display text of a loc line for hover tooltips.
+///
+/// A loc value is a quoted string, optionally followed by a `# comment`. The
+/// value runs from the first `"` to the LAST `"` on the line, so a `#` *inside*
+/// the quotes is kept as data (issue #50) while a trailing `# comment` after the
+/// closing quote is dropped. An unquoted value just has its inline `# comment`
+/// stripped.
+pub(crate) fn loc_display_text(desc: &str) -> &str {
+    if let Some(rest) = desc.strip_prefix('"') {
+        // Quoted: content runs to the last `"` on the line.
+        if let Some(end) = rest.rfind('"') {
+            return &rest[..end];
+        }
+        // Unterminated quote: best-effort, strip an inline comment from the rest.
+        return strip_loc_comment(rest).trim_end();
+    }
+    // Unquoted value: drop an inline `# comment`.
+    strip_loc_comment(desc).trim_end()
 }
 
 /// Human-readable language name for hover display.
@@ -442,5 +454,54 @@ mod tests {
     #[test]
     fn strip_loc_comment_handles_only_comment() {
         assert_eq!(strip_loc_comment("# just a comment"), "");
+    }
+
+    // ── loc_display_text (#50) ────────────────────────────────────────────
+    // Extracts the value a loc line should show in the hover tooltip: the
+    // quoted string with outer quotes removed and any trailing `# comment`
+    // dropped, while a `#` *inside* the quotes is preserved as data.
+
+    #[test]
+    fn loc_display_text_quoted_value_strips_outer_quotes() {
+        assert_eq!(loc_display_text(r#""value""#), "value");
+    }
+
+    #[test]
+    fn loc_display_text_drops_trailing_comment() {
+        assert_eq!(loc_display_text(r#""value" # comment"#), "value");
+    }
+
+    #[test]
+    fn loc_display_text_keeps_hash_inside_quotes() {
+        // The reported bug: a `#` inside the quoted value is data, not a comment.
+        assert_eq!(loc_display_text(r#""value # data""#), "value # data");
+    }
+
+    #[test]
+    fn loc_display_text_keeps_inner_hash_and_drops_trailing_comment() {
+        assert_eq!(
+            loc_display_text(r#""value # data" # comment"#),
+            "value # data"
+        );
+    }
+
+    #[test]
+    fn loc_display_text_unquoted_value_drops_comment() {
+        assert_eq!(loc_display_text("value # comment"), "value");
+    }
+
+    #[test]
+    fn loc_display_text_unquoted_value_without_comment() {
+        assert_eq!(loc_display_text("value"), "value");
+    }
+
+    #[test]
+    fn loc_display_text_empty_quoted_value() {
+        assert_eq!(loc_display_text(r#""""#), "");
+    }
+
+    #[test]
+    fn loc_display_text_empty_quoted_value_with_comment() {
+        assert_eq!(loc_display_text(r#""" # comment"#), "");
     }
 }
