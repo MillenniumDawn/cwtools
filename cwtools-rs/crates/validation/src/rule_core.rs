@@ -303,6 +303,27 @@ fn validate_leaf_against_rule(
                 );
             } else {
                 validate_leaf(ctx, leaf, rule_type, scope_context.as_ref(), errors);
+                // CW282: a bool field explicitly set to the default declared by
+                // `## default_bool = yes|no` is redundant and can be omitted.
+                if let Some(default) = opts.default_bool {
+                    let raw = leaf_value_to_string(&leaf.value, ctx.table);
+                    let v = raw.trim_matches('"').trim();
+                    let is_default = match v.to_ascii_lowercase().as_str() {
+                        "yes" | "true" => default,
+                        "no" | "false" => !default,
+                        _ => false,
+                    };
+                    if is_default {
+                        let code = &error_codes::CW282_REDUNDANT_DEFAULT_BOOL;
+                        errors.push(ValidationError::from_code(
+                            code,
+                            ctx.file_path,
+                            leaf.pos.start.line,
+                            leaf.pos.start.col,
+                            &[v],
+                        ));
+                    }
+                }
             }
         }
         RuleType::NodeRule {

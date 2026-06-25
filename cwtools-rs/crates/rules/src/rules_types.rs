@@ -604,6 +604,9 @@ pub struct Options {
     // key_required_quotes, value_required_quotes, type_hint removed:
     // always default-valued, no readers (quoted-key enforcement unimplemented).
     pub error_if_only_match: Option<String>,
+    /// `## default_bool = yes|no`: the field's engine default. When the field is
+    /// set to this value an info-level hint (CW282) notes it can be omitted.
+    pub default_bool: Option<bool>,
 }
 
 impl Default for Options {
@@ -621,6 +624,7 @@ impl Default for Options {
             comparison: false,
             reference_details: None,
             error_if_only_match: None,
+            default_bool: None,
         }
     }
 }
