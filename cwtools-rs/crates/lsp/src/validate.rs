@@ -694,8 +694,7 @@ impl Backend {
                 continue;
             }
             for entry in &file.entries {
-                let display =
-                    crate::paths::strip_loc_comment(crate::paths::strip_loc_quotes(&entry.desc));
+                let display = crate::paths::loc_display_text(&entry.desc);
                 if !display.is_empty() {
                     new_entries
                         .entry(entry.key.to_lowercase())

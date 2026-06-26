@@ -462,6 +462,15 @@ pub const CW281_EMPTY_LIMIT: ErrorCode = ErrorCode {
     message_template: "This 'limit' contains no triggers",
 };
 
+/// A bool field is explicitly set to the engine default declared by the rule's
+/// `## default_bool = yes|no` directive, so the line is redundant and can be
+/// omitted. A Rust-original cleanup hint (no F# equivalent). Arg is the value.
+pub const CW282_REDUNDANT_DEFAULT_BOOL: ErrorCode = ErrorCode {
+    id: "CW282",
+    severity: ErrorSeverity::Information,
+    message_template: "This is the default value ({}) and can be omitted",
+};
+
 // ── Tier B — Stellaris-specific if/else + set_name (per_game::stellaris) ────
 
 /// Nested `if`/`else` in effects, deprecated with Stellaris 2.1. F# `DeprecatedElse`.

@@ -171,6 +171,16 @@ pub(crate) fn options_from_comments(comments: &[String], is_comparison: bool) ->
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
+    // default_bool: `## default_bool = yes|no` marks the field's engine default
+    // so setting it to that value emits an info hint (CW282).
+    let default_bool = directives.get("default_bool").copied().and_then(|v| {
+        match v.to_ascii_lowercase().as_str() {
+            "yes" | "true" => Some(true),
+            "no" | "false" => Some(false),
+            _ => None,
+        }
+    });
+
     Options {
         min,
         max,
@@ -184,6 +194,7 @@ pub(crate) fn options_from_comments(comments: &[String], is_comparison: bool) ->
         comparison: is_comparison,
         reference_details,
         error_if_only_match,
+        default_bool,
     }
 }
 
@@ -421,5 +432,25 @@ mod tests {
             desc, "First doc line\nSecond doc line",
             "CRLF comments should extract as documentation"
         );
+    }
+
+    // ── default_bool (#26) ────────────────────────────────────────────────────
+
+    #[test]
+    fn default_bool_yes_parses() {
+        let opts = options_from_comments(&s(&["## default_bool = yes"]), false);
+        assert_eq!(opts.default_bool, Some(true));
+    }
+
+    #[test]
+    fn default_bool_no_parses() {
+        let opts = options_from_comments(&s(&["## default_bool = no"]), false);
+        assert_eq!(opts.default_bool, Some(false));
+    }
+
+    #[test]
+    fn default_bool_absent_is_none() {
+        let opts = options_from_comments(&s(&["## cardinality = 0..1"]), false);
+        assert_eq!(opts.default_bool, None);
     }
 }

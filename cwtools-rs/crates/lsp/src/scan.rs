@@ -9,8 +9,8 @@ use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::build_modifier_keys;
 
 use crate::paths::{
-    default_cache_dir, discover_vanilla_dir, logical_path_from_uri, path_to_uri, strip_loc_comment,
-    strip_loc_quotes, uri_to_path_str,
+    default_cache_dir, discover_vanilla_dir, loc_display_text, logical_path_from_uri, path_to_uri,
+    uri_to_path_str,
 };
 use crate::validate::{
     loc_diag_to_validation_error, make_prepared, parse_error_to_diagnostic,
@@ -737,7 +737,7 @@ impl Backend {
                         if !lang_included {
                             continue;
                         }
-                        let display = strip_loc_comment(strip_loc_quotes(&entry.desc));
+                        let display = loc_display_text(&entry.desc);
                         if !display.is_empty() {
                             lt.entry(entry.key.to_lowercase())
                                 .or_default()
