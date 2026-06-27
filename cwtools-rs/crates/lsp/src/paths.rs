@@ -69,19 +69,41 @@ pub(crate) fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
 /// When the line prefix before the cursor reads `key =` (value not typed yet,
 /// so the last good parse has no leaf there), return the key so value
 /// completions can still resolve. `line0`/`char0` are LSP 0-based.
+///
+/// Implementation note: the function keys off the *first* operator in the
+/// trimmed line, not the last. A previous version stripped trailing operators
+/// then `rsplit` on whitespace, which returned just `"="` for inputs like
+/// `has_idea = ==` (the `==` after the value the user is editing was
+/// incorrectly consumed as the key). That broke the rescue in
+/// `completion::completion_impl`: the wrong key was passed to
+/// `value_rules_for_key`, the rule match was empty, value completions were
+/// empty, and the generic variable fallback was shown to the user — the
+/// "context evaporates after backspace" symptom. Keying on the first operator
+/// is also robust against multi-character comparison operators (`==`, `>=`,
+/// `!=`, `?=`) which the previous logic treated as a sequence of single
+/// characters.
 pub(crate) fn line_value_key(text: &str, line0: u32, char0: u32) -> Option<String> {
     let line = text.lines().nth(line0 as usize)?;
     let n = line.len().min(char0 as usize);
     let n = (0..=n).rev().find(|&i| line.is_char_boundary(i))?;
     let upto = &line[..n];
     let trimmed = upto.trim_end();
-    let rest = trimmed
-        .strip_suffix(['=', '<', '>'])?
-        .trim_end_matches(['=', '<', '>', '!', '?'])
-        .trim_end();
-    let key = rest
+    // Require the line to end with an operator: the value position is
+    // recognisable by the `=` / `<` / `>` the user is sitting on (or has just
+    // typed). Lines like `my_block = {` end with `{` — the user is at an
+    // insert position inside the block, not a value position for `my_block`,
+    // so the rescue must NOT claim a key here.
+    if !trimmed.ends_with(['=', '<', '>', '!', '?']) {
+        return None;
+    }
+    // First operator = the boundary between key and value. Everything after
+    // is the value the user is typing (which may contain its own `=` / `<`
+    // / `>` from a comparison), so we ignore it and look at the prefix.
+    let op_pos = trimmed.find(['=', '<', '>', '!', '?'])?;
+    let key_part = &trimmed[..op_pos];
+    let key = key_part
         .rsplit(|c: char| c.is_whitespace() || c == '{')
-        .next()?;
+        .find(|s| !s.is_empty())?;
     if key.is_empty() || key.contains('}') || key.contains('"') {
         return None;
     }
@@ -323,6 +345,44 @@ mod tests {
         // Comparison operators count too.
         let text2 = "block = {\n    num > \n}\n";
         assert_eq!(line_value_key(text2, 1, 10).as_deref(), Some("num"));
+    }
+
+    #[test]
+    fn test_line_value_key_handles_comparison_operators_in_value() {
+        // Regression for the "context evaporates after backspace" symptom:
+        // a value-position line where the user is mid-way through typing a
+        // comparison operator (e.g. `key = ==` or `key = >= `) must still
+        // resolve to the key. The previous implementation keyed off the
+        // LAST operator and returned the operator character itself (`"="`),
+        // which then failed the value_rules lookup and triggered the
+        // generic variable fallback.
+        assert_eq!(
+            line_value_key("has_idea = ==", 0, 12).as_deref(),
+            Some("has_idea"),
+            "trailing `==` must still resolve to the key"
+        );
+        assert_eq!(
+            line_value_key("has_idea = =", 0, 11).as_deref(),
+            Some("has_idea"),
+            "trailing `= =` (space, single =) must still resolve to the key"
+        );
+        assert_eq!(
+            line_value_key("num >= ", 0, 6).as_deref(),
+            Some("num"),
+            "comparison `>=` must still resolve to the key"
+        );
+        assert_eq!(
+            line_value_key("flag != ", 0, 8).as_deref(),
+            Some("flag"),
+            "comparison `!=` must still resolve to the key"
+        );
+        // An insert position right after a block-opener `{` is NOT a value
+        // position — the rescue must return None, not the block's key.
+        assert_eq!(
+            line_value_key("my_block = {", 0, 12),
+            None,
+            "`my_block = {{` is an insert position, not a value position"
+        );
     }
 
     #[test]

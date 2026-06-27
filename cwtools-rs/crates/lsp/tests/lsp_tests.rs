@@ -704,6 +704,171 @@ fn test_completion_country_flags_for_has_country_flag() {
     );
 }
 
+// ── Backspace robustness: same-context completions must not evaporate when the
+//    value is deleted, and the flat variable fallback must NOT be substituted
+//    for the context-aware list. The cwt rules define the context; deleting
+//    characters in the value doesn't change which block the cursor is in. ─────
+
+/// Like `completion_labels_with_files` but issues a `didChange` to `new_text`
+/// (full-sync) before requesting completion, so the test exercises the
+/// backspace-into-blank case end to end. `wait_after_change` controls whether
+/// the test waits for the debounced validate to republish diagnostics before
+/// requesting completion — pass `true` to land on the post-debounce AST,
+/// `false` to land on the stale AST (the realistic mid-typing snapshot).
+fn completion_labels_after_change(
+    rel_path: &str,
+    open_text: &str,
+    extra_files: &[(&str, &str)],
+    new_text: &str,
+    line0: u32,
+    char0: u32,
+    wait_after_change: bool,
+) -> Vec<String> {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), DYNAMIC_RULES).unwrap();
+
+    for (rel, content) in extra_files.iter().chain([&(rel_path, open_text)]) {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    for (rel, content) in extra_files.iter().chain([&(rel_path, open_text)]) {
+        let uri = format!("file://{}", ws.path().join(rel).display());
+        let body = jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": content,
+                }
+            }),
+        );
+        write_frame(&mut child, &body).unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+
+    // didChange to the new (backspaced) text. Bump the version so the LSP
+    // accepts it. Full-sync: server ignores the range and replaces the whole
+    // document text.
+    let doc_uri = format!("file://{}", ws.path().join(rel_path).display());
+    let body = jsonrpc_notification(
+        "textDocument/didChange",
+        serde_json::json!({
+            "textDocument": { "uri": &doc_uri, "version": 2 },
+            "contentChanges": [{ "text": new_text }],
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    if wait_after_change {
+        wait_for_diagnostics(&mut reader, rel_path);
+    }
+
+    let body = jsonrpc_request(
+        2,
+        "textDocument/completion",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "position": { "line": line0, "character": char0 },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let resp_str = read_response(&mut reader).expect("no completion response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(resp["id"], 2, "got: {}", resp_str);
+    let items = resp["result"]
+        .as_array()
+        .cloned()
+        .or_else(|| resp["result"]["items"].as_array().cloned())
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|i| i["label"].as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+#[test]
+fn test_completion_value_deleted_then_reoffered_keeps_context() {
+    // User scenario: a decision's `allowed` block has `has_country_flag = my_war_flag`
+    // with a working completion. They backspace the value, leaving
+    // `has_country_flag = ` (or shorter). The same flag set must still be
+    // offered — the block context (`allowed = { ... }`) hasn't changed, only
+    // the value text has. The flat variable dump must NOT be substituted.
+    let setter = (
+        "common/decisions/setter.txt",
+        "other_decision = {\n    complete_effect = {\n        set_country_flag = my_war_flag\n    }\n    cost = 1\n}\n",
+    );
+    let open_text = "my_decision = {\n    allowed = {\n        has_country_flag = my_war_flag\n    }\n    cost = 5\n}\n";
+    // After backspacing the value, the cursor is right after `= ` on line 2.
+    let new_text =
+        "my_decision = {\n    allowed = {\n        has_country_flag = \n    }\n    cost = 5\n}\n";
+
+    // Post-debounce (the AST has caught up to the new text): same flag set.
+    let labels_post = completion_labels_after_change(
+        "common/decisions/test.txt",
+        open_text,
+        std::slice::from_ref(&setter),
+        new_text,
+        2,
+        27,
+        true,
+    );
+    assert!(
+        labels_post.iter().any(|l| l == "my_war_flag"),
+        "post-debounce: backspaced value must still offer my_war_flag, got: {:?}",
+        labels_post
+    );
+
+    // Mid-debounce (the AST is still the open_text one — the user is typing
+    // fast and the next completion request arrives before the 250ms validate
+    // has fired). Same expected behavior: the context-aware list, not the
+    // generic variable dump.
+    let labels_mid = completion_labels_after_change(
+        "common/decisions/test.txt",
+        open_text,
+        &[setter],
+        new_text,
+        2,
+        27,
+        false,
+    );
+    assert!(
+        labels_mid.iter().any(|l| l == "my_war_flag"),
+        "mid-debounce: backspaced value must still offer my_war_flag, got: {:?}",
+        labels_mid
+    );
+}
+
 // ── Hover: localisation display ──────────────────────────────────────────────
 
 /// Spawn a server with DYNAMIC_RULES, write `loc_files` (each: filename under
