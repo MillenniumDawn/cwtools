@@ -3,10 +3,16 @@
 ## Improvements
 
 - Autocomplete no longer freezes or goes generic when the user returns to a half-typed file. Context-aware completions are now flagged `is_incomplete` so the editor re-queries on every keystroke (instead of caching the previous list client-side past the point where the live text has moved on — the "popup sticks on a half-typed prefix" symptom). The exclusive `documents` lock and the rules read guard are released as soon as the request snapshots the data it needs, so the debounced validate's AST update and concurrent `did_open`/`did_change`/`did_close` no longer block behind a slow completion. The loc-completion and fallback lists are cached by an info-revision counter, so a stable workspace (the common case while typing into a half-typed file) skips the per-request `info.files` walk. A stale completion request for a URI is cancelled when a newer one arrives, so a burst of keystrokes no longer stacks N parallel AST walks. When the last parse failed (`doc.ast` is None), the completion handler re-parses on demand for that request only (not written back) to recover a useful context for the half-typed state.
+- Every completion item now carries a kind-aware `sortText`, so as the user iterates the popup keeps a useful order (concrete leaf fields ahead of node blocks ahead of alias-driven keys ahead of type instances ahead of enum values ahead of scope names) instead of falling back to alphabetical. The bucket is a single digit so the secondary label sort stays stable. The scope-aware `0_<name>` bucket for `required_scopes` items (already in place) is unchanged and still leads the list.
+
+## Notes
+
+- The cwtools-hoi4-config `regimental_support` rule (`Config/effects.cwt`, `Config/history/oobs.cwt`, `Config/common/consolidated_ai.cwt`) accepts any `<unit.support_unit>` key — `anti_air_battery`, `mot_fire_support`, `mot_recon`, `artillery`, etc. as used by Kaiserreich `common/ai_templates/*.txt`. If the engine flags one of these as an error, the cause is almost always that the HOI4 vanilla install path isn't picked up by the extension, so the `game/common/units/*.txt` files that register support units are not loaded; double-check the `cwtools.cache.hoi4` setting and rebuild the vanilla cache.
 
 ## Developer
 
 - Added two completion tests: one asserting context-aware completions are marked `is_incomplete`, and one exercising the half-typed state (text that fails to parse from the start)
+- Added two completion tests covering the new `sortText` order: one pins the bucket mapping (1-9 per kind, 0 reserved for scope-aware) and one walks a real completion list to confirm every item has a `sortText` and that the first item by sort is a concrete leaf field.
 
 # 1.8.4
 

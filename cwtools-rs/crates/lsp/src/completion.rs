@@ -13,6 +13,31 @@ use crate::Backend;
 use crate::CompletionCacheEntry;
 use crate::paths::{line_value_key, logical_path_from_uri};
 
+/// Build a `sortText` so the most relevant items surface first as the user
+/// iterates. The LSP spec is clear the SERVER must return all valid items and
+/// let the client filter by the typed prefix, so the natural label sort is
+/// what the user sees if every item has the same prefix. The kind buckets
+/// below keep the order useful even when a half-typed word matches many
+/// items: specific leaf fields ahead of node blocks ahead of alias-driven
+/// keys ahead of type instances ahead of enum values ahead of scope names
+/// ahead of generic text. The bucket prefix (`0_` ... `9_`) is fixed-width
+/// so a later secondary sort by label stays stable.
+fn sort_for_kind(kind: Option<CompletionItemKind>, label: &str) -> Option<String> {
+    let bucket = match kind? {
+        CompletionItemKind::FIELD => "1",   // specific leaf key (concrete)
+        CompletionItemKind::STRUCT => "2",  // specific node key + type def
+        CompletionItemKind::KEYWORD => "3", // alias, bool yes/no
+        CompletionItemKind::ENUM_MEMBER => "4", // enum value
+        CompletionItemKind::VALUE => "5",   // scope name (value side)
+        CompletionItemKind::CONSTANT => "6", // variable, value set member
+        CompletionItemKind::REFERENCE => "7", // type instance reference
+        CompletionItemKind::FUNCTION => "8", // scope command ([GetName])
+        CompletionItemKind::TEXT => "9",    // loc key, generic text
+        _ => "9",
+    };
+    Some(format!("{}_{}", bucket, label))
+}
+
 /// Snapshotted ruleset-derived state for one completion request. The `Arc`s
 /// carry the lifetime across the request so the helpers can take borrows
 /// without holding the rules read guard.
@@ -284,6 +309,7 @@ impl Backend {
                     label: t.name.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
                     detail: Some("Type definition".to_string()),
+                    sort_text: sort_for_kind(Some(CompletionItemKind::STRUCT), &t.name),
                     ..Default::default()
                 });
             }
@@ -295,6 +321,7 @@ impl Backend {
                     label: e.key.clone(),
                     kind: Some(CompletionItemKind::ENUM),
                     detail: Some(format!("Enum ({} values)", e.values.len())),
+                    sort_text: sort_for_kind(Some(CompletionItemKind::ENUM), &e.key),
                     ..Default::default()
                 });
             }
@@ -309,6 +336,7 @@ impl Backend {
                 label: var.clone(),
                 kind: Some(CompletionItemKind::CONSTANT),
                 detail: Some("Variable".to_string()),
+                sort_text: sort_for_kind(Some(CompletionItemKind::CONSTANT), var),
                 ..Default::default()
             });
         }
@@ -316,10 +344,12 @@ impl Backend {
             if items.len() >= FALLBACK_CAP {
                 break;
             }
+            let label = format!("event_target:{}", et);
             items.push(CompletionItem {
-                label: format!("event_target:{}", et),
+                label: label.clone(),
                 kind: Some(CompletionItemKind::VARIABLE),
                 detail: Some("Event target".to_string()),
+                sort_text: sort_for_kind(Some(CompletionItemKind::VARIABLE), &label),
                 ..Default::default()
             });
         }
@@ -335,6 +365,7 @@ impl Backend {
                     label: key.clone(),
                     kind: Some(CompletionItemKind::KEYWORD),
                     detail: Some(format!("Key in {}", file_uri)),
+                    sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), key),
                     ..Default::default()
                 });
             }
@@ -510,6 +541,7 @@ fn push_specific_leaf_key(
         } else {
             None
         },
+        sort_text: sort_for_kind(Some(CompletionItemKind::FIELD), k),
         ..Default::default()
     });
 }
@@ -564,6 +596,7 @@ fn push_enum_keyed_leaf(
             detail: Some(format!("enum {}", e)),
             insert_text: Some(format!("{} = {}", v, snippet_value)),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
+            sort_text: sort_for_kind(Some(CompletionItemKind::FIELD), v),
             ..Default::default()
         });
     }
@@ -585,6 +618,7 @@ fn push_enum_keyed_node(
             detail: Some(format!("enum {}", e)),
             insert_text: Some(format!("{} = {{\n\t$0\n}}", v)),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
+            sort_text: sort_for_kind(Some(CompletionItemKind::STRUCT), v),
             ..Default::default()
         });
     }
@@ -604,6 +638,7 @@ fn push_enum_leaf_values(
             label: v.clone(),
             kind: Some(CompletionItemKind::ENUM_MEMBER),
             detail: Some(format!("enum {}", e)),
+            sort_text: sort_for_kind(Some(CompletionItemKind::ENUM_MEMBER), v),
             ..Default::default()
         });
     }
@@ -647,6 +682,7 @@ fn push_type_instances(
             detail: Some(format!("{} instance", t)),
             insert_text_format: insert_text.as_ref().map(|_| InsertTextFormat::SNIPPET),
             insert_text,
+            sort_text: sort_for_kind(Some(kind), &inst.name),
             ..Default::default()
         });
     }
@@ -702,6 +738,7 @@ fn push_alias_keys(
             documentation: opts.description.clone().map(Documentation::String),
             insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
             insert_text: snippet,
+            sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), k),
             ..Default::default()
         });
     }
@@ -717,6 +754,7 @@ fn push_alias_keys(
                 detail: Some("modifier".to_string()),
                 insert_text: Some(format!("{} = $0", m)),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
+                sort_text: sort_for_kind(Some(CompletionItemKind::FIELD), m),
                 ..Default::default()
             });
         }
@@ -730,6 +768,7 @@ fn push_scope_names(items: &mut Vec<CompletionItem>, names: &[String]) {
             label: name.clone(),
             kind: Some(CompletionItemKind::VALUE),
             detail: Some("scope".to_string()),
+            sort_text: sort_for_kind(Some(CompletionItemKind::VALUE), name),
             ..Default::default()
         });
     }
@@ -742,6 +781,7 @@ fn push_bool_leaf_values(items: &mut Vec<CompletionItem>) {
             label: v.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
             detail: Some("bool".to_string()),
+            sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), v),
             ..Default::default()
         });
     }
@@ -814,10 +854,12 @@ pub(crate) fn value_completions(
                     detail: String,
                     items: &mut Vec<CompletionItem>| {
         if seen.insert(label.clone()) {
+            let sort_label = label.clone();
             items.push(CompletionItem {
                 label,
                 kind: Some(kind),
                 detail: Some(detail),
+                sort_text: sort_for_kind(Some(kind), &sort_label),
                 ..Default::default()
             });
         }
@@ -1123,16 +1165,19 @@ pub(crate) fn loc_completions(
             label: k.to_string(),
             kind: Some(CompletionItemKind::TEXT),
             detail: Some("loc key".to_string()),
+            sort_text: sort_for_kind(Some(CompletionItemKind::TEXT), k),
             ..Default::default()
         })
         .collect();
 
     // Offer scope names as data-function completions inside [...]
     for name in scope_completion_names(language, registry) {
+        let sort_label = name.clone();
         items.push(CompletionItem {
             label: name,
             kind: Some(CompletionItemKind::FUNCTION),
             detail: Some("scope command".to_string()),
+            sort_text: sort_for_kind(Some(CompletionItemKind::FUNCTION), &sort_label),
             ..Default::default()
         });
     }
@@ -1362,12 +1407,10 @@ mod tests {
         // not a bare `name` (cwtools-vscode#16).
         let rs = bool_enum_ruleset();
         let info = cwtools_info::InfoService::new();
-        let rules = if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
-            rs.root_rules.first()
-        {
-            rules.as_slice()
-        } else {
-            panic!("expected TypeRule");
+        let first_root = rs.root_rules.first().expect("expected root rule");
+        let rules: &[(RuleType, cwtools_rules::rules_types::Options)] = match first_root {
+            RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _)) => rules.as_slice(),
+            _ => panic!("expected TypeRule"),
         };
         let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None);
         let name = items
@@ -1380,6 +1423,96 @@ mod tests {
             "scalar key should insert 'name = ', got: {:?}",
             name.insert_text
         );
+    }
+
+    #[test]
+    fn test_completion_items_have_kind_aware_sort_text() {
+        // Every item in a key-context list must carry a sortText so VS Code
+        // orders them by usefulness as the user types. Concrete leaf fields
+        // sort ahead of node blocks, which sort ahead of aliases, which sort
+        // ahead of type instances, which sort ahead of enum values, which sort
+        // ahead of scope names. The user-visible "iteration" feel depends on
+        // this — without it, the popup sorts purely alphabetically and a
+        // common prefix keeps many similarly-named items in the same row.
+        let rs = bool_enum_ruleset();
+        let info = cwtools_info::InfoService::new();
+        let first_root = rs.root_rules.first().expect("expected root rule");
+        let rules: &[(RuleType, cwtools_rules::rules_types::Options)] =
+            if let RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _)) = first_root {
+                rules.as_slice()
+            } else {
+                panic!("expected TypeRule");
+            };
+        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None);
+        assert!(!items.is_empty(), "expected some completions");
+        for item in &items {
+            assert!(
+                item.sort_text.is_some(),
+                "completion {:?} has no sortText, will sort alphabetically",
+                item.label
+            );
+        }
+        // The first item by sortText should be a concrete leaf field (the
+        // bool `active` from the fixture), not an enum value or alias.
+        let mut sorted = items.clone();
+        sorted.sort_by(|a, b| {
+            a.sort_text
+                .as_deref()
+                .unwrap()
+                .cmp(b.sort_text.as_deref().unwrap())
+        });
+        let first = sorted.first().unwrap();
+        assert_eq!(
+            first.kind,
+            Some(CompletionItemKind::FIELD),
+            "first item by sort should be a concrete field, got {:?}",
+            first.label
+        );
+    }
+
+    #[test]
+    fn test_completion_sort_key_buckets() {
+        // The bucket prefix is fixed-width (single digit 0-9) so the secondary
+        // sort by label stays stable when the same item kind appears in two
+        // different rule lists. The scope-aware bucket for `required_scopes`
+        // is `0_` and must always lead the list.
+        assert_eq!(
+            sort_for_kind(Some(CompletionItemKind::FIELD), "x"),
+            Some("1_x".to_string())
+        );
+        assert_eq!(
+            sort_for_kind(Some(CompletionItemKind::STRUCT), "x"),
+            Some("2_x".to_string())
+        );
+        assert_eq!(
+            sort_for_kind(Some(CompletionItemKind::KEYWORD), "x"),
+            Some("3_x".to_string())
+        );
+        assert_eq!(
+            sort_for_kind(Some(CompletionItemKind::ENUM_MEMBER), "x"),
+            Some("4_x".to_string())
+        );
+        assert_eq!(
+            sort_for_kind(Some(CompletionItemKind::VALUE), "x"),
+            Some("5_x".to_string())
+        );
+        assert_eq!(
+            sort_for_kind(Some(CompletionItemKind::CONSTANT), "x"),
+            Some("6_x".to_string())
+        );
+        assert_eq!(
+            sort_for_kind(Some(CompletionItemKind::REFERENCE), "x"),
+            Some("7_x".to_string())
+        );
+        assert_eq!(
+            sort_for_kind(Some(CompletionItemKind::FUNCTION), "x"),
+            Some("8_x".to_string())
+        );
+        assert_eq!(
+            sort_for_kind(Some(CompletionItemKind::TEXT), "x"),
+            Some("9_x".to_string())
+        );
+        assert_eq!(sort_for_kind(None, "x"), None);
     }
 
     // ── snippet generation tests ─────────────────────────────────────────────
