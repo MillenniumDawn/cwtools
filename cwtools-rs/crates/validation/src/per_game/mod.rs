@@ -30,7 +30,14 @@ pub(crate) fn run_game_validators(ctx: &ValidationCtx, game: Game) -> Vec<Valida
 
     match game {
         Game::Stellaris => {
-            stellaris::validate_stellaris(ast, ruleset, table, file_path, &mut errors);
+            stellaris::validate_stellaris(
+                ast,
+                ruleset,
+                table,
+                file_path,
+                ctx.type_index,
+                &mut errors,
+            );
         }
         Game::Eu4 => {
             eu4::validate_eu4(ast, ruleset, table, file_path, &mut errors);

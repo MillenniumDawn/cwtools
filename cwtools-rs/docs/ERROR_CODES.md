@@ -55,11 +55,11 @@ Codes with no emission site in either engine were removed from both; see
 | CW105 | Error | {} effect used in incorrect scope. In {} but expected {} | An effect is used in the wrong scope. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`) |
 | CW106 | Error | {} scope command used in incorrect scope. In {} but expected {} | A scope command is used outside its valid scope. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`) |
 | CW107 | Information | Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick. | An event has no guard against running every tick. | Emitted (reconciled from F# CW107 / formerly Rust CW300) |
-| CW108 | Error | This research_leader is missing required "area" | A `research_leader` block omits the required `area` field. | Defined, emission pending (vanilla data registries) |
+| CW108 | Error | This research_leader is missing required "area" | A `research_leader` block omits the required `area` field. | Emitted (Stellaris only; CW109 still defined, emission pending cross-block reasoning) |
 | CW109 | Information | This research_leader uses area {} but the technology uses area {} | The area in `research_leader` disagrees with the linked technology's area. | Defined, emission pending (vanilla data registries) |
-| CW110 | Error | No category found for this technology | A technology definition has no category. | Defined, emission pending (vanilla data registries) |
+| CW110 | Error | No category found for this technology | A technology definition has no category. | Emitted (Stellaris only; matches `tech_<name> = { ... }` and `technology = { ... }` root blocks) |
 | CW113 | Error | File {} not found, this is case sensitive | A file path referenced in script doesn't exist (case-sensitive check). | Emitted (FilepathField refs checked against the mod+vanilla file index) |
-| CW120 | Information | Trigger {} can be made a pretrigger (see code action to fix) | A trigger that could be promoted to a pretrigger for performance. | Defined, emission pending (pretrigger registry + scope engine) |
+| CW120 | Information | Trigger {} can be made a pretrigger (see code action to fix) | A trigger that could be promoted to a pretrigger for performance. | Emitted (Stellaris only; global walker, fires alongside the event-scoped CW301) |
 | CW121 | Warning | This 'if' trigger contains no effects | An `if` block contains only a `limit` or nothing at all. | Emitted |
 | CW122 | Information | Localisation key {} should not be quoted when used inline, this can cause unexpected behaviour | A loc key is wrapped in quotes where it is used inline. | Emitted |
 
@@ -92,9 +92,9 @@ Codes with no emission site in either engine were removed from both; see
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW227 | Error | Section template {} can not be found | A ship design references a section template that doesn't exist. | Defined, emission pending (vanilla data registries) |
+| CW227 | Error | Section template {} can not be found | A ship design references a section template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design` blocks, looks up via TypeIndex; CW228/CW230/CW233 still defined, emission pending per-template field data) |
 | CW228 | Error | Section template {} does not have a slot {} | A section template is referenced with a slot name it doesn't define. | Defined, emission pending (vanilla data registries) |
-| CW229 | Error | Component template {} can not be found | A ship design references a component template that doesn't exist. | Defined, emission pending (vanilla data registries) |
+| CW229 | Error | Component template {} can not be found | A ship design references a component template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design` blocks, looks up via TypeIndex) |
 | CW230 | Warning | Component and slot do not match, slot {} has size {} and component {} has size {} | The size of a component doesn't fit the slot it's placed in. | Defined, emission pending (vanilla data registries) |
 | CW231 | Warning | Technology {} is not used | A technology definition is never referenced anywhere. | Defined, emission pending (cross-file reference tracking) |
 | CW233 | Error | Entity {} is not defined | A section or other asset references an entity that isn't defined. | Defined, emission pending (vanilla data registries / asset index) |
@@ -136,7 +136,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW250 | Error | {} | A `planet_killer` definition is missing required configuration. | Defined, emission pending (vanilla data registries) |
+| CW250 | Error | {} | A `planet_killer` definition is missing required configuration. | Emitted (Stellaris only; fires when `planet_killer = { ... }` is missing `type` or any of `planet_damage`/`armor_penetration`/`armor_damage`) |
 | CW251 | Warning | This {} is unnecessary | A boolean operator (`AND`/`OR`) is nested directly inside an identical operator. | Emitted |
 | CW253 | Information | Consider using "set_name" instead for consistency | `set_empire_name` or `set_planet_name` should be replaced with `set_name`. | Emitted |
 | CW280 | Information | {} = { always = ... } matches the default and can be removed | HOI4 cleanup hint: a field whose body is exactly `{ always = <bool> }` matching the field's default (e.g. `allowed_civil_war = { always = no }`) is a no-op and can be deleted. Rust-original (no F# equivalent); field/default table in `per_game::hoi4`. | Emitted |

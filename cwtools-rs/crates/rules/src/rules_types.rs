@@ -73,6 +73,13 @@ pub struct RuleSet {
     /// Built by `reindex()`, keyed like `values`: each `value[name]` set as a
     /// `FxHashSet` for O(1) exact membership. Empty until reindex.
     pub value_sets: std::collections::HashMap<String, rustc_hash::FxHashSet<String>>,
+    /// Built by `reindex()`: every trigger name declared as a pretrigger alias
+    /// (`alias[<scope>_pre_trigger:<name>] = bool`), lowercased and stripped of
+    /// its scope prefix. The cwtools-stellaris-config declares pretriggers
+    /// per-scope (planet_pre_trigger:has_owner, pop_pre_trigger:is_ai, …); the
+    /// validator collects them into one set so CW120/CW301 can ask "is this
+    /// trigger name a known pretrigger?" without caring which scope it lives in.
+    pub pretriggers: std::collections::HashSet<String>,
 }
 
 /// Scope/link config inputs (`scopes.cwt` / `links.cwt`). The types live in the
@@ -217,6 +224,7 @@ impl RuleSet {
             enum_values_lower: Vec::new(),
             enum_has_at: Vec::new(),
             value_sets: std::collections::HashMap::new(),
+            pretriggers: std::collections::HashSet::new(),
         }
     }
 
@@ -225,6 +233,7 @@ impl RuleSet {
     pub fn reindex(&mut self) {
         self.alias_exact.clear();
         self.alias_categories.clear();
+        self.pretriggers.clear();
         self.value_set_effects.clear();
         self.value_set_effect_fields.clear();
         // Which value_set namespace (if any) a rule tree declares.
@@ -277,6 +286,17 @@ impl RuleSet {
             }
         }
         for (i, (name, (rule, _))) in self.aliases.iter().enumerate() {
+            // Collect pretriggers: every alias whose category ends in
+            // `_pre_trigger` contributes its key (the part after the colon,
+            // lowercased) to the cross-scope pretrigger set. Categories seen in
+            // the cwtools-stellaris-config: planet_pre_trigger, pop_pre_trigger,
+            // system_pre_trigger, starbase_pre_trigger, leader_pre_trigger,
+            // situation_pre_trigger, country_pre_trigger.
+            if let Some((cat, key)) = name.split_once(':')
+                && cat.ends_with("_pre_trigger")
+            {
+                self.pretriggers.insert(key.to_ascii_lowercase());
+            }
             if let Some((cat, key)) = name.split_once(':')
                 && (cat == "effect" || cat == "trigger")
             {
