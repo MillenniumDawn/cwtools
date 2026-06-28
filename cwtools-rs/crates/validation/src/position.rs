@@ -352,6 +352,28 @@ fn descend(
                             false,
                         );
                     }
+                    // The parser extends a clause leaf's range past `}` to absorb
+                    // trailing whitespace. If the cursor is past all children's end
+                    // lines, we're in that trailing whitespace — not inside the block.
+                    // Skip and let the parent's insert-position handler supply the
+                    // correct context instead of leaking this block's rules.
+                    if !clause_children.is_empty() {
+                        let max_child_end = clause_children
+                            .iter()
+                            .filter_map(|ch| match ch {
+                                Child::Leaf(i) => {
+                                    Some(ctx.ast.arena.leaves[*i as usize].pos.end.line)
+                                }
+                                Child::LeafValue(i) => {
+                                    Some(ctx.ast.arena.leaf_values[*i as usize].pos.end.line)
+                                }
+                                _ => None,
+                            })
+                            .max();
+                        if max_child_end.is_some_and(|max| line > max) {
+                            continue;
+                        }
+                    }
                     // Descend into every matching rule body (disjunction → union).
                     let candidates = matching_candidates(
                         rules,

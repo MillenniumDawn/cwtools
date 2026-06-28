@@ -241,13 +241,29 @@ impl Backend {
                     None => Some(root_type_snippets(rs, &logical_path)),
                     Some(rctx) => {
                         let items = if rctx.leaf.as_ref().is_some_and(|l| l.in_value) {
-                            value_completions(
-                                &rctx.value_rules,
-                                rs,
-                                &info_guard,
-                                scope_registry_arc.as_deref(),
-                                &language,
-                            )
+                            let is_bare_key = rctx
+                                .leaf
+                                .as_ref()
+                                .is_some_and(|l| l.key.is_empty() && rctx.value_rules.is_empty());
+                            if is_bare_key {
+                                // Bare token (no `=`): treat as a key being typed, not a value.
+                                completions_from_rules(
+                                    &rctx.child_rules,
+                                    rs,
+                                    &info_guard,
+                                    &language,
+                                    &modifier_keys_arc,
+                                    scope_registry_arc.as_deref(),
+                                )
+                            } else {
+                                value_completions(
+                                    &rctx.value_rules,
+                                    rs,
+                                    &info_guard,
+                                    scope_registry_arc.as_deref(),
+                                    &language,
+                                )
+                            }
                         } else if let Some(key) = line_value_key(&doc_text, pos.line, pos.character)
                         {
                             // Mid-edit `key = |`: the last good parse has no such

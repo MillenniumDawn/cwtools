@@ -200,6 +200,9 @@ types = {
     type[mio] = {
         path = "game/common/military_industrial_organization/organizations"
     }
+    type[event] = {
+        path = "game/events"
+    }
 }
 decision = {
     allowed = {
@@ -209,6 +212,31 @@ decision = {
     set_math = {
         value_set[variable] = math_expr
         value_set[variable] = scalar
+    }
+}
+focus = {
+    id = scalar
+    x = int
+    y = int
+    cost = float
+    completion_reward = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+    available = {
+        alias_name[trigger] = alias_match_left[trigger]
+    }
+}
+event = {
+    id = scalar
+    title = scalar
+    trigger = {
+        alias_name[trigger] = alias_match_left[trigger]
+    }
+    immediate = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+    option = {
+        name = scalar
     }
 }
 alias[mathexpr:add] = math_expr
@@ -224,6 +252,7 @@ mio = {
 }
 alias[trigger:has_completed_focus] = <focus>
 alias[trigger:always] = bool
+alias[effect:add_political_power] = int
 modifiers = {
     build_cost_ic = economy
     production_speed_factor = economy
@@ -726,6 +755,75 @@ fn test_completion_equipment_stats_in_mio_trait_bonus() {
         labels
     );
     assert!(labels.iter().any(|l| l == "instant"), "got: {:?}", labels);
+}
+
+#[test]
+fn test_completion_focus_keys_after_clause_subblock() {
+    // Cursor on the blank line AFTER `completion_reward = { ... }` must offer
+    // focus-level keys (id, x, y, cost, …), not the effects inside the sub-block.
+    // Regression: parser extends completion_reward's range past `}`, causing
+    // descend() to enter the sub-block and return effect aliases.
+    let text = "my_focus = {\n    completion_reward = {\n        add_political_power = 5\n    }\n    \n}\n";
+    // Line 4, col 4: blank line after `}` of completion_reward, still inside focus.
+    let labels = completion_labels("common/national_focus/test.txt", text, 4, 4);
+    assert!(
+        labels.iter().any(|l| l == "id"),
+        "focus keys should be offered after a clause sub-block, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|l| l == "cost"),
+        "focus keys should be offered after a clause sub-block, got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l == "add_political_power"),
+        "effect from sub-block must not leak into focus context, got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn test_completion_focus_effects_inside_clause_subblock() {
+    // Cursor on the blank line INSIDE `completion_reward = { }` must offer
+    // effects, not focus-level keys.
+    let text = "my_focus = {\n    completion_reward = {\n        \n    }\n}\n";
+    // Line 2, col 8: blank line inside completion_reward.
+    let labels = completion_labels("common/national_focus/test.txt", text, 2, 8);
+    assert!(
+        labels.iter().any(|l| l == "add_political_power"),
+        "effects should be offered inside completion_reward, got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l == "id"),
+        "focus key `id` must not appear inside completion_reward, got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn test_completion_event_keys_after_clause_subblock() {
+    // Cursor after `trigger = { ... }` inside an event block must offer event-level
+    // keys (id, title, immediate, option, …), not trigger aliases.
+    let text = "my_event = {\n    trigger = {\n        always = yes\n    }\n    \n}\n";
+    // Line 4, col 4: blank line after `}` of trigger, still inside event.
+    let labels = completion_labels("events/test.txt", text, 4, 4);
+    assert!(
+        labels.iter().any(|l| l == "title"),
+        "event keys should be offered after a clause sub-block, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|l| l == "immediate"),
+        "event keys should be offered after a clause sub-block, got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l == "always"),
+        "trigger alias must not leak into event context, got: {:?}",
+        labels
+    );
 }
 
 #[test]
