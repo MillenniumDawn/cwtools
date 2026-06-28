@@ -30,15 +30,6 @@ pub fn validate_stellaris(
                 file_path,
                 errors,
             ),
-            "ship_size" => validate_ship_size(
-                block.children,
-                block.range.start.line,
-                ast,
-                table,
-                file_path,
-                type_index,
-                errors,
-            ),
             // Stellaris technology blocks follow the `tech_<name> = { ... }`
             // convention (see cwtools-stellaris-config's `type[technology]`).
             k if k == "technology" || k.starts_with("tech_") => validate_technology(
@@ -88,12 +79,7 @@ pub fn validate_stellaris(
     walk_if_else(&ast.root_children, ast, table, file_path, errors);
 }
 
-// ── If/Else & set_name structural hints (Item: Tier B Stellaris) ───────────
-//
-// Ported from CWTools/Validation/Stellaris/STLValidation.fs `validateIfElse210`
-// (CW236/CW237), `validateIfElse` (CW238) and `validateDeprecatedSetName`
-// (CW253). F# scopes these to classified effect blocks; this walk keys off the
-// node names instead, which only appear in effect script.
+// ── If/Else & set_name structural hints (CW236/CW237/CW238/CW253) ─────────
 
 /// Keys of a block's direct keyed children, in order.
 fn child_keys(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<String> {
@@ -241,12 +227,10 @@ fn validate_event(
         ));
     }
 
-    // CW301: pre-triggers found inside the trigger block should be moved to event
-    // root for performance. Mirrors F# STLValidation.fs `validatePreTriggers` which
-    // checks trigger block leaves, not event root leaves. The set comes from the
-    // config (`alias[<scope>_pre_trigger:<name>] = bool`); the engine collects
-    // them into `ruleset.pretriggers` during reindex so adding/removing
-    // pretriggers in the config is the only place the list has to change.
+    // CW301: a pre-trigger inside the event's `trigger = { ... }` block
+    // should be moved to event root for performance. The set comes from the
+    // config (`alias[<scope>_pre_trigger:<name>] = bool`), collected into
+    // `ruleset.pretriggers` during reindex.
     let pretriggers = &ruleset.pretriggers;
     for child in children {
         if !child_key_eq(child, ast, table, "trigger") {
@@ -285,46 +269,13 @@ fn validate_event(
     }
 }
 
-// ── Ship Size Validation ───────────────────────────────
+// ── Ship Design Validation (CW227 / CW229) ───────────────────────────────
 //
-// CW227 (section template not found), CW229 (component template not found):
-// walk every `section = { template = ... slot = ... }` and
-// `component = { template = ... slot = ... }` leaf under any `ship_design` /
-// `global_ship_design` block, then ask the type index whether the named
-// template exists. Slot-in-section (CW228), size match (CW230), and entity
-// (CW233) need per-template field values (which slots a section_template
-// defines, what size a component_template is, …) that the current indexer
-// doesn't capture; those emit no diagnostic for now and pick up the indexer
-// extension when vanilla data is wired in.
-fn validate_ship_size(
-    _children: &[Child],
-    _design_line: u32,
-    _ast: &ParsedFile,
-    _table: &StringTable,
-    _file_path: &str,
-    _type_index: Option<&TypeIndex>,
-    _errors: &mut Vec<ValidationError>,
-) {
-    // No standalone ship_size validator for now — ship sizes are chassis
-    // definitions, not ship designs. The ship_design validators live in
-    // validate_ship_design below.
-}
-
-// ── Ship Design Validation ─────────────────────────────
-//
-// Walks every `ship_design = { ... }` and `global_ship_design = { ... }`
-// block at root, then each `section = { template = X slot = Y }` and
-// `component = { template = X slot = Y }` under it. For each, emits:
-//   CW227 when the section template name isn't a known `section_template`.
-//   CW229 when the component template name isn't a known `component_template`.
-//
-// The walk is keyed off block keys (not a registered type), so this works
+// Walks `ship_design` / `global_ship_design` blocks and emits CW227 / CW229
+// for missing section/component templates. Keyed off block keys so it works
 // whether or not the config declares a `ship_design` type — the diagnostics
-// just need the type index to know about templates, which the
-// cwtools-stellaris-config's `type[section_template]` and
-// `type[component_template]` declarations ensure as soon as a mod's
-// `common/section_templates/*.txt` and `common/component_templates/*.txt`
-// files are indexed.
+// just need the type index to know about templates (populated by the
+// `type[section_template]` / `type[component_template]` declarations).
 fn validate_ship_designs(
     root_children: &[Child],
     ast: &ParsedFile,
@@ -348,47 +299,39 @@ fn validate_ship_designs(
             let Some(gc_block) = as_block(grandchild, ast) else {
                 continue;
             };
-            let gc_key = gc_block.key_string(table);
-            if gc_key == "section" {
-                let (template, _slot) =
-                    child_scalar_pair(gc_block.children, ast, table, "template", "slot");
-                if let Some(template) = template
-                    && !type_index.contains("section_template", &template)
-                {
-                    errors.push(ValidationError {
-                        message: error_codes::CW227_UNKNOWN_SECTION_TEMPLATE.format(&[&template]),
-                        severity: error_codes::CW227_UNKNOWN_SECTION_TEMPLATE.severity,
-                        line: gc_block.range.start.line,
-                        col: gc_block.range.start.col,
-                        file: file_path.to_string(),
-                        code: Some(error_codes::CW227_UNKNOWN_SECTION_TEMPLATE.id),
-                    });
-                }
-            } else if gc_key == "component" {
-                let (template, _slot) =
-                    child_scalar_pair(gc_block.children, ast, table, "template", "slot");
-                if let Some(template) = template
-                    && !type_index.contains("component_template", &template)
-                {
-                    errors.push(ValidationError {
-                        message: error_codes::CW229_UNKNOWN_COMPONENT_TEMPLATE.format(&[&template]),
-                        severity: error_codes::CW229_UNKNOWN_COMPONENT_TEMPLATE.severity,
-                        line: gc_block.range.start.line,
-                        col: gc_block.range.start.col,
-                        file: file_path.to_string(),
-                        code: Some(error_codes::CW229_UNKNOWN_COMPONENT_TEMPLATE.id),
-                    });
-                }
+            let (type_name, code) = match gc_block.key_string(table).as_str() {
+                "section" => (
+                    "section_template",
+                    &error_codes::CW227_UNKNOWN_SECTION_TEMPLATE,
+                ),
+                "component" => (
+                    "component_template",
+                    &error_codes::CW229_UNKNOWN_COMPONENT_TEMPLATE,
+                ),
+                _ => continue,
+            };
+            let Some(template) = child_scalar(gc_block.children, ast, table, "template") else {
+                continue;
+            };
+            if type_index.contains(type_name, &template) {
+                continue;
             }
+            errors.push(ValidationError {
+                message: code.format(&[&template]),
+                severity: code.severity,
+                line: gc_block.range.start.line,
+                col: gc_block.range.start.col,
+                file: file_path.to_string(),
+                code: Some(code.id),
+            });
         }
     }
 }
 
-// ── Technology Validation ──────────────────────────────
+// ── Technology (CW110) ────────────────────────────────
 //
-// CW110: every `technology = { ... }` block must declare a `category`. The
-// category groups techs by area (physics / society / engineering) and the
-// game refuses to load a tech without one. F# `TechCatMissing`.
+// CW110: a technology (matches `technology = { ... }` or `tech_<name> = { ... }`)
+// must declare a `category`; the game refuses to load a tech without one.
 fn validate_technology(
     children: &[Child],
     tech_line: u32,
@@ -414,14 +357,10 @@ fn validate_technology(
     });
 }
 
-// ── Research Leader Validation ──────────────────────────
+// ── Research Leader (CW108) ─────────────────────────────
 //
-// CW108: every `research_leader = { ... }` block must declare an `area`.
-// Without it, the game rejects the leader. F# `ResearchLeaderArea`.
-//
-// CW109 (area disagrees with technology) needs cross-block reasoning
-// (the leader's tech comes from the linked `add_research_leader` effect or
-// the surrounding event chain). Not emitted for now.
+// CW108: a research_leader block must declare an `area`; the game rejects it
+// otherwise. CW109 (area-vs-technology mismatch) needs cross-block reasoning.
 fn validate_research_leader(
     children: &[Child],
     leader_line: u32,
@@ -447,13 +386,11 @@ fn validate_research_leader(
     });
 }
 
-// ── Planet Killer Validation ───────────────────────────
+// ── Planet Killer (CW250) ──────────────────────────────
 //
-// CW250: every `planet_killer = { ... }` block must declare at least a
-// `type` and one damage-related key (`planet_damage`, `armor_penetration`,
-// or `armor_damage`). Stellaris reads these as the planet-killer weapon's
-// configuration; without them the weapon is a no-op or crashes the load.
-// F# `PlanetKillerMissing`.
+// CW250: a planet_killer block must declare a `type` and one damage key
+// (`planet_damage`, `armor_penetration`, or `armor_damage`); without them
+// the weapon is a no-op or crashes the load.
 fn validate_planet_killer(
     children: &[Child],
     pk_line: u32,
@@ -478,18 +415,14 @@ fn validate_planet_killer(
         }
     }
     if !has_required || !has_damage {
-        let missing: Vec<&str> = [
-            (!has_required).then_some("type"),
-            (!has_damage).then_some("damage"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let missing: &str = match (has_required, has_damage) {
+            (false, false) => "type, damage",
+            (false, true) => "type",
+            (true, false) => "damage",
+            (true, true) => unreachable!(),
+        };
         errors.push(ValidationError {
-            message: format!(
-                "planet_killer is missing required field(s): {}",
-                missing.join(", ")
-            ),
+            message: format!("planet_killer is missing required field(s): {missing}"),
             severity: error_codes::CW250_PLANET_KILLER_MISSING.severity,
             line: pk_line,
             col: 0,
@@ -501,11 +434,9 @@ fn validate_planet_killer(
 
 // ── Global Pretrigger Walker (CW120) ───────────────────
 //
-// Ported from F# STLValidation.fs `validatePreTriggers` (the global pass, not
-// the event-scoped CW301). For every `trigger = { ... }` block anywhere in the
-// file, look up each child leaf in the config-derived pretrigger set; emit
-// CW120 if it is one. Mirrors the event-scoped CW301 check but applies to
-// trigger blocks outside of events (pop job triggers, planet triggers, …).
+// CW120: any leaf under a `trigger = { ... }` block anywhere in the file
+// (not just events) that names a known pretrigger. Sits alongside the
+// event-scoped CW301.
 fn walk_global_pretriggers(
     children: &[Child],
     ast: &ParsedFile,
@@ -552,7 +483,7 @@ fn walk_pretriggers_in(
                 }
             }
         }
-        // Recurse — `trigger = { ... }` can nest (limit blocks, etc.).
+        // Recurse so trigger blocks nested inside any parent get visited.
         walk_pretriggers_in(block.children, ast, pretriggers, table, file_path, errors);
     }
 }
@@ -606,7 +537,7 @@ fn child_is_bool(child: &Child, ast: &ParsedFile, table: &StringTable, expected:
     }
 }
 
-/// The leaf's key as an owned `String` when it's a non-clause leaf, else None.
+/// A non-clause leaf's key as an owned `String`; None for clauses and bare values.
 fn child_key_str(child: &Child, ast: &ParsedFile, table: &StringTable) -> Option<String> {
     match child {
         Child::Leaf(idx) => {
@@ -617,30 +548,24 @@ fn child_key_str(child: &Child, ast: &ParsedFile, table: &StringTable) -> Option
     }
 }
 
-/// `(template, slot)` for a `section = { template = X slot = Y }` /
-/// `component = { template = X slot = Y }` block. Returns None for either
-/// when the key is absent or the leaf carries a clause instead of a scalar.
-fn child_scalar_pair(
+/// Scalar value of the first child leaf whose key matches `key` (case-insensitive),
+/// or None if the key is absent or the leaf carries a clause.
+fn child_scalar(
     children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
-    template_key: &str,
-    slot_key: &str,
-) -> (Option<String>, Option<String>) {
-    let mut template = None;
-    let mut slot = None;
+    key: &str,
+) -> Option<String> {
     for c in children {
-        let Some(key) = child_key_str(c, ast, table) else {
+        let Some(child_key) = child_key_str(c, ast, table) else {
             continue;
         };
-        let Child::Leaf(idx) = c else { continue };
-        let leaf = &ast.arena.leaves[*idx as usize];
-        let is_template = key.eq_ignore_ascii_case(template_key);
-        let is_slot = key.eq_ignore_ascii_case(slot_key);
-        if !is_template && !is_slot {
+        if !child_key.eq_ignore_ascii_case(key) {
             continue;
         }
-        let value = match &leaf.value {
+        let Child::Leaf(idx) = c else { continue };
+        let leaf = &ast.arena.leaves[*idx as usize];
+        return match &leaf.value {
             Value::String(t) | Value::QString(t) => {
                 Some(table.get_string(t.normal).unwrap_or_default())
             }
@@ -649,13 +574,8 @@ fn child_scalar_pair(
             Value::Float(n) => Some(n.to_string()),
             _ => None,
         };
-        if is_template {
-            template = value;
-        } else {
-            slot = value;
-        }
     }
-    (template, slot)
+    None
 }
 
 #[cfg(test)]
@@ -1053,17 +973,13 @@ mod tests {
         );
     }
 
+    /// When the type index has no data (empty), the validator fires CW227 for
+    /// any referenced section_template — it can't prove the template exists,
+    /// so it reports it as missing. The fix path is to load a mod whose
+    /// `common/section_templates/*.txt` populates the type index.
     #[test]
-    fn ship_design_known_section_template_is_clean() {
-        let mut index = TypeIndex::new();
-        // Stub a TypeInstance for the template. The TypeIndex public API for
-        // adding instances directly is `add` — but we just need `contains`
-        // to return true, so use the lowercase lookup the validator does.
-        // TypeIndex doesn't expose a clean add-from-string; fall back to
-        // inserting via the lower-level path the driver uses.
-        // Simpler: skip adding; assert the unknown-template path is clean
-        // when the template IS known by indexing a script that defines it.
-        let _ = &mut index;
+    fn ship_design_empty_type_index_falls_back_to_unknown() {
+        let index = TypeIndex::new();
         let c = codes_with_type_index(
             "\
                 section_template = { key = \"SSM_known_01\" }\n\
@@ -1072,9 +988,6 @@ mod tests {
             &RuleSet::new(),
             &index,
         );
-        // Empty TypeIndex — the validator can't see the section_template. So
-        // CW227 fires here as the no-knowledge fallback; this test pins that
-        // behaviour rather than asserting a clean pass.
         assert!(
             has_code(&c, "CW227"),
             "with no TypeIndex data, unknown template path should fire CW227, got: {:?}",

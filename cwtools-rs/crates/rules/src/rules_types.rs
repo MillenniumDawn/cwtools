@@ -75,10 +75,8 @@ pub struct RuleSet {
     pub value_sets: std::collections::HashMap<String, rustc_hash::FxHashSet<String>>,
     /// Built by `reindex()`: every trigger name declared as a pretrigger alias
     /// (`alias[<scope>_pre_trigger:<name>] = bool`), lowercased and stripped of
-    /// its scope prefix. The cwtools-stellaris-config declares pretriggers
-    /// per-scope (planet_pre_trigger:has_owner, pop_pre_trigger:is_ai, …); the
-    /// validator collects them into one set so CW120/CW301 can ask "is this
-    /// trigger name a known pretrigger?" without caring which scope it lives in.
+    /// its scope prefix. CW120/CW301 query this set to flag pretriggers that
+    /// could move to root for performance.
     pub pretriggers: std::collections::HashSet<String>,
 }
 
@@ -286,39 +284,33 @@ impl RuleSet {
             }
         }
         for (i, (name, (rule, _))) in self.aliases.iter().enumerate() {
-            // Collect pretriggers: every alias whose category ends in
-            // `_pre_trigger` contributes its key (the part after the colon,
-            // lowercased) to the cross-scope pretrigger set. Categories seen in
-            // the cwtools-stellaris-config: planet_pre_trigger, pop_pre_trigger,
-            // system_pre_trigger, starbase_pre_trigger, leader_pre_trigger,
-            // situation_pre_trigger, country_pre_trigger.
-            if let Some((cat, key)) = name.split_once(':')
-                && cat.ends_with("_pre_trigger")
-            {
-                self.pretriggers.insert(key.to_ascii_lowercase());
-            }
-            if let Some((cat, key)) = name.split_once(':')
-                && (cat == "effect" || cat == "trigger")
-            {
-                if let Some(ns) = first_value_set_ns(rule) {
-                    self.value_set_effects
-                        .entry(key.to_ascii_lowercase())
-                        .or_insert_with(|| ns.to_string());
-                }
-                let mut fields = Vec::new();
-                collect_binding_fields(rule, &mut fields);
-                if !fields.is_empty() {
-                    self.value_set_effect_fields
-                        .entry(key.to_ascii_lowercase())
-                        .or_default()
-                        .extend(fields);
-                }
-            }
-            // Store under the original category+key AND the all-lowercase variant
-            // so that game-file keys like `instantTextboxType` (mixed case) match
-            // rule alias keys like `instantTextBoxType` (camelCase). Paradox
-            // script keys are case-insensitive; aliases are no different.
             if let Some((cat, key)) = name.split_once(':') {
+                // Pretrigger collection: every alias whose category ends in
+                // `_pre_trigger` contributes its key to the cross-scope set
+                // CW120/CW301 query.
+                if cat.ends_with("_pre_trigger") {
+                    self.pretriggers.insert(key.to_ascii_lowercase());
+                }
+                // value_set namespace + binding-field extraction (effect/trigger only).
+                if cat == "effect" || cat == "trigger" {
+                    if let Some(ns) = first_value_set_ns(rule) {
+                        self.value_set_effects
+                            .entry(key.to_ascii_lowercase())
+                            .or_insert_with(|| ns.to_string());
+                    }
+                    let mut fields = Vec::new();
+                    collect_binding_fields(rule, &mut fields);
+                    if !fields.is_empty() {
+                        self.value_set_effect_fields
+                            .entry(key.to_ascii_lowercase())
+                            .or_default()
+                            .extend(fields);
+                    }
+                }
+                // Store under the original category+key AND the all-lowercase variant
+                // so that game-file keys like `instantTextboxType` (mixed case) match
+                // rule alias keys like `instantTextBoxType` (camelCase). Paradox
+                // script keys are case-insensitive; aliases are no different.
                 self.alias_exact
                     .entry(cat.to_string())
                     .or_default()

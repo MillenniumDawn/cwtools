@@ -26,12 +26,16 @@ fn fixture_dir() -> PathBuf {
 fn load_stellaris_ruleset() -> cwtools_rules::rules_types::RuleSet {
     let table = StringTable::new();
     let (ruleset, _errors) = load_ruleset_from_dir(&fixture_dir(), &table);
-    // The fixture only carries the small subset of files we care about
-    // (scopes.cwt, links.cwt, pre_triggers.cwt), so cross-file type
-    // references in links.cwt surface as config-validation warnings.
-    // Those are about unrelated type definitions (script_value, etc.) — the
-    // scope and link inputs we test against are populated regardless.
+    // The fixture only carries scopes.cwt, links.cwt, pre_triggers.cwt; other
+    // cross-file type references surface as config-validation warnings about
+    // unrelated type definitions. The scope and link inputs we test against
+    // are populated regardless.
     ruleset
+}
+
+fn stellaris_registry() -> ScopeRegistry {
+    let ruleset = load_stellaris_ruleset();
+    ScopeRegistry::from_config(&ruleset.scope_inputs, &ruleset.link_inputs, Game::Stellaris)
 }
 
 /// Sanity: the fixture must contain a scopes.cwt and a links.cwt, otherwise
@@ -57,8 +61,7 @@ fn fixture_files_exist() {
 #[test]
 fn config_scopes_resolve() {
     let ruleset = load_stellaris_ruleset();
-    let reg =
-        ScopeRegistry::from_config(&ruleset.scope_inputs, &ruleset.link_inputs, Game::Stellaris);
+    let reg = stellaris_registry();
 
     // Every scope name declared in the config must resolve.
     for si in &ruleset.scope_inputs {
@@ -115,9 +118,7 @@ fn config_scopes_resolve() {
 /// new behaviour: each name resolves to its own id.
 #[test]
 fn config_alliance_and_federation_are_separate_scopes() {
-    let ruleset = load_stellaris_ruleset();
-    let reg =
-        ScopeRegistry::from_config(&ruleset.scope_inputs, &ruleset.link_inputs, Game::Stellaris);
+    let reg = stellaris_registry();
 
     let alliance = reg
         .id_of("Alliance")
@@ -132,7 +133,6 @@ fn config_alliance_and_federation_are_separate_scopes() {
          separate scopes; the engine must not merge them"
     );
 
-    // Their lowercase aliases each map to their own id.
     assert_eq!(reg.id_of("alliance"), Some(alliance));
     assert_eq!(reg.id_of("federation"), Some(federation));
 }
@@ -141,21 +141,19 @@ fn config_alliance_and_federation_are_separate_scopes() {
 /// target scope (if any) must also resolve.
 #[test]
 fn config_links_resolve() {
-    let ruleset = load_stellaris_ruleset();
-    let reg =
-        ScopeRegistry::from_config(&ruleset.scope_inputs, &ruleset.link_inputs, Game::Stellaris);
+    let reg = stellaris_registry();
 
-    for li in &ruleset.link_inputs {
-        let key_exists = if li.prefix.is_some() {
+    for li in &load_stellaris_ruleset().link_inputs {
+        let registered = match &li.prefix {
             // Prefix links live in `prefix_links`, not `links`.
-            reg.prefix_links
+            Some(p) => reg
+                .prefix_links
                 .iter()
-                .any(|(p, _)| p == &li.prefix.as_deref().unwrap_or("").to_ascii_lowercase())
-        } else {
-            reg.links.contains_key(&li.name.to_ascii_lowercase())
+                .any(|(prefix, _)| prefix == p.to_ascii_lowercase().as_str()),
+            None => reg.links.contains_key(&li.name.to_ascii_lowercase()),
         };
         assert!(
-            key_exists,
+            registered,
             "config-declared link `{}` did not register",
             li.name
         );
@@ -176,13 +174,12 @@ fn config_links_resolve() {
 #[test]
 fn synthesized_iterators_present_for_every_scope_alias() {
     let ruleset = load_stellaris_ruleset();
-    let reg =
-        ScopeRegistry::from_config(&ruleset.scope_inputs, &ruleset.link_inputs, Game::Stellaris);
+    let reg = stellaris_registry();
 
     for si in &ruleset.scope_inputs {
         for alias in std::iter::once(&si.name).chain(si.aliases.iter()) {
-            // Only simple (ascii-alphanumeric/underscore) aliases are
-            // synthesized — compound names like `planet_army` aren't.
+            // Compound names like `planet_army` are not synthesized — only
+            // simple ascii-alphanumeric/underscore aliases are.
             if !alias.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 continue;
             }

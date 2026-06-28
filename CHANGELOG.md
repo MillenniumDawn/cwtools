@@ -12,7 +12,7 @@
 - Scripted effects are suggested inside effect blocks. A type-pattern alias (`alias[effect:<scripted_effect>]`) now expands to the actual scripted-effect names instead of emitting the literal `<scripted_effect>` placeholder. (cwtools-vscode#64)
 - Modifiers are suggested inside `dynamic_modifier` blocks (`alias_keys_field[modifier]`). (cwtools-vscode#65)
 - Duplicate autocomplete entries are removed. (cwtools-vscode#66)
-- Stellaris modding support lands. The engine now consumes the `cwtools-stellaris-config` as the source of truth for scope/link/pretrigger resolution: scopes and links come from `scopes.cwt`/`links.cwt` via the runtime `ScopeRegistry`, and the pretrigger set comes from `alias[<scope>_pre_trigger:<name>] = bool` declarations in `pre_triggers.cwt`. The hardcoded `STELLARIS_SCOPES` const and `load_stellaris_links` table are kept as a backfill for partial configs and tests but no longer consulted on the Stellaris path.
+- Stellaris modding support lands. The engine now consumes the `cwtools-stellaris-config` as the source of truth for scope/link/pretrigger resolution: scopes and links come from `scopes.cwt`/`links.cwt` via the runtime `ScopeRegistry`, and the pretrigger set comes from `alias[<scope>_pre_trigger:<name>] = bool` declarations in `pre_triggers.cwt`. The hardcoded `STELLARIS_SCOPES` const and `load_stellaris_links` table stay in place as a backfill for partial configs and tests.
 - New Stellaris-specific validators, ported from `CWTools/Validation/Stellaris/STLValidation.fs`:
   - **CW108** `research_leader` missing `area`
   - **CW110** `technology` (matches `technology = { ... }` and `tech_<name> = { ... }`) missing `category`
@@ -25,13 +25,13 @@
 ## Notes
 
 - Stellaris coverage in this release is best-effort: there is no vanilla corpus or real-world mod in the test data, so a few checks (CW109 area-vs-technology mismatch, CW228 slot-in-section, CW230 size mismatch, CW231 unused technology, CW233 entity defined) are defined and wired but emit no diagnostic yet. They need either a vanilla install path or per-template field data indexed from mod files; the engine is ready to consume that data when it lands.
-- The cwtools-stellaris-config's `scopes.cwt` declares `Alliance` and `Federation` as separate scopes; the previous hardcoded table merged them under one id. With the config-driven path live, `id_of("alliance")` and `id_of("federation")` now resolve to different ids. This matches the config's source-of-truth and is the new behaviour. Pinning test: `crates/validation/tests/stellaris_config.rs::config_alliance_and_federation_are_separate_scopes`.
+- The cwtools-stellaris-config's `scopes.cwt` declares `Alliance` and `Federation` as separate scopes; the previous hardcoded table merged them under one id. With the config-driven path live, `id_of("alliance")` and `id_of("federation")` now resolve to different ids. Pinning test: `crates/validation/tests/stellaris_config.rs::config_alliance_and_federation_are_separate_scopes`.
 
 ## Developer
 
 - Added tests for the unterminated-quote and invalid-key loc checks, the missing-required diagnostic position (nested block and top-level regression), go-to-definition de-duplication, scripted-effect and dynamic-modifier completion, completion de-duplication, and a CLI test asserting the unterminated-quote fixture is flagged.
 - Added `cwtools-rs/testfiles/stellaris-config/` (a small subset of the external cwtools-stellaris-config: `scopes.cwt`, `links.cwt`, `pre_triggers.cwt`) plus `crates/validation/tests/stellaris_config.rs` (5 integration tests: scope/alias resolution, link resolution, synthesized iterators, Alliance-vs-Federation separation, fixture-files-exist sanity check).
-- Added 19 unit tests under `crates/validation/src/per_game/stellaris.rs::tests` for the new validators (CW108, CW110, CW120, CW227, CW229, CW250) plus two for the config-driven pretrigger set (replacing the prior hardcoded constant).
+- Added unit tests under `crates/validation/src/per_game/stellaris.rs::tests` for the new validators (CW108, CW110, CW120, CW227, CW229, CW250) plus two for the config-driven pretrigger set (replacing the prior hardcoded constant).
 
 # 1.8.5
 
