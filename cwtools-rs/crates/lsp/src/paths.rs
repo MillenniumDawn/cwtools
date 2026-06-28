@@ -110,6 +110,45 @@ pub(crate) fn line_value_key(text: &str, line0: u32, char0: u32) -> Option<Strin
     Some(key.to_string())
 }
 
+/// The range of the identifier token the cursor sits in or after, used as the
+/// completion replace-range. Without an explicit range the client guesses a
+/// word boundary, which it gets wrong right after a backspace across a `=` /
+/// `<` / `>` (it filters the candidate list against the operator or whitespace
+/// instead of the half-typed identifier, so the ranking goes to noise). Pinning
+/// the range to the identifier under the cursor makes the client filter against
+/// exactly the typed text. The charset is the bare identifier (`A-Za-z0-9_`):
+/// `.` / `:` are token boundaries so member/scope-chain completion restarts the
+/// word after them. `line0` / `char0` are LSP 0-based.
+pub(crate) fn current_token_range(
+    text: &str,
+    line0: u32,
+    char0: u32,
+) -> tower_lsp::lsp_types::Range {
+    use tower_lsp::lsp_types::{Position, Range};
+    let line = text.lines().nth(line0 as usize).unwrap_or("");
+    let chars: Vec<char> = line.chars().collect();
+    let cur = (char0 as usize).min(chars.len());
+    let mut start = cur;
+    while start > 0 {
+        let c = chars[start - 1];
+        if c.is_alphanumeric() || c == '_' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    Range {
+        start: Position {
+            line: line0,
+            character: start as u32,
+        },
+        end: Position {
+            line: line0,
+            character: char0,
+        },
+    }
+}
+
 /// Whether a URI is a localisation file (`.yml` / `.yaml` / `.csv`), where
 /// `$KEY$` references resolve to other loc entries rather than to game-script
 /// rules. One predicate so hover/goto, completion, and validate agree on what
@@ -382,6 +421,38 @@ mod tests {
             line_value_key("my_block = {", 0, 12),
             None,
             "`my_block = {{` is an insert position, not a value position"
+        );
+    }
+
+    #[test]
+    fn test_current_token_range() {
+        // Mid-identifier value: `set_variable = { gdpc_conv| }` — the range
+        // covers the half-typed `gdpc_conv` so the client filters against it.
+        let line = "\tset_variable = { gdpc_conv }";
+        let cur = "\tset_variable = { gdpc_conv".chars().count() as u32;
+        let r = current_token_range(line, 0, cur);
+        assert_eq!(
+            r.start.character,
+            "\tset_variable = { ".chars().count() as u32
+        );
+        assert_eq!(r.end.character, cur);
+
+        // Empty value position right after `= `: an empty range at the cursor
+        // (start == end) so the client shows the unfiltered list until typing.
+        let line2 = "\tvar = ";
+        let cur2 = line2.chars().count() as u32;
+        let r2 = current_token_range(line2, 0, cur2);
+        assert_eq!(r2.start.character, cur2, "no token → empty range at cursor");
+        assert_eq!(r2.end.character, cur2);
+
+        // `.` and `:` are token boundaries: typing after them restarts the word.
+        let line3 = "value = event_target:foo";
+        let cur3 = line3.chars().count() as u32;
+        let r3 = current_token_range(line3, 0, cur3);
+        assert_eq!(
+            r3.start.character,
+            "value = event_target:".chars().count() as u32,
+            "`:` is a boundary; token is `foo`"
         );
     }
 

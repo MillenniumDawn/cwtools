@@ -206,7 +206,14 @@ decision = {
         alias_name[trigger] = alias_match_left[trigger]
     }
     cost = int
+    set_math = {
+        value_set[variable] = math_expr
+        value_set[variable] = scalar
+    }
 }
+alias[mathexpr:add] = math_expr
+alias[mathexpr:subtract] = math_expr
+alias[mathexpr:multiply] = math_expr
 mio = {
     name = scalar
     equipment_bonus = {
@@ -392,6 +399,59 @@ fn test_completion_in_half_typed_state() {
         Some(true),
         "half-typed completion must be marked is_incomplete, got: {}",
         resp
+    );
+}
+
+#[test]
+fn test_completion_items_carry_text_edit_anchor() {
+    // Every item must carry an explicit `textEdit` so the client filters and
+    // inserts against the cursor range instead of guessing a word boundary (the
+    // guess breaks right after a backspace across `=` / `<` / `>`). Blank-line
+    // key position inside the decision block (line 2, col 4): the range anchors
+    // at the cursor and `filterText` is pinned to the label. (Non-empty token
+    // ranges are covered by paths::test_current_token_range.)
+    let text = "my_decision = {\n    cost = 5\n    \n}\n";
+    let resp = completion_response("common/decisions/test.txt", text, 2, 4);
+    let items = resp["result"]["items"]
+        .as_array()
+        .or_else(|| resp["result"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(!items.is_empty(), "expected items, got: {}", resp);
+    let allowed = items
+        .iter()
+        .find(|i| i["label"] == "allowed")
+        .unwrap_or_else(|| panic!("`allowed` not offered, got: {}", resp));
+    let range = &allowed["textEdit"]["range"];
+    assert_eq!(range["start"]["line"], 2, "got: {}", allowed);
+    assert_eq!(
+        range["start"]["character"], 4,
+        "replace range must anchor at the cursor token, got: {}",
+        allowed
+    );
+    assert_eq!(range["end"]["character"], 4, "got: {}", allowed);
+    // filterText is pinned to the label so the client never filters a snippet.
+    assert_eq!(allowed["filterText"], "allowed", "got: {}", allowed);
+}
+
+#[test]
+fn test_completion_offers_mathexpr_operators_in_math_block() {
+    // Inside a `math_expr` block (`set_math = { x = { | } }`), completion must
+    // offer `value` and the registered mathexpr operators (add/subtract/…),
+    // resolved by the position descent into the synthesized math-clause rules —
+    // not the flat fallback.
+    let text = "d = {\n    set_math = {\n        x = {\n            \n        }\n    }\n}\n";
+    // Blank line inside the innermost math block `x = { ... }` (line 3, col 12).
+    let labels = completion_labels("common/decisions/test.txt", text, 3, 12);
+    assert!(
+        labels.iter().any(|l| l == "add") && labels.iter().any(|l| l == "subtract"),
+        "math operators should be offered inside a math block, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|l| l == "value"),
+        "`value` base should be offered inside a math block, got: {:?}",
+        labels
     );
 }
 

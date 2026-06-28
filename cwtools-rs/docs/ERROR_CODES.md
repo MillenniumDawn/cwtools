@@ -153,8 +153,8 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW259 | Error | This localisation string refers to itself | A loc key's value includes a `$KEY$` reference back to the same key. | Emitted |
 | CW260 | Error | Loc command {} used in wrong scope. In {} but expected {} | A loc command is used in a data scope that doesn't support it. | Emitted |
 | CW261 | Error | Key {} of type {} is defined multiple times | A `unique` type key appears more than once across the loaded files. | Emitted (reconciled from Rust CW501) |
-| CW262 | Error | {} | An unexpected `key = { ... }` node where the rule doesn't allow one. | Emitted |
-| CW263 | Error | {} | An unexpected `key = value` leaf where the rule doesn't allow one. | Emitted |
+| CW262 | Error | {} | An unexpected `key = { ... }` node where the rule doesn't allow one. Also fires on a bad key inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
+| CW263 | Error | {} | An unexpected `key = value` leaf where the rule doesn't allow one. Also fires on a mis-typed operator inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
 | CW264 | Warning | {} | An unexpected bare value where the rule doesn't allow one. | Emitted |
 | CW265 | Warning | {} | An unexpected `{ ... }` value clause where the rule doesn't allow one. | Emitted |
 | CW266 | Error | Localisation key {} uses command {} which does not exist in data type {}. | A loc command is not valid in the resolved data type for that scope. | Emitted (reconciled from Rust CW262) |

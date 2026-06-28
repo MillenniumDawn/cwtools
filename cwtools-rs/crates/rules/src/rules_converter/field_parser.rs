@@ -42,6 +42,7 @@ pub(crate) fn field_from_string(s: &str) -> NewField {
 fn parse_simple_keyword(trimmed: &str) -> Option<NewField> {
     Some(match trimmed {
         "scalar" => NewField::ScalarField,
+        "math_expr" => NewField::ValueField(ValueType::MathExpr),
         "bool" => NewField::ValueField(ValueType::Bool),
         "int" => NewField::ValueField(ValueType::Int {
             min: INT_MIN,

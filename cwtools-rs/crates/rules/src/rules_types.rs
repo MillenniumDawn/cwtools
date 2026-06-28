@@ -552,9 +552,15 @@ pub enum NewField {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueType {
     Enum(String),
-    Float { min: f64, max: f64 },
+    Float {
+        min: f64,
+        max: f64,
+    },
     Bool,
-    Int { min: i32, max: i32 },
+    Int {
+        min: i32,
+        max: i32,
+    },
     Percent,
     Date,
     DateTime,
@@ -562,6 +568,12 @@ pub enum ValueType {
     Ck2DnaProperty,
     IrFamilyName,
     StlNameFormat(String),
+    /// A recursive math-expression operand (HOI4 `set_variable` math blocks).
+    /// As a leaf it is a number or variable reference; as a `{block}` it is a
+    /// `value` base plus `mathexpr` operator keys, validated strictly so a
+    /// mis-typed operator is flagged rather than silently treated as a new
+    /// variable assignment. See `rule_core::validate_math_clause`.
+    MathExpr,
 }
 
 #[derive(Debug, Clone, PartialEq)]

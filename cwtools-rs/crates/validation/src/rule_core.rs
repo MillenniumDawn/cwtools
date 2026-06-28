@@ -583,6 +583,73 @@ fn count_children(
     (key_counts, leafvalue_counts, valueclause_counts)
 }
 
+/// Whether a rule's right-hand side is the `math_expr` value type.
+pub(crate) fn rule_right_is_math_expr(rule_type: &RuleType) -> bool {
+    matches!(
+        rule_type,
+        RuleType::LeafRule {
+            right: NewField::ValueField(ValueType::MathExpr),
+            ..
+        }
+    )
+}
+
+/// The rule set a `math_expr` `{block}` is validated against: a `value` base
+/// (itself a math operand), an optional `tooltip`, and any registered
+/// `mathexpr` operator key (`add`/`subtract`/…). No `= scalar` catch-all — that
+/// is the whole point: an unrecognised key is an unexpected field, not a
+/// silently-accepted variable assignment. Operator argument shapes are owned by
+/// the config's `alias[mathexpr:*]` definitions, which `validate_children`
+/// expands; an operator whose argument is itself `math_expr` recurses here.
+pub(crate) fn math_clause_rules() -> Vec<(RuleType, Options)> {
+    let many = Options {
+        min: 0,
+        max: i32::MAX,
+        ..Default::default()
+    };
+    vec![
+        (
+            RuleType::LeafRule {
+                left: NewField::SpecificField("value".to_string()),
+                right: NewField::ValueField(ValueType::MathExpr),
+            },
+            many.clone(),
+        ),
+        (
+            RuleType::LeafRule {
+                left: NewField::SpecificField("tooltip".to_string()),
+                right: NewField::ScalarField,
+            },
+            many.clone(),
+        ),
+        (
+            RuleType::LeafRule {
+                left: NewField::AliasField("mathexpr".to_string()),
+                right: NewField::AliasField("mathexpr".to_string()),
+            },
+            many,
+        ),
+    ]
+}
+
+/// Validate a `{block}` math expression strictly against [`math_clause_rules`].
+fn validate_math_clause(
+    ctx: &ValidationCtx,
+    children: &[Child],
+    scope_context: &mut Option<ScopeContext>,
+    pos: (u32, u16),
+    errors: &mut Vec<ValidationError>,
+) {
+    validate_children(
+        ctx,
+        children,
+        &math_clause_rules(),
+        scope_context,
+        pos,
+        errors,
+    );
+}
+
 /// Phase 2 of [`validate_children`]: validate each child against the matching
 /// rules, emitting unexpected-property and per-rule diagnostics. Recurses into
 /// nested blocks via [`validate_children`].
@@ -609,6 +676,20 @@ fn validate_each_child(
                     .unwrap_or_default();
                 let candidates =
                     matching_candidates(rules, &key, ruleset, type_index, rule_matches_leaf_key);
+                // `math_expr` is authoritative: a `{block}` math expression is
+                // validated strictly here, BEFORE the candidate disjunction
+                // below. A permissive sibling overload (`value_set[variable] =
+                // scalar`, present on every variable-math effect) would
+                // otherwise accept the block with zero errors and `pick_best_candidate`
+                // would discard the strict unexpected-key diagnostic. Bypassing
+                // the disjunction keeps the strict check.
+                if let Value::Clause(math_children) = &leaf.value
+                    && candidates.iter().any(|(rt, _)| rule_right_is_math_expr(rt))
+                {
+                    let pos = (leaf.pos.start.line, leaf.pos.start.col);
+                    validate_math_clause(ctx, math_children, scope_context, pos, errors);
+                    continue;
+                }
                 if candidates.is_empty() {
                     // Item 5: dynamic modifier keys — if provided and this key is a
                     // known modifier, accept silently (modifier context mechanism).
@@ -1493,6 +1574,21 @@ fn validate_alias_usage(
         }
     }
 
+    // math_expr is authoritative: when the usage is a `{block}` and any
+    // overload types it as math_expr (e.g. `check_expr = math_expr`), validate
+    // it strictly and skip the overload disjunction below. Otherwise a
+    // permissive sibling overload — typically a pattern alias whose backing enum
+    // is unpopulated, so it matches any key with a `variable_field` that accepts
+    // the block cleanly — would win clean and discard the strict math
+    // diagnostic. Mirrors the same authoritative bypass in `validate_each_child`.
+    if let Some(leaf) = leaf
+        && matches!(&leaf.value, Value::Clause(_))
+        && let Some((mrt, _)) = overloads.iter().find(|(rt, _)| rule_right_is_math_expr(rt))
+    {
+        validate_leaf(ctx, leaf, mrt, scope_context.as_ref(), errors);
+        return;
+    }
+
     let mut best: Option<Vec<ValidationError>> = None;
     let mut temp: Vec<ValidationError> = Vec::new();
     for (rule_type, opts) in overloads {
@@ -1687,6 +1783,18 @@ fn validate_leaf(
     let file_path = ctx.file_path;
     let type_index = ctx.type_index;
     if let RuleType::LeafRule { right, .. } = rule_type {
+        // MathExpr operand: a bare leaf (number or variable reference) is
+        // accepted; a `{block}` is a nested math expression validated strictly.
+        // This is the path for an operator argument (`subtract = { … }`,
+        // expanded from `alias[mathexpr:subtract] = math_expr`) and for a bare
+        // operand in the candidate disjunction (`calc = 5`).
+        if let NewField::ValueField(ValueType::MathExpr) = right {
+            if let Value::Clause(math_children) = &leaf.value {
+                let pos = (leaf.pos.start.line, leaf.pos.start.col);
+                validate_math_clause(ctx, math_children, &mut scope_context.cloned(), pos, errors);
+            }
+            return;
+        }
         // LocalisationField: check the referenced loc key exists (CW100/CW122)
         // and, when we know the scope, validate the loc string's commands
         // (CW260/CW262). See `validate_localisation_field`.
@@ -2099,6 +2207,12 @@ pub(crate) fn field_matches_value(
 
         // --- Scalar: accept anything ---
         (NewField::ScalarField, _) => true,
+
+        // --- MathExpr: a math operand — a number/variable leaf or a `{block}`.
+        // The block's contents are validated strictly elsewhere
+        // (`validate_math_clause`); here it just qualifies as a candidate for
+        // either value shape. ---
+        (NewField::ValueField(ValueType::MathExpr), _) => true,
 
         // --- SpecificField: case-insensitive string match ---
         (NewField::SpecificField(s), Value::String(t))

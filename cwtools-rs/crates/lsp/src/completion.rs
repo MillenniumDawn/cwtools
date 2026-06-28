@@ -11,7 +11,7 @@ use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 
 use crate::Backend;
 use crate::CompletionCacheEntry;
-use crate::paths::{line_value_key, logical_path_from_uri};
+use crate::paths::{current_token_range, line_value_key, logical_path_from_uri};
 
 /// Build a `sortText` so the most relevant items surface first as the user
 /// iterates. The LSP spec is clear the SERVER must return all valid items and
@@ -36,6 +36,29 @@ fn sort_for_kind(kind: Option<CompletionItemKind>, label: &str) -> Option<String
         _ => "9",
     };
     Some(format!("{}_{}", bucket, label))
+}
+
+/// Stamp an explicit replace-range on every item so the client filters and
+/// inserts against exactly the identifier token under the cursor. The LSP spec
+/// lets the client guess the replaced word when an item carries no `textEdit`,
+/// and that guess is wrong right after a backspace across a `=` / `<` / `>`:
+/// the client filters the whole list against the operator (or empty string)
+/// and the ranking collapses to noise — the "matching is off / irrelevant
+/// context after backspace" symptom. An explicit range pins the filter input
+/// to the typed text. `insert_text` (snippets) moves into `text_edit.new_text`
+/// so `insert_text_format` still applies; `filter_text` is pinned to the label
+/// so the client never filters against a snippet body.
+fn anchor_items(items: &mut [CompletionItem], range: Range) {
+    for it in items.iter_mut() {
+        if it.text_edit.is_some() {
+            continue;
+        }
+        let new_text = it.insert_text.take().unwrap_or_else(|| it.label.clone());
+        if it.filter_text.is_none() {
+            it.filter_text = Some(it.label.clone());
+        }
+        it.text_edit = Some(CompletionTextEdit::Edit(TextEdit { range, new_text }));
+    }
 }
 
 /// Snapshotted ruleset-derived state for one completion request. The `Arc`s
@@ -110,6 +133,11 @@ impl Backend {
                 .map(|d| (d.text.clone(), d.ast.clone()))
                 .unwrap_or_default()
         };
+        // Replace-range for every item the script paths return: the identifier
+        // token under the cursor. Loc completion keeps its own behavior (the
+        // cached items are shared and the token shape differs), so it is not
+        // anchored here.
+        let replace_range = current_token_range(&doc_text, pos.line, pos.character);
         let (ruleset_arc, modifier_keys_arc, scope_registry_arc): RulesSnapshot = {
             let rules_guard = self.state.rules.read();
             (
@@ -254,9 +282,10 @@ impl Backend {
             _ => None,
         };
 
-        if let Some(items) = context_items
+        if let Some(mut items) = context_items
             && !items.is_empty()
         {
+            anchor_items(&mut items, replace_range);
             // `is_incomplete` so the client re-queries on every keystroke.
             // Without it, VS Code caches the list and filters client-side —
             // which feels right until the half-typed state recovers (a new
@@ -289,43 +318,26 @@ impl Backend {
         if let Some(cached) = self.state.fallback_cache.lock().as_ref()
             && cached.revision == revision
         {
-            let items = (*cached.items).clone();
+            let mut items = (*cached.items).clone();
             if !items.is_empty() {
+                anchor_items(&mut items, replace_range);
                 return Ok(Some(CompletionResponse::List(CompletionList {
                     is_incomplete: true,
                     items,
                 })));
             }
         }
+        // Narrowed fallback: only the dynamic value sets — variables and event
+        // targets. The old fallback also dumped every type, enum, and top-level
+        // key in the workspace; that flood is exactly the "irrelevant context"
+        // that appears the moment a backspace drops the cursor into a position
+        // the AST can't resolve (most often a math / `check_variable` block,
+        // where variables and event targets are the only things you'd type
+        // anyway). Types/enums/keys are still offered wherever the context-aware
+        // path resolves a real rule. The `text_edit` anchor below filters this
+        // set to the typed token client-side.
         const FALLBACK_CAP: usize = 2000;
         let mut items = Vec::new();
-
-        if let Some(rules) = ruleset_arc.as_ref() {
-            for t in &rules.types {
-                if items.len() >= FALLBACK_CAP {
-                    break;
-                }
-                items.push(CompletionItem {
-                    label: t.name.clone(),
-                    kind: Some(CompletionItemKind::STRUCT),
-                    detail: Some("Type definition".to_string()),
-                    sort_text: sort_for_kind(Some(CompletionItemKind::STRUCT), &t.name),
-                    ..Default::default()
-                });
-            }
-            for e in &rules.enums {
-                if items.len() >= FALLBACK_CAP {
-                    break;
-                }
-                items.push(CompletionItem {
-                    label: e.key.clone(),
-                    kind: Some(CompletionItemKind::ENUM),
-                    detail: Some(format!("Enum ({} values)", e.values.len())),
-                    sort_text: sort_for_kind(Some(CompletionItemKind::ENUM), &e.key),
-                    ..Default::default()
-                });
-            }
-        }
 
         let info = self.state.info_service.read();
         for var in info.variable_counts.keys() {
@@ -353,23 +365,6 @@ impl Backend {
                 ..Default::default()
             });
         }
-        for (file_uri, file_info) in &info.files {
-            if items.len() >= FALLBACK_CAP {
-                break;
-            }
-            for (key, _loc) in &file_info.top_level_keys {
-                if items.len() >= FALLBACK_CAP {
-                    break;
-                }
-                items.push(CompletionItem {
-                    label: key.clone(),
-                    kind: Some(CompletionItemKind::KEYWORD),
-                    detail: Some(format!("Key in {}", file_uri)),
-                    sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), key),
-                    ..Default::default()
-                });
-            }
-        }
 
         if items.is_empty() {
             Ok(None)
@@ -380,11 +375,15 @@ impl Backend {
             // real rule context becomes available — the "stuck on abc suggestions"
             // symptom. With is_incomplete, the next keystroke re-queries and the
             // context-aware list replaces it. (#41)
+            // Cache the un-anchored items: the replace-range is per-request
+            // (it moves with the cursor), so anchor the clone that is returned,
+            // not the cached copy.
             *self.state.fallback_cache.lock() = Some(CompletionCacheEntry {
                 revision,
                 language: String::new(),
                 items: std::sync::Arc::new(items.clone()),
             });
+            anchor_items(&mut items, replace_range);
             Ok(Some(CompletionResponse::List(CompletionList {
                 is_incomplete: true,
                 items,

@@ -394,6 +394,15 @@ fn descend(
                                 next.extend(body.iter().cloned());
                                 entered.get_or_insert(opts);
                             }
+                            // `value_set[variable] = math_expr` (and `value =
+                            // math_expr`): a `{block}` math expression. Descend
+                            // into the synthesized math-clause rules so completion
+                            // offers `value`, the `mathexpr` operators, and
+                            // variable operands inside the block.
+                            rt if crate::rule_core::rule_right_is_math_expr(rt) => {
+                                next.extend(crate::rule_core::math_clause_rules());
+                                entered.get_or_insert(opts);
+                            }
                             _ => {}
                         }
                     }
