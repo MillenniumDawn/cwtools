@@ -2,7 +2,7 @@
 //!
 //! Runs the scope-independent loc-entry checks (`validate_loc_file`) over every
 //! loaded loc file and normalizes the results to the F# numeric error codes
-//! (CW001/CW225/CW234/CW259/CW268/CW275), plus the per-file name/header checks
+//! (CW001/CW225/CW234/CW259/CW268/CW275/CW276), plus the per-file name/header checks
 //! (CW254/CW255/CW256/CW257). Scope-dependent command checks
 //! (CW226/CW260/CW266) run at the config reference site, not here, because they
 //! need the scope of the referencing field.
@@ -83,6 +83,14 @@ fn loc_error_parts(
             LocSeverity::Warning,
             format!(
                 "Localisation value for {} contains unexpected characters, and may not render correctly",
+                key
+            ),
+        ),
+        LocErrorKind::LocKeyInvalidChars => (
+            "CW276",
+            LocSeverity::Warning,
+            format!(
+                "Localisation key {} contains invalid characters (spaces or special characters are not allowed)",
                 key
             ),
         ),
@@ -532,6 +540,34 @@ mod tests {
             "no CW225 from recovered parse: {:?}",
             diags
         );
+    }
+
+    #[test]
+    fn unterminated_string_maps_to_cw268() {
+        // Regression: opening quote with no closing quote was falsely reported as
+        // balanced because the truncation reduced effective to a single `"`.
+        let svc = service_from(&[(
+            "a_l_english.yml",
+            "l_english:\n missing_quote:0 \"unclosed\n",
+        )]);
+        let diags = validate_loc_project(&svc, Game::HOI4);
+        let cw268: Vec<_> = diags.iter().filter(|d| d.code == "CW268").collect();
+        assert_eq!(cw268.len(), 1, "unterminated string should emit CW268: {:?}", diags);
+        assert_eq!(cw268[0].severity, LocSeverity::Warning);
+    }
+
+    #[test]
+    fn key_with_space_maps_to_cw276() {
+        let svc = service_from(&[(
+            "a_l_english.yml",
+            "l_english:\n \"bad key\": \"value\"\n",
+        )]);
+        let diags = validate_loc_project(&svc, Game::HOI4);
+        let cw276: Vec<_> = diags.iter().filter(|d| d.code == "CW276").collect();
+        assert_eq!(cw276.len(), 1, "key with space should emit CW276: {:?}", diags);
+        assert_eq!(cw276[0].severity, LocSeverity::Warning);
+        assert!(cw276[0].message.contains("bad key") || cw276[0].message.contains("\"bad key\""),
+            "message should reference the key: {}", cw276[0].message);
     }
 
     #[test]

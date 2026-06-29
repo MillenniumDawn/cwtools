@@ -19,7 +19,8 @@ pub use pipeline::{
 pub use scope_validation::{LocCommandDiagnostic, LocScopeData, validate_loc_commands};
 pub use service::*;
 pub use validation::{
-    HARDCODED_LOC, LocErrorKind, LocValidationError, validate_invalid_chars, validate_loc_file,
+    HARDCODED_LOC, LocErrorKind, LocValidationError, validate_invalid_chars, validate_key_chars,
+    validate_loc_file,
 };
 pub use yaml_parser::{
     LangHeaderDiagnostic, MissingBomDiagnostic, check_loc_file_lang, check_utf8_bom,

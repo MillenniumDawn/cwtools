@@ -29,6 +29,8 @@ pub enum LocErrorKind {
     LocMissingQuote,
     /// Value contains characters outside the allowed Unicode ranges (F# CW275).
     LocInvalidChars,
+    /// Key contains spaces or characters not valid in loc keys (CW276).
+    LocKeyInvalidChars,
 }
 
 /// Validation error for a loc entry. `line`/`col` are 1-based source positions.
@@ -80,6 +82,9 @@ pub fn validate_loc_file_with_hardcoded(
     let mut errors = Vec::new();
 
     for entry in &file.entries {
+        // ---- Invalid key characters ----
+        validate_key_chars(entry, &mut errors);
+
         // ---- Invalid characters ----
         validate_invalid_chars(entry, &mut errors);
 
@@ -164,6 +169,25 @@ pub fn validate_invalid_chars(entry: &LocEntry, errors: &mut Vec<LocValidationEr
     }
 }
 
+/// Check whether a loc key contains only characters valid in a loc key.
+///
+/// Valid: ASCII alphanumeric, `_`, `.`, `-`. A space or anything outside this
+/// set triggers CW276.
+pub fn validate_key_chars(entry: &LocEntry, errors: &mut Vec<LocValidationError>) {
+    if entry.key.chars().any(|c| !is_valid_loc_key_char(c)) {
+        errors.push(LocValidationError {
+            line: entry.position.line,
+            col: entry.position.column,
+            key: entry.key.clone(),
+            kind: LocErrorKind::LocKeyInvalidChars,
+        });
+    }
+}
+
+fn is_valid_loc_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
 /// Quote validation (mirrors F# `validateQuotes`).
 ///
 /// Returns `true` if OK, `false` if unbalanced.
@@ -189,6 +213,13 @@ pub fn validate_quotes(entry: &LocEntry) -> bool {
 
     let starts = effective.starts_with('"');
     let ends = effective.ends_with('"');
+
+    // A single `"` satisfies both starts_with and ends_with — it's only an
+    // opening quote with the truncation consuming the whole string. Still
+    // unbalanced.
+    if starts && ends && effective.len() == 1 {
+        return false;
+    }
 
     // Balanced when both ends quote or neither does; mismatch -> CW268. (No
     // mutation here: the caller already ran the invalid-char check that reads
@@ -347,6 +378,63 @@ mod tests {
         assert!(
             inv_char_errors.is_empty(),
             "valid chars should not produce LocInvalidChars"
+        );
+    }
+
+    // ---- unterminated string (CW268) bug fix --------------------------------
+
+    #[test]
+    fn test_unterminated_string_emits_cw268() {
+        // A value with only an opening quote and no closing quote must flag CW268.
+        // The previous implementation truncated effective to a single `"` which
+        // appeared balanced on both ends, so no error was emitted.
+        let text = "l_english:\n missing_quote:0 \"unclosed\n";
+        let file = parse_loc_text(text, "test.yml").unwrap();
+        let keys: HashSet<String> = HashSet::new();
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
+
+        let cw268: Vec<_> = errors
+            .iter()
+            .filter(|e| e.kind == LocErrorKind::LocMissingQuote)
+            .collect();
+        assert!(
+            !cw268.is_empty(),
+            "opening quote with no closing quote should emit LocMissingQuote: {:?}",
+            errors
+        );
+    }
+
+    // ---- key character validation (CW276) -----------------------------------
+
+    #[test]
+    fn test_key_with_space_emits_cw276() {
+        let text = "l_english:\n \"bad key\": \"value\"\n";
+        let file = parse_loc_text(text, "test.yml").unwrap();
+        let keys: HashSet<String> = HashSet::new();
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
+
+        let cw276: Vec<_> = errors
+            .iter()
+            .filter(|e| e.kind == LocErrorKind::LocKeyInvalidChars)
+            .collect();
+        assert!(
+            !cw276.is_empty(),
+            "key with space should emit LocKeyInvalidChars: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_valid_key_no_cw276() {
+        let text = "l_english:\n valid_key.sub-key: \"value\"\n";
+        let file = parse_loc_text(text, "test.yml").unwrap();
+        let keys: HashSet<String> = HashSet::new();
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
+
+        assert!(
+            errors.iter().all(|e| e.kind != LocErrorKind::LocKeyInvalidChars),
+            "valid key chars should not emit LocKeyInvalidChars: {:?}",
+            errors
         );
     }
 
