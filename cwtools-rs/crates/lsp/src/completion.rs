@@ -808,14 +808,9 @@ fn push_alias_keys(
                             label: inst.name.clone(),
                             kind: Some(CompletionItemKind::KEYWORD),
                             detail: Some(cat.to_string()),
-                            insert_text_format: snippet
-                                .as_ref()
-                                .map(|_| InsertTextFormat::SNIPPET),
+                            insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
                             insert_text: snippet,
-                            sort_text: sort_for_kind(
-                                Some(CompletionItemKind::KEYWORD),
-                                &inst.name,
-                            ),
+                            sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), &inst.name),
                             ..Default::default()
                         });
                     }
@@ -830,9 +825,7 @@ fn push_alias_keys(
                             label: v.clone(),
                             kind: Some(CompletionItemKind::KEYWORD),
                             detail: Some(cat.to_string()),
-                            insert_text_format: snippet
-                                .as_ref()
-                                .map(|_| InsertTextFormat::SNIPPET),
+                            insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
                             insert_text: snippet,
                             sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), &v),
                             ..Default::default()
@@ -853,9 +846,7 @@ fn push_alias_keys(
                             label: v.to_string(),
                             kind: Some(CompletionItemKind::KEYWORD),
                             detail: Some(cat.to_string()),
-                            insert_text_format: snippet
-                                .as_ref()
-                                .map(|_| InsertTextFormat::SNIPPET),
+                            insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
                             insert_text: snippet,
                             sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), v),
                             ..Default::default()
@@ -1969,9 +1960,7 @@ mod tests {
             "effect:<scripted_effect>".to_string(),
             (
                 RuleType::LeafRule {
-                    left: NewField::SpecificField(
-                        "alias[effect:<scripted_effect>]".to_string(),
-                    ),
+                    left: NewField::SpecificField("alias[effect:<scripted_effect>]".to_string()),
                     right: NewField::SpecificField("yes".to_string()),
                 },
                 Options::default(),
@@ -1998,7 +1987,8 @@ mod tests {
                 primary_loc_key: None,
             }],
         );
-        info.type_index.merge("file:///scripted_effects/se.txt", per_type);
+        info.type_index
+            .merge("file:///scripted_effects/se.txt", per_type);
 
         let rules = vec![(
             RuleType::LeafRule {
@@ -2041,10 +2031,9 @@ mod tests {
         // `dynamic_modifier` blocks) must offer modifier keys as completions.
         let rs = bool_enum_ruleset(); // arbitrary ruleset with reindex() called
         let info = cwtools_info::InfoService::new();
-        let modifier_keys: HashSet<String> =
-            ["my_modifier".to_string(), "other_mod".to_string()]
-                .into_iter()
-                .collect();
+        let modifier_keys: HashSet<String> = ["my_modifier".to_string(), "other_mod".to_string()]
+            .into_iter()
+            .collect();
         let rules = vec![(
             RuleType::LeafRule {
                 left: NewField::AliasValueKeysField("modifier".to_string()),

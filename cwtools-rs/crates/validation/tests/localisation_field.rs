@@ -150,7 +150,10 @@ fn loc_pipeline_codes_match_error_catalog() {
         (LocErrorKind::ReplaceMe, &ec::CW234_REPLACE_ME_LOC),
         (LocErrorKind::LocMissingQuote, &ec::CW268_LOC_MISSING_QUOTE),
         (LocErrorKind::LocInvalidChars, &ec::CW275_LOC_INVALID_CHARS),
-        (LocErrorKind::LocKeyInvalidChars, &ec::CW276_LOC_KEY_INVALID_CHARS),
+        (
+            LocErrorKind::LocKeyInvalidChars,
+            &ec::CW276_LOC_KEY_INVALID_CHARS,
+        ),
     ];
 
     for (kind, code) in cases {

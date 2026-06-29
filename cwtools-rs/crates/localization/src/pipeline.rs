@@ -552,22 +552,32 @@ mod tests {
         )]);
         let diags = validate_loc_project(&svc, Game::HOI4);
         let cw268: Vec<_> = diags.iter().filter(|d| d.code == "CW268").collect();
-        assert_eq!(cw268.len(), 1, "unterminated string should emit CW268: {:?}", diags);
+        assert_eq!(
+            cw268.len(),
+            1,
+            "unterminated string should emit CW268: {:?}",
+            diags
+        );
         assert_eq!(cw268[0].severity, LocSeverity::Warning);
     }
 
     #[test]
     fn key_with_space_maps_to_cw276() {
-        let svc = service_from(&[(
-            "a_l_english.yml",
-            "l_english:\n \"bad key\": \"value\"\n",
-        )]);
+        let svc = service_from(&[("a_l_english.yml", "l_english:\n \"bad key\": \"value\"\n")]);
         let diags = validate_loc_project(&svc, Game::HOI4);
         let cw276: Vec<_> = diags.iter().filter(|d| d.code == "CW276").collect();
-        assert_eq!(cw276.len(), 1, "key with space should emit CW276: {:?}", diags);
+        assert_eq!(
+            cw276.len(),
+            1,
+            "key with space should emit CW276: {:?}",
+            diags
+        );
         assert_eq!(cw276[0].severity, LocSeverity::Warning);
-        assert!(cw276[0].message.contains("bad key") || cw276[0].message.contains("\"bad key\""),
-            "message should reference the key: {}", cw276[0].message);
+        assert!(
+            cw276[0].message.contains("bad key") || cw276[0].message.contains("\"bad key\""),
+            "message should reference the key: {}",
+            cw276[0].message
+        );
     }
 
     #[test]

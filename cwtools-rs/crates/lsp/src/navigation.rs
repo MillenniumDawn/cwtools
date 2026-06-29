@@ -916,7 +916,11 @@ mod tests {
             make_location("file:///vanilla/events/a.txt", 2, 0),
         ];
         let deduped = dedup_locations(locs);
-        assert_eq!(deduped.len(), 2, "different URIs at same position must both survive");
+        assert_eq!(
+            deduped.len(),
+            2,
+            "different URIs at same position must both survive"
+        );
     }
 
     #[test]
@@ -926,19 +930,34 @@ mod tests {
         let first = Location {
             uri: file.parse().unwrap(),
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 10 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 10,
+                },
             },
         };
         let second = Location {
             uri: file.parse().unwrap(),
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 99 }, // different end, same start key
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 99,
+                }, // different end, same start key
             },
         };
         let deduped = dedup_locations(vec![first.clone(), second]);
         assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0].range.end.character, 10, "must keep first occurrence");
+        assert_eq!(
+            deduped[0].range.end.character, 10,
+            "must keep first occurrence"
+        );
     }
 }

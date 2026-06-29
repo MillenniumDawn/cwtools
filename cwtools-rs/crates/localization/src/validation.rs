@@ -432,7 +432,9 @@ mod tests {
         let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
 
         assert!(
-            errors.iter().all(|e| e.kind != LocErrorKind::LocKeyInvalidChars),
+            errors
+                .iter()
+                .all(|e| e.kind != LocErrorKind::LocKeyInvalidChars),
             "valid key chars should not emit LocKeyInvalidChars: {:?}",
             errors
         );
