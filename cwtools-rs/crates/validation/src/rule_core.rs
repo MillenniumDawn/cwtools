@@ -853,13 +853,19 @@ fn enforce_cardinality(
     let table = ctx.table;
     let file_path = ctx.file_path;
 
-    // Cardinality enforcement. Report at the block's own location (its first
-    // child) rather than line 0 — a missing required field belongs to THIS
-    // entity (e.g. the specific decision), not the top of the file.
-    let (block_line, block_col) = children
-        .iter()
-        .find_map(|c| child_start_pos(c, ast))
-        .unwrap_or(block_pos);
+    // Under-count: anchor on the block's key position (block_pos) so the
+    // squiggle lands on the `key = { ... }` opener, not on whatever child
+    // happens to be first. When block_pos is (0,0) — the type_per_file
+    // sentinel where the whole file is one entity and there is no block key
+    // — fall back to the first child to avoid a line-0 diagnostic.
+    let (block_line, block_col) = if block_pos != (0, 0) {
+        block_pos
+    } else {
+        children
+            .iter()
+            .find_map(|c| child_start_pos(c, ast))
+            .unwrap_or(block_pos)
+    };
 
     // Aggregate keyed-rule cardinality per (lowercased) key. Duplicate keys are
     // overloads/alternatives (e.g. two `clicksound =` rules in one subtype), so
