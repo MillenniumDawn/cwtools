@@ -267,6 +267,18 @@ fn test_loc_valid_directory() {
 }
 
 #[test]
+fn test_loc_detects_unterminated_quote() {
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW268"))
+        .stdout(predicate::str::contains("missing_quote"))
+        .stdout(predicate::str::contains("1 issues"));
+}
+
+#[test]
 fn test_loc_empty_directory() {
     let tmp = tempfile::tempdir().unwrap();
     cwtools()
