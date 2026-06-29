@@ -65,7 +65,7 @@ Codes with no emission site in either engine were removed from both; see
 
 ---
 
-## CW220-CW275 -- Loc references, event targets, bool/syntax hints, rules engine, type system
+## CW220-CW276 -- Loc references, event targets, bool/syntax hints, rules engine, type system
 
 ### CW220-CW222 -- Event targets / event index
 
@@ -161,7 +161,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW267 | Error | Expected a {} value, got {} | An alias key/value didn't match the expected alias category. | Emitted |
 | CW268 | Warning | Localisation key {} doesn't start and end with double quotes | A loc value is missing its enclosing double-quote delimiters. | Emitted |
 
-### CW269-CW275 -- Optimisation, precision, custom errors, inline scripts, invalid chars
+### CW269-CW276 -- Optimisation, precision, custom errors, inline scripts, invalid chars, key validation
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
@@ -172,6 +172,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW273 | Warning | Modifier type {} is not defined but is used | A modifier's type reference points to a modifier-type that isn't defined. | Defined, emission pending (modifier-type registry) |
 | CW274 | Error | This usage of inline_script results in an error, see related | An `inline_script` call resolves to content that itself fails validation. | Defined, not wired (inline-script expansion does not propagate child errors yet) |
 | CW275 | Warning | Localisation key {} contains unexpected characters, and may not render correctly | A loc value contains characters outside the expected set for that game. | Emitted |
+| CW276 | Warning | Localisation key {} contains invalid characters (spaces or special characters are not allowed) | A loc key contains a space or character not valid in a loc key (only alphanumeric, `_`, `.`, `-` are allowed). Rust-only (no F# equivalent). | Emitted |
 
 ---
 

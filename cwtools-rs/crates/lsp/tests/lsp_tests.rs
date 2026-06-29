@@ -862,6 +862,193 @@ fn test_completion_country_flags_for_has_country_flag() {
     );
 }
 
+// ── Issues #64, #65: type-pattern alias and alias_keys_field completions ──────
+
+/// Spawn a server with custom `rules` text, open `extra_files` + the main file,
+/// and return the completion labels at `(line0, char0)`.  Mirrors
+/// `completion_labels_with_files` but the rules come from the caller.
+fn completion_labels_custom_rules(
+    rules: &str,
+    rel_path: &str,
+    text: &str,
+    extra_files: &[(&str, &str)],
+    line0: u32,
+    char0: u32,
+) -> Vec<String> {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), rules).unwrap();
+
+    for (rel, content) in extra_files.iter().chain([&(rel_path, text)]) {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    for (rel, content) in extra_files.iter().chain([&(rel_path, text)]) {
+        let uri = format!("file://{}", ws.path().join(rel).display());
+        let body = jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": content,
+                }
+            }),
+        );
+        write_frame(&mut child, &body).unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+
+    let doc_uri = format!("file://{}", ws.path().join(rel_path).display());
+    let body = jsonrpc_request(
+        2,
+        "textDocument/completion",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "position": { "line": line0, "character": char0 },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let resp_str = read_response(&mut reader).expect("no completion response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(resp["id"], 2, "got: {}", resp_str);
+    let items = resp["result"]
+        .as_array()
+        .cloned()
+        .or_else(|| resp["result"]["items"].as_array().cloned())
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|i| i["label"].as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+/// Rules for the #64 and #66 integration tests.
+const SCRIPTED_EFFECT_RULES: &str = r#"
+types = {
+    type[scripted_effect] = {
+        path = "game/common/scripted_effects"
+    }
+    type[decision] = {
+        path = "game/common/decisions"
+    }
+}
+decision = {
+    complete_effect = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+}
+alias[effect:<scripted_effect>] = yes
+scripted_effect = {
+    alias_name[effect] = alias_match_left[effect]
+}
+"#;
+
+#[test]
+fn test_completion_scripted_effects_in_effect_block() {
+    // #64: `alias[effect:<scripted_effect>] = yes` means every scripted_effect
+    // instance must appear as a KEYWORD completion inside effect blocks. The bug
+    // was that the raw placeholder `<scripted_effect>` appeared instead of actual
+    // instance names.
+    let se_file = (
+        "common/scripted_effects/my_effects.txt",
+        "my_special_effect = {\n}\n",
+    );
+    // Blank line inside `complete_effect = { }` of the decision.
+    let text = "my_dec = {\n    complete_effect = {\n        \n    }\n}\n";
+    let labels = completion_labels_custom_rules(
+        SCRIPTED_EFFECT_RULES,
+        "common/decisions/d.txt",
+        text,
+        &[se_file],
+        2,
+        8,
+    );
+    assert!(
+        labels.iter().any(|l| l == "my_special_effect"),
+        "scripted_effect instances must be offered in effect blocks, got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l == "<scripted_effect>"),
+        "raw placeholder must not appear in labels, got: {:?}",
+        labels
+    );
+}
+
+/// Rules for the #65 integration test: a `dynamic_modifier` type whose body uses
+/// `alias_keys_field[modifier]` as the key pattern.
+const DYNAMIC_MODIFIER_RULES: &str = r#"
+types = {
+    type[dynamic_modifier] = {
+        path = "game/common/dynamic_modifiers"
+    }
+}
+modifiers = {
+    build_cost_ic = economy
+    production_speed_factor = economy
+}
+dynamic_modifier = {
+    ## cardinality = 0..inf
+    alias_keys_field[modifier] = float
+}
+"#;
+
+#[test]
+fn test_completion_alias_keys_field_in_dynamic_modifier() {
+    // #65: a block whose children use `alias_keys_field[modifier]` as their key
+    // (common/dynamic_modifiers/*.txt in HOI4) must offer modifier names.
+    let text = "my_dmod = {\n    \n}\n";
+    let labels = completion_labels_custom_rules(
+        DYNAMIC_MODIFIER_RULES,
+        "common/dynamic_modifiers/test.txt",
+        text,
+        &[],
+        1,
+        4,
+    );
+    assert!(
+        labels.iter().any(|l| l == "build_cost_ic"),
+        "modifier names must be offered inside a dynamic_modifier block, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|l| l == "production_speed_factor"),
+        "all modifier keys must be offered, got: {:?}",
+        labels
+    );
+}
+
 // ── Backspace robustness: same-context completions must not evaporate when the
 //    value is deleted, and the flat variable fallback must NOT be substituted
 //    for the context-aware list. The cwt rules define the context; deleting

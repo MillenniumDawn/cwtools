@@ -6,7 +6,9 @@ use tower_lsp::lsp_types::*;
 
 use cwtools_info::InfoService;
 use cwtools_parser::ast::ParsedFile;
-use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType, TypeType, ValueType};
+use cwtools_rules::rules_types::{
+    NewField, ParsedAliasPattern, PatternKind, RootRule, RuleSet, RuleType, TypeType, ValueType,
+};
 use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 
 use crate::Backend;
@@ -490,7 +492,15 @@ pub(crate) fn completions_from_rules(
             | RuleType::NodeRule {
                 left: NewField::AliasField(cat),
                 ..
-            } => push_alias_keys(&mut items, ruleset, modifier_keys, cat),
+            } => push_alias_keys(&mut items, ruleset, info, modifier_keys, cat),
+            // alias_keys_field[cat]: the KEY of this leaf must be one of the alias
+            // names in category `cat` (e.g. `alias_keys_field[modifier]` in a
+            // dynamic_modifier block). Offer the same set as alias_name[cat] would
+            // (cwtools-vscode#65).
+            RuleType::LeafRule {
+                left: NewField::AliasValueKeysField(cat),
+                ..
+            } => push_alias_keys(&mut items, ruleset, info, modifier_keys, cat),
             // Scope names
             RuleType::LeafRule {
                 right: NewField::ScopeField(_),
@@ -510,6 +520,12 @@ pub(crate) fn completions_from_rules(
             _ => {}
         }
     }
+
+    // Dedup by label: subtype-flattening can produce duplicate rules when the same
+    // field appears in multiple subtypes. Keep the first occurrence (which carries
+    // the most specific snippet) (cwtools-vscode#66).
+    let mut seen_labels: HashSet<String> = HashSet::new();
+    items.retain(|item| seen_labels.insert(item.label.clone()));
 
     items
 }
@@ -708,19 +724,32 @@ fn push_type_instances(
 /// onto one item (first description and first resolvable snippet win). The
 /// `modifier` category has no alias entries, so its keys come from the expanded
 /// modifier-key set instead.
+///
+/// Type-pattern aliases like `alias[effect:<scripted_effect>] = yes` are expanded
+/// here: instead of emitting the raw `<scripted_effect>` placeholder, we look up
+/// every instance of the `scripted_effect` type in the index and offer each as a
+/// KEYWORD item (cwtools-vscode#64).
 fn push_alias_keys(
     items: &mut Vec<CompletionItem>,
     ruleset: &RuleSet,
+    info: &InfoService,
     modifier_keys: &HashSet<String>,
     cat: &str,
 ) {
     let prefix = format!("{}:", cat);
-    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    // Own the keys so that instance names (borrowed from the type index, not from
+    // `ruleset.aliases`) can also participate in the seen-check below.
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (alias_name, (rule, opts)) in &ruleset.aliases {
         let Some(k) = alias_name.strip_prefix(&prefix) else {
             continue;
         };
         if k == "scope_field" {
+            continue;
+        }
+        // Skip type/enum/value pattern aliases (e.g. `<scripted_effect>`,
+        // `enum[idea_name]`). They are expanded from the type index below.
+        if ParsedAliasPattern::parse(k, 0).is_some() {
             continue;
         }
         if let Some(&idx) = seen.get(k) {
@@ -740,7 +769,7 @@ fn push_alias_keys(
             }
             continue;
         }
-        seen.insert(k, items.len());
+        seen.insert(k.to_string(), items.len());
         // A block effect/trigger (`if`, `random`, …) completes to
         // `key = { …required fields… }`; a value one
         // (`add_political_power`) to `key = <placeholder>` so the
@@ -757,6 +786,77 @@ fn push_alias_keys(
             ..Default::default()
         });
     }
+
+    // Expand pure type-pattern aliases (e.g. `alias[effect:<scripted_effect>] = yes`):
+    // emit one KEYWORD item per instance of the referenced type. Composite patterns
+    // like `production_speed_<building>_factor` (non-empty prefix/suffix) are too
+    // complex to expand here and are skipped.
+    if let Some(cat_idx) = ruleset.alias_categories.get(cat) {
+        for pattern in &cat_idx.parsed_patterns {
+            if !pattern.prefix.is_empty() || !pattern.suffix.is_empty() {
+                continue;
+            }
+            let (_, (rule, _)) = &ruleset.aliases[pattern.alias_idx];
+            match pattern.kind {
+                PatternKind::Type => {
+                    for (_, inst) in info.type_index.instances(&pattern.placeholder_name) {
+                        if seen.contains_key(&inst.name) {
+                            continue;
+                        }
+                        let snippet = alias_completion_snippet(&inst.name, rule, ruleset);
+                        items.push(CompletionItem {
+                            label: inst.name.clone(),
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            detail: Some(cat.to_string()),
+                            insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
+                            insert_text: snippet,
+                            sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), &inst.name),
+                            ..Default::default()
+                        });
+                    }
+                }
+                PatternKind::Enum => {
+                    for v in all_enum_values(ruleset, info, &pattern.placeholder_name) {
+                        if seen.contains_key(&v) {
+                            continue;
+                        }
+                        let snippet = alias_completion_snippet(&v, rule, ruleset);
+                        items.push(CompletionItem {
+                            label: v.clone(),
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            detail: Some(cat.to_string()),
+                            insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
+                            insert_text: snippet,
+                            sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), &v),
+                            ..Default::default()
+                        });
+                    }
+                }
+                PatternKind::Value => {
+                    for v in info
+                        .type_index
+                        .value_set_values
+                        .values(&pattern.placeholder_name)
+                    {
+                        if seen.contains_key(v) {
+                            continue;
+                        }
+                        let snippet = alias_completion_snippet(v, rule, ruleset);
+                        items.push(CompletionItem {
+                            label: v.to_string(),
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            detail: Some(cat.to_string()),
+                            insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
+                            insert_text: snippet,
+                            sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), v),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // The `modifier` category has no alias entries — modifiers live
     // in the expanded modifier-key set (modifiers.cwt + templated
     // names like production_speed_<building>_factor). This is the
@@ -1082,6 +1182,9 @@ pub(crate) fn leaf_right_placeholder(right: &NewField, tab_stop: u32, ruleset: &
                 format!("${{{}}}", tab_stop)
             }
         }
+        // A concrete literal value (e.g. `alias[effect:<se>] = yes`): insert it
+        // directly so the snippet reads `my_se = yes` rather than `my_se = ${0}`.
+        NewField::SpecificField(s) if !s.is_empty() => s.clone(),
         _ => format!("${{{}}}", tab_stop),
     }
 }
@@ -1771,6 +1874,209 @@ mod tests {
             items.is_empty(),
             "should not offer types for wrong path, got: {:?}",
             items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    // ── #67: bool trigger alias must insert `key = ${yes/no}` ────────────────
+
+    fn bool_trigger_ruleset() -> RuleSet {
+        let mut rs = RuleSet::new();
+        rs.aliases.push((
+            "trigger:always".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[trigger:always]".to_string()),
+                    right: NewField::ValueField(ValueType::Bool),
+                },
+                Options::default(),
+            ),
+        ));
+        rs.reindex();
+        rs
+    }
+
+    #[test]
+    fn alias_bool_trigger_completes_with_equals_and_yesno() {
+        // #67: `alias[trigger:always] = bool` must complete to
+        // `always = ${0|yes,no|}`, not a bare `${0|yes,no|}` with no `=`.
+        let rs = bool_trigger_ruleset();
+        let info = cwtools_info::InfoService::new();
+        let rules = vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField("trigger".to_string()),
+                right: NewField::AliasField("trigger".to_string()),
+            },
+            Options::default(),
+        )];
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+
+        let always = items
+            .iter()
+            .find(|i| i.label == "always")
+            .expect("'always' completion missing");
+        let snip = always.insert_text.as_deref().unwrap_or("");
+        assert!(
+            snip.starts_with("always = "),
+            "bool trigger must insert 'always = ', got: {:?}",
+            always.insert_text
+        );
+        assert!(
+            snip.contains("yes") && snip.contains("no"),
+            "bool trigger must offer yes/no choices, got: {:?}",
+            always.insert_text
+        );
+    }
+
+    // ── #64: type-pattern alias expands to type instances ────────────────────
+
+    fn scripted_effect_alias_ruleset() -> RuleSet {
+        let mut rs = RuleSet::new();
+        rs.types.push(TypeDefinition {
+            name: "scripted_effect".to_string(),
+            name_field: None,
+            path_options: PathOptions {
+                paths: vec!["common/scripted_effects".to_string()],
+                path_strict: false,
+                path_file: None,
+                path_extension: None,
+                paths_lower: Vec::new(),
+                ..Default::default()
+            },
+            subtypes: Vec::new(),
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: false,
+            localisation: Vec::new(),
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        });
+        // alias[effect:<scripted_effect>] = yes
+        rs.aliases.push((
+            "effect:<scripted_effect>".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[effect:<scripted_effect>]".to_string()),
+                    right: NewField::SpecificField("yes".to_string()),
+                },
+                Options::default(),
+            ),
+        ));
+        rs.reindex();
+        rs
+    }
+
+    #[test]
+    fn alias_type_pattern_expands_to_instances() {
+        // #64: type-pattern aliases like `alias[effect:<scripted_effect>] = yes`
+        // must emit one KEYWORD item per known instance, NOT the raw placeholder
+        // label `<scripted_effect>`.
+        let rs = scripted_effect_alias_ruleset();
+        let mut info = cwtools_info::InfoService::new();
+        let mut per_type: std::collections::HashMap<String, Vec<cwtools_info::TypeInstance>> =
+            std::collections::HashMap::new();
+        per_type.insert(
+            "scripted_effect".to_string(),
+            vec![cwtools_info::TypeInstance {
+                name: "my_special_effect".to_string(),
+                location: cwtools_info::SourceLocation { line: 1, col: 0 },
+                primary_loc_key: None,
+            }],
+        );
+        info.type_index
+            .merge("file:///scripted_effects/se.txt", per_type);
+
+        let rules = vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField("effect".to_string()),
+                right: NewField::AliasField("effect".to_string()),
+            },
+            Options::default(),
+        )];
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+
+        assert!(
+            items.iter().any(|i| i.label == "my_special_effect"),
+            "type-pattern alias must expand to type instances, got: {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        assert!(
+            !items.iter().any(|i| i.label == "<scripted_effect>"),
+            "raw pattern placeholder must not appear in labels, got: {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        // The instance's snippet should be `my_special_effect = yes` because the
+        // alias rule has `right = SpecificField("yes")`.
+        let item = items
+            .iter()
+            .find(|i| i.label == "my_special_effect")
+            .unwrap();
+        let snip = item.insert_text.as_deref().unwrap_or("");
+        assert!(
+            snip.contains("= yes"),
+            "scripted_effect snippet should contain '= yes', got: {:?}",
+            item.insert_text
+        );
+    }
+
+    // ── #65: alias_keys_field[modifier] must emit modifier keys ──────────────
+
+    #[test]
+    fn alias_keys_field_emits_modifier_keys() {
+        // #65: a rule with `alias_keys_field[modifier]` on its left side (as in
+        // `dynamic_modifier` blocks) must offer modifier keys as completions.
+        let rs = bool_enum_ruleset(); // arbitrary ruleset with reindex() called
+        let info = cwtools_info::InfoService::new();
+        let modifier_keys: HashSet<String> = ["my_modifier".to_string(), "other_mod".to_string()]
+            .into_iter()
+            .collect();
+        let rules = vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasValueKeysField("modifier".to_string()),
+                right: NewField::ValueField(ValueType::Float {
+                    min: -1e8,
+                    max: 1e8,
+                }),
+            },
+            Options::default(),
+        )];
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &modifier_keys, None);
+
+        assert!(
+            items.iter().any(|i| i.label == "my_modifier"),
+            "alias_keys_field[modifier] must offer modifier keys, got: {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        assert!(
+            items.iter().any(|i| i.label == "other_mod"),
+            "alias_keys_field[modifier] must offer all modifier keys, got: {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    // ── #66: duplicate labels are removed from the completion list ───────────
+
+    #[test]
+    fn completions_from_rules_deduplicates() {
+        // #66: when the same concrete field appears in multiple rule entries
+        // (e.g. from subtype-flattening), the label must appear only once.
+        let rs = bool_enum_ruleset();
+        let info = cwtools_info::InfoService::new();
+        // Two identical `active = bool` rules.
+        let rules = vec![
+            make_leaf_rule("active", NewField::ValueField(ValueType::Bool)),
+            make_leaf_rule("active", NewField::ValueField(ValueType::Bool)),
+        ];
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+        let count = items.iter().filter(|i| i.label == "active").count();
+        assert_eq!(
+            count, 1,
+            "duplicate label 'active' must appear exactly once, got {} copies",
+            count
         );
     }
 

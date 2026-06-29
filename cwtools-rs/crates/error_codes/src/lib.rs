@@ -386,6 +386,13 @@ pub const CW275_LOC_INVALID_CHARS: ErrorCode = ErrorCode {
     message_template: "Localisation value for {} contains unexpected characters, and may not render correctly",
 };
 
+/// Localisation key contains spaces or characters not valid in loc keys.
+pub const CW276_LOC_KEY_INVALID_CHARS: ErrorCode = ErrorCode {
+    id: "CW276",
+    severity: ErrorSeverity::Warning,
+    message_template: "Localisation key {} contains invalid characters (spaces or special characters are not allowed)",
+};
+
 /// Event may fire every tick (performance hint). F# `EventEveryTick`.
 ///
 /// Reconciliation: cwtools-rs originally emitted this as the Rust-invented

@@ -102,6 +102,7 @@ impl Backend {
                 ReferenceHint::FileRef { path } => self.file_ref_locations(path, fallback).await,
                 _ => Vec::new(),
             };
+            let locations = dedup_locations(locations);
             if !locations.is_empty() {
                 return Ok(Some(GotoDefinitionResponse::Array(locations)));
             }
@@ -150,6 +151,7 @@ impl Backend {
                         fallback,
                     );
                 }
+                let locations = dedup_locations(locations);
                 if !locations.is_empty() {
                     return Ok(Some(GotoDefinitionResponse::Array(locations)));
                 }
@@ -771,6 +773,27 @@ pub(crate) fn is_type_ref_leaf(
     false
 }
 
+/// Remove duplicate `Location` values from a goto-definition result, keeping
+/// the first occurrence of each `(uri, start_line, start_char)` triple.
+///
+/// Identical entries arise when the same entity is recorded in both the vanilla
+/// cache (whose synthetic `"<vanilla-cache>"` URI resolves to the fallback URL
+/// via `parse_uri`) and the mod file, and the caller happens to be in the same
+/// file. Genuinely distinct locations (different file or different position) are
+/// preserved.
+fn dedup_locations(locs: Vec<Location>) -> Vec<Location> {
+    let mut seen = HashSet::new();
+    locs.into_iter()
+        .filter(|l| {
+            seen.insert((
+                l.uri.to_string(),
+                l.range.start.line,
+                l.range.start.character,
+            ))
+        })
+        .collect()
+}
+
 /// Strip matching outer double quotes from a token. Quoted string values keep
 /// their quotes through the parser/string-table, but indexed instance names and
 /// loc keys are unquoted, so references must be unquoted before comparison.
@@ -838,5 +861,103 @@ fn line_location(file_uri: &str, line0: u32, col: u32, len: usize, fallback: &Ur
                 character: col + len as u32,
             },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_location(uri: &str, line: u32, ch: u32) -> Location {
+        Location {
+            uri: uri.parse().unwrap(),
+            range: Range {
+                start: Position {
+                    line,
+                    character: ch,
+                },
+                end: Position {
+                    line,
+                    character: ch + 5,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn dedup_locations_collapses_identical() {
+        // Issue #62: same entity in mod + vanilla produces two Locations that
+        // resolve to the same (uri, line, char) when "<vanilla-cache>" falls
+        // back to the current file URI. They must collapse to one.
+        let file = "file:///mod/events/a.txt";
+        let locs = vec![
+            make_location(file, 2, 0),
+            make_location(file, 2, 0), // duplicate
+        ];
+        let deduped = dedup_locations(locs);
+        assert_eq!(deduped.len(), 1, "identical locations must collapse to one");
+    }
+
+    #[test]
+    fn dedup_locations_preserves_distinct_positions() {
+        // Mod at line 2, vanilla fallback happens to be at line 6 — two
+        // genuinely different definition sites, both must survive.
+        let file = "file:///mod/events/a.txt";
+        let locs = vec![make_location(file, 2, 0), make_location(file, 6, 0)];
+        let deduped = dedup_locations(locs);
+        assert_eq!(deduped.len(), 2, "distinct positions must both survive");
+    }
+
+    #[test]
+    fn dedup_locations_preserves_distinct_uris() {
+        // Mod file and a different (real) vanilla file: two separate definitions.
+        let locs = vec![
+            make_location("file:///mod/events/a.txt", 2, 0),
+            make_location("file:///vanilla/events/a.txt", 2, 0),
+        ];
+        let deduped = dedup_locations(locs);
+        assert_eq!(
+            deduped.len(),
+            2,
+            "different URIs at same position must both survive"
+        );
+    }
+
+    #[test]
+    fn dedup_locations_keeps_first_occurrence() {
+        // When two are identical the first must be kept (stable ordering).
+        let file = "file:///mod/events/a.txt";
+        let first = Location {
+            uri: file.parse().unwrap(),
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 10,
+                },
+            },
+        };
+        let second = Location {
+            uri: file.parse().unwrap(),
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 99,
+                }, // different end, same start key
+            },
+        };
+        let deduped = dedup_locations(vec![first.clone(), second]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(
+            deduped[0].range.end.character, 10,
+            "must keep first occurrence"
+        );
     }
 }
