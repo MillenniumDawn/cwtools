@@ -1,3 +1,22 @@
+# 1.8.6
+
+## Bug Fixes
+
+- Localisation linting now flags an unterminated quoted string (CW268). A value with only an opening quote (`KEY:0 "unclosed`) was truncated to its single `"` and read as balanced, so it was silently accepted even though it breaks every loc line after it. (cwtools-vscode#59)
+- Localisation keys containing spaces or other invalid characters are now flagged with the new CW276. Only the value was checked before; the key was not. (cwtools-vscode#59)
+- A missing required field now reports its warning on the block's own key (`my_decision = {`) instead of on the first field inside the block. The file-root case (a `type_per_file` entity) keeps reporting on its first child so it doesn't land on line 0. (cwtools-vscode#63)
+- Go-to-definition no longer returns the same definition twice. An entity present in both the vanilla cache and the mod produced two locations that collapsed to the same place; results are now de-duplicated by location, while genuinely distinct definitions are kept. (cwtools-vscode#62)
+
+## Improvements
+
+- Scripted effects are suggested inside effect blocks. A type-pattern alias (`alias[effect:<scripted_effect>]`) now expands to the actual scripted-effect names instead of emitting the literal `<scripted_effect>` placeholder. (cwtools-vscode#64)
+- Modifiers are suggested inside `dynamic_modifier` blocks (`alias_keys_field[modifier]`). (cwtools-vscode#65)
+- Duplicate autocomplete entries are removed. (cwtools-vscode#66)
+
+## Developer
+
+- Added tests for the unterminated-quote and invalid-key loc checks, the missing-required diagnostic position (nested block and top-level regression), go-to-definition de-duplication, scripted-effect and dynamic-modifier completion, completion de-duplication, and a CLI test asserting the unterminated-quote fixture is flagged.
+
 # 1.8.5
 
 ## Improvements
