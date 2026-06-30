@@ -484,6 +484,30 @@ fn test_completion_offers_mathexpr_operators_in_math_block() {
     );
 }
 
+#[test]
+fn test_completion_math_block_value_excludes_effects() {
+    // Value position after `add = ` inside a math block (line 3, col 18).
+    let text = "d = {\n    set_math = {\n        x = {\n            add = \n        }\n    }\n}\n";
+    let labels = completion_labels("common/decisions/test.txt", text, 3, 18);
+    assert!(
+        !labels.iter().any(|l| l == "add_political_power"),
+        "effects must not appear at math value position, got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn test_completion_math_leaf_value_excludes_effects() {
+    // Value position after `x = ` at the set_variable level (line 2, col 12).
+    let text = "d = {\n    set_math = {\n        x = \n    }\n}\n";
+    let labels = completion_labels("common/decisions/test.txt", text, 2, 12);
+    assert!(
+        !labels.iter().any(|l| l == "add_political_power"),
+        "effects must not appear at math leaf value position, got: {:?}",
+        labels
+    );
+}
+
 fn completion_response(rel_path: &str, text: &str, line0: u32, char0: u32) -> serde_json::Value {
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();

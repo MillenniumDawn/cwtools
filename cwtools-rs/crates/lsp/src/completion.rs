@@ -1086,6 +1086,24 @@ pub(crate) fn value_completions(
                     );
                 }
             }
+            NewField::ValueField(ValueType::MathExpr) => {
+                for v in info.variable_counts.keys() {
+                    push(
+                        v.clone(),
+                        CompletionItemKind::CONSTANT,
+                        "variable".to_string(),
+                        &mut items,
+                    );
+                }
+                for et in info.event_target_counts.keys() {
+                    push(
+                        format!("event_target:{}", et),
+                        CompletionItemKind::VARIABLE,
+                        "event target".to_string(),
+                        &mut items,
+                    );
+                }
+            }
             _ => {}
         }
     }
