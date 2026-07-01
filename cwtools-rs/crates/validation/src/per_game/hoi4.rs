@@ -124,7 +124,6 @@ mod tests {
 
     #[test]
     fn flags_mixed_case_key() {
-        // Paradox keys are case-insensitive; dispatch must be too.
         let errors = run("my_idea = {\n Allowed_Civil_War = { Always = no }\n}\n");
         assert_eq!(errors.len(), 1, "expected one CW280");
         assert_eq!(errors[0].code, Some("CW280"));

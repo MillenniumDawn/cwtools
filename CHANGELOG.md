@@ -13,13 +13,13 @@
 - Modifiers are suggested inside `dynamic_modifier` blocks (`alias_keys_field[modifier]`). (cwtools-vscode#65)
 - Duplicate autocomplete entries are removed. (cwtools-vscode#66)
 - Stellaris modding support lands. The engine now consumes the `cwtools-stellaris-config` as the source of truth for scope/link/pretrigger resolution: scopes and links come from `scopes.cwt`/`links.cwt` via the runtime `ScopeRegistry`, and the pretrigger set comes from `alias[<scope>_pre_trigger:<name>] = bool` declarations in `pre_triggers.cwt`. The hardcoded `STELLARIS_SCOPES` const and `load_stellaris_links` table stay in place as a backfill for partial configs and tests.
-- New Stellaris-specific validators, ported from `CWTools/Validation/Stellaris/STLValidation.fs`. Each one is folder-scoped the way F# scoped it by entity type, and root-key dispatch is now case-insensitive (Paradox keys are):
-  - **CW108/CW109** `research_leader` blocks nested inside `common/technology` definitions: missing `area`, or an `area` disagreeing with the technology's (CW109's two message args are leader area then tech area; F# had them swapped)
-  - **CW110** any root block of `common/technology/*.txt` (the `category/` subfolder is excluded) whose `category` holds no value
-  - **CW120** pretrigger placement: a known pretrigger inside an event's `trigger = { ... }` block (for event types whose config subtype has a `pre_triggers` block; per-scope sets, so a pop-only pretrigger doesn't fire in a planet_event) or inside a pop job's `possible = { ... }` block
-  - **CW227/CW229** `ship_design`/`global_ship_design` references an unknown `section_template`/`component_template`. Only fires when the type index is complete (vanilla merged) and has instances of the looked-up type — the same gate as CW500 — so validating a mod without vanilla doesn't flag every vanilla template; `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` are engine builtins and exempt
+- New Stellaris-specific validators, ported from `CWTools/Validation/Stellaris/STLValidation.fs`, folder-scoped like F# and dispatched case-insensitively:
+  - **CW108/CW109** `research_leader` blocks nested in `common/technology` definitions: missing `area` (CW108), or disagreeing with the technology's (CW109; args are leader-then-tech, F# had them swapped)
+  - **CW110** any root block of `common/technology/*.txt` (the `category/` subfolder excluded) whose `category` holds no value
+  - **CW120** pretrigger placement: a known pretrigger in an event's `trigger` block (event types with `pre_triggers` support, per scope) or a pop job's `possible` block
+  - **CW227/CW229** `ship_design`/`global_ship_design` references an unknown `section_template`/`component_template`. Gated like CW500 (complete index, known instances); `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` are exempt
   - **CW250** a `common/component_templates` block with `type = planet_killer` missing its `on_destroy_planet_with_<key>` on_action or `can_destroy_planet_with_<key>` scripted trigger (same completeness gate)
-- `RuleSet` exposes `pretriggers: HashMap<String, HashSet<String>>` (scope category → trigger names), populated during `reindex()` from `alias[<scope>_pre_trigger:<name>]` declarations. CW120 is the single pretrigger diagnostic; the Rust-only CW301 duplicated it on the same leaf and is retired.
+- `RuleSet` exposes `pretriggers: HashMap<String, HashSet<String>>` (scope -> trigger names) from `reindex()`. CW301 duplicated CW120 on the same leaf and is retired.
 
 ## Notes
 

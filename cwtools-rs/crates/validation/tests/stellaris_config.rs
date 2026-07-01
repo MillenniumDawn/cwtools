@@ -169,10 +169,7 @@ fn config_links_resolve() {
     }
 }
 
-/// `reindex()` must populate the per-scope pretrigger map from the fixture's
-/// `pre_triggers.cwt` (`alias[<scope>_pre_trigger:<name>] = bool`). Pins the
-/// production config→reindex→CW120 wiring; the validator unit tests hand-build
-/// the map.
+/// Pins the production config -> reindex() -> CW120 wiring (validator unit tests hand-build the map).
 #[test]
 fn config_pretriggers_populate_per_scope() {
     let ruleset = load_stellaris_ruleset();
@@ -208,9 +205,7 @@ fn config_pretriggers_populate_per_scope() {
     );
 }
 
-/// End-to-end: the loaded config drives CW120 on a planet_event whose trigger
-/// holds a planet pretrigger, and stays quiet for a fleet_event (no pretrigger
-/// category).
+/// End-to-end: the loaded config drives CW120 for planet_event but not fleet_event.
 #[test]
 fn config_driven_cw120_fires_for_planet_event() {
     use cwtools_string_table::string_table::StringTable;

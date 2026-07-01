@@ -16,9 +16,7 @@ pub(crate) struct Block<'a> {
 }
 
 impl Block<'_> {
-    /// The block's key lowercased (empty if interning lost it), for the
-    /// case-insensitive dispatch the per-game walkers do (Paradox script keys
-    /// are case-insensitive).
+    /// The block's key lowercased, for case-insensitive Paradox key dispatch.
     pub fn key_string_lower(&self, table: &StringTable) -> String {
         table.get_string(self.key_lower).unwrap_or_default()
     }

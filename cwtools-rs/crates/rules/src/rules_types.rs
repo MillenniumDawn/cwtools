@@ -73,11 +73,8 @@ pub struct RuleSet {
     /// Built by `reindex()`, keyed like `values`: each `value[name]` set as a
     /// `FxHashSet` for O(1) exact membership. Empty until reindex.
     pub value_sets: std::collections::HashMap<String, rustc_hash::FxHashSet<String>>,
-    /// Built by `reindex()`: pretrigger names per scope category, from
-    /// `alias[<scope>_pre_trigger:<name>] = bool` declarations. Keyed by the
-    /// lowercased scope prefix (`planet`, `pop`, ...) with lowercased trigger
-    /// names. CW120 queries this to flag pretriggers that could move to the
-    /// event's `pre_triggers` block (or a job's `possible_pre_triggers`).
+    /// Built by `reindex()` from `alias[<scope>_pre_trigger:<name>] = bool`
+    /// declarations: lowercased scope prefix -> lowercased trigger names. CW120 queries this.
     pub pretriggers: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
@@ -286,9 +283,7 @@ impl RuleSet {
         }
         for (i, (name, (rule, _))) in self.aliases.iter().enumerate() {
             if let Some((cat, key)) = name.split_once(':') {
-                // Pretrigger collection: every alias whose category ends in
-                // `_pre_trigger` contributes its key to that scope's set
-                // (`planet_pre_trigger:has_owner` → pretriggers["planet"]).
+                // `planet_pre_trigger:has_owner` -> pretriggers["planet"].insert("has_owner").
                 if let Some(scope) = cat.strip_suffix("_pre_trigger") {
                     self.pretriggers
                         .entry(scope.to_ascii_lowercase())
