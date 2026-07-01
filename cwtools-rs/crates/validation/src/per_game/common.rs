@@ -78,14 +78,13 @@ pub fn validate_common(
                 // to the same token. F#'s check is project-wide and grouped
                 // by extracted instance id — a known refinement gap.
                 let code = &error_codes::CW261_DUPLICATE_TYPE_DEF;
-                errors.push(ValidationError {
-                    message: code.format(&[&key, &key]),
-                    severity: code.severity,
+                errors.push(ValidationError::from_code(
+                    code,
+                    file_path,
                     line,
                     col,
-                    file: file_path.to_string(),
-                    code: Some(code.id),
-                });
+                    &[&key, &key],
+                ));
             }
         }
     }

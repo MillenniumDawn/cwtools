@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{
     Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, Position, Range,
 };
 
-use cwtools_info::{PositionElement, ReferenceHint, element_at_position};
+use cwtools_info::{PositionElement, ReferenceHint};
 
 use crate::Backend;
 use crate::RuleCursorInfo;
@@ -32,133 +32,119 @@ impl Backend {
             return Ok(None);
         }
 
-        // Snapshot the AST (a cheap `Arc` clone) and drop the documents guard
-        // before taking ruleset, so hover never co-holds documents + ruleset and
-        // its documents window stays tiny.
-        let ast = {
-            let docs = self.state.documents.lock();
-            docs.get(&uri).and_then(|d| d.ast.clone())
-        };
-        if let Some(ast) = ast {
-            let ws_uri = self.state.config.read().workspace_uri.clone();
-            let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let ws_uri = self.state.config.read().workspace_uri.clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-            if let Some(RuleCursorInfo {
-                element,
-                hint,
-                category,
-                description: desc,
-                required_scopes: scopes,
-                current_scope,
-                root_scope,
-                prev_scope,
-                from_scopes,
-                resolved_scope,
-            }) = self.rule_info_at_cursor(&uri, pos, &logical_path)
-            {
-                let debug = self
-                    .state
-                    .hover_debug
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                // `resolved_scope` is already `None` unless the resolved setting
-                // is on (computed in rule_info_at_cursor).
-                let mut md = build_hover_markdown(
-                    &element,
-                    &hint,
-                    category.as_deref(),
-                    desc.as_deref(),
-                    &scopes,
-                    ScopeTable {
-                        current: current_scope.as_deref(),
-                        root: root_scope.as_deref(),
-                        prev: prev_scope.as_deref(),
-                        from: &from_scopes,
-                        resolved: resolved_scope.as_deref(),
-                    },
-                    debug,
-                );
-                // For a variable read, append the known assigned value(s) so the
-                // user sees what it resolves to without chasing the definition.
-                if let ReferenceHint::Variable { name, .. } = &hint {
-                    let info_guard = self.state.info_service.read();
-                    let (values, more) = info_guard.variable_values(name, 5);
-                    if !values.is_empty() {
-                        let joined = values
-                            .iter()
-                            .map(|v| format!("`{}`", v))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let suffix = if more { ", +more" } else { "" };
-                        md.push_str(&format!("\n\nSet to: {}{}", joined, suffix));
+        if let Some(RuleCursorInfo {
+            element,
+            hint,
+            category,
+            description: desc,
+            required_scopes: scopes,
+            current_scope,
+            root_scope,
+            prev_scope,
+            from_scopes,
+            resolved_scope,
+        }) = self.rule_info_at_cursor(&uri, pos, &logical_path)
+        {
+            let debug = self
+                .state
+                .hover_debug
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // `resolved_scope` is already `None` unless the resolved setting
+            // is on (computed in rule_info_at_cursor).
+            let mut md = build_hover_markdown(
+                &element,
+                &hint,
+                category.as_deref(),
+                desc.as_deref(),
+                &scopes,
+                ScopeTable {
+                    current: current_scope.as_deref(),
+                    root: root_scope.as_deref(),
+                    prev: prev_scope.as_deref(),
+                    from: &from_scopes,
+                    resolved: resolved_scope.as_deref(),
+                },
+                debug,
+            );
+            // For a variable read, append the known assigned value(s) so the
+            // user sees what it resolves to without chasing the definition.
+            if let ReferenceHint::Variable { name, .. } = &hint {
+                let info_guard = self.state.info_service.read();
+                let (values, more) = info_guard.variable_values(name, 5);
+                if !values.is_empty() {
+                    let joined = values
+                        .iter()
+                        .map(|v| format!("`{}`", v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let suffix = if more { ", +more" } else { "" };
+                    md.push_str(&format!("\n\nSet to: {}{}", joined, suffix));
+                }
+            }
+            // Append localisation translations. A reference resolves by leaf
+            // value; a definition key (idea/decision) resolves by its key.
+            append_localisation(&mut md, &element, &self.state.loc_text.read());
+            // A reference to a type with a primary localisation (an event id,
+            // …) shows the localised title, resolved from the captured
+            // explicit-field key or a name-derived key. (#40)
+            if let ReferenceHint::TypeRef { type_name, value } = &hint {
+                // Lock order: rules -> info_service -> loc_text.
+                let rules_guard = self.state.rules.read();
+                let info_guard = self.state.info_service.read();
+                let loc_text = self.state.loc_text.read();
+                if let Some(ruleset) = rules_guard.ruleset.as_ref() {
+                    append_type_localisation(
+                        &mut md,
+                        type_name,
+                        value,
+                        &info_guard.type_index,
+                        ruleset,
+                        &loc_text,
+                    );
+                }
+            }
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: md,
+                }),
+                range: None,
+            }));
+        }
+
+        // Fallback: no-rule position finder. With debug off this shows only
+        // localisation (the raw `Field`/`Value` line is developer detail); if
+        // there's nothing to show, return no hover rather than an empty box.
+        if let Some(element) = self.element_at_cursor(&uri, pos) {
+            let debug = self
+                .state
+                .hover_debug
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let mut contents = if debug {
+                match &element {
+                    PositionElement::Leaf { key, value } => {
+                        format!("**Field**: `{} = {}`", key, value)
+                    }
+                    PositionElement::LeafValue { value } => {
+                        format!("**Value**: `{}`", value)
                     }
                 }
-                // Append localisation translations. A reference resolves by leaf
-                // value; a definition key (idea/decision) resolves by its key.
-                append_localisation(&mut md, &element, &self.state.loc_text.read());
-                // A reference to a type with a primary localisation (an event id,
-                // …) shows the localised title, resolved from the captured
-                // explicit-field key or a name-derived key. (#40)
-                if let ReferenceHint::TypeRef { type_name, value } = &hint {
-                    // Lock order: rules -> info_service -> loc_text.
-                    let rules_guard = self.state.rules.read();
-                    let info_guard = self.state.info_service.read();
-                    let loc_text = self.state.loc_text.read();
-                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
-                        append_type_localisation(
-                            &mut md,
-                            type_name,
-                            value,
-                            &info_guard.type_index,
-                            ruleset,
-                            &loc_text,
-                        );
-                    }
-                }
+            } else {
+                String::new()
+            };
+            // Append localisation translations for the hovered element.
+            append_localisation(&mut contents, &element, &self.state.loc_text.read());
+            if !contents.trim().is_empty() {
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
-                        value: md,
+                        value: contents,
                     }),
                     range: None,
                 }));
-            }
-
-            // Fallback: no-rule position finder. With debug off this shows only
-            // localisation (the raw `Field`/`Value` line is developer detail); if
-            // there's nothing to show, return no hover rather than an empty box.
-            if let Some(element) = element_at_position(
-                &ast,
-                pos.line + 1,
-                pos.character as u16,
-                &self.state.string_table,
-            ) {
-                let debug = self
-                    .state
-                    .hover_debug
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let mut contents = if debug {
-                    match &element {
-                        PositionElement::Leaf { key, value } => {
-                            format!("**Field**: `{} = {}`", key, value)
-                        }
-                        PositionElement::LeafValue { value } => {
-                            format!("**Value**: `{}`", value)
-                        }
-                    }
-                } else {
-                    String::new()
-                };
-                // Append localisation translations for the hovered element.
-                append_localisation(&mut contents, &element, &self.state.loc_text.read());
-                if !contents.trim().is_empty() {
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: contents,
-                        }),
-                        range: None,
-                    }));
-                }
             }
         }
         Ok(None)

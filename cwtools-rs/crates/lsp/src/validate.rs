@@ -166,11 +166,18 @@ fn diag_end_col(line_ends: &[u32], line: u32, col: u32) -> u32 {
         .max(col + 1)
 }
 
-pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Diagnostic {
-    let (line, col, msg) = match e {
-        ParseError::Pos(_f, line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
-        ParseError::General(msg) => (0, 0, msg.clone()),
-    };
+/// Build a whole-statement-line diagnostic at `(line, col)` (0-based). The
+/// squiggle spans from `col` to the line's end column via [`diag_end_col`].
+/// Shared skeleton behind the `*_to_diagnostic` builders.
+fn diagnostic_at(
+    line: u32,
+    col: u32,
+    line_ends: &[u32],
+    severity: DiagnosticSeverity,
+    source: &str,
+    code: Option<NumberOrString>,
+    message: String,
+) -> Diagnostic {
     Diagnostic {
         range: Range {
             start: Position {
@@ -182,15 +189,31 @@ pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Di
                 character: diag_end_col(line_ends, line, col),
             },
         },
-        severity: Some(DiagnosticSeverity::ERROR),
-        code: None,
+        severity: Some(severity),
+        code,
         code_description: None,
-        source: Some("cwtools".to_string()),
-        message: msg,
+        source: Some(source.to_string()),
+        message,
         related_information: None,
         tags: None,
         data: None,
     }
+}
+
+pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Diagnostic {
+    let (line, col, msg) = match e {
+        ParseError::Pos(_f, line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
+        ParseError::General(msg) => (0, 0, msg.clone()),
+    };
+    diagnostic_at(
+        line,
+        col,
+        line_ends,
+        DiagnosticSeverity::ERROR,
+        "cwtools",
+        None,
+        msg,
+    )
 }
 
 /// Convert a `.cwt` rule-config error (parse or structural reference) into an LSP
@@ -202,26 +225,15 @@ pub(crate) fn rule_parse_error_to_diagnostic(
 ) -> Diagnostic {
     let line = err.line.saturating_sub(1);
     let col = err.col as u32;
-    Diagnostic {
-        range: Range {
-            start: Position {
-                line,
-                character: col,
-            },
-            end: Position {
-                line,
-                character: diag_end_col(line_ends, line, col),
-            },
-        },
-        severity: Some(DiagnosticSeverity::ERROR),
-        code: None,
-        code_description: None,
-        source: Some("cwtools-rules".to_string()),
-        message: err.message.clone(),
-        related_information: None,
-        tags: None,
-        data: None,
-    }
+    diagnostic_at(
+        line,
+        col,
+        line_ends,
+        DiagnosticSeverity::ERROR,
+        "cwtools-rules",
+        None,
+        err.message.clone(),
+    )
 }
 
 pub(crate) fn validation_error_to_diagnostic(
@@ -230,31 +242,21 @@ pub(crate) fn validation_error_to_diagnostic(
 ) -> Diagnostic {
     let line = err.line.saturating_sub(1);
     let col = err.col as u32;
-    Diagnostic {
-        range: Range {
-            start: Position {
-                line,
-                character: col,
-            },
-            end: Position {
-                line,
-                character: diag_end_col(line_ends, line, col),
-            },
-        },
-        severity: match err.severity {
-            cwtools_validation::ErrorSeverity::Error => Some(DiagnosticSeverity::ERROR),
-            cwtools_validation::ErrorSeverity::Warning => Some(DiagnosticSeverity::WARNING),
-            cwtools_validation::ErrorSeverity::Information => Some(DiagnosticSeverity::INFORMATION),
-            cwtools_validation::ErrorSeverity::Hint => Some(DiagnosticSeverity::HINT),
-        },
-        code: err.code.map(|c| NumberOrString::String(c.to_string())),
-        code_description: None,
-        source: Some("cwtools".to_string()),
-        message: err.message.clone(),
-        related_information: None,
-        tags: None,
-        data: None,
-    }
+    let severity = match err.severity {
+        cwtools_validation::ErrorSeverity::Error => DiagnosticSeverity::ERROR,
+        cwtools_validation::ErrorSeverity::Warning => DiagnosticSeverity::WARNING,
+        cwtools_validation::ErrorSeverity::Information => DiagnosticSeverity::INFORMATION,
+        cwtools_validation::ErrorSeverity::Hint => DiagnosticSeverity::HINT,
+    };
+    diagnostic_at(
+        line,
+        col,
+        line_ends,
+        severity,
+        "cwtools",
+        err.code.map(|c| NumberOrString::String(c.to_string())),
+        err.message.clone(),
+    )
 }
 
 /// Collect the lowercased identifier-like tokens a parsed file mentions: every

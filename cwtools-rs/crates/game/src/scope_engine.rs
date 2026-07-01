@@ -170,8 +170,10 @@ impl ScopeContext {
     /// Restore the mutable parts from a snapshot.
     pub fn restore(&mut self, saved: SavedContext) {
         self.root = saved.root;
-        self.scopes = saved.scopes.into_vec();
-        self.from = saved.from.into_vec();
+        self.scopes.clear();
+        self.scopes.extend_from_slice(&saved.scopes);
+        self.from.clear();
+        self.from.extend_from_slice(&saved.from);
     }
 
     // ── replace_scope ────────────────────────────────────────────────────────
@@ -257,18 +259,22 @@ impl ScopeContext {
 
         // Config-driven prefix links (`var:`, `sp:`, `mio:`, `event_target:`, …).
         // A scope-changing prefix (`sp:` → special_project) pushes its target; a
-        // value/data prefix (`var:`, `event_target:`) opens ANY.
-        for (prefix, link) in &self.registry.prefix_links {
-            if lower.starts_with(prefix.as_str()) {
-                if let Some(target) = link.target {
-                    self.scopes.push(target);
-                    return ScopeResult::NewScope {
-                        scope: target,
-                        ignore_keys: link.ignore_keys.clone(),
-                    };
+        // value/data prefix (`var:`, `event_target:`) opens ANY. Every prefix
+        // carries its `:` separator, so a key with no `:` can't match any of
+        // them — skip the ordered scan entirely in that (common) case.
+        if lower.contains(':') {
+            for (prefix, link) in &self.registry.prefix_links {
+                if lower.starts_with(prefix.as_str()) {
+                    if let Some(target) = link.target {
+                        self.scopes.push(target);
+                        return ScopeResult::NewScope {
+                            scope: target,
+                            ignore_keys: link.ignore_keys.clone(),
+                        };
+                    }
+                    self.scopes.push(SCOPE_ANY);
+                    return ScopeResult::AnyScope;
                 }
-                self.scopes.push(SCOPE_ANY);
-                return ScopeResult::AnyScope;
             }
         }
 
@@ -320,8 +326,14 @@ impl ScopeContext {
 
     /// Resolve a single (non-dotted) key.
     fn resolve_single(&mut self, key: &str) -> ScopeResult {
-        let lower_owned = key.to_ascii_lowercase();
-        self.resolve_single_with_lower(key, &lower_owned)
+        let lower_owned;
+        let lower: &str = if key.bytes().any(|b| b.is_ascii_uppercase()) {
+            lower_owned = key.to_ascii_lowercase();
+            &lower_owned
+        } else {
+            key
+        };
+        self.resolve_single_with_lower(key, lower)
     }
 
     #[inline]

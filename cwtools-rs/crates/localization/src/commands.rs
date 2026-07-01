@@ -63,7 +63,7 @@ impl Lang {
 /// Parse an `l_xxx` prefix into a Lang variant.
 ///
 /// Accepts all known language keys including `l_default`.
-pub fn key_to_language(prefix: &str) -> Option<Lang> {
+pub(crate) fn key_to_language(prefix: &str) -> Option<Lang> {
     match prefix {
         "l_english" => Some(Lang::English),
         "l_french" => Some(Lang::French),

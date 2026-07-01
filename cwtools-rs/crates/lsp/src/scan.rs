@@ -313,7 +313,15 @@ impl Backend {
                     if open_uris.contains(&uri) {
                         return None;
                     }
-                    let text = std::fs::read_to_string(file_path).ok()?;
+                    // Read via the file manager so cp1252-encoded script files
+                    // (pre-Jomini mods) are indexed instead of silently dropped.
+                    let text = match cwtools_file_manager::file_manager::read_text(file_path) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!(path = %file_path.display(), error = %e, "scan: skipping unreadable file");
+                            return None;
+                        }
+                    };
                     // Try the parse cache first.
                     if let Some((ref cd, fp)) = cache_info
                         && let Some(parsed) =
@@ -655,9 +663,8 @@ impl Backend {
         // closes only LocIndex (keys) and the diagnostic map survive.
         // Names a `$ref$` may resolve to besides loc keys: `$modifier$` / `$idea$`
         // embeds resolve against those registries (mirrors the CLI/driver path).
-        // With cached vanilla loc keys, the service holds no vanilla keys, so
-        // they join this set too — otherwise mod loc referencing a base-game key
-        // would flag CW225.
+        // Cached vanilla keys are resolved via the loc-index union passed to
+        // `validate_loc_project_with_union`, so they aren't duplicated here.
         let extra_valid_refs: HashSet<String> = {
             // Lock order: rules -> info_service.
             let mut extra = (*self.state.rules.read().modifier_keys).clone();
@@ -665,11 +672,6 @@ impl Backend {
             // Dynamic modifiers, ideas, other game-object names + defined
             // variables a `$ref$` can bind to (mirrors the CLI/driver path).
             extra.extend(info.type_index.loc_bindable_names());
-            if let Some(cached) = &cached_vanilla_loc {
-                for (_, keys) in cached {
-                    extra.extend(keys.iter().cloned());
-                }
-            }
             extra
         };
 
@@ -694,10 +696,13 @@ impl Backend {
                     idx.merge_cached_keys(typed, loc_languages.as_deref());
                 }
                 let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
-                for d in cwtools_localization::validate_loc_project_scoped(
+                // Reuse the merged loc-index union (with cached vanilla keys)
+                // instead of rebuilding the ~2M-key set inside the validate pass.
+                for d in cwtools_localization::validate_loc_project_with_union(
                     &service,
                     loc_game,
                     loc_languages.as_deref(),
+                    idx.union(),
                     &extra_valid_refs,
                 ) {
                     if !d.file.starts_with(&root_str) {
@@ -719,27 +724,30 @@ impl Backend {
                 for file in service.files() {
                     let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
                     let lang_included = hover_all || lang == primary_lang;
+                    // Every entry in a file shares the same source path.
+                    let file_uri = path_to_uri(std::path::Path::new(&file.path));
                     for entry in &file.entries {
+                        let key_lower = entry.key.to_lowercase();
                         // goto: prefer the primary language's location (English by
                         // default) so Ctrl+Click lands on the canonical entry, not
                         // whichever language happened to be scanned first.
                         let loc = || {
                             (
-                                path_to_uri(std::path::Path::new(&*entry.position.stream_name)),
+                                file_uri.clone(),
                                 (entry.position.line.saturating_sub(1)) as u32,
                             )
                         };
                         if lang == primary_lang {
-                            ll.insert(entry.key.to_lowercase(), loc());
+                            ll.insert(key_lower.clone(), loc());
                         } else {
-                            ll.entry(entry.key.to_lowercase()).or_insert_with(loc);
+                            ll.entry(key_lower.clone()).or_insert_with(loc);
                         }
                         if !lang_included {
                             continue;
                         }
                         let display = loc_display_text(&entry.desc);
                         if !display.is_empty() {
-                            lt.entry(entry.key.to_lowercase())
+                            lt.entry(key_lower)
                                 .or_default()
                                 .push((lang, display.to_string()));
                         }
@@ -1027,8 +1035,20 @@ impl Backend {
                     }
                     tracing::debug!(%uri, "watched file changed/created");
                     let path = uri_to_path_str(&uri);
-                    match tokio::fs::read_to_string(&path).await {
-                        Ok(text) => {
+                    // Read on a blocking thread via the file manager so cp1252
+                    // script files are validated (not silently dropped) and the
+                    // async runtime isn't stalled on the sync read.
+                    let read = {
+                        let path = path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            cwtools_file_manager::file_manager::read_text(std::path::Path::new(
+                                &path,
+                            ))
+                        })
+                        .await
+                    };
+                    match read {
+                        Ok(Ok(text)) => {
                             let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
                             if let Some(parsed) = parsed {
                                 let ast = Arc::new(parsed);
@@ -1038,8 +1058,11 @@ impl Backend {
                                 self.publish_gated(uri_obj, diagnostics, None).await;
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!("could not read watched file {}: {}", path, e);
+                        }
+                        Err(e) => {
+                            tracing::warn!("read task panicked for watched file {}: {}", path, e);
                         }
                     }
                 }

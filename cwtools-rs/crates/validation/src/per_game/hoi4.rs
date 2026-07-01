@@ -63,14 +63,13 @@ fn walk(
         if let Some(default) = default
             && sole_always_value(block.children, ast, table) == Some(default)
         {
-            errors.push(ValidationError {
-                message: error_codes::CW280_REDUNDANT_DEFAULT_FIELD.format(&[&key]),
-                severity: error_codes::CW280_REDUNDANT_DEFAULT_FIELD.severity,
-                line: block.range.start.line,
-                col: block.range.start.col,
-                file: file_path.to_string(),
-                code: Some(error_codes::CW280_REDUNDANT_DEFAULT_FIELD.id),
-            });
+            errors.push(ValidationError::from_code(
+                &error_codes::CW280_REDUNDANT_DEFAULT_FIELD,
+                file_path,
+                block.range.start.line,
+                block.range.start.col,
+                &[&key],
+            ));
         }
 
         walk(block.children, ast, table, file_path, errors);

@@ -368,37 +368,9 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
     ) -> Option<RuleCursorInfo> {
-        let (game, scope_checks, var_checks) = {
-            let cfg = self.state.config.read();
-            (cfg.game(), cfg.scope_checks, cfg.var_checks)
-        };
-        // Lock order: documents -> rules -> info_service (see DocumentState).
-        let docs = self.state.documents.lock();
-        let rules_guard = self.state.rules.read();
-        let info_guard = self.state.info_service.read();
-        let doc = docs.get(uri)?;
-        let rs = rules_guard.ruleset.as_ref()?;
-        let ast = doc.ast.as_ref()?;
-
-        let prepared = crate::validate::make_prepared(
-            rs,
-            &self.state.string_table,
-            game,
-            &info_guard.type_index,
-            &rules_guard.modifier_keys,
-            None,
-            None,
-            rules_guard.scope_registry.as_ref(),
-            scope_checks,
-            var_checks,
-        );
-        let rctx = rules_at_pos(
-            ast,
-            logical_path,
-            &prepared,
-            pos.line + 1,
-            pos.character as u16,
-        )?;
+        let CursorResolution { rctx, ruleset, .. } =
+            self.resolve_at_cursor(uri, pos, logical_path)?;
+        let rs = ruleset.as_ref();
         let leaf = rctx.leaf?;
 
         let element = if leaf.key.is_empty() {
@@ -446,6 +418,7 @@ impl Backend {
         // description that did match comes from a coincidental alias — resolve the
         // key to its type and drop the misleading description/category.
         let mut scope_link_key = false;
+        let info_guard = self.state.info_service.read();
         if !leaf.in_value
             && !leaf.key.is_empty()
             && !matches!(hint, ReferenceHint::TypeRef { .. })
@@ -468,6 +441,7 @@ impl Backend {
                 &leaf.key,
             )
         };
+        drop(info_guard);
         // Current scope at the cursor (the scope the containing block evaluates
         // in), so a hover shows where you are regardless of whether the rule
         // declares a required scope. The related scopes (ROOT/PREV and the FROM
@@ -535,6 +509,86 @@ impl Backend {
 }
 
 impl Backend {
+    /// Snapshot the document AST for `uri`. Returns the last good parse when the
+    /// buffer currently parses; when the last parse failed (the user typed
+    /// something unparseable) it re-parses the live text for THIS request only,
+    /// so hover/goto/completion still resolve a context mid-edit. The fresh AST
+    /// is not written back — the debounced validate owns the long-term one. The
+    /// `documents` mutex is held only for the snapshot, never across the parse.
+    pub(crate) fn ast_for(&self, uri: &str) -> Option<Arc<ParsedFile>> {
+        let text = {
+            let docs = self.state.documents.lock();
+            let doc = docs.get(uri)?;
+            if let Some(ast) = &doc.ast {
+                return Some(ast.clone());
+            }
+            doc.text.clone()
+        };
+        let table = self.state.string_table.clone();
+        tokio::task::block_in_place(|| {
+            cwtools_parser::parser::parse_string(&text, &table)
+                .ok()
+                .map(Arc::new)
+        })
+    }
+
+    /// The classified element under the cursor via `element_at_position`, run on
+    /// the snapshotted AST (with the mid-edit re-parse fallback from `ast_for`).
+    /// Shared by hover and goto's heuristic fallbacks.
+    pub(crate) fn element_at_cursor(
+        &self,
+        uri: &str,
+        pos: tower_lsp::lsp_types::Position,
+    ) -> Option<PositionElement> {
+        let ast = self.ast_for(uri)?;
+        let (line, col) = crate::paths::lsp_pos_to_source(pos);
+        cwtools_info::element_at_position(&ast, line, col, &self.state.string_table)
+    }
+
+    /// Resolve the rule context at the cursor, snapshotting the AST and ruleset
+    /// so neither the `documents` mutex nor the rules guard is held across
+    /// `rules_at_pos`. Shared by completion and `rule_info_at_cursor` (hover /
+    /// goto). `RuleContext` is owned, so all guards are released on return.
+    pub(crate) fn resolve_at_cursor(
+        &self,
+        uri: &str,
+        pos: tower_lsp::lsp_types::Position,
+        logical_path: &str,
+    ) -> Option<CursorResolution> {
+        let (game, scope_checks, var_checks) = {
+            let cfg = self.state.config.read();
+            (cfg.game(), cfg.scope_checks, cfg.var_checks)
+        };
+        let ast = self.ast_for(uri)?;
+        let (ruleset, modifier_keys, scope_registry) = {
+            let rules_guard = self.state.rules.read();
+            (
+                rules_guard.ruleset.clone()?,
+                rules_guard.modifier_keys.clone(),
+                rules_guard.scope_registry.clone(),
+            )
+        };
+        let (line, col) = crate::paths::lsp_pos_to_source(pos);
+        // info_service read is held only for the resolve; `rules_at_pos` returns
+        // owned data, so it is dropped before the caller runs.
+        let info_guard = self.state.info_service.read();
+        let prepared = crate::validate::make_prepared(
+            &ruleset,
+            &self.state.string_table,
+            game,
+            &info_guard.type_index,
+            &modifier_keys,
+            None,
+            None,
+            scope_registry.as_ref(),
+            scope_checks,
+            var_checks,
+        );
+        let rctx = rules_at_pos(&ast, logical_path, &prepared, line, col)?;
+        drop(info_guard);
+        Some(CursorResolution { rctx, ruleset })
+    }
+
     /// The `$KEY$` loc reference under the cursor in an open `.yml` document, plus
     /// its `[start, end)` UTF-16 column range. `None` when the cursor isn't on a
     /// reference (or the document isn't open). Shared by hover and goto.
@@ -548,6 +602,15 @@ impl Backend {
         let line = doc.text.lines().nth(pos.line as usize)?;
         crate::paths::loc_ref_at_cursor(line, pos.character)
     }
+}
+
+/// The resolved rule context at the cursor plus the ruleset snapshot it was
+/// resolved against, returned by [`Backend::resolve_at_cursor`]. The Arcs keep
+/// the ruleset/registry alive for callers that inspect the context after the
+/// guards are dropped.
+pub(crate) struct CursorResolution {
+    pub(crate) rctx: cwtools_validation::position::RuleContext,
+    pub(crate) ruleset: Arc<RuleSet>,
 }
 
 /// What `rule_info_at_cursor` resolves for the leaf under the cursor.

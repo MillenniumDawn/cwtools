@@ -89,14 +89,17 @@ pub fn read_text_with_encoding(path: &Path) -> Result<(String, FileEncoding), Fi
     // Fast path: valid UTF-8 (includes pure ASCII). The BOM, when present, is
     // valid UTF-8 (U+FEFF) and is kept in the string — existing parsers already
     // tolerate a leading BOM character.
-    if let Ok(s) = std::str::from_utf8(&bytes) {
-        let enc = if has_bom {
-            FileEncoding::Utf8Bom
-        } else {
-            FileEncoding::Utf8NoBom
-        };
-        return Ok((s.to_owned(), enc));
-    }
+    let bytes = match String::from_utf8(bytes) {
+        Ok(s) => {
+            let enc = if has_bom {
+                FileEncoding::Utf8Bom
+            } else {
+                FileEncoding::Utf8NoBom
+            };
+            return Ok((s, enc));
+        }
+        Err(e) => e.into_bytes(),
+    };
     // Not valid UTF-8: strip a leading BOM if any, then decode as Windows-1252.
     let body = if has_bom { &bytes[3..] } else { &bytes[..] };
     let text = body.iter().map(|&b| cp1252_byte(b)).collect();
@@ -120,8 +123,18 @@ pub enum FileKind {
 /// in the LSP and the CLI driver both filter by this list.
 pub const SCRIPT_EXTENSIONS: &[&str] = &["txt", "gui", "gfx", "sfx", "asset", "map"];
 
+/// True for a localisation file extension (case-insensitive): `yml`, `yaml`,
+/// `csv`. The single source of truth so script discovery, the localisation
+/// walker, and the LSP's loc-file predicate all agree — previously the loc
+/// walker missed `.yaml`.
+pub fn is_loc_ext(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("yml")
+        || ext.eq_ignore_ascii_case("yaml")
+        || ext.eq_ignore_ascii_case("csv")
+}
+
 /// Classify a file by its extension, matching F# FileManager.fs:215-273.
-pub fn classify_extension(path: &Path) -> FileKind {
+pub(crate) fn classify_extension(path: &Path) -> FileKind {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -129,11 +142,49 @@ pub fn classify_extension(path: &Path) -> FileKind {
         .to_ascii_lowercase();
     if SCRIPT_EXTENSIONS.contains(&ext.as_str()) {
         FileKind::Script
-    } else if matches!(ext.as_str(), "yml" | "yaml" | "csv") {
+    } else if is_loc_ext(&ext) {
         FileKind::Localisation
     } else {
         FileKind::Resource
     }
+}
+
+/// Directory names skipped everywhere during discovery: VCS, build output, and
+/// editor/tooling dirs that never hold game content (walking them double-counts
+/// files, e.g. a `.claude` worktree mirroring the whole mod tree). The single
+/// source of truth, shared with the localisation walker via [`is_excluded_dir`].
+pub const EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    ".claude",
+    "target",
+    ".vs",
+    "node_modules",
+    "out",
+    "dist",
+    "bin",
+    "obj",
+    ".idea",
+    ".vscode",
+];
+
+/// Directory names skipped ONLY at the workspace root. A top-level `resources/`
+/// is dev scratch the game never loads, but nested `common/resources/` defines
+/// the `resource` type (oil, steel, …) and must be indexed. Shared via
+/// [`is_excluded_root_dir`].
+pub const EXCLUDED_ROOT_DIRS: &[&str] = &["resources"];
+
+/// True for a directory name skipped everywhere during discovery (see
+/// [`EXCLUDED_DIRS`]). Case-insensitive.
+pub fn is_excluded_dir(name: &str) -> bool {
+    EXCLUDED_DIRS.iter().any(|d| name.eq_ignore_ascii_case(d))
+}
+
+/// True for a directory name skipped only at the workspace root (see
+/// [`EXCLUDED_ROOT_DIRS`]). Case-insensitive.
+pub fn is_excluded_root_dir(name: &str) -> bool {
+    EXCLUDED_ROOT_DIRS
+        .iter()
+        .any(|d| name.eq_ignore_ascii_case(d))
 }
 
 #[derive(Debug, Error)]
@@ -226,27 +277,9 @@ impl Default for FileManagerConfig {
                 "LICENSE.md".into(),
                 "*.md".into(),
             ],
-            exclude_dirs: vec![
-                ".git".into(),
-                // Claude Code tooling dir. Holds git worktrees that mirror the
-                // whole mod tree; walking it double-counts every file (e.g. the
-                // loc set), so skip it like .git. Never game content.
-                ".claude".into(),
-                "target".into(),
-                ".vs".into(),
-                "node_modules".into(),
-                "out".into(),
-                "dist".into(),
-                "bin".into(),
-                "obj".into(),
-                ".idea".into(),
-                ".vscode".into(),
-            ],
+            exclude_dirs: EXCLUDED_DIRS.iter().map(|s| s.to_string()).collect(),
             exclude_dir_patterns: vec![],
-            // A top-level `resources/` is dev scratch the game never loads; skip it
-            // only at the root so the real `common/resources/` (resource defs) still
-            // indexes. A bare name-exclude would drop both.
-            exclude_root_dirs: vec!["resources".into()],
+            exclude_root_dirs: EXCLUDED_ROOT_DIRS.iter().map(|s| s.to_string()).collect(),
             max_file_size: 2 * 1024 * 1024, // 2 MB
         }
     }
@@ -326,106 +359,42 @@ impl FileManager {
     /// parallel; this pass is just filesystem traversal.
     fn collect_paths(&self, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), FileError> {
         let root_prefix = normalize_root_prefix(&self.config.root);
-        self.collect_paths_inner(dir, &root_prefix, out)
-    }
-
-    fn collect_paths_inner(
-        &self,
-        dir: &Path,
-        root_prefix: &str,
-        out: &mut Vec<(PathBuf, String)>,
-    ) -> Result<(), FileError> {
-        // Collect (sort-key, path) once so sorting doesn't re-allocate an
-        // OsString per comparison.
-        let mut entries: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            entries.push((entry.file_name(), entry.path()));
-        }
-        // Sort for deterministic ordering
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        for (_name, path) in entries {
-            if path.is_dir() {
-                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if self
-                    .config
-                    .exclude_dirs
-                    .iter()
-                    .any(|ex| dir_name.eq_ignore_ascii_case(ex))
-                {
-                    continue;
-                }
-                if self
-                    .config
-                    .exclude_dir_patterns
-                    .iter()
-                    .any(|pat| glob_match(pat, dir_name))
-                {
-                    continue;
-                }
-                // Root-anchored excludes: only when this dir is a direct child of
-                // the workspace root (its relative path has no separator).
-                let rel = compute_logical_path_with_root(&path, root_prefix);
-                if !rel.contains('/')
-                    && self
-                        .config
-                        .exclude_root_dirs
-                        .iter()
-                        .any(|ex| dir_name.eq_ignore_ascii_case(ex))
-                {
-                    continue;
-                }
-                if let Err(e) = self.collect_paths_inner(&path, root_prefix, out) {
-                    eprintln!("warn: skipping {}: {}", path.display(), e);
-                }
-                continue;
+        let cfg = &self.config;
+        // Accept only script files that match the include patterns, aren't
+        // excluded, and pass the size guard; each yields (path, logical_path).
+        let mut accept = |path: &Path| -> Option<(PathBuf, String)> {
+            if classify_extension(path) != FileKind::Script {
+                return None;
             }
-
-            // Extension routing — skip non-script files early
-            if classify_extension(&path) != FileKind::Script {
-                continue;
-            }
-
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-            // Check include patterns
-            let mut matched = false;
-            for pattern in &self.config.file_patterns {
-                if glob_match(pattern, file_name) {
-                    matched = true;
-                    break;
-                }
-            }
-            if !matched {
-                continue;
-            }
-
-            // Check exclude patterns
-            let mut excluded = false;
-            for pattern in &self.config.exclude_patterns {
-                if glob_match(pattern, file_name) {
-                    excluded = true;
-                    break;
-                }
-            }
-            if excluded {
-                continue;
-            }
-
-            // Size guard
-            if self.config.max_file_size > 0
-                && let Ok(meta) = path.metadata()
-                && meta.len() > self.config.max_file_size
+            if !cfg
+                .file_patterns
+                .iter()
+                .any(|pat| glob_match(pat, file_name))
             {
-                continue;
+                return None;
             }
-
-            // Compute logical path relative to root
-            let logical_path = compute_logical_path_with_root(&path, root_prefix);
-            out.push((path, logical_path));
-        }
-        Ok(())
+            if cfg
+                .exclude_patterns
+                .iter()
+                .any(|pat| glob_match(pat, file_name))
+            {
+                return None;
+            }
+            if cfg.max_file_size > 0
+                && let Ok(meta) = path.metadata()
+                && meta.len() > cfg.max_file_size
+            {
+                return None;
+            }
+            let logical_path = compute_logical_path_with_root(path, &root_prefix);
+            Some((path.to_path_buf(), logical_path))
+        };
+        let mut on_err = |path: &Path, e: std::io::Error| {
+            eprintln!("warn: skipping {}: {}", path.display(), FileError::from(e));
+        };
+        walk_dir_generic(dir, &root_prefix, cfg, &[], &mut accept, &mut on_err, out)
+            .map_err(FileError::from)
     }
 
     pub fn parse_single_file(&mut self, path: &Path) -> Result<ParsedFile, FileError> {
@@ -448,7 +417,7 @@ impl FileManager {
 ///
 /// Given `root = /mnt/mod` and `path = /mnt/mod/common/effects/foo.txt`,
 /// returns `common/effects/foo.txt`.
-pub fn compute_logical_path(path: &Path, root: &Path) -> String {
+pub(crate) fn compute_logical_path(path: &Path, root: &Path) -> String {
     compute_logical_path_with_root(path, &normalize_root_prefix(root))
 }
 
@@ -493,7 +462,7 @@ fn normalize_slashes(s: std::borrow::Cow<'_, str>) -> std::borrow::Cow<'_, str> 
 ///
 /// Mirrors F# FileManager.fs:91-125: extracts `name`, `path`, and
 /// `replace_path` entries.
-pub fn parse_mod_descriptor(path: &Path) -> Result<ModDescriptor, FileError> {
+pub(crate) fn parse_mod_descriptor(path: &Path) -> Result<ModDescriptor, FileError> {
     let raw = read_text(path)?;
     // Strip UTF-8 BOM (U+FEFF) so the first key isn't parsed as "\u{FEFF}name".
     let content = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
@@ -737,86 +706,115 @@ pub fn walk_workspace_files(
     let cfg = FileManagerConfig::default();
     let root_prefix = normalize_root_prefix(root);
     let mut out = Vec::new();
-    walk_workspace_inner(
+    // Accept any file whose extension is requested and which isn't a free-form
+    // excluded filename. No size guard (unlike the CLI walker).
+    let mut accept = |path: &Path| -> Option<PathBuf> {
+        let ext = path.extension().and_then(|e| e.to_str())?;
+        if !extensions.contains(&ext) {
+            return None;
+        }
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if cfg
+            .exclude_patterns
+            .iter()
+            .any(|pat| glob_match(pat, file_name))
+            || extra_file_globs
+                .iter()
+                .any(|pat| glob_match(pat, file_name))
+        {
+            return None;
+        }
+        Some(path.to_path_buf())
+    };
+    // The LSP walk silently ignores unreadable directories.
+    let mut on_err = |_: &Path, _: std::io::Error| {};
+    let _ = walk_dir_generic(
         root,
         &root_prefix,
-        extensions,
         &cfg,
-        extra_file_globs,
         extra_dir_globs,
+        &mut accept,
+        &mut on_err,
         &mut out,
     );
     out
 }
 
-fn walk_workspace_inner(
+/// Shared directory traversal for both discovery walkers. Sorts each
+/// directory's entries for deterministic order, applies the config's
+/// directory-exclusion lists (plus `extra_dir_globs`), and passes every
+/// non-directory path to `accept`; whatever `accept` returns is collected into
+/// `out`. Symlinked directories are followed (matching the previous
+/// `path.is_dir()` behaviour); regular entries reuse the `file_type` from
+/// `read_dir` to avoid a second stat. Read errors on child directories go to
+/// `on_dir_err`; the top-level read error is returned.
+fn walk_dir_generic<T>(
     dir: &Path,
     root_prefix: &str,
-    extensions: &[&str],
     cfg: &FileManagerConfig,
-    extra_file_globs: &[String],
     extra_dir_globs: &[String],
-    out: &mut Vec<PathBuf>,
-) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    // Sort each directory's entries so the scan order matches the CLI's
-    // `collect_paths` and stays stable across filesystems. Collect the sort key
-    // once so sorting doesn't re-allocate an OsString per comparison.
-    let mut entries: Vec<(std::ffi::OsString, PathBuf)> =
-        rd.flatten().map(|e| (e.file_name(), e.path())).collect();
+    accept: &mut dyn FnMut(&Path) -> Option<T>,
+    on_dir_err: &mut dyn FnMut(&Path, std::io::Error),
+    out: &mut Vec<T>,
+) -> std::io::Result<()> {
+    // Collect (sort-key, path, file_type) once so sorting doesn't re-allocate an
+    // OsString per comparison and directory tests reuse the readdir file type.
+    let mut entries: Vec<(std::ffi::OsString, PathBuf, std::fs::FileType)> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let Ok(ft) = entry.file_type() else { continue };
+        entries.push((entry.file_name(), entry.path(), ft));
+    }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    for (_name, path) in entries {
-        if path.is_dir() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+    for (_name, path, ft) in entries {
+        // `file_type()` from `read_dir` doesn't follow symlinks; stat only those
+        // to preserve the previous symlink-following discovery.
+        let is_dir = if ft.is_symlink() {
+            path.is_dir()
+        } else {
+            ft.is_dir()
+        };
+        if is_dir {
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // Root-anchored excludes apply only to direct children of the root.
             let rel = compute_logical_path_with_root(&path, root_prefix);
             let root_level = !rel.contains('/');
             let skip = cfg
                 .exclude_dirs
                 .iter()
-                .any(|ex| name.eq_ignore_ascii_case(ex))
+                .any(|ex| dir_name.eq_ignore_ascii_case(ex))
                 || cfg
                     .exclude_dir_patterns
                     .iter()
-                    .any(|pat| glob_match(pat, name))
-                || extra_dir_globs.iter().any(|pat| glob_match(pat, name))
+                    .any(|pat| glob_match(pat, dir_name))
+                || extra_dir_globs.iter().any(|pat| glob_match(pat, dir_name))
                 || (root_level
                     && cfg
                         .exclude_root_dirs
                         .iter()
-                        .any(|ex| name.eq_ignore_ascii_case(ex)));
-            if !skip {
-                walk_workspace_inner(
+                        .any(|ex| dir_name.eq_ignore_ascii_case(ex)));
+            if !skip
+                && let Err(e) = walk_dir_generic(
                     &path,
                     root_prefix,
-                    extensions,
                     cfg,
-                    extra_file_globs,
                     extra_dir_globs,
+                    accept,
+                    on_dir_err,
                     out,
-                );
+                )
+            {
+                on_dir_err(&path, e);
             }
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if !extensions.contains(&ext) {
-                continue;
-            }
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            // Engine baseline (Changelog.txt, README.*, LICENSE.*, *.md) lives in
-            // the default config's exclude_patterns; user globs extend it.
-            let skip = cfg
-                .exclude_patterns
-                .iter()
-                .any(|pat| glob_match(pat, file_name))
-                || extra_file_globs
-                    .iter()
-                    .any(|pat| glob_match(pat, file_name));
-            if !skip {
-                out.push(path);
-            }
+            continue;
+        }
+
+        if let Some(item) = accept(&path) {
+            out.push(item);
         }
     }
+    Ok(())
 }
 
 /// Classify a directory following F# FileManager.fs:80-147.
@@ -887,6 +885,11 @@ pub fn classify_directory(dir: &Path) -> DirectoryType {
 /// - `?` single-char wildcard
 /// - Directory-name plain equality
 pub fn glob_match(pattern: &str, text: &str) -> bool {
+    // Fast path for wildcard-free patterns (the default excludes are all
+    // literal filenames): plain equality, skipping the DP matcher entirely.
+    if !pattern.contains(['*', '?']) {
+        return pattern == text;
+    }
     // Fast path for *.ext — only valid when the remainder has no further wildcards.
     if let Some(suffix) = pattern.strip_prefix('*')
         && !suffix.contains(['*', '?'])

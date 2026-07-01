@@ -8,7 +8,9 @@ license.workspace = true
 cwtools_game = { workspace = true }
 cwtools_parser = { workspace = true }
 cwtools_string_table = { workspace = true }
+cwtools_error_codes = { workspace = true }
 tracing = { workspace = true }
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

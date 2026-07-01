@@ -136,8 +136,12 @@ fn read_settings_sig(dir: &Path) -> Option<u64> {
 
 /// Write the current fingerprint to `settings.sig`.
 fn write_settings_sig(dir: &Path, sig: u64) {
-    let _ = fs::create_dir_all(dir);
-    let _ = fs::write(settings_sig_path(dir), sig.to_le_bytes());
+    if let Err(e) = fs::create_dir_all(dir) {
+        tracing::warn!(dir = %dir.display(), error = %e, "settings.sig: create_dir_all failed");
+    }
+    if let Err(e) = fs::write(settings_sig_path(dir), sig.to_le_bytes()) {
+        tracing::warn!(dir = %dir.display(), error = %e, "settings.sig: write failed");
+    }
 }
 
 /// Validate (and update) the settings signature. Returns `true` if the cache is
@@ -157,8 +161,14 @@ pub fn validate_or_clear(cache_dir: &Path, fingerprint: u64) -> bool {
         }
         _ => {
             // Stale or missing — wipe the directory and recreate.
-            let _ = fs::remove_dir_all(&dir);
-            let _ = fs::create_dir_all(&dir);
+            if let Err(e) = fs::remove_dir_all(&dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(dir = %dir.display(), error = %e, "cache reset: remove_dir_all failed");
+            }
+            if let Err(e) = fs::create_dir_all(&dir) {
+                tracing::warn!(dir = %dir.display(), error = %e, "cache reset: create_dir_all failed");
+            }
             write_settings_sig(&dir, fingerprint);
             false
         }
@@ -183,8 +193,9 @@ fn sweep_orphan_dirs(cache_dir: &Path, current_fingerprint: u64) {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|name| name != current_hex)
+            && let Err(e) = fs::remove_dir_all(&path)
         {
-            let _ = fs::remove_dir_all(&path);
+            tracing::warn!(path = %path.display(), error = %e, "orphan cache dir sweep failed");
         }
     }
 }
@@ -315,7 +326,9 @@ pub fn store(
     let path = file_cache_path(&dir, hash);
 
     let cached = arena_to_cached(&parsed.arena, &parsed.root_children, table);
-    let _ = serialize_to_file(&cached, &path);
+    if let Err(e) = serialize_to_file(&cached, &path) {
+        tracing::warn!(path = %path.display(), error = %e, "parse cache write failed");
+    }
 }
 
 #[cfg(test)]

@@ -269,7 +269,7 @@ impl VarIndex {
     /// Like [`normalize`](Self::normalize) but writes the canonical key into a
     /// reusable buffer (cleared first), avoiding a per-call allocation on the hot
     /// `contains` path. Identifiers are ASCII, so the lowercase fold is ASCII.
-    pub fn normalize_into(raw: &str, buf: &mut String) {
+    pub(crate) fn normalize_into(raw: &str, buf: &mut String) {
         let s = raw.trim().trim_matches('"');
         let before_amp = s.split('@').next().unwrap_or(s);
         let last_seg = before_amp.rsplit('.').next().unwrap_or(before_amp);
@@ -375,10 +375,16 @@ impl TypeIndex {
     /// Paradox script identifiers are case-insensitive, so a reference like
     /// `LBA_AI_BEHAVIOR` resolves to the `LBA_ai_behavior` definition.
     pub fn contains(&self, type_name: &str, instance: &str) -> bool {
-        self.instance_sets
-            .get(type_name)
-            .map(|names| names.contains_key(&instance.to_ascii_lowercase()))
-            .unwrap_or(false)
+        let Some(names) = self.instance_sets.get(type_name) else {
+            return false;
+        };
+        // Borrow the key directly when it's already lowercase (the common case),
+        // only allocating a lowercase copy when it actually has uppercase bytes.
+        if instance.bytes().any(|b| b.is_ascii_uppercase()) {
+            names.contains_key(&instance.to_ascii_lowercase())
+        } else {
+            names.contains_key(instance)
+        }
     }
 
     /// Return true if `name` is a known instance of ANY type. Used to recognise
@@ -386,7 +392,11 @@ impl TypeIndex {
     /// of a referenced type (character, state, ideology, ...) open its own scope,
     /// e.g. `LBA_some_character = { ... }`.
     pub fn is_any_instance(&self, name: &str) -> bool {
-        self.name_counts.contains_key(&name.to_ascii_lowercase())
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.name_counts.contains_key(&name.to_ascii_lowercase())
+        } else {
+            self.name_counts.contains_key(name)
+        }
     }
 
     /// All instances for a type (across all files).
@@ -433,7 +443,7 @@ impl TypeIndex {
     /// each bindable name by reference, no per-name allocation. Use this when the
     /// caller only needs to read the names (membership, iteration) rather than own
     /// them.
-    pub fn loc_bindable_names_iter(&self) -> impl Iterator<Item = &str> + '_ {
+    pub(crate) fn loc_bindable_names_iter(&self) -> impl Iterator<Item = &str> + '_ {
         self.name_counts
             .keys()
             .map(String::as_str)
@@ -581,18 +591,46 @@ pub fn dir_matches_pattern(dir_lower: &str, pat_lower: &str, strict: bool) -> bo
 /// Also enforces `path_file` (exact filename match) and `path_extension` (extension
 /// match), mirroring the validator's `find_type_by_path_and_key` behaviour.
 pub fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
-    // Normalise separators and split into directory and filename.
-    let norm = logical_path.replace('\\', "/");
-    let basename = norm.rsplit('/').next().unwrap_or(&norm);
-    let basename_lower = basename.to_lowercase();
+    check_path_dir_norm(opts, &NormalizedPath::new(logical_path))
+}
+
+/// A logical path pre-split into lowercase directory + basename. Compute once
+/// per file and reuse across every type's [`check_path_dir_norm`] probe instead
+/// of re-normalising and re-lowercasing the same path per type.
+pub struct NormalizedPath {
+    dir_lower: String,
+    basename_lower: String,
+}
+
+impl NormalizedPath {
+    pub fn new(logical_path: &str) -> Self {
+        let norm = logical_path.replace('\\', "/");
+        let basename = norm.rsplit('/').next().unwrap_or(&norm);
+        let basename_lower = basename.to_lowercase();
+        let dir = match norm.rfind('/') {
+            Some(idx) => &norm[..idx],
+            None => "",
+        };
+        let dir_lower = dir.to_lowercase();
+        Self {
+            dir_lower,
+            basename_lower,
+        }
+    }
+}
+
+/// As [`check_path_dir`], but takes a pre-normalised path so callers looping over
+/// all types pay the normalisation cost once per file rather than per type.
+pub fn check_path_dir_norm(opts: &PathOptions, np: &NormalizedPath) -> bool {
+    let basename_lower: &str = &np.basename_lower;
 
     // path_file: exact filename constraint (precomputed by reindex when available).
     if let Some(pf_lower) = &opts.path_file_lower {
-        if basename_lower != *pf_lower {
+        if basename_lower != pf_lower.as_str() {
             return false;
         }
     } else if let Some(pf) = &opts.path_file
-        && basename_lower != pf.to_lowercase()
+        && basename_lower != pf.to_lowercase().as_str()
     {
         return false;
     }
@@ -623,11 +661,7 @@ pub fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
         return true;
     }
 
-    let dir = match norm.rfind('/') {
-        Some(idx) => &norm[..idx],
-        None => "",
-    };
-    let dir_lower = dir.to_lowercase();
+    let dir_lower = np.dir_lower.as_str();
 
     if opts.paths_lower.is_empty() && !opts.paths.is_empty() {
         // Fallback for PathOptions built without reindex() (e.g. tests).
@@ -635,7 +669,7 @@ pub fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
             let pat = p.replace('\\', "/");
             let pat = pat.trim_matches('/');
             let pat_lower = pat.to_lowercase();
-            if dir_matches_pattern(&dir_lower, &pat_lower, opts.path_strict) {
+            if dir_matches_pattern(dir_lower, &pat_lower, opts.path_strict) {
                 return true;
             }
         }
@@ -643,7 +677,7 @@ pub fn check_path_dir(opts: &PathOptions, logical_path: &str) -> bool {
     }
 
     for pat_lower in &opts.paths_lower {
-        if dir_matches_pattern(&dir_lower, pat_lower, opts.path_strict) {
+        if dir_matches_pattern(dir_lower, pat_lower, opts.path_strict) {
             return true;
         }
     }
@@ -833,10 +867,9 @@ pub fn for_each_instance_node<F>(
 ) where
     F: FnMut(&TypeDefinition, &str, &str, &[Child], SourceLocation),
 {
+    let np = NormalizedPath::new(logical_path);
     for td in &ruleset.types {
-        if td.type_per_file
-            || td.subtypes.is_empty()
-            || !check_path_dir(&td.path_options, logical_path)
+        if td.type_per_file || td.subtypes.is_empty() || !check_path_dir_norm(&td.path_options, &np)
         {
             continue;
         }
@@ -922,9 +955,10 @@ pub fn collect_type_instances(
 ) -> HashMap<String, Vec<TypeInstance>> {
     let mut result: HashMap<String, Vec<TypeInstance>> = HashMap::new();
 
+    let np = NormalizedPath::new(logical_path);
     for td in &ruleset.types {
         // Path filter (mirrors CheckPathDir)
-        if !check_path_dir(&td.path_options, logical_path) {
+        if !check_path_dir_norm(&td.path_options, &np) {
             continue;
         }
 
@@ -1031,8 +1065,9 @@ pub fn collect_defined_variables_from_rules(
     }
 
     // Walk type instances (path-filtered) and scan their rules for VariableSetField
+    let np = NormalizedPath::new(logical_path);
     for td in &ruleset.types {
-        if !check_path_dir(&td.path_options, logical_path) {
+        if !check_path_dir_norm(&td.path_options, &np) {
             continue;
         }
         let Some(rules_for_type) = type_rules.get(td.name.as_str()) else {
@@ -1068,8 +1103,13 @@ fn collect_at_vars(
     for child in children {
         if let Child::Leaf(idx) = child {
             let leaf = &arena.leaves[*idx as usize];
-            let key = get_string_or_empty(table, leaf.key.normal);
-            if key.starts_with('@') {
+            // Gate on the cheap `@` prefix test inside `with_string` so the vast
+            // majority of (non-`@`) leaves never allocate a key String.
+            let is_at_var = table
+                .with_string(leaf.key.normal, |k| k.starts_with('@'))
+                .unwrap_or(false);
+            if is_at_var {
+                let key = get_string_or_empty(table, leaf.key.normal);
                 let value = leaf_value_string(&leaf.value, table);
                 out.entry("@".to_string())
                     .or_default()
@@ -1102,7 +1142,9 @@ fn sibling_value_in_children(
             let leaf = &arena.leaves[*li as usize];
             let is_value_key = table
                 .with_string(leaf.key.normal, |k| {
-                    matches!(k.to_ascii_lowercase().as_str(), "value" | "amount" | "add")
+                    ["value", "amount", "add"]
+                        .iter()
+                        .any(|w| k.eq_ignore_ascii_case(w))
                 })
                 .unwrap_or(false);
             if is_value_key {
@@ -1127,9 +1169,9 @@ fn scan_children_for_varset(
     out: &mut HashMap<String, Vec<DefinedVariable>>,
 ) {
     // For the explicit `var = value_set[variable] / value = variable_field` form
-    // the assigned value lives in a sibling `value` leaf of the same block. Find
-    // it once so the var-defining leaf can record it.
-    let sibling_value = sibling_value_in_children(children, arena, table);
+    // the assigned value lives in a sibling `value` leaf of the same block.
+    // Computed lazily: most blocks never hit the arm that needs it.
+    let sibling_value = std::cell::OnceCell::new();
     for child in children {
         // A keyed clause (`key = { ... }`) takes the NodeRule path.
         if let Some(kc) = arena.keyed_clause(child) {
@@ -1181,11 +1223,12 @@ fn scan_children_for_varset(
         match child {
             Child::Leaf(li) => {
                 let leaf = &arena.leaves[*li as usize];
-                // Resolve key and value sequentially (each releases the table lock)
-                // rather than nesting two `with_string` borrows, which would risk a
-                // re-entrant read-lock deadlock under writer contention.
-                let key = get_string_or_empty(table, leaf.key.normal);
-                let val = leaf_value_string(&leaf.value, table);
+                // Resolve key and value lazily and only on a matching rule (each
+                // resolution releases the table lock, avoiding the re-entrant
+                // read-lock hazard of nesting `with_string` borrows). Most leaves
+                // match neither variable-set arm, so they allocate nothing.
+                let key = std::cell::OnceCell::new();
+                let val = std::cell::OnceCell::new();
                 for (rule_type, _opts) in rules {
                     match rule_type {
                         // left = VariableSetField: the leaf's key IS the defined
@@ -1197,6 +1240,9 @@ fn scan_children_for_varset(
                             left: NewField::VariableSetField(ns),
                             ..
                         } => {
+                            let key =
+                                key.get_or_init(|| get_string_or_empty(table, leaf.key.normal));
+                            let val = val.get_or_init(|| leaf_value_string(&leaf.value, table));
                             out.entry(ns.clone()).or_default().push(DefinedVariable {
                                 name: key.clone(),
                                 namespace: Some(ns.clone()),
@@ -1214,16 +1260,25 @@ fn scan_children_for_varset(
                         RuleType::LeafRule {
                             left: NewField::SpecificField(expected_key),
                             right: NewField::VariableSetField(ns),
-                        } if !val.is_empty() && key.eq_ignore_ascii_case(expected_key) => {
-                            out.entry(ns.clone()).or_default().push(DefinedVariable {
-                                name: val.clone(),
-                                namespace: Some(ns.clone()),
-                                location: SourceLocation {
-                                    line: leaf.pos.start.line,
-                                    col: leaf.pos.start.col,
-                                },
-                                value: sibling_value.clone(),
-                            });
+                        } => {
+                            let val = val.get_or_init(|| leaf_value_string(&leaf.value, table));
+                            let key =
+                                key.get_or_init(|| get_string_or_empty(table, leaf.key.normal));
+                            if !val.is_empty() && key.eq_ignore_ascii_case(expected_key) {
+                                out.entry(ns.clone()).or_default().push(DefinedVariable {
+                                    name: val.clone(),
+                                    namespace: Some(ns.clone()),
+                                    location: SourceLocation {
+                                        line: leaf.pos.start.line,
+                                        col: leaf.pos.start.col,
+                                    },
+                                    value: sibling_value
+                                        .get_or_init(|| {
+                                            sibling_value_in_children(children, arena, table)
+                                        })
+                                        .clone(),
+                                });
+                            }
                         }
                         _ => {}
                     }

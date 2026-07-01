@@ -88,6 +88,14 @@ impl NamedValueIndex {
             .flat_map(|m| m.keys().map(Arc::as_ref))
     }
 
+    /// Whether `name`'s set contains `value` (O(1) hash probe, versus scanning
+    /// every member with `values(name)`).
+    pub fn contains(&self, name: &str, value: &str) -> bool {
+        self.by_name
+            .get(name)
+            .is_some_and(|m| m.contains_key(value))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
     }
@@ -146,8 +154,8 @@ pub fn collect_complex_enum_values(
 
 /// Push a value-set member, stripping an `@datestamp` suffix
 /// (`my_flag@1936.1.1` sets `my_flag`). Empty bases are skipped.
-fn push_member(out: &mut HashMap<String, Vec<String>>, ns: String, raw: String) {
-    let v = unquote(&raw);
+fn push_member(out: &mut HashMap<String, Vec<String>>, ns: String, raw: &str) {
+    let v = unquote(raw);
     let base = v.split('@').next().unwrap_or(v);
     if !base.is_empty() {
         out.entry(ns).or_default().push(base.to_string());
@@ -290,9 +298,7 @@ fn collect_value_sets_in(
             // all_variables); skip them here to avoid double-storing 100k names.
             (_, Some(ns)) if ns == "variable" => {}
             (Value::String(t) | Value::QString(t), Some(ns)) => {
-                if let Some(v) = table.get_string(t.normal) {
-                    push_member(out, ns, v);
-                }
+                table.with_string(t.normal, |v| push_member(out, ns, v));
             }
             (Value::Clause(sub), Some(ns)) => {
                 // Block form: the member is the value of the child bound to
@@ -326,9 +332,8 @@ fn collect_value_sets_in(
                             .flatten();
                         if let Some(field_ns) = field_ns
                             && field_ns != "variable"
-                            && let Some(v) = table.get_string(t.normal)
                         {
-                            push_member(out, field_ns, v);
+                            table.with_string(t.normal, |v| push_member(out, field_ns, v));
                         }
                     }
                 } else {
@@ -345,9 +350,10 @@ fn collect_value_sets_in(
                             .unwrap_or(false);
                         if is_name_key
                             && let Value::String(t) | Value::QString(t) = &cl.value
-                            && let Some(v) = table.get_string(t.normal)
+                            && table
+                                .with_string(t.normal, |v| push_member(out, ns.clone(), v))
+                                .is_some()
                         {
-                            push_member(out, ns.clone(), v);
                             break;
                         }
                     }

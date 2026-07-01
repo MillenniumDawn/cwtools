@@ -41,6 +41,28 @@ impl ValidationError {
             code: Some(code.id),
         }
     }
+
+    /// Like [`from_code`](Self::from_code) but with an explicit `severity` and a
+    /// pre-built `message`, for the sites whose severity is decided at runtime
+    /// (cardinality) or whose message is assembled from a match arm. Still tags
+    /// the diagnostic with the catalog `code.id`.
+    pub(crate) fn from_code_with(
+        code: &ErrorCode,
+        severity: ErrorSeverity,
+        file: &str,
+        line: u32,
+        col: u16,
+        message: String,
+    ) -> Self {
+        ValidationError {
+            message,
+            severity,
+            line,
+            col,
+            file: file.to_string(),
+            code: Some(code.id),
+        }
+    }
 }
 
 /// Number of significant decimal places in a numeric string; trailing zeros do
@@ -196,27 +218,27 @@ pub(crate) fn enum_contains(
     enum_name: &str,
     value: &str,
 ) -> bool {
-    match crate::enum_def(ruleset, enum_name) {
-        Some(def) if !def.values.is_empty() => {
+    match ruleset.enum_by_name.get(enum_name) {
+        Some(&idx) if !ruleset.enums[idx].values.is_empty() => {
             // Enum membership is case-insensitive (F# lowercases both the enum
             // values and the checked key — FieldValidators.fs `getLowerKey` +
             // RuleValidationService.fs `.lower`). e.g. `containerOrientations`
             // is authored UPPER_LEFT/CENTER but files use upper_left/center.
-            if def.values.iter().any(|v| v.eq_ignore_ascii_case(value)) {
+            if ruleset.enum_values_contains_ci(idx, value) {
                 return true;
             }
             // An enum whose members are `@`-prefixed scripted constants (e.g.
             // `enum[command_cap_increase] = { @tier1_cp_cap_increase ... }`) accepts
             // the resolved literal value too (`command_cap_increase = 10`), which we
             // can't resolve statically — be permissive.
-            if def.values.iter().any(|v| v.starts_with('@')) {
+            if ruleset.enum_has_at_constant(idx) {
                 return true;
             }
             // Large enums are likely incomplete game-data catalogues — accept any
             // non-empty value rather than flag every unlisted member.
             // Small enums (≤ 5 members) are authoritative; an unlisted value is
             // a genuine error.
-            if enum_is_authoritative(def) {
+            if enum_is_authoritative(&ruleset.enums[idx]) {
                 return !value.is_empty();
             }
             false
@@ -266,12 +288,7 @@ pub(crate) fn leaf_value_to_string(value: &Value, table: &StringTable) -> String
 }
 
 pub(crate) fn severity_to_error(sev: &Severity) -> ErrorSeverity {
-    match sev {
-        Severity::Error => ErrorSeverity::Error,
-        Severity::Warning => ErrorSeverity::Warning,
-        Severity::Information => ErrorSeverity::Information,
-        Severity::Hint => ErrorSeverity::Hint,
-    }
+    sev.into()
 }
 
 pub fn error_hash(error: &ValidationError) -> String {

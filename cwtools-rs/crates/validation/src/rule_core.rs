@@ -6,7 +6,9 @@ use cwtools_parser::ast::{Child, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
 use crate::common::*;
 use crate::ctx::ValidationCtx;
@@ -417,7 +419,7 @@ pub(crate) fn matching_candidates<'a, F>(
     ruleset: &RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
     matcher: F,
-) -> Vec<&'a (RuleType, Options)>
+) -> SmallVec<[&'a (RuleType, Options); 4]>
 where
     F: Fn(&RuleType, &str, &RuleSet, Option<&cwtools_index::TypeIndex>) -> bool,
 {
@@ -531,17 +533,44 @@ fn count_children(
     let table = ctx.table;
     let ruleset = ctx.ruleset;
 
+    // Only the rule kinds actually present in `rules` need a count structure.
+    // The dominant block kind (effect/trigger bodies whose sole rule is an
+    // `alias_name[...]` wildcard) has no keyed / LeafValue / ValueClause rule at
+    // all, so every structure below stays unallocated and the scan is skipped.
+    let any_keyed = rules.iter().any(|(rt, _)| get_rule_key(rt).is_some());
+    let any_leafvalue = rules
+        .iter()
+        .any(|(rt, _)| matches!(rt, RuleType::LeafValueRule { .. }));
+    let any_valueclause = rules
+        .iter()
+        .any(|(rt, _)| matches!(rt, RuleType::ValueClauseRule { .. }));
+
     // Keyed children (Leaf/Node): key string -> count.
-    let mut key_counts: FxHashMap<String, usize> =
-        FxHashMap::with_capacity_and_hasher(children.len(), Default::default());
+    let mut key_counts: FxHashMap<String, usize> = if any_keyed {
+        FxHashMap::with_capacity_and_hasher(children.len(), Default::default())
+    } else {
+        FxHashMap::default()
+    };
     // Item 5: LeafValues — count per LeafValueRule index.
-    let mut leafvalue_counts: Vec<usize> = vec![0usize; rules.len()];
+    let mut leafvalue_counts: Vec<usize> = if any_leafvalue {
+        vec![0usize; rules.len()]
+    } else {
+        Vec::new()
+    };
     // Item 5: ValueClause — count per ValueClauseRule index.
-    let mut valueclause_counts: Vec<usize> = vec![0usize; rules.len()];
+    let mut valueclause_counts: Vec<usize> = if any_valueclause {
+        vec![0usize; rules.len()]
+    } else {
+        Vec::new()
+    };
+
+    if !any_keyed && !any_leafvalue && !any_valueclause {
+        return (key_counts, leafvalue_counts, valueclause_counts);
+    }
 
     for child in children {
         match child {
-            Child::Leaf(idx) => {
+            Child::Leaf(idx) if any_keyed => {
                 let leaf = &ast.arena.leaves[*idx as usize];
                 // Paradox keys are case-insensitive; key the counts in lowercase so
                 // a field written `texturefile` satisfies a rule keyed `textureFile`.
@@ -555,12 +584,14 @@ fn count_children(
                 // An anonymous `{ ... }` block parses as a clause-valued LeafValue;
                 // count it toward a ValueClauseRule, not a LeafValueRule.
                 if matches!(lv.value, Value::Clause(_)) {
-                    for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
-                        if matches!(rule_type, RuleType::ValueClauseRule { .. }) {
-                            valueclause_counts[rule_idx] += 1;
+                    if any_valueclause {
+                        for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
+                            if matches!(rule_type, RuleType::ValueClauseRule { .. }) {
+                                valueclause_counts[rule_idx] += 1;
+                            }
                         }
                     }
-                } else {
+                } else if any_leafvalue {
                     // Count toward EVERY matching LeafValueRule, not just the
                     // first. Alternative leafvalue rules in one block are counted
                     // independently (checkCardinality is a per-rule sum). Breaking on the first match lets
@@ -601,7 +632,7 @@ pub(crate) fn rule_right_is_math_expr(rule_type: &RuleType) -> bool {
 /// silently-accepted variable assignment. Operator argument shapes are owned by
 /// the config's `alias[mathexpr:*]` definitions, which `validate_children`
 /// expands; an operator whose argument is itself `math_expr` recurses here.
-pub(crate) fn math_clause_rules() -> Vec<(RuleType, Options)> {
+static MATH_CLAUSE_RULES: LazyLock<Vec<(RuleType, Options)>> = LazyLock::new(|| {
     let many = Options {
         min: 0,
         max: i32::MAX,
@@ -630,6 +661,10 @@ pub(crate) fn math_clause_rules() -> Vec<(RuleType, Options)> {
             many,
         ),
     ]
+});
+
+pub(crate) fn math_clause_rules() -> &'static [(RuleType, Options)] {
+    &MATH_CLAUSE_RULES
 }
 
 /// Validate a `{block}` math expression strictly against [`math_clause_rules`].
@@ -643,7 +678,7 @@ fn validate_math_clause(
     validate_children(
         ctx,
         children,
-        &math_clause_rules(),
+        math_clause_rules(),
         scope_context,
         pos,
         errors,
@@ -671,11 +706,17 @@ fn validate_each_child(
         match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-                let key = table
-                    .with_string(leaf.key.normal, |s| unquote_key(s).to_string())
-                    .unwrap_or_default();
+                // Script keys are short; buffer the unquoted key on the stack to
+                // avoid a per-leaf heap String. Borrowing across `with_string` is
+                // unsafe (the closure holds the table's read guard and validation
+                // recurses), so copy the bytes out into an owned stack buffer.
+                let mut keybuf: SmallVec<[u8; 24]> = SmallVec::new();
+                table.with_string(leaf.key.normal, |s| {
+                    keybuf.extend_from_slice(unquote_key(s).as_bytes())
+                });
+                let key: &str = std::str::from_utf8(&keybuf).unwrap_or_default();
                 let candidates =
-                    matching_candidates(rules, &key, ruleset, type_index, rule_matches_leaf_key);
+                    matching_candidates(rules, key, ruleset, type_index, rule_matches_leaf_key);
                 // `math_expr` is authoritative: a `{block}` math expression is
                 // validated strictly here, BEFORE the candidate disjunction
                 // below. A permissive sibling overload (`value_set[variable] =
@@ -709,7 +750,7 @@ fn validate_each_child(
                             file_path,
                             leaf.pos.start.line,
                             leaf.pos.start.col,
-                            &[&key],
+                            &[key],
                         ));
                     }
                     // A `@name = value` leaf is a Paradox read-time variable
@@ -733,14 +774,14 @@ fn validate_each_child(
                                 &error_codes::CW263_UNEXPECTED_PROPERTY_LEAF,
                             )
                         };
-                        errors.push(ValidationError {
-                            message: msg,
-                            severity: ErrorSeverity::Error,
-                            line: leaf.pos.start.line,
-                            col: leaf.pos.start.col,
-                            file: file_path.to_string(),
-                            code: Some(code.id),
-                        });
+                        errors.push(ValidationError::from_code_with(
+                            code,
+                            ErrorSeverity::Error,
+                            file_path,
+                            leaf.pos.start.line,
+                            leaf.pos.start.col,
+                            msg,
+                        ));
                     }
                 } else {
                     // An overloaded key (several rules with the same key, e.g. two
@@ -753,7 +794,7 @@ fn validate_each_child(
                             validate_leaf_against_rule(
                                 ctx,
                                 leaf,
-                                &key,
+                                key,
                                 rt,
                                 opts,
                                 scope_context,
@@ -874,19 +915,21 @@ fn enforce_cardinality(
     // times, or an absent optional alternative double-reports.
     // Third field tracks strictness: a `~` (soft) minimum on ANY overload of a
     // key makes the whole key's minimum soft, so an under-count is not flagged.
+    // Lowercase each keyed rule's key once and reuse it below (both the key_card
+    // aggregation and the per-rule report loop need it), instead of re-lowercasing
+    // per rule per phase. `None` for non-keyed rules.
+    let rule_keys_lower: Vec<Option<String>> = rules
+        .iter()
+        .map(|(rt, _)| get_rule_key(rt).map(|k| k.to_ascii_lowercase()))
+        .collect();
+
     let mut key_card: FxHashMap<String, (i32, i32, bool)> =
         FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
-    for (rule_type, opts) in rules.iter() {
-        if matches!(
-            rule_type,
-            RuleType::LeafRule { .. } | RuleType::NodeRule { .. }
-        ) && let Some(k) = get_rule_key(rule_type)
-        {
-            let e = key_card.entry(k.to_ascii_lowercase()).or_insert((
-                opts.min,
-                opts.max,
-                opts.strict_min,
-            ));
+    for (i, (_, opts)) in rules.iter().enumerate() {
+        if let Some(lkey) = &rule_keys_lower[i] {
+            let e = key_card
+                .entry(lkey.clone())
+                .or_insert((opts.min, opts.max, opts.strict_min));
             e.0 = e.0.min(opts.min);
             e.1 = e.1.max(opts.max);
             e.2 = e.2 && opts.strict_min;
@@ -909,28 +952,29 @@ fn enforce_cardinality(
 
         match rule_type {
             RuleType::LeafRule { .. } | RuleType::NodeRule { .. } => {
-                if let Some(key) = get_rule_key(rule_type) {
-                    let lkey = key.to_ascii_lowercase();
+                if let (Some(key), Some(lkey)) =
+                    (get_rule_key(rule_type), &rule_keys_lower[rule_idx])
+                {
                     // Each distinct key is reported at most once (see key_card above).
                     if reported_keys.insert(lkey.clone()) {
-                        let (kmin, kmax, kstrict) = key_card.get(&lkey).copied().unwrap_or((
+                        let (kmin, kmax, kstrict) = key_card.get(lkey).copied().unwrap_or((
                             opts.min,
                             opts.max,
                             opts.strict_min,
                         ));
-                        let count = key_counts.get(&lkey).copied().unwrap_or(0) as i32;
+                        let count = key_counts.get(lkey).copied().unwrap_or(0) as i32;
                         if count < kmin && kstrict {
-                            errors.push(ValidationError {
-                                message: format!(
+                            errors.push(ValidationError::from_code_with(
+                                &error_codes::CW242_WRONG_NUMBER,
+                                missing_sev,
+                                file_path,
+                                block_line,
+                                block_col,
+                                format!(
                                     "Field '{}' appears {} time(s), expected at least {}",
                                     key, count, kmin
                                 ),
-                                severity: missing_sev,
-                                line: block_line,
-                                col: block_col,
-                                file: file_path.to_string(),
-                                code: Some(error_codes::CW242_WRONG_NUMBER.id),
-                            });
+                            ));
                         }
                         if count > kmax {
                             // Anchor the over-count on the first actual
@@ -941,20 +985,20 @@ fn enforce_cardinality(
                             // occurrence to point at, so it stays on the block.)
                             let (line, col) = children
                                 .iter()
-                                .find(|c| child_key_matches(c, ast, table, &lkey))
+                                .find(|c| child_key_matches(c, ast, table, lkey))
                                 .and_then(|c| child_start_pos(c, ast))
                                 .unwrap_or((block_line, block_col));
-                            errors.push(ValidationError {
-                                message: format!(
+                            errors.push(ValidationError::from_code_with(
+                                &error_codes::CW242_WRONG_NUMBER,
+                                max_sev,
+                                file_path,
+                                line,
+                                col,
+                                format!(
                                     "Field '{}' appears {} time(s), expected at most {}",
                                     key, count, kmax
                                 ),
-                                severity: max_sev,
-                                line,
-                                col,
-                                file: file_path.to_string(),
-                                code: Some(error_codes::CW242_WRONG_NUMBER.id),
-                            });
+                            ));
                         }
                     }
                 }
@@ -969,60 +1013,60 @@ fn enforce_cardinality(
                 // the others at 0, which is not an error. Genuinely invalid values
                 // are still caught by the per-value "Unexpected bare value" check.
                 if count < opts.min && opts.strict_min {
-                    errors.push(ValidationError {
-                        message: format!(
+                    errors.push(ValidationError::from_code_with(
+                        &error_codes::CW242_WRONG_NUMBER,
+                        missing_sev,
+                        file_path,
+                        block_line,
+                        block_col,
+                        format!(
                             "LeafValue {:?} appears {} time(s), expected at least {}",
                             right, count, opts.min
                         ),
-                        severity: missing_sev,
-                        line: block_line,
-                        col: block_col,
-                        file: file_path.to_string(),
-                        code: Some(error_codes::CW242_WRONG_NUMBER.id),
-                    });
+                    ));
                 }
                 if count > opts.max {
-                    errors.push(ValidationError {
-                        message: format!(
+                    errors.push(ValidationError::from_code_with(
+                        &error_codes::CW242_WRONG_NUMBER,
+                        max_sev,
+                        file_path,
+                        block_line,
+                        block_col,
+                        format!(
                             "LeafValue {:?} appears {} time(s), expected at most {}",
                             right, count, opts.max
                         ),
-                        severity: max_sev,
-                        line: block_line,
-                        col: block_col,
-                        file: file_path.to_string(),
-                        code: Some(error_codes::CW242_WRONG_NUMBER.id),
-                    });
+                    ));
                 }
             }
             // Item 5: ValueClauseRule cardinality
             RuleType::ValueClauseRule { .. } => {
                 let count = valueclause_counts[rule_idx] as i32;
                 if count < opts.min && opts.strict_min {
-                    errors.push(ValidationError {
-                        message: format!(
+                    errors.push(ValidationError::from_code_with(
+                        &error_codes::CW242_WRONG_NUMBER,
+                        missing_sev,
+                        file_path,
+                        block_line,
+                        block_col,
+                        format!(
                             "ValueClause appears {} time(s), expected at least {}",
                             count, opts.min
                         ),
-                        severity: missing_sev,
-                        line: block_line,
-                        col: block_col,
-                        file: file_path.to_string(),
-                        code: Some(error_codes::CW242_WRONG_NUMBER.id),
-                    });
+                    ));
                 }
                 if count > opts.max {
-                    errors.push(ValidationError {
-                        message: format!(
+                    errors.push(ValidationError::from_code_with(
+                        &error_codes::CW242_WRONG_NUMBER,
+                        max_sev,
+                        file_path,
+                        block_line,
+                        block_col,
+                        format!(
                             "ValueClause appears {} time(s), expected at most {}",
                             count, opts.max
                         ),
-                        severity: max_sev,
-                        line: block_line,
-                        col: block_col,
-                        file: file_path.to_string(),
-                        code: Some(error_codes::CW242_WRONG_NUMBER.id),
-                    });
+                    ));
                 }
             }
             _ => {}
@@ -1123,7 +1167,7 @@ fn is_from_data_value_set_member(
         .filter(|li| li.from_data)
         .flat_map(|li| li.data_source.iter())
         .filter_map(|src| value_set_name(src))
-        .any(|set| type_index.value_set_values.values(set).any(|m| m == key))
+        .any(|set| type_index.value_set_values.contains(set, key))
 }
 
 /// Extract `<set>` from a `data_source = value[<set>]` entry; `None` for any other
@@ -1166,10 +1210,34 @@ fn parsed_pattern_matches(
     type_index: Option<&cwtools_index::TypeIndex>,
     permissive: bool,
 ) -> bool {
+    match classify_pattern_match(pat, key, ruleset, type_index) {
+        PatternMatch::Confident => true,
+        PatternMatch::PermissiveOnly => permissive,
+        PatternMatch::No => false,
+    }
+}
+
+/// Tri-state result of matching a key against an alias pattern, distinguishing a
+/// verified match (`Confident`) from a match that only holds under the permissive
+/// fallback because the pattern's backing enum/value set is absent or empty
+/// (`PermissiveOnly`). Lets `alias_overloads_with_confidence` compute the pattern
+/// match once and derive both the permissive and confident overload sets.
+enum PatternMatch {
+    No,
+    Confident,
+    PermissiveOnly,
+}
+
+fn classify_pattern_match(
+    pat: &ParsedAliasPattern,
+    key: &str,
+    ruleset: &RuleSet,
+    type_index: Option<&cwtools_index::TypeIndex>,
+) -> PatternMatch {
     let pre = pat.prefix.as_str();
     let suf = pat.suffix.as_str();
     if key.len() < pre.len() + suf.len() || !key.starts_with(pre) || !key.ends_with(suf) {
-        return false;
+        return PatternMatch::No;
     }
     let middle = &key[pre.len()..key.len() - suf.len()];
     let name = pat.placeholder_name.as_str();
@@ -1177,22 +1245,37 @@ fn parsed_pattern_matches(
         PatternKind::Type => {
             // `<type.subtype>` → check the base type (subtype is a refinement).
             let base = name.split('.').next().unwrap_or(name);
-            type_index
+            if type_index
                 .map(|idx| idx.contains(base, middle))
                 .unwrap_or(false)
+            {
+                PatternMatch::Confident
+            } else {
+                PatternMatch::No
+            }
         }
         PatternKind::Enum => match ruleset.enum_by_name.get(name) {
             Some(&idx) if !ruleset.enums[idx].values.is_empty() => {
-                let def = &ruleset.enums[idx];
-                def.values.iter().any(|v| v.eq_ignore_ascii_case(middle))
-                    || def.values.iter().any(|v| v.starts_with('@'))
-                    || enum_is_authoritative(def)
+                if ruleset.enum_values_contains_ci(idx, middle)
+                    || ruleset.enum_has_at_constant(idx)
+                    || enum_is_authoritative(&ruleset.enums[idx])
+                {
+                    PatternMatch::Confident
+                } else {
+                    PatternMatch::No
+                }
             }
-            _ => permissive, // enum absent/empty (game-derived)
+            _ => PatternMatch::PermissiveOnly, // enum absent/empty (game-derived)
         },
-        PatternKind::Value => match ruleset.values.get(name) {
-            Some(vs) if !vs.is_empty() => vs.iter().any(|v| v == middle),
-            _ => permissive, // value set not collected
+        PatternKind::Value => match ruleset.value_set_lookup(name, middle) {
+            Some(is_member) => {
+                if is_member {
+                    PatternMatch::Confident
+                } else {
+                    PatternMatch::No
+                }
+            }
+            None => PatternMatch::PermissiveOnly, // value set not collected
         },
     }
 }
@@ -1268,10 +1351,10 @@ pub(crate) fn field_matches_key(
                     if def.values.is_empty() {
                         return true;
                     }
-                    if def.values.iter().any(|v| v.eq_ignore_ascii_case(key)) {
+                    if ruleset.enum_values_contains_ci(idx, key) {
                         return true;
                     }
-                    if def.values.iter().any(|v| v.starts_with('@')) {
+                    if ruleset.enum_has_at_constant(idx) {
                         return true;
                     }
                     enum_is_authoritative(def)
@@ -1333,37 +1416,38 @@ pub(crate) fn alias_overloads<'a>(
     category: &str,
     key: &str,
 ) -> Vec<&'a (RuleType, Options)> {
-    alias_overloads_impl(ruleset, type_index, category, key, true)
+    alias_overloads_with_confidence(ruleset, type_index, category, key)
+        .into_iter()
+        .map(|(rule, _)| rule)
+        .collect()
 }
 
-/// As [`alias_overloads`], but pattern matches `confident`ly: an `enum[..]` /
-/// `value[..]` / `<type>` pattern matches only when its backing data is actually
-/// populated, never via the empty/absent permissive fallback. Used by the scope
-/// check so a coincidental match against an unpopulated game-derived enum (e.g.
-/// `oil` against an empty `enum[equipment_category]` when vanilla isn't indexed)
-/// doesn't drag in that alias's unrelated `## scope` and flag a false CW104.
-pub(crate) fn confident_alias_overloads<'a>(
+/// Gather every alias overload for `key` in a single pass, tagging each with
+/// whether the match is `confident` (verified against populated backing data)
+/// vs a permissive-only pattern match (backing enum/value set absent/empty).
+///
+/// A confident pattern match (`enum[..]` / `value[..]` / `<type>` matched against
+/// populated data, never the empty/absent permissive fallback) is what the scope
+/// check trusts, so a coincidental match against an unpopulated game-derived enum
+/// (e.g. `oil` against an empty `enum[equipment_category]` when vanilla isn't
+/// indexed) doesn't drag in that alias's unrelated `## scope` and flag a false
+/// CW104. Exact, lowercase-retry and `scope_field` overloads are always confident.
+///
+/// Push order is exact → lowercase → patterns → scope_field; [`alias_overloads`]
+/// keeps all, the scope check filters to the confident subset, preserving that
+/// order. Order feeds `pick_best`'s tie-break.
+fn alias_overloads_with_confidence<'a>(
     ruleset: &'a RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
     category: &str,
     key: &str,
-) -> Vec<&'a (RuleType, Options)> {
-    alias_overloads_impl(ruleset, type_index, category, key, false)
-}
-
-fn alias_overloads_impl<'a>(
-    ruleset: &'a RuleSet,
-    type_index: Option<&cwtools_index::TypeIndex>,
-    category: &str,
-    key: &str,
-    permissive: bool,
-) -> Vec<&'a (RuleType, Options)> {
+) -> Vec<(&'a (RuleType, Options), bool)> {
     // Gather candidate overloads via the precomputed alias index (O(1) exact +
     // O(patterns)) rather than scanning every alias.
-    let mut overloads: Vec<&(RuleType, Options)> = Vec::new();
+    let mut overloads: Vec<(&(RuleType, Options), bool)> = Vec::new();
     if let Some(idxs) = ruleset.alias_exact.get(category).and_then(|m| m.get(key)) {
         for &i in idxs {
-            overloads.push(&ruleset.aliases[i].1);
+            overloads.push((&ruleset.aliases[i].1, true));
         }
     }
     // Case-insensitive retry: usages like `IF`, `Country_event` resolve to the
@@ -1378,20 +1462,28 @@ fn alias_overloads_impl<'a>(
             .and_then(|m| m.get(lower.as_str()))
         {
             for &i in idxs {
-                overloads.push(&ruleset.aliases[i].1);
+                overloads.push((&ruleset.aliases[i].1, true));
             }
         }
     }
     if let Some(cat) = ruleset.alias_categories.get(category) {
         for pat in &cat.parsed_patterns {
-            if parsed_pattern_matches(pat, key, ruleset, type_index, permissive) {
-                overloads.push(&ruleset.aliases[pat.alias_idx].1);
+            // Classify once: a `Confident` match is included in both sets, a
+            // `PermissiveOnly` match only in the permissive (all) set.
+            match classify_pattern_match(pat, key, ruleset, type_index) {
+                PatternMatch::Confident => {
+                    overloads.push((&ruleset.aliases[pat.alias_idx].1, true))
+                }
+                PatternMatch::PermissiveOnly => {
+                    overloads.push((&ruleset.aliases[pat.alias_idx].1, false))
+                }
+                PatternMatch::No => {}
             }
         }
         if let Some(sf_idx) = cat.scope_field_idx
             && is_scope_key(key, ruleset, type_index)
         {
-            overloads.push(&ruleset.aliases[sf_idx].1);
+            overloads.push((&ruleset.aliases[sf_idx].1, true));
         }
     }
     overloads
@@ -1486,12 +1578,16 @@ fn validate_alias_usage(
     let table = ctx.table;
     let file_path = ctx.file_path;
     let ruleset = ctx.ruleset;
-    let overloads = alias_overloads(ruleset, ctx.type_index, category, key);
-    if overloads.is_empty() {
+    // Compute the overload set (with per-overload confidence) ONCE; the scope
+    // check below reuses the confident subset instead of re-walking the aliases.
+    let overloads_conf = alias_overloads_with_confidence(ruleset, ctx.type_index, category, key);
+    if overloads_conf.is_empty() {
         // Category unloaded or no such alias key — accept silently, matching the
         // permissive key-match in field_matches_key.
         return;
     }
+    let overloads: Vec<&(RuleType, Options)> =
+        overloads_conf.iter().map(|(rule, _)| *rule).collect();
 
     // CW248: an invalid scope command in a chain. Restricted to dotted lower-case
     // chains (`owner.capital`): a bare command that's missing from this config's
@@ -1550,7 +1646,11 @@ fn validate_alias_usage(
         // e.g. `oil` when vanilla resources aren't indexed) must not contribute
         // its unrelated `## scope`. With no confident overload the key's real
         // alias is unverifiable here, so stay lenient and skip the check.
-        let confident = confident_alias_overloads(ctx.ruleset, ctx.type_index, category, key);
+        let confident: Vec<&(RuleType, Options)> = overloads_conf
+            .iter()
+            .filter(|(_, c)| *c)
+            .map(|(rule, _)| *rule)
+            .collect();
         let any_ok = confident.is_empty()
             || confident
                 .iter()
@@ -1690,14 +1790,7 @@ fn alias_mismatch_error(
     col: u16,
 ) -> ValidationError {
     let code = &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE;
-    ValidationError {
-        message: code.format(&[category, value]),
-        severity: code.severity,
-        line,
-        col,
-        file: file_path.to_string(),
-        code: Some(code.id),
-    }
+    ValidationError::from_code(code, file_path, line, col, &[category, value])
 }
 
 /// Check a `value[variable]` (VariableGetField) read against the project-wide
@@ -1814,11 +1907,11 @@ fn validate_leaf(
         // so every valid cross-reference would be a false positive.
         if let NewField::TypeField(type_type) = right {
             let raw_value = leaf_value_to_string(&leaf.value, table);
-            let value_str = raw_value
+            // Strip a surrounding quote pair by slice (no allocation).
+            let value_str: &str = raw_value
                 .strip_prefix('"')
                 .and_then(|s| s.strip_suffix('"'))
-                .unwrap_or(&raw_value)
-                .to_string();
+                .unwrap_or(&raw_value);
             // An empty value (`soundeffect = ""`, `textureFile = ""`) is the
             // engine's "none" — there's nothing to resolve, so don't flag it.
             if value_str.is_empty() {
@@ -1835,30 +1928,6 @@ fn validate_leaf(
                 TypeType::Simple(n) => n.as_str(),
                 TypeType::Complex { name, .. } => name.as_str(),
             };
-            // Complex TypeField (`prefix<type>suffix`) maps a value to an instance
-            // and the game accepts any of these forms, so we try them all:
-            //   (a) strip: the value carries the affixes and the instance is
-            //       stored without them (`GFX_event_x` -> `x`).
-            //   (b) raw: the value IS already the full instance name
-            //       (HOI4 ideas may write `picture = GFX_idea_x` directly).
-            //   (c) prepend: the value is bare and the affixed form is the real
-            //       instance (HOI4 ideas: `picture = x` -> `GFX_idea_x`).
-            // The reference resolves if ANY candidate is a known instance, so this
-            // branch can only ever REMOVE false positives, never add them.
-            let (lookup_value, alt_candidates) = match type_type {
-                TypeType::Complex { prefix, suffix, .. } => {
-                    let mut v = value_str.as_str();
-                    if !prefix.is_empty() {
-                        v = v.strip_prefix(prefix.as_str()).unwrap_or(v);
-                    }
-                    if !suffix.is_empty() {
-                        v = v.strip_suffix(suffix.as_str()).unwrap_or(v);
-                    }
-                    let prepended = format!("{}{}{}", prefix, value_str, suffix);
-                    (v.to_string(), vec![value_str.clone(), prepended])
-                }
-                _ => (value_str.clone(), Vec::new()),
-            };
             // Subtype-qualified references (`<type.subtype>`, e.g.
             // `<event.country_event>` / `<equipment.naval_equip>`) resolve
             // permissively. The index's `type.subtype` membership is derived from
@@ -1870,16 +1939,45 @@ fn validate_leaf(
             // invertedTypeMap has.)
             if let Some(idx) = type_index
                 && !cwtools_index::is_subtype_key(type_name)
-            {
                 // Only flag when the index is complete (vanilla loaded) AND we have
-                // known instances for this type AND the reference doesn't resolve.
-                let resolved = idx.contains(type_name, &lookup_value)
-                    || alt_candidates.iter().any(|c| idx.contains(type_name, c));
-                if idx.complete && !idx.instances(type_name).is_empty() && !resolved {
+                // known instances for this type. Check this BEFORE any lookup so a
+                // clean resolve pays for no membership probes.
+                && idx.complete
+                && !idx.instances(type_name).is_empty()
+            {
+                // Complex TypeField (`prefix<type>suffix`) maps a value to an
+                // instance and the game accepts any of these forms, tried in order:
+                //   (a) strip: the value carries the affixes and the instance is
+                //       stored without them (`GFX_event_x` -> `x`).
+                //   (b) raw: the value IS already the full instance name
+                //       (HOI4 ideas may write `picture = GFX_idea_x` directly).
+                //   (c) prepend: the value is bare and the affixed form is the real
+                //       instance (HOI4 ideas: `picture = x` -> `GFX_idea_x`). Built
+                //       lazily only when (a)/(b) miss.
+                // The reference resolves if ANY candidate is a known instance, so
+                // this branch can only ever REMOVE false positives, never add them.
+                let (lookup_value, resolved): (&str, bool) = match type_type {
+                    TypeType::Complex { prefix, suffix, .. } => {
+                        let mut v = value_str;
+                        if !prefix.is_empty() {
+                            v = v.strip_prefix(prefix.as_str()).unwrap_or(v);
+                        }
+                        if !suffix.is_empty() {
+                            v = v.strip_suffix(suffix.as_str()).unwrap_or(v);
+                        }
+                        let resolved = idx.contains(type_name, v)
+                            || idx.contains(type_name, value_str)
+                            || idx
+                                .contains(type_name, &format!("{}{}{}", prefix, value_str, suffix));
+                        (v, resolved)
+                    }
+                    _ => (value_str, idx.contains(type_name, value_str)),
+                };
+                if !resolved {
                     let is_event = type_name == "event" || type_name.starts_with("event.");
                     let (code, message) = if is_event {
                         let c = &error_codes::CW222_UNDEFINED_EVENT;
-                        (c, c.format(&[&lookup_value]))
+                        (c, c.format(&[lookup_value]))
                     } else {
                         let key = table
                             .with_string(leaf.key.normal, |s| s.to_string())
@@ -1892,14 +1990,14 @@ fn validate_leaf(
                             ),
                         )
                     };
-                    errors.push(ValidationError {
+                    errors.push(ValidationError::from_code_with(
+                        code,
+                        code.severity,
+                        file_path,
+                        leaf.pos.start.line,
+                        leaf.pos.start.col,
                         message,
-                        severity: code.severity,
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                        file: file_path.to_string(),
-                        code: Some(code.id),
-                    });
+                    ));
                 }
             }
             // TypeField is otherwise accepted (non-empty check done by field_matches_value).
@@ -1978,6 +2076,15 @@ fn validate_leaf(
             is_int, is_32bit, ..
         } = right
         {
+            // Fast path: a parsed integer literal is numeric with no fractional
+            // part, so it can never violate the int-only (CW271) or 3-decimal
+            // 32-bit (CW270) check, and never reaches the CW246 name check.
+            // Skip the stringify + reparse. (A `Value::Float` still needs the
+            // string form for the precise `decimal_places` count, so only `Int`
+            // is short-circuited here.)
+            if matches!(leaf.value, Value::Int(_)) {
+                return;
+            }
             let raw = leaf_value_to_string(&leaf.value, table);
             let v = raw.trim_matches('"').trim();
             // Accept at-vars (@x), inline math ([...]), loc refs ($$) and boolean

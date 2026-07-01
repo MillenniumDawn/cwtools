@@ -77,16 +77,13 @@ fn walk_if_else(
 
         // CW253 — deprecated set_empire_name / set_planet_name.
         if key == "set_empire_name" || key == "set_planet_name" {
-            errors.push(ValidationError {
-                message: error_codes::CW253_DEPRECATED_SET_NAME
-                    .message_template
-                    .to_string(),
-                severity: error_codes::CW253_DEPRECATED_SET_NAME.severity,
+            errors.push(ValidationError::from_code(
+                &error_codes::CW253_DEPRECATED_SET_NAME,
+                file_path,
                 line,
                 col,
-                file: file_path.to_string(),
-                code: Some(error_codes::CW253_DEPRECATED_SET_NAME.id),
-            });
+                &[],
+            ));
         }
 
         if key != "limit" && key != "modifier" {
@@ -100,30 +97,24 @@ fn walk_if_else(
 
             // CW236 — old nested if/else style.
             if deprecated_else {
-                errors.push(ValidationError {
-                    message: error_codes::CW236_DEPRECATED_ELSE
-                        .message_template
-                        .to_string(),
-                    severity: error_codes::CW236_DEPRECATED_ELSE.severity,
+                errors.push(ValidationError::from_code(
+                    &error_codes::CW236_DEPRECATED_ELSE,
+                    file_path,
                     line,
                     col,
-                    file: file_path.to_string(),
-                    code: Some(error_codes::CW236_DEPRECATED_ELSE.id),
-                });
+                    &[],
+                ));
             }
 
             // CW237 — ambiguous if = { if ... else }.
             if key == "if" && has_else && has_if {
-                errors.push(ValidationError {
-                    message: error_codes::CW237_AMBIGUOUS_IF_ELSE
-                        .message_template
-                        .to_string(),
-                    severity: error_codes::CW237_AMBIGUOUS_IF_ELSE.severity,
+                errors.push(ValidationError::from_code(
+                    &error_codes::CW237_AMBIGUOUS_IF_ELSE,
+                    file_path,
                     line,
                     col,
-                    file: file_path.to_string(),
-                    code: Some(error_codes::CW237_AMBIGUOUS_IF_ELSE.id),
-                });
+                    &[],
+                ));
             }
 
             // CW238 — else/else_if missing a preceding if (skip the deprecated case).
@@ -139,16 +130,13 @@ fn walk_if_else(
                         prev_was_if = true;
                     } else {
                         // else / else_if with no preceding if.
-                        errors.push(ValidationError {
-                            message: error_codes::CW238_IF_ELSE_ORDER
-                                .message_template
-                                .to_string(),
-                            severity: error_codes::CW238_IF_ELSE_ORDER.severity,
+                        errors.push(ValidationError::from_code(
+                            &error_codes::CW238_IF_ELSE_ORDER,
+                            file_path,
                             line,
                             col,
-                            file: file_path.to_string(),
-                            code: Some(error_codes::CW238_IF_ELSE_ORDER.id),
-                        });
+                            &[],
+                        ));
                         break;
                     }
                 }
@@ -191,14 +179,14 @@ fn validate_event(
     }
 
     if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
-        errors.push(ValidationError {
-            message: "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
-            severity: ErrorSeverity::Information,
-            line: event_line,
-            col: 0,
-            file: file_path.to_string(),
-            code: Some(error_codes::CW107_EVENT_EVERY_TICK.id),
-        });
+        errors.push(ValidationError::from_code_with(
+            &error_codes::CW107_EVENT_EVERY_TICK,
+            ErrorSeverity::Information,
+            file_path,
+            event_line,
+            0,
+            "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
+        ));
     }
 
     // CW301: pre-triggers found inside the trigger block should be moved to event
@@ -237,17 +225,17 @@ fn validate_event(
                 let key = table
                     .with_string(leaf.key.normal, |s| s.to_string())
                     .unwrap_or_default();
-                errors.push(ValidationError {
-                    message: format!(
+                errors.push(ValidationError::from_code_with(
+                    &error_codes::CW301_PRE_TRIGGER_LEVEL,
+                    ErrorSeverity::Information,
+                    file_path,
+                    child_line(tc, ast),
+                    0,
+                    format!(
                         "Trigger '{}' can be a pre-trigger at event root for better performance",
                         key
                     ),
-                    severity: ErrorSeverity::Information,
-                    line: child_line(tc, ast),
-                    col: 0,
-                    file: file_path.to_string(),
-                    code: Some(error_codes::CW301_PRE_TRIGGER_LEVEL.id),
-                });
+                ));
             }
         }
     }
