@@ -12,10 +12,26 @@
 - Scripted effects are suggested inside effect blocks. A type-pattern alias (`alias[effect:<scripted_effect>]`) now expands to the actual scripted-effect names instead of emitting the literal `<scripted_effect>` placeholder. (cwtools-vscode#64)
 - Modifiers are suggested inside `dynamic_modifier` blocks (`alias_keys_field[modifier]`). (cwtools-vscode#65)
 - Duplicate autocomplete entries are removed. (cwtools-vscode#66)
+- Stellaris modding support lands. The engine now consumes the `cwtools-stellaris-config` as the source of truth for scope/link/pretrigger resolution: scopes and links come from `scopes.cwt`/`links.cwt` via the runtime `ScopeRegistry`, and the pretrigger set comes from `alias[<scope>_pre_trigger:<name>] = bool` declarations in `pre_triggers.cwt`. The hardcoded `STELLARIS_SCOPES` const and `load_stellaris_links` table stay in place as a backfill for partial configs and tests.
+- New Stellaris-specific validators, ported from `CWTools/Validation/Stellaris/STLValidation.fs`, folder-scoped like F# and dispatched case-insensitively:
+  - **CW108/CW109** `research_leader` blocks nested in `common/technology` definitions: missing `area` (CW108), or disagreeing with the technology's (CW109; args are leader-then-tech, F# had them swapped)
+  - **CW110** any root block of `common/technology/*.txt` (the `category/` subfolder excluded) whose `category` holds no value
+  - **CW120** pretrigger placement: a known pretrigger in an event's `trigger` block (event types with `pre_triggers` support, per scope) or a pop job's `possible` block
+  - **CW227/CW229** `ship_design`/`global_ship_design` references an unknown `section_template`/`component_template`. Gated like CW500 (complete index, known instances); `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` are exempt
+  - **CW250** a `common/component_templates` block with `type = planet_killer` missing its `on_destroy_planet_with_<key>` on_action or `can_destroy_planet_with_<key>` scripted trigger (same completeness gate)
+- `RuleSet` exposes `pretriggers: HashMap<String, HashSet<String>>` (scope -> trigger names) from `reindex()`. CW301 duplicated CW120 on the same leaf and is retired.
+
+## Notes
+
+- Stellaris coverage in this release is best-effort: there is no vanilla corpus or real-world mod in the test data, so a few checks (CW228 slot-in-section, CW230 size mismatch, CW231 unused technology, CW233 entity defined) are defined and wired but emit no diagnostic yet. They need per-template field data indexed from mod files; the engine is ready to consume that data when it lands.
+- The cwtools-stellaris-config's `scopes.cwt` declares `Alliance` and `Federation` as separate scopes; the previous hardcoded table merged them under one id. With the config-driven path live, `id_of("alliance")` and `id_of("federation")` now resolve to different ids. Pinning test: `crates/validation/tests/stellaris_config.rs::config_alliance_and_federation_are_separate_scopes`.
 
 ## Developer
 
 - Added tests for the unterminated-quote and invalid-key loc checks, the missing-required diagnostic position (nested block and top-level regression), go-to-definition de-duplication, scripted-effect and dynamic-modifier completion, completion de-duplication, and a CLI test asserting the unterminated-quote fixture is flagged.
+- Added `cwtools-rs/testfiles/stellaris-config/` (a small subset of the external cwtools-stellaris-config: `scopes.cwt`, `links.cwt`, `pre_triggers.cwt`) plus `crates/validation/tests/stellaris_config.rs` (7 integration tests: scope/alias resolution, link resolution, synthesized iterators, Alliance-vs-Federation separation, per-scope pretrigger population through the real loader, an end-to-end CW120 run, fixture-files-exist sanity check).
+- Added unit tests under `crates/validation/src/per_game/stellaris.rs::tests` for the new validators (CW108, CW109, CW110, CW120, CW227, CW229, CW250) including folder-scoping, per-scope pretrigger separation, completeness-gate, and mixed-case dispatch cases.
+- `child_scalar` in the Stellaris validators now strips the quotes QString tokens carry, so `template = "SSM_..."` lookups compare the bare name (quoted values never matched the type index before).
 
 # 1.8.5
 

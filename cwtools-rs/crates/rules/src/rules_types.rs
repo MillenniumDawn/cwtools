@@ -73,6 +73,9 @@ pub struct RuleSet {
     /// Built by `reindex()`, keyed like `values`: each `value[name]` set as a
     /// `FxHashSet` for O(1) exact membership. Empty until reindex.
     pub value_sets: std::collections::HashMap<String, rustc_hash::FxHashSet<String>>,
+    /// Built by `reindex()` from `alias[<scope>_pre_trigger:<name>] = bool`
+    /// declarations: lowercased scope prefix -> lowercased trigger names. CW120 queries this.
+    pub pretriggers: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 /// Scope/link config inputs (`scopes.cwt` / `links.cwt`). The types live in the
@@ -217,6 +220,7 @@ impl RuleSet {
             enum_values_lower: Vec::new(),
             enum_has_at: Vec::new(),
             value_sets: std::collections::HashMap::new(),
+            pretriggers: std::collections::HashMap::new(),
         }
     }
 
@@ -225,6 +229,7 @@ impl RuleSet {
     pub fn reindex(&mut self) {
         self.alias_exact.clear();
         self.alias_categories.clear();
+        self.pretriggers.clear();
         self.value_set_effects.clear();
         self.value_set_effect_fields.clear();
         // Which value_set namespace (if any) a rule tree declares.
@@ -277,28 +282,34 @@ impl RuleSet {
             }
         }
         for (i, (name, (rule, _))) in self.aliases.iter().enumerate() {
-            if let Some((cat, key)) = name.split_once(':')
-                && (cat == "effect" || cat == "trigger")
-            {
-                if let Some(ns) = first_value_set_ns(rule) {
-                    self.value_set_effects
-                        .entry(key.to_ascii_lowercase())
-                        .or_insert_with(|| ns.to_string());
-                }
-                let mut fields = Vec::new();
-                collect_binding_fields(rule, &mut fields);
-                if !fields.is_empty() {
-                    self.value_set_effect_fields
-                        .entry(key.to_ascii_lowercase())
-                        .or_default()
-                        .extend(fields);
-                }
-            }
-            // Store under the original category+key AND the all-lowercase variant
-            // so that game-file keys like `instantTextboxType` (mixed case) match
-            // rule alias keys like `instantTextBoxType` (camelCase). Paradox
-            // script keys are case-insensitive; aliases are no different.
             if let Some((cat, key)) = name.split_once(':') {
+                // `planet_pre_trigger:has_owner` -> pretriggers["planet"].insert("has_owner").
+                if let Some(scope) = cat.strip_suffix("_pre_trigger") {
+                    self.pretriggers
+                        .entry(scope.to_ascii_lowercase())
+                        .or_default()
+                        .insert(key.to_ascii_lowercase());
+                }
+                // value_set namespace + binding-field extraction (effect/trigger only).
+                if cat == "effect" || cat == "trigger" {
+                    if let Some(ns) = first_value_set_ns(rule) {
+                        self.value_set_effects
+                            .entry(key.to_ascii_lowercase())
+                            .or_insert_with(|| ns.to_string());
+                    }
+                    let mut fields = Vec::new();
+                    collect_binding_fields(rule, &mut fields);
+                    if !fields.is_empty() {
+                        self.value_set_effect_fields
+                            .entry(key.to_ascii_lowercase())
+                            .or_default()
+                            .extend(fields);
+                    }
+                }
+                // Store under the original category+key AND the all-lowercase variant
+                // so that game-file keys like `instantTextboxType` (mixed case) match
+                // rule alias keys like `instantTextBoxType` (camelCase). Paradox
+                // script keys are case-insensitive; aliases are no different.
                 self.alias_exact
                     .entry(cat.to_string())
                     .or_default()

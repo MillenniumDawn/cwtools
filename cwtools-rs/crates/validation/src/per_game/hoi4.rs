@@ -24,7 +24,7 @@ fn sole_always_value(children: &[Child], ast: &ParsedFile, table: &StringTable) 
             Child::Leaf(idx) => {
                 let l = &ast.arena.leaves[*idx as usize];
                 if !table
-                    .with_string(l.key.normal, |k| k == "always")
+                    .with_string(l.key.lower, |k| k == "always")
                     .unwrap_or(false)
                 {
                     return None;
@@ -51,7 +51,7 @@ fn walk(
         let Some(block) = as_block(child, ast) else {
             continue;
         };
-        let key = block.key_string(table);
+        let key = block.key_string_lower(table);
 
         // Fields whose body `{ always = <bool> }` matches the game default (so the
         // field is a no-op) -> the default the `always` value must equal. Listed
@@ -120,6 +120,13 @@ mod tests {
         // A real trigger (not a bare always) does work — leave it alone.
         let errors = run("my_idea = {\n allowed_civil_war = { has_war = no }\n}\n");
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn flags_mixed_case_key() {
+        let errors = run("my_idea = {\n Allowed_Civil_War = { Always = no }\n}\n");
+        assert_eq!(errors.len(), 1, "expected one CW280");
+        assert_eq!(errors[0].code, Some("CW280"));
     }
 
     #[test]

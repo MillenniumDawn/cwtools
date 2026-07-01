@@ -55,11 +55,11 @@ Codes with no emission site in either engine were removed from both; see
 | CW105 | Error | {} effect used in incorrect scope. In {} but expected {} | An effect is used in the wrong scope. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`) |
 | CW106 | Error | {} scope command used in incorrect scope. In {} but expected {} | A scope command is used outside its valid scope. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`) |
 | CW107 | Information | Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick. | An event has no guard against running every tick. | Emitted (reconciled from F# CW107 / formerly Rust CW300) |
-| CW108 | Error | This research_leader is missing required "area" | A `research_leader` block omits the required `area` field. | Defined, emission pending (vanilla data registries) |
-| CW109 | Information | This research_leader uses area {} but the technology uses area {} | The area in `research_leader` disagrees with the linked technology's area. | Defined, emission pending (vanilla data registries) |
-| CW110 | Error | No category found for this technology | A technology definition has no category. | Defined, emission pending (vanilla data registries) |
+| CW108 | Error | This research_leader is missing required "area" | A `research_leader` block omits the required `area` field. | Emitted (Stellaris only; `research_leader` nested in `common/technology/*.txt`) |
+| CW109 | Information | This research_leader uses area {} but the technology uses area {} | The area in `research_leader` disagrees with the enclosing technology's area. | Emitted (Stellaris only; args leader-then-tech, F# had them swapped) |
+| CW110 | Error | No category found for this technology | A technology definition has no category. | Emitted (Stellaris only; any `common/technology/*.txt` root block) |
 | CW113 | Error | File {} not found, this is case sensitive | A file path referenced in script doesn't exist (case-sensitive check). | Emitted (FilepathField refs checked against the mod+vanilla file index) |
-| CW120 | Information | Trigger {} can be made a pretrigger (see code action to fix) | A trigger that could be promoted to a pretrigger for performance. | Defined, emission pending (pretrigger registry + scope engine) |
+| CW120 | Information | Trigger {} can be made a pretrigger (see code action to fix) | A trigger that could be promoted to a pretrigger for performance. | Emitted (Stellaris only; per-scope set, event `trigger` and pop-job `possible` blocks) |
 | CW121 | Warning | This 'if' trigger contains no effects | An `if` block contains only a `limit` or nothing at all. | Emitted |
 | CW122 | Information | Localisation key {} should not be quoted when used inline, this can cause unexpected behaviour | A loc key is wrapped in quotes where it is used inline. | Emitted |
 
@@ -92,9 +92,9 @@ Codes with no emission site in either engine were removed from both; see
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW227 | Error | Section template {} can not be found | A ship design references a section template that doesn't exist. | Defined, emission pending (vanilla data registries) |
+| CW227 | Error | Section template {} can not be found | A ship design references a section template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500; `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` exempt) |
 | CW228 | Error | Section template {} does not have a slot {} | A section template is referenced with a slot name it doesn't define. | Defined, emission pending (vanilla data registries) |
-| CW229 | Error | Component template {} can not be found | A ship design references a component template that doesn't exist. | Defined, emission pending (vanilla data registries) |
+| CW229 | Error | Component template {} can not be found | A ship design references a component template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500) |
 | CW230 | Warning | Component and slot do not match, slot {} has size {} and component {} has size {} | The size of a component doesn't fit the slot it's placed in. | Defined, emission pending (vanilla data registries) |
 | CW231 | Warning | Technology {} is not used | A technology definition is never referenced anywhere. | Defined, emission pending (cross-file reference tracking) |
 | CW233 | Error | Entity {} is not defined | A section or other asset references an entity that isn't defined. | Defined, emission pending (vanilla data registries / asset index) |
@@ -136,7 +136,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW250 | Error | {} | A `planet_killer` definition is missing required configuration. | Defined, emission pending (vanilla data registries) |
+| CW250 | Error | {} | A planet-killer component template lacks its support script. | Emitted (Stellaris only; needs a matching `on_destroy_planet_with_<key>` on_action and `can_destroy_planet_with_<key>` scripted trigger; gated like CW500) |
 | CW251 | Warning | This {} is unnecessary | A boolean operator (`AND`/`OR`) is nested directly inside an identical operator. | Emitted |
 | CW253 | Information | Consider using "set_name" instead for consistency | `set_empire_name` or `set_planet_name` should be replaced with `set_name`. | Emitted |
 | CW280 | Information | {} = { always = ... } matches the default and can be removed | HOI4 cleanup hint: a field whose body is exactly `{ always = <bool> }` matching the field's default (e.g. `allowed_civil_war = { always = no }`) is a no-op and can be deleted. Rust-original (no F# equivalent); field/default table in `per_game::hoi4`. | Emitted |
@@ -173,14 +173,6 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW274 | Error | This usage of inline_script results in an error, see related | An `inline_script` call resolves to content that itself fails validation. | Defined, not wired (inline-script expansion does not propagate child errors yet) |
 | CW275 | Warning | Localisation key {} contains unexpected characters, and may not render correctly | A loc value contains characters outside the expected set for that game. | Emitted |
 | CW276 | Warning | Localisation key {} contains invalid characters (spaces or special characters are not allowed) | A loc key contains a space or character not valid in a loc key (only alphanumeric, `_`, `.`, `-` are allowed). Rust-only (no F# equivalent). | Emitted |
-
----
-
-## CW301 -- Pre-trigger placement (Rust-only)
-
-| ID | Severity | Message | Meaning | Status |
-|---|---|---|---|---|
-| CW301 | Warning | Pre-trigger '{}' should be inside a 'trigger' block, not at event root | A pre-trigger keyword appears at event root instead of inside a `trigger` block. No F# equivalent. | Emitted |
 
 ---
 
@@ -234,12 +226,9 @@ Stellaris/other-game checks that need that game's corpus to validate.
 
 | Subsystem needed | Codes blocked |
 |---|---|
-| Vanilla data registries (research_leader area / technology category) | CW108, CW109, CW110 |
-| Pretrigger registry + scope engine | CW120 |
 | Event-target dataflow + cross-file event index | CW220, CW221 |
-| Ship sections / components (Stellaris asset model) | CW227, CW228, CW229, CW230, CW233 |
+| Per-template field data (slots/sizes) + asset index | CW228, CW230, CW233 |
 | Cross-file reference tracking (unused type / tech) | CW231, CW239 |
-| Planet-killer config (Stellaris) | CW250 |
 | List-merge optimisation hint | CW269 |
 | Modifier-type registry | CW273 |
 | Variable index edge (CW246 is wired + gated; CW249 is F#'s rare `changeScope` NotFound case) | CW249 |
@@ -256,8 +245,10 @@ references plus some runtime/concatenated-name false positives still being triag
 
 ### Rust-only extensions (no F# equivalent)
 
-- **CW301** — pre-trigger keyword at event root instead of inside a `trigger` block.
 - **CW500** — an `<type>` reference that resolves to no known instance (the event-specific case is F#'s CW222).
+
+CW301 (pre-trigger at event root) was a Rust-invented ID that duplicated F#'s
+CW120 on the same leaf; it has been retired in favour of CW120.
 
 ### Removed (experimental / dead, deleted from both engines)
 
