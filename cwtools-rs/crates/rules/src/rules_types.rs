@@ -73,11 +73,12 @@ pub struct RuleSet {
     /// Built by `reindex()`, keyed like `values`: each `value[name]` set as a
     /// `FxHashSet` for O(1) exact membership. Empty until reindex.
     pub value_sets: std::collections::HashMap<String, rustc_hash::FxHashSet<String>>,
-    /// Built by `reindex()`: every trigger name declared as a pretrigger alias
-    /// (`alias[<scope>_pre_trigger:<name>] = bool`), lowercased and stripped of
-    /// its scope prefix. CW120/CW301 query this set to flag pretriggers that
-    /// could move to root for performance.
-    pub pretriggers: std::collections::HashSet<String>,
+    /// Built by `reindex()`: pretrigger names per scope category, from
+    /// `alias[<scope>_pre_trigger:<name>] = bool` declarations. Keyed by the
+    /// lowercased scope prefix (`planet`, `pop`, ...) with lowercased trigger
+    /// names. CW120 queries this to flag pretriggers that could move to the
+    /// event's `pre_triggers` block (or a job's `possible_pre_triggers`).
+    pub pretriggers: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 /// Scope/link config inputs (`scopes.cwt` / `links.cwt`). The types live in the
@@ -222,7 +223,7 @@ impl RuleSet {
             enum_values_lower: Vec::new(),
             enum_has_at: Vec::new(),
             value_sets: std::collections::HashMap::new(),
-            pretriggers: std::collections::HashSet::new(),
+            pretriggers: std::collections::HashMap::new(),
         }
     }
 
@@ -286,10 +287,13 @@ impl RuleSet {
         for (i, (name, (rule, _))) in self.aliases.iter().enumerate() {
             if let Some((cat, key)) = name.split_once(':') {
                 // Pretrigger collection: every alias whose category ends in
-                // `_pre_trigger` contributes its key to the cross-scope set
-                // CW120/CW301 query.
-                if cat.ends_with("_pre_trigger") {
-                    self.pretriggers.insert(key.to_ascii_lowercase());
+                // `_pre_trigger` contributes its key to that scope's set
+                // (`planet_pre_trigger:has_owner` → pretriggers["planet"]).
+                if let Some(scope) = cat.strip_suffix("_pre_trigger") {
+                    self.pretriggers
+                        .entry(scope.to_ascii_lowercase())
+                        .or_default()
+                        .insert(key.to_ascii_lowercase());
                 }
                 // value_set namespace + binding-field extraction (effect/trigger only).
                 if cat == "effect" || cat == "trigger" {

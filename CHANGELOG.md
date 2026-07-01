@@ -13,25 +13,25 @@
 - Modifiers are suggested inside `dynamic_modifier` blocks (`alias_keys_field[modifier]`). (cwtools-vscode#65)
 - Duplicate autocomplete entries are removed. (cwtools-vscode#66)
 - Stellaris modding support lands. The engine now consumes the `cwtools-stellaris-config` as the source of truth for scope/link/pretrigger resolution: scopes and links come from `scopes.cwt`/`links.cwt` via the runtime `ScopeRegistry`, and the pretrigger set comes from `alias[<scope>_pre_trigger:<name>] = bool` declarations in `pre_triggers.cwt`. The hardcoded `STELLARIS_SCOPES` const and `load_stellaris_links` table stay in place as a backfill for partial configs and tests.
-- New Stellaris-specific validators, ported from `CWTools/Validation/Stellaris/STLValidation.fs`:
-  - **CW108** `research_leader` missing `area`
-  - **CW110** `technology` (matches `technology = { ... }` and `tech_<name> = { ... }`) missing `category`
-  - **CW120** global pretrigger check (fires on every `trigger = { ... }` block, not just events; sits alongside the event-scoped CW301)
-  - **CW227** `ship_design`/`global_ship_design` references an unknown `section_template`
-  - **CW229** `ship_design`/`global_ship_design` references an unknown `component_template`
-  - **CW250** `planet_killer` missing required fields (`type` or any of `planet_damage`/`armor_penetration`/`armor_damage`)
-- `RuleSet` exposes `pretriggers: HashSet<String>`, populated during `reindex()` from `alias[<scope>_pre_trigger:<name>]` declarations. CW301 (event-scoped) and CW120 (global) consume the same set.
+- New Stellaris-specific validators, ported from `CWTools/Validation/Stellaris/STLValidation.fs`. Each one is folder-scoped the way F# scoped it by entity type, and root-key dispatch is now case-insensitive (Paradox keys are):
+  - **CW108/CW109** `research_leader` blocks nested inside `common/technology` definitions: missing `area`, or an `area` disagreeing with the technology's (CW109's two message args are leader area then tech area; F# had them swapped)
+  - **CW110** any root block of `common/technology/*.txt` (the `category/` subfolder is excluded) whose `category` holds no value
+  - **CW120** pretrigger placement: a known pretrigger inside an event's `trigger = { ... }` block (for event types whose config subtype has a `pre_triggers` block; per-scope sets, so a pop-only pretrigger doesn't fire in a planet_event) or inside a pop job's `possible = { ... }` block
+  - **CW227/CW229** `ship_design`/`global_ship_design` references an unknown `section_template`/`component_template`. Only fires when the type index is complete (vanilla merged) and has instances of the looked-up type — the same gate as CW500 — so validating a mod without vanilla doesn't flag every vanilla template; `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` are engine builtins and exempt
+  - **CW250** a `common/component_templates` block with `type = planet_killer` missing its `on_destroy_planet_with_<key>` on_action or `can_destroy_planet_with_<key>` scripted trigger (same completeness gate)
+- `RuleSet` exposes `pretriggers: HashMap<String, HashSet<String>>` (scope category → trigger names), populated during `reindex()` from `alias[<scope>_pre_trigger:<name>]` declarations. CW120 is the single pretrigger diagnostic; the Rust-only CW301 duplicated it on the same leaf and is retired.
 
 ## Notes
 
-- Stellaris coverage in this release is best-effort: there is no vanilla corpus or real-world mod in the test data, so a few checks (CW109 area-vs-technology mismatch, CW228 slot-in-section, CW230 size mismatch, CW231 unused technology, CW233 entity defined) are defined and wired but emit no diagnostic yet. They need either a vanilla install path or per-template field data indexed from mod files; the engine is ready to consume that data when it lands.
+- Stellaris coverage in this release is best-effort: there is no vanilla corpus or real-world mod in the test data, so a few checks (CW228 slot-in-section, CW230 size mismatch, CW231 unused technology, CW233 entity defined) are defined and wired but emit no diagnostic yet. They need per-template field data indexed from mod files; the engine is ready to consume that data when it lands.
 - The cwtools-stellaris-config's `scopes.cwt` declares `Alliance` and `Federation` as separate scopes; the previous hardcoded table merged them under one id. With the config-driven path live, `id_of("alliance")` and `id_of("federation")` now resolve to different ids. Pinning test: `crates/validation/tests/stellaris_config.rs::config_alliance_and_federation_are_separate_scopes`.
 
 ## Developer
 
 - Added tests for the unterminated-quote and invalid-key loc checks, the missing-required diagnostic position (nested block and top-level regression), go-to-definition de-duplication, scripted-effect and dynamic-modifier completion, completion de-duplication, and a CLI test asserting the unterminated-quote fixture is flagged.
-- Added `cwtools-rs/testfiles/stellaris-config/` (a small subset of the external cwtools-stellaris-config: `scopes.cwt`, `links.cwt`, `pre_triggers.cwt`) plus `crates/validation/tests/stellaris_config.rs` (5 integration tests: scope/alias resolution, link resolution, synthesized iterators, Alliance-vs-Federation separation, fixture-files-exist sanity check).
-- Added unit tests under `crates/validation/src/per_game/stellaris.rs::tests` for the new validators (CW108, CW110, CW120, CW227, CW229, CW250) plus two for the config-driven pretrigger set (replacing the prior hardcoded constant).
+- Added `cwtools-rs/testfiles/stellaris-config/` (a small subset of the external cwtools-stellaris-config: `scopes.cwt`, `links.cwt`, `pre_triggers.cwt`) plus `crates/validation/tests/stellaris_config.rs` (7 integration tests: scope/alias resolution, link resolution, synthesized iterators, Alliance-vs-Federation separation, per-scope pretrigger population through the real loader, an end-to-end CW120 run, fixture-files-exist sanity check).
+- Added unit tests under `crates/validation/src/per_game/stellaris.rs::tests` for the new validators (CW108, CW109, CW110, CW120, CW227, CW229, CW250) including folder-scoping, per-scope pretrigger separation, completeness-gate, and mixed-case dispatch cases.
+- `child_scalar` in the Stellaris validators now strips the quotes QString tokens carry, so `template = "SSM_..."` lookups compare the bare name (quoted values never matched the type index before).
 
 # 1.8.5
 

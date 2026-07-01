@@ -169,6 +169,82 @@ fn config_links_resolve() {
     }
 }
 
+/// `reindex()` must populate the per-scope pretrigger map from the fixture's
+/// `pre_triggers.cwt` (`alias[<scope>_pre_trigger:<name>] = bool`). Pins the
+/// production config→reindex→CW120 wiring; the validator unit tests hand-build
+/// the map.
+#[test]
+fn config_pretriggers_populate_per_scope() {
+    let ruleset = load_stellaris_ruleset();
+
+    for (scope, member) in [
+        ("planet", "has_owner"),
+        ("planet", "is_ai"),
+        ("pop", "is_enslaved"),
+        ("pop", "is_being_purged"),
+        ("system", "is_capital"),
+        ("starbase", "is_occupied_flag"),
+        ("leader", "is_idle"),
+        ("situation", "has_owner"),
+        ("country", "is_ai"),
+    ] {
+        assert!(
+            ruleset
+                .pretriggers
+                .get(scope)
+                .is_some_and(|set| set.contains(member)),
+            "expected pretriggers[{scope}] to contain `{member}`, got: {:?}",
+            ruleset.pretriggers.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // The map is per-scope, not a flat union: `is_idle` is leader-only.
+    assert!(
+        !ruleset
+            .pretriggers
+            .get("planet")
+            .is_some_and(|set| set.contains("is_idle")),
+        "leader-only pretrigger must not leak into the planet set"
+    );
+}
+
+/// End-to-end: the loaded config drives CW120 on a planet_event whose trigger
+/// holds a planet pretrigger, and stays quiet for a fleet_event (no pretrigger
+/// category).
+#[test]
+fn config_driven_cw120_fires_for_planet_event() {
+    use cwtools_string_table::string_table::StringTable;
+    use cwtools_validation::per_game::stellaris::validate_stellaris;
+
+    let ruleset = load_stellaris_ruleset();
+    let table = StringTable::new();
+
+    let run = |script: &str| {
+        let ast = cwtools_parser::parser::parse_string(script, &table).unwrap();
+        let mut errors = Vec::new();
+        validate_stellaris(&ast, &ruleset, &table, "events/test.txt", None, &mut errors);
+        errors
+    };
+
+    let flagged = run("planet_event = {\n\
+         is_triggered_only = yes\n\
+         trigger = { has_owner = yes }\n\
+         }\n");
+    assert!(
+        flagged.iter().any(|e| e.code == Some("CW120")),
+        "planet pretrigger inside trigger should emit CW120, got: {flagged:?}"
+    );
+
+    let quiet = run("fleet_event = {\n\
+         is_triggered_only = yes\n\
+         trigger = { has_owner = yes }\n\
+         }\n");
+    assert!(
+        !quiet.iter().any(|e| e.code == Some("CW120")),
+        "fleet_event has no pretrigger category, got: {quiet:?}"
+    );
+}
+
 /// Synthesized iterators (`every_/random_/any_/all_<scope>`) must be
 /// generated for every scope alias the config declares.
 #[test]

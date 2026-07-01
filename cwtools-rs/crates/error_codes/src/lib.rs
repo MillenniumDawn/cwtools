@@ -405,12 +405,9 @@ pub const CW107_EVENT_EVERY_TICK: ErrorCode = ErrorCode {
     message_template: "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.",
 };
 
-/// Pre-trigger at wrong level. Rust-only (no F# equivalent).
-pub const CW301_PRE_TRIGGER_LEVEL: ErrorCode = ErrorCode {
-    id: "CW301",
-    severity: ErrorSeverity::Warning,
-    message_template: "Pre-trigger '{}' should be inside a 'trigger' block, not at event root",
-};
+// CW301 (pre-trigger at wrong level) retired: it was Rust-only and duplicated
+// F#'s CW120 (`PossiblePretrigger`) on the same leaf; CW120 is the single
+// pretrigger-placement diagnostic.
 
 // ── Tier B — boolean/syntax structural hints (cross-game) ──────────────────
 //

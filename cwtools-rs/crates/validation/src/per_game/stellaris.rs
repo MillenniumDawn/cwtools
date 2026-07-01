@@ -4,6 +4,7 @@ use cwtools_index::TypeIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
+use std::collections::HashSet;
 
 /// Stellaris-specific validators.
 /// Ported from CWTools/Validation/Stellaris/STLValidation.fs
@@ -15,13 +16,22 @@ pub fn validate_stellaris(
     type_index: Option<&TypeIndex>,
     errors: &mut Vec<ValidationError>,
 ) {
+    // F# scopes each structure validator to its entity type (folder); key names
+    // alone are not enough — `research_leader` only exists inside technology
+    // files, a root key like `my_event` outside `events/` is not an event.
+    let in_events = under_dir_segment(file_path, "events");
+    let in_technology = parent_dir_is(file_path, "common/technology");
+    let in_pop_jobs = parent_dir_is(file_path, "common/pop_jobs");
+    let in_component_templates = parent_dir_is(file_path, "common/component_templates");
+
     for child in &ast.root_children {
         let Some(block) = as_block(child, ast) else {
             continue;
         };
-        let key = block.key_string(table);
-        match key.as_str() {
-            k if k.ends_with("_event") || k == "event" => validate_event(
+        let key = block.key_string_lower(table);
+        if in_events && (key.ends_with("_event") || key == "event") {
+            validate_event(
+                &key,
                 block.children,
                 block.range.start.line,
                 ast,
@@ -29,34 +39,31 @@ pub fn validate_stellaris(
                 table,
                 file_path,
                 errors,
-            ),
-            // Stellaris technology blocks follow the `tech_<name> = { ... }`
-            // convention (see cwtools-stellaris-config's `type[technology]`).
-            k if k == "technology" || k.starts_with("tech_") => validate_technology(
+            );
+        }
+        if in_technology {
+            validate_technology(
                 block.children,
                 block.range.start.line,
                 ast,
                 table,
                 file_path,
                 errors,
-            ),
-            "research_leader" => validate_research_leader(
+            );
+        }
+        if in_pop_jobs {
+            validate_pop_job(block.children, ast, ruleset, table, file_path, errors);
+        }
+        if in_component_templates {
+            validate_planet_killer(
                 block.children,
                 block.range.start.line,
                 ast,
                 table,
                 file_path,
+                type_index,
                 errors,
-            ),
-            "planet_killer" => validate_planet_killer(
-                block.children,
-                block.range.start.line,
-                ast,
-                table,
-                file_path,
-                errors,
-            ),
-            _ => {}
+            );
         }
     }
 
@@ -71,24 +78,43 @@ pub fn validate_stellaris(
         errors,
     );
 
-    // CW120: any leaf under any `trigger = { ... }` block (not just events)
-    // that names a known pretrigger is a candidate for being moved to root.
-    walk_global_pretriggers(&ast.root_children, ast, ruleset, table, file_path, errors);
-
     // Stellaris-specific structural hints (if/else 2.1, deprecated set_name).
     walk_if_else(&ast.root_children, ast, table, file_path, errors);
 }
 
+// ── Path scoping helpers ───────────────────────────────
+
+/// The file's directory part, `/`-normalised and lowercased; None when the
+/// path has no directory component.
+fn dir_of(file_path: &str) -> Option<String> {
+    let norm = file_path.replace('\\', "/");
+    norm.rsplit_once('/')
+        .map(|(dir, _)| dir.to_ascii_lowercase())
+}
+
+/// True when the file sits DIRECTLY in `suffix` (e.g. `common/technology`),
+/// not in a subfolder of it — mirrors F#'s `**/common/technology/*.txt` globs
+/// (`common/technology/category/` holds categories, not technologies).
+fn parent_dir_is(file_path: &str, suffix: &str) -> bool {
+    dir_of(file_path).is_some_and(|dir| dir == suffix || dir.ends_with(&format!("/{suffix}")))
+}
+
+/// True when any directory segment of the path equals `segment` (events live
+/// under `events/`, sometimes organised into subfolders by mods).
+fn under_dir_segment(file_path: &str, segment: &str) -> bool {
+    dir_of(file_path).is_some_and(|dir| dir.split('/').any(|s| s == segment))
+}
+
 // ── If/Else & set_name structural hints (CW236/CW237/CW238/CW253) ─────────
 
-/// Keys of a block's direct keyed children, in order.
+/// Lowercased keys of a block's direct keyed children, in order.
 fn child_keys(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<String> {
     children
         .iter()
         .filter_map(|c| match c {
             Child::Leaf(idx) => Some(
                 table
-                    .get_string(ast.arena.leaves[*idx as usize].key.normal)
+                    .get_string(ast.arena.leaves[*idx as usize].key.lower)
                     .unwrap_or_default(),
             ),
             _ => None,
@@ -107,7 +133,7 @@ fn walk_if_else(
         let Some(block) = as_block(child, ast) else {
             continue;
         };
-        let key = block.key_string(table);
+        let key = block.key_string_lower(table);
         let block_children = block.children;
         let line = block.range.start.line;
         let col = block.range.start.col;
@@ -184,11 +210,24 @@ fn walk_if_else(
     }
 }
 
-// ── Event Validation ───────────────────────────────────
+// ── Event Validation (CW107 / CW120) ───────────────────
 
-/// Validate a Stellaris event body (children of `*_event = { ... }` or inline clause).
+/// The pretrigger set for an event root key: `planet_event` → the
+/// `planet_pre_trigger` aliases, etc. Event types with no `<scope>_pre_trigger`
+/// category in the config (ship, fleet, first_contact, ...) have no pretrigger
+/// support and return None. `pop_group_event` shares the pop set (events.cwt
+/// gives subtype[pop_group] the `pop_pre_trigger` aliases).
+fn event_pretriggers<'a>(event_key: &str, ruleset: &'a RuleSet) -> Option<&'a HashSet<String>> {
+    let scope = event_key.strip_suffix("_event")?;
+    let scope = if scope == "pop_group" { "pop" } else { scope };
+    ruleset.pretriggers.get(scope)
+}
+
+/// Validate a Stellaris event body (children of `*_event = { ... }`).
 /// `event_line` is the line of the event key for anchoring the CW107 diagnostic.
+#[allow(clippy::too_many_arguments)]
 fn validate_event(
+    event_key: &str,
     children: &[Child],
     event_line: u32,
     ast: &ParsedFile,
@@ -227,55 +266,98 @@ fn validate_event(
         ));
     }
 
-    // CW301: a pre-trigger inside the event's `trigger = { ... }` block
-    // should be moved to event root for performance. The set comes from the
-    // config (`alias[<scope>_pre_trigger:<name>] = bool`), collected into
-    // `ruleset.pretriggers` during reindex.
-    let pretriggers = &ruleset.pretriggers;
+    // CW120: a pretrigger inside the event's `trigger = { ... }` block could
+    // move to the event's `pre_triggers = { ... }` block for performance. The
+    // set is scope-specific — only the categories the config declares for this
+    // event type count (F#'s validatePreTriggers, generalised from its
+    // hardcoded planet_event list to the config's `<scope>_pre_trigger`
+    // aliases).
+    let Some(pretriggers) = event_pretriggers(event_key, ruleset) else {
+        return;
+    };
     for child in children {
         if !child_key_eq(child, ast, table, "trigger") {
             continue;
         }
-        let trigger_children = match child {
-            Child::Leaf(idx) => {
-                if let Value::Clause(c) = &ast.arena.leaves[*idx as usize].value {
-                    c.as_slice()
-                } else {
-                    continue;
-                }
-            }
-            _ => continue,
+        let Some(trigger) = as_block(child, ast) else {
+            continue;
         };
-        for tc in trigger_children {
-            let Child::Leaf(idx) = tc else { continue };
-            let leaf = &ast.arena.leaves[*idx as usize];
-            let key = table
-                .with_string(leaf.key.normal, |s| s.to_string())
-                .unwrap_or_default();
-            if pretriggers.contains(&key.to_ascii_lowercase()) {
-                errors.push(ValidationError::from_code_with(
-                    &error_codes::CW301_PRE_TRIGGER_LEVEL,
-                    ErrorSeverity::Information,
-                    file_path,
-                    child_line(tc, ast),
-                    0,
-                    format!(
-                        "Trigger '{}' can be a pre-trigger at event root for better performance",
-                        key
-                    ),
-                ));
-            }
+        flag_pretriggers(trigger.children, ast, pretriggers, table, file_path, errors);
+    }
+}
+
+/// Emit CW120 for every direct leaf of `children` naming a known pretrigger.
+/// Direct leaves only — F# doesn't recurse into `limit`/`AND`/... sub-blocks,
+/// because a nested condition can't be lifted wholesale.
+fn flag_pretriggers(
+    children: &[Child],
+    ast: &ParsedFile,
+    pretriggers: &HashSet<String>,
+    table: &StringTable,
+    file_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    for tc in children {
+        let Child::Leaf(idx) = tc else { continue };
+        let leaf = &ast.arena.leaves[*idx as usize];
+        if matches!(leaf.value, Value::Clause(_)) {
+            continue;
         }
+        let leaf_key = table.get_string(leaf.key.lower).unwrap_or_default();
+        if pretriggers.contains(&leaf_key) {
+            let code = &error_codes::CW120_POSSIBLE_PRETRIGGER;
+            errors.push(ValidationError {
+                message: code.format(&[&leaf_key]),
+                severity: code.severity,
+                line: leaf.pos.start.line,
+                col: leaf.pos.start.col,
+                file: file_path.to_string(),
+                code: Some(code.id),
+            });
+        }
+    }
+}
+
+// ── Pop Jobs (CW120) ───────────────────────────────────
+//
+// A pop pretrigger inside a job's `possible = { ... }` block could move to
+// `possible_pre_triggers = { ... }`. F#'s validatePreTriggers, pop-job half.
+fn validate_pop_job(
+    children: &[Child],
+    ast: &ParsedFile,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    file_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(pretriggers) = ruleset.pretriggers.get("pop") else {
+        return;
+    };
+    for child in children {
+        if !child_key_eq(child, ast, table, "possible") {
+            continue;
+        }
+        let Some(possible) = as_block(child, ast) else {
+            continue;
+        };
+        flag_pretriggers(
+            possible.children,
+            ast,
+            pretriggers,
+            table,
+            file_path,
+            errors,
+        );
     }
 }
 
 // ── Ship Design Validation (CW227 / CW229) ───────────────────────────────
 //
 // Walks `ship_design` / `global_ship_design` blocks and emits CW227 / CW229
-// for missing section/component templates. Keyed off block keys so it works
-// whether or not the config declares a `ship_design` type — the diagnostics
-// just need the type index to know about templates (populated by the
-// `type[section_template]` / `type[component_template]` declarations).
+// for missing section/component templates. Skipped unless the type index is
+// complete (vanilla merged) and has instances of the looked-up type — same
+// gate as CW500, so a mod validated without vanilla doesn't flag every
+// vanilla template reference.
 fn validate_ship_designs(
     root_children: &[Child],
     ast: &ParsedFile,
@@ -287,11 +369,19 @@ fn validate_ship_designs(
     let Some(type_index) = type_index else {
         return;
     };
+    if !type_index.complete {
+        return;
+    }
+    // Engine-builtin sections that no file defines (F#'s defaultTemplates).
+    const DEFAULT_SECTION_TEMPLATES: &[&str] = &[
+        "DEFAULT_COLONIZATION_SECTION",
+        "DEFAULT_CONSTRUCTION_SECTION",
+    ];
     for child in root_children {
         let Some(block) = as_block(child, ast) else {
             continue;
         };
-        let key = block.key_string(table);
+        let key = block.key_string_lower(table);
         if key != "ship_design" && key != "global_ship_design" {
             continue;
         }
@@ -299,7 +389,7 @@ fn validate_ship_designs(
             let Some(gc_block) = as_block(grandchild, ast) else {
                 continue;
             };
-            let (type_name, code) = match gc_block.key_string(table).as_str() {
+            let (type_name, code) = match gc_block.key_string_lower(table).as_str() {
                 "section" => (
                     "section_template",
                     &error_codes::CW227_UNKNOWN_SECTION_TEMPLATE,
@@ -313,7 +403,16 @@ fn validate_ship_designs(
             let Some(template) = child_scalar(gc_block.children, ast, table, "template") else {
                 continue;
             };
-            if type_index.contains(type_name, &template) {
+            if type_name == "section_template"
+                && DEFAULT_SECTION_TEMPLATES
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(&template))
+            {
+                continue;
+            }
+            if type_index.instances(type_name).is_empty()
+                || type_index.contains(type_name, &template)
+            {
                 continue;
             }
             errors.push(ValidationError {
@@ -328,10 +427,12 @@ fn validate_ship_designs(
     }
 }
 
-// ── Technology (CW110) ────────────────────────────────
+// ── Technology (CW108 / CW109 / CW110) ─────────────────
 //
-// CW110: a technology (matches `technology = { ... }` or `tech_<name> = { ... }`)
-// must declare a `category`; the game refuses to load a tech without one.
+// Every root block of a `common/technology/*.txt` file is a technology.
+// CW110: it must declare a `category` with a value; the game refuses to load a
+// tech without one. CW108/CW109: any nested `research_leader` block must
+// declare an `area` matching the technology's.
 fn validate_technology(
     children: &[Child],
     tech_line: u32,
@@ -340,122 +441,56 @@ fn validate_technology(
     file_path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    for c in children {
-        if child_key_eq(c, ast, table, "category") {
-            return;
-        }
-    }
-    errors.push(ValidationError {
-        message: error_codes::CW110_TECH_CAT_MISSING
-            .message_template
-            .to_string(),
-        severity: error_codes::CW110_TECH_CAT_MISSING.severity,
-        line: tech_line,
-        col: 0,
-        file: file_path.to_string(),
-        code: Some(error_codes::CW110_TECH_CAT_MISSING.id),
-    });
-}
-
-// ── Research Leader (CW108) ─────────────────────────────
-//
-// CW108: a research_leader block must declare an `area`; the game rejects it
-// otherwise. CW109 (area-vs-technology mismatch) needs cross-block reasoning.
-fn validate_research_leader(
-    children: &[Child],
-    leader_line: u32,
-    ast: &ParsedFile,
-    table: &StringTable,
-    file_path: &str,
-    errors: &mut Vec<ValidationError>,
-) {
-    for c in children {
-        if child_key_eq(c, ast, table, "area") {
-            return;
-        }
-    }
-    errors.push(ValidationError {
-        message: error_codes::CW108_RESEARCH_LEADER_AREA
-            .message_template
-            .to_string(),
-        severity: error_codes::CW108_RESEARCH_LEADER_AREA.severity,
-        line: leader_line,
-        col: 0,
-        file: file_path.to_string(),
-        code: Some(error_codes::CW108_RESEARCH_LEADER_AREA.id),
-    });
-}
-
-// ── Planet Killer (CW250) ──────────────────────────────
-//
-// CW250: a planet_killer block must declare a `type` and one damage key
-// (`planet_damage`, `armor_penetration`, or `armor_damage`); without them
-// the weapon is a no-op or crashes the load.
-fn validate_planet_killer(
-    children: &[Child],
-    pk_line: u32,
-    ast: &ParsedFile,
-    table: &StringTable,
-    file_path: &str,
-    errors: &mut Vec<ValidationError>,
-) {
-    const REQUIRED_KEYS: &[&str] = &["type"];
-    const DAMAGE_KEYS: &[&str] = &["planet_damage", "armor_penetration", "armor_damage"];
-    let mut has_required = false;
-    let mut has_damage = false;
-    for c in children {
-        let Some(key) = child_key_str(c, ast, table) else {
-            continue;
-        };
-        if REQUIRED_KEYS.iter().any(|k| k.eq_ignore_ascii_case(&key)) {
-            has_required = true;
-        }
-        if DAMAGE_KEYS.iter().any(|k| k.eq_ignore_ascii_case(&key)) {
-            has_damage = true;
-        }
-    }
-    if !has_required || !has_damage {
-        let missing: &str = match (has_required, has_damage) {
-            (false, false) => "type, damage",
-            (false, true) => "type",
-            (true, false) => "damage",
-            (true, true) => unreachable!(),
-        };
+    if !technology_has_category(children, ast, table) {
         errors.push(ValidationError {
-            message: format!("planet_killer is missing required field(s): {missing}"),
-            severity: error_codes::CW250_PLANET_KILLER_MISSING.severity,
-            line: pk_line,
+            message: error_codes::CW110_TECH_CAT_MISSING
+                .message_template
+                .to_string(),
+            severity: error_codes::CW110_TECH_CAT_MISSING.severity,
+            line: tech_line,
             col: 0,
             file: file_path.to_string(),
-            code: Some(error_codes::CW250_PLANET_KILLER_MISSING.id),
+            code: Some(error_codes::CW110_TECH_CAT_MISSING.id),
         });
     }
+
+    let tech_area = child_scalar(children, ast, table, "area").unwrap_or_default();
+    walk_research_leaders(children, &tech_area, ast, table, file_path, errors);
 }
 
-// ── Global Pretrigger Walker (CW120) ───────────────────
-//
-// CW120: any leaf under a `trigger = { ... }` block anywhere in the file
-// (not just events) that names a known pretrigger. Sits alongside the
-// event-scoped CW301.
-fn walk_global_pretriggers(
-    children: &[Child],
-    ast: &ParsedFile,
-    ruleset: &RuleSet,
-    table: &StringTable,
-    file_path: &str,
-    errors: &mut Vec<ValidationError>,
-) {
-    let pretriggers = &ruleset.pretriggers;
-    if pretriggers.is_empty() {
-        return;
+/// `category = { physics }` (block with a member, the game's form) or a bare
+/// `category = physics` scalar both count; an empty `category = { }` doesn't.
+fn technology_has_category(children: &[Child], ast: &ParsedFile, table: &StringTable) -> bool {
+    for c in children {
+        let Child::Leaf(idx) = c else { continue };
+        let leaf = &ast.arena.leaves[*idx as usize];
+        let is_cat = table
+            .with_string(leaf.key.normal, |k| k.eq_ignore_ascii_case("category"))
+            .unwrap_or(false);
+        if !is_cat {
+            continue;
+        }
+        let has_value = match &leaf.value {
+            Value::Clause(cs) => cs.iter().any(|m| matches!(m, Child::LeafValue(_))),
+            Value::String(t) | Value::QString(t) => table
+                .with_string(t.normal, |s| !s.is_empty())
+                .unwrap_or(false),
+            _ => false,
+        };
+        if has_value {
+            return true;
+        }
     }
-    walk_pretriggers_in(children, ast, pretriggers, table, file_path, errors);
+    false
 }
 
-fn walk_pretriggers_in(
+/// Recursively find `research_leader` blocks under a technology (they sit
+/// inside `weight_modifier`, never at file root). CW108: missing `area`.
+/// CW109: `area` disagrees with the technology's.
+fn walk_research_leaders(
     children: &[Child],
+    tech_area: &str,
     ast: &ParsedFile,
-    pretriggers: &std::collections::HashSet<String>,
     table: &StringTable,
     file_path: &str,
     errors: &mut Vec<ValidationError>,
@@ -464,27 +499,91 @@ fn walk_pretriggers_in(
         let Some(block) = as_block(child, ast) else {
             continue;
         };
-        let key = block.key_string(table);
-        if key == "trigger" {
-            for tc in block.children {
-                let Child::Leaf(idx) = tc else { continue };
-                let leaf = &ast.arena.leaves[*idx as usize];
-                let leaf_key = table.get_string(leaf.key.normal).unwrap_or_default();
-                let leaf_key_lc = leaf_key.to_ascii_lowercase();
-                if pretriggers.contains(&leaf_key_lc) {
-                    errors.push(ValidationError {
-                        message: error_codes::CW120_POSSIBLE_PRETRIGGER.format(&[&leaf_key]),
-                        severity: error_codes::CW120_POSSIBLE_PRETRIGGER.severity,
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                        file: file_path.to_string(),
-                        code: Some(error_codes::CW120_POSSIBLE_PRETRIGGER.id),
-                    });
+        if block.key_string_lower(table) == "research_leader" {
+            match child_scalar(block.children, ast, table, "area") {
+                None => {
+                    let code = &error_codes::CW108_RESEARCH_LEADER_AREA;
+                    errors.push(ValidationError::from_code(
+                        code,
+                        file_path,
+                        block.range.start.line,
+                        block.range.start.col,
+                        &[],
+                    ));
                 }
+                Some(leader_area)
+                    if !tech_area.is_empty() && !leader_area.eq_ignore_ascii_case(tech_area) =>
+                {
+                    let code = &error_codes::CW109_RESEARCH_LEADER_TECH;
+                    errors.push(ValidationError::from_code(
+                        code,
+                        file_path,
+                        block.range.start.line,
+                        block.range.start.col,
+                        &[&leader_area, tech_area],
+                    ));
+                }
+                _ => {}
             }
         }
-        // Recurse so trigger blocks nested inside any parent get visited.
-        walk_pretriggers_in(block.children, ast, pretriggers, table, file_path, errors);
+        walk_research_leaders(block.children, tech_area, ast, table, file_path, errors);
+    }
+}
+
+// ── Planet Killer (CW250) ──────────────────────────────
+//
+// A component template with `type = planet_killer` needs a matching
+// `on_destroy_planet_with_<key>` on_action and `can_destroy_planet_with_<key>`
+// scripted trigger, or the weapon can't fire. F#'s validatePlanetKillers.
+fn validate_planet_killer(
+    children: &[Child],
+    block_line: u32,
+    ast: &ParsedFile,
+    table: &StringTable,
+    file_path: &str,
+    type_index: Option<&TypeIndex>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(type_index) = type_index else {
+        return;
+    };
+    if !type_index.complete {
+        return;
+    }
+    let is_planet_killer = child_scalar(children, ast, table, "type")
+        .is_some_and(|t| t.eq_ignore_ascii_case("planet_killer"));
+    if !is_planet_killer {
+        return;
+    }
+    let Some(key) = child_scalar(children, ast, table, "key") else {
+        return;
+    };
+
+    let code = &error_codes::CW250_PLANET_KILLER_MISSING;
+    let checks: &[(&str, &str, &str)] = &[
+        ("on_action", "on_action", "on_destroy_planet_with_"),
+        (
+            "scripted_trigger",
+            "scripted trigger",
+            "can_destroy_planet_with_",
+        ),
+    ];
+    for (type_name, label, prefix) in checks {
+        // Same completeness rule as CW500: only flag when we actually know
+        // instances of the looked-up type.
+        if type_index.instances(type_name).is_empty() {
+            continue;
+        }
+        let wanted = format!("{prefix}{key}");
+        if !type_index.contains(type_name, &wanted) {
+            errors.push(ValidationError::from_code(
+                code,
+                file_path,
+                block_line,
+                0,
+                &[&format!("Planet killer {key} is missing {label} {wanted}")],
+            ));
+        }
     }
 }
 
@@ -499,13 +598,6 @@ fn child_key_eq(child: &Child, ast: &ParsedFile, table: &StringTable, expected: 
                 .unwrap_or(false)
         }
         _ => false,
-    }
-}
-
-fn child_line(child: &Child, ast: &ParsedFile) -> u32 {
-    match child {
-        Child::Leaf(idx) => ast.arena.leaves[*idx as usize].pos.start.line,
-        _ => 0,
     }
 }
 
@@ -537,17 +629,6 @@ fn child_is_bool(child: &Child, ast: &ParsedFile, table: &StringTable, expected:
     }
 }
 
-/// A non-clause leaf's key as an owned `String`; None for clauses and bare values.
-fn child_key_str(child: &Child, ast: &ParsedFile, table: &StringTable) -> Option<String> {
-    match child {
-        Child::Leaf(idx) => {
-            let leaf = &ast.arena.leaves[*idx as usize];
-            Some(table.get_string(leaf.key.normal).unwrap_or_default())
-        }
-        _ => None,
-    }
-}
-
 /// Scalar value of the first child leaf whose key matches `key` (case-insensitive),
 /// or None if the key is absent or the leaf carries a clause.
 fn child_scalar(
@@ -557,18 +638,24 @@ fn child_scalar(
     key: &str,
 ) -> Option<String> {
     for c in children {
-        let Some(child_key) = child_key_str(c, ast, table) else {
-            continue;
-        };
-        if !child_key.eq_ignore_ascii_case(key) {
-            continue;
-        }
         let Child::Leaf(idx) = c else { continue };
         let leaf = &ast.arena.leaves[*idx as usize];
+        let matches_key = table
+            .with_string(leaf.key.normal, |k| k.eq_ignore_ascii_case(key))
+            .unwrap_or(false);
+        if !matches_key {
+            continue;
+        }
         return match &leaf.value {
-            Value::String(t) | Value::QString(t) => {
-                Some(table.get_string(t.normal).unwrap_or_default())
-            }
+            // QString tokens keep their quotes; `template = "SSM_..."` must
+            // yield the bare name.
+            Value::String(t) | Value::QString(t) => Some(
+                table
+                    .get_string(t.normal)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string(),
+            ),
             Value::Bool(b) => Some(b.to_string()),
             Value::Int(n) => Some(n.to_string()),
             Value::Float(n) => Some(n.to_string()),
@@ -581,28 +668,61 @@ fn child_scalar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cwtools_index::{SourceLocation, TypeInstance};
     use cwtools_parser::parser::parse_string;
 
-    fn codes(script: &str) -> Vec<(String, u32, u16)> {
-        codes_with(script, &RuleSet::new())
+    const EVENTS: &str = "events/test.txt";
+    const TECH: &str = "common/technology/test.txt";
+    const POP_JOBS: &str = "common/pop_jobs/test.txt";
+    const COMPONENTS: &str = "common/component_templates/test.txt";
+
+    fn codes_at(path: &str, script: &str) -> Vec<(String, u32, u16)> {
+        codes_with(path, script, &RuleSet::new(), None)
     }
 
-    /// Build a RuleSet whose pretrigger set contains every name in `pretriggers`.
-    /// Mirrors what `reindex()` produces for the cwtools-stellaris-config's
+    /// Build a RuleSet whose pretrigger map holds the given `(scope, names)`
+    /// categories. Mirrors what `reindex()` produces for the config's
     /// `alias[<scope>_pre_trigger:<name>] = bool` declarations.
-    fn ruleset_with_pretriggers(pretriggers: &[&str]) -> RuleSet {
+    fn ruleset_with_pretriggers(categories: &[(&str, &[&str])]) -> RuleSet {
         let mut rs = RuleSet::new();
-        for name in pretriggers {
-            rs.pretriggers.insert((*name).to_string());
+        for (scope, names) in categories {
+            let set = rs.pretriggers.entry((*scope).to_string()).or_default();
+            for name in *names {
+                set.insert((*name).to_string());
+            }
         }
         rs
     }
 
-    fn codes_with(script: &str, ruleset: &RuleSet) -> Vec<(String, u32, u16)> {
+    /// A complete TypeIndex holding the given `(type, instance)` pairs.
+    fn index_with(entries: &[(&str, &str)]) -> TypeIndex {
+        let mut per_type: std::collections::HashMap<String, Vec<TypeInstance>> = Default::default();
+        for (ty, name) in entries {
+            per_type
+                .entry((*ty).to_string())
+                .or_default()
+                .push(TypeInstance {
+                    name: (*name).to_string(),
+                    location: SourceLocation { line: 0, col: 0 },
+                    primary_loc_key: None,
+                });
+        }
+        let mut idx = TypeIndex::new();
+        idx.merge("test://config.txt", per_type);
+        idx.complete = true;
+        idx
+    }
+
+    fn codes_with(
+        path: &str,
+        script: &str,
+        ruleset: &RuleSet,
+        type_index: Option<&TypeIndex>,
+    ) -> Vec<(String, u32, u16)> {
         let table = StringTable::new();
         let ast = parse_string(script, &table).unwrap();
         let mut errors = Vec::new();
-        validate_stellaris(&ast, ruleset, &table, "test.txt", None, &mut errors);
+        validate_stellaris(&ast, ruleset, &table, path, type_index, &mut errors);
         errors
             .into_iter()
             .filter_map(|e| e.code.map(|c| (c.to_string(), e.line, e.col)))
@@ -611,6 +731,10 @@ mod tests {
 
     fn has_code(codes: &[(String, u32, u16)], code: &str) -> bool {
         codes.iter().any(|(c, _, _)| c == code)
+    }
+
+    fn count_code(codes: &[(String, u32, u16)], code: &str) -> usize {
+        codes.iter().filter(|(c, _, _)| c == code).count()
     }
 
     #[test]
@@ -638,7 +762,7 @@ mod tests {
 
     #[test]
     fn event_without_mtth_or_trigger_is_cw107() {
-        let c = codes("my_event = { }\n");
+        let c = codes_at(EVENTS, "my_event = { }\n");
         assert!(
             has_code(&c, "CW107"),
             "event with no MTTH/trigger/once should emit CW107, got: {:?}",
@@ -648,126 +772,226 @@ mod tests {
 
     #[test]
     fn event_with_mtth_is_clean() {
-        let c = codes("my_event = { mean_time_to_happen = { years = 5 } }\n");
+        let c = codes_at(
+            EVENTS,
+            "my_event = { mean_time_to_happen = { years = 5 } }\n",
+        );
         assert!(!has_code(&c, "CW107"), "got: {:?}", c);
     }
 
     #[test]
     fn event_is_triggered_only_is_clean() {
-        let c = codes("my_event = { is_triggered_only = yes }\n");
+        let c = codes_at(EVENTS, "my_event = { is_triggered_only = yes }\n");
         assert!(!has_code(&c, "CW107"), "got: {:?}", c);
     }
 
     #[test]
     fn event_fire_only_once_is_clean() {
-        let c = codes("my_event = { fire_only_once = yes }\n");
+        let c = codes_at(EVENTS, "my_event = { fire_only_once = yes }\n");
         assert!(!has_code(&c, "CW107"), "got: {:?}", c);
     }
 
     #[test]
     fn event_trigger_always_no_is_clean() {
-        let c = codes("my_event = { trigger = { always = no } }\n");
+        let c = codes_at(EVENTS, "my_event = { trigger = { always = no } }\n");
         assert!(!has_code(&c, "CW107"), "got: {:?}", c);
     }
 
     #[test]
     fn event_trigger_always_yes_still_cw107() {
         // `trigger = { always = yes }` does NOT suppress CW107; only always=no does.
-        let c = codes("my_event = { trigger = { always = yes } }\n");
+        let c = codes_at(EVENTS, "my_event = { trigger = { always = yes } }\n");
         assert!(has_code(&c, "CW107"), "got: {:?}", c);
     }
 
     #[test]
     fn non_event_root_is_not_cw107() {
         // The CW107 check is scoped to *_event / event keys only.
-        let c = codes("foo = { }\n");
+        let c = codes_at(EVENTS, "foo = { }\n");
         assert!(!has_code(&c, "CW107"), "got: {:?}", c);
     }
 
-    // ── Pre-trigger placement (CW301) ───────────────────────────────────────
+    #[test]
+    fn event_key_outside_events_dir_is_not_cw107() {
+        // An `*_event` root key in a non-events file is not an event.
+        let c = codes_at("common/scripted_effects/test.txt", "my_event = { }\n");
+        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
+    }
 
     #[test]
-    fn pre_trigger_inside_trigger_is_cw301() {
-        let rs = ruleset_with_pretriggers(&["is_ai"]);
+    fn mixed_case_event_key_is_cw107() {
+        // Paradox keys are case-insensitive; dispatch must be too.
+        let c = codes_at(EVENTS, "My_Event = { }\n");
+        assert!(has_code(&c, "CW107"), "got: {:?}", c);
+    }
+
+    // ── Pre-trigger placement (CW120, event-scoped) ───────────────────────────
+
+    #[test]
+    fn pre_trigger_inside_trigger_is_cw120() {
+        let rs = ruleset_with_pretriggers(&[("planet", &["is_ai"])]);
         let c = codes_with(
-            "my_event = {\n\
+            EVENTS,
+            "planet_event = {\n\
              mean_time_to_happen = { years = 5 }\n\
              trigger = { is_ai = yes }\n\
              }\n",
             &rs,
+            None,
         );
         assert!(
-            has_code(&c, "CW301"),
-            "pre-trigger inside trigger block should emit CW301, got: {:?}",
+            has_code(&c, "CW120"),
+            "pre-trigger inside trigger block should emit CW120, got: {:?}",
+            c
+        );
+        assert_eq!(
+            count_code(&c, "CW120"),
+            1,
+            "exactly one diagnostic per pretrigger leaf, got: {:?}",
             c
         );
     }
 
     #[test]
     fn pre_trigger_at_root_is_clean() {
-        // `is_ai` at the event root is the preferred (pre-trigger) location.
-        let rs = ruleset_with_pretriggers(&["is_ai"]);
+        // `is_ai` outside the trigger block is fine (the fix location).
+        let rs = ruleset_with_pretriggers(&[("planet", &["is_ai"])]);
         let c = codes_with(
-            "my_event = {\n\
+            EVENTS,
+            "planet_event = {\n\
              mean_time_to_happen = { years = 5 }\n\
              is_ai = yes\n\
              }\n",
             &rs,
+            None,
         );
-        assert!(!has_code(&c, "CW301"), "got: {:?}", c);
+        assert!(!has_code(&c, "CW120"), "got: {:?}", c);
     }
 
-    /// Pretriggers come from the config, not a hardcoded list: an exotic
-    /// pretrigger declared in the config (e.g. `is_being_purged` from
-    /// `pop_pre_trigger:`) fires CW301 just like the original seven did.
     #[test]
-    fn pre_trigger_set_drives_cw301_from_config() {
-        let rs = ruleset_with_pretriggers(&["is_being_purged", "is_enslaved"]);
+    fn pre_trigger_wrong_scope_event_is_clean() {
+        // `is_ai` is a planet/country pretrigger; a fleet_event has no
+        // pretrigger support at all, so nothing fires there.
+        let rs = ruleset_with_pretriggers(&[("planet", &["is_ai"])]);
         let c = codes_with(
-            "my_event = {\n\
+            EVENTS,
+            "fleet_event = {\n\
              mean_time_to_happen = { years = 5 }\n\
-             trigger = { is_being_purged = yes }\n\
+             trigger = { is_ai = yes }\n\
              }\n",
             &rs,
+            None,
         );
         assert!(
-            has_code(&c, "CW301"),
-            "config-driven pretrigger `is_being_purged` inside trigger should emit CW301, got: {:?}",
+            !has_code(&c, "CW120"),
+            "fleet_event has no pretrigger category, got: {:?}",
             c
         );
     }
 
-    /// When the config declares nothing as a pretrigger, nothing fires CW301
-    /// even for names that used to be in the hardcoded list. Pins that the
-    /// set is config-driven, not magic.
     #[test]
-    fn empty_pretrigger_set_emits_no_cw301() {
-        // No pretriggers inserted; the previously-hardcoded `is_ai` no longer
-        // counts as a pretrigger.
-        let c = codes(
-            "my_event = {\n\
+    fn pre_trigger_scope_sets_are_separate() {
+        // `is_enslaved` is a pop pretrigger only; a planet_event trigger using
+        // it must stay quiet, a pop_event trigger must flag it.
+        let rs = ruleset_with_pretriggers(&[("pop", &["is_enslaved"]), ("planet", &["is_ai"])]);
+        let planet = codes_with(
+            EVENTS,
+            "planet_event = { is_triggered_only = yes trigger = { is_enslaved = yes } }\n",
+            &rs,
+            None,
+        );
+        assert!(!has_code(&planet, "CW120"), "got: {:?}", planet);
+        let pop = codes_with(
+            EVENTS,
+            "pop_event = { is_triggered_only = yes trigger = { is_enslaved = yes } }\n",
+            &rs,
+            None,
+        );
+        assert!(has_code(&pop, "CW120"), "got: {:?}", pop);
+    }
+
+    #[test]
+    fn pop_group_event_uses_pop_pretriggers() {
+        let rs = ruleset_with_pretriggers(&[("pop", &["is_being_purged"])]);
+        let c = codes_with(
+            EVENTS,
+            "pop_group_event = { is_triggered_only = yes trigger = { is_being_purged = yes } }\n",
+            &rs,
+            None,
+        );
+        assert!(has_code(&c, "CW120"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn empty_pretrigger_map_emits_no_cw120() {
+        // No pretriggers in the config → nothing fires, even for names that
+        // used to be in the old hardcoded list. Pins that the set is
+        // config-driven, not magic.
+        let c = codes_at(
+            EVENTS,
+            "planet_event = {\n\
              mean_time_to_happen = { years = 5 }\n\
              trigger = { is_ai = yes }\n\
              }\n",
         );
+        assert!(!has_code(&c, "CW120"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn pre_trigger_nested_in_limit_does_not_fire() {
+        // F# only looks at direct children of the trigger block — a pretrigger
+        // under a nested `limit`/`AND` can't be lifted wholesale.
+        let rs = ruleset_with_pretriggers(&[("planet", &["is_ai"])]);
+        let c = codes_with(
+            EVENTS,
+            "planet_event = { is_triggered_only = yes trigger = { limit = { is_ai = yes } } }\n",
+            &rs,
+            None,
+        );
+        assert!(!has_code(&c, "CW120"), "got: {:?}", c);
+    }
+
+    // ── Pre-trigger placement (CW120, pop jobs) ───────────────────────────────
+
+    #[test]
+    fn pop_job_possible_pretrigger_is_cw120() {
+        let rs = ruleset_with_pretriggers(&[("pop", &["is_enslaved"])]);
+        let c = codes_with(
+            POP_JOBS,
+            "my_job = { possible = { is_enslaved = yes } }\n",
+            &rs,
+            None,
+        );
         assert!(
-            !has_code(&c, "CW301"),
-            "without pretriggers in the ruleset, no CW301 should fire, got: {:?}",
+            has_code(&c, "CW120"),
+            "pop pretrigger inside a job's possible block should emit CW120, got: {:?}",
             c
         );
+    }
+
+    #[test]
+    fn pop_job_check_only_runs_in_pop_jobs_dir() {
+        let rs = ruleset_with_pretriggers(&[("pop", &["is_enslaved"])]);
+        let c = codes_with(
+            "common/edicts/test.txt",
+            "my_edict = { possible = { is_enslaved = yes } }\n",
+            &rs,
+            None,
+        );
+        assert!(!has_code(&c, "CW120"), "got: {:?}", c);
     }
 
     // ── Deprecated set_name (CW253) ───────────────────────────────────────────
 
     #[test]
     fn set_empire_name_is_cw253() {
-        let c = codes("foo = { set_empire_name = { key = \"X\" } }\n");
+        let c = codes_at(EVENTS, "foo = { set_empire_name = { key = \"X\" } }\n");
         assert!(has_code(&c, "CW253"), "got: {:?}", c);
     }
 
     #[test]
     fn set_planet_name_is_cw253() {
-        let c = codes("foo = { set_planet_name = { key = \"Y\" } }\n");
+        let c = codes_at(EVENTS, "foo = { set_planet_name = { key = \"Y\" } }\n");
         assert!(has_code(&c, "CW253"), "got: {:?}", c);
     }
 
@@ -776,33 +1000,39 @@ mod tests {
     #[test]
     fn deprecated_nested_else_is_cw236() {
         // Old Stellaris style: if = { else = { ... } } without an inner if.
-        let c = codes("foo = { if = { limit = { } else = { a = 1 } } }\n");
+        let c = codes_at(EVENTS, "foo = { if = { limit = { } else = { a = 1 } } }\n");
         assert!(has_code(&c, "CW236"), "got: {:?}", c);
     }
 
     #[test]
     fn ambiguous_if_with_else_and_inner_if_is_cw237() {
         // `if = { if ... else }` is ambiguous nesting.
-        let c = codes("foo = { if = { limit = { } if = { a = 1 } else = { b = 2 } } }\n");
+        let c = codes_at(
+            EVENTS,
+            "foo = { if = { limit = { } if = { a = 1 } else = { b = 2 } } }\n",
+        );
         assert!(has_code(&c, "CW237"), "got: {:?}", c);
     }
 
     #[test]
     fn else_without_preceding_if_is_cw238() {
-        let c = codes("foo = { else = { a = 1 } }\n");
+        let c = codes_at(EVENTS, "foo = { else = { a = 1 } }\n");
         assert!(has_code(&c, "CW238"), "got: {:?}", c);
     }
 
     #[test]
     fn properly_ordered_if_else_if_is_clean() {
-        let c = codes("foo = { if = { limit = { } a = 1 } else_if = { limit = { } b = 2 } }\n");
+        let c = codes_at(
+            EVENTS,
+            "foo = { if = { limit = { } a = 1 } else_if = { limit = { } b = 2 } }\n",
+        );
         assert!(!has_code(&c, "CW238"), "got: {:?}", c);
     }
 
     #[test]
     fn nested_limit_and_modifier_do_not_false_positive() {
         // `limit` and `modifier` blocks are excluded from the if/else order walk.
-        let c = codes("foo = { limit = { } modifier = { } }\n");
+        let c = codes_at(EVENTS, "foo = { limit = { } modifier = { } }\n");
         assert!(!has_code(&c, "CW236") && !has_code(&c, "CW237") && !has_code(&c, "CW238"));
     }
 
@@ -810,7 +1040,7 @@ mod tests {
 
     #[test]
     fn technology_without_category_is_cw110() {
-        let c = codes("tech_my_thing = { cost = 100 }\n");
+        let c = codes_at(TECH, "tech_my_thing = { cost = 100 }\n");
         assert!(
             has_code(&c, "CW110"),
             "tech without category should emit CW110, got: {:?}",
@@ -819,152 +1049,206 @@ mod tests {
     }
 
     #[test]
-    fn technology_with_category_is_clean() {
-        let c = codes("tech_my_thing = { cost = 100 category = physics }\n");
+    fn technology_with_category_block_is_clean() {
+        let c = codes_at(
+            TECH,
+            "tech_my_thing = { cost = 100 category = { physics } }\n",
+        );
         assert!(!has_code(&c, "CW110"), "got: {:?}", c);
     }
 
     #[test]
-    fn technology_category_is_case_insensitive() {
-        let c = codes("tech_my_thing = { cost = 100 Category = physics }\n");
+    fn technology_with_scalar_category_is_clean() {
+        let c = codes_at(TECH, "tech_my_thing = { cost = 100 Category = physics }\n");
         assert!(!has_code(&c, "CW110"), "got: {:?}", c);
     }
 
-    // ── Research Leader (CW108) ───────────────────────────────────────────
+    #[test]
+    fn technology_with_empty_category_is_cw110() {
+        let c = codes_at(TECH, "tech_my_thing = { cost = 100 category = { } }\n");
+        assert!(has_code(&c, "CW110"), "got: {:?}", c);
+    }
 
     #[test]
-    fn research_leader_without_area_is_cw108() {
-        let c = codes("research_leader = { name = \"Dr. Smith\" }\n");
+    fn any_root_key_in_technology_dir_is_a_tech() {
+        // F# checks every root node of common/technology/*.txt — the tech_
+        // prefix is convention, not a requirement.
+        let c = codes_at(TECH, "oddly_named_tech = { cost = 100 }\n");
+        assert!(has_code(&c, "CW110"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn technology_check_skips_category_subdir() {
+        // common/technology/category/*.txt holds category definitions.
+        let c = codes_at(
+            "common/technology/category/test.txt",
+            "physics = { led_by = \"x\" }\n",
+        );
+        assert!(!has_code(&c, "CW110"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn tech_key_outside_technology_dir_is_not_checked() {
+        let c = codes_at("common/scripted_effects/test.txt", "tech_thing = { }\n");
+        assert!(!has_code(&c, "CW110"), "got: {:?}", c);
+    }
+
+    // ── Research Leader (CW108 / CW109) ───────────────────────────────────
+
+    #[test]
+    fn nested_research_leader_without_area_is_cw108() {
+        // research_leader sits inside weight_modifier, never at root.
+        let c = codes_at(
+            TECH,
+            "tech_my_thing = {\n\
+             area = physics\n\
+             category = { physics }\n\
+             weight_modifier = { research_leader = { modifier = { factor = 2 } } }\n\
+             }\n",
+        );
         assert!(
             has_code(&c, "CW108"),
-            "research_leader without area should emit CW108, got: {:?}",
+            "nested research_leader without area should emit CW108, got: {:?}",
             c
         );
     }
 
     #[test]
-    fn research_leader_with_area_is_clean() {
-        let c = codes("research_leader = { name = \"Dr. Smith\" area = physics }\n");
+    fn nested_research_leader_with_matching_area_is_clean() {
+        let c = codes_at(
+            TECH,
+            "tech_my_thing = {\n\
+             area = physics\n\
+             category = { physics }\n\
+             weight_modifier = { research_leader = { area = physics } }\n\
+             }\n",
+        );
+        assert!(
+            !has_code(&c, "CW108") && !has_code(&c, "CW109"),
+            "got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn research_leader_area_mismatch_is_cw109() {
+        let c = codes_at(
+            TECH,
+            "tech_my_thing = {\n\
+             area = physics\n\
+             category = { physics }\n\
+             weight_modifier = { research_leader = { area = society } }\n\
+             }\n",
+        );
+        assert!(
+            has_code(&c, "CW109"),
+            "research_leader area disagreeing with the tech should emit CW109, got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn root_research_leader_outside_technology_is_not_checked() {
+        // A root research_leader block outside common/technology is meaningless
+        // script the rules engine flags; the per-game check stays quiet.
+        let c = codes_at(EVENTS, "research_leader = { name = \"Dr. Smith\" }\n");
         assert!(!has_code(&c, "CW108"), "got: {:?}", c);
     }
 
     // ── Planet Killer (CW250) ──────────────────────────────────────────────
 
+    const PK_TEMPLATE: &str = "weapon_component_template = {\n\
+         key = \"PLANET_KILLER_TEST\"\n\
+         type = planet_killer\n\
+         }\n";
+
     #[test]
-    fn planet_killer_without_required_fields_is_cw250() {
-        // Empty planet_killer — missing both `type` and a damage key.
-        let c = codes("planet_killer = { }\n");
-        assert!(
-            has_code(&c, "CW250"),
-            "empty planet_killer should emit CW250, got: {:?}",
+    fn planet_killer_missing_on_action_and_trigger_is_cw250() {
+        // Index knows on_actions and scripted triggers, but not the two this
+        // planet killer needs → one CW250 per missing piece.
+        let idx = index_with(&[
+            ("on_action", "on_game_start"),
+            ("scripted_trigger", "some_trigger"),
+        ]);
+        let c = codes_with(COMPONENTS, PK_TEMPLATE, &RuleSet::new(), Some(&idx));
+        assert_eq!(
+            count_code(&c, "CW250"),
+            2,
+            "missing on_action AND scripted trigger, got: {:?}",
             c
         );
     }
 
     #[test]
-    fn planet_killer_with_type_only_is_cw250() {
-        // Has `type` but no damage key — still incomplete.
-        let c = codes("planet_killer = { type = something }\n");
-        assert!(
-            has_code(&c, "CW250"),
-            "planet_killer with only type should emit CW250, got: {:?}",
-            c
-        );
-    }
-
-    #[test]
-    fn planet_killer_with_damage_only_is_cw250() {
-        // Has damage but no `type` — still incomplete.
-        let c = codes("planet_killer = { planet_damage = 100 }\n");
-        assert!(
-            has_code(&c, "CW250"),
-            "planet_killer with only damage should emit CW250, got: {:?}",
-            c
-        );
-    }
-
-    #[test]
-    fn planet_killer_with_type_and_damage_is_clean() {
-        let c = codes("planet_killer = { type = something planet_damage = 100 }\n");
+    fn planet_killer_with_both_hooks_is_clean() {
+        let idx = index_with(&[
+            ("on_action", "on_destroy_planet_with_PLANET_KILLER_TEST"),
+            (
+                "scripted_trigger",
+                "can_destroy_planet_with_PLANET_KILLER_TEST",
+            ),
+        ]);
+        let c = codes_with(COMPONENTS, PK_TEMPLATE, &RuleSet::new(), Some(&idx));
         assert!(!has_code(&c, "CW250"), "got: {:?}", c);
     }
 
-    // ── Global Pretrigger (CW120) ─────────────────────────────────────────
-
     #[test]
-    fn global_pretrigger_in_trigger_block_is_cw120() {
-        let rs = ruleset_with_pretriggers(&["is_ai"]);
-        let c = codes_with("some_effect = { trigger = { is_ai = yes } }\n", &rs);
-        assert!(
-            has_code(&c, "CW120"),
-            "pretrigger inside any trigger block should emit CW120, got: {:?}",
-            c
-        );
+    fn planet_killer_missing_only_trigger_is_one_cw250() {
+        let idx = index_with(&[
+            ("on_action", "on_destroy_planet_with_PLANET_KILLER_TEST"),
+            ("scripted_trigger", "some_other_trigger"),
+        ]);
+        let c = codes_with(COMPONENTS, PK_TEMPLATE, &RuleSet::new(), Some(&idx));
+        assert_eq!(count_code(&c, "CW250"), 1, "got: {:?}", c);
     }
 
     #[test]
-    fn global_pretrigger_without_ruleset_emits_no_cw120() {
-        // Empty ruleset — no pretriggers known.
-        let c = codes("some_effect = { trigger = { is_ai = yes } }\n");
-        assert!(
-            !has_code(&c, "CW120"),
-            "without pretriggers in the ruleset, no CW120 should fire, got: {:?}",
-            c
-        );
-    }
-
-    #[test]
-    fn global_pretrigger_nested_in_limit_does_not_fire() {
-        // F# STLValidation.fs `validatePreTriggers` only looks at direct
-        // children of a `trigger = { ... }` block — it doesn't recurse into
-        // `limit = { ... }` / `modifier = { ... }` sub-blocks. The walker
-        // mirrors that: a pretrigger under a nested block stays quiet for
-        // CW120. CW301 (event-scoped) follows the same rule.
-        let rs = ruleset_with_pretriggers(&["is_ai"]);
+    fn non_planet_killer_component_is_not_checked() {
+        let idx = index_with(&[
+            ("on_action", "on_game_start"),
+            ("scripted_trigger", "some_trigger"),
+        ]);
         let c = codes_with(
-            "some_effect = { trigger = { limit = { is_ai = yes } } }\n",
-            &rs,
+            COMPONENTS,
+            "weapon_component_template = { key = \"GUN\" type = instant }\n",
+            &RuleSet::new(),
+            Some(&idx),
         );
-        assert!(
-            !has_code(&c, "CW120"),
-            "pretrigger nested inside trigger.limit should NOT fire CW120 (matches F#), got: {:?}",
-            c
-        );
+        assert!(!has_code(&c, "CW250"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn planet_killer_incomplete_index_stays_quiet() {
+        // Without vanilla merged (complete = false) the on_action/trigger sets
+        // are partial — no CW250.
+        let mut idx = index_with(&[("on_action", "on_game_start")]);
+        idx.complete = false;
+        let c = codes_with(COMPONENTS, PK_TEMPLATE, &RuleSet::new(), Some(&idx));
+        assert!(!has_code(&c, "CW250"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn planet_killer_outside_component_templates_is_not_checked() {
+        let idx = index_with(&[
+            ("on_action", "on_game_start"),
+            ("scripted_trigger", "some_trigger"),
+        ]);
+        let c = codes_with(EVENTS, PK_TEMPLATE, &RuleSet::new(), Some(&idx));
+        assert!(!has_code(&c, "CW250"), "got: {:?}", c);
     }
 
     // ── Ship Design (CW227 / CW229) ────────────────────────────────────────
 
-    fn codes_with_type_index(
-        script: &str,
-        ruleset: &RuleSet,
-        type_index: &TypeIndex,
-    ) -> Vec<(String, u32, u16)> {
-        let table = StringTable::new();
-        let ast = parse_string(script, &table).unwrap();
-        let mut errors = Vec::new();
-        validate_stellaris(
-            &ast,
-            ruleset,
-            &table,
-            "test.txt",
-            Some(type_index),
-            &mut errors,
-        );
-        errors
-            .into_iter()
-            .filter_map(|e| e.code.map(|c| (c.to_string(), e.line, e.col)))
-            .collect()
-    }
-
-    /// TypeIndex::new() is empty; adding a name populates `contains` for it.
     #[test]
     fn ship_design_section_template_not_found_is_cw227() {
-        let index = TypeIndex::new();
-        // No section_template names registered — every reference is unknown.
-        let c = codes_with_type_index(
+        // Index is complete and knows OTHER section templates — the referenced
+        // one is genuinely unknown.
+        let idx = index_with(&[("section_template", "SSM_known_01")]);
+        let c = codes_with(
+            EVENTS,
             "ship_design = { section = { template = \"SSM_unknown_01\" slot = \"A\" } }\n",
             &RuleSet::new(),
-            &index,
+            Some(&idx),
         );
         assert!(
             has_code(&c, "CW227"),
@@ -973,35 +1257,26 @@ mod tests {
         );
     }
 
-    /// When the type index has no data (empty), the validator fires CW227 for
-    /// any referenced section_template — it can't prove the template exists,
-    /// so it reports it as missing. The fix path is to load a mod whose
-    /// `common/section_templates/*.txt` populates the type index.
     #[test]
-    fn ship_design_empty_type_index_falls_back_to_unknown() {
-        let index = TypeIndex::new();
-        let c = codes_with_type_index(
-            "\
-                section_template = { key = \"SSM_known_01\" }\n\
-                ship_design = { section = { template = \"SSM_known_01\" slot = \"A\" } }\n\
-            ",
+    fn ship_design_known_section_template_is_clean() {
+        let idx = index_with(&[("section_template", "SSM_known_01")]);
+        let c = codes_with(
+            EVENTS,
+            "ship_design = { section = { template = \"SSM_known_01\" slot = \"A\" } }\n",
             &RuleSet::new(),
-            &index,
+            Some(&idx),
         );
-        assert!(
-            has_code(&c, "CW227"),
-            "with no TypeIndex data, unknown template path should fire CW227, got: {:?}",
-            c
-        );
+        assert!(!has_code(&c, "CW227"), "got: {:?}", c);
     }
 
     #[test]
     fn ship_design_component_template_not_found_is_cw229() {
-        let index = TypeIndex::new();
-        let c = codes_with_type_index(
+        let idx = index_with(&[("component_template", "WEAPON_known")]);
+        let c = codes_with(
+            EVENTS,
             "ship_design = { component = { template = \"WEAPON_unknown\" slot = \"X\" } }\n",
             &RuleSet::new(),
-            &index,
+            Some(&idx),
         );
         assert!(
             has_code(&c, "CW229"),
@@ -1011,14 +1286,59 @@ mod tests {
     }
 
     #[test]
+    fn ship_design_default_section_templates_are_exempt() {
+        // Engine builtins no file defines — F#'s defaultTemplates.
+        let idx = index_with(&[("section_template", "SSM_known_01")]);
+        let c = codes_with(
+            EVENTS,
+            "ship_design = { section = { template = \"DEFAULT_COLONIZATION_SECTION\" slot = \"A\" } }\n",
+            &RuleSet::new(),
+            Some(&idx),
+        );
+        assert!(!has_code(&c, "CW227"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn ship_design_empty_type_index_stays_quiet() {
+        // No section templates indexed at all (e.g. rules without the
+        // section_template type) → can't distinguish unknown from unindexed,
+        // so stay quiet. Same rule as CW500.
+        let mut idx = index_with(&[]);
+        idx.complete = true;
+        let c = codes_with(
+            EVENTS,
+            "ship_design = { section = { template = \"SSM_known_01\" slot = \"A\" } }\n",
+            &RuleSet::new(),
+            Some(&idx),
+        );
+        assert!(!has_code(&c, "CW227"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn ship_design_incomplete_index_stays_quiet() {
+        // Mod validated without vanilla: vanilla template references must not
+        // false-positive.
+        let mut idx = index_with(&[("section_template", "SSM_known_01")]);
+        idx.complete = false;
+        let c = codes_with(
+            EVENTS,
+            "ship_design = { section = { template = \"SSM_vanilla_thing\" slot = \"A\" } }\n",
+            &RuleSet::new(),
+            Some(&idx),
+        );
+        assert!(!has_code(&c, "CW227"), "got: {:?}", c);
+    }
+
+    #[test]
     fn ship_design_walker_skips_non_ship_design_root() {
         // A `foo = { ... }` block at root is not a ship_design, so its inner
         // section/component entries are not validated.
-        let index = TypeIndex::new();
-        let c = codes_with_type_index(
+        let idx = index_with(&[("section_template", "SSM_known_01")]);
+        let c = codes_with(
+            EVENTS,
             "foo = { section = { template = \"X\" slot = \"A\" } }\n",
             &RuleSet::new(),
-            &index,
+            Some(&idx),
         );
         assert!(
             !has_code(&c, "CW227") && !has_code(&c, "CW229"),
@@ -1031,7 +1351,10 @@ mod tests {
     fn ship_design_no_type_index_skips_silently() {
         // Passing None for type_index — the validator must not crash and must
         // not emit CW227/CW229 (it has nothing to look up against).
-        let c = codes("ship_design = { section = { template = \"X\" slot = \"A\" } }\n");
+        let c = codes_at(
+            EVENTS,
+            "ship_design = { section = { template = \"X\" slot = \"A\" } }\n",
+        );
         assert!(
             !has_code(&c, "CW227") && !has_code(&c, "CW229"),
             "without a type index, ship-design validators should stay quiet, got: {:?}",
