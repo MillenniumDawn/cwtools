@@ -34,84 +34,72 @@ pub struct LocDiagnostic {
     pub message: String,
 }
 
-/// Single source of truth for a scope-independent loc-entry error's code,
-/// severity, and human-readable message (matching the F# `ErrorCodes` text).
-///
-/// Adding a `LocErrorKind` variant only needs one new arm here; the public
-/// `loc_error_code` / `loc_error_severity` accessors and the message used by the
-/// emission paths all derive from this.
+/// Single source of truth for a scope-independent loc-entry error's code and
+/// severity (matching the F# `ErrorCodes` mapping). Splitting this from the
+/// message means the code / severity accessors don't build (and discard) a
+/// formatted `String`, and the emission path formats each message exactly once.
+fn loc_error_code_severity(kind: &LocErrorKind) -> (&'static str, LocSeverity) {
+    match kind {
+        LocErrorKind::UndefinedLocReference { .. } => ("CW225", LocSeverity::Error),
+        LocErrorKind::RecursiveLocRef => ("CW259", LocSeverity::Error),
+        LocErrorKind::ReplaceMe => ("CW234", LocSeverity::Information),
+        LocErrorKind::LocMissingQuote => ("CW268", LocSeverity::Warning),
+        LocErrorKind::LocInvalidChars => ("CW275", LocSeverity::Warning),
+        LocErrorKind::LocKeyInvalidChars => ("CW276", LocSeverity::Warning),
+    }
+}
+
+/// Code, severity, and human-readable message for a loc-entry error, built in one
+/// pass so the emission path (`build_diagnostics`) formats the message once.
 fn loc_error_parts(
     kind: &LocErrorKind,
     key: &str,
     lang: Option<Lang>,
 ) -> (&'static str, LocSeverity, String) {
-    let lang_label = lang
-        .map(|l| l.to_string())
-        .unwrap_or_else(|| "?".to_string());
-    match kind {
-        LocErrorKind::UndefinedLocReference { other_key } => (
-            "CW225",
-            LocSeverity::Error,
-            format!(
-                "Localisation key \"{}\" references \"{}\" which doesn't exist in {}",
-                key, other_key, lang_label
-            ),
-        ),
-        LocErrorKind::RecursiveLocRef => (
-            "CW259",
-            LocSeverity::Error,
-            "This localisation string refers to itself".to_string(),
-        ),
-        LocErrorKind::ReplaceMe => (
-            "CW234",
-            LocSeverity::Information,
-            format!(
-                "Localisation key {} is a placeholder for {}",
-                key, lang_label
-            ),
-        ),
-        LocErrorKind::LocMissingQuote => (
-            "CW268",
-            LocSeverity::Warning,
-            format!(
-                "Localisation key {} doesn't start and end with double quotes",
-                key
-            ),
-        ),
-        LocErrorKind::LocInvalidChars => (
-            "CW275",
-            LocSeverity::Warning,
-            format!(
-                "Localisation value for {} contains unexpected characters, and may not render correctly",
-                key
-            ),
-        ),
-        LocErrorKind::LocKeyInvalidChars => (
-            "CW276",
-            LocSeverity::Warning,
-            format!(
-                "Localisation key {} contains invalid characters (spaces or special characters are not allowed)",
-                key
-            ),
-        ),
-    }
+    let (code, severity) = loc_error_code_severity(kind);
+    (code, severity, loc_error_message(kind, key, lang))
 }
 
 /// The F# numeric code for a scope-independent loc-entry error.
 pub fn loc_error_code(kind: &LocErrorKind) -> &'static str {
-    // key/lang don't affect the code; pass placeholders.
-    loc_error_parts(kind, "", None).0
+    loc_error_code_severity(kind).0
 }
 
 /// The severity for a scope-independent loc-entry error.
 pub fn loc_error_severity(kind: &LocErrorKind) -> LocSeverity {
-    // key/lang don't affect the severity; pass placeholders.
-    loc_error_parts(kind, "", None).1
+    loc_error_code_severity(kind).1
 }
 
 /// Build the human-readable message, matching the F# `ErrorCodes` text.
 fn loc_error_message(kind: &LocErrorKind, key: &str, lang: Option<Lang>) -> String {
-    loc_error_parts(kind, key, lang).2
+    let lang_label = lang
+        .map(|l| l.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    match kind {
+        LocErrorKind::UndefinedLocReference { other_key } => format!(
+            "Localisation key \"{}\" references \"{}\" which doesn't exist in {}",
+            key, other_key, lang_label
+        ),
+        LocErrorKind::RecursiveLocRef => "This localisation string refers to itself".to_string(),
+        LocErrorKind::ReplaceMe => {
+            format!(
+                "Localisation key {} is a placeholder for {}",
+                key, lang_label
+            )
+        }
+        LocErrorKind::LocMissingQuote => format!(
+            "Localisation key {} doesn't start and end with double quotes",
+            key
+        ),
+        LocErrorKind::LocInvalidChars => format!(
+            "Localisation value for {} contains unexpected characters, and may not render correctly",
+            key
+        ),
+        LocErrorKind::LocKeyInvalidChars => format!(
+            "Localisation key {} contains invalid characters (spaces or special characters are not allowed)",
+            key
+        ),
+    }
 }
 
 /// F# `STLLang` case name, used to reproduce the CW257 message (`%A`).
@@ -234,13 +222,14 @@ fn build_diagnostics(
     }
 
     for err in validate_loc_file_with_hardcoded(file, union, extra_valid_refs, hardcoded) {
+        let (code, severity, message) = loc_error_parts(&err.kind, &err.key, lang);
         out.push(LocDiagnostic {
             file: file_path.to_string(),
             line: err.line,
             col: err.col,
-            code: loc_error_code(&err.kind),
-            severity: loc_error_severity(&err.kind),
-            message: loc_error_message(&err.kind, &err.key, lang),
+            code,
+            severity,
+            message,
         });
     }
     out
@@ -274,7 +263,7 @@ pub fn validate_loc_project(service: &LocService, game: Game) -> Vec<LocDiagnost
 /// defined, suppressing CW225. Pass `&HashSet::new()` for none.
 pub fn validate_loc_project_scoped(
     service: &LocService,
-    _game: Game,
+    game: Game,
     langs: Option<&[Lang]>,
     extra_valid_refs: &HashSet<String>,
 ) -> Vec<LocDiagnostic> {
@@ -291,11 +280,28 @@ pub fn validate_loc_project_scoped(
         .par_iter()
         .flat_map_iter(|file| file.entries.iter().map(|e| e.key.to_lowercase()))
         .collect();
+    validate_loc_project_with_union(service, game, langs, &union, extra_valid_refs)
+}
+
+/// As [`validate_loc_project_scoped`], but reuses a caller-owned key `union`
+/// instead of rebuilding it. The [`crate::LocIndex`] already holds the lowercased
+/// union (with any merged vanilla-cache keys); passing it by reference avoids a
+/// third full materialization of the ~2M-key universe per run. When the union
+/// carries cached vanilla keys it's a superset, but a `$ref$` found in it only
+/// triggers the recursion check on a self-reference (the entry's own key, always
+/// present regardless), so the emitted diagnostics are unchanged.
+pub fn validate_loc_project_with_union(
+    service: &LocService,
+    _game: Game,
+    langs: Option<&[Lang]>,
+    union: &HashSet<String>,
+    extra_valid_refs: &HashSet<String>,
+) -> Vec<LocDiagnostic> {
+    use rayon::prelude::*;
 
     // Each file validates independently against the read-only key union, so the
     // per-file pass runs in parallel. `par_iter` over the indexed `files` slice
     // collects in input order — output matches the sequential version.
-    let union_ref = &union;
     // Lowercased hardcoded-loc set, built once and shared read-only across the
     // per-file parallel pass (was re-lowercased + re-collected per file).
     let hardcoded = hardcoded_loc_set();
@@ -313,7 +319,7 @@ pub fn validate_loc_project_scoped(
             build_diagnostics(
                 file,
                 &file.path,
-                union_ref,
+                union,
                 extra_valid_refs,
                 hardcoded,
                 should_emit_cw254(file),

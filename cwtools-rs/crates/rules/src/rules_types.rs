@@ -63,6 +63,16 @@ pub struct RuleSet {
     /// instead of guessing from a fixed key list, so members under non-obvious keys
     /// (`token_base`, `id`, `legacy_id`, `array`, …) are still collected.
     pub value_set_effect_fields: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Built by `reindex()`, parallel to `enums`: each enum's values lowercased
+    /// into a set for O(1) case-insensitive membership (matches the
+    /// `eq_ignore_ascii_case` scans in the validator). Empty until reindex.
+    pub enum_values_lower: Vec<rustc_hash::FxHashSet<String>>,
+    /// Built by `reindex()`, parallel to `enums`: whether the enum has any
+    /// `@`-prefixed scripted-constant member. Empty until reindex.
+    pub enum_has_at: Vec<bool>,
+    /// Built by `reindex()`, keyed like `values`: each `value[name]` set as a
+    /// `FxHashSet` for O(1) exact membership. Empty until reindex.
+    pub value_sets: std::collections::HashMap<String, rustc_hash::FxHashSet<String>>,
 }
 
 /// Scope/link config inputs (`scopes.cwt` / `links.cwt`). The types live in the
@@ -204,6 +214,9 @@ impl RuleSet {
             type_rules_idx: std::collections::HashMap::new(),
             value_set_effects: std::collections::HashMap::new(),
             value_set_effect_fields: std::collections::HashMap::new(),
+            enum_values_lower: Vec::new(),
+            enum_has_at: Vec::new(),
+            value_sets: std::collections::HashMap::new(),
         }
     }
 
@@ -354,6 +367,21 @@ impl RuleSet {
         for (i, e) in self.enums.iter().enumerate() {
             self.enum_by_name.insert(e.key.clone(), i);
         }
+        self.enum_values_lower = self
+            .enums
+            .iter()
+            .map(|e| e.values.iter().map(|v| v.to_ascii_lowercase()).collect())
+            .collect();
+        self.enum_has_at = self
+            .enums
+            .iter()
+            .map(|e| e.values.iter().any(|v| v.starts_with('@')))
+            .collect();
+        self.value_sets = self
+            .values
+            .iter()
+            .map(|(k, vs)| (k.clone(), vs.iter().cloned().collect()))
+            .collect();
         self.type_rules_idx.clear();
         for (i, rr) in self.root_rules.iter().enumerate() {
             if let RootRule::TypeRule(name, _) = rr {
@@ -361,6 +389,63 @@ impl RuleSet {
                 // first TypeRule with a given name.
                 self.type_rules_idx.entry(name.clone()).or_insert(i);
             }
+        }
+    }
+
+    /// Case-insensitive membership in enum `idx`'s values. Uses the precomputed
+    /// lowercased set built by `reindex()`; falls back to a scan when the set
+    /// isn't built yet (e.g. a ruleset assembled in a test without reindex).
+    pub fn enum_values_contains_ci(&self, idx: usize, value: &str) -> bool {
+        match self.enum_values_lower.get(idx) {
+            Some(set) => {
+                // The set stores lowercased values; probe directly when `value`
+                // is already lowercase, else allocate the lowercased form once.
+                if value.bytes().any(|b| b.is_ascii_uppercase()) {
+                    set.contains(&value.to_ascii_lowercase() as &str)
+                } else {
+                    set.contains(value)
+                }
+            }
+            None => self.enums[idx]
+                .values
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(value)),
+        }
+    }
+
+    /// Whether enum `idx` has any `@`-prefixed scripted-constant member. Uses the
+    /// precomputed flag from `reindex()`, with a scan fallback.
+    pub fn enum_has_at_constant(&self, idx: usize) -> bool {
+        match self.enum_has_at.get(idx) {
+            Some(&b) => b,
+            None => self.enums[idx].values.iter().any(|v| v.starts_with('@')),
+        }
+    }
+
+    /// Exact membership in the `value[name]` set, mirroring `values.get(name)`:
+    /// `Some(is_member)` when the set exists and is non-empty, `None` when the
+    /// set is absent or empty. Uses the precomputed `value_sets`, falling back to
+    /// the source `values` Vec when it isn't built yet.
+    pub fn value_set_lookup(&self, name: &str, value: &str) -> Option<bool> {
+        if let Some(set) = self.value_sets.get(name)
+            && !set.is_empty()
+        {
+            return Some(set.contains(value));
+        }
+        match self.values.get(name) {
+            Some(vs) if !vs.is_empty() => Some(vs.iter().any(|v| v == value)),
+            _ => None,
+        }
+    }
+}
+
+impl From<&Severity> for cwtools_error_codes::ErrorSeverity {
+    fn from(sev: &Severity) -> Self {
+        match sev {
+            Severity::Error => Self::Error,
+            Severity::Warning => Self::Warning,
+            Severity::Information => Self::Information,
+            Severity::Hint => Self::Hint,
         }
     }
 }

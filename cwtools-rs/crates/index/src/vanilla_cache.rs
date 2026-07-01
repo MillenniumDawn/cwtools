@@ -157,7 +157,7 @@ fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
 /// `type_per_file`, `key_prefix`, `type_key_filter`, `unique`, and subtype
 /// key fields. When these change, a cache built from the old rules is stale even
 /// if the game version is identical, so this is folded into the fingerprint.
-pub fn ruleset_shape_hash(ruleset: &RuleSet) -> String {
+pub(crate) fn ruleset_shape_hash(ruleset: &RuleSet) -> String {
     let skip_str = |s: &SkipRootKey| match s {
         SkipRootKey::SpecificKey(k) => format!("s:{k}"),
         SkipRootKey::AnyKey => "any".to_string(),

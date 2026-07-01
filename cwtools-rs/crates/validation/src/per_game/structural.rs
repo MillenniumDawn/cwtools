@@ -95,14 +95,14 @@ fn push(
     r: SourceRange,
     file: &str,
 ) {
-    errors.push(ValidationError {
-        message: msg,
-        severity: code.severity,
-        line: r.start.line,
-        col: r.start.col,
-        file: file.to_string(),
-        code: Some(code.id),
-    });
+    errors.push(ValidationError::from_code_with(
+        code,
+        code.severity,
+        file,
+        r.start.line,
+        r.start.col,
+        msg,
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]

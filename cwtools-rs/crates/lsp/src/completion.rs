@@ -103,8 +103,7 @@ impl Backend {
             return Ok(None);
         }
 
-        let lsp_line = pos.line + 1;
-        let lsp_col = pos.character as u16;
+        let (lsp_line, lsp_col) = crate::paths::lsp_pos_to_source(pos);
 
         // Try context-aware completions first: resolve the rules at the cursor
         // with the validation engine's own descent (aliases, typed keys,
@@ -129,11 +128,9 @@ impl Backend {
         // running. The same pattern for the rules guard: clone the Arcs and
         // drop the guard. The helpers below take borrows, so the Arcs carry
         // the lifetime across the work without holding the lock.
-        let (doc_text, doc_ast): (String, Option<Arc<ParsedFile>>) = {
+        let doc_text: String = {
             let docs = self.state.documents.lock();
-            docs.get(&uri)
-                .map(|d| (d.text.clone(), d.ast.clone()))
-                .unwrap_or_default()
+            docs.get(&uri).map(|d| d.text.clone()).unwrap_or_default()
         };
         // Replace-range for every item the script paths return: the identifier
         // token under the cursor. Loc completion keeps its own behavior (the
@@ -198,26 +195,10 @@ impl Backend {
         // an unknown block where suggestions from any other level would be
         // wrong). `None` = no doc/ruleset/AST — fall through to the flat list.
         //
-        // Re-parse on demand when the AST is missing: the last parse failed
-        // (the user typed something unparseable), so `doc.ast` is None. Try
-        // a fresh parse for THIS request only — if the user has since added a
-        // `}` or fixed the syntax, the new AST is closer to the live text
-        // and `rules_at_pos` finds a useful context. The fresh AST is not
-        // written back; the debounced validate still owns the long-term one.
-        // Wrapped in `block_in_place` so the parse doesn't stall the async
-        // executor for slow large files.
-        let effective_ast: Option<Arc<ParsedFile>> = match doc_ast {
-            Some(ast) => Some(ast),
-            None => {
-                let text = doc_text.clone();
-                let table = self.state.string_table.clone();
-                tokio::task::block_in_place(|| {
-                    cwtools_parser::parser::parse_string(&text, &table)
-                        .ok()
-                        .map(Arc::new)
-                })
-            }
-        };
+        // `ast_for` returns the last good parse, or (when the last parse failed)
+        // a fresh parse of the live text for this request only, so a half-typed
+        // buffer still resolves a context.
+        let effective_ast: Option<Arc<ParsedFile>> = self.ast_for(&uri);
         let context_items: Option<Vec<CompletionItem>> = match (effective_ast, ruleset_arc.as_ref())
         {
             (Some(ast), Some(rs)) => {

@@ -111,9 +111,6 @@ pub struct Session {
     loc_languages: Option<Vec<Lang>>,
     registry: Option<Arc<ScopeRegistry>>,
     directory: PathBuf,
-    /// True when vanilla loc keys came from a cache rather than the loc_service
-    /// walk — loc `$ref$` resolution must then consult the loc_index union too.
-    vanilla_loc_cached: bool,
 }
 
 impl Session {
@@ -301,7 +298,6 @@ impl Session {
         let loc_game = cwtools_localization::Game::from_engine(Some(game));
         let mut loc_index =
             LocIndex::build_scoped(&loc_service, loc_game, loc_languages.as_deref());
-        let vanilla_loc_cached = cached_loc_keys.is_some();
         if let Some(keys) = cached_loc_keys {
             let typed: Vec<(Lang, Vec<String>)> = keys
                 .into_iter()
@@ -325,7 +321,6 @@ impl Session {
             loc_languages,
             registry,
             directory,
-            vanilla_loc_cached,
         }
         .with_parsed_cache(parsed, discovery_failed)
     }
@@ -372,10 +367,13 @@ impl Session {
     /// mod+vanilla union; the caller filters to mod-path files.
     pub fn loc_project_diagnostics(&self) -> Vec<LocDiagnostic> {
         let extra = self.loc_extra_valid_refs();
-        cwtools_localization::validate_loc_project_scoped(
+        // Reuse the prebuilt loc-index union (with cached vanilla keys already
+        // merged) rather than rebuilding the ~2M-key set here.
+        cwtools_localization::validate_loc_project_with_union(
             &self.loc_service,
             self.loc_game,
             self.loc_languages.as_deref(),
+            self.loc_index.union(),
             &extra,
         )
     }
@@ -383,16 +381,12 @@ impl Session {
     /// Names a loc `$ref$` may resolve to besides loc keys: the engine resolves
     /// `$modifier$` / `$idea$` / `$dynamic_modifier$` embeds and `$some_variable$`
     /// substitutions against those registries. Lowercased to match the loc union's
-    /// case-insensitive lookup. With a vanilla cache the loc_service holds no
-    /// vanilla keys, so the loc_index union (which has the cached keys merged in)
-    /// joins the set — otherwise mod loc referencing a base-game key would flag
-    /// CW225.
+    /// case-insensitive lookup. Cached vanilla keys are resolved via the loc-index
+    /// union passed to `validate_loc_project_with_union`, so they don't need to be
+    /// duplicated into this set.
     pub fn loc_extra_valid_refs(&self) -> HashSet<String> {
         let mut extra = self.modifier_keys.clone();
         extra.extend(self.type_index.loc_bindable_names());
-        if self.vanilla_loc_cached {
-            extra.extend(self.loc_index.union().iter().cloned());
-        }
         extra
     }
 

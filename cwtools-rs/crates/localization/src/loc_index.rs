@@ -52,7 +52,11 @@ impl LocIndex {
             for entry in &file.entries {
                 let lower = entry.key.to_lowercase();
                 set.insert(lower.clone());
-                union.insert(lower.clone());
+                // Duplicate keys across files/languages are common (~2M entries,
+                // far fewer unique); only clone into the union when it's new.
+                if !union.contains(&lower) {
+                    union.insert(lower.clone());
+                }
 
                 // Representative entry for command validation only — skip keys
                 // with no commands so the map stays tiny.

@@ -58,6 +58,15 @@ fn normalize_separators(path: String) -> String {
     }
 }
 
+/// Convert an LSP `Position` to the parser's 1-based line + 0-based column pair.
+/// The parser counts Unicode scalar values (`char`s) and stores columns as
+/// `u16`; the LSP column is UTF-16 code units (they agree on BMP-only lines).
+/// One place for the `line + 1` / `as u16` conversion the position resolvers all
+/// need — see the `position_encoding` note in `initialize_impl`.
+pub(crate) fn lsp_pos_to_source(pos: tower_lsp::lsp_types::Position) -> (u32, u16) {
+    (pos.line + 1, pos.character as u16)
+}
+
 /// Parse a string into an LSP Url, falling back to a clone of `fallback` on error.
 pub(crate) fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
     uri_str
@@ -155,8 +164,10 @@ pub(crate) fn current_token_range(
 /// counts as loc (previously hover/goto only matched `.yml`, so loc resolution
 /// silently skipped `.yaml`/`.csv` files that completion and validate handled).
 pub(crate) fn is_loc_file(uri: &str) -> bool {
-    let lower = uri.to_ascii_lowercase();
-    lower.ends_with(".yml") || lower.ends_with(".yaml") || lower.ends_with(".csv")
+    std::path::Path::new(uri)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(cwtools_file_manager::is_loc_ext)
 }
 
 /// Whether a URI is a `.cwt` rule-config file. These are the schema the rules

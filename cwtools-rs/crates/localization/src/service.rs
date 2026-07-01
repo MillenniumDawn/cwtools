@@ -8,7 +8,10 @@
 use crate::commands::{Lang, LocFile};
 use crate::csv_parser::parse_csv_loc_per_lang;
 use crate::yaml_parser::parse_loc_text;
-use cwtools_file_manager::{FileEncoding, read_text_with_encoding};
+use cwtools_file_manager::{
+    FileEncoding, is_excluded_dir, is_excluded_root_dir, is_loc_ext, read_text_with_encoding,
+};
+use std::path::{Path, PathBuf};
 
 /// A multi-file localization service for a single game.
 ///
@@ -38,48 +41,16 @@ impl LocService {
         // Parsing is independent per file; run it in parallel, preserving input
         // order (`par_iter` over the indexed Vec) so first-seen-wins semantics
         // and diagnostics order are unchanged.
-        //
-        // CSV files (CK2/VIC2) are routed through csv_parser; everything else
-        // goes through parse_loc_text (YAML).
         let results: Vec<Result<Vec<LocFile>, (String, String)>> = files
             .into_par_iter()
-            .map(|(path, text, encoding)| {
-                if path.ends_with(".csv") {
-                    // CSV: produce one LocFile per language present in the file.
-                    let entries_by_lang = parse_csv_loc_per_lang(&text, &path, None);
-                    // Group by lang
-                    let mut by_lang: std::collections::HashMap<
-                        Lang,
-                        Vec<crate::commands::LocEntry>,
-                    > = std::collections::HashMap::new();
-                    for (_key, lang, entry) in entries_by_lang {
-                        by_lang.entry(lang).or_default().push(entry);
-                    }
-                    let loc_files: Vec<LocFile> = by_lang
-                        .into_iter()
-                        .map(|(lang, entries)| LocFile {
-                            path: path.clone(),
-                            language_prefix: lang.to_string(),
-                            lang: Some(lang),
-                            entries,
-                            file_diagnostics: Vec::new(),
-                            parse_errors: Vec::new(),
-                            encoding,
-                        })
-                        .collect();
-                    Ok(loc_files)
-                } else {
-                    match parse_loc_text(&text, &path) {
-                        Ok(mut file) => {
-                            file.encoding = encoding;
-                            Ok(vec![file])
-                        }
-                        Err(e) => Err((path, e)),
-                    }
-                }
-            })
+            .map(|(path, text, encoding)| parse_loc_file_entry(path, text, encoding))
             .collect();
+        Self::from_results(results)
+    }
 
+    /// Collect the parallel per-file parse results into the service, preserving
+    /// input order for first-seen-wins semantics and diagnostics order.
+    fn from_results(results: Vec<Result<Vec<LocFile>, (String, String)>>) -> Self {
         let mut parsed: Vec<LocFile> = Vec::new();
         let mut errors: Vec<(String, String)> = Vec::new();
         for r in results {
@@ -88,7 +59,6 @@ impl LocService {
                 Err(e) => errors.push(e),
             }
         }
-
         Self {
             files: parsed,
             errors,
@@ -96,19 +66,38 @@ impl LocService {
     }
 
     /// Load from a directory tree (recursively).
-    pub fn from_folder(folder: &std::path::Path) -> Self {
-        Self::from_files_with_encoding(walk_folder(folder))
+    pub fn from_folder(folder: &Path) -> Self {
+        Self::from_paths(walk_folder(folder))
     }
 
     /// Load from several directory trees (e.g. a mod dir plus the vanilla
     /// install). Later folders' keys join the union; duplicate keys keep the
     /// first-seen entry per language.
-    pub fn from_folders(folders: &[&std::path::Path]) -> Self {
-        let mut files = Vec::new();
+    pub fn from_folders(folders: &[&Path]) -> Self {
+        let mut paths = Vec::new();
         for folder in folders {
-            files.extend(walk_folder(folder));
+            paths.extend(walk_folder(folder));
         }
-        Self::from_files_with_encoding(files)
+        Self::from_paths(paths)
+    }
+
+    /// Read and parse a set of loc files in parallel. Reading (disk I/O) happens
+    /// inside the parallel map alongside parsing — mirroring the CLI's
+    /// `discover_and_parse` — so a large loc tree isn't read sequentially before
+    /// the parse fans out.
+    fn from_paths(paths: Vec<PathBuf>) -> Self {
+        use rayon::prelude::*;
+        let results: Vec<Result<Vec<LocFile>, (String, String)>> = paths
+            .into_par_iter()
+            .map(|path| {
+                let path_str = path.to_string_lossy().to_string();
+                match read_text_with_encoding(&path) {
+                    Ok((text, enc)) => parse_loc_file_entry(path_str, text, Some(enc)),
+                    Err(e) => Err((path_str, format!("IO error: {}", e))),
+                }
+            })
+            .collect();
+        Self::from_results(results)
     }
 
     /// All successfully parsed loc files (the single owner of loc entries).
@@ -135,7 +124,48 @@ impl LocService {
     }
 }
 
-type WalkedFile = (String, String, Option<FileEncoding>);
+/// Parse one loc file's text. CSV files (CK2/VIC2) are routed through
+/// `csv_parser` (one `LocFile` per language present); everything else goes
+/// through `parse_loc_text` (YAML).
+fn parse_loc_file_entry(
+    path: String,
+    text: String,
+    encoding: Option<FileEncoding>,
+) -> Result<Vec<LocFile>, (String, String)> {
+    let is_csv = Path::new(&path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+    if is_csv {
+        // CSV: produce one LocFile per language present in the file.
+        let entries_by_lang = parse_csv_loc_per_lang(&text, &path, None);
+        let mut by_lang: std::collections::HashMap<Lang, Vec<crate::commands::LocEntry>> =
+            std::collections::HashMap::new();
+        for (_key, lang, entry) in entries_by_lang {
+            by_lang.entry(lang).or_default().push(entry);
+        }
+        let loc_files: Vec<LocFile> = by_lang
+            .into_iter()
+            .map(|(lang, entries)| LocFile {
+                path: path.clone(),
+                language_prefix: lang.to_string(),
+                lang: Some(lang),
+                entries,
+                file_diagnostics: Vec::new(),
+                parse_errors: Vec::new(),
+                encoding,
+            })
+            .collect();
+        Ok(loc_files)
+    } else {
+        match parse_loc_text(&text, &path) {
+            Ok(mut file) => {
+                file.encoding = encoding;
+                Ok(vec![file])
+            }
+            Err(e) => Err((path, e)),
+        }
+    }
+}
 
 /// True for a directory name the game treats as a localisation root.
 fn is_loc_dir_name(name: &str) -> bool {
@@ -143,24 +173,25 @@ fn is_loc_dir_name(name: &str) -> bool {
     lower == "localisation" || lower == "localization"
 }
 
-/// Tooling / VCS directories that never hold game loc. Skipped during the walk so
-/// a mirror of the mod tree (e.g. a `.claude/worktrees/<wt>/localisation`, a
-/// `.git` checkout, or `node_modules`) isn't loaded and double-counted. Mirrors
-/// the intent of `FileManager`'s `exclude_dirs` for the separate loc walker. Any
-/// dot-directory is skipped, covering `.git`/`.claude`/`.vscode`/`.idea`/`.vs`.
-fn is_excluded_loc_dir(name: &str) -> bool {
-    name.starts_with('.') || matches!(name, "node_modules" | "target")
+/// Tooling / VCS / build directories that never hold game loc. Skipped during the
+/// walk so a mirror of the mod tree (e.g. a `.claude/worktrees/<wt>/localisation`,
+/// a `.git` checkout, or `node_modules`) isn't loaded and double-counted. Shares
+/// `FileManager`'s exclusion set so the two walkers stay consistent; any
+/// dot-directory is additionally skipped, and the root-anchored `resources/`
+/// exclusion applies only to a direct child of the walk root.
+fn is_excluded_loc_dir(name: &str, at_root: bool) -> bool {
+    name.starts_with('.') || is_excluded_dir(name) || (at_root && is_excluded_root_dir(name))
 }
 
-fn walk_folder(folder: &std::path::Path) -> Vec<WalkedFile> {
+fn walk_folder(folder: &Path) -> Vec<PathBuf> {
     // Only files under a `localisation` (or `localization`) directory are loc —
     // that's what the game and F# load. Scanning every `.yml` in the tree pulls
     // in CI workflows, editor caches, and staging copies as bogus loc files
     // (false CW254/CW268) and wastes memory on data the game never reads.
-    walk_folder_inner(folder, false)
+    walk_folder_inner(folder, false, true)
 }
 
-fn walk_folder_inner(folder: &std::path::Path, in_loc: bool) -> Vec<WalkedFile> {
+fn walk_folder_inner(folder: &Path, in_loc: bool, at_root: bool) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(entries) = std::fs::read_dir(folder) else {
         return files;
@@ -170,30 +201,18 @@ fn walk_folder_inner(folder: &std::path::Path, in_loc: bool) -> Vec<WalkedFile> 
         let path = entry.path();
         if path.is_dir() {
             let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if is_excluded_loc_dir(dir_name) {
+            if is_excluded_loc_dir(dir_name, at_root) {
                 continue;
             }
             let child_in_loc = in_loc || is_loc_dir_name(dir_name);
-            files.extend(walk_folder_inner(&path, child_in_loc));
+            files.extend(walk_folder_inner(&path, child_in_loc, false));
         } else if in_loc
-            && matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("yml") | Some("csv")
-            )
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(is_loc_ext)
         {
-            match read_text_with_encoding(&path) {
-                Ok((text, enc)) => {
-                    files.push((path.to_string_lossy().to_string(), text, Some(enc)));
-                }
-                Err(e) => {
-                    // Propagate IO errors as a failed entry so callers can report them.
-                    files.push((
-                        path.to_string_lossy().to_string(),
-                        format!("IO error: {}", e),
-                        None,
-                    ));
-                }
-            }
+            files.push(path);
         }
     }
 
@@ -213,12 +232,19 @@ mod tests {
             ".idea",
             "node_modules",
             "target",
+            "out",
+            "dist",
+            "bin",
+            "obj",
         ] {
-            assert!(is_excluded_loc_dir(skip), "{skip} should be skipped");
+            assert!(is_excluded_loc_dir(skip, false), "{skip} should be skipped");
         }
         for keep in ["localisation", "localization", "common", "english"] {
-            assert!(!is_excluded_loc_dir(keep), "{keep} should be walked");
+            assert!(!is_excluded_loc_dir(keep, false), "{keep} should be walked");
         }
+        // `resources` is excluded only at the walk root.
+        assert!(is_excluded_loc_dir("resources", true));
+        assert!(!is_excluded_loc_dir("resources", false));
     }
 
     #[test]

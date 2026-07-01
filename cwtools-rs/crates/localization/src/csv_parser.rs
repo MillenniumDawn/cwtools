@@ -38,7 +38,7 @@ pub const CK2_COLUMN_LANGS: &[Option<Lang>] = &[
 /// header lines which are also skipped (not parsed as data).
 ///
 /// Returns `(key, lang, LocEntry)` triples so the caller can bucket them.
-pub fn parse_csv_loc_per_lang(
+pub(crate) fn parse_csv_loc_per_lang(
     text: &str,
     name: &str,
     column_langs: Option<&[Option<Lang>]>,
@@ -99,7 +99,7 @@ pub fn parse_csv_loc_per_lang(
 /// that only care about one language.
 ///
 /// Uses `CK2_COLUMN_LANGS` column mapping.
-pub fn parse_csv_loc_for_lang(text: &str, name: &str, lang: Lang) -> Vec<LocEntry> {
+pub(crate) fn parse_csv_loc_for_lang(text: &str, name: &str, lang: Lang) -> Vec<LocEntry> {
     parse_csv_loc_per_lang(text, name, None)
         .into_iter()
         .filter_map(|(_, l, e)| if l == lang { Some(e) } else { None })

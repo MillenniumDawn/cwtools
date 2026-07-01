@@ -195,12 +195,12 @@ fn push_loc_command_diagnostic(
             (code, code.format(&[loc_key, command.as_str()]))
         }
     };
-    errors.push(ValidationError {
+    errors.push(ValidationError::from_code_with(
+        code,
+        code.severity,
+        file_path,
+        leaf.pos.start.line,
+        leaf.pos.start.col,
         message,
-        severity: code.severity,
-        line: leaf.pos.start.line,
-        col: leaf.pos.start.col,
-        file: file_path.to_string(),
-        code: Some(code.id),
-    });
+    ));
 }

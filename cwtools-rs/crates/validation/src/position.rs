@@ -422,7 +422,7 @@ fn descend(
                             // offers `value`, the `mathexpr` operators, and
                             // variable operands inside the block.
                             rt if crate::rule_core::rule_right_is_math_expr(rt) => {
-                                next.extend(crate::rule_core::math_clause_rules());
+                                next.extend(crate::rule_core::math_clause_rules().iter().cloned());
                                 entered.get_or_insert(opts);
                             }
                             _ => {}

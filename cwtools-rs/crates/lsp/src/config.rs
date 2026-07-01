@@ -324,8 +324,22 @@ impl Backend {
             }
         }
 
+        // Negotiate position encoding. The parser counts Unicode scalar values
+        // (chars), which equal UTF-32 code units, so advertise utf-32 when the
+        // client lists it — that client then gets exact columns on non-BMP
+        // lines for free. Clients that don't advertise utf-32 (VS Code) stay on
+        // the LSP default (utf-16), so their behavior is unchanged.
+        let position_encoding = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.as_ref())
+            .filter(|encs| encs.contains(&PositionEncodingKind::UTF32))
+            .map(|_| PositionEncodingKind::UTF32);
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                position_encoding,
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
@@ -362,15 +376,11 @@ impl Backend {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
-                // Position encoding: we do not negotiate position_encoding here,
-                // so clients default to UTF-16 (LSP spec default). The parser
-                // counts Unicode scalar values (chars), NOT UTF-16 code units.
-                // On BMP-only files (no surrogate pairs) the counts agree; on
-                // files containing emoji or non-BMP characters, column offsets
-                // will be off by the number of astral code points on the line.
-                // TODO: negotiate utf-8 or utf-32 once tower-lsp exposes
-                // PositionEncodingKind in InitializeResult, so clients that
-                // support utf-32 get exact columns for free.
+                // `position_encoding` (above): utf-32 when the client supports
+                // it, else the LSP default (utf-16). The parser counts chars,
+                // so on utf-16 clients column offsets are off by the number of
+                // astral code points on a line; utf-32 clients get exact
+                // columns since UTF-32 code units equal Unicode scalar values.
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -447,27 +457,46 @@ impl Backend {
                     .cache_dir
                     .clone()
                     .or_else(default_cache_dir);
+                let mut failures: Vec<String> = Vec::new();
                 if let Some(dir) = &dir {
                     let dir = dir.clone();
-                    tokio::task::block_in_place(|| {
-                        let _ = std::fs::remove_dir_all(dir.join("parse-cache"));
+                    failures = tokio::task::block_in_place(|| {
+                        let mut failures: Vec<String> = Vec::new();
+                        let parse_cache = dir.join("parse-cache");
+                        if let Err(e) = std::fs::remove_dir_all(&parse_cache)
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(path = %parse_cache.display(), error = %e, "clearAllCaches: remove parse-cache failed");
+                            failures.push(format!("{}: {}", parse_cache.display(), e));
+                        }
                         if let Ok(entries) = std::fs::read_dir(&dir) {
                             for e in entries.flatten() {
                                 let name = e.file_name();
-                                if name.to_string_lossy().starts_with("vanilla-") {
-                                    let _ = std::fs::remove_file(e.path());
+                                if name.to_string_lossy().starts_with("vanilla-")
+                                    && let Err(err) = std::fs::remove_file(e.path())
+                                {
+                                    tracing::warn!(path = %e.path().display(), error = %err, "clearAllCaches: remove vanilla cache failed");
+                                    failures.push(format!("{}: {}", e.path().display(), err));
                                 }
                             }
                         }
+                        failures
                     });
                 }
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
                 self.validate_entire_workspace().await;
-                Ok(Some(Value::String(
-                    "Caches cleared; workspace re-indexed.".to_string(),
-                )))
+                let msg = if failures.is_empty() {
+                    "Caches cleared; workspace re-indexed.".to_string()
+                } else {
+                    format!(
+                        "Caches cleared with {} error(s); workspace re-indexed. Failed: {}",
+                        failures.len(),
+                        failures.join("; ")
+                    )
+                };
+                Ok(Some(Value::String(msg)))
             }
             _ => Ok(None),
         }

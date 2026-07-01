@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
-use cwtools_info::{PositionElement, element_at_position};
+use cwtools_info::PositionElement;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType};
 use cwtools_string_table::string_table::StringTable;
 
@@ -114,16 +114,7 @@ impl Backend {
         // which the rule-aware path misses when the field is typed `scalar`. The
         // key is tried second so a definition node (e.g. `decision = { … }`)
         // still resolves. (#39)
-        let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri)
-            && let Some(ast) = &doc.ast
-            && let Some(element) = element_at_position(
-                ast,
-                pos.line + 1,
-                pos.character as u16,
-                &self.state.string_table,
-            )
-        {
+        if let Some(element) = self.element_at_cursor(&uri, pos) {
             let candidates: Vec<String> = match &element {
                 PositionElement::Leaf { key, value } if !value.is_empty() => {
                     vec![unquote(value).to_string(), key.clone()]
@@ -131,7 +122,6 @@ impl Backend {
                 PositionElement::Leaf { key, .. } => vec![key.clone()],
                 PositionElement::LeafValue { value } => vec![unquote(value).to_string()],
             };
-            drop(docs);
             let info = self.state.info_service.read();
             for symbol in candidates {
                 // Type-instance index first: events/decisions are keyed by id.
@@ -224,21 +214,12 @@ impl Backend {
                     .iter()
                     .filter(|(_, inst)| inst.name == instance_name)
                 {
-                    all_locs.push(Location {
-                        uri: file_uri.as_ref().parse().unwrap_or_else(|_| {
-                            params.text_document_position.text_document.uri.clone()
-                        }),
-                        range: Range {
-                            start: Position {
-                                line: inst.location.line.saturating_sub(1),
-                                character: inst.location.col as u32,
-                            },
-                            end: Position {
-                                line: inst.location.line.saturating_sub(1),
-                                character: inst.location.col as u32 + instance_name.len() as u32,
-                            },
-                        },
-                    });
+                    all_locs.push(source_loc_location(
+                        file_uri.as_ref(),
+                        inst.location,
+                        instance_name.len(),
+                        &params.text_document_position.text_document.uri,
+                    ));
                 }
             }
 
@@ -257,22 +238,12 @@ impl Backend {
                         &self.state.string_table,
                     );
                     for (file_uri, loc) in use_sites {
-                        all_locs.push(Location {
-                            uri: parse_uri(
-                                file_uri,
-                                &params.text_document_position.text_document.uri,
-                            ),
-                            range: Range {
-                                start: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: loc.col as u32,
-                                },
-                                end: Position {
-                                    line: loc.line.saturating_sub(1),
-                                    character: loc.col as u32 + instance_name.len() as u32,
-                                },
-                            },
-                        });
+                        all_locs.push(source_loc_location(
+                            &file_uri,
+                            loc,
+                            instance_name.len(),
+                            &params.text_document_position.text_document.uri,
+                        ));
                     }
                 }
             }
@@ -283,69 +254,33 @@ impl Backend {
         }
 
         // Fallback: heuristic-based approach
-        let docs = self.state.documents.lock();
-        if let Some(doc) = docs.get(&uri)
-            && let Some(ast) = &doc.ast
-            && let Some(element) = element_at_position(
-                ast,
-                pos.line + 1,
-                pos.character as u16,
-                &self.state.string_table,
-            )
-        {
+        if let Some(element) = self.element_at_cursor(&uri, pos) {
             let symbol = match &element {
                 PositionElement::Leaf { key, .. } => key.clone(),
                 PositionElement::LeafValue { value } => value.clone(),
             };
-            drop(docs);
             let info = self.state.info_service.read();
             let mut all_locs = Vec::new();
+            let fallback = &params.text_document_position.text_document.uri;
             if let Some(defs) = info.find_definitions(&symbol) {
-                all_locs.extend(defs.iter().map(|(file_uri, loc)| Location {
-                    uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
-                    range: Range {
-                        start: Position {
-                            line: loc.line.saturating_sub(1),
-                            character: loc.col as u32,
-                        },
-                        end: Position {
-                            line: loc.line.saturating_sub(1),
-                            character: (loc.col + symbol.len() as u16) as u32,
-                        },
-                    },
+                all_locs.extend(defs.iter().map(|(file_uri, loc)| {
+                    source_loc_location(file_uri, *loc, symbol.len(), fallback)
                 }));
             }
             if let Some(refs) = info.find_references(&symbol) {
-                all_locs.extend(refs.iter().map(|(file_uri, loc)| Location {
-                    uri: parse_uri(file_uri, &params.text_document_position.text_document.uri),
-                    range: Range {
-                        start: Position {
-                            line: loc.line.saturating_sub(1),
-                            character: loc.col as u32,
-                        },
-                        end: Position {
-                            line: loc.line.saturating_sub(1),
-                            character: (loc.col + symbol.len() as u16) as u32,
-                        },
-                    },
+                all_locs.extend(refs.iter().map(|(file_uri, loc)| {
+                    source_loc_location(file_uri, *loc, symbol.len(), fallback)
                 }));
             }
             let index = self.state.symbol_index.lock();
             if let Some(locs) = index.find_references(&symbol) {
                 all_locs.extend(locs.iter().map(|l| Location {
-                    uri: l.uri.parse().unwrap_or_else(|_| {
-                        params.text_document_position.text_document.uri.clone()
-                    }),
-                    range: Range {
-                        start: Position {
-                            line: l.line.saturating_sub(1),
-                            character: l.col as u32,
-                        },
-                        end: Position {
-                            line: l.line.saturating_sub(1),
-                            character: (l.col + symbol.len() as u16) as u32,
-                        },
-                    },
+                    uri: parse_uri(&l.uri, fallback),
+                    range: source_loc_to_range_at(
+                        l.line.saturating_sub(1),
+                        l.col as u32,
+                        symbol.len(),
+                    ),
                 }));
             }
             if !all_locs.is_empty() {
@@ -367,27 +302,15 @@ impl Backend {
         // per-file copy of these.
         let mut symbols: Vec<SymbolInformation> = Vec::new();
         for (type_name, inst) in info.type_index.instances_in_file(&uri) {
-            #[allow(deprecated)]
-            symbols.push(SymbolInformation {
-                name: inst.name.clone(),
-                kind: SymbolKind::STRUCT,
-                tags: None,
-                deprecated: None,
-                location: Location {
+            symbols.push(make_symbol(
+                inst.name.clone(),
+                SymbolKind::STRUCT,
+                Location {
                     uri: params.text_document.uri.clone(),
-                    range: Range {
-                        start: Position {
-                            line: inst.location.line.saturating_sub(1),
-                            character: inst.location.col as u32,
-                        },
-                        end: Position {
-                            line: inst.location.line.saturating_sub(1),
-                            character: inst.location.col as u32 + inst.name.len() as u32,
-                        },
-                    },
+                    range: source_loc_to_range(inst.location, inst.name.len()),
                 },
-                container_name: Some(type_name.to_string()),
-            });
+                Some(type_name.to_string()),
+            ));
         }
 
         // Also include @-variables as symbols (still tracked per-file).
@@ -399,27 +322,15 @@ impl Backend {
             });
         };
         for (name, loc) in &file_info.defined_variables {
-            #[allow(deprecated)]
-            symbols.push(SymbolInformation {
-                name: name.clone(),
-                kind: SymbolKind::CONSTANT,
-                tags: None,
-                deprecated: None,
-                location: Location {
+            symbols.push(make_symbol(
+                name.clone(),
+                SymbolKind::CONSTANT,
+                Location {
                     uri: params.text_document.uri.clone(),
-                    range: Range {
-                        start: Position {
-                            line: loc.line.saturating_sub(1),
-                            character: loc.col as u32,
-                        },
-                        end: Position {
-                            line: loc.line.saturating_sub(1),
-                            character: loc.col as u32 + name.len() as u32,
-                        },
-                    },
+                    range: source_loc_to_range(*loc, name.len()),
                 },
-                container_name: None,
-            });
+                None,
+            ));
         }
 
         if symbols.is_empty() {
@@ -436,34 +347,23 @@ impl Backend {
         let query = params.query.to_lowercase();
         let info = self.state.info_service.read();
         let mut symbols: Vec<SymbolInformation> = Vec::new();
+        // No request document to fall back to for a workspace-wide query.
+        let fallback = Url::parse("file:///unknown").expect("static URI");
 
         for (type_name, instances) in &info.type_index.map {
             for (file_uri, inst) in instances {
                 if query.is_empty() || inst.name.to_lowercase().contains(&query) {
-                    #[allow(deprecated)]
-                    symbols.push(SymbolInformation {
-                        name: inst.name.clone(),
-                        kind: SymbolKind::STRUCT,
-                        tags: None,
-                        deprecated: None,
-                        location: Location {
-                            uri: file_uri
-                                .as_ref()
-                                .parse()
-                                .unwrap_or_else(|_| Url::parse("file:///unknown").unwrap()),
-                            range: Range {
-                                start: Position {
-                                    line: inst.location.line.saturating_sub(1),
-                                    character: inst.location.col as u32,
-                                },
-                                end: Position {
-                                    line: inst.location.line.saturating_sub(1),
-                                    character: inst.location.col as u32 + inst.name.len() as u32,
-                                },
-                            },
-                        },
-                        container_name: Some(type_name.clone()),
-                    });
+                    symbols.push(make_symbol(
+                        inst.name.clone(),
+                        SymbolKind::STRUCT,
+                        source_loc_location(
+                            file_uri.as_ref(),
+                            inst.location,
+                            inst.name.len(),
+                            &fallback,
+                        ),
+                        Some(type_name.clone()),
+                    ));
                 }
                 // Cap at 500 to avoid flooding the client.
                 if symbols.len() >= 500 {
@@ -494,19 +394,25 @@ impl Backend {
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((_, instance_name)) = type_ref {
-            // Return a range covering the whole instance name token. The range
-            // start is computed by finding where the token begins relative to
-            // pos.character; for now we start at pos.character and extend right
-            // (the cursor is somewhere within the token).
-            // TODO: compute the true token-start position for mid-token cursors.
-            let range = Range {
-                start: Position {
+            // Return a range covering the whole instance-name token. Anchor the
+            // start at the token's beginning (so a mid-token cursor doesn't
+            // rename a shifted span) and extend by the name's length.
+            let text = {
+                let docs = self.state.documents.lock();
+                docs.get(&uri).map(|d| d.text.clone())
+            };
+            let start = match &text {
+                Some(t) => crate::paths::current_token_range(t, pos.line, pos.character).start,
+                None => Position {
                     line: pos.line,
                     character: pos.character,
                 },
+            };
+            let range = Range {
+                start,
                 end: Position {
                     line: pos.line,
-                    character: pos.character + instance_name.len() as u32,
+                    character: start.character + instance_name.len() as u32,
                 },
             };
             return Ok(Some(PrepareRenameResponse::Range(range)));
@@ -851,16 +757,61 @@ fn locations_at<'a>(
 fn line_location(file_uri: &str, line0: u32, col: u32, len: usize, fallback: &Url) -> Location {
     Location {
         uri: parse_uri(file_uri, fallback),
-        range: Range {
-            start: Position {
-                line: line0,
-                character: col,
-            },
-            end: Position {
-                line: line0,
-                character: col + len as u32,
-            },
+        range: source_loc_to_range_at(line0, col, len),
+    }
+}
+
+/// The LSP range for a `len`-char token at a 1-based `SourceLocation`. All
+/// arithmetic is `u32`-first so a long line or column can't wrap (the old
+/// `(col + len as u16) as u32` form truncated past 65535).
+pub(crate) fn source_loc_to_range(loc: cwtools_info::SourceLocation, len: usize) -> Range {
+    source_loc_to_range_at(loc.line.saturating_sub(1), loc.col as u32, len)
+}
+
+/// The LSP range for a `len`-char token at an already-0-based `(line0, col)`.
+fn source_loc_to_range_at(line0: u32, col: u32, len: usize) -> Range {
+    Range {
+        start: Position {
+            line: line0,
+            character: col,
         },
+        end: Position {
+            line: line0,
+            character: col + len as u32,
+        },
+    }
+}
+
+/// A `Location` for a `len`-char token at a 1-based `SourceLocation` in
+/// `file_uri`, falling back to `fallback` when the URI won't parse.
+pub(crate) fn source_loc_location(
+    file_uri: &str,
+    loc: cwtools_info::SourceLocation,
+    len: usize,
+    fallback: &Url,
+) -> Location {
+    Location {
+        uri: parse_uri(file_uri, fallback),
+        range: source_loc_to_range(loc, len),
+    }
+}
+
+/// Build a `SymbolInformation` (the `deprecated` field is required by the
+/// struct but deprecated by the protocol).
+fn make_symbol(
+    name: String,
+    kind: SymbolKind,
+    location: Location,
+    container_name: Option<String>,
+) -> SymbolInformation {
+    #[allow(deprecated)]
+    SymbolInformation {
+        name,
+        kind,
+        tags: None,
+        deprecated: None,
+        location,
+        container_name,
     }
 }
 

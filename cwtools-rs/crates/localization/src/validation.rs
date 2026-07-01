@@ -73,7 +73,7 @@ pub fn hardcoded_loc_set() -> &'static HashSet<String> {
 
 /// As [`validate_loc_file`], but takes the already-lowercased hardcoded set so
 /// the caller can build it once outside a per-file loop.
-pub fn validate_loc_file_with_hardcoded(
+pub(crate) fn validate_loc_file_with_hardcoded(
     file: &LocFile,
     all_keys: &HashSet<String>,
     extra_valid_refs: &HashSet<String>,
@@ -192,7 +192,7 @@ fn is_valid_loc_key_char(c: char) -> bool {
 ///
 /// Returns `true` if OK, `false` if unbalanced.
 /// On failure, sets `entry.error_range`.
-pub fn validate_quotes(entry: &LocEntry) -> bool {
+pub(crate) fn validate_quotes(entry: &LocEntry) -> bool {
     let trimmed = entry.desc.trim();
 
     let last_quote = trimmed.rfind('"');
