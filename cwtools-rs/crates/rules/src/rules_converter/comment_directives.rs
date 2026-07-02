@@ -188,11 +188,11 @@ pub(crate) fn options_from_comments(comments: &[String], is_comparison: bool) ->
         leafvalue: false,
         description,
         push_scope,
-        replace_scopes,
+        replace_scopes: replace_scopes.map(Box::new),
         severity,
         required_scopes,
         comparison: is_comparison,
-        reference_details,
+        reference_details: reference_details.map(Box::new),
         error_if_only_match,
         default_bool,
     }

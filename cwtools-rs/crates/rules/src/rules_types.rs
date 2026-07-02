@@ -703,11 +703,11 @@ pub struct Options {
     pub leafvalue: bool,
     pub description: Option<String>,
     pub push_scope: Option<String>,
-    pub replace_scopes: Option<ReplaceScopes>,
+    pub replace_scopes: Option<Box<ReplaceScopes>>,
     pub severity: Option<Severity>,
     pub required_scopes: Vec<String>,
     pub comparison: bool,
-    pub reference_details: Option<ReferenceDetail>,
+    pub reference_details: Option<Box<ReferenceDetail>>,
     // key_required_quotes, value_required_quotes, type_hint removed:
     // always default-valued, no readers (quoted-key enforcement unimplemented).
     pub error_if_only_match: Option<String>,
