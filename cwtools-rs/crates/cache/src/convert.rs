@@ -87,6 +87,118 @@ fn collect_value_strings<'a>(v: &'a CachedValue, out: &mut Vec<&'a str>) {
     }
 }
 
+/// Archived twin of [`cached_to_arena`]: walks the rkyv archived view directly,
+/// interning strings straight out of the mapped buffer. Same two-pass
+/// batch-intern structure; token assignment is identical.
+pub fn archived_to_arena(
+    cached: &ArchivedCachedFile,
+    string_table: &StringTable,
+) -> (Arena, Vec<Child>) {
+    let mut to_intern: Vec<&str> = Vec::new();
+    for l in cached.leaves.iter() {
+        to_intern.push(l.key.as_str());
+        collect_archived_value_strings(&l.value, &mut to_intern);
+    }
+    for lv in cached.leaf_values.iter() {
+        collect_archived_value_strings(&lv.value, &mut to_intern);
+    }
+
+    let tokens = string_table.intern_batch(to_intern.iter().copied());
+    let mut tokens = tokens.into_iter();
+
+    let mut arena = Arena::new();
+    for l in cached.leaves.iter() {
+        let idx = arena.push_leaf(Leaf {
+            key: next_token(&mut tokens),
+            value: archived_value_to_value(&l.value, &mut tokens),
+            op: archived_op_to_op(&l.op),
+            pos: cached_to_range(
+                l.start_line.to_native(),
+                l.start_col.to_native(),
+                l.end_line.to_native(),
+                l.end_col.to_native(),
+            ),
+        });
+        assert_eq!(idx as usize, arena.leaves.len() - 1);
+    }
+    for lv in cached.leaf_values.iter() {
+        let idx = arena.push_leaf_value(LeafValue {
+            value: archived_value_to_value(&lv.value, &mut tokens),
+            pos: cached_to_range(
+                lv.start_line.to_native(),
+                lv.start_col.to_native(),
+                lv.end_line.to_native(),
+                lv.end_col.to_native(),
+            ),
+        });
+        assert_eq!(idx as usize, arena.leaf_values.len() - 1);
+    }
+    for c in cached.comments.iter() {
+        let idx = arena.push_comment(Comment {
+            text: c.text.as_str().to_string(),
+            pos: cached_to_range(
+                c.start_line.to_native(),
+                c.start_col.to_native(),
+                c.end_line.to_native(),
+                c.end_col.to_native(),
+            ),
+        });
+        assert_eq!(idx as usize, arena.comments.len() - 1);
+    }
+    debug_assert!(tokens.next().is_none(), "interned token count mismatch");
+
+    let root = children_from_archived(&cached.root_children);
+    (arena, root)
+}
+
+fn collect_archived_value_strings<'a>(v: &'a ArchivedCachedValue, out: &mut Vec<&'a str>) {
+    match v {
+        ArchivedCachedValue::String(s) | ArchivedCachedValue::QString(s) => out.push(s.as_str()),
+        ArchivedCachedValue::Float(_)
+        | ArchivedCachedValue::Int(_)
+        | ArchivedCachedValue::Bool(_)
+        | ArchivedCachedValue::Clause(_) => {}
+    }
+}
+
+fn children_from_archived(children: &rkyv::vec::ArchivedVec<ArchivedCachedChild>) -> Vec<Child> {
+    children
+        .iter()
+        .map(|c| match c {
+            ArchivedCachedChild::Leaf(i) => Child::Leaf(i.to_native()),
+            ArchivedCachedChild::LeafValue(i) => Child::LeafValue(i.to_native()),
+            ArchivedCachedChild::Comment(i) => Child::Comment(i.to_native()),
+        })
+        .collect()
+}
+
+fn archived_value_to_value(
+    v: &ArchivedCachedValue,
+    tokens: &mut impl Iterator<Item = StringTokens>,
+) -> Value {
+    match v {
+        ArchivedCachedValue::String(_) => Value::String(next_token(tokens)),
+        ArchivedCachedValue::QString(_) => Value::QString(next_token(tokens)),
+        ArchivedCachedValue::Float(f) => Value::Float(f.to_native()),
+        ArchivedCachedValue::Int(i) => Value::Int(i.to_native()),
+        ArchivedCachedValue::Bool(b) => Value::Bool(*b),
+        ArchivedCachedValue::Clause(children) => Value::Clause(children_from_archived(children)),
+    }
+}
+
+fn archived_op_to_op(op: &ArchivedCachedOperator) -> Operator {
+    match op {
+        ArchivedCachedOperator::Equals => Operator::Equals,
+        ArchivedCachedOperator::GreaterThan => Operator::GreaterThan,
+        ArchivedCachedOperator::LessThan => Operator::LessThan,
+        ArchivedCachedOperator::GreaterThanOrEqual => Operator::GreaterThanOrEqual,
+        ArchivedCachedOperator::LessThanOrEqual => Operator::LessThanOrEqual,
+        ArchivedCachedOperator::NotEqual => Operator::NotEqual,
+        ArchivedCachedOperator::EqualEqual => Operator::EqualEqual,
+        ArchivedCachedOperator::QuestionEqual => Operator::QuestionEqual,
+    }
+}
+
 // ---- helpers ----
 
 fn string_token_to_owned(token: &StringTokens, table: &StringResolver<'_>) -> String {

@@ -149,6 +149,75 @@ key_a key_b = { x = 1 }
     }
 }
 
+/// The zero-copy archived path must rebuild an arena identical to the owned
+/// `deserialize_from_file` + `cached_to_arena` path: same tokens (interning
+/// order is shared), same values, ops, positions, and root children.
+#[test]
+fn archived_to_arena_matches_owned_path() {
+    let test_dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testfiles/performancetest2/"
+    );
+
+    let config = FileManagerConfig {
+        root: std::path::PathBuf::from(test_dir),
+        ..Default::default()
+    };
+    let mut manager = FileManager::new(config);
+    let files = manager.discover_and_parse().unwrap();
+    assert!(!files.is_empty());
+
+    for parsed in files {
+        let cached =
+            convert::arena_to_cached(&parsed.arena, &parsed.root_children, &manager.string_table);
+        let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
+        io::serialize_to_file(&cached, tmp.path()).unwrap();
+
+        let owned_table = StringTable::new();
+        let loaded = io::deserialize_from_file(tmp.path()).unwrap();
+        let (owned_arena, owned_root) = convert::cached_to_arena(&loaded, &owned_table);
+
+        let arch_table = StringTable::new();
+        let (arch_arena, arch_root) = io::with_archived_file(tmp.path(), |archived| {
+            convert::archived_to_arena(archived, &arch_table)
+        })
+        .unwrap();
+
+        let ctx = parsed.path.display();
+        assert_eq!(owned_arena.leaves.len(), arch_arena.leaves.len(), "{ctx}");
+        for (a, b) in owned_arena.leaves.iter().zip(arch_arena.leaves.iter()) {
+            assert_eq!(a.key, b.key, "{ctx}");
+            assert_eq!(a.value, b.value, "{ctx}");
+            assert_eq!(a.op, b.op, "{ctx}");
+            assert_eq!(a.pos, b.pos, "{ctx}");
+            assert_eq!(
+                owned_table.get_string(a.key.normal),
+                arch_table.get_string(b.key.normal),
+                "token text diverged in {ctx}"
+            );
+        }
+        assert_eq!(
+            owned_arena.leaf_values.len(),
+            arch_arena.leaf_values.len(),
+            "{ctx}"
+        );
+        for (a, b) in owned_arena
+            .leaf_values
+            .iter()
+            .zip(arch_arena.leaf_values.iter())
+        {
+            assert_eq!(a.value, b.value, "{ctx}");
+            assert_eq!(a.pos, b.pos, "{ctx}");
+        }
+        assert_eq!(owned_arena.comments.len(), arch_arena.comments.len());
+        for (a, b) in owned_arena.comments.iter().zip(arch_arena.comments.iter()) {
+            assert_eq!(a.text, b.text, "{ctx}");
+            assert_eq!(a.pos, b.pos, "{ctx}");
+        }
+        assert_eq!(owned_root, arch_root, "{ctx}");
+    }
+}
+
 /// Gate: Cache round-trip verified for all 63 test files.
 #[test]
 fn roundtrip_all_performancetest_files() {
