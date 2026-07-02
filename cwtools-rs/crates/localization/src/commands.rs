@@ -81,103 +81,6 @@ pub(crate) fn key_to_language(prefix: &str) -> Option<Lang> {
     }
 }
 
-/// Returns the set of valid `l_xxx` language tokens for the given game.
-///
-/// Mirrors the per-game `keyToLanguage` functions in `YAMLLocalisationParser.fs`
-/// (lines 222–375) plus the `l_default` wildcard for Stellaris. Games with no
-/// distinct loc set (`None`, CK2, VIC2, Custom) accept the full known set.
-pub fn languages_for_game(game: Option<cwtools_game::constants::Game>) -> &'static [Lang] {
-    use cwtools_game::constants::Game as G;
-    match game {
-        Some(G::Stellaris) => &[
-            Lang::English,
-            Lang::French,
-            Lang::German,
-            Lang::Spanish,
-            Lang::Russian,
-            Lang::Polish,
-            Lang::BrazPor,
-            Lang::SimpChinese,
-            Lang::Japanese,
-            Lang::Korean,
-            Lang::Default,
-        ],
-        Some(G::Hoi4) => &[
-            Lang::English,
-            Lang::French,
-            Lang::German,
-            Lang::Spanish,
-            Lang::Russian,
-            Lang::Polish,
-            Lang::BrazPor,
-            Lang::SimpChinese,
-            Lang::Japanese,
-        ],
-        Some(G::Eu4) => &[Lang::English, Lang::French, Lang::German, Lang::Spanish],
-        Some(G::Ck3) => &[
-            Lang::English,
-            Lang::French,
-            Lang::German,
-            Lang::Spanish,
-            Lang::SimpChinese,
-            Lang::Russian,
-            Lang::Korean,
-        ],
-        Some(G::Vic3) | Some(G::Eu5) => &[
-            Lang::English,
-            Lang::French,
-            Lang::German,
-            Lang::Spanish,
-            Lang::SimpChinese,
-            Lang::Russian,
-            Lang::Korean,
-            Lang::Japanese,
-            Lang::BrazPor,
-            Lang::Polish,
-            Lang::Turkish,
-        ],
-        Some(G::Ir) => &[
-            Lang::English,
-            Lang::French,
-            Lang::German,
-            Lang::Spanish,
-            Lang::SimpChinese,
-            Lang::Russian,
-        ],
-        // None, CK2, VIC2, Custom: accept all known languages.
-        _ => &[
-            Lang::English,
-            Lang::French,
-            Lang::German,
-            Lang::Spanish,
-            Lang::Russian,
-            Lang::Polish,
-            Lang::BrazPor,
-            Lang::SimpChinese,
-            Lang::Japanese,
-            Lang::Korean,
-            Lang::Turkish,
-            Lang::Default,
-        ],
-    }
-}
-
-/// Parse an `l_xxx` prefix into a `Lang` for the given game.
-///
-/// Returns `None` if the key is not valid for that game.
-/// Keeps `key_to_language` for generic / backwards-compatible use.
-pub fn key_to_language_for_game(
-    game: Option<cwtools_game::constants::Game>,
-    prefix: &str,
-) -> Option<Lang> {
-    let lang = key_to_language(prefix)?;
-    if languages_for_game(game).contains(&lang) {
-        Some(lang)
-    } else {
-        None
-    }
-}
-
 /// A localized entry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocEntry {
@@ -254,7 +157,6 @@ pub struct LocFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cwtools_game::constants::Game;
 
     #[test]
     fn test_key_to_language_default() {
@@ -280,66 +182,6 @@ mod tests {
         assert_eq!(Lang::from_name("Chinese"), Some(Lang::SimpChinese));
         assert_eq!(Lang::from_name("Braz_Por"), Some(Lang::BrazPor));
         assert_eq!(Lang::from_name("klingon"), None);
-    }
-
-    #[test]
-    fn test_key_to_language_for_game_stellaris() {
-        // Stellaris supports l_korean and l_default
-        assert_eq!(
-            key_to_language_for_game(Some(Game::Stellaris), "l_korean"),
-            Some(Lang::Korean)
-        );
-        assert_eq!(
-            key_to_language_for_game(Some(Game::Stellaris), "l_default"),
-            Some(Lang::Default)
-        );
-        // Turkish is NOT in Stellaris set
-        assert_eq!(
-            key_to_language_for_game(Some(Game::Stellaris), "l_turkish"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_key_to_language_for_game_eu4() {
-        // EU4 only has English, French, German, Spanish
-        assert_eq!(
-            key_to_language_for_game(Some(Game::Eu4), "l_english"),
-            Some(Lang::English)
-        );
-        assert_eq!(key_to_language_for_game(Some(Game::Eu4), "l_russian"), None);
-        assert_eq!(key_to_language_for_game(Some(Game::Eu4), "l_default"), None);
-    }
-
-    #[test]
-    fn test_key_to_language_for_game_hoi4() {
-        assert_eq!(
-            key_to_language_for_game(Some(Game::Hoi4), "l_japanese"),
-            Some(Lang::Japanese)
-        );
-        // HOI4 does not have Korean
-        assert_eq!(key_to_language_for_game(Some(Game::Hoi4), "l_korean"), None);
-    }
-
-    #[test]
-    fn test_key_to_language_for_game_custom_has_default() {
-        // Custom has no distinct loc set, so it accepts the full known list.
-        assert_eq!(
-            key_to_language_for_game(Some(Game::Custom), "l_default"),
-            Some(Lang::Default)
-        );
-    }
-
-    #[test]
-    fn test_generic_accepts_all() {
-        assert_eq!(
-            key_to_language_for_game(None, "l_turkish"),
-            Some(Lang::Turkish)
-        );
-        assert_eq!(
-            key_to_language_for_game(None, "l_default"),
-            Some(Lang::Default)
-        );
     }
 
     #[test]

@@ -241,7 +241,7 @@ fn validate_event(
             has_once = true;
         } else if child_key_eq(c, ast, table, "base") {
             has_base = true;
-        } else if child_key_eq(c, ast, table, "trigger") && child_has_always_no(c, ast, table) {
+        } else if child_key_eq(c, ast, table, "trigger") && child_is_always_no(c, ast, table) {
             has_always_no = true;
         }
     }
@@ -575,32 +575,22 @@ fn child_key_eq(child: &Child, ast: &ParsedFile, table: &StringTable, expected: 
     }
 }
 
-fn child_has_always_no(child: &Child, ast: &ParsedFile, table: &StringTable) -> bool {
+fn child_is_always_no(child: &Child, ast: &ParsedFile, table: &StringTable) -> bool {
     as_block(child, ast).is_some_and(|block| {
-        block
-            .children
-            .iter()
-            .any(|c| child_key_eq(c, ast, table, "always") && child_is_bool(c, ast, table, false))
-    })
-}
-
-fn child_is_bool(child: &Child, ast: &ParsedFile, table: &StringTable, expected: bool) -> bool {
-    match child {
-        Child::Leaf(idx) => {
-            let leaf = &ast.arena.leaves[*idx as usize];
-            match &leaf.value {
-                Value::Bool(b) => *b == expected,
+        block.children.iter().any(|c| {
+            if !child_key_eq(c, ast, table, "always") {
+                return false;
+            }
+            let Child::Leaf(idx) = c else { return false };
+            match &ast.arena.leaves[*idx as usize].value {
+                Value::Bool(b) => !*b,
                 Value::String(t) | Value::QString(t) => table
-                    .with_string(t.normal, |s| {
-                        (expected && s.eq_ignore_ascii_case("yes"))
-                            || (!expected && s.eq_ignore_ascii_case("no"))
-                    })
+                    .with_string(t.normal, |s| s.eq_ignore_ascii_case("no"))
                     .unwrap_or(false),
                 _ => false,
             }
-        }
-        _ => false,
-    }
+        })
+    })
 }
 
 /// Scalar value of the first child leaf whose key matches `key` (case-insensitive),

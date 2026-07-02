@@ -1,7 +1,6 @@
 //! Tests for LocalisationField existence checking (CW100 / CW122) wired into
 //! the main validation pipeline via `validate_ast_with_loc`.
 
-use cwtools_game::constants::Game;
 use cwtools_localization::{LocIndex, LocService};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
@@ -28,7 +27,7 @@ fn loc_index(files: &[(&str, &str)]) -> LocIndex {
             .map(|(p, t)| (p.to_string(), t.to_string()))
             .collect(),
     );
-    LocIndex::build(&svc, Some(Game::Hoi4))
+    LocIndex::build(&svc)
 }
 
 fn run(script: &str, idx: &LocIndex) -> Vec<cwtools_validation::ValidationError> {

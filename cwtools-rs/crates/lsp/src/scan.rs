@@ -628,9 +628,6 @@ impl Backend {
     /// diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace loc files.
     #[tracing::instrument(skip_all)]
     pub(crate) async fn rebuild_and_publish_loc(&self, root_path: &std::path::Path) {
-        let game = self.state.config.read().game();
-        let loc_game = game;
-
         // Cached vanilla loc keys (from the vanilla cache) supplement the key
         // index, but the hover text map needs the actual loc text from the files.
         // Always load the vanilla loc files when the dir is available so hover
@@ -683,7 +680,6 @@ impl Backend {
                 let service = cwtools_localization::LocService::from_folders(&dir_refs);
                 let mut idx = cwtools_localization::LocIndex::build_scoped(
                     &service,
-                    loc_game,
                     loc_languages.as_deref(),
                 );
                 if let Some(cached) = cached_vanilla_loc {
@@ -700,7 +696,6 @@ impl Backend {
                 // instead of rebuilding the ~2M-key set inside the validate pass.
                 for d in cwtools_localization::validate_loc_project_with_union(
                     &service,
-                    loc_game,
                     loc_languages.as_deref(),
                     idx.union(),
                     &extra_valid_refs,

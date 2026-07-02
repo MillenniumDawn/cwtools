@@ -29,7 +29,7 @@ pub enum CacheError {
 /// caches compress identically.
 pub const ZSTD_LEVEL: i32 = 3;
 
-/// Magic bytes at the start of every `.cwb` file. Lets `deserialize_from_file`
+/// Magic bytes at the start of every `.cwb` file. Lets `read_archive_bytes`
 /// reject files written by an incompatible layout before rkyv gets confused.
 const MAGIC: &[u8; 4] = b"CWB\x00";
 
@@ -83,18 +83,6 @@ fn read_archive_bytes(path: &Path) -> Result<rkyv::util::AlignedVec, CacheError>
     let mut aligned = rkyv::util::AlignedVec::new();
     zstd::stream::copy_decode(compressed, &mut aligned).map_err(CacheError::Compression)?;
     Ok(aligned)
-}
-
-/// Deserialize a `CachedFile` from a `.cwb` file (zstd-decompressed rkyv).
-pub fn deserialize_from_file(path: &Path) -> Result<CachedFile, CacheError> {
-    let bytes = read_archive_bytes(path)?;
-    let deserialized: CachedFile = rkyv::from_bytes::<CachedFile, rkyv::rancor::Error>(&bytes)
-        .map_err(|e| CacheError::Deserialize {
-            msg: "rkyv decode failed",
-            source: Some(e),
-        })?;
-
-    Ok(deserialized)
 }
 
 /// Run `f` on the checked archived view of a `.cwb` file without

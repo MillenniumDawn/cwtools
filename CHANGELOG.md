@@ -45,6 +45,7 @@
 - The driver crate has tests now (8 smoke tests: `search_config_for` branches, `index_game_dir`, `Session::load` determinism). Workspace total is 642.
 - Every change in this batch was gated on a Kaiserreich full-corpus sorted-CSV diff (byte-identical throughout).
 - Deleted `specs/code-review-findings.md`, a 38KB planning artifact that had been committed by accident.
+- Simplification pass over this branch's new code: dropped the dead `game` parameter threaded through the loc build/validate pipeline (both terminals ignored it), deleted the owned cache reverse path (`cached_to_arena` and its helpers; the CLI `deserialize` and the round-trip tests now reload through the zero-copy archived path), removed the production-dead `languages_for_game`/`key_to_language_for_game`, and collapsed the Stellaris `child_has_always_no`/`child_is_bool` pair into one `child_is_always_no`. Five now-dead language-list tests removed (suite 637); Kaiserreich corpus byte-identical.
 
 # 1.8.5
 

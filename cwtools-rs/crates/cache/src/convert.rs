@@ -27,69 +27,12 @@ pub fn arena_to_cached(
     })
 }
 
-/// Convert a CachedFile back into an arena AST, re-interning strings.
-///
-/// On a fresh `StringTable` every string is a miss, so interning each one
-/// individually would take the write lock per string. Instead this collects
-/// every string in the exact order `intern` would have been called, interns the
-/// whole batch under a single write lock via
+/// Rebuild an arena AST from the rkyv archived view, interning strings straight
+/// out of the mapped buffer. Two-pass: collect every string in traversal order
+/// (leaves, then leaf_values), batch-intern under a single write lock via
 /// [`StringTable::intern_batch`](cwtools_string_table::string_table::StringTable::intern_batch),
-/// then re-walks the nodes consuming the resulting tokens in the same order.
-/// The token assignment is identical to per-string interning.
-pub fn cached_to_arena(cached: &CachedFile, string_table: &StringTable) -> (Arena, Vec<Child>) {
-    // Pass 1: collect every string slice in the same order `intern` is reached
-    // when building leaves, then leaf_values.
-    let mut to_intern: Vec<&str> = Vec::new();
-    for l in &cached.leaves {
-        to_intern.push(&l.key);
-        collect_value_strings(&l.value, &mut to_intern);
-    }
-    for lv in &cached.leaf_values {
-        collect_value_strings(&lv.value, &mut to_intern);
-    }
-
-    // Batch-intern under one write lock; tokens come back in collection order.
-    let tokens = string_table.intern_batch(to_intern.iter().copied());
-    let mut tokens = tokens.into_iter();
-
-    // Pass 2: rebuild the arena, drawing tokens in the identical order.
-    // The asserts confirm each push returns the index matching its position in
-    // collection order, so the cached `Child` indices still address the right
-    // elements in the rebuilt arena (a layout mismatch would corrupt the tree).
-    let mut arena = Arena::new();
-    for l in &cached.leaves {
-        let idx = arena.push_leaf(cached_leaf_to_leaf(l, &mut tokens));
-        assert_eq!(idx as usize, arena.leaves.len() - 1);
-    }
-    for lv in &cached.leaf_values {
-        let idx = arena.push_leaf_value(cached_leaf_value_to_leaf_value(lv, &mut tokens));
-        assert_eq!(idx as usize, arena.leaf_values.len() - 1);
-    }
-    for c in &cached.comments {
-        let idx = arena.push_comment(cached_comment_to_comment(c));
-        assert_eq!(idx as usize, arena.comments.len() - 1);
-    }
-    debug_assert!(tokens.next().is_none(), "interned token count mismatch");
-
-    let root = children_from_cached(&cached.root_children);
-    (arena, root)
-}
-
-/// Push the strings a `CachedValue` contributes to interning, in field order.
-/// `Clause` holds only child indices, so it contributes nothing here.
-fn collect_value_strings<'a>(v: &'a CachedValue, out: &mut Vec<&'a str>) {
-    match v {
-        CachedValue::String(s) | CachedValue::QString(s) => out.push(s),
-        CachedValue::Float(_)
-        | CachedValue::Int(_)
-        | CachedValue::Bool(_)
-        | CachedValue::Clause(_) => {}
-    }
-}
-
-/// Archived twin of [`cached_to_arena`]: walks the rkyv archived view directly,
-/// interning strings straight out of the mapped buffer. Same two-pass
-/// batch-intern structure; token assignment is identical.
+/// then re-walk the nodes drawing the resulting tokens in the same order. The
+/// token assignment is identical to per-string interning.
 pub fn archived_to_arena(
     cached: &ArchivedCachedFile,
     string_table: &StringTable,
@@ -240,17 +183,6 @@ fn children_to_cached(children: &[Child]) -> Vec<CachedChild> {
         .collect()
 }
 
-fn children_from_cached(children: &[CachedChild]) -> Vec<Child> {
-    children
-        .iter()
-        .map(|c| match c {
-            CachedChild::Leaf(i) => Child::Leaf(*i),
-            CachedChild::LeafValue(i) => Child::LeafValue(*i),
-            CachedChild::Comment(i) => Child::Comment(*i),
-        })
-        .collect()
-}
-
 fn leaf_to_cached(l: &Leaf, table: &StringResolver<'_>) -> CachedLeaf {
     let (sl, sc, el, ec) = range_to_cached(&l.pos);
     CachedLeaf {
@@ -261,15 +193,6 @@ fn leaf_to_cached(l: &Leaf, table: &StringResolver<'_>) -> CachedLeaf {
         start_col: sc,
         end_line: el,
         end_col: ec,
-    }
-}
-
-fn cached_leaf_to_leaf(l: &CachedLeaf, tokens: &mut impl Iterator<Item = StringTokens>) -> Leaf {
-    Leaf {
-        key: next_token(tokens),
-        value: cached_value_to_value(&l.value, tokens),
-        op: cached_op_to_op(&l.op),
-        pos: cached_to_range(l.start_line, l.start_col, l.end_line, l.end_col),
     }
 }
 
@@ -284,16 +207,6 @@ fn leaf_value_to_cached(lv: &LeafValue, table: &StringResolver<'_>) -> CachedLea
     }
 }
 
-fn cached_leaf_value_to_leaf_value(
-    lv: &CachedLeafValue,
-    tokens: &mut impl Iterator<Item = StringTokens>,
-) -> LeafValue {
-    LeafValue {
-        value: cached_value_to_value(&lv.value, tokens),
-        pos: cached_to_range(lv.start_line, lv.start_col, lv.end_line, lv.end_col),
-    }
-}
-
 fn comment_to_cached(c: &Comment) -> CachedComment {
     let (sl, sc, el, ec) = range_to_cached(&c.pos);
     CachedComment {
@@ -302,13 +215,6 @@ fn comment_to_cached(c: &Comment) -> CachedComment {
         start_col: sc,
         end_line: el,
         end_col: ec,
-    }
-}
-
-fn cached_comment_to_comment(c: &CachedComment) -> Comment {
-    Comment {
-        text: c.text.clone(),
-        pos: cached_to_range(c.start_line, c.start_col, c.end_line, c.end_col),
     }
 }
 
@@ -323,20 +229,6 @@ fn value_to_cached(v: &Value, table: &StringResolver<'_>) -> CachedValue {
     }
 }
 
-fn cached_value_to_value(
-    v: &CachedValue,
-    tokens: &mut impl Iterator<Item = StringTokens>,
-) -> Value {
-    match v {
-        CachedValue::String(_) => Value::String(next_token(tokens)),
-        CachedValue::QString(_) => Value::QString(next_token(tokens)),
-        CachedValue::Float(f) => Value::Float(*f),
-        CachedValue::Int(i) => Value::Int(*i),
-        CachedValue::Bool(b) => Value::Bool(*b),
-        CachedValue::Clause(children) => Value::Clause(children_from_cached(children)),
-    }
-}
-
 fn op_to_cached(op: &Operator) -> CachedOperator {
     match op {
         Operator::Equals => CachedOperator::Equals,
@@ -347,18 +239,5 @@ fn op_to_cached(op: &Operator) -> CachedOperator {
         Operator::NotEqual => CachedOperator::NotEqual,
         Operator::EqualEqual => CachedOperator::EqualEqual,
         Operator::QuestionEqual => CachedOperator::QuestionEqual,
-    }
-}
-
-fn cached_op_to_op(op: &CachedOperator) -> Operator {
-    match op {
-        CachedOperator::Equals => Operator::Equals,
-        CachedOperator::GreaterThan => Operator::GreaterThan,
-        CachedOperator::LessThan => Operator::LessThan,
-        CachedOperator::GreaterThanOrEqual => Operator::GreaterThanOrEqual,
-        CachedOperator::LessThanOrEqual => Operator::LessThanOrEqual,
-        CachedOperator::NotEqual => Operator::NotEqual,
-        CachedOperator::EqualEqual => Operator::EqualEqual,
-        CachedOperator::QuestionEqual => Operator::QuestionEqual,
     }
 }
