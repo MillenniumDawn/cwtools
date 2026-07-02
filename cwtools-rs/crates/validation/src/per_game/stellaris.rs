@@ -4,7 +4,6 @@ use cwtools_index::TypeIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
-use std::collections::HashSet;
 
 /// Stellaris-specific validators.
 /// Ported from CWTools/Validation/Stellaris/STLValidation.fs
@@ -211,7 +210,10 @@ fn walk_if_else(
 /// Pretrigger set for an event key (`planet_event` -> `planet_pre_trigger` names).
 /// `pop_group_event` maps to the `pop` category; event types with no
 /// `<scope>_pre_trigger` category in the config return None.
-fn event_pretriggers<'a>(event_key: &str, ruleset: &'a RuleSet) -> Option<&'a HashSet<String>> {
+fn event_pretriggers<'a>(
+    event_key: &str,
+    ruleset: &'a RuleSet,
+) -> Option<&'a rustc_hash::FxHashSet<String>> {
     let scope = event_key.strip_suffix("_event")?;
     let scope = if scope == "pop_group" { "pop" } else { scope };
     ruleset.pretriggers.get(scope)
@@ -283,7 +285,7 @@ fn validate_event(
 fn flag_pretriggers(
     children: &[Child],
     ast: &ParsedFile,
-    pretriggers: &HashSet<String>,
+    pretriggers: &rustc_hash::FxHashSet<String>,
     table: &StringTable,
     file_path: &str,
     errors: &mut Vec<ValidationError>,

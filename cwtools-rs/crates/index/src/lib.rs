@@ -3,6 +3,7 @@ use cwtools_rules::rules_types::{
     NewField, PathOptions, RuleSet, RuleType, SkipRootKey, TypeDefinition,
 };
 use cwtools_string_table::string_table::{StringId, StringTable};
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -23,10 +24,11 @@ pub(crate) fn unquote(s: &str) -> &str {
 /// Decrement a refcount entry in `map`, removing it when the count reaches 0.
 /// Does nothing if the key is absent. Shared by every refcounted name/value
 /// index so re-indexing a file drops only its last contribution.
-pub(crate) fn dec_ref<K, Q>(map: &mut HashMap<K, usize>, key: &Q)
+pub(crate) fn dec_ref<K, Q, S>(map: &mut HashMap<K, usize, S>, key: &Q)
 where
     K: std::hash::Hash + Eq + std::borrow::Borrow<Q>,
     Q: std::hash::Hash + Eq + ?Sized,
+    S: std::hash::BuildHasher,
 {
     if let Some(count) = map.get_mut(key) {
         *count -= 1;
@@ -334,19 +336,19 @@ pub fn is_subtype_key(type_name: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
-    pub map: HashMap<String, Vec<(Arc<str>, TypeInstance)>>,
+    pub map: FxHashMap<String, Vec<(Arc<str>, TypeInstance)>>,
     /// lowercased instance name → how many definitions carry that name (across all
     /// types and files). Lets `is_any_instance` be O(1) instead of scanning every
     /// instance. A refcount so `remove_file` can drop a name only when its last
     /// definition goes. Keyed lowercase because Paradox identifiers are
     /// case-insensitive (same normalization as `contains`/`instance_sets`).
-    name_counts: HashMap<String, usize>,
+    name_counts: FxHashMap<String, usize>,
     /// type_name → (lowercased instance name → refcount). Makes `contains` an O(1)
     /// hash lookup instead of a linear scan over every instance of the type, which
     /// was quadratic over the corpus for high-cardinality types (state, character,
     /// country_event). The refcount lets `remove_file` drop a name only when its
     /// last definition in that type goes.
-    instance_sets: HashMap<String, HashMap<String, usize>>,
+    instance_sets: FxHashMap<String, FxHashMap<String, usize>>,
     /// Index of every asset/file path under the game roots, for `filepath`
     /// reference checks (CW113). Empty unless the CLI populated it.
     pub file_index: FileIndex,

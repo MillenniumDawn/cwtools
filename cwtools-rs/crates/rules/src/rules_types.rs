@@ -9,7 +9,7 @@ pub struct RuleSet {
     pub root_rules: Vec<RootRule>,
     /// Parsed `values = { value[name] = { ... } }` blocks (item G).
     /// Keyed by name; sets from multiple .cwt files are unioned at merge.
-    pub values: std::collections::HashMap<String, Vec<String>>,
+    pub values: rustc_hash::FxHashMap<String, Vec<String>>,
     /// Names from a top-level `modifiers = { name = category ... }` block. These
     /// are the valid keys for `alias_name[modifier]` slots (modifier contexts).
     pub modifiers: Vec<String>,
@@ -18,7 +18,7 @@ pub struct RuleSet {
     /// scope-switching key, so these are the valid keys for an `[cat:scope_field]`
     /// slot alongside scope commands and type instances. See [`crate`] consumers.
     /// Derived from `link_inputs` (names + prefixes) during reindex.
-    pub scope_links: std::collections::HashSet<String>,
+    pub scope_links: rustc_hash::FxHashSet<String>,
     /// Scope definitions from a top-level `scopes = { Name = { aliases = {..} } }`
     /// block (scopes.cwt). Used to build the runtime scope registry. Empty when no
     /// scopes.cwt is loaded (the engine then falls back to the hardcoded table).
@@ -34,27 +34,26 @@ pub struct RuleSet {
     /// Lookup index over `aliases`, built by `reindex()`. Two-level map:
     /// `category → key → indices of every matching overload`. Lookups require
     /// only two borrowed-str probes with zero allocation on the hot path.
-    pub alias_exact:
-        std::collections::HashMap<String, std::collections::HashMap<String, Vec<usize>>>,
+    pub alias_exact: rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, Vec<usize>>>,
     /// Per-category alias metadata (the `<type>` patterns and `scope_field`),
     /// also built by `reindex()`.
-    pub alias_categories: std::collections::HashMap<String, AliasCategoryIndex>,
+    pub alias_categories: rustc_hash::FxHashMap<String, AliasCategoryIndex>,
     /// Lookup index over `types`, built by `reindex()`. Maps a type name to its
     /// index in `types`, so name lookups are O(1) instead of a linear scan.
-    pub type_by_name: std::collections::HashMap<String, usize>,
+    pub type_by_name: rustc_hash::FxHashMap<String, usize>,
     /// Lookup index over `enums`, built by `reindex()`. Maps an enum key to its
     /// index in `enums` for O(1) lookups.
-    pub enum_by_name: std::collections::HashMap<String, usize>,
+    pub enum_by_name: rustc_hash::FxHashMap<String, usize>,
     /// Lookup index over `root_rules`, built by `reindex()`. Maps a type-rule
     /// name to its index in `root_rules`, so `find_rules_by_name` is O(1)
     /// instead of a linear scan per root child.
-    pub type_rules_idx: std::collections::HashMap<String, usize>,
+    pub type_rules_idx: rustc_hash::FxHashMap<String, usize>,
     /// Built by `reindex()`: lowercased effect/trigger alias key -> the
     /// `value_set[...]` namespace its body declares (e.g. `set_country_flag` ->
     /// `country_flag`). Used to collect dynamically-defined set members (flags,
     /// tokens, …) for completion. Aliases declaring multiple namespaces keep
     /// the first found.
-    pub value_set_effects: std::collections::HashMap<String, String>,
+    pub value_set_effects: rustc_hash::FxHashMap<String, String>,
     /// Built by `reindex()`: lowercased effect/trigger alias key -> the
     /// `(binding_field_key, namespace)` pairs declared by a NESTED field in its
     /// block body (e.g. `generate_character` -> `[("token_base", "character_token")]`,
@@ -62,7 +61,7 @@ pub struct RuleSet {
     /// collector capture the value of the exact field bound to `value_set[ns]`
     /// instead of guessing from a fixed key list, so members under non-obvious keys
     /// (`token_base`, `id`, `legacy_id`, `array`, …) are still collected.
-    pub value_set_effect_fields: std::collections::HashMap<String, Vec<(String, String)>>,
+    pub value_set_effect_fields: rustc_hash::FxHashMap<String, Vec<(String, String)>>,
     /// Built by `reindex()`, parallel to `enums`: each enum's values lowercased
     /// into a set for O(1) case-insensitive membership (matches the
     /// `eq_ignore_ascii_case` scans in the validator). Empty until reindex.
@@ -72,10 +71,10 @@ pub struct RuleSet {
     pub enum_has_at: Vec<bool>,
     /// Built by `reindex()`, keyed like `values`: each `value[name]` set as a
     /// `FxHashSet` for O(1) exact membership. Empty until reindex.
-    pub value_sets: std::collections::HashMap<String, rustc_hash::FxHashSet<String>>,
+    pub value_sets: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>,
     /// Built by `reindex()` from `alias[<scope>_pre_trigger:<name>] = bool`
     /// declarations: lowercased scope prefix -> lowercased trigger names. CW120 queries this.
-    pub pretriggers: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    pub pretriggers: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>,
 }
 
 /// Scope/link config inputs (`scopes.cwt` / `links.cwt`). The types live in the
@@ -204,23 +203,23 @@ impl RuleSet {
             enums: Vec::new(),
             complex_enums: Vec::new(),
             root_rules: Vec::new(),
-            values: std::collections::HashMap::new(),
+            values: rustc_hash::FxHashMap::default(),
             modifiers: Vec::new(),
-            scope_links: std::collections::HashSet::new(),
+            scope_links: rustc_hash::FxHashSet::default(),
             scope_inputs: Vec::new(),
             link_inputs: Vec::new(),
             folders: Vec::new(),
-            alias_exact: std::collections::HashMap::default(),
-            alias_categories: std::collections::HashMap::new(),
-            type_by_name: std::collections::HashMap::new(),
-            enum_by_name: std::collections::HashMap::new(),
-            type_rules_idx: std::collections::HashMap::new(),
-            value_set_effects: std::collections::HashMap::new(),
-            value_set_effect_fields: std::collections::HashMap::new(),
+            alias_exact: rustc_hash::FxHashMap::default(),
+            alias_categories: rustc_hash::FxHashMap::default(),
+            type_by_name: rustc_hash::FxHashMap::default(),
+            enum_by_name: rustc_hash::FxHashMap::default(),
+            type_rules_idx: rustc_hash::FxHashMap::default(),
+            value_set_effects: rustc_hash::FxHashMap::default(),
+            value_set_effect_fields: rustc_hash::FxHashMap::default(),
             enum_values_lower: Vec::new(),
             enum_has_at: Vec::new(),
-            value_sets: std::collections::HashMap::new(),
-            pretriggers: std::collections::HashMap::new(),
+            value_sets: rustc_hash::FxHashMap::default(),
+            pretriggers: rustc_hash::FxHashMap::default(),
         }
     }
 

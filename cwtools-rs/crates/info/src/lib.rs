@@ -518,11 +518,11 @@ impl InfoService {
 
     // ── Heuristic child walker (unchanged from original) ─────────────────────
 
-    fn index_child_heuristic(
+    fn index_child_heuristic<S: std::hash::BuildHasher>(
         child: &Child,
         arena: &Arena,
         table: &StringTable,
-        type_names: &HashMap<String, usize>,
+        type_names: &HashMap<String, usize, S>,
         info: &mut FileInfo,
     ) {
         if let Child::Leaf(idx) = child {
@@ -554,10 +554,10 @@ impl InfoService {
 
     /// Record a clause leaf as a top-level key, and as a type definition when
     /// its key names a known type.
-    fn record_top_level_key(
+    fn record_top_level_key<S: std::hash::BuildHasher>(
         leaf: &cwtools_parser::ast::Leaf,
         key: &str,
-        type_names: &HashMap<String, usize>,
+        type_names: &HashMap<String, usize, S>,
         info: &mut FileInfo,
     ) {
         if let Value::Clause(_) = &leaf.value {
