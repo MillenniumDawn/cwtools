@@ -9,7 +9,7 @@
 //! `trigger = { always = no }`, see CW107), so only fields whose default is
 //! known are listed.
 
-use super::common::as_block;
+use super::common::walk_blocks;
 use crate::{ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_string_table::string_table::StringTable;
@@ -40,17 +40,15 @@ fn sole_always_value(children: &[Child], ast: &ParsedFile, table: &StringTable) 
     found
 }
 
-fn walk(
-    children: &[Child],
+/// Run the HOI4-specific cleanup hints over a whole file.
+pub fn validate_hoi4(
     ast: &ParsedFile,
+    _ruleset: &cwtools_rules::rules_types::RuleSet,
     table: &StringTable,
     file_path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    for child in children {
-        let Some(block) = as_block(child, ast) else {
-            continue;
-        };
+    walk_blocks(&ast.root_children, ast, &mut |block| {
         let key = block.key_string_lower(table);
 
         // Fields whose body `{ always = <bool> }` matches the game default (so the
@@ -71,20 +69,7 @@ fn walk(
                 &[&key],
             ));
         }
-
-        walk(block.children, ast, table, file_path, errors);
-    }
-}
-
-/// Run the HOI4-specific cleanup hints over a whole file.
-pub fn validate_hoi4(
-    ast: &ParsedFile,
-    _ruleset: &cwtools_rules::rules_types::RuleSet,
-    table: &StringTable,
-    file_path: &str,
-    errors: &mut Vec<ValidationError>,
-) {
-    walk(&ast.root_children, ast, table, file_path, errors);
+    });
 }
 
 #[cfg(test)]

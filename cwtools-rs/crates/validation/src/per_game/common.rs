@@ -44,6 +44,20 @@ pub(crate) fn as_block<'a>(child: &Child, ast: &'a ParsedFile) -> Option<Block<'
     }
 }
 
+/// Depth-first pre-order walk over every `key = { ... }` block under
+/// `children`, calling `f` on each block before descending into it. Shared
+/// skeleton for the stateless per-game walkers; walkers that thread state down
+/// the recursion (structural's CW223 fold) keep their own.
+pub(crate) fn walk_blocks(children: &[Child], ast: &ParsedFile, f: &mut impl FnMut(&Block<'_>)) {
+    for child in children {
+        let Some(block) = as_block(child, ast) else {
+            continue;
+        };
+        f(&block);
+        walk_blocks(block.children, ast, f);
+    }
+}
+
 /// Validate common features across all games.
 pub fn validate_common(
     ast: &ParsedFile,

@@ -48,16 +48,9 @@ pub(crate) const MAX_FILE_ERRORS: usize = 100;
 pub(crate) fn loc_diag_to_validation_error(
     d: &cwtools_localization::LocDiagnostic,
 ) -> ValidationError {
-    let severity = match d.severity {
-        cwtools_localization::LocSeverity::Error => cwtools_validation::ErrorSeverity::Error,
-        cwtools_localization::LocSeverity::Warning => cwtools_validation::ErrorSeverity::Warning,
-        cwtools_localization::LocSeverity::Information => {
-            cwtools_validation::ErrorSeverity::Information
-        }
-    };
     ValidationError {
         message: d.message.clone(),
-        severity,
+        severity: d.severity,
         line: d.line as u32,
         col: d.col.saturating_sub(1) as u16,
         file: d.file.clone(),

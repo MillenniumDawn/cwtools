@@ -1,4 +1,4 @@
-use super::common::as_block;
+use super::common::{as_block, walk_blocks};
 use crate::{ErrorSeverity, ValidationError, error_codes};
 use cwtools_index::TypeIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
@@ -124,10 +124,7 @@ fn walk_if_else(
     file_path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    for child in children {
-        let Some(block) = as_block(child, ast) else {
-            continue;
-        };
+    walk_blocks(children, ast, &mut |block| {
         let key = block.key_string_lower(table);
         let block_children = block.children;
         let line = block.range.start.line;
@@ -200,9 +197,7 @@ fn walk_if_else(
                 }
             }
         }
-
-        walk_if_else(block_children, ast, table, file_path, errors);
-    }
+    });
 }
 
 // ── Event Validation (CW107 / CW120) ───────────────────
@@ -299,14 +294,13 @@ fn flag_pretriggers(
         let leaf_key = table.get_string(leaf.key.lower).unwrap_or_default();
         if pretriggers.contains(&leaf_key) {
             let code = &error_codes::CW120_POSSIBLE_PRETRIGGER;
-            errors.push(ValidationError {
-                message: code.format(&[&leaf_key]),
-                severity: code.severity,
-                line: leaf.pos.start.line,
-                col: leaf.pos.start.col,
-                file: file_path.to_string(),
-                code: Some(code.id),
-            });
+            errors.push(ValidationError::from_code(
+                code,
+                file_path,
+                leaf.pos.start.line,
+                leaf.pos.start.col,
+                &[&leaf_key],
+            ));
         }
     }
 }
@@ -405,14 +399,13 @@ fn validate_ship_designs(
             {
                 continue;
             }
-            errors.push(ValidationError {
-                message: code.format(&[&template]),
-                severity: code.severity,
-                line: gc_block.range.start.line,
-                col: gc_block.range.start.col,
-                file: file_path.to_string(),
-                code: Some(code.id),
-            });
+            errors.push(ValidationError::from_code(
+                code,
+                file_path,
+                gc_block.range.start.line,
+                gc_block.range.start.col,
+                &[&template],
+            ));
         }
     }
 }
@@ -430,16 +423,13 @@ fn validate_technology(
     errors: &mut Vec<ValidationError>,
 ) {
     if !technology_has_category(children, ast, table) {
-        errors.push(ValidationError {
-            message: error_codes::CW110_TECH_CAT_MISSING
-                .message_template
-                .to_string(),
-            severity: error_codes::CW110_TECH_CAT_MISSING.severity,
-            line: tech_line,
-            col: 0,
-            file: file_path.to_string(),
-            code: Some(error_codes::CW110_TECH_CAT_MISSING.id),
-        });
+        errors.push(ValidationError::from_code(
+            &error_codes::CW110_TECH_CAT_MISSING,
+            file_path,
+            tech_line,
+            0,
+            &[],
+        ));
     }
 
     let tech_area = child_scalar(children, ast, table, "area").unwrap_or_default();
@@ -482,10 +472,7 @@ fn walk_research_leaders(
     file_path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    for child in children {
-        let Some(block) = as_block(child, ast) else {
-            continue;
-        };
+    walk_blocks(children, ast, &mut |block| {
         if block.key_string_lower(table) == "research_leader" {
             match child_scalar(block.children, ast, table, "area") {
                 None => {
@@ -514,8 +501,7 @@ fn walk_research_leaders(
                 _ => {}
             }
         }
-        walk_research_leaders(block.children, tech_area, ast, table, file_path, errors);
-    }
+    });
 }
 
 // ── Planet Killer (CW250) ──────────────────────────────

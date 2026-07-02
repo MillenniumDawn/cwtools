@@ -136,7 +136,7 @@ fn dollar_var_reference_is_skipped() {
 /// scope-independent loc-entry checks must match the validation crate's catalog.
 #[test]
 fn loc_pipeline_codes_match_error_catalog() {
-    use cwtools_localization::{LocErrorKind, LocSeverity, loc_error_code, loc_error_severity};
+    use cwtools_localization::{LocErrorKind, loc_error_code, loc_error_severity};
     use cwtools_validation::error_codes as ec;
 
     let cases = [
@@ -162,15 +162,9 @@ fn loc_pipeline_codes_match_error_catalog() {
             code.id,
             "code id mismatch for {kind:?}"
         );
-        let want = match code.severity {
-            cwtools_validation::ErrorSeverity::Error => LocSeverity::Error,
-            cwtools_validation::ErrorSeverity::Warning => LocSeverity::Warning,
-            cwtools_validation::ErrorSeverity::Information => LocSeverity::Information,
-            cwtools_validation::ErrorSeverity::Hint => LocSeverity::Information,
-        };
         assert_eq!(
             loc_error_severity(&kind),
-            want,
+            code.severity,
             "severity mismatch for {kind:?}"
         );
     }

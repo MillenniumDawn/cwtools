@@ -529,17 +529,7 @@ fn main() {
                 if !d.file.starts_with(&dir_prefix) {
                     continue;
                 }
-                let severity = match d.severity {
-                    cwtools_localization::LocSeverity::Error => {
-                        cwtools_validation::ErrorSeverity::Error
-                    }
-                    cwtools_localization::LocSeverity::Warning => {
-                        cwtools_validation::ErrorSeverity::Warning
-                    }
-                    cwtools_localization::LocSeverity::Information => {
-                        cwtools_validation::ErrorSeverity::Information
-                    }
-                };
+                let severity = d.severity;
                 let line = d.line as u32;
                 let code = d.code.to_string();
                 let hash = diag_hash(&d.file, &code, &d.message, line);

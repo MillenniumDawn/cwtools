@@ -11,16 +11,8 @@ use crate::commands::{Game, Lang, LocFile};
 use crate::service::LocService;
 use crate::validation::{LocErrorKind, hardcoded_loc_set, validate_loc_file_with_hardcoded};
 use crate::yaml_parser::{LangHeaderDiagnostic, check_loc_file_lang, parse_loc_text};
+use cwtools_error_codes::ErrorSeverity;
 use std::collections::HashSet;
-
-/// Severity of a loc diagnostic. Mirrors the validation crate's `ErrorSeverity`
-/// without taking a dependency on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocSeverity {
-    Error,
-    Warning,
-    Information,
-}
 
 /// A normalized loc diagnostic ready to be surfaced as a `ValidationError` or an
 /// LSP `Diagnostic`. `line`/`col` are 1-based.
@@ -30,7 +22,7 @@ pub struct LocDiagnostic {
     pub line: usize,
     pub col: usize,
     pub code: &'static str,
-    pub severity: LocSeverity,
+    pub severity: ErrorSeverity,
     pub message: String,
 }
 
@@ -38,14 +30,14 @@ pub struct LocDiagnostic {
 /// severity (matching the F# `ErrorCodes` mapping). Splitting this from the
 /// message means the code / severity accessors don't build (and discard) a
 /// formatted `String`, and the emission path formats each message exactly once.
-fn loc_error_code_severity(kind: &LocErrorKind) -> (&'static str, LocSeverity) {
+fn loc_error_code_severity(kind: &LocErrorKind) -> (&'static str, ErrorSeverity) {
     match kind {
-        LocErrorKind::UndefinedLocReference { .. } => ("CW225", LocSeverity::Error),
-        LocErrorKind::RecursiveLocRef => ("CW259", LocSeverity::Error),
-        LocErrorKind::ReplaceMe => ("CW234", LocSeverity::Information),
-        LocErrorKind::LocMissingQuote => ("CW268", LocSeverity::Warning),
-        LocErrorKind::LocInvalidChars => ("CW275", LocSeverity::Warning),
-        LocErrorKind::LocKeyInvalidChars => ("CW276", LocSeverity::Warning),
+        LocErrorKind::UndefinedLocReference { .. } => ("CW225", ErrorSeverity::Error),
+        LocErrorKind::RecursiveLocRef => ("CW259", ErrorSeverity::Error),
+        LocErrorKind::ReplaceMe => ("CW234", ErrorSeverity::Information),
+        LocErrorKind::LocMissingQuote => ("CW268", ErrorSeverity::Warning),
+        LocErrorKind::LocInvalidChars => ("CW275", ErrorSeverity::Warning),
+        LocErrorKind::LocKeyInvalidChars => ("CW276", ErrorSeverity::Warning),
     }
 }
 
@@ -55,7 +47,7 @@ fn loc_error_parts(
     kind: &LocErrorKind,
     key: &str,
     lang: Option<Lang>,
-) -> (&'static str, LocSeverity, String) {
+) -> (&'static str, ErrorSeverity, String) {
     let (code, severity) = loc_error_code_severity(kind);
     (code, severity, loc_error_message(kind, key, lang))
 }
@@ -66,7 +58,7 @@ pub fn loc_error_code(kind: &LocErrorKind) -> &'static str {
 }
 
 /// The severity for a scope-independent loc-entry error.
-pub fn loc_error_severity(kind: &LocErrorKind) -> LocSeverity {
+pub fn loc_error_severity(kind: &LocErrorKind) -> ErrorSeverity {
     loc_error_code_severity(kind).1
 }
 
@@ -126,19 +118,19 @@ fn lang_fsharp_name(lang: Lang) -> &'static str {
 /// carry a recognised `l_xxx` tag, the first line must be a recognised
 /// `l_xxx:` header, and the two must agree.
 fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
-    let (code, severity, message): (&'static str, LocSeverity, String) = match check_loc_file_lang(
+    let (code, severity, message): (&'static str, ErrorSeverity, String) = match check_loc_file_lang(
         &file.path,
         &file.language_prefix,
     )? {
         LangHeaderDiagnostic::MissingLocFileLangHeader { .. } => (
             cwtools_error_codes::CW256_MISSING_LOC_FILE_LANG_HEADER.id,
-            LocSeverity::Error,
+            ErrorSeverity::Error,
             "Localisation file should start with \"l_language:\" on the first line (or a comment)"
                 .to_string(),
         ),
         LangHeaderDiagnostic::MissingLocFileLang { .. } => (
             cwtools_error_codes::CW255_MISSING_LOC_FILE_LANG.id,
-            LocSeverity::Error,
+            ErrorSeverity::Error,
             "Localisation file name should contain (and ideally end with) \"l_language.yml\""
                 .to_string(),
         ),
@@ -148,7 +140,7 @@ fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
             ..
         } => (
             cwtools_error_codes::CW257_LOC_FILE_LANG_MISMATCH.id,
-            LocSeverity::Error,
+            ErrorSeverity::Error,
             format!(
                 "Localisation file's name has language {} doesn't match the header language {}",
                 lang_fsharp_name(filename_lang),
@@ -204,7 +196,7 @@ fn build_diagnostics(
             line: 1,
             col: 1,
             code: cwtools_error_codes::CW254_WRONG_ENCODING.id,
-            severity: LocSeverity::Error,
+            severity: ErrorSeverity::Error,
             message: "Localisation files must be UTF-8 BOM, this file is not".to_string(),
         });
     }
@@ -216,7 +208,7 @@ fn build_diagnostics(
             line: pe.line,
             col: 1,
             code: cwtools_error_codes::CW001_PARSE_ERROR.id,
-            severity: LocSeverity::Error,
+            severity: ErrorSeverity::Error,
             message: cwtools_error_codes::CW001_PARSE_ERROR.format(&[pe.message.as_str()]),
         });
     }
@@ -376,7 +368,7 @@ mod tests {
         let diags = validate_loc_project(&svc, Game::HOI4);
         let cw225: Vec<_> = diags.iter().filter(|d| d.code == "CW225").collect();
         assert_eq!(cw225.len(), 1, "got: {:?}", diags);
-        assert_eq!(cw225[0].severity, LocSeverity::Error);
+        assert_eq!(cw225[0].severity, ErrorSeverity::Error);
         assert!(cw225[0].message.contains("english"));
     }
 
@@ -387,7 +379,7 @@ mod tests {
         let diags = validate_loc_project(&svc, Game::HOI4);
         let cw255: Vec<_> = diags.iter().filter(|d| d.code == "CW255").collect();
         assert_eq!(cw255.len(), 1, "got: {:?}", diags);
-        assert_eq!(cw255[0].severity, LocSeverity::Error);
+        assert_eq!(cw255[0].severity, ErrorSeverity::Error);
     }
 
     #[test]
@@ -397,7 +389,7 @@ mod tests {
         let diags = validate_loc_project(&svc, Game::HOI4);
         let cw256: Vec<_> = diags.iter().filter(|d| d.code == "CW256").collect();
         assert_eq!(cw256.len(), 1, "got: {:?}", diags);
-        assert_eq!(cw256[0].severity, LocSeverity::Error);
+        assert_eq!(cw256[0].severity, ErrorSeverity::Error);
     }
 
     #[test]
@@ -433,7 +425,7 @@ mod tests {
         let diags = validate_loc_project(&svc, Game::HOI4);
         let cw234: Vec<_> = diags.iter().filter(|d| d.code == "CW234").collect();
         assert_eq!(cw234.len(), 1, "got: {:?}", diags);
-        assert_eq!(cw234[0].severity, LocSeverity::Information);
+        assert_eq!(cw234[0].severity, ErrorSeverity::Information);
     }
 
     #[test]
@@ -476,7 +468,7 @@ mod tests {
             .filter(|d| d.code == "CW254")
             .collect();
         assert_eq!(cw254.len(), 1, "missing-BOM file should warn CW254");
-        assert_eq!(cw254[0].severity, LocSeverity::Error);
+        assert_eq!(cw254[0].severity, ErrorSeverity::Error);
     }
 
     #[test]
@@ -537,7 +529,7 @@ mod tests {
             "exactly one CW001 for one bad line: {:?}",
             diags
         );
-        assert_eq!(cw001[0].severity, LocSeverity::Error);
+        assert_eq!(cw001[0].severity, ErrorSeverity::Error);
         assert_eq!(cw001[0].line, 3, "bad line is line 3");
 
         // The good entries still parse — no spurious CW225/CW100 from the bad line.
@@ -564,7 +556,7 @@ mod tests {
             "unterminated string should emit CW268: {:?}",
             diags
         );
-        assert_eq!(cw268[0].severity, LocSeverity::Warning);
+        assert_eq!(cw268[0].severity, ErrorSeverity::Warning);
     }
 
     #[test]
@@ -578,7 +570,7 @@ mod tests {
             "key with space should emit CW276: {:?}",
             diags
         );
-        assert_eq!(cw276[0].severity, LocSeverity::Warning);
+        assert_eq!(cw276[0].severity, ErrorSeverity::Warning);
         assert!(
             cw276[0].message.contains("bad key") || cw276[0].message.contains("\"bad key\""),
             "message should reference the key: {}",
