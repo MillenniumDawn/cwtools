@@ -568,16 +568,27 @@ fn count_children(
         return (key_counts, leafvalue_counts, valueclause_counts);
     }
 
+    let mut keybuf: SmallVec<[u8; 24]> = SmallVec::new();
     for child in children {
         match child {
             Child::Leaf(idx) if any_keyed => {
                 let leaf = &ast.arena.leaves[*idx as usize];
                 // Paradox keys are case-insensitive; key the counts in lowercase so
                 // a field written `texturefile` satisfies a rule keyed `textureFile`.
-                let key = table
-                    .with_string(leaf.key.normal, |s| unquote_key(s).to_ascii_lowercase())
-                    .unwrap_or_default();
-                *key_counts.entry(key).or_insert(0) += 1;
+                // Lowercase into a reused stack buffer so the owned String is only
+                // allocated on the first occurrence of each distinct key.
+                keybuf.clear();
+                table.with_string(leaf.key.normal, |s| {
+                    keybuf.extend_from_slice(unquote_key(s).as_bytes())
+                });
+                keybuf.make_ascii_lowercase();
+                let key: &str = std::str::from_utf8(&keybuf).unwrap_or_default();
+                match key_counts.get_mut(key) {
+                    Some(c) => *c += 1,
+                    None => {
+                        key_counts.insert(key.to_owned(), 1);
+                    }
+                }
             }
             Child::LeafValue(lvidx) => {
                 let lv = &ast.arena.leaf_values[*lvidx as usize];
@@ -923,19 +934,19 @@ fn enforce_cardinality(
         .map(|(rt, _)| get_rule_key(rt).map(|k| k.to_ascii_lowercase()))
         .collect();
 
-    let mut key_card: FxHashMap<String, (i32, i32, bool)> =
+    let mut key_card: FxHashMap<&str, (i32, i32, bool)> =
         FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
     for (i, (_, opts)) in rules.iter().enumerate() {
         if let Some(lkey) = &rule_keys_lower[i] {
             let e = key_card
-                .entry(lkey.clone())
+                .entry(lkey.as_str())
                 .or_insert((opts.min, opts.max, opts.strict_min));
             e.0 = e.0.min(opts.min);
             e.1 = e.1.max(opts.max);
             e.2 = e.2 && opts.strict_min;
         }
     }
-    let mut reported_keys: FxHashSet<String> =
+    let mut reported_keys: FxHashSet<&str> =
         FxHashSet::with_capacity_and_hasher(key_card.len(), Default::default());
 
     for (rule_idx, (rule_type, opts)) in rules.iter().enumerate() {
@@ -956,13 +967,12 @@ fn enforce_cardinality(
                     (get_rule_key(rule_type), &rule_keys_lower[rule_idx])
                 {
                     // Each distinct key is reported at most once (see key_card above).
-                    if reported_keys.insert(lkey.clone()) {
-                        let (kmin, kmax, kstrict) = key_card.get(lkey).copied().unwrap_or((
-                            opts.min,
-                            opts.max,
-                            opts.strict_min,
-                        ));
-                        let count = key_counts.get(lkey).copied().unwrap_or(0) as i32;
+                    if reported_keys.insert(lkey.as_str()) {
+                        let (kmin, kmax, kstrict) = key_card
+                            .get(lkey.as_str())
+                            .copied()
+                            .unwrap_or((opts.min, opts.max, opts.strict_min));
+                        let count = key_counts.get(lkey.as_str()).copied().unwrap_or(0) as i32;
                         if count < kmin && kstrict {
                             errors.push(ValidationError::from_code_with(
                                 &error_codes::CW242_WRONG_NUMBER,
