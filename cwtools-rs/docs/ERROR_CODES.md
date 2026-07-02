@@ -51,9 +51,9 @@ Codes with no emission site in either engine were removed from both; see
 | CW101 | Error | {} is not defined | A `@variable` is used but never defined. | Defined, not wired (needs FP-safe @-var def/use tracking) |
 | CW102 | Error | unknown trigger {} used. | A trigger name is not in the known trigger list. | Defined, not wired (rules-engine structural codes CW262-265 cover this; a generic check needs a complete trigger registry to avoid false positives) |
 | CW103 | Error | unknown effect {} used. | An effect name is not in the known effect list. | Defined, not wired (as CW102, needs a complete effect registry) |
-| CW104 | Error | {} trigger used in incorrect scope. In {} but expected {} | A trigger is used in a scope it doesn't accept. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`). Scope tracking handles links/iterators/data-refs/root-scope; a DLC-scope long tail remains, so off by default |
-| CW105 | Error | {} effect used in incorrect scope. In {} but expected {} | An effect is used in the wrong scope. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`) |
-| CW106 | Error | {} scope command used in incorrect scope. In {} but expected {} | A scope command is used outside its valid scope. | Wired, gated off (`CWTOOLS_SCOPE_CHECKS=1`) |
+| CW104 | Error | {} trigger used in incorrect scope. In {} but expected {} | A trigger is used in a scope it doesn't accept. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`). Scope tracking handles links/iterators/data-refs/root-scope; a DLC-scope long tail may still surface false positives |
+| CW105 | Error | {} effect used in incorrect scope. In {} but expected {} | An effect is used in the wrong scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
+| CW106 | Error | {} scope command used in incorrect scope. In {} but expected {} | A scope command is used outside its valid scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
 | CW107 | Information | Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick. | An event has no guard against running every tick. | Emitted (reconciled from F# CW107 / formerly Rust CW300) |
 | CW108 | Error | This research_leader is missing required "area" | A `research_leader` block omits the required `area` field. | Emitted (Stellaris only; `research_leader` nested in `common/technology/*.txt`) |
 | CW109 | Information | This research_leader uses area {} but the technology uses area {} | The area in `research_leader` disagrees with the enclosing technology's area. | Emitted (Stellaris only; args leader-then-tech, F# had them swapped) |
@@ -140,6 +140,8 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW251 | Warning | This {} is unnecessary | A boolean operator (`AND`/`OR`) is nested directly inside an identical operator. | Emitted |
 | CW253 | Information | Consider using "set_name" instead for consistency | `set_empire_name` or `set_planet_name` should be replaced with `set_name`. | Emitted |
 | CW280 | Information | {} = { always = ... } matches the default and can be removed | HOI4 cleanup hint: a field whose body is exactly `{ always = <bool> }` matching the field's default (e.g. `allowed_civil_war = { always = no }`) is a no-op and can be deleted. Rust-original (no F# equivalent); field/default table in `per_game::hoi4`. | Emitted |
+| CW281 | Warning | This 'limit' contains no triggers | A `limit = { }` block with no conditions. An empty limit matches everything, so it is almost always forgotten conditions or dead weight. Rust-original (no F# equivalent); emitted from `per_game::structural`. | Emitted |
+| CW282 | Information | This is the default value ({}) and can be omitted | A bool field explicitly set to the engine default declared by the rule's `## default_bool` directive, so the line is redundant. Rust-original (no F# equivalent); emitted from `rule_core::children`. | Emitted |
 
 ### CW254-CW268 -- Localisation file headers and content
 
@@ -171,7 +173,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW272 | Error | {} | A custom error attached to a rule via `## error = ...`. | Defined, not wired (rules loader does not parse the `## error` option yet) |
 | CW273 | Warning | Modifier type {} is not defined but is used | A modifier's type reference points to a modifier-type that isn't defined. | Defined, emission pending (modifier-type registry) |
 | CW274 | Error | This usage of inline_script results in an error, see related | An `inline_script` call resolves to content that itself fails validation. | Defined, not wired (inline-script expansion does not propagate child errors yet) |
-| CW275 | Warning | Localisation key {} contains unexpected characters, and may not render correctly | A loc value contains characters outside the expected set for that game. | Emitted |
+| CW275 | Warning | Localisation value for {} contains unexpected characters, and may not render correctly | A loc value contains characters outside the expected set for that game. | Emitted |
 | CW276 | Warning | Localisation key {} contains invalid characters (spaces or special characters are not allowed) | A loc key contains a space or character not valid in a loc key (only alphanumeric, `_`, `.`, `-` are allowed). Rust-only (no F# equivalent). | Emitted |
 
 ---

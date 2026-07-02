@@ -25,6 +25,19 @@ Produces two binaries in `target/release/`:
 | `cwtools` | CLI validator (`validate`, `cache-vanilla`, etc.) |
 | `cwtools-server` | LSP server (used by the VS Code extension) |
 
+## CLI subcommands
+
+`cwtools <subcommand> --help` prints the flags for each. The full set:
+
+- `validate`: validate a directory of game files against `.cwt` rules (the main command).
+- `cache-vanilla`: pre-generate a vanilla type index from a base-game install, for later use with `validate --vanilla-cache`.
+- `parse`: parse a single script file (or a directory of `.cwt` rule files) and print a summary.
+- `discover`: discover and parse every file under a directory (no validation).
+- `serialize`: serialize a parsed AST to a `.cwb` cache file.
+- `deserialize`: read a `.cwb` cache file back and verify it.
+- `rules`: parse a `.cwt` rules file or directory and print a summary.
+- `loc`: parse and validate localisation `.yml` files.
+
 ## Build all targets (debug + tests)
 
 ```plaintext
