@@ -126,6 +126,22 @@ impl<'a> Parser<'a> {
         None
     }
 
+    /// Consume a comment without materializing its text. For the discard paths
+    /// (comments before a value) where `consume_comment`'s String would be
+    /// thrown away.
+    fn skip_comment(&mut self) -> bool {
+        if self.peek() == Some('#') {
+            while let Some(c) = self.peek() {
+                if c == '\n' {
+                    break;
+                }
+                self.advance();
+            }
+            return true;
+        }
+        false
+    }
+
     fn parse_operator(&mut self) -> Option<Operator> {
         let c1 = self.peek()?;
         let c2 = self.peek2();
@@ -220,7 +236,7 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
         // Skip any comments that appear before the actual value (e.g. value on next line).
         // The AST has no place for comments inside Leaf values, so just discard them.
-        while self.consume_comment().is_some() {
+        while self.skip_comment() {
             self.skip_whitespace();
         }
 

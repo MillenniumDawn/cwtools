@@ -287,6 +287,25 @@ pub(crate) fn leaf_value_to_string(value: &Value, table: &StringTable) -> String
     }
 }
 
+/// Run `f` on the leaf value's string form without a heap String for the
+/// dominant String/QString case. The bytes are copied into a stack buffer
+/// while the table's read guard is held, then `f` runs after the guard drops
+/// (holding the guard through `f` risks lock nesting, see rule_core).
+pub(crate) fn with_leaf_value_str<R>(
+    value: &Value,
+    table: &StringTable,
+    f: impl FnOnce(&str) -> R,
+) -> R {
+    match value {
+        Value::String(t) | Value::QString(t) => {
+            let mut buf: smallvec::SmallVec<[u8; 64]> = smallvec::SmallVec::new();
+            table.with_string(t.normal, |s| buf.extend_from_slice(s.as_bytes()));
+            f(std::str::from_utf8(&buf).unwrap_or_default())
+        }
+        other => f(&leaf_value_to_string(other, table)),
+    }
+}
+
 pub(crate) fn severity_to_error(sev: &Severity) -> ErrorSeverity {
     sev.into()
 }

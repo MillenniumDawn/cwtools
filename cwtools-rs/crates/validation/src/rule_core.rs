@@ -308,23 +308,28 @@ fn validate_leaf_against_rule(
                 // CW282: a bool field explicitly set to the default declared by
                 // `## default_bool = yes|no` is redundant and can be omitted.
                 if let Some(default) = opts.default_bool {
-                    let raw = leaf_value_to_string(&leaf.value, ctx.table);
-                    let v = raw.trim_matches('"').trim();
-                    let is_default = match v.to_ascii_lowercase().as_str() {
-                        "yes" | "true" => default,
-                        "no" | "false" => !default,
-                        _ => false,
-                    };
-                    if is_default {
-                        let code = &error_codes::CW282_REDUNDANT_DEFAULT_BOOL;
-                        errors.push(ValidationError::from_code(
-                            code,
-                            ctx.file_path,
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                            &[v],
-                        ));
-                    }
+                    with_leaf_value_str(&leaf.value, ctx.table, |raw| {
+                        let v = raw.trim_matches('"').trim();
+                        let is_default = if v.eq_ignore_ascii_case("yes")
+                            || v.eq_ignore_ascii_case("true")
+                        {
+                            default
+                        } else if v.eq_ignore_ascii_case("no") || v.eq_ignore_ascii_case("false") {
+                            !default
+                        } else {
+                            false
+                        };
+                        if is_default {
+                            let code = &error_codes::CW282_REDUNDANT_DEFAULT_BOOL;
+                            errors.push(ValidationError::from_code(
+                                code,
+                                ctx.file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                &[v],
+                            ));
+                        }
+                    });
                 }
             }
         }
@@ -1916,100 +1921,103 @@ fn validate_leaf(
         // index only contains mod-defined instances; vanilla instances are absent,
         // so every valid cross-reference would be a false positive.
         if let NewField::TypeField(type_type) = right {
-            let raw_value = leaf_value_to_string(&leaf.value, table);
-            // Strip a surrounding quote pair by slice (no allocation).
-            let value_str: &str = raw_value
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .unwrap_or(&raw_value);
-            // An empty value (`soundeffect = ""`, `textureFile = ""`) is the
-            // engine's "none" — there's nothing to resolve, so don't flag it.
-            if value_str.is_empty() {
-                return;
-            }
-            // A `[...]` value is inline scripted localisation / a defined_text
-            // reference (e.g. `picture = "[GetCivilWarVictorPicture]"`) that the
-            // engine resolves at runtime, so it can't be checked against a literal
-            // type instance.
-            if value_str.starts_with('[') {
-                return;
-            }
-            let type_name = match type_type {
-                TypeType::Simple(n) => n.as_str(),
-                TypeType::Complex { name, .. } => name.as_str(),
-            };
-            // Subtype-qualified references (`<type.subtype>`, e.g.
-            // `<event.country_event>` / `<equipment.naval_equip>`) resolve
-            // permissively. The index's `type.subtype` membership is derived from
-            // each instance's own discriminators for subtype *activation* and is
-            // intentionally incomplete for *references*: a variant that inherits a
-            // subtype through `archetype = <type.subtype>` isn't listed, so a
-            // strict check would false-flag valid references to it. (Precise
-            // subtype-reference validation would need full membership, as F#'s
-            // invertedTypeMap has.)
-            if let Some(idx) = type_index
+            with_leaf_value_str(&leaf.value, table, |raw_value| {
+                // Strip a surrounding quote pair by slice (no allocation).
+                let value_str: &str = raw_value
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(raw_value);
+                // An empty value (`soundeffect = ""`, `textureFile = ""`) is the
+                // engine's "none" — there's nothing to resolve, so don't flag it.
+                if value_str.is_empty() {
+                    return;
+                }
+                // A `[...]` value is inline scripted localisation / a defined_text
+                // reference (e.g. `picture = "[GetCivilWarVictorPicture]"`) that the
+                // engine resolves at runtime, so it can't be checked against a literal
+                // type instance.
+                if value_str.starts_with('[') {
+                    return;
+                }
+                let type_name = match type_type {
+                    TypeType::Simple(n) => n.as_str(),
+                    TypeType::Complex { name, .. } => name.as_str(),
+                };
+                // Subtype-qualified references (`<type.subtype>`, e.g.
+                // `<event.country_event>` / `<equipment.naval_equip>`) resolve
+                // permissively. The index's `type.subtype` membership is derived from
+                // each instance's own discriminators for subtype *activation* and is
+                // intentionally incomplete for *references*: a variant that inherits a
+                // subtype through `archetype = <type.subtype>` isn't listed, so a
+                // strict check would false-flag valid references to it. (Precise
+                // subtype-reference validation would need full membership, as F#'s
+                // invertedTypeMap has.)
+                if let Some(idx) = type_index
                 && !cwtools_index::is_subtype_key(type_name)
                 // Only flag when the index is complete (vanilla loaded) AND we have
                 // known instances for this type. Check this BEFORE any lookup so a
                 // clean resolve pays for no membership probes.
                 && idx.complete
                 && !idx.instances(type_name).is_empty()
-            {
-                // Complex TypeField (`prefix<type>suffix`) maps a value to an
-                // instance and the game accepts any of these forms, tried in order:
-                //   (a) strip: the value carries the affixes and the instance is
-                //       stored without them (`GFX_event_x` -> `x`).
-                //   (b) raw: the value IS already the full instance name
-                //       (HOI4 ideas may write `picture = GFX_idea_x` directly).
-                //   (c) prepend: the value is bare and the affixed form is the real
-                //       instance (HOI4 ideas: `picture = x` -> `GFX_idea_x`). Built
-                //       lazily only when (a)/(b) miss.
-                // The reference resolves if ANY candidate is a known instance, so
-                // this branch can only ever REMOVE false positives, never add them.
-                let (lookup_value, resolved): (&str, bool) = match type_type {
-                    TypeType::Complex { prefix, suffix, .. } => {
-                        let mut v = value_str;
-                        if !prefix.is_empty() {
-                            v = v.strip_prefix(prefix.as_str()).unwrap_or(v);
+                {
+                    // Complex TypeField (`prefix<type>suffix`) maps a value to an
+                    // instance and the game accepts any of these forms, tried in order:
+                    //   (a) strip: the value carries the affixes and the instance is
+                    //       stored without them (`GFX_event_x` -> `x`).
+                    //   (b) raw: the value IS already the full instance name
+                    //       (HOI4 ideas may write `picture = GFX_idea_x` directly).
+                    //   (c) prepend: the value is bare and the affixed form is the real
+                    //       instance (HOI4 ideas: `picture = x` -> `GFX_idea_x`). Built
+                    //       lazily only when (a)/(b) miss.
+                    // The reference resolves if ANY candidate is a known instance, so
+                    // this branch can only ever REMOVE false positives, never add them.
+                    let (lookup_value, resolved): (&str, bool) = match type_type {
+                        TypeType::Complex { prefix, suffix, .. } => {
+                            let mut v = value_str;
+                            if !prefix.is_empty() {
+                                v = v.strip_prefix(prefix.as_str()).unwrap_or(v);
+                            }
+                            if !suffix.is_empty() {
+                                v = v.strip_suffix(suffix.as_str()).unwrap_or(v);
+                            }
+                            let resolved = idx.contains(type_name, v)
+                                || idx.contains(type_name, value_str)
+                                || idx.contains(
+                                    type_name,
+                                    &format!("{}{}{}", prefix, value_str, suffix),
+                                );
+                            (v, resolved)
                         }
-                        if !suffix.is_empty() {
-                            v = v.strip_suffix(suffix.as_str()).unwrap_or(v);
-                        }
-                        let resolved = idx.contains(type_name, v)
-                            || idx.contains(type_name, value_str)
-                            || idx
-                                .contains(type_name, &format!("{}{}{}", prefix, value_str, suffix));
-                        (v, resolved)
-                    }
-                    _ => (value_str, idx.contains(type_name, value_str)),
-                };
-                if !resolved {
-                    let is_event = type_name == "event" || type_name.starts_with("event.");
-                    let (code, message) = if is_event {
-                        let c = &error_codes::CW222_UNDEFINED_EVENT;
-                        (c, c.format(&[lookup_value]))
-                    } else {
-                        let key = table
-                            .with_string(leaf.key.normal, |s| s.to_string())
-                            .unwrap_or_default();
-                        (
-                            &error_codes::CW500_TYPE_NOT_FOUND,
-                            format!(
-                                "Field '{}' references '{}' which is not a known instance of type '{}'",
-                                key, lookup_value, type_name
-                            ),
-                        )
+                        _ => (value_str, idx.contains(type_name, value_str)),
                     };
-                    errors.push(ValidationError::from_code_with(
-                        code,
-                        code.severity,
-                        file_path,
-                        leaf.pos.start.line,
-                        leaf.pos.start.col,
-                        message,
-                    ));
+                    if !resolved {
+                        let is_event = type_name == "event" || type_name.starts_with("event.");
+                        let (code, message) = if is_event {
+                            let c = &error_codes::CW222_UNDEFINED_EVENT;
+                            (c, c.format(&[lookup_value]))
+                        } else {
+                            let key = table
+                                .with_string(leaf.key.normal, |s| s.to_string())
+                                .unwrap_or_default();
+                            (
+                                &error_codes::CW500_TYPE_NOT_FOUND,
+                                format!(
+                                    "Field '{}' references '{}' which is not a known instance of type '{}'",
+                                    key, lookup_value, type_name
+                                ),
+                            )
+                        };
+                        errors.push(ValidationError::from_code_with(
+                            code,
+                            code.severity,
+                            file_path,
+                            leaf.pos.start.line,
+                            leaf.pos.start.col,
+                            message,
+                        ));
+                    }
                 }
-            }
+            });
             // TypeField is otherwise accepted (non-empty check done by field_matches_value).
             return;
         }
@@ -2019,56 +2027,57 @@ fn validate_leaf(
             if let Some(idx) = type_index
                 && !idx.file_index.is_empty()
             {
-                let raw = leaf_value_to_string(&leaf.value, table);
-                let value = raw.trim_matches('"').trim();
-                // Skip dynamic / templated paths we can't resolve statically.
-                let dynamic = value.is_empty()
-                    || value.contains('$')
-                    || value.contains('[')
-                    || value.contains('<');
-                if !dynamic {
-                    // The reference with the field's configured extension applied
-                    // (if any), without the root prefix. Used for the root-prefixed
-                    // lookup and the `.asset`-relative fallback below.
-                    let mut rel_value = value.to_string();
-                    if let Some(ext) = extension
-                        && !ext.is_empty()
-                        && !rel_value
-                            .to_ascii_lowercase()
-                            .ends_with(&ext.to_ascii_lowercase())
-                    {
-                        rel_value.push_str(ext);
-                    }
-                    let candidate = match prefix {
-                        Some(p)
-                            if !value
+                with_leaf_value_str(&leaf.value, table, |raw| {
+                    let value = raw.trim_matches('"').trim();
+                    // Skip dynamic / templated paths we can't resolve statically.
+                    let dynamic = value.is_empty()
+                        || value.contains('$')
+                        || value.contains('[')
+                        || value.contains('<');
+                    if !dynamic {
+                        // The reference with the field's configured extension applied
+                        // (if any), without the root prefix. Used for the root-prefixed
+                        // lookup and the `.asset`-relative fallback below.
+                        let mut rel_value = value.to_string();
+                        if let Some(ext) = extension
+                            && !ext.is_empty()
+                            && !rel_value
                                 .to_ascii_lowercase()
-                                .starts_with(&p.to_ascii_lowercase()) =>
+                                .ends_with(&ext.to_ascii_lowercase())
                         {
-                            format!("{}{}", p, rel_value)
+                            rel_value.push_str(ext);
                         }
-                        _ => rel_value.clone(),
-                    };
-                    // A `.asset` `file =` (sound/entity assets) resolves relative
-                    // to the .asset's own directory, not the field's root prefix
-                    // (e.g. `sound/zom/zom_vo.asset` -> `zom_idle_001.wav` beside
-                    // it). Genuinely-missing siblings still fail to resolve.
-                    let asset_relative = file_path.to_ascii_lowercase().ends_with(".asset")
-                        && idx.file_index.resolve_relative(file_path, &rel_value);
-                    if !idx.file_index.contains(&candidate)
-                        && !texture_sibling_exists(&candidate, &idx.file_index)
-                        && !asset_relative
-                    {
-                        let code = &error_codes::CW113_MISSING_FILE;
-                        errors.push(ValidationError::from_code(
-                            code,
-                            file_path,
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                            &[&candidate],
-                        ));
+                        let candidate = match prefix {
+                            Some(p)
+                                if !value
+                                    .to_ascii_lowercase()
+                                    .starts_with(&p.to_ascii_lowercase()) =>
+                            {
+                                format!("{}{}", p, rel_value)
+                            }
+                            _ => rel_value.clone(),
+                        };
+                        // A `.asset` `file =` (sound/entity assets) resolves relative
+                        // to the .asset's own directory, not the field's root prefix
+                        // (e.g. `sound/zom/zom_vo.asset` -> `zom_idle_001.wav` beside
+                        // it). Genuinely-missing siblings still fail to resolve.
+                        let asset_relative = file_path.to_ascii_lowercase().ends_with(".asset")
+                            && idx.file_index.resolve_relative(file_path, &rel_value);
+                        if !idx.file_index.contains(&candidate)
+                            && !texture_sibling_exists(&candidate, &idx.file_index)
+                            && !asset_relative
+                        {
+                            let code = &error_codes::CW113_MISSING_FILE;
+                            errors.push(ValidationError::from_code(
+                                code,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                &[&candidate],
+                            ));
+                        }
                     }
-                }
+                });
             }
             return;
         }
@@ -2095,70 +2104,72 @@ fn validate_leaf(
             if matches!(leaf.value, Value::Int(_)) {
                 return;
             }
-            let raw = leaf_value_to_string(&leaf.value, table);
-            let v = raw.trim_matches('"').trim();
-            // Accept at-vars (@x), inline math ([...]), loc refs ($$) and boolean
-            // literals (`yes`/`no`, used by boolean modifiers) — all valid in a
-            // value slot (F# FieldValidators bypasses).
-            let is_bool = matches!(leaf.value, Value::Bool(_))
-                || matches!(v.to_ascii_lowercase().as_str(), "yes" | "no");
-            let bypass = v.is_empty()
-                || v.starts_with('@')
-                || v.starts_with('[')
-                || v.contains("$$")
-                || is_bool;
-            if !bypass {
-                // Strip a `?`/`^` default-value selector before parsing.
-                let core = v.split(['?', '^']).next().unwrap_or(v).trim();
-                if let Ok(f) = core.parse::<f64>() {
-                    // Numeric value: enforce int-ness / decimal precision.
-                    if *is_int && f.fract() != 0.0 {
-                        let code = &error_codes::CW271_VARIABLE_INT_ONLY;
-                        errors.push(ValidationError::from_code(
-                            code,
-                            file_path,
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                            &[],
-                        ));
-                    } else if *is_32bit && decimal_places(core) > 3 {
-                        let code = &error_codes::CW270_VARIABLE_TOO_SMALL;
-                        errors.push(ValidationError::from_code(
-                            code,
-                            file_path,
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                            &[],
-                        ));
-                    }
-                } else if ctx.var_checks {
-                    // Non-numeric value: it must name a defined variable. Stay
-                    // lenient: only flag a single bare token (a `.`-chain is a
-                    // scope/target, handled elsewhere) that isn't a scope
-                    // keyword/link and isn't in the project variable index.
-                    let single_token = !core.contains('.') && !core.contains(':');
-                    let is_scopeish = scope_context
-                        .map(|sc| resolves_as_scope_key(sc, core))
-                        .unwrap_or(false);
-                    if single_token
-                        && !is_scopeish
-                        && !is_builtin_variable(ctx.ruleset, core)
-                        && !ctx.is_loop_var(core)
-                        && let Some(idx) = type_index
-                        && !idx.var_index.is_empty()
-                        && !idx.var_index.contains(core)
-                    {
-                        let code = &error_codes::CW246_UNSET_VARIABLE;
-                        errors.push(ValidationError::from_code(
-                            code,
-                            file_path,
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                            &[core],
-                        ));
+            with_leaf_value_str(&leaf.value, table, |raw| {
+                let v = raw.trim_matches('"').trim();
+                // Accept at-vars (@x), inline math ([...]), loc refs ($$) and boolean
+                // literals (`yes`/`no`, used by boolean modifiers) — all valid in a
+                // value slot (F# FieldValidators bypasses).
+                let is_bool = matches!(leaf.value, Value::Bool(_))
+                    || v.eq_ignore_ascii_case("yes")
+                    || v.eq_ignore_ascii_case("no");
+                let bypass = v.is_empty()
+                    || v.starts_with('@')
+                    || v.starts_with('[')
+                    || v.contains("$$")
+                    || is_bool;
+                if !bypass {
+                    // Strip a `?`/`^` default-value selector before parsing.
+                    let core = v.split(['?', '^']).next().unwrap_or(v).trim();
+                    if let Ok(f) = core.parse::<f64>() {
+                        // Numeric value: enforce int-ness / decimal precision.
+                        if *is_int && f.fract() != 0.0 {
+                            let code = &error_codes::CW271_VARIABLE_INT_ONLY;
+                            errors.push(ValidationError::from_code(
+                                code,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                &[],
+                            ));
+                        } else if *is_32bit && decimal_places(core) > 3 {
+                            let code = &error_codes::CW270_VARIABLE_TOO_SMALL;
+                            errors.push(ValidationError::from_code(
+                                code,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                &[],
+                            ));
+                        }
+                    } else if ctx.var_checks {
+                        // Non-numeric value: it must name a defined variable. Stay
+                        // lenient: only flag a single bare token (a `.`-chain is a
+                        // scope/target, handled elsewhere) that isn't a scope
+                        // keyword/link and isn't in the project variable index.
+                        let single_token = !core.contains('.') && !core.contains(':');
+                        let is_scopeish = scope_context
+                            .map(|sc| resolves_as_scope_key(sc, core))
+                            .unwrap_or(false);
+                        if single_token
+                            && !is_scopeish
+                            && !is_builtin_variable(ctx.ruleset, core)
+                            && !ctx.is_loop_var(core)
+                            && let Some(idx) = type_index
+                            && !idx.var_index.is_empty()
+                            && !idx.var_index.contains(core)
+                        {
+                            let code = &error_codes::CW246_UNSET_VARIABLE;
+                            errors.push(ValidationError::from_code(
+                                code,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                &[core],
+                            ));
+                        }
                     }
                 }
-            }
+            });
             return;
         }
 
@@ -2167,8 +2178,9 @@ fn validate_leaf(
         // variable that was set somewhere. Gated like CW246 (needs a complete
         // variable index) so empty-index setups don't false-positive.
         if let NewField::VariableGetField(_) = right {
-            let raw = leaf_value_to_string(&leaf.value, table);
-            check_variable_get(ctx, &raw, leaf.pos.start.line, leaf.pos.start.col, errors);
+            with_leaf_value_str(&leaf.value, table, |raw| {
+                check_variable_get(ctx, raw, leaf.pos.start.line, leaf.pos.start.col, errors);
+            });
             return;
         }
 
@@ -2178,8 +2190,9 @@ fn validate_leaf(
             && ctx.scope_checks
             && let Some(ctx) = scope_context
         {
-            let value = leaf_value_to_string(&leaf.value, table);
-            validate_scope_target(ctx, &value, expected, leaf, file_path, errors);
+            with_leaf_value_str(&leaf.value, table, |value| {
+                validate_scope_target(ctx, value, expected, leaf, file_path, errors);
+            });
         }
 
         if !field_matches_value(right, &leaf.value, table, ctx.ruleset) {
