@@ -744,7 +744,7 @@ fn main() {
 
             // Standalone loc lint uses the scope-independent checks (CW225 etc.);
             // scope-aware command checks need the referencing config's scope.
-            let diags = validate_loc_project(&service, cwtools_localization::Game::Generic);
+            let diags = validate_loc_project(&service, None);
 
             // Surface parse failures too.
             let parse_errors = service.errors();

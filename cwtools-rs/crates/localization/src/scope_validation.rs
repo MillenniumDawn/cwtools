@@ -5,7 +5,7 @@
 //! when a chain is invalid.  Unknown commands are accepted leniently so missing
 //! entries don't produce false positives.
 
-use crate::commands::{Game, LocEntry};
+use crate::commands::LocEntry;
 use crate::loc_string::JominiCommand;
 use cwtools_game::constants::Game as EngineGame;
 use cwtools_game::scope_engine::{SCOPE_ANY, ScopeContext, ScopeId, ScopeResult};
@@ -54,7 +54,7 @@ pub enum LocCommandDiagnostic {
 /// stable while the data grows.
 pub struct LocScopeData {
     /// Game variant (controls which scope links are loaded).
-    pub game: Game,
+    pub game: Option<EngineGame>,
     /// Terminal getter commands accepted for this game.
     ///
     /// If this is empty every unknown command is accepted (fully lenient).
@@ -73,7 +73,7 @@ pub struct LocScopeData {
 impl Default for LocScopeData {
     fn default() -> Self {
         Self {
-            game: Game::Generic,
+            game: None,
             terminal_commands: Vec::new(),
             question_mark_variable: true,
             parameter_variables: true,
@@ -153,20 +153,25 @@ pub fn validate_loc_commands(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Convert the localization crate's `Game` enum to the engine `Game` enum.
-fn game_to_engine(game: Game) -> EngineGame {
+/// Pick the engine `Game` whose scope table drives loc-command validation.
+///
+/// The seven games with a scope table map to themselves; everything else
+/// (`None`, CK2, VIC2, Custom) falls back to Hoi4 (lenient).
+fn game_to_engine(game: Option<EngineGame>) -> EngineGame {
     match game {
-        Game::HOI4 => EngineGame::Hoi4,
-        Game::Stellaris => EngineGame::Stellaris,
-        Game::EU4 => EngineGame::Eu4,
-        Game::CK3 => EngineGame::Ck3,
-        Game::IR => EngineGame::Ir,
-        Game::VIC3 => EngineGame::Vic3,
-        Game::EU5 => EngineGame::Eu5,
-        Game::Generic | Game::Custom => {
+        Some(
+            g @ (EngineGame::Hoi4
+            | EngineGame::Stellaris
+            | EngineGame::Eu4
+            | EngineGame::Ck3
+            | EngineGame::Ir
+            | EngineGame::Vic3
+            | EngineGame::Eu5),
+        ) => g,
+        other => {
             tracing::warn!(
                 "localization game {:?} has no engine mapping; defaulting to Hoi4",
-                game
+                other
             );
             EngineGame::Hoi4 // fallback: lenient
         }
@@ -445,7 +450,7 @@ fn is_terminal_command(lower: &str, terminal_set: &HashSet<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Game, LocEntry, Position};
+    use crate::commands::{LocEntry, Position};
     use crate::loc_string::JominiCommand;
 
     fn make_entry_with_commands(commands: Vec<String>) -> LocEntry {
@@ -501,7 +506,7 @@ mod tests {
             );
         }
         LocScopeData {
-            game: Game::HOI4,
+            game: Some(EngineGame::Hoi4),
             terminal_commands: vec![
                 "GetName".into(),
                 "GetNameDef".into(),
@@ -718,7 +723,7 @@ mod tests {
             params: Vec::new(),
         }]]);
         let data = LocScopeData {
-            game: Game::HOI4,
+            game: Some(EngineGame::Hoi4),
             terminal_commands: Vec::new(),
             question_mark_variable: true,
             parameter_variables: true,

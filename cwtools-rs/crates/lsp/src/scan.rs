@@ -629,7 +629,7 @@ impl Backend {
     #[tracing::instrument(skip_all)]
     pub(crate) async fn rebuild_and_publish_loc(&self, root_path: &std::path::Path) {
         let game = self.state.config.read().game();
-        let loc_game = cwtools_localization::Game::from_engine(game);
+        let loc_game = game;
 
         // Cached vanilla loc keys (from the vanilla cache) supplement the key
         // index, but the hover text map needs the actual loc text from the files.

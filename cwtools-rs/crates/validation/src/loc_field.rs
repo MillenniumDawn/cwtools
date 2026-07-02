@@ -135,7 +135,7 @@ pub(crate) fn validate_localisation_field(
             .map(|c| c.current())
             .unwrap_or(cwtools_game::scope_engine::SCOPE_ANY);
         let data = cwtools_localization::LocScopeData {
-            game: cwtools_localization::Game::from_engine(game),
+            game,
             registry: scope_context.map(|c| c.registry.clone()),
             ..Default::default()
         };
