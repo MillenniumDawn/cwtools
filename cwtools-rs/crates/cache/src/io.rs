@@ -1,4 +1,4 @@
-use crate::cache_format::CachedFile;
+use crate::cache_format::{ArchivedCachedFile, CachedFile};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -29,7 +29,7 @@ pub enum CacheError {
 /// caches compress identically.
 pub const ZSTD_LEVEL: i32 = 3;
 
-/// Magic bytes at the start of every `.cwb` file. Lets `deserialize_from_file`
+/// Magic bytes at the start of every `.cwb` file. Lets `read_archive_bytes`
 /// reject files written by an incompatible layout before rkyv gets confused.
 const MAGIC: &[u8; 4] = b"CWB\x00";
 
@@ -59,8 +59,9 @@ pub fn serialize_to_file(cached: &CachedFile, path: &Path) -> Result<(), CacheEr
     Ok(())
 }
 
-/// Deserialize a `CachedFile` from a `.cwb` file (zstd-decompressed rkyv).
-pub fn deserialize_from_file(path: &Path) -> Result<CachedFile, CacheError> {
+/// Read a `.cwb` file, validate its header, and return the decompressed rkyv
+/// bytes in an aligned buffer suitable for archived access.
+fn read_archive_bytes(path: &Path) -> Result<rkyv::util::AlignedVec, CacheError> {
     let mut file = File::open(path)?;
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
@@ -79,13 +80,26 @@ pub fn deserialize_from_file(path: &Path) -> Result<CachedFile, CacheError> {
     }
     let compressed = &data[MAGIC.len() + 1..];
 
-    let bytes = zstd::decode_all(compressed).map_err(CacheError::Compression)?;
+    let mut aligned = rkyv::util::AlignedVec::new();
+    zstd::stream::copy_decode(compressed, &mut aligned).map_err(CacheError::Compression)?;
+    Ok(aligned)
+}
 
-    let deserialized: CachedFile = rkyv::from_bytes::<CachedFile, rkyv::rancor::Error>(&bytes)
-        .map_err(|e| CacheError::Deserialize {
-            msg: "rkyv decode failed",
-            source: Some(e),
+/// Run `f` on the checked archived view of a `.cwb` file without
+/// materializing an owned `CachedFile`. The only per-load allocations are the
+/// file read and one aligned decompression buffer; every cached string is
+/// borrowed straight out of that buffer.
+pub fn with_archived_file<R>(
+    path: &Path,
+    f: impl FnOnce(&ArchivedCachedFile) -> R,
+) -> Result<R, CacheError> {
+    let bytes = read_archive_bytes(path)?;
+    let archived =
+        rkyv::access::<ArchivedCachedFile, rkyv::rancor::Error>(&bytes).map_err(|e| {
+            CacheError::Deserialize {
+                msg: "rkyv access failed",
+                source: Some(e),
+            }
         })?;
-
-    Ok(deserialized)
+    Ok(f(archived))
 }

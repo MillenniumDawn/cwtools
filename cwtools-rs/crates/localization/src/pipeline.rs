@@ -7,20 +7,12 @@
 //! (CW226/CW260/CW266) run at the config reference site, not here, because they
 //! need the scope of the referencing field.
 
-use crate::commands::{Game, Lang, LocFile};
+use crate::commands::{Lang, LocFile};
 use crate::service::LocService;
 use crate::validation::{LocErrorKind, hardcoded_loc_set, validate_loc_file_with_hardcoded};
 use crate::yaml_parser::{LangHeaderDiagnostic, check_loc_file_lang, parse_loc_text};
+use cwtools_error_codes::ErrorSeverity;
 use std::collections::HashSet;
-
-/// Severity of a loc diagnostic. Mirrors the validation crate's `ErrorSeverity`
-/// without taking a dependency on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocSeverity {
-    Error,
-    Warning,
-    Information,
-}
 
 /// A normalized loc diagnostic ready to be surfaced as a `ValidationError` or an
 /// LSP `Diagnostic`. `line`/`col` are 1-based.
@@ -30,7 +22,7 @@ pub struct LocDiagnostic {
     pub line: usize,
     pub col: usize,
     pub code: &'static str,
-    pub severity: LocSeverity,
+    pub severity: ErrorSeverity,
     pub message: String,
 }
 
@@ -38,14 +30,14 @@ pub struct LocDiagnostic {
 /// severity (matching the F# `ErrorCodes` mapping). Splitting this from the
 /// message means the code / severity accessors don't build (and discard) a
 /// formatted `String`, and the emission path formats each message exactly once.
-fn loc_error_code_severity(kind: &LocErrorKind) -> (&'static str, LocSeverity) {
+fn loc_error_code_severity(kind: &LocErrorKind) -> (&'static str, ErrorSeverity) {
     match kind {
-        LocErrorKind::UndefinedLocReference { .. } => ("CW225", LocSeverity::Error),
-        LocErrorKind::RecursiveLocRef => ("CW259", LocSeverity::Error),
-        LocErrorKind::ReplaceMe => ("CW234", LocSeverity::Information),
-        LocErrorKind::LocMissingQuote => ("CW268", LocSeverity::Warning),
-        LocErrorKind::LocInvalidChars => ("CW275", LocSeverity::Warning),
-        LocErrorKind::LocKeyInvalidChars => ("CW276", LocSeverity::Warning),
+        LocErrorKind::UndefinedLocReference { .. } => ("CW225", ErrorSeverity::Error),
+        LocErrorKind::RecursiveLocRef => ("CW259", ErrorSeverity::Error),
+        LocErrorKind::ReplaceMe => ("CW234", ErrorSeverity::Information),
+        LocErrorKind::LocMissingQuote => ("CW268", ErrorSeverity::Warning),
+        LocErrorKind::LocInvalidChars => ("CW275", ErrorSeverity::Warning),
+        LocErrorKind::LocKeyInvalidChars => ("CW276", ErrorSeverity::Warning),
     }
 }
 
@@ -55,7 +47,7 @@ fn loc_error_parts(
     kind: &LocErrorKind,
     key: &str,
     lang: Option<Lang>,
-) -> (&'static str, LocSeverity, String) {
+) -> (&'static str, ErrorSeverity, String) {
     let (code, severity) = loc_error_code_severity(kind);
     (code, severity, loc_error_message(kind, key, lang))
 }
@@ -66,7 +58,7 @@ pub fn loc_error_code(kind: &LocErrorKind) -> &'static str {
 }
 
 /// The severity for a scope-independent loc-entry error.
-pub fn loc_error_severity(kind: &LocErrorKind) -> LocSeverity {
+pub fn loc_error_severity(kind: &LocErrorKind) -> ErrorSeverity {
     loc_error_code_severity(kind).1
 }
 
@@ -126,19 +118,19 @@ fn lang_fsharp_name(lang: Lang) -> &'static str {
 /// carry a recognised `l_xxx` tag, the first line must be a recognised
 /// `l_xxx:` header, and the two must agree.
 fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
-    let (code, severity, message): (&'static str, LocSeverity, String) = match check_loc_file_lang(
+    let (code, severity, message): (&'static str, ErrorSeverity, String) = match check_loc_file_lang(
         &file.path,
         &file.language_prefix,
     )? {
         LangHeaderDiagnostic::MissingLocFileLangHeader { .. } => (
             cwtools_error_codes::CW256_MISSING_LOC_FILE_LANG_HEADER.id,
-            LocSeverity::Error,
+            ErrorSeverity::Error,
             "Localisation file should start with \"l_language:\" on the first line (or a comment)"
                 .to_string(),
         ),
         LangHeaderDiagnostic::MissingLocFileLang { .. } => (
             cwtools_error_codes::CW255_MISSING_LOC_FILE_LANG.id,
-            LocSeverity::Error,
+            ErrorSeverity::Error,
             "Localisation file name should contain (and ideally end with) \"l_language.yml\""
                 .to_string(),
         ),
@@ -148,7 +140,7 @@ fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
             ..
         } => (
             cwtools_error_codes::CW257_LOC_FILE_LANG_MISMATCH.id,
-            LocSeverity::Error,
+            ErrorSeverity::Error,
             format!(
                 "Localisation file's name has language {} doesn't match the header language {}",
                 lang_fsharp_name(filename_lang),
@@ -204,7 +196,7 @@ fn build_diagnostics(
             line: 1,
             col: 1,
             code: cwtools_error_codes::CW254_WRONG_ENCODING.id,
-            severity: LocSeverity::Error,
+            severity: ErrorSeverity::Error,
             message: "Localisation files must be UTF-8 BOM, this file is not".to_string(),
         });
     }
@@ -216,7 +208,7 @@ fn build_diagnostics(
             line: pe.line,
             col: 1,
             code: cwtools_error_codes::CW001_PARSE_ERROR.id,
-            severity: LocSeverity::Error,
+            severity: ErrorSeverity::Error,
             message: cwtools_error_codes::CW001_PARSE_ERROR.format(&[pe.message.as_str()]),
         });
     }
@@ -247,8 +239,8 @@ fn should_emit_cw254(file: &LocFile) -> bool {
 }
 
 /// Validate every loaded loc file and return normalized diagnostics.
-pub fn validate_loc_project(service: &LocService, game: Game) -> Vec<LocDiagnostic> {
-    validate_loc_project_scoped(service, game, None, &HashSet::new())
+pub fn validate_loc_project(service: &LocService) -> Vec<LocDiagnostic> {
+    validate_loc_project_scoped(service, None, &HashSet::new())
 }
 
 /// As [`validate_loc_project`], but only emit per-file diagnostics for files
@@ -263,7 +255,6 @@ pub fn validate_loc_project(service: &LocService, game: Game) -> Vec<LocDiagnost
 /// defined, suppressing CW225. Pass `&HashSet::new()` for none.
 pub fn validate_loc_project_scoped(
     service: &LocService,
-    game: Game,
     langs: Option<&[Lang]>,
     extra_valid_refs: &HashSet<String>,
 ) -> Vec<LocDiagnostic> {
@@ -280,7 +271,7 @@ pub fn validate_loc_project_scoped(
         .par_iter()
         .flat_map_iter(|file| file.entries.iter().map(|e| e.key.to_lowercase()))
         .collect();
-    validate_loc_project_with_union(service, game, langs, &union, extra_valid_refs)
+    validate_loc_project_with_union(service, langs, &union, extra_valid_refs)
 }
 
 /// As [`validate_loc_project_scoped`], but reuses a caller-owned key `union`
@@ -292,7 +283,6 @@ pub fn validate_loc_project_scoped(
 /// present regardless), so the emitted diagnostics are unchanged.
 pub fn validate_loc_project_with_union(
     service: &LocService,
-    _game: Game,
     langs: Option<&[Lang]>,
     union: &HashSet<String>,
     extra_valid_refs: &HashSet<String>,
@@ -373,10 +363,10 @@ mod tests {
             "a_l_english.yml",
             "l_english:\n key1: \"Hello $undefined_key$\"\n",
         )]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
         let cw225: Vec<_> = diags.iter().filter(|d| d.code == "CW225").collect();
         assert_eq!(cw225.len(), 1, "got: {:?}", diags);
-        assert_eq!(cw225[0].severity, LocSeverity::Error);
+        assert_eq!(cw225[0].severity, ErrorSeverity::Error);
         assert!(cw225[0].message.contains("english"));
     }
 
@@ -384,27 +374,27 @@ mod tests {
     fn filename_without_lang_maps_to_cw255() {
         // Valid header, but the file name carries no l_xxx tag.
         let svc = service_from(&[("events.yml", "l_english:\n key1: \"hi\"\n")]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
         let cw255: Vec<_> = diags.iter().filter(|d| d.code == "CW255").collect();
         assert_eq!(cw255.len(), 1, "got: {:?}", diags);
-        assert_eq!(cw255[0].severity, LocSeverity::Error);
+        assert_eq!(cw255[0].severity, ErrorSeverity::Error);
     }
 
     #[test]
     fn unrecognised_header_maps_to_cw256() {
         // File name has a lang tag, but the header language is unknown.
         let svc = service_from(&[("events_l_english.yml", "l_klingon:\n key1: \"hi\"\n")]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
         let cw256: Vec<_> = diags.iter().filter(|d| d.code == "CW256").collect();
         assert_eq!(cw256.len(), 1, "got: {:?}", diags);
-        assert_eq!(cw256[0].severity, LocSeverity::Error);
+        assert_eq!(cw256[0].severity, ErrorSeverity::Error);
     }
 
     #[test]
     fn name_header_mismatch_maps_to_cw257() {
         // File name says english, header says french.
         let svc = service_from(&[("events_l_english.yml", "l_french:\n key1: \"hi\"\n")]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
         let cw257: Vec<_> = diags.iter().filter(|d| d.code == "CW257").collect();
         assert_eq!(cw257.len(), 1, "got: {:?}", diags);
         assert!(
@@ -417,7 +407,7 @@ mod tests {
     #[test]
     fn matching_name_and_header_no_lang_diag() {
         let svc = service_from(&[("events_l_english.yml", "l_english:\n key1: \"hi\"\n")]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
         assert!(
             diags
                 .iter()
@@ -430,10 +420,10 @@ mod tests {
     #[test]
     fn replace_me_maps_to_cw234_info() {
         let svc = service_from(&[("a_l_english.yml", "l_english:\n key1: \"REPLACE_ME\"\n")]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
         let cw234: Vec<_> = diags.iter().filter(|d| d.code == "CW234").collect();
         assert_eq!(cw234.len(), 1, "got: {:?}", diags);
-        assert_eq!(cw234[0].severity, LocSeverity::Information);
+        assert_eq!(cw234[0].severity, ErrorSeverity::Information);
     }
 
     #[test]
@@ -445,7 +435,7 @@ mod tests {
             "a_l_english.yml",
             "l_english:\n bad_loc_entry: \"hello\u{200b}world\"\n",
         )]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
         let cw275: Vec<_> = diags.iter().filter(|d| d.code == "CW275").collect();
         assert_eq!(cw275.len(), 1, "got: {:?}", diags);
         let msg = &cw275[0].message;
@@ -471,12 +461,12 @@ mod tests {
             "l_english:\n key1: \"hi\"\n",
             Some(FileEncoding::Utf8NoBom),
         )]);
-        let cw254: Vec<_> = validate_loc_project(&svc, Game::HOI4)
+        let cw254: Vec<_> = validate_loc_project(&svc)
             .into_iter()
             .filter(|d| d.code == "CW254")
             .collect();
         assert_eq!(cw254.len(), 1, "missing-BOM file should warn CW254");
-        assert_eq!(cw254[0].severity, LocSeverity::Error);
+        assert_eq!(cw254[0].severity, ErrorSeverity::Error);
     }
 
     #[test]
@@ -487,7 +477,7 @@ mod tests {
             Some(FileEncoding::NonUtf8),
         )]);
         assert_eq!(
-            validate_loc_project(&svc, Game::HOI4)
+            validate_loc_project(&svc)
                 .iter()
                 .filter(|d| d.code == "CW254")
                 .count(),
@@ -503,9 +493,7 @@ mod tests {
             Some(FileEncoding::Utf8Bom),
         )]);
         assert!(
-            validate_loc_project(&svc, Game::HOI4)
-                .iter()
-                .all(|d| d.code != "CW254"),
+            validate_loc_project(&svc).iter().all(|d| d.code != "CW254"),
             "UTF-8 BOM file should not warn CW254"
         );
     }
@@ -515,11 +503,7 @@ mod tests {
         // The text-only path (LSP edits, tests) can't see bytes — no CW254.
         let svc =
             service_with_encoding(&[("a_l_english.yml", "l_english:\n key1: \"hi\"\n", None)]);
-        assert!(
-            validate_loc_project(&svc, Game::HOI4)
-                .iter()
-                .all(|d| d.code != "CW254")
-        );
+        assert!(validate_loc_project(&svc).iter().all(|d| d.code != "CW254"));
     }
 
     #[test]
@@ -528,7 +512,7 @@ mod tests {
         // The surrounding valid entries must still parse (parser remains lenient).
         let text = "l_english:\n good_key: \"valid\"\nthis line has no colon at all\n another_key: \"also valid\"\n";
         let svc = service_from(&[("a_l_english.yml", text)]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
 
         let cw001: Vec<_> = diags.iter().filter(|d| d.code == "CW001").collect();
         assert_eq!(
@@ -537,7 +521,7 @@ mod tests {
             "exactly one CW001 for one bad line: {:?}",
             diags
         );
-        assert_eq!(cw001[0].severity, LocSeverity::Error);
+        assert_eq!(cw001[0].severity, ErrorSeverity::Error);
         assert_eq!(cw001[0].line, 3, "bad line is line 3");
 
         // The good entries still parse — no spurious CW225/CW100 from the bad line.
@@ -556,7 +540,7 @@ mod tests {
             "a_l_english.yml",
             "l_english:\n missing_quote:0 \"unclosed\n",
         )]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
         let cw268: Vec<_> = diags.iter().filter(|d| d.code == "CW268").collect();
         assert_eq!(
             cw268.len(),
@@ -564,13 +548,13 @@ mod tests {
             "unterminated string should emit CW268: {:?}",
             diags
         );
-        assert_eq!(cw268[0].severity, LocSeverity::Warning);
+        assert_eq!(cw268[0].severity, ErrorSeverity::Warning);
     }
 
     #[test]
     fn key_with_space_maps_to_cw276() {
         let svc = service_from(&[("a_l_english.yml", "l_english:\n \"bad key\": \"value\"\n")]);
-        let diags = validate_loc_project(&svc, Game::HOI4);
+        let diags = validate_loc_project(&svc);
         let cw276: Vec<_> = diags.iter().filter(|d| d.code == "CW276").collect();
         assert_eq!(
             cw276.len(),
@@ -578,7 +562,7 @@ mod tests {
             "key with space should emit CW276: {:?}",
             diags
         );
-        assert_eq!(cw276[0].severity, LocSeverity::Warning);
+        assert_eq!(cw276[0].severity, ErrorSeverity::Warning);
         assert!(
             cw276[0].message.contains("bad key") || cw276[0].message.contains("\"bad key\""),
             "message should reference the key: {}",
@@ -590,9 +574,7 @@ mod tests {
     fn well_formed_file_no_cw001() {
         let svc = service_from(&[("a_l_english.yml", "l_english:\n key1: \"hi\"\n")]);
         assert!(
-            validate_loc_project(&svc, Game::HOI4)
-                .iter()
-                .all(|d| d.code != "CW001"),
+            validate_loc_project(&svc).iter().all(|d| d.code != "CW001"),
             "well-formed file must not emit CW001"
         );
     }

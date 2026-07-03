@@ -22,12 +22,12 @@ nested = {
     let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
     io::serialize_to_file(&cached, tmp.path()).unwrap();
 
-    // Deserialize
-    let loaded = io::deserialize_from_file(tmp.path()).unwrap();
-
-    // Convert back to arena
+    // Reload via the archived path and convert back to an arena.
     let table2 = StringTable::new();
-    let (arena2, root2) = convert::cached_to_arena(&loaded, &table2);
+    let (arena2, root2) = io::with_archived_file(tmp.path(), |archived| {
+        convert::archived_to_arena(archived, &table2)
+    })
+    .unwrap();
 
     // Verify structure counts match
     assert_eq!(arena2.leaves.len(), parsed.arena.leaves.len());
@@ -50,9 +50,11 @@ fn roundtrip_real_file() {
     let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
     io::serialize_to_file(&cached, tmp.path()).unwrap();
 
-    let loaded = io::deserialize_from_file(tmp.path()).unwrap();
     let table2 = StringTable::new();
-    let (arena2, root2) = convert::cached_to_arena(&loaded, &table2);
+    let (arena2, root2) = io::with_archived_file(tmp.path(), |archived| {
+        convert::archived_to_arena(archived, &table2)
+    })
+    .unwrap();
 
     assert_eq!(arena2.leaves.len(), parsed.arena.leaves.len());
     assert_eq!(root2.len(), parsed.root_children.len());
@@ -66,11 +68,11 @@ fn roundtrip_real_file() {
     }
 }
 
-/// The batched `cached_to_arena` must produce a StringTable identical to one
+/// The batched `archived_to_arena` must produce a StringTable identical to one
 /// built by interning each string individually in traversal order: same ids,
 /// same resolved text for every node.
 #[test]
-fn cached_to_arena_matches_per_string_interning() {
+fn archived_to_arena_matches_per_string_interning() {
     use cwtools_parser::ast::Value;
 
     let input = r#"
@@ -89,12 +91,17 @@ key_a key_b = { x = 1 }
     let parsed = parse_string(input, &table).unwrap();
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
-    // Batched path.
-    let batch_table = StringTable::new();
-    let (batch_arena, _) = convert::cached_to_arena(&cached, &batch_table);
+    // Archived path.
+    let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
+    io::serialize_to_file(&cached, tmp.path()).unwrap();
+    let arch_table = StringTable::new();
+    let (arch_arena, _) = io::with_archived_file(tmp.path(), |archived| {
+        convert::archived_to_arena(archived, &arch_table)
+    })
+    .unwrap();
 
     // Reference path: intern every string by hand, same traversal order as
-    // cached_to_arena (leaves, then leaf_values).
+    // archived_to_arena (leaves, then leaf_values).
     let ref_table = StringTable::new();
     let mut expected = Vec::new();
     for l in &cached.leaves {
@@ -105,26 +112,146 @@ key_a key_b = { x = 1 }
         push_value(&lv.value, &ref_table, &mut expected);
     }
 
-    // Collect the batched arena's tokens in the identical order and compare.
+    // Collect the archived arena's tokens in the identical order and compare.
     let mut actual = Vec::new();
-    for l in &batch_arena.leaves {
+    for l in &arch_arena.leaves {
         actual.push(l.key);
         collect_arena_value(&l.value, &mut actual);
     }
-    for lv in &batch_arena.leaf_values {
+    for lv in &arch_arena.leaf_values {
         collect_arena_value(&lv.value, &mut actual);
     }
 
-    assert_eq!(expected, actual, "batched tokens diverge from per-string");
+    assert_eq!(expected, actual, "archived tokens diverge from per-string");
     for tok in &actual {
         assert_eq!(
-            batch_table.get_string(tok.normal),
+            arch_table.get_string(tok.normal),
             ref_table.get_string(tok.normal)
         );
         assert_eq!(
-            batch_table.get_string(tok.lower),
+            arch_table.get_string(tok.lower),
             ref_table.get_string(tok.lower)
         );
+    }
+
+    fn push_value(
+        v: &cwtools_cache::cache_format::CachedValue,
+        t: &StringTable,
+        out: &mut Vec<cwtools_string_table::string_table::StringTokens>,
+    ) {
+        use cwtools_cache::cache_format::CachedValue;
+        match v {
+            CachedValue::String(s) | CachedValue::QString(s) => out.push(t.intern(s)),
+            _ => {}
+        }
+    }
+    fn collect_arena_value(
+        v: &Value,
+        out: &mut Vec<cwtools_string_table::string_table::StringTokens>,
+    ) {
+        match v {
+            Value::String(t) | Value::QString(t) => out.push(*t),
+            _ => {}
+        }
+    }
+}
+
+/// The zero-copy archived path must rebuild an arena equivalent to the source
+/// parse: token-independent fields (ops, positions, comment text, root children)
+/// match the original arena exactly, and every rebuilt token resolves to the same
+/// text as a hand-interned reference walked in the identical traversal order.
+#[test]
+fn archived_to_arena_matches_reference_over_corpus() {
+    use cwtools_parser::ast::Value;
+
+    let test_dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testfiles/performancetest2/"
+    );
+
+    let config = FileManagerConfig {
+        root: std::path::PathBuf::from(test_dir),
+        ..Default::default()
+    };
+    let mut manager = FileManager::new(config);
+    let files = manager.discover_and_parse().unwrap();
+    assert!(!files.is_empty());
+
+    for parsed in files {
+        let cached =
+            convert::arena_to_cached(&parsed.arena, &parsed.root_children, &manager.string_table);
+        let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
+        io::serialize_to_file(&cached, tmp.path()).unwrap();
+
+        let arch_table = StringTable::new();
+        let (arch_arena, arch_root) = io::with_archived_file(tmp.path(), |archived| {
+            convert::archived_to_arena(archived, &arch_table)
+        })
+        .unwrap();
+
+        let ctx = parsed.path.display();
+
+        // Token-independent structure must match the source parse exactly.
+        assert_eq!(parsed.arena.leaves.len(), arch_arena.leaves.len(), "{ctx}");
+        for (a, b) in parsed.arena.leaves.iter().zip(arch_arena.leaves.iter()) {
+            assert_eq!(a.op, b.op, "{ctx}");
+            assert_eq!(a.pos, b.pos, "{ctx}");
+        }
+        assert_eq!(
+            parsed.arena.leaf_values.len(),
+            arch_arena.leaf_values.len(),
+            "{ctx}"
+        );
+        for (a, b) in parsed
+            .arena
+            .leaf_values
+            .iter()
+            .zip(arch_arena.leaf_values.iter())
+        {
+            assert_eq!(a.pos, b.pos, "{ctx}");
+        }
+        assert_eq!(
+            parsed.arena.comments.len(),
+            arch_arena.comments.len(),
+            "{ctx}"
+        );
+        for (a, b) in parsed.arena.comments.iter().zip(arch_arena.comments.iter()) {
+            assert_eq!(a.text, b.text, "{ctx}");
+            assert_eq!(a.pos, b.pos, "{ctx}");
+        }
+        assert_eq!(parsed.root_children, arch_root, "{ctx}");
+
+        // Tokens: hand-intern the cached strings in the traversal order the
+        // archived rebuild uses (leaves, then leaf_values) and compare ids and
+        // resolved text against the rebuilt arena.
+        let ref_table = StringTable::new();
+        let mut expected = Vec::new();
+        for l in &cached.leaves {
+            expected.push(ref_table.intern(&l.key));
+            push_value(&l.value, &ref_table, &mut expected);
+        }
+        for lv in &cached.leaf_values {
+            push_value(&lv.value, &ref_table, &mut expected);
+        }
+        let mut actual = Vec::new();
+        for l in &arch_arena.leaves {
+            actual.push(l.key);
+            collect_arena_value(&l.value, &mut actual);
+        }
+        for lv in &arch_arena.leaf_values {
+            collect_arena_value(&lv.value, &mut actual);
+        }
+        assert_eq!(
+            expected, actual,
+            "archived tokens diverge from reference in {ctx}"
+        );
+        for tok in &actual {
+            assert_eq!(
+                arch_table.get_string(tok.normal),
+                ref_table.get_string(tok.normal),
+                "token text diverged in {ctx}"
+            );
+        }
     }
 
     fn push_value(
@@ -176,9 +303,11 @@ fn roundtrip_all_performancetest_files() {
         let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
         io::serialize_to_file(&cached, tmp.path()).unwrap();
 
-        let loaded = io::deserialize_from_file(tmp.path()).unwrap();
         let table2 = StringTable::new();
-        let (arena2, root2) = convert::cached_to_arena(&loaded, &table2);
+        let (arena2, root2) = io::with_archived_file(tmp.path(), |archived| {
+            convert::archived_to_arena(archived, &table2)
+        })
+        .unwrap();
 
         // Verify counts match
         assert_eq!(

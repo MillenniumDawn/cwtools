@@ -303,21 +303,25 @@ fn main() {
                 }
             }
         }
-        Commands::Deserialize { input } => match cwtools_cache::io::deserialize_from_file(&input) {
-            Ok(loaded) => {
-                let table = StringTable::new();
-                let (arena, root) = cwtools_cache::convert::cached_to_arena(&loaded, &table);
-                println!("Deserialized from {}", input.display());
-                println!("  Leaves:   {}", arena.leaves.len());
-                println!("  Values:   {}", arena.leaf_values.len());
-                println!("  Comments: {}", arena.comments.len());
-                println!("  Root children: {}", root.len());
+        Commands::Deserialize { input } => {
+            let table = StringTable::new();
+            let result = cwtools_cache::io::with_archived_file(&input, |archived| {
+                cwtools_cache::convert::archived_to_arena(archived, &table)
+            });
+            match result {
+                Ok((arena, root)) => {
+                    println!("Deserialized from {}", input.display());
+                    println!("  Leaves:   {}", arena.leaves.len());
+                    println!("  Values:   {}", arena.leaf_values.len());
+                    println!("  Comments: {}", arena.comments.len());
+                    println!("  Root children: {}", root.len());
+                }
+                Err(e) => {
+                    eprintln!("Error deserializing {}: {}", input.display(), e);
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("Error deserializing {}: {}", input.display(), e);
-                std::process::exit(1);
-            }
-        },
+        }
         Commands::Rules { file } => {
             let table = StringTable::new();
             let ruleset = load_rules(&file, &table);
@@ -529,17 +533,7 @@ fn main() {
                 if !d.file.starts_with(&dir_prefix) {
                     continue;
                 }
-                let severity = match d.severity {
-                    cwtools_localization::LocSeverity::Error => {
-                        cwtools_validation::ErrorSeverity::Error
-                    }
-                    cwtools_localization::LocSeverity::Warning => {
-                        cwtools_validation::ErrorSeverity::Warning
-                    }
-                    cwtools_localization::LocSeverity::Information => {
-                        cwtools_validation::ErrorSeverity::Information
-                    }
-                };
+                let severity = d.severity;
                 let line = d.line as u32;
                 let code = d.code.to_string();
                 let hash = diag_hash(&d.file, &code, &d.message, line);
@@ -754,7 +748,7 @@ fn main() {
 
             // Standalone loc lint uses the scope-independent checks (CW225 etc.);
             // scope-aware command checks need the referencing config's scope.
-            let diags = validate_loc_project(&service, cwtools_localization::Game::Generic);
+            let diags = validate_loc_project(&service);
 
             // Surface parse failures too.
             let parse_errors = service.errors();

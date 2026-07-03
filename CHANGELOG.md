@@ -12,10 +12,40 @@
 - Scripted effects are suggested inside effect blocks. A type-pattern alias (`alias[effect:<scripted_effect>]`) now expands to the actual scripted-effect names instead of emitting the literal `<scripted_effect>` placeholder. (cwtools-vscode#64)
 - Modifiers are suggested inside `dynamic_modifier` blocks (`alias_keys_field[modifier]`). (cwtools-vscode#65)
 - Duplicate autocomplete entries are removed. (cwtools-vscode#66)
+- Stellaris modding support lands. The engine now consumes the `cwtools-stellaris-config` as the source of truth for scope/link/pretrigger resolution: scopes and links come from `scopes.cwt`/`links.cwt` via the runtime `ScopeRegistry`, and the pretrigger set comes from `alias[<scope>_pre_trigger:<name>] = bool` declarations in `pre_triggers.cwt`. The hardcoded `STELLARIS_SCOPES` const and `load_stellaris_links` table stay in place as a backfill for partial configs and tests.
+- New Stellaris-specific validators, ported from `CWTools/Validation/Stellaris/STLValidation.fs`, folder-scoped like F# and dispatched case-insensitively:
+  - **CW108/CW109** `research_leader` blocks nested in `common/technology` definitions: missing `area` (CW108), or disagreeing with the technology's (CW109; args are leader-then-tech, F# had them swapped)
+  - **CW110** any root block of `common/technology/*.txt` (the `category/` subfolder excluded) whose `category` holds no value
+  - **CW120** pretrigger placement: a known pretrigger in an event's `trigger` block (event types with `pre_triggers` support, per scope) or a pop job's `possible` block
+  - **CW227/CW229** `ship_design`/`global_ship_design` references an unknown `section_template`/`component_template`. Gated like CW500 (complete index, known instances); `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` are exempt
+  - **CW250** a `common/component_templates` block with `type = planet_killer` missing its `on_destroy_planet_with_<key>` on_action or `can_destroy_planet_with_<key>` scripted trigger (same completeness gate)
+- `RuleSet` exposes `pretriggers: HashMap<String, HashSet<String>>` (scope -> trigger names) from `reindex()`. CW301 duplicated CW120 on the same leaf and is retired.
+- Editor warm start is faster: a parse-cache hit now reads the archived bytes in place instead of building an owned copy of every cached string first. Warm load over a 6293-file corpus drops from 0.73s to 0.52s.
+- Validation allocates far less per node: cardinality counting reuses one stack buffer and only allocates per distinct key, rule keys are lowercased once instead of per block, and the common value checks (type refs, file paths, variables, scope targets) borrow the value instead of copying it. The parser also stops materializing comments it throws away.
+
+## Notes
+
+- Stellaris coverage in this release is best-effort: there is no vanilla corpus or real-world mod in the test data, so a few checks (CW228 slot-in-section, CW230 size mismatch, CW231 unused technology, CW233 entity defined) are defined and wired but emit no diagnostic yet. They need per-template field data indexed from mod files; the engine is ready to consume that data when it lands.
+- The cwtools-stellaris-config's `scopes.cwt` declares `Alliance` and `Federation` as separate scopes; the previous hardcoded table merged them under one id. With the config-driven path live, `id_of("alliance")` and `id_of("federation")` now resolve to different ids. Pinning test: `crates/validation/tests/stellaris_config.rs::config_alliance_and_federation_are_separate_scopes`.
+- `docs/ARCHITECTURE.md` is now an actual architecture doc: the 15-crate map and layering, the batch pipeline, the CLI-vs-LSP split, and checklists for adding a game or an error code. The old loc-only content survives as a trimmed section.
+- `docs/ERROR_CODES.md` corrections: CW104/105/106 are on by default (opt out with `CWTOOLS_NO_SCOPE_CHECKS=1`; the doc cited a `CWTOOLS_SCOPE_CHECKS` variable that never existed), CW281/CW282 are now listed, and the CW275 message matches the code.
+- `PROFILING.md` documents `CWTOOLS_PROFILE` and `CWTOOLS_TIMINGS`; `BUILD.md` lists all eight subcommands.
 
 ## Developer
 
 - Added tests for the unterminated-quote and invalid-key loc checks, the missing-required diagnostic position (nested block and top-level regression), go-to-definition de-duplication, scripted-effect and dynamic-modifier completion, completion de-duplication, and a CLI test asserting the unterminated-quote fixture is flagged.
+- Added `cwtools-rs/testfiles/stellaris-config/` (a small subset of the external cwtools-stellaris-config: `scopes.cwt`, `links.cwt`, `pre_triggers.cwt`) plus `crates/validation/tests/stellaris_config.rs` (7 integration tests: scope/alias resolution, link resolution, synthesized iterators, Alliance-vs-Federation separation, per-scope pretrigger population through the real loader, an end-to-end CW120 run, fixture-files-exist sanity check).
+- Added unit tests under `crates/validation/src/per_game/stellaris.rs::tests` for the new validators (CW108, CW109, CW110, CW120, CW227, CW229, CW250) including folder-scoping, per-scope pretrigger separation, completeness-gate, and mixed-case dispatch cases.
+- `child_scalar` in the Stellaris validators now strips the quotes QString tokens carry, so `template = "SSM_..."` lookups compare the bare name (quoted values never matched the type index before).
+- The hot `RuleSet`/`TypeIndex` lookup maps use `FxHashMap` (trusted internal maps probed several times per leaf; SipHash bought nothing).
+- `Options` boxes its two fat rarely-set fields (`replace_scopes`, `reference_details`): 240 down to 128 bytes, cheaper rule merging.
+- The duplicate localisation `Game` enum is gone; loc APIs take `Option<cwtools_game::constants::Game>`. One fewer lockstep site when adding a game. `LocSeverity` likewise deleted in favor of the shared `ErrorSeverity`.
+- The three stateless per-game walkers share one `walk_blocks` visitor, and the hand-rolled `ValidationError` literals in `stellaris.rs` go through `from_code`.
+- Four oversized files became directory modules (pure moves, public paths preserved): `validation/rule_core/`, `index` submodules, `game/scope_engine/`, `lsp/completion/`.
+- The driver crate has tests now (8 smoke tests: `search_config_for` branches, `index_game_dir`, `Session::load` determinism). Workspace total is 642.
+- Every change in this batch was gated on a Kaiserreich full-corpus sorted-CSV diff (byte-identical throughout).
+- Deleted `specs/code-review-findings.md`, a 38KB planning artifact that had been committed by accident.
+- Simplification pass over this branch's new code: dropped the dead `game` parameter threaded through the loc build/validate pipeline (both terminals ignored it), deleted the owned cache reverse path (`cached_to_arena` and its helpers; the CLI `deserialize` and the round-trip tests now reload through the zero-copy archived path), removed the production-dead `languages_for_game`/`key_to_language_for_game`, and collapsed the Stellaris `child_has_always_no`/`child_is_bool` pair into one `child_is_always_no`. Five now-dead language-list tests removed (suite 637); Kaiserreich corpus byte-identical.
 
 # 1.8.5
 

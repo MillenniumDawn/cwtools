@@ -107,7 +107,6 @@ pub struct Session {
     modifier_keys: HashSet<String>,
     loc_service: LocService,
     loc_index: LocIndex,
-    loc_game: cwtools_localization::Game,
     loc_languages: Option<Vec<Lang>>,
     registry: Option<Arc<ScopeRegistry>>,
     directory: PathBuf,
@@ -295,9 +294,7 @@ impl Session {
             loc_dirs.push(v.as_path());
         }
         let loc_service = LocService::from_folders(&loc_dirs);
-        let loc_game = cwtools_localization::Game::from_engine(Some(game));
-        let mut loc_index =
-            LocIndex::build_scoped(&loc_service, loc_game, loc_languages.as_deref());
+        let mut loc_index = LocIndex::build_scoped(&loc_service, loc_languages.as_deref());
         if let Some(keys) = cached_loc_keys {
             let typed: Vec<(Lang, Vec<String>)> = keys
                 .into_iter()
@@ -317,7 +314,6 @@ impl Session {
             modifier_keys,
             loc_service,
             loc_index,
-            loc_game,
             loc_languages,
             registry,
             directory,
@@ -371,7 +367,6 @@ impl Session {
         // merged) rather than rebuilding the ~2M-key set here.
         cwtools_localization::validate_loc_project_with_union(
             &self.loc_service,
-            self.loc_game,
             self.loc_languages.as_deref(),
             self.loc_index.union(),
             &extra,

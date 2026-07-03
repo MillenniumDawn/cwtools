@@ -8,8 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cwtools_cache::convert::{arena_to_cached, cached_to_arena};
-use cwtools_cache::io::{deserialize_from_file, serialize_to_file};
+use cwtools_cache::convert::{archived_to_arena, arena_to_cached};
+use cwtools_cache::io::{serialize_to_file, with_archived_file};
 use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
@@ -296,13 +296,17 @@ pub fn load(
     let hash = content_hash(text);
     let path = file_cache_path(&dir, hash);
 
-    let cached = deserialize_from_file(&path).ok()?;
-    let (arena, root_children) = cached_to_arena(&cached, table);
-    Some(ParsedFile {
-        arena,
-        root_children,
-        errors: vec![],
+    // Zero-copy hit path: intern straight from the archived buffer instead of
+    // materializing an owned CachedFile first (halves per-string allocation).
+    with_archived_file(&path, |archived| {
+        let (arena, root_children) = archived_to_arena(archived, table);
+        ParsedFile {
+            arena,
+            root_children,
+            errors: vec![],
+        }
     })
+    .ok()
 }
 
 /// Persist a successfully parsed (error-free) `ParsedFile` to the cache.

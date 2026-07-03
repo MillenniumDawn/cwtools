@@ -10,14 +10,15 @@ use rustc_hash::FxHashMap;
 /// `String`.
 pub(crate) struct Block<'a> {
     pub key: StringId,
+    pub key_lower: StringId,
     pub children: &'a [Child],
     pub range: SourceRange,
 }
 
 impl Block<'_> {
-    /// The block's key as an owned `String` (empty if interning lost it).
-    pub fn key_string(&self, table: &StringTable) -> String {
-        table.get_string(self.key).unwrap_or_default()
+    /// The block's key lowercased, for case-insensitive Paradox key dispatch.
+    pub fn key_string_lower(&self, table: &StringTable) -> String {
+        table.get_string(self.key_lower).unwrap_or_default()
     }
 }
 
@@ -31,6 +32,7 @@ pub(crate) fn as_block<'a>(child: &Child, ast: &'a ParsedFile) -> Option<Block<'
             if let Value::Clause(children) = &l.value {
                 Some(Block {
                     key: l.key.normal,
+                    key_lower: l.key.lower,
                     children,
                     range: l.pos,
                 })
@@ -39,6 +41,20 @@ pub(crate) fn as_block<'a>(child: &Child, ast: &'a ParsedFile) -> Option<Block<'
             }
         }
         _ => None,
+    }
+}
+
+/// Depth-first pre-order walk over every `key = { ... }` block under
+/// `children`, calling `f` on each block before descending into it. Shared
+/// skeleton for the stateless per-game walkers; walkers that thread state down
+/// the recursion (structural's CW223 fold) keep their own.
+pub(crate) fn walk_blocks(children: &[Child], ast: &ParsedFile, f: &mut impl FnMut(&Block<'_>)) {
+    for child in children {
+        let Some(block) = as_block(child, ast) else {
+            continue;
+        };
+        f(&block);
+        walk_blocks(block.children, ast, f);
     }
 }
 

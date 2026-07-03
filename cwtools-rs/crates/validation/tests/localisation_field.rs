@@ -1,7 +1,7 @@
 //! Tests for LocalisationField existence checking (CW100 / CW122) wired into
 //! the main validation pipeline via `validate_ast_with_loc`.
 
-use cwtools_localization::{Game as LocGame, LocIndex, LocService};
+use cwtools_localization::{LocIndex, LocService};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
@@ -27,7 +27,7 @@ fn loc_index(files: &[(&str, &str)]) -> LocIndex {
             .map(|(p, t)| (p.to_string(), t.to_string()))
             .collect(),
     );
-    LocIndex::build(&svc, LocGame::HOI4)
+    LocIndex::build(&svc)
 }
 
 fn run(script: &str, idx: &LocIndex) -> Vec<cwtools_validation::ValidationError> {
@@ -136,7 +136,7 @@ fn dollar_var_reference_is_skipped() {
 /// scope-independent loc-entry checks must match the validation crate's catalog.
 #[test]
 fn loc_pipeline_codes_match_error_catalog() {
-    use cwtools_localization::{LocErrorKind, LocSeverity, loc_error_code, loc_error_severity};
+    use cwtools_localization::{LocErrorKind, loc_error_code, loc_error_severity};
     use cwtools_validation::error_codes as ec;
 
     let cases = [
@@ -162,15 +162,9 @@ fn loc_pipeline_codes_match_error_catalog() {
             code.id,
             "code id mismatch for {kind:?}"
         );
-        let want = match code.severity {
-            cwtools_validation::ErrorSeverity::Error => LocSeverity::Error,
-            cwtools_validation::ErrorSeverity::Warning => LocSeverity::Warning,
-            cwtools_validation::ErrorSeverity::Information => LocSeverity::Information,
-            cwtools_validation::ErrorSeverity::Hint => LocSeverity::Information,
-        };
         assert_eq!(
             loc_error_severity(&kind),
-            want,
+            code.severity,
             "severity mismatch for {kind:?}"
         );
     }

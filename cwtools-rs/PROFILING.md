@@ -5,9 +5,20 @@ for build instructions.
 
 ## Runtime profiling
 
-The workspace is instrumented with [`tracing`](https://docs.rs/tracing). The
-subscriber is off by default and only turns on when `RUST_LOG` is set, so normal
-runs stay quiet.
+The workspace is instrumented with [`tracing`](https://docs.rs/tracing); the
+subscriber and its helpers live in the `cwtools_profiling` crate. It is off by
+default and turns on when either of these is set, so normal runs stay quiet:
+
+- `RUST_LOG`: standard env-filter (e.g. `RUST_LOG=cwtools_validation=info`).
+  Output goes to **stderr** so it never corrupts the LSP's stdout JSON-RPC
+  channel.
+- `CWTOOLS_PROFILE`: turn on the profiling report (span timings at `info` plus
+  RSS samples at phase boundaries) without spelling out a filter. Truthy values:
+  `1`, `true`, `yes`, `on`. The LSP owns stdout for JSON-RPC and the VS Code
+  client never drains the server's stderr, so under `CWTOOLS_PROFILE` the output
+  is routed to a bounded in-memory ring buffer (4 MB, oldest bytes dropped)
+  instead of stderr; the client fetches it with the export-profiling-log command.
+  On the CLI it is the easy "just show me timings" switch.
 
 ## Run a profiled validate
 
@@ -33,6 +44,19 @@ RUST_LOG=cwtools_index=info,cwtools_rules=info cargo run --release -p cwtools_cl
 
 (Diagnostics go to stdout; the trace output goes to stderr, so redirect with
 `2> trace.log` to capture timings separately.)
+
+## CLI per-phase timings
+
+Independent of the tracing subscriber, `cwtools validate` prints coarse
+per-phase timings on stderr when `CWTOOLS_TIMINGS` is set (any value). Each line
+is `  [t] <phase> <elapsed>` for the three top-level stages: `load` (the whole
+`Session::load`: rules, discovery, indexing, loc, registry), `validate-config`
+(the file validation pass), and `validate-loc` (loc-project diagnostics). Use it
+for a quick where-did-the-time-go read without pulling in the full span output:
+
+```plaintext
+CWTOOLS_TIMINGS=1 cargo run --release -p cwtools_cli -- validate --game hoi4 ...
+```
 
 ## Add a new hot path
 
