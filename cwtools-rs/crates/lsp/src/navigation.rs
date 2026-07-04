@@ -194,16 +194,15 @@ impl Backend {
         let ws_uri = self.state.config.read().workspace_uri.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
 
-        // Try rule-aware: identify a TypeRef at cursor then scan type_index for
-        // all locations where that type's instances are referenced.
-        //
-        // Limitation: reference scanning walks the TypeIndex for definition
-        // locations only.  Tracking every *use* of a type instance across the
-        // workspace would require an additional references index that is not yet
-        // built.  Full cross-file reference tracking is left as future work.
+        // Rule-aware: identify a TypeRef at cursor, then gather every location
+        // where that instance is defined or used. Definitions come from the
+        // TypeIndex; use sites from the live AST of open docs plus the workspace
+        // reverse index for closed files. Use-site columns are resolved from
+        // text (the parser records the leaf key, not the value, precisely).
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((type_name, instance_name)) = type_ref {
+            let fallback = &params.text_document_position.text_document.uri;
             let mut all_locs: Vec<Location> = Vec::new();
 
             // 1. Definition location(s) from TypeIndex.
@@ -217,37 +216,22 @@ impl Backend {
                     all_locs.push(source_loc_location(
                         file_uri.as_ref(),
                         inst.location,
-                        instance_name.len(),
-                        &params.text_document_position.text_document.uri,
+                        instance_name.chars().count(),
+                        fallback,
                     ));
                 }
             }
 
-            // 2. Use-sites: scan all docs for TypeField leaves with the same value.
-            {
-                let docs = self.state.documents.lock();
-                let rules_guard = self.state.rules.read();
-                let ws_uri = self.state.config.read().workspace_uri.clone();
-                if let Some(rs) = rules_guard.ruleset.as_ref() {
-                    let use_sites = scan_use_sites(
-                        &type_name,
-                        &instance_name,
-                        &docs,
-                        rs,
-                        &ws_uri,
-                        &self.state.string_table,
-                    );
-                    for (file_uri, loc) in use_sites {
-                        all_locs.push(source_loc_location(
-                            &file_uri,
-                            loc,
-                            instance_name.len(),
-                            &params.text_document_position.text_document.uri,
-                        ));
-                    }
-                }
+            // 2. Use-sites (open docs via live AST + closed files via index).
+            let sites = self.collect_use_sites(&type_name, &instance_name);
+            for (file_uri, line0, col, _) in self.resolve_value_sites(&sites, &instance_name) {
+                all_locs.push(Location {
+                    uri: parse_uri(&file_uri, fallback),
+                    range: source_loc_to_range_at(line0, col, instance_name.chars().count()),
+                });
             }
 
+            let all_locs = dedup_locations(all_locs);
             if !all_locs.is_empty() {
                 return Ok(Some(all_locs));
             }
@@ -290,11 +274,193 @@ impl Backend {
         Ok(None)
     }
 
+    /// Gather all use sites `(file_uri, key location)` of `instance_name` as a
+    /// `type_name` reference: open docs from their live AST, closed files from
+    /// the workspace reverse index. Open docs are taken only from the live scan
+    /// (their index entry can lag a keystroke), so the reverse-index half skips
+    /// them.
+    fn collect_use_sites(
+        &self,
+        type_name: &str,
+        instance_name: &str,
+    ) -> Vec<(String, cwtools_info::SourceLocation)> {
+        let open_uris: HashSet<String> = {
+            let docs = self.state.documents.lock();
+            docs.keys().cloned().collect()
+        };
+        let mut sites: Vec<(String, cwtools_info::SourceLocation)> = Vec::new();
+        {
+            let docs = self.state.documents.lock();
+            let rules_guard = self.state.rules.read();
+            let ws_uri = self.state.config.read().workspace_uri.clone();
+            if let Some(rs) = rules_guard.ruleset.as_ref() {
+                sites.extend(scan_use_sites(
+                    type_name,
+                    instance_name,
+                    &docs,
+                    rs,
+                    &ws_uri,
+                    &self.state.string_table,
+                ));
+            }
+        }
+        {
+            let info = self.state.info_service.read();
+            for (file_uri, loc) in info.reference_index.references(type_name, instance_name) {
+                if !open_uris.contains(file_uri.as_ref()) {
+                    sites.push((file_uri.to_string(), loc));
+                }
+            }
+        }
+        sites
+    }
+
+    /// Resolve each `(file_uri, key_loc)` use site to `(file_uri, value_line0,
+    /// value_col, resolved)`. Reads each file once (open-doc text or disk) and
+    /// locates `name` as a whole token on the key line (falling back to the next
+    /// line). When the value can't be located, `resolved` is false and the key
+    /// position is returned unchanged.
+    fn resolve_value_sites(
+        &self,
+        sites: &[(String, cwtools_info::SourceLocation)],
+        name: &str,
+    ) -> Vec<(String, u32, u32, bool)> {
+        let mut by_file: HashMap<&str, Vec<cwtools_info::SourceLocation>> = HashMap::new();
+        for (uri, loc) in sites {
+            by_file.entry(uri.as_str()).or_default().push(*loc);
+        }
+        let mut out = Vec::new();
+        for (uri, locs) in by_file {
+            let lines: Option<Vec<String>> = self
+                .file_text_for(uri)
+                .map(|t| t.lines().map(str::to_string).collect());
+            for loc in locs {
+                let key_line0 = loc.line.saturating_sub(1);
+                let key_col = loc.col as u32;
+                let mut resolved = None;
+                if let Some(lines) = &lines {
+                    // Value on the key line, after the `=` that follows the key.
+                    if let Some(line) = lines.get(key_line0 as usize)
+                        && let Some(from) = value_start_after_eq(line, key_col)
+                        && let Some(col) = value_col_in_line(line, name, from)
+                    {
+                        resolved = Some((key_line0, col));
+                    }
+                    // Fallback: `key =` with the value on the next line.
+                    if resolved.is_none()
+                        && let Some(line) = lines.get(key_line0 as usize + 1)
+                        && let Some(col) = value_col_in_line(line, name, 0)
+                    {
+                        resolved = Some((key_line0 + 1, col));
+                    }
+                }
+                match resolved {
+                    Some((line0, col)) => out.push((uri.to_string(), line0, col, true)),
+                    None => out.push((uri.to_string(), key_line0, key_col, false)),
+                }
+            }
+        }
+        out
+    }
+
+    /// The current text of `uri`: the open-doc buffer if open, else read from
+    /// disk (encoding-aware). `None` when neither is available.
+    fn file_text_for(&self, uri: &str) -> Option<String> {
+        {
+            let docs = self.state.documents.lock();
+            if let Some(doc) = docs.get(uri) {
+                return Some(doc.text.clone());
+            }
+        }
+        let path = crate::paths::uri_to_path_str(uri);
+        cwtools_file_manager::file_manager::read_text(std::path::Path::new(&path)).ok()
+    }
+
+    pub(crate) async fn folding_range_impl(
+        &self,
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = params.text_document.uri.to_string();
+        let Some(text) = self.file_text_for(&uri) else {
+            return Ok(None);
+        };
+        // Brace-matched folding over the text: the parser drops the exact `}`
+        // line (it consumes trailing whitespace after a clause), so a direct
+        // scan is more accurate than the AST for the closing-brace line.
+        let ranges = brace_folding_ranges(&text);
+        if ranges.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(ranges))
+        }
+    }
+
+    pub(crate) async fn document_highlight_impl(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .to_string();
+        let pos = params.text_document_position_params.position;
+        let Some(text) = self.file_text_for(&uri) else {
+            return Ok(None);
+        };
+        // The identifier under the cursor: prefer the rule-resolved type-ref
+        // instance name, falling back to the raw token in the text.
+        let ws_uri = self.state.config.read().workspace_uri.clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let symbol = self
+            .type_ref_at_cursor(&uri, pos, &logical_path)
+            .map(|(_, name)| name)
+            .or_else(|| word_at_position(&text, pos.line, pos.character))
+            .filter(|s| !s.is_empty());
+        let Some(symbol) = symbol else {
+            return Ok(None);
+        };
+        let sym_len = symbol.chars().count();
+        let highlights: Vec<DocumentHighlight> = text
+            .lines()
+            .enumerate()
+            .flat_map(|(line0, line)| {
+                all_token_cols_in_line(line, &symbol)
+                    .into_iter()
+                    .map(move |col| DocumentHighlight {
+                        range: source_loc_to_range_at(line0 as u32, col, sym_len),
+                        kind: Some(DocumentHighlightKind::TEXT),
+                    })
+            })
+            .collect();
+        if highlights.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(highlights))
+        }
+    }
+
     pub(crate) async fn document_symbol_impl(
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri.to_string();
+
+        // Hierarchical outline walked straight from the retained AST, when the
+        // client advertises `hierarchicalDocumentSymbolSupport`. Falls through to
+        // the flat instance/variable list otherwise (or when the AST is empty).
+        if self
+            .state
+            .hierarchical_symbols
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(ast) = self.ast_for(&uri)
+        {
+            let syms = build_doc_symbols(&ast.root_children, &ast.arena, &self.state.string_table);
+            if !syms.is_empty() {
+                return Ok(Some(DocumentSymbolResponse::Nested(syms)));
+            }
+        }
+
         let info = self.state.info_service.read();
 
         // Emit type instances as document symbols (one per named instance),
@@ -435,84 +601,65 @@ impl Backend {
             None => return Ok(None),
         };
 
-        // Collect definition + use-site locations (reuse references logic)
-        let mut all_locs: Vec<(String, cwtools_info::SourceLocation, usize)> = Vec::new();
-
-        // Snapshot open URIs so we can detect closed-file appearances below.
-        let open_uris_snap: HashSet<String> = {
-            let docs = self.state.documents.lock();
-            docs.keys().cloned().collect()
-        };
+        // Edit positions as (file_uri, line0, col). Definition sites are the
+        // instance name itself (the node key), so their key position IS the name
+        // and needs no text lookup. Use-site value columns are resolved from
+        // text — this also reaches closed files via the reverse index, so rename
+        // no longer refuses when a reference lives in a file that isn't open.
+        let mut edits: Vec<(String, u32, u32)> = Vec::new();
 
         {
             let info = self.state.info_service.read();
             let instances = info.type_index.instances(&type_name);
             for (file_uri, inst) in instances.iter().filter(|(_, i)| i.name == instance_name) {
-                all_locs.push((file_uri.to_string(), inst.location, instance_name.len()));
+                edits.push((
+                    file_uri.to_string(),
+                    inst.location.line.saturating_sub(1),
+                    inst.location.col as u32,
+                ));
             }
         }
 
-        {
-            let docs = self.state.documents.lock();
-            let rules_guard = self.state.rules.read();
-            let ws_uri2 = self.state.config.read().workspace_uri.clone();
-            if let Some(rs) = rules_guard.ruleset.as_ref() {
-                let use_sites = scan_use_sites(
-                    &type_name,
-                    &instance_name,
-                    &docs,
-                    rs,
-                    &ws_uri2,
-                    &self.state.string_table,
-                );
-                for (file_uri, loc) in use_sites {
-                    all_locs.push((file_uri, loc, instance_name.len()));
-                }
-            }
-        }
-
-        if all_locs.is_empty() {
-            return Ok(None);
-        }
-
-        // Refuse if the symbol appears in closed files. Producing a partial
-        // WorkspaceEdit for open-only files would silently leave dangling
-        // references in closed files; better to tell the user up front.
-        let closed_file = all_locs
-            .iter()
-            .find(|(file_uri, _, _)| !open_uris_snap.contains(file_uri));
-        if let Some((file_uri, _, _)) = closed_file {
+        // Use sites: resolve each value column from text. Refuse (rather than
+        // corrupt) if any recorded reference can't be located in text.
+        let sites = self.collect_use_sites(&type_name, &instance_name);
+        let resolved = self.resolve_value_sites(&sites, &instance_name);
+        let unresolved = resolved.iter().filter(|(_, _, _, ok)| !ok).count();
+        if unresolved > 0 {
             return Err(tower_lsp::jsonrpc::Error {
                 // -32002 = RequestFailed (LSP extension to JSON-RPC)
                 code: tower_lsp::jsonrpc::ErrorCode::ServerError(-32002),
                 message: format!(
-                    "Rename cancelled: '{}' appears in closed file {}. \
-                     Open all files that reference this symbol and retry.",
-                    instance_name, file_uri
+                    "Rename cancelled: {} reference(s) to '{}' could not be located in text; \
+                     rename is limited to indexed references.",
+                    unresolved, instance_name
                 )
                 .into(),
                 data: None,
             });
         }
+        for (file_uri, line0, col, _) in resolved {
+            edits.push((file_uri, line0, col));
+        }
 
-        // Build WorkspaceEdit: group text edits by file URI
+        if edits.is_empty() {
+            return Ok(None);
+        }
+
+        // Group text edits by file URI, deduping so overlapping edits (a
+        // definition that also classifies as a use site) aren't emitted twice.
+        let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
-        for (file_uri, loc, name_len) in all_locs {
+        for (file_uri, line0, col) in edits {
+            if !seen.insert((file_uri.clone(), line0, col)) {
+                continue;
+            }
             let url = match file_uri.parse::<Url>() {
                 Ok(u) => u,
                 Err(_) => continue,
             };
             let edit = TextEdit {
-                range: Range {
-                    start: Position {
-                        line: loc.line.saturating_sub(1),
-                        character: loc.col as u32,
-                    },
-                    end: Position {
-                        line: loc.line.saturating_sub(1),
-                        character: loc.col as u32 + name_len as u32,
-                    },
-                },
+                range: source_loc_to_range_at(line0, col, instance_name.chars().count()),
                 new_text: new_name.clone(),
             };
             changes.entry(url).or_default().push(edit);
@@ -698,6 +845,250 @@ fn dedup_locations(locs: Vec<Location>) -> Vec<Location> {
             ))
         })
         .collect()
+}
+
+/// Whether `c` continues an identifier token (bare id charset plus `.` for
+/// dotted event ids). Used to word-bound the token searches below.
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '.'
+}
+
+/// Every 0-based char column where `name` appears on `line` as a whole
+/// identifier (bounded by non-identifier chars). Char-based to match the
+/// parser's column counting.
+fn all_token_cols_in_line(line: &str, name: &str) -> Vec<u32> {
+    let chars: Vec<char> = line.chars().collect();
+    let needle: Vec<char> = name.chars().collect();
+    let mut out = Vec::new();
+    if needle.is_empty() || needle.len() > chars.len() {
+        return out;
+    }
+    let mut i = 0;
+    while i + needle.len() <= chars.len() {
+        if chars[i..i + needle.len()] == needle[..] {
+            let before_ok = i == 0 || !is_ident_char(chars[i - 1]);
+            let after = i + needle.len();
+            let after_ok = after >= chars.len() || !is_ident_char(chars[after]);
+            if before_ok && after_ok {
+                out.push(i as u32);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The 0-based char column just past the first `=` at/after `key_col` on `line`
+/// (the operator of a `key = value` leaf; also the `=` in `>=`/`?=`/etc.). The
+/// value token scan starts here so nothing in the key can be mistaken for the
+/// value. `None` when no `=` follows the key.
+fn value_start_after_eq(line: &str, key_col: u32) -> Option<u32> {
+    line.chars()
+        .enumerate()
+        .skip(key_col as usize)
+        .find(|(_, c)| *c == '=')
+        .map(|(i, _)| i as u32 + 1)
+}
+
+/// The 0-based char column of the value token `name` on `line`, scanning only
+/// the region at/after char column `from` and stopping at an unquoted `#`
+/// comment. Takes the FIRST whole-token match so a repeat of the name inside a
+/// trailing comment (`x = MY_FOCUS # keep MY_FOCUS`) or a second `key = value`
+/// pair later on the line can't be mistaken for the value. Quoted values
+/// (`"MY_FOCUS"`) match the inner token. `None` when `name` doesn't occur here.
+fn value_col_in_line(line: &str, name: &str, from: u32) -> Option<u32> {
+    let chars: Vec<char> = line.chars().collect();
+    let needle: Vec<char> = name.chars().collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let mut in_string = false;
+    let mut i = from as usize;
+    while i + needle.len() <= chars.len() {
+        match chars[i] {
+            '"' => in_string = !in_string,
+            '#' if !in_string => break,
+            _ => {}
+        }
+        if chars[i..i + needle.len()] == needle[..] {
+            let before_ok = i == 0 || !is_ident_char(chars[i - 1]);
+            let after = i + needle.len();
+            let after_ok = after >= chars.len() || !is_ident_char(chars[after]);
+            if before_ok && after_ok {
+                return Some(i as u32);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The identifier token the cursor sits in (extended both directions over the
+/// identifier charset). `None` when the cursor isn't on an identifier.
+fn word_at_position(text: &str, line0: u32, char0: u32) -> Option<String> {
+    let line = text.lines().nth(line0 as usize)?;
+    let chars: Vec<char> = line.chars().collect();
+    let cur = (char0 as usize).min(chars.len());
+    let mut start = cur;
+    while start > 0 && is_ident_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = cur;
+    while end < chars.len() && is_ident_char(chars[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    Some(chars[start..end].iter().collect())
+}
+
+/// Region folding ranges for every multi-line `{ … }` block, from a brace-match
+/// scan of the text (comments and quoted strings ignored). More accurate than
+/// the AST for the closing-brace line, which the parser doesn't retain.
+fn brace_folding_ranges(text: &str) -> Vec<FoldingRange> {
+    let mut ranges = Vec::new();
+    let mut stack: Vec<u32> = Vec::new();
+    let mut line: u32 = 0;
+    let mut in_string = false;
+    let mut in_comment = false;
+    for c in text.chars() {
+        if c == '\n' {
+            line += 1;
+            in_comment = false;
+            // Quoted strings never span lines in this grammar.
+            in_string = false;
+            continue;
+        }
+        if c == '\r' || in_comment {
+            continue;
+        }
+        if in_string {
+            if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '#' => in_comment = true,
+            '"' => in_string = true,
+            '{' => stack.push(line),
+            '}' => {
+                if let Some(start) = stack.pop()
+                    && line > start
+                {
+                    ranges.push(FoldingRange {
+                        start_line: start,
+                        start_character: None,
+                        end_line: line,
+                        end_character: None,
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    ranges
+}
+
+/// The identity value of a block (`id` / `name` / `tag` child leaf, in that
+/// priority), used to give repeated block keys (`focus`, `country_event`, …)
+/// distinct outline names. `None` when the block has no such leaf.
+fn identity_value(
+    children: &[cwtools_parser::ast::Child],
+    arena: &cwtools_parser::ast::Arena,
+    table: &StringTable,
+) -> Option<String> {
+    use cwtools_parser::ast::{Child, Value};
+    for want in ["id", "name", "tag"] {
+        for child in children {
+            let Child::Leaf(idx) = child else { continue };
+            let leaf = &arena.leaves[*idx as usize];
+            let key = table.get_string(leaf.key.normal).unwrap_or_default();
+            if key.eq_ignore_ascii_case(want)
+                && let Value::String(t) | Value::QString(t) = &leaf.value
+                && let Some(raw) = table.get_string(t.normal)
+            {
+                let v = raw
+                    .strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .unwrap_or(&raw);
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build a nested `DocumentSymbol` tree from AST children: every keyed clause
+/// becomes a STRUCT symbol (named by its identity leaf when present, else its
+/// key) whose children are the nested clauses. `range` is the block span,
+/// `selection_range` the key token (⊆ range, as LSP requires). Sibling ranges
+/// are clamped so the parser's trailing-whitespace overshoot can't nest them.
+fn build_doc_symbols(
+    children: &[cwtools_parser::ast::Child],
+    arena: &cwtools_parser::ast::Arena,
+    table: &StringTable,
+) -> Vec<DocumentSymbol> {
+    let mut syms: Vec<DocumentSymbol> = Vec::new();
+    for child in children {
+        let Some(kc) = arena.keyed_clause(child) else {
+            continue;
+        };
+        let key = table.get_string(kc.key.normal).unwrap_or_default();
+        if key.is_empty() {
+            continue;
+        }
+        let child_syms = build_doc_symbols(kc.children, arena, table);
+        let (name, detail) = match identity_value(kc.children, arena, table) {
+            Some(v) if v != key => (v, Some(key.clone())),
+            _ => (key.clone(), None),
+        };
+        let start = Position {
+            line: kc.pos.start.line.saturating_sub(1),
+            character: kc.pos.start.col as u32,
+        };
+        let end = Position {
+            line: kc.pos.end.line.saturating_sub(1),
+            character: kc.pos.end.col as u32,
+        };
+        let selection_end = Position {
+            line: start.line,
+            character: start.character + key.chars().count() as u32,
+        };
+        #[allow(deprecated)]
+        syms.push(DocumentSymbol {
+            name,
+            detail,
+            kind: SymbolKind::STRUCT,
+            tags: None,
+            deprecated: None,
+            range: Range { start, end },
+            selection_range: Range {
+                start,
+                end: selection_end,
+            },
+            children: (!child_syms.is_empty()).then_some(child_syms),
+        });
+    }
+    // Clamp each range end to the next sibling's start so the overshoot past
+    // `}` (the parser consumes trailing whitespace) can't swallow a sibling.
+    for i in 0..syms.len().saturating_sub(1) {
+        let next_start = syms[i + 1].range.start;
+        let cur_end = syms[i].range.end;
+        if (next_start.line, next_start.character) < (cur_end.line, cur_end.character) {
+            syms[i].range.end = next_start;
+            let sel_end = syms[i].selection_range.end;
+            if (sel_end.line, sel_end.character) > (next_start.line, next_start.character) {
+                syms[i].selection_range.end = next_start;
+            }
+        }
+    }
+    syms
 }
 
 /// Strip matching outer double quotes from a token. Quoted string values keep

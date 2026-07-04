@@ -1,3 +1,24 @@
+# 1.19.0
+
+## Bug Fixes
+
+- Completion no longer dumps every saved variable and event target at a value position that has no context-specific suggestions. A leaf whose rule field type is numeric, a plain scalar, a localisation key, or an empty value set now suggests nothing instead of a wall of unrelated variables. Affects `add_tech_bonus = { name = }`, focus `x`/`y` positions, and `has_country_flag` among others; localisation fields now offer loc keys. (cwtools-vscode#74, cwtools-vscode#75, cwtools-vscode#79)
+- `has_dlc` and other short-enum value snippets no longer insert a literal `${0|...|}`. The choice sat on the final `$0` tab stop, which VS Code cannot render, so it appeared as plain text. Choices now use a real tab stop, choice delimiters are escaped, and values containing spaces or colons are quoted (`has_dlc = "Together for Victory"`). (cwtools-vscode#77)
+- Rename resolves each edit to the value token and ignores trailing comments, so a name repeated in a comment on the same line is no longer renamed in place of the real value. Rename refuses rather than emit an edit when the token cannot be located.
+
+## Improvements
+
+- `mio:<organization>` scope-switch keys are suggested at effect-block key positions, driven by the config's `mio:` link and the indexed MIO instances. Only prefixed scope-link keys are offered; high-cardinality bare links (country tags, state ids) are not flooded into the list. (cwtools-vscode#76)
+- Effect and modifier completion is scope-aware. Modifier categories are retained at parse and `modifier_categories.cwt`'s `supported_scopes` is read for the first time. In-scope effects and modifiers rank to the top of the list while out-of-scope ones sink to the bottom instead of being hidden, so imperfect scope tracking never removes a valid completion. (cwtools-vscode#78)
+- New editor features: hierarchical document symbols (Outline and breadcrumbs), folding ranges for brace blocks, document highlight for the symbol under the cursor, and a workspace-wide reference index so Find All References and Rename span closed files, not just open documents.
+- New `ignoredErrorCodes` initialization option suppresses diagnostics by error code, applied live on configuration change.
+- `genlocall` (generate localisation stubs for missing keys) and `reloadrulesconfig` (reload the rules folder without restarting the server) are re-implemented as server commands.
+
+## Developer
+
+- `RuleSet.modifiers` now carries the modifier category (`Vec<(String, String)>`) and a new `modifier_categories` map is parsed from `modifier_categories.cwt`; `cwtools_validation::scope_matches_required` is now public so completion and validation agree on scope compatibility.
+- Added completion tests for the variable-dump guard (numeric and localisation value positions, two-overload `has_country_flag`), the `has_dlc` snippet escaping and quoting, MIO scope-link keys, and scope-aware ranking; navigation tests for nested document symbols, folding, document highlight, and cross-file references and rename including the trailing-comment case; and unit tests for error-code suppression and the loc-stub renderer.
+
 # 1.8.6
 
 ## Bug Fixes

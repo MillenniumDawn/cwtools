@@ -22,6 +22,7 @@ mod subtype;
 
 pub use common::{ErrorSeverity, ValidationError, error_hash};
 pub use loc_field::build_modifier_keys;
+pub use scope::scope_matches_required;
 pub use subtype::collect_subtype_instances;
 
 use common::{leaf_value_to_string, path_contains_segment};

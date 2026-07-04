@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -39,6 +40,41 @@ pub(crate) fn extract_ignore_patterns(opts: &Value) -> (Vec<String>, Vec<String>
         }
     }
     (files, dirs)
+}
+
+/// Pull `ignoredErrorCodes` (diagnostic codes the user suppressed via
+/// `errors.ignore`) out of the shared init/didChange payload. Lowercased so the
+/// publish-time filter compares case-insensitively; non-string and empty
+/// entries are dropped.
+pub(crate) fn extract_ignored_error_codes(opts: &Value) -> Vec<String> {
+    let mut codes = Vec::new();
+    if let Some(arr) = opts.get("ignoredErrorCodes").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str()
+                && !s.is_empty()
+            {
+                codes.push(s.to_ascii_lowercase());
+            }
+        }
+    }
+    codes
+}
+
+/// Render one localisation stub file for `lang` covering every `missing` key,
+/// as `{language, filename_suggestion, content}`. Standard Paradox loc shape:
+/// an `l_<lang>:` header then ` KEY:0 "TODO"` entries. The file needs a UTF-8
+/// BOM on save — the client prepends it — so the suggested name is the only
+/// server-side hint the caller writes it as a `_l_<lang>.yml`.
+fn render_loc_stub(lang: cwtools_localization::Lang, missing: &BTreeSet<String>) -> Value {
+    let mut content = format!("l_{}:\n", lang);
+    for key in missing {
+        content.push_str(&format!(" {}:0 \"TODO\"\n", key));
+    }
+    serde_json::json!({
+        "language": lang.to_string(),
+        "filename_suggestion": format!("generated_l_{}.yml", lang),
+        "content": content,
+    })
 }
 
 impl Backend {
@@ -197,92 +233,12 @@ impl Backend {
                 }
             }
 
-            // Load .cwt rules from rulesCache if provided
+            // Load .cwt rules from rulesCache if provided. Retain the dir so the
+            // `reloadrulesconfig` command can re-read it later without a restart.
             if let Some(cache) = opts.get("rulesCache").and_then(|v| v.as_str()) {
-                let cache_path = std::path::Path::new(cache);
-                // Surface a missing rules dir explicitly. The client may hand us a
-                // path that doesn't resolve here (e.g. a Windows `rules_folder`
-                // that didn't normalise), which otherwise degrades silently to a
-                // generic "no rules loaded" with an empty error list.
-                if !cache_path.is_dir() {
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("`rulesCache` dir does not exist: {}", cache),
-                        )
-                        .await;
-                }
-                let (combined_ruleset, parse_errors) =
-                    load_ruleset_from_dir(cache_path, &self.state.string_table);
-
-                // Rules-config parse/read errors mean the .cwt rules are broken,
-                // which silently degrades every downstream check. Emit at ERROR so
-                // the client reveals its output channel (it auto-reveals on Error),
-                // surface a one-line popup so it's noticed even when the panel is
-                // closed, and publish a diagnostic on each offending .cwt file so
-                // the Problems panel points at the exact line.
-                let mut diags_by_file: std::collections::HashMap<String, Vec<Diagnostic>> =
-                    std::collections::HashMap::new();
-                for err in &parse_errors {
-                    self.client
-                        .log_message(MessageType::ERROR, err.to_string())
-                        .await;
-                    // Shared with the live per-file CWT lint (#43). No file text
-                    // here to widen the squiggle, so pass empty line-ends.
-                    diags_by_file
-                        .entry(crate::paths::path_to_uri(&err.file))
-                        .or_default()
-                        .push(crate::validate::rule_parse_error_to_diagnostic(err, &[]));
-                }
-                for (uri, diags) in diags_by_file {
-                    if let Ok(url) = uri.parse() {
-                        self.client.publish_diagnostics(url, diags, None).await;
-                    }
-                }
-                if !parse_errors.is_empty() {
-                    self.client
-                        .show_message(
-                            MessageType::ERROR,
-                            format!(
-                                "CWTools: {} rules-config error(s). See Output → CWTools for details.",
-                                parse_errors.len()
-                            ),
-                        )
-                        .await;
-                }
-
-                let loaded = !combined_ruleset.types.is_empty()
-                    || !combined_ruleset.enums.is_empty()
-                    || !combined_ruleset.aliases.is_empty()
-                    || !combined_ruleset.root_rules.is_empty();
-
-                if loaded {
-                    self.client
-                        .log_message(
-                            MessageType::INFO,
-                            format!(
-                                "Loaded rules from {} ({} types, {} enums, {} aliases, {} errors)",
-                                cache,
-                                combined_ruleset.types.len(),
-                                combined_ruleset.enums.len(),
-                                combined_ruleset.aliases.len(),
-                                parse_errors.len(),
-                            ),
-                        )
-                        .await;
-                    self.set_ruleset(combined_ruleset);
-                    // Rebuild modifier_keys now that the ruleset is loaded.
-                    // The type index is empty at this point; it will be rebuilt
-                    // again after validate_entire_workspace with the full index.
-                    self.rebuild_modifier_keys();
-                } else {
-                    self.client
-                        .log_message(
-                            MessageType::WARNING,
-                            format!("No rules loaded from {}. Errors: {:?}", cache, parse_errors),
-                        )
-                        .await;
-                }
+                let cache_path = std::path::PathBuf::from(cache);
+                self.state.config.write().rules_dir = Some(cache_path.clone());
+                self.load_rules_config(&cache_path).await;
             }
         }
 
@@ -305,19 +261,21 @@ impl Backend {
         // they don't replace.
         if let Some(opts) = &params.initialization_options {
             let (files, dirs) = extract_ignore_patterns(opts);
-            if !files.is_empty() || !dirs.is_empty() {
-                let (n_files, n_dirs) = (files.len(), dirs.len());
+            let codes = extract_ignored_error_codes(opts);
+            if !files.is_empty() || !dirs.is_empty() || !codes.is_empty() {
+                let (n_files, n_dirs, n_codes) = (files.len(), dirs.len(), codes.len());
                 {
                     let mut cfg = self.state.config.write();
                     cfg.ignore_file_patterns = files;
                     cfg.ignore_dir_patterns = dirs;
+                    cfg.ignored_error_codes = codes;
                 }
                 self.client
                     .log_message(
                         MessageType::INFO,
                         format!(
-                            "ignore patterns: {} files, {} dirs (engine defaults still apply)",
-                            n_files, n_dirs,
+                            "ignore patterns: {} files, {} dirs, {} suppressed codes (engine defaults still apply)",
+                            n_files, n_dirs, n_codes,
                         ),
                     )
                     .await;
@@ -336,6 +294,19 @@ impl Backend {
             .and_then(|g| g.position_encodings.as_ref())
             .filter(|encs| encs.contains(&PositionEncodingKind::UTF32))
             .map(|_| PositionEncodingKind::UTF32);
+
+        // documentSymbol: return a nested tree only when the client advertises
+        // support; otherwise the flat SymbolInformation list is served.
+        let hierarchical = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.document_symbol.as_ref())
+            .and_then(|ds| ds.hierarchical_document_symbol_support)
+            .unwrap_or(false);
+        self.state
+            .hierarchical_symbols
+            .store(hierarchical, Ordering::Relaxed);
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -367,11 +338,15 @@ impl Backend {
                         "exportProfilingLog".to_string(),
                         "cacheVanilla".to_string(),
                         "clearAllCaches".to_string(),
+                        "reloadrulesconfig".to_string(),
+                        "genlocall".to_string(),
                     ],
                     work_done_progress_options: Default::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
@@ -390,6 +365,102 @@ impl Backend {
         })
     }
 
+    /// Load the `.cwt` rules from `cache_path`, publish any parse errors as
+    /// per-file diagnostics plus a popup, and (on success) install the ruleset
+    /// and rebuild the modifier-key set. Shared by `initialize` and the
+    /// `reloadrulesconfig` command so a live reload behaves exactly like startup.
+    /// Returns whether a non-empty ruleset was loaded.
+    pub(crate) async fn load_rules_config(&self, cache_path: &std::path::Path) -> bool {
+        // Surface a missing rules dir explicitly. The client may hand us a
+        // path that doesn't resolve here (e.g. a Windows `rules_folder`
+        // that didn't normalise), which otherwise degrades silently to a
+        // generic "no rules loaded" with an empty error list.
+        if !cache_path.is_dir() {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("`rulesCache` dir does not exist: {}", cache_path.display()),
+                )
+                .await;
+        }
+        let (combined_ruleset, parse_errors) =
+            load_ruleset_from_dir(cache_path, &self.state.string_table);
+
+        // Rules-config parse/read errors mean the .cwt rules are broken,
+        // which silently degrades every downstream check. Emit at ERROR so
+        // the client reveals its output channel (it auto-reveals on Error),
+        // surface a one-line popup so it's noticed even when the panel is
+        // closed, and publish a diagnostic on each offending .cwt file so
+        // the Problems panel points at the exact line.
+        let mut diags_by_file: std::collections::HashMap<String, Vec<Diagnostic>> =
+            std::collections::HashMap::new();
+        for err in &parse_errors {
+            self.client
+                .log_message(MessageType::ERROR, err.to_string())
+                .await;
+            // Shared with the live per-file CWT lint (#43). No file text
+            // here to widen the squiggle, so pass empty line-ends.
+            diags_by_file
+                .entry(crate::paths::path_to_uri(&err.file))
+                .or_default()
+                .push(crate::validate::rule_parse_error_to_diagnostic(err, &[]));
+        }
+        for (uri, diags) in diags_by_file {
+            if let Ok(url) = uri.parse() {
+                self.client.publish_diagnostics(url, diags, None).await;
+            }
+        }
+        if !parse_errors.is_empty() {
+            self.client
+                .show_message(
+                    MessageType::ERROR,
+                    format!(
+                        "CWTools: {} rules-config error(s). See Output → CWTools for details.",
+                        parse_errors.len()
+                    ),
+                )
+                .await;
+        }
+
+        let loaded = !combined_ruleset.types.is_empty()
+            || !combined_ruleset.enums.is_empty()
+            || !combined_ruleset.aliases.is_empty()
+            || !combined_ruleset.root_rules.is_empty();
+
+        if loaded {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "Loaded rules from {} ({} types, {} enums, {} aliases, {} errors)",
+                        cache_path.display(),
+                        combined_ruleset.types.len(),
+                        combined_ruleset.enums.len(),
+                        combined_ruleset.aliases.len(),
+                        parse_errors.len(),
+                    ),
+                )
+                .await;
+            self.set_ruleset(combined_ruleset);
+            // Rebuild modifier_keys now that the ruleset is loaded.
+            // The type index is empty at this point; it will be rebuilt
+            // again after validate_entire_workspace with the full index.
+            self.rebuild_modifier_keys();
+        } else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "No rules loaded from {}. Errors: {:?}",
+                        cache_path.display(),
+                        parse_errors
+                    ),
+                )
+                .await;
+        }
+        loaded
+    }
+
     /// Re-read ignore globs when the extension's `cwtools.ignore.*` settings
     /// change. The shape mirrors what we accept in `initializationOptions`:
     /// the payload is the `cwtools` namespace object, with optional
@@ -402,17 +473,27 @@ impl Backend {
         // changed slice. `extract_ignore_patterns` looks for the same two
         // keys at the top level — works in both cases.
         let (files, dirs) = extract_ignore_patterns(&params.settings);
-        let (n_files, n_dirs) = (files.len(), dirs.len());
+        let codes = extract_ignored_error_codes(&params.settings);
+        let (n_files, n_dirs, n_codes) = (files.len(), dirs.len(), codes.len());
         {
             let mut cfg = self.state.config.write();
             cfg.ignore_file_patterns = files;
             cfg.ignore_dir_patterns = dirs;
+            cfg.ignored_error_codes = codes;
         }
         tracing::info!(
             file_globs = n_files,
             dir_globs = n_dirs,
+            ignored_codes = n_codes,
             "ignore patterns updated via didChangeConfiguration"
         );
+        // Re-filter the open documents' diagnostics against the updated
+        // suppression list without waiting for a reload. Gated on the initial
+        // index being ready so we don't publish partial cross-file results
+        // before the first scan finishes (that scan republishes anyway).
+        if self.state.index_ready.load(Ordering::Relaxed) {
+            self.revalidate_all_open_docs().await;
+        }
     }
 
     pub(crate) async fn execute_command_impl(
@@ -498,8 +579,94 @@ impl Backend {
                 };
                 Ok(Some(Value::String(msg)))
             }
+            // Re-read the rules-config dir from disk, rebuild the ruleset, and
+            // re-validate the whole workspace against it — no server restart.
+            "reloadrulesconfig" => {
+                let dir = self.state.config.read().rules_dir.clone();
+                match dir {
+                    Some(dir) => {
+                        let loaded = self.load_rules_config(&dir).await;
+                        self.validate_entire_workspace().await;
+                        let msg = if loaded {
+                            "Rules config reloaded; workspace re-validated.".to_string()
+                        } else {
+                            format!(
+                                "No rules loaded from {}; workspace re-validated.",
+                                dir.display()
+                            )
+                        };
+                        Ok(Some(Value::String(msg)))
+                    }
+                    None => Ok(Some(Value::String(
+                        "No rules directory configured; nothing to reload.".to_string(),
+                    ))),
+                }
+            }
+            // Generate localisation stubs for every missing `## required` loc key
+            // and hand them back to the client to open for review (no files are
+            // written server-side).
+            "genlocall" => Ok(Some(Value::Array(self.generate_missing_loc()))),
             _ => Ok(None),
         }
+    }
+
+    /// Aggregate every `## required` localisation key that no loc file provides
+    /// (the same keys the CW100 check flags), grouped into one stub file per
+    /// target language. Returned to the client as `[{language,
+    /// filename_suggestion, content}]`; the client opens each as an untitled
+    /// document for the user to review and save. Nothing is written here.
+    pub(crate) fn generate_missing_loc(&self) -> Vec<Value> {
+        // Snapshot the target languages first (config is read-clone-dropped, so
+        // its guard is never held across the ruleset/info/loc locks below).
+        let langs: Vec<cwtools_localization::Lang> = self
+            .state
+            .config
+            .read()
+            .loc_languages
+            .clone()
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| vec![cwtools_localization::Lang::English]);
+        // Live overlay of open `.yml` keys, so a key just typed isn't re-stubbed.
+        let overlay = self.loc_overlay_keys();
+        // Lock order: rules -> info_service -> loc_index.
+        let rules = self.state.rules.read();
+        let Some(ruleset) = rules.ruleset.as_ref() else {
+            return Vec::new();
+        };
+        let info = self.state.info_service.read();
+        let loc_guard = self.state.loc_index.read();
+        // Before the loc index is built every key looks missing; bail so the
+        // command never dumps the entire mod's key set as "missing".
+        let Some(loc) = loc_guard.as_ref().filter(|l| !l.union().is_empty()) else {
+            return Vec::new();
+        };
+        let exists = |key: &str| loc.exists_any(key) || overlay.contains(key);
+
+        let mut missing: BTreeSet<String> = BTreeSet::new();
+        for td in &ruleset.types {
+            if td.localisation.is_empty() {
+                continue;
+            }
+            for (_uri, inst) in info.type_index.instances(&td.name) {
+                for locdef in &td.localisation {
+                    // Only required, name-derived keys — mirrors check_missing_localisation.
+                    if !locdef.required || locdef.optional || locdef.explicit_field.is_some() {
+                        continue;
+                    }
+                    let expected = format!("{}{}{}", locdef.prefix, inst.name, locdef.suffix);
+                    if !exists(&expected.to_ascii_lowercase()) {
+                        missing.insert(expected);
+                    }
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Vec::new();
+        }
+        langs
+            .into_iter()
+            .map(|lang| render_loc_stub(lang, &missing))
+            .collect()
     }
 
     pub(crate) async fn determine_file_types(&self, uri: &str) -> Vec<String> {
@@ -543,5 +710,39 @@ impl Backend {
         }
 
         types
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cwtools_localization::Lang;
+    use serde_json::json;
+
+    #[test]
+    fn extract_ignored_error_codes_lowercases_and_drops_empties() {
+        let opts = json!({ "ignoredErrorCodes": ["CW100", "cw246", "", 5] });
+        let codes = extract_ignored_error_codes(&opts);
+        assert_eq!(codes, vec!["cw100".to_string(), "cw246".to_string()]);
+    }
+
+    #[test]
+    fn extract_ignored_error_codes_absent_is_empty() {
+        assert!(extract_ignored_error_codes(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn render_loc_stub_uses_paradox_shape() {
+        let mut missing = BTreeSet::new();
+        missing.insert("my_focus".to_string());
+        missing.insert("my_focus_desc".to_string());
+        let stub = render_loc_stub(Lang::English, &missing);
+        assert_eq!(stub["language"], "english");
+        assert_eq!(stub["filename_suggestion"], "generated_l_english.yml");
+        // Header line then one ` KEY:0 "TODO"` entry per key, keys sorted (BTreeSet).
+        assert_eq!(
+            stub["content"].as_str().unwrap(),
+            "l_english:\n my_focus:0 \"TODO\"\n my_focus_desc:0 \"TODO\"\n"
+        );
     }
 }

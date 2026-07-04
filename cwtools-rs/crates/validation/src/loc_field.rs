@@ -20,7 +20,7 @@ pub fn build_modifier_keys(
     type_index: &cwtools_index::TypeIndex,
 ) -> std::collections::HashSet<String> {
     let mut mk = std::collections::HashSet::new();
-    for m in &ruleset.modifiers {
+    for (m, _category) in &ruleset.modifiers {
         match (m.find('<'), m.find('>')) {
             (Some(open), Some(close)) if open < close => {
                 let tn = &m[open + 1..close];

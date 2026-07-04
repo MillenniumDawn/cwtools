@@ -10,9 +10,16 @@ pub struct RuleSet {
     /// Parsed `values = { value[name] = { ... } }` blocks (item G).
     /// Keyed by name; sets from multiple .cwt files are unioned at merge.
     pub values: rustc_hash::FxHashMap<String, Vec<String>>,
-    /// Names from a top-level `modifiers = { name = category ... }` block. These
-    /// are the valid keys for `alias_name[modifier]` slots (modifier contexts).
-    pub modifiers: Vec<String>,
+    /// `(name, category)` pairs from a top-level `modifiers = { name = category ... }`
+    /// block. The names are the valid keys for `alias_name[modifier]` slots (modifier
+    /// contexts); the category resolves to a scope set via [`Self::modifier_categories`]
+    /// for scope-aware completion.
+    pub modifiers: Vec<(String, String)>,
+    /// `category -> supported_scopes` from a top-level `modifier_categories = { cat =
+    /// { supported_scopes = { ... } } }` block (modifier_categories.cwt). Lets
+    /// completion rank/filter a modifier by whether the current scope is one its
+    /// category supports.
+    pub modifier_categories: rustc_hash::FxHashMap<String, Vec<String>>,
     /// Link names from a top-level `links = { name = { ... } }` block (links.cwt).
     /// A from-data scope link (e.g. `character`, `state`, `owner`) can appear as a
     /// scope-switching key, so these are the valid keys for an `[cat:scope_field]`
@@ -205,6 +212,7 @@ impl RuleSet {
             root_rules: Vec::new(),
             values: rustc_hash::FxHashMap::default(),
             modifiers: Vec::new(),
+            modifier_categories: rustc_hash::FxHashMap::default(),
             scope_links: rustc_hash::FxHashSet::default(),
             scope_inputs: Vec::new(),
             link_inputs: Vec::new(),

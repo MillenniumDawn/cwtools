@@ -229,6 +229,17 @@ pub(crate) fn rule_parse_error_to_diagnostic(
     )
 }
 
+/// Whether a diagnostic carrying `code` should be dropped given the user's
+/// lowercased suppression list (`errors.ignore` → `ignoredErrorCodes`). Only the
+/// string codes the validator emits (e.g. `CW100`) can be suppressed; compared
+/// case-insensitively. Numeric/absent codes are never suppressed.
+pub(crate) fn code_is_suppressed(code: Option<&NumberOrString>, ignored: &[String]) -> bool {
+    match code {
+        Some(NumberOrString::String(c)) => ignored.contains(&c.to_ascii_lowercase()),
+        _ => false,
+    }
+}
+
 pub(crate) fn validation_error_to_diagnostic(
     err: &ValidationError,
     line_ends: &[u32],
@@ -388,6 +399,29 @@ impl Backend {
         validate_parsed_with_indexes(uri, parsed, &prepared, line_ends)
     }
 
+    /// Publish diagnostics after dropping any whose code the user suppressed via
+    /// `errors.ignore` (`ignoredErrorCodes`). Every publish path funnels through
+    /// here so a suppressed code can't slip out from whichever validation route
+    /// produced it. A no-op (and off the hot path's cost) when nothing is
+    /// suppressed, which is the common case.
+    pub(crate) async fn publish_filtered(
+        &self,
+        uri: tower_lsp::lsp_types::Url,
+        mut diagnostics: Vec<Diagnostic>,
+        version: Option<i32>,
+    ) {
+        {
+            let cfg = self.state.config.read();
+            if !cfg.ignored_error_codes.is_empty() {
+                diagnostics
+                    .retain(|d| !code_is_suppressed(d.code.as_ref(), &cfg.ignored_error_codes));
+            }
+        }
+        self.client
+            .publish_diagnostics(uri, diagnostics, version)
+            .await;
+    }
+
     /// Publish diagnostics, but suppress them (publish an empty set) until the
     /// initial workspace index is ready. Before the index is built, a cross-file
     /// reference whose defining file isn't indexed yet would be flagged as
@@ -403,7 +437,7 @@ impl Backend {
             .index_ready
             .load(std::sync::atomic::Ordering::Relaxed);
         let diags = if ready { diagnostics } else { Vec::new() };
-        self.client.publish_diagnostics(uri, diags, version).await;
+        self.publish_filtered(uri, diags, version).await;
     }
 
     /// Parse and validate a single document.
@@ -641,8 +675,7 @@ impl Backend {
             .collect();
         for (uri, snapshot_version, diagnostics) in to_publish {
             if let Ok(uri_obj) = Url::parse(&uri) {
-                self.client
-                    .publish_diagnostics(uri_obj, diagnostics, Some(snapshot_version))
+                self.publish_filtered(uri_obj, diagnostics, Some(snapshot_version))
                     .await;
             }
         }
@@ -1060,5 +1093,34 @@ mod whole_line_range_tests {
         let diag = validation_error_to_diagnostic(&err, &[]);
         assert_eq!(diag.range.start.character, 2);
         assert_eq!(diag.range.end.character, 3);
+    }
+
+    #[test]
+    fn suppression_matches_codes_case_insensitively() {
+        let ignored = vec!["cw100".to_string()];
+        // Suppression list is stored lowercased; the diagnostic code can be any case.
+        assert!(code_is_suppressed(
+            Some(&NumberOrString::String("CW100".into())),
+            &ignored
+        ));
+        assert!(code_is_suppressed(
+            Some(&NumberOrString::String("cw100".into())),
+            &ignored
+        ));
+        assert!(!code_is_suppressed(
+            Some(&NumberOrString::String("CW246".into())),
+            &ignored
+        ));
+        // Absent and numeric codes are never suppressed.
+        assert!(!code_is_suppressed(None, &ignored));
+        assert!(!code_is_suppressed(
+            Some(&NumberOrString::Number(100)),
+            &ignored
+        ));
+        // Empty list suppresses nothing.
+        assert!(!code_is_suppressed(
+            Some(&NumberOrString::String("CW100".into())),
+            &[]
+        ));
     }
 }

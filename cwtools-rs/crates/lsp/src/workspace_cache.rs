@@ -91,6 +91,7 @@ pub fn settings_fingerprint(language: &str, ruleset: &RuleSet, workspace_root: &
     h = fnv1a(&ruleset.complex_enums.len().to_le_bytes(), h);
     h = fnv1a(&ruleset.root_rules.len().to_le_bytes(), h);
     h = fnv1a(&ruleset.modifiers.len().to_le_bytes(), h);
+    h = fnv1a(&ruleset.modifier_categories.len().to_le_bytes(), h);
     h = fnv1a(&ruleset.link_inputs.len().to_le_bytes(), h);
     h = fnv1a(&ruleset.scope_inputs.len().to_le_bytes(), h);
     // Bump version together so a format change also invalidates.

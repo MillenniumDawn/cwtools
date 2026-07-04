@@ -3,8 +3,10 @@
 
 use super::*;
 
-/// Collect modifier names from a top-level `modifiers = { name = category ... }`
-/// block. Each entry's key is a valid modifier name (the value is its category).
+/// Collect modifier `(name, category)` pairs from a top-level
+/// `modifiers = { name = category ... }` block. Each entry's key is a valid
+/// modifier name; its value is the category (resolved to a scope set via
+/// `modifier_categories.cwt` for scope-aware completion).
 pub(crate) fn extract_modifier_names(
     children: &Vec<Child>,
     ast: &ParsedFile,
@@ -15,12 +17,32 @@ pub(crate) fn extract_modifier_names(
         let Child::Leaf(lidx) = child else {
             continue;
         };
-        let name = table
-            .get_string(ast.arena.leaves[*lidx as usize].key.normal)
-            .unwrap_or_default();
+        let leaf = &ast.arena.leaves[*lidx as usize];
+        let name = table.get_string(leaf.key.normal).unwrap_or_default();
         if !name.is_empty() {
-            ruleset.modifiers.push(name);
+            let category = value_to_string(&leaf.value, table);
+            ruleset.modifiers.push((name, category));
         }
+    }
+}
+
+/// Parse a top-level `modifier_categories = { cat = { supported_scopes = { ... } } }`
+/// block (modifier_categories.cwt) into `category -> supported_scopes`.
+pub(crate) fn extract_modifier_categories(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    ruleset: &mut RuleSet,
+) {
+    for child in children {
+        let Some((name, body)) = entry_body(child, ast, table) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let scopes = child_clause_values(body, ast, table, "supported_scopes");
+        ruleset.modifier_categories.insert(name, scopes);
     }
 }
 

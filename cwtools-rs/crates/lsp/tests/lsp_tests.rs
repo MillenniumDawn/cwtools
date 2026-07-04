@@ -886,6 +886,176 @@ fn test_completion_country_flags_for_has_country_flag() {
     );
 }
 
+// ── #74/#75/#79: matched-but-empty value positions must not dump variables ────
+
+#[test]
+fn test_completion_focus_int_value_no_variable_dump() {
+    // #75: at a focus `x = ` (typed `int`), completion must offer NOTHING rather
+    // than dumping every saved variable. A variable is seeded in another file so
+    // the old fallback would have surfaced it.
+    let vars = (
+        "common/decisions/vars.txt",
+        "seed_dec = {\n    set_math = {\n        my_saved_var = 5\n    }\n}\n",
+    );
+    // Control: the seeded variable IS offered at a math value position, proving it
+    // is indexed — so the absence below is the guard working, not an empty index.
+    let control = completion_labels_custom_rules(
+        COMPLETION_RULES,
+        "common/decisions/test.txt",
+        "d = {\n    set_math = {\n        foo = \n    }\n}\n",
+        std::slice::from_ref(&vars),
+        2,
+        14,
+    );
+    assert!(
+        control.iter().any(|l| l == "my_saved_var"),
+        "control: seeded variable must be indexed and offered at a math value position, got: {:?}",
+        control
+    );
+    // The fix: at focus `x = ` (int), no variable dump.
+    let labels = completion_labels_custom_rules(
+        COMPLETION_RULES,
+        "common/national_focus/test.txt",
+        "my_focus = {\n    x = \n}\n",
+        &[vars],
+        1,
+        8,
+    );
+    assert!(
+        !labels.iter().any(|l| l == "my_saved_var"),
+        "focus int value must not dump saved variables, got: {:?}",
+        labels
+    );
+}
+
+const LOCALISATION_RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+    type[focus] = { path = "game/common/national_focus" }
+}
+decision = {
+    set_math = {
+        value_set[variable] = math_expr
+        value_set[variable] = scalar
+    }
+    loc_name = localisation
+}
+focus = {
+    id = scalar
+}
+"#;
+
+#[test]
+fn test_completion_localisation_value_offers_keys_not_variable_dump() {
+    // #74: a `localisation`-typed value position must offer loc keys (workspace
+    // entities), not the flat variable dump.
+    let vars = (
+        "common/decisions/vars.txt",
+        "seed_dec = {\n    set_math = {\n        my_saved_var = 5\n    }\n}\n",
+    );
+    let focus = (
+        "common/national_focus/f.txt",
+        "MY_FOCUS = {\n    id = f1\n}\n",
+    );
+    let labels = completion_labels_custom_rules(
+        LOCALISATION_RULES,
+        "common/decisions/test.txt",
+        "my_dec = {\n    loc_name = \n}\n",
+        &[vars, focus],
+        1,
+        15,
+    );
+    assert!(
+        labels.iter().any(|l| l == "MY_FOCUS"),
+        "localisation value should offer loc keys (entities), got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.iter().any(|l| l == "my_saved_var"),
+        "localisation value must not dump saved variables, got: {:?}",
+        labels
+    );
+}
+
+const TWO_OVERLOAD_FLAG_RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+decision = {
+    allowed = {
+        alias_name[trigger] = alias_match_left[trigger]
+    }
+    complete_effect = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+    set_math = {
+        value_set[variable] = math_expr
+        value_set[variable] = scalar
+    }
+    cost = int
+}
+alias[trigger:has_country_flag] = value[country_flag]
+alias[trigger:has_country_flag] = {
+    flag = value[country_flag]
+    ## cardinality = 0..1
+    days = int
+}
+alias[effect:set_country_flag] = value_set[country_flag]
+alias[effect:set_country_flag] = {
+    flag = value_set[country_flag]
+    ## cardinality = 0..1
+    days = int
+}
+"#;
+
+#[test]
+fn test_completion_has_country_flag_two_overloads_no_dump() {
+    // #79: with both a value and a block overload of has_country_flag /
+    // set_country_flag declared, the value-form flag set must still resolve, and
+    // an empty flag set must NOT fall back to the generic variable dump.
+    let setter = (
+        "common/decisions/setter.txt",
+        "other = {\n    complete_effect = {\n        set_country_flag = my_war_flag\n    }\n    cost = 1\n}\n",
+    );
+    let flag_read =
+        "my_decision = {\n    allowed = {\n        has_country_flag = \n    }\n    cost = 5\n}\n";
+
+    // Flags still resolve past the two-overload interaction.
+    let with_flag = completion_labels_custom_rules(
+        TWO_OVERLOAD_FLAG_RULES,
+        "common/decisions/test.txt",
+        flag_read,
+        std::slice::from_ref(&setter),
+        2,
+        27,
+    );
+    assert!(
+        with_flag.iter().any(|l| l == "my_war_flag"),
+        "two overloads: collected country flags must still resolve, got: {:?}",
+        with_flag
+    );
+
+    // Empty flag set (no setter) + a seeded variable: the reader must offer
+    // neither the (absent) flag nor the variable dump.
+    let vars = (
+        "common/decisions/vars.txt",
+        "seed_dec = {\n    set_math = {\n        my_saved_var = 5\n    }\n}\n",
+    );
+    let empty_set = completion_labels_custom_rules(
+        TWO_OVERLOAD_FLAG_RULES,
+        "common/decisions/test.txt",
+        flag_read,
+        &[vars],
+        2,
+        27,
+    );
+    assert!(
+        !empty_set.iter().any(|l| l == "my_saved_var"),
+        "empty flag set must not dump saved variables, got: {:?}",
+        empty_set
+    );
+}
+
 // ── Issues #64, #65: type-pattern alias and alias_keys_field completions ──────
 
 /// Spawn a server with custom `rules` text, open `extra_files` + the main file,
@@ -975,6 +1145,336 @@ fn completion_labels_custom_rules(
         .iter()
         .filter_map(|i| i["label"].as_str().map(|s| s.to_string()))
         .collect()
+}
+
+/// Like `completion_labels_custom_rules` but returns `(label, sortText)` pairs so
+/// tests can assert scope-aware ranking, not just membership.
+fn completion_items_custom_rules(
+    rules: &str,
+    rel_path: &str,
+    text: &str,
+    extra_files: &[(&str, &str)],
+    line0: u32,
+    char0: u32,
+) -> Vec<(String, Option<String>)> {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), rules).unwrap();
+
+    for (rel, content) in extra_files.iter().chain([&(rel_path, text)]) {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    for (rel, content) in extra_files.iter().chain([&(rel_path, text)]) {
+        let uri = format!("file://{}", ws.path().join(rel).display());
+        let body = jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": content,
+                }
+            }),
+        );
+        write_frame(&mut child, &body).unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+
+    let doc_uri = format!("file://{}", ws.path().join(rel_path).display());
+    let body = jsonrpc_request(
+        2,
+        "textDocument/completion",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "position": { "line": line0, "character": char0 },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let resp_str = read_response(&mut reader).expect("no completion response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(resp["id"], 2, "got: {}", resp_str);
+    let items = resp["result"]
+        .as_array()
+        .cloned()
+        .or_else(|| resp["result"]["items"].as_array().cloned())
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|i| {
+            i["label"]
+                .as_str()
+                .map(|s| (s.to_string(), i["sortText"].as_str().map(|t| t.to_string())))
+        })
+        .collect()
+}
+
+/// Rules mirroring the real HOI4 MIO shapes for the #76/#78 tests: a `mio:` scope
+/// link (links.cwt), the MIO scope (scopes.cwt), a MIO-category and a country-only
+/// modifier (modifiers.cwt + modifier_categories.cwt), and effect aliases split by
+/// `## scope`. The `equipment_bonus` block `## push_scope`s into the MIO scope so
+/// its modifier completions resolve against `military_industrial_organization`.
+const MIO_SCOPE_RULES: &str = r#"
+types = {
+    type[military_industrial_organization] = {
+        path = "game/common/military_industrial_organization/organizations"
+    }
+    type[scripted_effect] = {
+        path = "game/common/scripted_effects"
+    }
+    type[decision] = {
+        path = "game/common/decisions"
+    }
+    type[country_tag] = {
+        path = "game/common/country_tags"
+    }
+}
+links = {
+    mio = {
+        prefix = mio:
+        output_scope = military_industrial_organization
+        input_scopes = country
+        from_data = yes
+        data_source = <military_industrial_organization>
+    }
+    country_ref = {
+        output_scope = country
+        input_scopes = country
+        from_data = yes
+        data_source = <country_tag>
+    }
+}
+scopes = {
+    Country = {
+        aliases = { country }
+    }
+    "Military Industrial Organizations" = {
+        aliases = { military_industrial_organization }
+    }
+}
+modifiers = {
+    military_industrial_organization_funds_gain = military_industrial_organization
+    war_support_factor = country
+}
+modifier_categories = {
+    military_industrial_organization = {
+        supported_scopes = { military_industrial_organization }
+    }
+    country = {
+        supported_scopes = { country }
+    }
+}
+decision = {
+    complete_effect = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+}
+military_industrial_organization = {
+    name = scalar
+    ## push_scope = military_industrial_organization
+    equipment_bonus = {
+        alias_name[modifier] = alias_match_left[modifier]
+    }
+}
+scripted_effect = {
+    alias_name[effect] = alias_match_left[effect]
+}
+alias[effect:scope_field] = { alias_name[effect] = alias_match_left[effect] }
+### MIO-scope effect
+## scope = military_industrial_organization
+alias[effect:add_mio_funds] = int
+### Country-only effect
+## scope = country
+alias[effect:add_political_power] = int
+"#;
+
+const MIO_INSTANCE: (&str, &str) = (
+    "common/military_industrial_organization/organizations/orgs.txt",
+    "MY_ORG = {\n    name = org\n}\n",
+);
+
+#[test]
+fn test_completion_scope_link_keys_in_effect_block() {
+    // #76: at a key position inside an effect block, the `mio:` scope-switch key
+    // is offered per MIO instance (`mio:MY_ORG = { … }`). The scope_field alias
+    // makes the block accept a scope switch; the key was never suggested before.
+    let text = "my_dec = {\n    complete_effect = {\n        \n    }\n}\n";
+    let country_tags = ("common/country_tags/tags.txt", "GER = {\n}\n");
+    let labels = completion_labels_custom_rules(
+        MIO_SCOPE_RULES,
+        "common/decisions/d.txt",
+        text,
+        &[MIO_INSTANCE, country_tags],
+        2,
+        8,
+    );
+    assert!(
+        labels.iter().any(|l| l == "mio:MY_ORG"),
+        "scope-link key mio:MY_ORG must be offered in an effect block, got: {:?}",
+        labels
+    );
+    // The prefix-less `<country_tag>` from-data link must NOT be flooded in as a
+    // bare scope-switch key: a raw country tag is high-cardinality and rarely the
+    // way a scope switch is completed (#76 wanted only the prefixed keys).
+    assert!(
+        !labels.iter().any(|l| l == "GER"),
+        "bare country-tag scope-link key must not flood the list, got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn test_completion_effects_scope_filtered_in_mio_block() {
+    // #78 layer 1: inside `mio:MY_ORG = { … }` the current scope is
+    // military_industrial_organization. A MIO-scope effect must appear and rank in
+    // the top bucket; a country-only effect must NOT be dropped (scope tracking is
+    // imperfect) but de-ranked into the bottom bucket, behind the matching one.
+    let text = "my_dec = {\n    complete_effect = {\n        mio:MY_ORG = {\n            \n        }\n    }\n}\n";
+    let items = completion_items_custom_rules(
+        MIO_SCOPE_RULES,
+        "common/decisions/d.txt",
+        text,
+        &[MIO_INSTANCE],
+        3,
+        12,
+    );
+    let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+    let mio_effect = items.iter().find(|(l, _)| l == "add_mio_funds");
+    let country_effect = items.iter().find(|(l, _)| l == "add_political_power");
+    assert!(
+        mio_effect.is_some(),
+        "MIO-scope effect must be offered inside a MIO block, got: {:?}",
+        labels
+    );
+    let mio_sort = mio_effect.and_then(|(_, s)| s.clone());
+    assert!(
+        mio_sort.as_deref().is_some_and(|s| s.starts_with("0_")),
+        "MIO-scope effect must rank in the top bucket, got sortText: {:?}",
+        mio_sort
+    );
+    assert!(
+        country_effect.is_some(),
+        "country-only effect must NOT be dropped for scope mismatch, got: {:?}",
+        labels
+    );
+    let country_sort = country_effect.and_then(|(_, s)| s.clone());
+    assert!(
+        country_sort.as_deref().is_some_and(|s| s.starts_with("z_")),
+        "scope-mismatched effect must sink to the bottom bucket, got sortText: {:?}",
+        country_sort
+    );
+    assert!(
+        mio_sort < country_sort,
+        "MIO-scope effect must sort ahead of the mismatched one, got {:?} vs {:?}",
+        mio_sort,
+        country_sort
+    );
+}
+
+#[test]
+fn test_completion_modifiers_scope_filtered_in_mio_block() {
+    // #78 layer 2: inside a `## push_scope`d MIO `equipment_bonus` block, the
+    // MIO-category modifier ranks top and the country-category one is de-ranked to
+    // the bottom bucket (not dropped) — the modifier→category→supported_scopes
+    // plumbing at work.
+    let text = "my_org = {\n    name = org\n    equipment_bonus = {\n        \n    }\n}\n";
+    let items = completion_items_custom_rules(
+        MIO_SCOPE_RULES,
+        "common/military_industrial_organization/organizations/test.txt",
+        text,
+        &[],
+        3,
+        8,
+    );
+    let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+    let mio_mod = items
+        .iter()
+        .find(|(l, _)| l == "military_industrial_organization_funds_gain");
+    let country_mod = items.iter().find(|(l, _)| l == "war_support_factor");
+    assert!(
+        mio_mod.is_some(),
+        "MIO-category modifier must be offered in a MIO-scope modifier block, got: {:?}",
+        labels
+    );
+    let mio_sort = mio_mod.and_then(|(_, s)| s.clone());
+    assert!(
+        mio_sort.as_deref().is_some_and(|s| s.starts_with("0_")),
+        "MIO-category modifier must rank in the top bucket, got sortText: {:?}",
+        mio_sort
+    );
+    assert!(
+        country_mod.is_some(),
+        "country-category modifier must NOT be dropped for scope mismatch, got: {:?}",
+        labels
+    );
+    let country_sort = country_mod.and_then(|(_, s)| s.clone());
+    assert!(
+        country_sort.as_deref().is_some_and(|s| s.starts_with("z_")),
+        "scope-mismatched modifier must sink to the bottom bucket, got sortText: {:?}",
+        country_sort
+    );
+    assert!(
+        mio_sort < country_sort,
+        "MIO-category modifier must sort ahead of the mismatched one, got {:?} vs {:?}",
+        mio_sort,
+        country_sort
+    );
+}
+
+#[test]
+fn test_completion_effects_unfiltered_when_scope_unknown() {
+    // #78 regression guard: a scripted_effects file is scope-agnostic (SCOPE_ANY),
+    // so no scope filtering applies — both the MIO-scope and country-only effects
+    // must still be listed.
+    let text = "my_se = {\n    \n}\n";
+    let labels = completion_labels_custom_rules(
+        MIO_SCOPE_RULES,
+        "common/scripted_effects/se.txt",
+        text,
+        &[],
+        1,
+        4,
+    );
+    assert!(
+        labels.iter().any(|l| l == "add_mio_funds"),
+        "MIO-scope effect must still be listed when scope is unknown, got: {:?}",
+        labels
+    );
+    assert!(
+        labels.iter().any(|l| l == "add_political_power"),
+        "country-only effect must still be listed when scope is unknown, got: {:?}",
+        labels
+    );
 }
 
 /// Rules for the #64 and #66 integration tests.
@@ -2106,4 +2606,310 @@ fn test_did_open_definition_clears_open_caller_stale_error() {
         "opening the definition file should clear B's stale CW263, got: {:?}",
         after
     );
+}
+
+// ── B5/B7: document symbols, folding, highlight, cross-file references/rename ──
+
+/// Spawn a server with `rules`, write `files` to disk, initialize with
+/// `client_caps`, run the workspace scan (which indexes every file, open or
+/// not), didOpen the `open` files, then issue `method` against `doc_rel` with
+/// `extra` merged into the request params. Polls until a non-empty `result`
+/// arrives. Returns the JSON `result`.
+fn feature_request(
+    rules: &str,
+    files: &[(&str, &str)],
+    open: &[&str],
+    client_caps: serde_json::Value,
+    doc_rel: &str,
+    method: &str,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), rules).unwrap();
+    for (rel, content) in files {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": client_caps,
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    for &rel in open {
+        let content = files
+            .iter()
+            .find(|(r, _)| *r == rel)
+            .map(|(_, c)| *c)
+            .unwrap();
+        let uri = format!("file://{}", ws.path().join(rel).display());
+        write_frame(
+            &mut child,
+            &jsonrpc_notification(
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {"uri": uri, "languageId": "hoi4", "version": 1, "text": content}
+                }),
+            ),
+        )
+        .unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+
+    let doc_uri = format!("file://{}", ws.path().join(doc_rel).display());
+    let mut result = serde_json::Value::Null;
+    for attempt in 0..40 {
+        let mut params = serde_json::json!({ "textDocument": { "uri": doc_uri } });
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                params[k.as_str()] = v.clone();
+            }
+        }
+        let req = jsonrpc_request(100 + attempt, method, params);
+        write_frame(&mut child, &req).unwrap();
+        let resp_str = read_response(&mut reader).expect("no response");
+        let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+        result = resp["result"].clone();
+        let empty = result.is_null() || result.as_array().map(|a| a.is_empty()).unwrap_or(false);
+        if !empty {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    child.kill().ok();
+    result
+}
+
+#[test]
+fn test_document_symbols_nested() {
+    // A focus tree with two focuses: the outline is a nested tree, each block
+    // named by its `id` child so repeated `focus` keys stay distinct.
+    let doc = "focus_tree = {\n    id = my_tree\n    focus = {\n        id = focus_a\n        x = 1\n    }\n    focus = {\n        id = focus_b\n    }\n}\n";
+    let files = &[("common/national_focus/f.txt", doc)];
+    let caps = serde_json::json!({
+        "textDocument": { "documentSymbol": { "hierarchicalDocumentSymbolSupport": true } }
+    });
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/national_focus/f.txt"],
+        caps,
+        "common/national_focus/f.txt",
+        "textDocument/documentSymbol",
+        serde_json::json!({}),
+    );
+    let syms = result.as_array().expect("nested symbols array");
+    let tree = &syms[0];
+    assert_eq!(
+        tree["name"], "my_tree",
+        "top symbol named by id, got: {}",
+        result
+    );
+    // selection_range ⊆ range: they share a start, selection ends within range.
+    assert_eq!(tree["selectionRange"]["start"], tree["range"]["start"]);
+    let children = tree["children"].as_array().expect("nested children");
+    assert!(
+        children.iter().any(|c| c["name"] == "focus_a"),
+        "expected nested focus_a, got: {}",
+        result
+    );
+    assert!(
+        children.iter().any(|c| c["name"] == "focus_b"),
+        "expected nested focus_b, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_folding_ranges_nested_blocks() {
+    let doc = "outer = {\n    inner = {\n        x = 1\n    }\n}\n";
+    let files = &[("common/national_focus/f.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/national_focus/f.txt"],
+        serde_json::json!({}),
+        "common/national_focus/f.txt",
+        "textDocument/foldingRange",
+        serde_json::json!({}),
+    );
+    let ranges = result.as_array().expect("folding ranges");
+    let has = |s: u64, e: u64| {
+        ranges
+            .iter()
+            .any(|r| r["startLine"] == s && r["endLine"] == e)
+    };
+    assert!(has(0, 4), "expected outer fold 0..4, got: {}", result);
+    assert!(has(1, 3), "expected inner fold 1..3, got: {}", result);
+}
+
+#[test]
+fn test_document_highlight_occurrences() {
+    // `MY_FOCUS` appears three times; highlighting one returns all three.
+    let doc = "a = {\n    has_focus = MY_FOCUS\n}\nb = {\n    has_focus = MY_FOCUS\n}\nc = {\n    load_oob = MY_FOCUS\n}\n";
+    let files = &[("common/decisions/d.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/documentHighlight",
+        serde_json::json!({ "position": { "line": 1, "character": 16 } }),
+    );
+    let hl = result.as_array().expect("highlights array");
+    assert_eq!(
+        hl.len(),
+        3,
+        "expected 3 occurrences of MY_FOCUS, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_references_finds_closed_file() {
+    // A (open) and B (never opened) both reference focus MY_FOCUS. Find-refs from
+    // A must reach B via the workspace reverse index.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/a.txt",
+            "adec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+        (
+            "common/decisions/b.txt",
+            "bdec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/a.txt"],
+        serde_json::json!({}),
+        "common/decisions/a.txt",
+        "textDocument/references",
+        serde_json::json!({
+            "position": { "line": 1, "character": 16 },
+            "context": { "includeDeclaration": true }
+        }),
+    );
+    let locs = result.as_array().expect("references array");
+    assert!(
+        locs.iter()
+            .any(|l| l["uri"].as_str().unwrap_or("").ends_with("decisions/b.txt")),
+        "references must include the closed file b.txt, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_rename_edits_closed_file() {
+    // Renaming MY_FOCUS from the open file A must also edit the closed file B, at
+    // the value column (16), not the key.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/a.txt",
+            "adec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+        (
+            "common/decisions/b.txt",
+            "bdec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/a.txt"],
+        serde_json::json!({}),
+        "common/decisions/a.txt",
+        "textDocument/rename",
+        serde_json::json!({ "position": { "line": 1, "character": 16 }, "newName": "NEW_FOCUS" }),
+    );
+    let changes = result["changes"]
+        .as_object()
+        .expect("WorkspaceEdit changes");
+    let b_key = changes
+        .keys()
+        .find(|u| u.ends_with("decisions/b.txt"))
+        .unwrap_or_else(|| panic!("rename must edit closed file b.txt, got: {}", result));
+    let edits = changes[b_key].as_array().expect("edits for b.txt");
+    assert_eq!(
+        edits[0]["range"]["start"]["character"], 16,
+        "edit must target the value column, got: {}",
+        result
+    );
+    assert_eq!(edits[0]["newText"], "NEW_FOCUS");
+}
+
+#[test]
+fn test_rename_targets_value_not_trailing_comment() {
+    // Regression: a use site whose line repeats the instance name in a trailing
+    // comment must rename the VALUE (col 16), never the comment occurrence. The
+    // old value-column scan took the LAST match on the raw line, so it wrote the
+    // new text into the comment and left the real value dangling (silent
+    // corruption). The value is resolved as the first token after the `=`.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/a.txt",
+            "adec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+        (
+            "common/decisions/b.txt",
+            "bdec = {\n    has_focus = MY_FOCUS   # keep MY_FOCUS until 1939\n}\n",
+        ),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/a.txt"],
+        serde_json::json!({}),
+        "common/decisions/a.txt",
+        "textDocument/rename",
+        serde_json::json!({ "position": { "line": 1, "character": 16 }, "newName": "NEW_FOCUS" }),
+    );
+    let changes = result["changes"]
+        .as_object()
+        .expect("WorkspaceEdit changes");
+    let b_key = changes
+        .keys()
+        .find(|u| u.ends_with("decisions/b.txt"))
+        .unwrap_or_else(|| panic!("rename must edit closed file b.txt, got: {}", result));
+    let edits = changes[b_key].as_array().expect("edits for b.txt");
+    assert_eq!(
+        edits[0]["range"]["start"]["character"], 16,
+        "edit must target the value column, not the trailing comment, got: {}",
+        result
+    );
+    assert_eq!(edits[0]["newText"], "NEW_FOCUS");
 }
