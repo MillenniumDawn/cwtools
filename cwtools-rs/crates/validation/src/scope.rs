@@ -17,7 +17,7 @@ pub(crate) fn build_scope_registry(ruleset: &RuleSet, game: Game) -> ScopeRegist
     ScopeRegistry::from_config(&ruleset.scope_inputs, &ruleset.link_inputs, game)
 }
 
-pub(crate) fn scope_matches_required(
+pub fn scope_matches_required(
     current: ScopeId,
     registry: &ScopeRegistry,
     required: &[String],

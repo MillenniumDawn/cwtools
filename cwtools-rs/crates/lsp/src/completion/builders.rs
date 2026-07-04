@@ -2,15 +2,56 @@ use std::collections::HashSet;
 
 use tower_lsp::lsp_types::*;
 
+use cwtools_game::scope_engine::{SCOPE_ANY, ScopeId};
+use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_info::InfoService;
 use cwtools_rules::rules_types::{
     NewField, ParsedAliasPattern, PatternKind, RootRule, RuleSet, RuleType, TypeType, ValueType,
 };
+use cwtools_validation::scope_matches_required;
 
 use super::generate_node_snippet;
 use super::scope_names::scope_completion_names;
-use super::snippets::alias_completion_snippet;
+use super::snippets::{alias_completion_snippet, choice_list, quote_if_needed};
 use super::sort_for_kind;
+
+/// The current scope at the cursor, paired with the registry that resolves it,
+/// when scope-aware completion can act. `None` when no scope is known or the
+/// scope is the open wildcard (`SCOPE_ANY`) — in which case completion offers the
+/// full set unchanged.
+type ScopeCtx<'a> = Option<(ScopeId, &'a ScopeRegistry)>;
+
+/// Whether a `## scope` requirement list is genuinely scope-specific (narrows the
+/// set) rather than the scope-agnostic `any`/`all`.
+fn is_specific_requirement(required: &[String]) -> bool {
+    !required.is_empty()
+        && !required
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case("any") || s.eq_ignore_ascii_case("all"))
+}
+
+/// How a completion item ranks against the current scope. A mismatch is never
+/// dropped (scope tracking is imperfect, so hiding a valid item is worse than a
+/// stale one at the bottom of the list); it only sinks below the normal buckets.
+#[derive(Clone, Copy)]
+enum ScopeRank {
+    /// Matches a scope-specific `## scope` — leads the list (bucket `0`).
+    SpecificMatch,
+    /// No scope info, or a scope-agnostic match — keeps the kind bucket.
+    Neutral,
+    /// No overload satisfies the current scope — bottom bucket (`z`).
+    Mismatch,
+}
+
+impl ScopeRank {
+    fn sort_text(self, kind: Option<CompletionItemKind>, label: &str) -> Option<String> {
+        match self {
+            ScopeRank::SpecificMatch => Some(format!("0_{}", label)),
+            ScopeRank::Neutral => sort_for_kind(kind, label),
+            ScopeRank::Mismatch => Some(format!("z_{}", label)),
+        }
+    }
+}
 
 /// Build context-aware completion items from the child rules at the cursor's
 /// position (the rules come from `position::rules_at_pos`, which resolves
@@ -22,6 +63,7 @@ pub(crate) fn completions_from_rules(
     language: &str,
     modifier_keys: &HashSet<String>,
     registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
+    current_scope: Option<ScopeId>,
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
     // Per-request memo so a repeated enum is only collected/sorted once (#46).
@@ -30,6 +72,15 @@ pub(crate) fn completions_from_rules(
     // Built (sort + clone) at most once per call even if several scope rules
     // appear in this block (#44).
     let mut scope_names: Option<Vec<String>> = None;
+    // Scope-aware ranking/filtering acts only on a definitely-known scope; the
+    // open wildcard (`SCOPE_ANY`) means "unknown", so leave the set unchanged.
+    let scope_ctx: ScopeCtx = match (current_scope, registry) {
+        (Some(s), Some(reg)) if s != SCOPE_ANY => Some((s, reg)),
+        _ => None,
+    };
+    // Scope-link keys (`mio:ORG = { … }`) are the same regardless of which alias
+    // category triggered them, so emit them at most once per block (#76).
+    let mut scope_links_emitted = false;
 
     for (rule_type, opts) in rules {
         match rule_type {
@@ -94,7 +145,21 @@ pub(crate) fn completions_from_rules(
             | RuleType::NodeRule {
                 left: NewField::AliasField(cat),
                 ..
-            } => push_alias_keys(&mut items, ruleset, info, modifier_keys, cat),
+            } => {
+                push_alias_keys(&mut items, ruleset, info, modifier_keys, cat, scope_ctx);
+                // A category with a `scope_field` alias (effect/trigger) accepts a
+                // scope-switch key here (`mio:ORG = { … }`), so offer those keys too
+                // (#76). The resolution machinery already backs goto/hover.
+                if !scope_links_emitted
+                    && ruleset
+                        .alias_categories
+                        .get(cat)
+                        .is_some_and(|c| c.scope_field_idx.is_some())
+                {
+                    push_scope_link_keys(&mut items, ruleset, info);
+                    scope_links_emitted = true;
+                }
+            }
             // alias_keys_field[cat]: the KEY of this leaf must be one of the alias
             // names in category `cat` (e.g. `alias_keys_field[modifier]` in a
             // dynamic_modifier block). Offer the same set as alias_name[cat] would
@@ -102,7 +167,7 @@ pub(crate) fn completions_from_rules(
             RuleType::LeafRule {
                 left: NewField::AliasValueKeysField(cat),
                 ..
-            } => push_alias_keys(&mut items, ruleset, info, modifier_keys, cat),
+            } => push_alias_keys(&mut items, ruleset, info, modifier_keys, cat, scope_ctx),
             // Scope names
             RuleType::LeafRule {
                 right: NewField::ScopeField(_),
@@ -151,8 +216,7 @@ fn push_specific_leaf_key(
             // Inline enum values if the list is short enough
             let vals = enum_values_for(ruleset, e);
             if !vals.is_empty() && vals.len() <= 20 {
-                let choices = vals.join(",");
-                Some(format!("{} = ${{1|{}|}}", k, choices))
+                Some(format!("{} = ${{1|{}|}}", k, choice_list(vals)))
             } else {
                 // Long enum: still complete the `key = ` and let the
                 // value be typed/triggered.
@@ -331,14 +395,44 @@ fn push_type_instances(
 /// here: instead of emitting the raw `<scripted_effect>` placeholder, we look up
 /// every instance of the `scripted_effect` type in the index and offer each as a
 /// KEYWORD item (cwtools-vscode#64).
+///
+/// When `scope` is known, an alias/modifier is filtered out if every overload
+/// declares a `## scope` the current scope can't satisfy, and one that matches a
+/// scope-specific requirement is ranked into the top bucket (#78). The scope test
+/// reuses the validator's `scope_matches_required`, so completion and validation
+/// agree on what is in scope.
 fn push_alias_keys(
     items: &mut Vec<CompletionItem>,
     ruleset: &RuleSet,
     info: &InfoService,
     modifier_keys: &HashSet<String>,
     cat: &str,
+    scope: ScopeCtx,
 ) {
     let prefix = format!("{}:", cat);
+    // Pre-pass: aggregate a scope verdict per exact-alias key across all its
+    // overloads (`(any_match, any_specific_match)`). A key survives if ANY overload
+    // is in scope; it ranks top if ANY overload matches a scope-specific `## scope`.
+    // Mirrors the validator's per-key `.any(...)` scope check (rule_core/alias.rs).
+    let verdicts: Option<std::collections::HashMap<&str, (bool, bool)>> =
+        scope.map(|(current, reg)| {
+            let mut m: std::collections::HashMap<&str, (bool, bool)> =
+                std::collections::HashMap::new();
+            for (alias_name, (_, opts)) in &ruleset.aliases {
+                let Some(k) = alias_name.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if k == "scope_field" || ParsedAliasPattern::parse(k, 0).is_some() {
+                    continue;
+                }
+                let matches = scope_matches_required(current, reg, &opts.required_scopes);
+                let specific = matches && is_specific_requirement(&opts.required_scopes);
+                let e = m.entry(k).or_insert((false, false));
+                e.0 |= matches;
+                e.1 |= specific;
+            }
+            m
+        });
     // Own the keys so that instance names (borrowed from the type index, not from
     // `ruleset.aliases`) can also participate in the seen-check below.
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -354,6 +448,15 @@ fn push_alias_keys(
         if ParsedAliasPattern::parse(k, 0).is_some() {
             continue;
         }
+        // Scope ranking (never a drop): a scope-specific match leads the list,
+        // a scope mismatch sinks to the bottom bucket, everything else keeps its
+        // kind bucket. Scope tracking is imperfect (nested/event_target/half-typed
+        // contexts), so a valid key must never silently vanish (#78).
+        let scope_rank = match verdicts.as_ref().and_then(|v| v.get(k)) {
+            Some(&(false, _)) => ScopeRank::Mismatch,
+            Some(&(true, true)) => ScopeRank::SpecificMatch,
+            _ => ScopeRank::Neutral,
+        };
         if let Some(&idx) = seen.get(k) {
             let item: &mut CompletionItem = &mut items[idx];
             if item.documentation.is_none()
@@ -377,6 +480,7 @@ fn push_alias_keys(
         // (`add_political_power`) to `key = <placeholder>` so the
         // cursor lands after the `=`, ready for the value.
         let snippet = alias_completion_snippet(k, rule, ruleset);
+        let sort_text = scope_rank.sort_text(Some(CompletionItemKind::KEYWORD), k);
         items.push(CompletionItem {
             label: k.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
@@ -384,7 +488,7 @@ fn push_alias_keys(
             documentation: opts.description.clone().map(Documentation::String),
             insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
             insert_text: snippet,
-            sort_text: sort_for_kind(Some(CompletionItemKind::KEYWORD), k),
+            sort_text,
             ..Default::default()
         });
     }
@@ -464,16 +568,120 @@ fn push_alias_keys(
     // names like production_speed_<building>_factor). This is the
     // MIO `equipment_bonus` / idea `modifier` block case.
     if cat == "modifier" {
+        // When the scope is known, resolve each modifier to its category's
+        // `supported_scopes` (modifier_categories.cwt) so a scope-specific modifier
+        // ranks ahead and a scope-mismatched one sinks to the bottom bucket (never
+        // dropped — see the alias path). The map is keyed by the SAME
+        // expanded/lowercased names as `modifier_keys`, so nothing shifts when the
+        // scope is unknown (#78).
+        let modifier_scopes = scope.map(|_| expanded_modifier_scopes(ruleset, info));
         for m in modifier_keys {
+            let scope_rank = match scope {
+                Some((current, reg)) => {
+                    let scopes = modifier_scopes
+                        .as_ref()
+                        .and_then(|map| map.get(m).copied())
+                        .unwrap_or(&[]);
+                    if !scope_matches_required(current, reg, scopes) {
+                        ScopeRank::Mismatch
+                    } else if is_specific_requirement(scopes) {
+                        ScopeRank::SpecificMatch
+                    } else {
+                        ScopeRank::Neutral
+                    }
+                }
+                None => ScopeRank::Neutral,
+            };
+            let sort_text = scope_rank.sort_text(Some(CompletionItemKind::FIELD), m);
             items.push(CompletionItem {
                 label: m.clone(),
                 kind: Some(CompletionItemKind::FIELD),
                 detail: Some("modifier".to_string()),
                 insert_text: Some(format!("{} = $0", m)),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                sort_text: sort_for_kind(Some(CompletionItemKind::FIELD), m),
+                sort_text,
                 ..Default::default()
             });
+        }
+    }
+}
+
+/// Map each (expanded, lowercased) modifier name to its category's
+/// `supported_scopes`. Templated modifiers (`production_speed_<building>_factor`)
+/// expand against the type index one instance each — the same expansion
+/// `build_modifier_keys` performs, so the keys line up with the modifier-key set.
+/// Names whose category has no `modifier_categories.cwt` entry map to an empty
+/// (unrestricted) scope list.
+fn expanded_modifier_scopes<'a>(
+    ruleset: &'a RuleSet,
+    info: &InfoService,
+) -> std::collections::HashMap<String, &'a [String]> {
+    let mut map: std::collections::HashMap<String, &'a [String]> = std::collections::HashMap::new();
+    for (name, category) in &ruleset.modifiers {
+        let scopes = ruleset
+            .modifier_categories
+            .get(category)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        match (name.find('<'), name.find('>')) {
+            (Some(open), Some(close)) if open < close => {
+                let tn = &name[open + 1..close];
+                let pre = &name[..open];
+                let suf = &name[close + 1..];
+                for (_, inst) in info.type_index.instances(tn) {
+                    map.insert(
+                        format!("{}{}{}", pre, inst.name, suf).to_lowercase(),
+                        scopes,
+                    );
+                }
+            }
+            _ => {
+                map.insert(name.to_lowercase(), scopes);
+            }
+        }
+    }
+    map
+}
+
+/// Emit scope-switch keys for PREFIXED `from_data` scope links
+/// (`mio:ORG = { … }`, `sp:PROJ = { … }`, `token:… = { … }`): one block-opening
+/// item per type instance the link's `data_source` names (#76). Only prefixed
+/// links are offered — the prefix-less bare links (`<country>`, `<state>`, …)
+/// are high-cardinality and would flood every effect/trigger block on every
+/// keystroke (the response is always incomplete, so they rebuild each time). A
+/// scope switch is rarely completed by typing a raw country tag / state id, and
+/// goto/hover still resolve those. Capped so a mod with thousands of MIOs can't
+/// bury the block's real effects.
+fn push_scope_link_keys(items: &mut Vec<CompletionItem>, ruleset: &RuleSet, info: &InfoService) {
+    const SCOPE_LINK_KEY_CAP: usize = 2000;
+    let mut count = 0usize;
+    for li in &ruleset.link_inputs {
+        if !li.from_data {
+            continue;
+        }
+        let Some(prefix) = li.prefix.as_deref().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        for ds in &li.data_source {
+            let Some(t) = ds.strip_prefix('<').and_then(|s| s.strip_suffix('>')) else {
+                continue;
+            };
+            for (_, inst) in info.type_index.instances(t) {
+                if count >= SCOPE_LINK_KEY_CAP {
+                    return;
+                }
+                let label = format!("{}{}", prefix, inst.name);
+                items.push(CompletionItem {
+                    label: label.clone(),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: Some(format!("{} scope", li.name)),
+                    insert_text: Some(format!("{} = {{\n\t$0\n}}", label)),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    sort_text: sort_for_kind(Some(CompletionItemKind::REFERENCE), &label),
+                    ..Default::default()
+                });
+                count += 1;
+            }
         }
     }
 }
@@ -569,6 +777,7 @@ pub(crate) fn value_completions(
     let mut push = |label: String,
                     kind: CompletionItemKind,
                     detail: String,
+                    insert_text: Option<String>,
                     items: &mut Vec<CompletionItem>| {
         if seen.insert(label.clone()) {
             let sort_label = label.clone();
@@ -576,6 +785,7 @@ pub(crate) fn value_completions(
                 label,
                 kind: Some(kind),
                 detail: Some(detail),
+                insert_text,
                 sort_text: sort_for_kind(Some(kind), &sort_label),
                 ..Default::default()
             });
@@ -595,6 +805,7 @@ pub(crate) fn value_completions(
                         inst.name.clone(),
                         CompletionItemKind::REFERENCE,
                         format!("{} instance", t),
+                        None,
                         &mut items,
                     );
                 }
@@ -609,16 +820,37 @@ pub(crate) fn value_completions(
                         format!("{}{}{}", prefix, inst.name, suffix),
                         CompletionItemKind::REFERENCE,
                         format!("{} instance", name),
+                        None,
                         &mut items,
                     );
                 }
             }
             NewField::ValueField(ValueType::Enum(e)) => {
                 for v in all_enum_values_cached(&mut enum_cache, ruleset, info, e) {
+                    // A value with whitespace/special chars must insert quoted so
+                    // it parses as one token (`"No Compromise, No Surrender"`); a
+                    // bare identifier inserts as its own label.
+                    let quoted = quote_if_needed(v);
+                    let insert_text = (quoted != *v).then_some(quoted);
                     push(
                         v.clone(),
                         CompletionItemKind::ENUM_MEMBER,
                         format!("enum {}", e),
+                        insert_text,
+                        &mut items,
+                    );
+                }
+            }
+            // A free localisation name (`name = localisation`): offer known loc
+            // keys (workspace entities) rather than falling through to the flat
+            // variable dump (cwtools-vscode#74).
+            NewField::LocalisationField { .. } => {
+                for k in super::scope_names::loc_key_names(info) {
+                    push(
+                        k.to_string(),
+                        CompletionItemKind::TEXT,
+                        "loc key".to_string(),
+                        None,
                         &mut items,
                     );
                 }
@@ -629,6 +861,7 @@ pub(crate) fn value_completions(
                         v.to_string(),
                         CompletionItemKind::KEYWORD,
                         "bool".to_string(),
+                        None,
                         &mut items,
                     );
                 }
@@ -643,6 +876,7 @@ pub(crate) fn value_completions(
                         name.clone(),
                         CompletionItemKind::VALUE,
                         "scope".to_string(),
+                        None,
                         &mut items,
                     );
                 }
@@ -674,6 +908,7 @@ pub(crate) fn value_completions(
                         v,
                         CompletionItemKind::CONSTANT,
                         format!("value[{}]", ns),
+                        None,
                         &mut items,
                     );
                 }
@@ -684,6 +919,7 @@ pub(crate) fn value_completions(
                         v.clone(),
                         CompletionItemKind::CONSTANT,
                         "variable".to_string(),
+                        None,
                         &mut items,
                     );
                 }
@@ -694,6 +930,7 @@ pub(crate) fn value_completions(
                         v.clone(),
                         CompletionItemKind::CONSTANT,
                         "variable".to_string(),
+                        None,
                         &mut items,
                     );
                 }
@@ -702,6 +939,7 @@ pub(crate) fn value_completions(
                         format!("event_target:{}", et),
                         CompletionItemKind::VARIABLE,
                         "event target".to_string(),
+                        None,
                         &mut items,
                     );
                 }

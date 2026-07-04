@@ -24,10 +24,7 @@ pub(crate) fn loc_completions(
     // change `info.files` (the initial scan, `did_close`, and validate's
     // `clear_file` all mutate it without a bump), so keying on it would serve
     // stale completions. The fix would have to live outside completion.rs.
-    let mut items: Vec<CompletionItem> = info
-        .files
-        .values()
-        .flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.as_str()))
+    let mut items: Vec<CompletionItem> = loc_key_names(info)
         .collect::<std::collections::HashSet<&str>>()
         .into_iter()
         .map(|k| CompletionItem {
@@ -52,6 +49,15 @@ pub(crate) fn loc_completions(
     }
 
     items
+}
+
+/// Candidate localisation keys: the top-level clause keys (workspace entities)
+/// from every indexed file. Shared by loc-file completion and the value-position
+/// `localisation` field arm.
+pub(crate) fn loc_key_names(info: &InfoService) -> impl Iterator<Item = &str> {
+    info.files
+        .values()
+        .flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.as_str()))
 }
 
 /// Chain-keyword prelude for scope completions. These are runtime traversal

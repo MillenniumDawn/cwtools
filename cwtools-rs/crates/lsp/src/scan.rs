@@ -505,9 +505,7 @@ impl Backend {
                 .count();
 
             if let Ok(uri_obj) = Url::parse(&uri) {
-                self.client
-                    .publish_diagnostics(uri_obj, diagnostics, None)
-                    .await;
+                self.publish_filtered(uri_obj, diagnostics, None).await;
             }
             if i % 50 == 49 {
                 tokio::task::yield_now().await;
@@ -594,8 +592,9 @@ impl Backend {
     /// Re-validate every currently-open document against the current (complete)
     /// index and re-publish, skipping any whose version changed meanwhile. Called
     /// once after the workspace scan so open docs validated against a partial
-    /// index don't keep stale cross-file diagnostics.
-    async fn revalidate_all_open_docs(&self) {
+    /// index don't keep stale cross-file diagnostics, and on a live
+    /// `didChangeConfiguration` so a changed suppression list re-filters at once.
+    pub(crate) async fn revalidate_all_open_docs(&self) {
         let open_docs: Vec<(String, String, i32)> = {
             let docs = self.state.documents.lock();
             docs.iter()
@@ -616,8 +615,7 @@ impl Backend {
                 continue;
             }
             if let Ok(uri_obj) = Url::parse(&uri) {
-                self.client
-                    .publish_diagnostics(uri_obj, diagnostics, Some(version))
+                self.publish_filtered(uri_obj, diagnostics, Some(version))
                     .await;
             }
         }
@@ -759,7 +757,7 @@ impl Backend {
         for (file, diags) in by_file.drain() {
             let uri = path_to_uri(std::path::Path::new(&file));
             if let Ok(uri_obj) = Url::parse(&uri) {
-                self.client.publish_diagnostics(uri_obj, diags, None).await;
+                self.publish_filtered(uri_obj, diags, None).await;
             }
         }
         cwtools_profiling::log_rss("loc_rebuild_done");

@@ -203,103 +203,132 @@ impl Backend {
         // `ast_for` returns the last good parse, or (when the last parse failed)
         // a fresh parse of the live text for this request only, so a half-typed
         // buffer still resolves a context.
+        //
+        // The bool paired with the item list is `resolved_value_pos`: true when
+        // the cursor sat at a leaf VALUE position whose rule set was concretely
+        // matched (non-empty value rules). When such a position yields no items,
+        // the flat variable dump below must NOT stand in for it — that dump is
+        // the #74/#75/#79 bug. Key positions and unresolved contexts keep the
+        // bool false so the fallback still fires for them.
         let effective_ast: Option<Arc<ParsedFile>> = self.ast_for(&uri);
-        let context_items: Option<Vec<CompletionItem>> = match (effective_ast, ruleset_arc.as_ref())
-        {
-            (Some(ast), Some(rs)) => {
-                if is_stale() {
-                    return Ok(None);
-                }
-                let info_guard = self.state.info_service.read();
-                let game = cwtools_game::constants::Game::from_str(&language);
-                let prepared = crate::validate::make_prepared(
-                    rs,
-                    &self.state.string_table,
-                    game,
-                    &info_guard.type_index,
-                    &modifier_keys_arc,
-                    None,
-                    None,
-                    scope_registry_arc.as_ref(),
-                    scope_checks,
-                    var_checks,
-                );
-                match rules_at_pos(&ast, &logical_path, &prepared, lsp_line, lsp_col) {
-                    // Outside any known entity — offer root-type snippets.
-                    None => Some(root_type_snippets(rs, &logical_path)),
-                    Some(rctx) => {
-                        let items = if rctx.leaf.as_ref().is_some_and(|l| l.in_value) {
-                            let is_bare_key = rctx
-                                .leaf
-                                .as_ref()
-                                .is_some_and(|l| l.key.is_empty() && rctx.value_rules.is_empty());
-                            if is_bare_key {
-                                // Bare token (no `=`): treat as a key being typed, not a value.
-                                completions_from_rules(
-                                    &rctx.child_rules,
-                                    rs,
-                                    &info_guard,
-                                    &language,
-                                    &modifier_keys_arc,
-                                    scope_registry_arc.as_deref(),
-                                )
-                            } else {
-                                value_completions(
-                                    &rctx.value_rules,
-                                    rs,
-                                    &info_guard,
-                                    scope_registry_arc.as_deref(),
-                                    &language,
-                                )
-                            }
-                        } else if let Some(key) = line_value_key(&doc_text, pos.line, pos.character)
-                        {
-                            // Mid-edit `key = |`: the last good parse has no such
-                            // leaf yet; resolve the value rules from the live line.
-                            let vr = value_rules_for_key(
-                                rs,
-                                Some(&info_guard.type_index),
-                                &rctx.child_rules,
-                                &key,
-                            );
-                            value_completions(
-                                &vr,
-                                rs,
-                                &info_guard,
-                                scope_registry_arc.as_deref(),
-                                &language,
-                            )
-                        } else {
-                            completions_from_rules(
-                                &rctx.child_rules,
-                                rs,
-                                &info_guard,
-                                &language,
-                                &modifier_keys_arc,
-                                scope_registry_arc.as_deref(),
-                            )
-                        };
-                        Some(items)
+        let context_items: Option<(Vec<CompletionItem>, bool)> =
+            match (effective_ast, ruleset_arc.as_ref()) {
+                (Some(ast), Some(rs)) => {
+                    if is_stale() {
+                        return Ok(None);
+                    }
+                    let info_guard = self.state.info_service.read();
+                    let game = cwtools_game::constants::Game::from_str(&language);
+                    let prepared = crate::validate::make_prepared(
+                        rs,
+                        &self.state.string_table,
+                        game,
+                        &info_guard.type_index,
+                        &modifier_keys_arc,
+                        None,
+                        None,
+                        scope_registry_arc.as_ref(),
+                        scope_checks,
+                        var_checks,
+                    );
+                    match rules_at_pos(&ast, &logical_path, &prepared, lsp_line, lsp_col) {
+                        // Outside any known entity — offer root-type snippets.
+                        None => Some((root_type_snippets(rs, &logical_path), false)),
+                        Some(rctx) => {
+                            let (items, resolved_value_pos) =
+                                if rctx.leaf.as_ref().is_some_and(|l| l.in_value) {
+                                    let is_bare_key = rctx.leaf.as_ref().is_some_and(|l| {
+                                        l.key.is_empty() && rctx.value_rules.is_empty()
+                                    });
+                                    if is_bare_key {
+                                        // Bare token (no `=`): treat as a key being typed, not a value.
+                                        (
+                                            completions_from_rules(
+                                                &rctx.child_rules,
+                                                rs,
+                                                &info_guard,
+                                                &language,
+                                                &modifier_keys_arc,
+                                                scope_registry_arc.as_deref(),
+                                                rctx.scope.as_ref().map(|s| s.current()),
+                                            ),
+                                            false,
+                                        )
+                                    } else {
+                                        (
+                                            value_completions(
+                                                &rctx.value_rules,
+                                                rs,
+                                                &info_guard,
+                                                scope_registry_arc.as_deref(),
+                                                &language,
+                                            ),
+                                            !rctx.value_rules.is_empty(),
+                                        )
+                                    }
+                                } else if let Some(key) =
+                                    line_value_key(&doc_text, pos.line, pos.character)
+                                {
+                                    // Mid-edit `key = |`: the last good parse has no such
+                                    // leaf yet; resolve the value rules from the live line.
+                                    let vr = value_rules_for_key(
+                                        rs,
+                                        Some(&info_guard.type_index),
+                                        &rctx.child_rules,
+                                        &key,
+                                    );
+                                    let resolved = !vr.is_empty();
+                                    (
+                                        value_completions(
+                                            &vr,
+                                            rs,
+                                            &info_guard,
+                                            scope_registry_arc.as_deref(),
+                                            &language,
+                                        ),
+                                        resolved,
+                                    )
+                                } else {
+                                    (
+                                        completions_from_rules(
+                                            &rctx.child_rules,
+                                            rs,
+                                            &info_guard,
+                                            &language,
+                                            &modifier_keys_arc,
+                                            scope_registry_arc.as_deref(),
+                                            rctx.scope.as_ref().map(|s| s.current()),
+                                        ),
+                                        false,
+                                    )
+                                };
+                            Some((items, resolved_value_pos))
+                        }
                     }
                 }
-            }
-            _ => None,
-        };
+                _ => None,
+            };
 
-        if let Some(mut items) = context_items
-            && !items.is_empty()
-        {
-            anchor_items(&mut items, replace_range);
-            // `is_incomplete` so the client re-queries on every keystroke.
-            // Without it, VS Code caches the list and filters client-side —
-            // which feels right until the half-typed state recovers (a new
-            // block, a recovered parse) and the cached list stays stuck on
-            // the wrong context. The re-query is cheap: the server returns
-            // the same items for a stable cursor.
-            return Ok(Some(CompletionResponse::List(CompletionList {
-                is_incomplete: true,
-                items,
-            })));
+        if let Some((mut items, resolved_value_pos)) = context_items {
+            if !items.is_empty() {
+                anchor_items(&mut items, replace_range);
+                // `is_incomplete` so the client re-queries on every keystroke.
+                // Without it, VS Code caches the list and filters client-side —
+                // which feels right until the half-typed state recovers (a new
+                // block, a recovered parse) and the cached list stays stuck on
+                // the wrong context. The re-query is cheap: the server returns
+                // the same items for a stable cursor.
+                return Ok(Some(CompletionResponse::List(CompletionList {
+                    is_incomplete: true,
+                    items,
+                })));
+            }
+            // Value position matched a concrete rule but had nothing to offer
+            // (empty dynamic set, or a value type with no enumerable members):
+            // return no completions rather than the flat variable dump.
+            if resolved_value_pos {
+                return Ok(None);
+            }
         }
 
         // Fallback: flat global list (original behavior) when context-aware
@@ -502,7 +531,8 @@ mod tests {
             panic!("expected TypeRule");
         };
 
-        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None);
+        let items =
+            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");
@@ -535,7 +565,8 @@ mod tests {
             RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _)) => rules.as_slice(),
             _ => panic!("expected TypeRule"),
         };
-        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None);
+        let items =
+            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
         let name = items
             .iter()
             .find(|i| i.label == "name")
@@ -566,7 +597,8 @@ mod tests {
             } else {
                 panic!("expected TypeRule");
             };
-        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None);
+        let items =
+            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
         assert!(!items.is_empty(), "expected some completions");
         for item in &items {
             assert!(
@@ -814,7 +846,7 @@ mod tests {
         let rs = alias_effect_ruleset();
         let info = cwtools_info::InfoService::new();
         let rules = effect_alias_usage();
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
 
         let if_item = items
             .iter()
@@ -837,7 +869,7 @@ mod tests {
         let rs = alias_effect_ruleset();
         let info = cwtools_info::InfoService::new();
         let rules = effect_alias_usage();
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
 
         let appp = items
             .iter()
@@ -903,7 +935,7 @@ mod tests {
     #[test]
     fn alias_bool_trigger_completes_with_equals_and_yesno() {
         // #67: `alias[trigger:always] = bool` must complete to
-        // `always = ${0|yes,no|}`, not a bare `${0|yes,no|}` with no `=`.
+        // `always = ${1|yes,no|}$0`, not a bare `${1|yes,no|}` with no `=`.
         let rs = bool_trigger_ruleset();
         let info = cwtools_info::InfoService::new();
         let rules = vec![(
@@ -913,7 +945,7 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
 
         let always = items
             .iter()
@@ -925,10 +957,137 @@ mod tests {
             "bool trigger must insert 'always = ', got: {:?}",
             always.insert_text
         );
+        // #77: pin the corrected shape `always = ${1|yes,no|}$0`. A choice on the
+        // final `$0` tab stop (`${0|…|}`) is inserted literally by VS Code, so the
+        // choice must sit on tab stop 1 with a trailing `$0`.
+        assert!(
+            snip.contains("${1|") && snip.ends_with("$0") && !snip.contains("${0|"),
+            "bool trigger must use a non-zero choice tab stop ending in $0, got: {:?}",
+            always.insert_text
+        );
         assert!(
             snip.contains("yes") && snip.contains("no"),
             "bool trigger must offer yes/no choices, got: {:?}",
             always.insert_text
+        );
+    }
+
+    // ── #77: has_dlc enum snippet — tab stops, escaping, quoting ──────────────
+
+    /// A ruleset with `alias[trigger:has_dlc] = enum[dlc]` whose enum mixes a
+    /// multi-word value, a value with an embedded comma, a colon value, and a
+    /// bare identifier — the shapes that exercise all three snippet defects.
+    fn dlc_enum_ruleset() -> RuleSet {
+        let mut rs = RuleSet::new();
+        rs.enums.push(EnumDefinition {
+            key: "dlc".to_string(),
+            description: String::new(),
+            values: vec![
+                "Together for Victory".to_string(),
+                "No Compromise, No Surrender".to_string(),
+                "expansion:foo".to_string(),
+                "base_game".to_string(),
+            ],
+        });
+        rs.aliases.push((
+            "trigger:has_dlc".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[trigger:has_dlc]".to_string()),
+                    right: NewField::ValueField(ValueType::Enum("dlc".to_string())),
+                },
+                Options::default(),
+            ),
+        ));
+        rs.reindex();
+        rs
+    }
+
+    #[test]
+    fn alias_dlc_enum_snippet_escapes_and_quotes_choices() {
+        // #77: an enum alias must complete to `has_dlc = ${1|...|}$0` — a choice
+        // on tab stop 1 (not the unsupported `$0`), with each choice value quoted
+        // when it has whitespace and its delimiters escaped.
+        let rs = dlc_enum_ruleset();
+        let info = cwtools_info::InfoService::new();
+        let rules = vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField("trigger".to_string()),
+                right: NewField::AliasField("trigger".to_string()),
+            },
+            Options::default(),
+        )];
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+
+        let has_dlc = items
+            .iter()
+            .find(|i| i.label == "has_dlc")
+            .expect("'has_dlc' completion missing");
+        assert_eq!(has_dlc.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        let snip = has_dlc.insert_text.as_deref().unwrap_or("");
+        assert!(
+            snip.starts_with("has_dlc = ${1|"),
+            "must be a choice on tab stop 1, got: {:?}",
+            has_dlc.insert_text
+        );
+        assert!(
+            snip.ends_with("|}$0"),
+            "must end with a trailing $0, got: {:?}",
+            has_dlc.insert_text
+        );
+        // Multi-word values are quoted.
+        assert!(
+            snip.contains("\"Together for Victory\""),
+            "multi-word value must be quoted, got: {:?}",
+            has_dlc.insert_text
+        );
+        // The comma inside a value is escaped so it can't split the choice, and
+        // the quotes are kept around the whitespace-bearing value.
+        assert!(
+            snip.contains("\"No Compromise\\, No Surrender\""),
+            "embedded comma must be escaped and value quoted, got: {:?}",
+            has_dlc.insert_text
+        );
+        // A bare identifier stays unquoted.
+        assert!(
+            snip.contains("base_game") && !snip.contains("\"base_game\""),
+            "bare identifier must stay unquoted, got: {:?}",
+            has_dlc.insert_text
+        );
+    }
+
+    #[test]
+    fn value_completions_enum_quotes_spaced_values() {
+        // #77: at a value position, an enum member with whitespace inserts quoted
+        // (so it parses as one token); a bare identifier inserts as its label.
+        let rs = dlc_enum_ruleset();
+        let info = cwtools_info::InfoService::new();
+        let value_rules = vec![(
+            RuleType::LeafValueRule {
+                right: NewField::ValueField(ValueType::Enum("dlc".to_string())),
+            },
+            Options::default(),
+        )];
+        let items = value_completions(&value_rules, &rs, &info, None, "hoi4");
+
+        let spaced = items
+            .iter()
+            .find(|i| i.label == "Together for Victory")
+            .expect("spaced enum value missing");
+        assert_eq!(
+            spaced.insert_text.as_deref(),
+            Some("\"Together for Victory\""),
+            "spaced value must insert quoted, got: {:?}",
+            spaced.insert_text
+        );
+        let bare = items
+            .iter()
+            .find(|i| i.label == "base_game")
+            .expect("bare enum value missing");
+        assert_eq!(
+            bare.insert_text, None,
+            "bare identifier must not carry a quoted insert_text, got: {:?}",
+            bare.insert_text
         );
     }
 
@@ -1002,7 +1161,7 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
 
         assert!(
             items.iter().any(|i| i.label == "my_special_effect"),
@@ -1049,7 +1208,7 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &modifier_keys, None);
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &modifier_keys, None, None);
 
         assert!(
             items.iter().any(|i| i.label == "my_modifier"),
@@ -1076,7 +1235,7 @@ mod tests {
             make_leaf_rule("active", NewField::ValueField(ValueType::Bool)),
             make_leaf_rule("active", NewField::ValueField(ValueType::Bool)),
         ];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None);
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
         let count = items.iter().filter(|i| i.label == "active").count();
         assert_eq!(
             count, 1,

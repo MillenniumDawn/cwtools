@@ -108,6 +108,11 @@ fn fill_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                         extract_modifier_names(children, ast, table, &mut ruleset);
                     }
                 }
+                "modifier_categories" => {
+                    if let Value::Clause(children) = &leaf.value {
+                        extract_modifier_categories(children, ast, table, &mut ruleset);
+                    }
+                }
                 "links" => {
                     if let Value::Clause(children) = &leaf.value {
                         extract_links(children, ast, table, &mut ruleset);

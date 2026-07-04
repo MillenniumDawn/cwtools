@@ -63,6 +63,7 @@ pub fn merge_ruleset(dst: &mut RuleSet, src: RuleSet) {
         dst.values.entry(name).or_default().extend(vals);
     }
     dst.modifiers.extend(src.modifiers);
+    dst.modifier_categories.extend(src.modifier_categories);
     dst.scope_links.extend(src.scope_links);
     dst.scope_inputs.extend(src.scope_inputs);
     dst.link_inputs.extend(src.link_inputs);

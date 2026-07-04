@@ -77,6 +77,13 @@ pub(crate) struct Config {
     /// from `ignoreDirectories` in `initializationOptions` and
     /// `workspace/didChangeConfiguration`.
     pub(crate) ignore_dir_patterns: Vec<String>,
+    /// Diagnostic codes (e.g. `CW100`) the user suppressed via `errors.ignore`
+    /// (`ignoredErrorCodes`). Stored lowercased; matched case-insensitively
+    /// against each diagnostic's code just before publishing.
+    pub(crate) ignored_error_codes: Vec<String>,
+    /// Rules-config directory loaded at `initialize` (the `rulesCache` init
+    /// option). Retained so the `reloadrulesconfig` command can re-read it.
+    pub(crate) rules_dir: Option<std::path::PathBuf>,
     pub(crate) scope_checks: bool,
     pub(crate) var_checks: bool,
 }
@@ -92,6 +99,8 @@ impl Config {
             loc_languages: None,
             ignore_file_patterns: Vec::new(),
             ignore_dir_patterns: Vec::new(),
+            ignored_error_codes: Vec::new(),
+            rules_dir: None,
             scope_checks,
             var_checks,
         }
@@ -208,6 +217,10 @@ struct DocumentState {
     /// (run through `change_scope`), alongside the ambient current scope. Off by
     /// default — the ambient scope is shown alone. (#37)
     hover_resolved_scope: std::sync::atomic::AtomicBool,
+    /// Whether the client advertised `hierarchicalDocumentSymbolSupport` at
+    /// initialize. When `true`, documentSymbol returns a nested `DocumentSymbol`
+    /// tree; otherwise it falls back to the flat `SymbolInformation` list.
+    hierarchical_symbols: std::sync::atomic::AtomicBool,
     /// `false` until the first full workspace scan has finished building the
     /// index. While `false`, per-file validation still parses and indexes, but
     /// suppresses published diagnostics (clears instead) so the user never sees
@@ -302,6 +315,7 @@ impl DocumentState {
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
             hover_resolved_scope: std::sync::atomic::AtomicBool::new(false),
+            hierarchical_symbols: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
@@ -1015,6 +1029,17 @@ impl LanguageServer for Backend {
         self.symbol_impl(params).await
     }
 
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        self.folding_range_impl(params).await
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        self.document_highlight_impl(params).await
+    }
+
     async fn prepare_rename(
         &self,
         params: TextDocumentPositionParams,
@@ -1186,7 +1211,8 @@ mod tests {
             panic!("expected TypeRule");
         };
 
-        let items = completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None);
+        let items =
+            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");

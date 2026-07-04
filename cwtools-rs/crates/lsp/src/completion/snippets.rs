@@ -72,10 +72,12 @@ pub(super) fn alias_completion_snippet(
 ) -> Option<String> {
     match rule {
         RuleType::NodeRule { rules, .. } => Some(generate_node_snippet(key, rules, ruleset)),
+        // Tab stop 1 (not 0) with a trailing `$0`: VS Code does not support a
+        // choice on the final `$0` tab stop and inserts `${0|a,b|}` literally.
         RuleType::LeafRule { right, .. } => Some(format!(
-            "{} = {}",
+            "{} = {}$0",
             key,
-            leaf_right_placeholder(right, 0, ruleset)
+            leaf_right_placeholder(right, 1, ruleset)
         )),
         _ => None,
     }
@@ -90,7 +92,7 @@ pub(crate) fn leaf_right_placeholder(right: &NewField, tab_stop: u32, ruleset: &
         NewField::ValueField(ValueType::Enum(e)) => {
             let vals = enum_values_for(ruleset, e);
             if !vals.is_empty() && vals.len() <= 20 {
-                format!("${{{}|{}|}}", tab_stop, vals.join(","))
+                format!("${{{}|{}|}}", tab_stop, choice_list(vals))
             } else {
                 format!("${{{}}}", tab_stop)
             }
@@ -99,5 +101,45 @@ pub(crate) fn leaf_right_placeholder(right: &NewField, tab_stop: u32, ruleset: &
         // directly so the snippet reads `my_se = yes` rather than `my_se = ${0}`.
         NewField::SpecificField(s) if !s.is_empty() => s.clone(),
         _ => format!("${{{}}}", tab_stop),
+    }
+}
+
+/// Build the comma-joined body of a `${n|...|}` choice from enum values: quote
+/// each value that needs it (whitespace / special chars), then escape the choice
+/// delimiters. Quoting first so the quoted string is the literal text to insert,
+/// then the delimiter escape keeps an embedded comma from splitting the choice.
+pub(super) fn choice_list(vals: &[String]) -> String {
+    vals.iter()
+        .map(|v| escape_choice(&quote_if_needed(v)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Backslash-escape the characters that are special inside a `${n|...|}` snippet
+/// choice (`\`, `,`, `|`, `}`). Backslash is handled by the loop itself, so it is
+/// escaped before the delimiters it might precede.
+pub(super) fn escape_choice(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | ',' | '|' | '}') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Wrap a value in double quotes when the raw token would not parse as a single
+/// bare value — i.e. it is empty or contains whitespace or a character outside
+/// the identifier-ish set. Conservative on purpose: bare-identifier enum values
+/// (the common case, and other games' enums) must stay unquoted.
+pub(super) fn quote_if_needed(v: &str) -> String {
+    let needs_quote = v.is_empty()
+        || v.chars()
+            .any(|c| !(c.is_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')));
+    if needs_quote {
+        format!("\"{}\"", v)
+    } else {
+        v.to_string()
     }
 }
