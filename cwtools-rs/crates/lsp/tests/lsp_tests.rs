@@ -3468,3 +3468,92 @@ fn perf_completion_md() {
         "expected at least one cwtools_completion summary line in stderr"
     );
 }
+
+#[test]
+fn test_rescan_prunes_deleted_file_from_index() {
+    // Definition file A holds scripted_effect my_se; caller B references it.
+    // A is deleted from disk (no watcher event — e.g. deleted while the server
+    // wasn't watching, or the file was never open) and a rescan is forced via
+    // `clearAllCaches`. The rescan re-indexes what's still on disk (just B) but
+    // must also PRUNE A's now-stale entries, or my_se keeps "resolving" forever
+    // and B's CW263 never comes back.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    let cache_dir = tempfile::tempdir().unwrap(); // isolate clearAllCaches from the real cache
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let a_rel = "common/scripted_effects/a.txt";
+    let a_path = ws.path().join(a_rel);
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, "my_se = { log = \"hi\" }\n").unwrap();
+
+    let b_rel = "common/decisions/b.txt";
+    let b_path = ws.path().join(b_rel);
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &b_path,
+        "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n",
+    )
+    .unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+                "cacheDir": cache_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    // Both files exist on disk for the initial scan, so my_se resolves.
+    let before = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics before delete");
+    assert!(
+        !before.contains(&"CW263".to_string()),
+        "expected my_se to resolve while A exists, got: {:?}",
+        before
+    );
+
+    // Delete the definition, then force a rescan (no file watcher in this test).
+    std::fs::remove_file(&a_path).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({"command": "clearAllCaches", "arguments": []}),
+        ),
+    )
+    .unwrap();
+
+    let after = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics after rescan");
+    child.kill().ok();
+    assert!(
+        after.contains(&"CW263".to_string()),
+        "deleting A should resurrect B's CW263 once the rescan prunes it, got: {:?}",
+        after
+    );
+}
