@@ -82,6 +82,7 @@ impl Backend {
         &self,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
+        self.mark_activity();
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
 

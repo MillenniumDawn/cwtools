@@ -157,15 +157,15 @@ impl Backend {
     /// panic inside the scan is handled separately by the watcher in
     /// `initialized`, which clears the bar too.
     ///
-    /// Re-entrancy guarded: the startup scan, `clearAllCaches`, and a future
-    /// periodic rescan can all land here, and two overlapping scans would race
-    /// each other's serial `info_service` writes. A losing caller skips the
-    /// scan entirely rather than blocking behind the running one — returns
-    /// `false` so a future caller can report that back instead of the scan
-    /// silently no-oping.
+    /// Re-entrancy guarded: the startup scan, `clearAllCaches`, `reindexWorkspace`,
+    /// and the periodic background pass can all land here, and two overlapping
+    /// scans would race each other's serial `info_service` writes. A losing
+    /// caller skips the scan entirely rather than blocking behind the running
+    /// one — returns `false` so a caller like the `reindexWorkspace` command
+    /// can report that back instead of the scan silently no-oping.
     ///
     /// `quiet` suppresses every `loadingBar` notification the scan would
-    /// otherwise send, for a future background pass that shouldn't flash the
+    /// otherwise send, so the periodic background pass doesn't flash the
     /// status bar while the user is working. `send_update_file_list` still
     /// fires either way — it's cheap and keeps the file explorer honest.
     pub(crate) async fn validate_entire_workspace(&self, quiet: bool) -> bool {
@@ -508,10 +508,10 @@ impl Backend {
         // On a quiet background pass, skip this ~2M-entry rebuild (the biggest
         // transient cost of a scan) when a stat-only signature over the same
         // files says nothing loc-related changed since the last scan. A
-        // foreground scan (startup, clearAllCaches) always rebuilds, so a
-        // user-triggered rescan never serves stale loc diagnostics — it just
-        // also records the signature for the next quiet pass to compare
-        // against.
+        // foreground scan (startup, clearAllCaches, reindexWorkspace) always
+        // rebuilds, so a user-triggered rescan never serves stale loc
+        // diagnostics — it just also records the signature for the next
+        // quiet pass to compare against.
         let loc_signature = tokio::task::block_in_place(|| self.compute_loc_signature(&root_path));
         let loc_unchanged = *self.state.last_loc_signature.lock() == Some(loc_signature);
         if quiet && loc_unchanged {
@@ -1218,6 +1218,103 @@ impl Backend {
             }
         }
     }
+
+    // ── Background reindex ──────────────────────────────────────────────
+
+    /// Record that the user just interacted with the editor (an edit or a
+    /// completion request), resetting the idle clock the background reindex
+    /// loop watches.
+    pub(crate) fn mark_activity(&self) {
+        let now_ms = self.state.start.elapsed().as_millis() as u64;
+        self.state.last_activity_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Whether a quiet background pass may run right now: the initial scan
+    /// has finished, no scan (foreground or background) is already running,
+    /// and the user has been idle for at least `idle_ms`.
+    pub(crate) fn should_run_background_pass(&self, idle_ms: u64) -> bool {
+        if !self.state.index_ready.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.state.scan_in_progress.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now_ms = self.state.start.elapsed().as_millis() as u64;
+        let last_activity_ms = self.state.last_activity_ms.load(Ordering::Relaxed);
+        is_idle(now_ms, last_activity_ms, idle_ms)
+    }
+
+    /// The configured background-reindex cadence in seconds. `0` means off.
+    /// `CWTOOLS_REINDEX_INTERVAL_SECS` overrides the config value entirely
+    /// when set (including to re-enable a disabled config), so tests don't
+    /// have to wait out a real 30-minute default.
+    fn effective_reindex_interval_secs(&self) -> u64 {
+        if let Ok(v) = std::env::var("CWTOOLS_REINDEX_INTERVAL_SECS") {
+            return v.parse().unwrap_or(0);
+        }
+        self.state.config.read().background_reindex_interval_minutes * 60
+    }
+
+    /// How long the user must be idle before a background pass runs, in
+    /// milliseconds. `CWTOOLS_REINDEX_IDLE_SECS` overrides the default of 15s
+    /// (for tests).
+    fn reindex_idle_ms() -> u64 {
+        let secs = std::env::var("CWTOOLS_REINDEX_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15);
+        secs * 1000
+    }
+
+    /// Periodic quiet re-scan so a long-running session doesn't accumulate
+    /// stale index state (deleted-file entries missed by the watcher, a
+    /// settings change that only takes effect on the next scan, …). Spawned
+    /// once from `initialized` alongside the startup scan; runs for the life
+    /// of the server.
+    ///
+    /// Each cycle re-reads the effective interval so toggling the setting (or
+    /// the env override, in tests) live takes effect without a restart: 0
+    /// means disabled, and the loop just polls every 60s waiting for it to
+    /// become positive. Once enabled, it sleeps out the interval, then waits
+    /// for the user to go idle — checking on each idle-window tick whether
+    /// background reindex got disabled in the meantime — before running a
+    /// quiet `validate_entire_workspace`. Never unwraps: a malformed env var
+    /// degrades to "disabled"/"default", it doesn't panic the loop.
+    pub(crate) async fn background_reindex_loop(&self) {
+        loop {
+            let interval_secs = self.effective_reindex_interval_secs();
+            if interval_secs == 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+
+            let idle_ms = Self::reindex_idle_ms();
+            loop {
+                if self.effective_reindex_interval_secs() == 0 {
+                    // Disabled while we were waiting for the interval or for
+                    // the user to go idle; the outer loop will pick that up
+                    // and fall back to polling.
+                    break;
+                }
+                if self.should_run_background_pass(idle_ms) {
+                    self.validate_entire_workspace(true).await;
+                    break;
+                }
+                // Not idle yet — slip forward and check again rather than
+                // skipping the whole interval.
+                tokio::time::sleep(std::time::Duration::from_millis(idle_ms.max(50))).await;
+            }
+        }
+    }
+}
+
+/// Whether at least `idle_ms` have passed since `last_activity_ms`, both
+/// measured in milliseconds on the same monotonic clock (`DocumentState::start`).
+/// Saturating so a `last_activity_ms` briefly ahead of `now_ms` (there is no
+/// such clock, but defend anyway) reads as "not idle" instead of wrapping.
+pub(crate) fn is_idle(now_ms: u64, last_activity_ms: u64, idle_ms: u64) -> bool {
+    now_ms.saturating_sub(last_activity_ms) >= idle_ms
 }
 
 /// Fold a stat-only signature (path, size, mtime) over `files` into one
@@ -1254,6 +1351,43 @@ mod tests {
     fn test_discover_vanilla_dir_unknown_game_is_none() {
         assert!(discover_vanilla_dir("not_a_real_game").is_none());
         assert!(discover_vanilla_dir("").is_none());
+    }
+
+    // ── is_idle (background reindex gating) ────────────────────────────────
+
+    #[test]
+    fn test_is_idle_below_threshold_is_false() {
+        // 4999ms since last activity, 5000ms required — not idle yet.
+        assert!(!is_idle(5_000, 1, 5_000));
+    }
+
+    #[test]
+    fn test_is_idle_at_exact_threshold_is_true() {
+        // Exactly `idle_ms` elapsed counts as idle (>=, not >).
+        assert!(is_idle(6_000, 1_000, 5_000));
+    }
+
+    #[test]
+    fn test_is_idle_past_threshold_is_true() {
+        assert!(is_idle(10_000, 1_000, 5_000));
+    }
+
+    #[test]
+    fn test_is_idle_zero_threshold_is_always_true() {
+        // idle_ms = 0 means "never wait" — used by the e2e test to trigger
+        // the background pass immediately once the interval elapses.
+        assert!(is_idle(0, 0, 0));
+        assert!(is_idle(12_345, 12_345, 0));
+    }
+
+    #[test]
+    fn test_is_idle_last_activity_ahead_of_now_is_false() {
+        // Should never happen (last_activity_ms is derived from the same
+        // monotonic clock as now_ms), but the saturating subtraction must
+        // not wrap into "always idle" if it somehow does.
+        assert!(!is_idle(100, 200, 1));
+        // ...unless idle_ms is 0, where "no wait required" still holds.
+        assert!(is_idle(100, 200, 0));
     }
 
     // ── loc_signature_for (quiet-scan loc-rebuild skip) ─────────────────────
