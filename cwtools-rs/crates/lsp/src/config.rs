@@ -486,7 +486,7 @@ impl Backend {
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
-                self.validate_entire_workspace().await;
+                self.validate_entire_workspace(false).await;
                 let msg = if failures.is_empty() {
                     "Caches cleared; workspace re-indexed.".to_string()
                 } else {

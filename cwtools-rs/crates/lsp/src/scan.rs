@@ -159,8 +159,15 @@ impl Backend {
     /// Re-entrancy guarded: the startup scan, `clearAllCaches`, and a future
     /// periodic rescan can all land here, and two overlapping scans would race
     /// each other's serial `info_service` writes. A losing caller skips the
-    /// scan entirely rather than blocking behind the running one.
-    pub(crate) async fn validate_entire_workspace(&self) {
+    /// scan entirely rather than blocking behind the running one — returns
+    /// `false` so a future caller can report that back instead of the scan
+    /// silently no-oping.
+    ///
+    /// `quiet` suppresses every `loadingBar` notification the scan would
+    /// otherwise send, for a future background pass that shouldn't flash the
+    /// status bar while the user is working. `send_update_file_list` still
+    /// fires either way — it's cheap and keeps the file explorer honest.
+    pub(crate) async fn validate_entire_workspace(&self, quiet: bool) -> bool {
         if self
             .state
             .scan_in_progress
@@ -168,18 +175,23 @@ impl Backend {
             .is_err()
         {
             tracing::debug!("workspace scan already in progress; skipping");
-            return;
+            return false;
         }
         let _guard = ScanGuard(&self.state.scan_in_progress);
-        self.validate_entire_workspace_inner().await;
-        self.send_loading_bar(false, "").await;
+        self.validate_entire_workspace_inner(quiet).await;
+        if !quiet {
+            self.send_loading_bar(false, "").await;
+        }
+        true
     }
 
     /// Scan the entire workspace for relevant game files and validate them all.
     #[tracing::instrument(skip_all)]
-    async fn validate_entire_workspace_inner(&self) {
+    async fn validate_entire_workspace_inner(&self, quiet: bool) {
         cwtools_profiling::log_rss("workspace_scan_start");
-        self.send_loading_bar(true, "Indexing workspace…").await;
+        if !quiet {
+            self.send_loading_bar(true, "Indexing workspace…").await;
+        }
 
         let workspace_uri = self.state.config.read().workspace_uri.clone();
 
@@ -299,7 +311,9 @@ impl Backend {
         // persist for the next scan. The disk cache speeds the cold→warm scan
         // across restarts; keeping the AST resident avoids a pass-2 re-parse
         // within a single scan.
-        self.send_loading_bar(true, "Indexing workspace…").await;
+        if !quiet {
+            self.send_loading_bar(true, "Indexing workspace…").await;
+        }
         // Snapshot the set of currently-open document URIs so both passes can
         // skip them: open docs were already indexed by did_open/did_change and
         // their fresher in-memory diagnostics must not be clobbered by stale
@@ -369,7 +383,7 @@ impl Backend {
         // Serial index phase, in file order.
         let mut parsed_files: Vec<Option<cwtools_parser::ast::ParsedFile>> =
             Vec::with_capacity(files_to_validate.len());
-        for (file_path, outcome) in files_to_validate.iter().zip(outcomes) {
+        for (i, (file_path, outcome)) in files_to_validate.iter().zip(outcomes).enumerate() {
             let parsed = match outcome {
                 Some((cache_hit, parsed)) => {
                     let uri = path_to_uri(file_path);
@@ -384,6 +398,13 @@ impl Backend {
                 None => None,
             };
             parsed_files.push(parsed);
+            // A quiet background pass shares the runtime with live requests
+            // (hover, completion, did_change); yield periodically through this
+            // serial loop so it doesn't hog a worker thread for the whole
+            // index phase. Mirrors pass 2's yield-every-50 below.
+            if quiet && i % 64 == 63 {
+                tokio::task::yield_now().await;
+            }
         }
 
         self.client
@@ -500,7 +521,9 @@ impl Backend {
         // open (populated by did_open) — the scan used to insert every
         // workspace file there, pinning all texts+ASTs in memory for the
         // whole session.
-        self.send_loading_bar(true, "Validating workspace…").await;
+        if !quiet {
+            self.send_loading_bar(true, "Validating workspace…").await;
+        }
         let mut total_errors = 0usize;
         let total_files = files_to_validate.len();
         // Build the scope registry + enum_map ONCE for the whole scan instead of

@@ -806,7 +806,7 @@ impl LanguageServer for Backend {
         let watch_client = self.client.clone();
         let handle = tokio::spawn(async move {
             let backend = Backend { client, state };
-            backend.validate_entire_workspace().await;
+            backend.validate_entire_workspace(false).await;
         });
         // Log if the workspace scan panics — without this, a panic is silently
         // swallowed (the JoinHandle is dropped) and the server runs in a
