@@ -158,6 +158,25 @@ pub(crate) fn current_token_range(
     }
 }
 
+/// The text of the token between `start_char` (typically
+/// `current_token_range`'s start) and the cursor column `char0` — what the
+/// user has actually typed of the current token so far. Deliberately keyed
+/// off `char0`, not a range end: the token may extend past the cursor in a
+/// mid-word edit, and filtering completions against characters the user
+/// hasn't typed yet would hide items they could still reach. `line0`/`char0`
+/// are LSP 0-based.
+pub(crate) fn current_token_text(text: &str, line0: u32, char0: u32, start_char: u32) -> String {
+    let line = text.lines().nth(line0 as usize).unwrap_or("");
+    let chars: Vec<char> = line.chars().collect();
+    let start = (start_char as usize).min(chars.len());
+    let end = (char0 as usize).min(chars.len());
+    if start >= end {
+        String::new()
+    } else {
+        chars[start..end].iter().collect()
+    }
+}
+
 /// Whether a URI is a localisation file (`.yml` / `.yaml` / `.csv`), where
 /// `$KEY$` references resolve to other loc entries rather than to game-script
 /// rules. One predicate so hover/goto, completion, and validate agree on what
@@ -465,6 +484,21 @@ mod tests {
             "value = event_target:".chars().count() as u32,
             "`:` is a boundary; token is `foo`"
         );
+    }
+
+    #[test]
+    fn test_current_token_text() {
+        // Half-typed token: only the characters left of the cursor count, not
+        // the rest of the identifier if the cursor sits mid-word.
+        let line = "\tset_variable = { gdpc_conv }";
+        let start = "\tset_variable = { ".chars().count() as u32;
+        let mid = "\tset_variable = { gdpc".chars().count() as u32;
+        assert_eq!(current_token_text(line, 0, mid, start), "gdpc");
+
+        // Empty range (cursor right after `= `) → empty token.
+        let line2 = "\tvar = ";
+        let cur2 = line2.chars().count() as u32;
+        assert_eq!(current_token_text(line2, 0, cur2, cur2), "");
     }
 
     #[test]

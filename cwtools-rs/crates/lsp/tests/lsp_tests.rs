@@ -373,11 +373,14 @@ fn test_completion_on_blank_line_after_field() {
 }
 
 #[test]
-fn test_completion_response_marks_incomplete() {
-    // Context-aware completions must be flagged `is_incomplete` so the client
-    // re-queries on every keystroke. Without it, VS Code caches the list and
-    // filters client-side — the "popup sticks on a half-typed prefix"
-    // symptom when the user returns to a file with stale context.
+fn test_small_context_completion_is_complete() {
+    // Strategy A (perf/completion-responsiveness): a resolved-context list at
+    // or under CONTEXT_COMPLETE_THRESHOLD is returned unfiltered and marked
+    // `is_incomplete: false` — small enough that VS Code filters and
+    // re-filters it client-side for free as the user keeps typing, with zero
+    // further requests until a word boundary or trigger char forces a
+    // re-query. (Large/filtered/fallback lists still must stay
+    // `is_incomplete: true` — see test_completion_in_half_typed_state.)
     let resp = completion_response(
         "common/decisions/test.txt",
         "my_decision = {\n    cost = 5\n}\n",
@@ -389,8 +392,8 @@ fn test_completion_response_marks_incomplete() {
         .or_else(|| resp["result"]["is_incomplete"].as_bool());
     assert_eq!(
         is_incomplete,
-        Some(true),
-        "context-aware completion must be marked is_incomplete, got: {}",
+        Some(false),
+        "a small resolved-context list must be marked complete, got: {}",
         resp
     );
 }
@@ -3186,8 +3189,8 @@ fn perf_completion_md() {
     let summaries: Vec<_> = lines.iter().filter_map(|l| perf_parse_summary(l)).collect();
 
     println!(
-        "\n{:<22} {:<6} {:>10} {:>10} {:>7} {:<10}",
-        "position", "pass", "total_us", "build_us", "items", "path"
+        "\n{:<22} {:<6} {:>10} {:>10} {:>7} {:<10} {:<10} {:<10}",
+        "position", "pass", "total_us", "build_us", "items", "path", "strategy", "incomplete"
     );
     let labels: Vec<&str> = positions.iter().map(|(_, _, _, label)| *label).collect();
     let passes = ["cold", "warm"];
@@ -3197,13 +3200,15 @@ fn perf_completion_md() {
         let label = labels.get(i / 2).copied().unwrap_or("?");
         let pass = passes.get(i % 2).copied().unwrap_or("?");
         println!(
-            "{:<22} {:<6} {:>10} {:>10} {:>7} {:<10}",
+            "{:<22} {:<6} {:>10} {:>10} {:>7} {:<10} {:<10} {:<10}",
             label,
             pass,
             summary.get("total_us").map(String::as_str).unwrap_or("?"),
             summary.get("build_us").map(String::as_str).unwrap_or("?"),
             summary.get("items").map(String::as_str).unwrap_or("?"),
             summary.get("path").map(String::as_str).unwrap_or("?"),
+            summary.get("strategy").map(String::as_str).unwrap_or("?"),
+            summary.get("incomplete").map(String::as_str).unwrap_or("?"),
         );
     }
     assert!(
