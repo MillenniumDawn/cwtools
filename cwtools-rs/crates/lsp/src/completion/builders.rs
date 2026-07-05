@@ -56,6 +56,7 @@ impl ScopeRank {
 /// Build context-aware completion items from the child rules at the cursor's
 /// position (the rules come from `position::rules_at_pos`, which resolves
 /// aliases, typed keys, and subtypes the same way validation does).
+#[tracing::instrument(skip_all, fields(rules = rules.len()))]
 pub(crate) fn completions_from_rules(
     rules: &[(RuleType, cwtools_rules::rules_types::Options)],
     ruleset: &RuleSet,
@@ -355,6 +356,7 @@ enum TypeInstanceStyle {
 /// Emit one completion item per known instance of `t`. Shared by the typed-key
 /// arms (which complete to `name = …` snippets) and the bare type-reference
 /// value arm (which offers the instance name directly).
+#[tracing::instrument(skip_all, fields(type_name = %t))]
 fn push_type_instances(
     items: &mut Vec<CompletionItem>,
     info: &InfoService,
@@ -759,6 +761,7 @@ fn all_enum_values_cached<'c>(
 /// rules' right-hand sides accept. `value_rules` comes from
 /// `position::rules_at_pos` (alias usages already expanded to their overloads,
 /// so `has_completed_focus = |` arrives here as a `TypeField("focus")` rule).
+#[tracing::instrument(skip_all, fields(value_rules = value_rules.len()))]
 pub(crate) fn value_completions(
     value_rules: &[(RuleType, cwtools_rules::rules_types::Options)],
     ruleset: &RuleSet,
@@ -957,6 +960,7 @@ pub(crate) fn value_completions(
 /// matching type.  Mirrors F# rootTypeItems:1077-1097: uses typeKeyFilter keys
 /// as the block opener if set, otherwise the type name itself; also adds
 /// subtype.typeKeyField alternatives.
+#[tracing::instrument(skip_all, fields(logical_path = %logical_path))]
 pub(crate) fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 

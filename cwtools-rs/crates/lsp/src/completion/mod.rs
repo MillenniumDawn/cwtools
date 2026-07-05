@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -77,16 +78,62 @@ type RulesSnapshot = (
     Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>,
 );
 
+/// One line per completion request on `target: "cwtools_completion"`, emitted
+/// before every return path. Cheap when the level is disabled — tracing
+/// checks that before formatting the fields — so it stays on unconditionally.
+fn log_completion_summary(
+    total: Duration,
+    ast: Duration,
+    rules: Duration,
+    build: Duration,
+    items: usize,
+    incomplete: bool,
+    path: &str,
+) {
+    tracing::info!(
+        target: "cwtools_completion",
+        total_us = total.as_micros() as u64,
+        ast_us = ast.as_micros() as u64,
+        rules_us = rules.as_micros() as u64,
+        build_us = build.as_micros() as u64,
+        items,
+        incomplete,
+        path,
+    );
+}
+
 impl Backend {
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            uri = %params.text_document_position.text_document.uri,
+            line = params.text_document_position.position.line,
+            col = params.text_document_position.position.character,
+        )
+    )]
     pub(crate) async fn completion_impl(
         &self,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
+        let t_start = Instant::now();
+        let mut ast_dur = Duration::ZERO;
+        let mut rules_dur = Duration::ZERO;
+        let mut build_dur = Duration::ZERO;
+
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
 
         // `.cwt` rule files aren't game content — no rule-driven completion. (#43)
         if crate::paths::is_cwt_file(&uri) {
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                0,
+                false,
+                "none",
+            );
             return Ok(None);
         }
 
@@ -105,6 +152,15 @@ impl Backend {
         let is_stale =
             || self.state.completion_generation.lock().get(&uri).copied() > Some(my_generation);
         if is_stale() {
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                0,
+                false,
+                "none",
+            );
             return Ok(None);
         }
 
@@ -154,6 +210,15 @@ impl Backend {
         // check here too — the rule-snapshot block is cheap, but we want the
         // staleness gate to cover the full body of the function from here.
         if is_stale() {
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                0,
+                false,
+                "none",
+            );
             return Ok(None);
         }
 
@@ -174,6 +239,15 @@ impl Backend {
             {
                 let items = (*cached.items).clone();
                 if !items.is_empty() {
+                    log_completion_summary(
+                        t_start.elapsed(),
+                        ast_dur,
+                        rules_dur,
+                        build_dur,
+                        items.len(),
+                        true,
+                        "loc",
+                    );
                     return Ok(Some(CompletionResponse::List(CompletionList {
                         is_incomplete: true,
                         items,
@@ -181,13 +255,24 @@ impl Backend {
                 }
             } else {
                 let info_guard = self.state.info_service.read();
+                let t_build = Instant::now();
                 let items = loc_completions(&info_guard, &language, scope_registry_arc.as_deref());
+                build_dur = t_build.elapsed();
                 if !items.is_empty() {
                     *self.state.loc_cache.lock() = Some(CompletionCacheEntry {
                         revision,
                         language: language.clone(),
                         items: std::sync::Arc::new(items.clone()),
                     });
+                    log_completion_summary(
+                        t_start.elapsed(),
+                        ast_dur,
+                        rules_dur,
+                        build_dur,
+                        items.len(),
+                        true,
+                        "loc",
+                    );
                     return Ok(Some(CompletionResponse::List(CompletionList {
                         is_incomplete: true,
                         items,
@@ -210,11 +295,22 @@ impl Backend {
         // the flat variable dump below must NOT stand in for it — that dump is
         // the #74/#75/#79 bug. Key positions and unresolved contexts keep the
         // bool false so the fallback still fires for them.
+        let t_ast = Instant::now();
         let effective_ast: Option<Arc<ParsedFile>> = self.ast_for(&uri);
+        ast_dur = t_ast.elapsed();
         let context_items: Option<(Vec<CompletionItem>, bool)> =
             match (effective_ast, ruleset_arc.as_ref()) {
                 (Some(ast), Some(rs)) => {
                     if is_stale() {
+                        log_completion_summary(
+                            t_start.elapsed(),
+                            ast_dur,
+                            rules_dur,
+                            build_dur,
+                            0,
+                            false,
+                            "none",
+                        );
                         return Ok(None);
                     }
                     let info_guard = self.state.info_service.read();
@@ -231,7 +327,11 @@ impl Backend {
                         scope_checks,
                         var_checks,
                     );
-                    match rules_at_pos(&ast, &logical_path, &prepared, lsp_line, lsp_col) {
+                    let t_rules = Instant::now();
+                    let rctx_opt = rules_at_pos(&ast, &logical_path, &prepared, lsp_line, lsp_col);
+                    rules_dur = t_rules.elapsed();
+                    let t_build = Instant::now();
+                    let items = match rctx_opt {
                         // Outside any known entity — offer root-type snippets.
                         None => Some((root_type_snippets(rs, &logical_path), false)),
                         Some(rctx) => {
@@ -304,7 +404,9 @@ impl Backend {
                                 };
                             Some((items, resolved_value_pos))
                         }
-                    }
+                    };
+                    build_dur = t_build.elapsed();
+                    items
                 }
                 _ => None,
             };
@@ -318,6 +420,15 @@ impl Backend {
                 // block, a recovered parse) and the cached list stays stuck on
                 // the wrong context. The re-query is cheap: the server returns
                 // the same items for a stable cursor.
+                log_completion_summary(
+                    t_start.elapsed(),
+                    ast_dur,
+                    rules_dur,
+                    build_dur,
+                    items.len(),
+                    true,
+                    "context",
+                );
                 return Ok(Some(CompletionResponse::List(CompletionList {
                     is_incomplete: true,
                     items,
@@ -327,6 +438,15 @@ impl Backend {
             // (empty dynamic set, or a value type with no enumerable members):
             // return no completions rather than the flat variable dump.
             if resolved_value_pos {
+                log_completion_summary(
+                    t_start.elapsed(),
+                    ast_dur,
+                    rules_dur,
+                    build_dur,
+                    0,
+                    false,
+                    "none",
+                );
                 return Ok(None);
             }
         }
@@ -354,6 +474,15 @@ impl Backend {
             let mut items = (*cached.items).clone();
             if !items.is_empty() {
                 anchor_items(&mut items, replace_range);
+                log_completion_summary(
+                    t_start.elapsed(),
+                    ast_dur,
+                    rules_dur,
+                    build_dur,
+                    items.len(),
+                    true,
+                    "fallback",
+                );
                 return Ok(Some(CompletionResponse::List(CompletionList {
                     is_incomplete: true,
                     items,
@@ -372,6 +501,7 @@ impl Backend {
         const FALLBACK_CAP: usize = 2000;
         let mut items = Vec::new();
 
+        let t_fallback_build = Instant::now();
         let info = self.state.info_service.read();
         for var in info.variable_counts.keys() {
             if items.len() >= FALLBACK_CAP {
@@ -398,8 +528,18 @@ impl Backend {
                 ..Default::default()
             });
         }
+        build_dur += t_fallback_build.elapsed();
 
         if items.is_empty() {
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                0,
+                false,
+                "none",
+            );
             Ok(None)
         } else {
             // Always flag the fallback `is_incomplete` so the client re-requests
@@ -417,6 +557,15 @@ impl Backend {
                 items: std::sync::Arc::new(items.clone()),
             });
             anchor_items(&mut items, replace_range);
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                items.len(),
+                true,
+                "fallback",
+            );
             Ok(Some(CompletionResponse::List(CompletionList {
                 is_incomplete: true,
                 items,
