@@ -251,6 +251,7 @@ mio = {
     }
 }
 alias[trigger:has_completed_focus] = <focus>
+### Always evaluates to true.
 alias[trigger:always] = bool
 alias[effect:add_political_power] = int
 modifiers = {
@@ -354,6 +355,132 @@ fn test_completion_trigger_alias_in_allowed_block() {
         !labels.iter().any(|l| l == "cost"),
         "out-of-context field `cost` should not appear inside allowed, got: {:?}",
         labels
+    );
+}
+
+/// Send a `completionItem/resolve` request for `item` over an already-running
+/// session and return the resolved `CompletionItem` JSON. Mirrors the shape of
+/// `jsonrpc_request`/`write_frame`/`read_response` used by the completion
+/// helpers above — `completionItem/resolve`'s params ARE the completion item
+/// itself (no wrapper), per the LSP spec.
+fn resolve_request(
+    child: &mut std::process::Child,
+    reader: &mut BufReader<std::process::ChildStdout>,
+    id: i64,
+    item: serde_json::Value,
+) -> serde_json::Value {
+    let body = jsonrpc_request(id, "completionItem/resolve", item);
+    write_frame(child, &body).unwrap();
+    let resp_str = read_response(reader).expect("no resolve response");
+    serde_json::from_str(&resp_str).unwrap()
+}
+
+#[test]
+fn test_completion_resolve_fills_alias_documentation() {
+    // perf/completion-responsiveness: the `### docs` comment on an alias is
+    // deferred out of the initial completion response (payload shrink) and
+    // recomputed by `completionItem/resolve` — see `completion::resolve`.
+    // `always` carries a `### Always evaluates to true.` doc in COMPLETION_RULES.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), COMPLETION_RULES).unwrap();
+    let rel_path = "common/decisions/test.txt";
+    let text = "my_decision = {\n    allowed = {\n        \n    }\n    cost = 5\n}\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let init_resp = read_response(&mut reader).expect("no init response");
+    // The server must advertise resolve support so the client knows to call
+    // completionItem/resolve at all.
+    let init: serde_json::Value = serde_json::from_str(&init_resp).unwrap();
+    assert_eq!(
+        init["result"]["capabilities"]["completionProvider"]["resolveProvider"], true,
+        "server must advertise completion resolveProvider, got: {}",
+        init_resp
+    );
+
+    let body = jsonrpc_notification(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": doc_uri,
+                "languageId": "hoi4",
+                "version": 1,
+                "text": text,
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    wait_for_diagnostics(&mut reader, rel_path);
+
+    let body = jsonrpc_request(
+        2,
+        "textDocument/completion",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            // Blank line inside `allowed = { ... }` (line 2, col 8).
+            "position": { "line": 2, "character": 8 },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let resp_str = read_response(&mut reader).expect("no completion response");
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    let items = resp["result"]["items"]
+        .as_array()
+        .or_else(|| resp["result"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let always = items
+        .iter()
+        .find(|i| i["label"] == "always")
+        .unwrap_or_else(|| panic!("`always` not offered, got: {}", resp_str));
+    // The initial response must NOT carry the deferred documentation — this
+    // is the payload shrink the deferral exists for.
+    assert!(
+        always.get("documentation").is_none() || always["documentation"].is_null(),
+        "documentation must be deferred out of the initial response, got: {}",
+        always
+    );
+    assert!(
+        !always["data"].is_null(),
+        "a deferred item must carry `data` for resolve to key off, got: {}",
+        always
+    );
+
+    let resolved = resolve_request(&mut child, &mut reader, 3, always.clone());
+    child.kill().ok();
+    let doc = &resolved["result"]["documentation"];
+    let doc_text = doc.as_str().or_else(|| doc["value"].as_str());
+    assert_eq!(
+        doc_text,
+        Some("Always evaluates to true."),
+        "resolve should repopulate the alias's ### doc, got: {}",
+        resolved
     );
 }
 
@@ -3099,7 +3226,7 @@ fn perf_completion_md() {
 
     // (relative path, 0-based line, 0-based char, label) — see the branch
     // description for how each position was picked against a real MD file.
-    let positions: [(&str, u32, u32, &str); 3] = [
+    let positions: [(&str, u32, u32, &str); 4] = [
         // Inside a small focus's block: cursor on the `cost` key column, a
         // sibling-key context resolving through `completions_from_rules`.
         (
@@ -3126,9 +3253,30 @@ fn perf_completion_md() {
             0,
             "flat-fallback",
         ),
+        // `add_dynamic_modifier` key inside `completion_reward = { ... }`: an
+        // effect-alias key context resolving through `completions_from_rules`
+        // (the `alias/effect/trigger ### docs` category). At MD's scale this
+        // list is dominated by `<scripted_effect>` pattern-expanded instances
+        // (thousands of them, never carrying docs either way) once capped/
+        // sorted to CONTEXT_CAP, so `bytes` here doesn't move — the doc
+        // deferral's payload win shows up whenever the returned list is
+        // mostly genuinely-named aliases instead (see the branch description
+        // for the controlled measurement against cwtools-hoi4-config's docs).
+        (
+            "common/national_focus/03_benelux_shared.txt",
+            23,
+            2,
+            "effect-alias (key)",
+        ),
     ];
 
     let mut next_id = 10i64;
+    // Serialized response size per request, in request order (1:1 with the
+    // `cwtools_completion` summaries collected below) — the payload-shrink
+    // half of the completionItem/resolve deferral isn't visible in
+    // total_us/build_us (the docs were strings, not compute), so measure it
+    // directly.
+    let mut response_bytes: Vec<usize> = Vec::new();
     for (rel_path, line0, char0, label) in positions {
         let file_path = mod_path.join(rel_path);
         if !file_path.is_file() {
@@ -3171,6 +3319,7 @@ fn perf_completion_md() {
             );
             write_frame(&mut child, &body).unwrap();
             let resp_str = read_response(&mut reader).expect("no completion response");
+            response_bytes.push(resp_str.len());
             let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
             assert_eq!(resp["id"], id, "{} {} got: {}", label, pass_label, resp_str);
         }
@@ -3189,8 +3338,16 @@ fn perf_completion_md() {
     let summaries: Vec<_> = lines.iter().filter_map(|l| perf_parse_summary(l)).collect();
 
     println!(
-        "\n{:<22} {:<6} {:>10} {:>10} {:>7} {:<10} {:<10} {:<10}",
-        "position", "pass", "total_us", "build_us", "items", "path", "strategy", "incomplete"
+        "\n{:<22} {:<6} {:>10} {:>10} {:>7} {:>9} {:<10} {:<10} {:<10}",
+        "position",
+        "pass",
+        "total_us",
+        "build_us",
+        "items",
+        "bytes",
+        "path",
+        "strategy",
+        "incomplete"
     );
     let labels: Vec<&str> = positions.iter().map(|(_, _, _, label)| *label).collect();
     let passes = ["cold", "warm"];
@@ -3199,13 +3356,18 @@ fn perf_completion_md() {
     for (i, summary) in summaries.iter().enumerate() {
         let label = labels.get(i / 2).copied().unwrap_or("?");
         let pass = passes.get(i % 2).copied().unwrap_or("?");
+        let bytes = response_bytes
+            .get(i)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "?".to_string());
         println!(
-            "{:<22} {:<6} {:>10} {:>10} {:>7} {:<10} {:<10} {:<10}",
+            "{:<22} {:<6} {:>10} {:>10} {:>7} {:>9} {:<10} {:<10} {:<10}",
             label,
             pass,
             summary.get("total_us").map(String::as_str).unwrap_or("?"),
             summary.get("build_us").map(String::as_str).unwrap_or("?"),
             summary.get("items").map(String::as_str).unwrap_or("?"),
+            bytes,
             summary.get("path").map(String::as_str).unwrap_or("?"),
             summary.get("strategy").map(String::as_str).unwrap_or("?"),
             summary.get("incomplete").map(String::as_str).unwrap_or("?"),

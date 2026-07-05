@@ -1009,6 +1009,10 @@ impl LanguageServer for Backend {
         self.completion_impl(params).await
     }
 
+    async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
+        Ok(self.completion_resolve_impl(item))
+    }
+
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,

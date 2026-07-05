@@ -16,6 +16,7 @@ use crate::paths::{
 };
 
 mod builders;
+mod resolve;
 mod scope_names;
 mod snippets;
 

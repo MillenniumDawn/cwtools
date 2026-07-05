@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use serde_json::Value;
 use tower_lsp::lsp_types::*;
 
 use cwtools_game::scope_engine::{SCOPE_ANY, ScopeId};
@@ -49,6 +50,78 @@ impl ScopeRank {
             ScopeRank::SpecificMatch => Some(format!("0_{}", label)),
             ScopeRank::Neutral => sort_for_kind(kind, label),
             ScopeRank::Mismatch => Some(format!("z_{}", label)),
+        }
+    }
+}
+
+/// Self-describing payload stamped as a completion item's `data` when its
+/// `documentation`/`detail` is deferred to `completionItem/resolve` (see
+/// `completion::resolve`) instead of computed here. Carries only what's
+/// needed to recompute the doc text from current server state — never the
+/// doc text itself, or deferring it would buy nothing.
+///
+/// Encoded as a single colon-delimited string, not a JSON object: this is
+/// repeated once per item in a list that can run into the thousands, and a
+/// `{"k":...}` object's brace/key/quote overhead is bigger than most of the
+/// `detail` strings it would replace — measured against the real MD-scale
+/// perf fixture, the object form was a net payload *increase* for the
+/// type/enum categories. A bare string avoids that: `type`/`enum` items
+/// don't even repeat the instance name/value, since it's already the item's
+/// own `label` (see `resolve::resolve_item`).
+///
+/// Covers the categories whose per-item doc/detail cost is large enough
+/// across a full list to matter: alias/effect/trigger/modifier-alias
+/// keywords (`### docs`, arbitrarily long — only stamped when at least one
+/// overload actually has one, see `alias_has_description`), `<type>`
+/// instances, and enum members. Concrete leaf/node key descriptions stay
+/// eager — they come from the position-resolved rule, not a
+/// name-addressable index, so there's no stable key to resolve them by
+/// later — and so do the one-word static details (`"bool"`, `"scope"`, …),
+/// which cost nothing to keep inline.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ResolveData {
+    /// `alias:<cat>:<name>` — an alias/effect/trigger/modifier-alias keyword,
+    /// `name` being the key with the category prefix stripped (matches the
+    /// label `push_alias_keys` built).
+    Alias { cat: String, name: String },
+    /// `type:<t>` — a `<type>` instance; the instance name is the item's `label`.
+    Type { t: String },
+    /// `enum:<id>` — an enum member; the value is the item's `label`.
+    Enum { id: String },
+}
+
+impl ResolveData {
+    /// Encode into the `CompletionItem::data` slot.
+    fn into_value(self) -> Option<Value> {
+        let s = match self {
+            ResolveData::Alias { cat, name } => format!("alias:{cat}:{name}"),
+            ResolveData::Type { t } => format!("type:{t}"),
+            ResolveData::Enum { id } => format!("enum:{id}"),
+        };
+        Some(Value::String(s))
+    }
+
+    /// Decode a `data` string built by `into_value`. `None` for anything
+    /// that doesn't match one of the three known shapes (an item this server
+    /// never deferred, or a future/foreign `data` value) — resolve treats
+    /// that as "nothing to add", never an error.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        let (kind, rest) = s.split_once(':')?;
+        match kind {
+            "alias" => {
+                let (cat, name) = rest.split_once(':')?;
+                Some(ResolveData::Alias {
+                    cat: cat.to_string(),
+                    name: name.to_string(),
+                })
+            }
+            "type" => Some(ResolveData::Type {
+                t: rest.to_string(),
+            }),
+            "enum" => Some(ResolveData::Enum {
+                id: rest.to_string(),
+            }),
+            _ => None,
         }
     }
 }
@@ -291,7 +364,8 @@ fn push_enum_keyed_leaf(
         items.push(CompletionItem {
             label: v.clone(),
             kind: Some(CompletionItemKind::FIELD),
-            detail: Some(format!("enum {}", e)),
+            // `detail` ("enum {e}") deferred to resolve — see push_type_instances.
+            data: ResolveData::Enum { id: e.to_string() }.into_value(),
             insert_text: Some(format!("{} = {}", v, snippet_value)),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
             sort_text: sort_for_kind(Some(CompletionItemKind::FIELD), v),
@@ -313,7 +387,7 @@ fn push_enum_keyed_node(
         items.push(CompletionItem {
             label: v.clone(),
             kind: Some(CompletionItemKind::STRUCT),
-            detail: Some(format!("enum {}", e)),
+            data: ResolveData::Enum { id: e.to_string() }.into_value(),
             insert_text: Some(format!("{} = {{\n\t$0\n}}", v)),
             insert_text_format: Some(InsertTextFormat::SNIPPET),
             sort_text: sort_for_kind(Some(CompletionItemKind::STRUCT), v),
@@ -335,7 +409,7 @@ fn push_enum_leaf_values(
         items.push(CompletionItem {
             label: v.clone(),
             kind: Some(CompletionItemKind::ENUM_MEMBER),
-            detail: Some(format!("enum {}", e)),
+            data: ResolveData::Enum { id: e.to_string() }.into_value(),
             sort_text: sort_for_kind(Some(CompletionItemKind::ENUM_MEMBER), v),
             ..Default::default()
         });
@@ -378,13 +452,29 @@ fn push_type_instances(
         items.push(CompletionItem {
             label: inst.name.clone(),
             kind: Some(kind),
-            detail: Some(format!("{} instance", t)),
+            // `detail` ("{t} instance") is deferred to resolve: this list can
+            // run into the thousands (every state/country/…), and the
+            // instance name doesn't need repeating in `data` — it's already
+            // `label`, which resolve reads back (see `resolve::resolve_item`).
+            data: ResolveData::Type { t: t.to_string() }.into_value(),
             insert_text_format: insert_text.as_ref().map(|_| InsertTextFormat::SNIPPET),
             insert_text,
             sort_text: sort_for_kind(Some(kind), &inst.name),
             ..Default::default()
         });
     }
+}
+
+/// Recompute a `<type>` instance item's `detail` on `completionItem/resolve`.
+/// `None` when `name` is no longer a known instance of `t` (best-effort: the
+/// item is left untouched rather than showing detail for a vanished
+/// instance).
+pub(crate) fn type_instance_detail(info: &InfoService, t: &str, name: &str) -> Option<String> {
+    info.type_index
+        .instances(t)
+        .iter()
+        .any(|(_, inst)| inst.name == name)
+        .then(|| format!("{} instance", t))
 }
 
 /// Emit the keys of all `alias:<cat>` entries, labelled with the category
@@ -438,7 +528,7 @@ fn push_alias_keys(
     // Own the keys so that instance names (borrowed from the type index, not from
     // `ruleset.aliases`) can also participate in the seen-check below.
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (alias_name, (rule, opts)) in &ruleset.aliases {
+    for (alias_name, (rule, _)) in &ruleset.aliases {
         let Some(k) = alias_name.strip_prefix(&prefix) else {
             continue;
         };
@@ -461,13 +551,11 @@ fn push_alias_keys(
         };
         if let Some(&idx) = seen.get(k) {
             let item: &mut CompletionItem = &mut items[idx];
-            if item.documentation.is_none()
-                && let Some(d) = &opts.description
-            {
-                item.documentation = Some(Documentation::String(d.clone()));
-            }
             // First overload wins the snippet; adopt a later one only
-            // if the first had no resolvable shape.
+            // if the first had no resolvable shape. (`documentation` is
+            // deferred to resolve, which re-walks every overload in this
+            // same order — see `alias_documentation` — so there's no eager
+            // merge to do here for it.)
             if item.insert_text.is_none()
                 && let Some(snip) = alias_completion_snippet(k, rule, ruleset)
             {
@@ -483,11 +571,28 @@ fn push_alias_keys(
         // cursor lands after the `=`, ready for the value.
         let snippet = alias_completion_snippet(k, rule, ruleset);
         let sort_text = scope_rank.sort_text(Some(CompletionItemKind::KEYWORD), k);
+        // `documentation` (the alias's `### docs`, potentially a large
+        // multi-paragraph block) is deferred to resolve — this is the
+        // biggest single contributor to completion payload size, since an
+        // effect/trigger block offers every alias in the category on every
+        // request. But most aliases carry no docs at all, and `data` isn't
+        // free either, so only stamp it when there's actually something to
+        // fetch later — otherwise every doc-less item would pay for a
+        // `data` string that resolve would just no-op on.
+        let data = if alias_has_description(ruleset, cat, k) {
+            ResolveData::Alias {
+                cat: cat.to_string(),
+                name: k.to_string(),
+            }
+            .into_value()
+        } else {
+            None
+        };
         items.push(CompletionItem {
             label: k.to_string(),
             kind: Some(CompletionItemKind::KEYWORD),
             detail: Some(cat.to_string()),
-            documentation: opts.description.clone().map(Documentation::String),
+            data,
             insert_text_format: snippet.as_ref().map(|_| InsertTextFormat::SNIPPET),
             insert_text: snippet,
             sort_text,
@@ -688,6 +793,36 @@ fn push_scope_link_keys(items: &mut Vec<CompletionItem>, ruleset: &RuleSet, info
     }
 }
 
+/// Recompute an alias/effect/trigger/modifier-alias item's `documentation` on
+/// `completionItem/resolve`: the first `### docs` description among the
+/// alias's overloads, in the same "first wins" order `push_alias_keys` used
+/// when it merged them eagerly. `None` when `cat`/`name` no longer resolves
+/// to any alias (the ruleset reloaded since the item was built) or none of
+/// its overloads carry a description.
+pub(crate) fn alias_documentation(ruleset: &RuleSet, cat: &str, name: &str) -> Option<String> {
+    let indices = ruleset.alias_exact.get(cat)?.get(name)?;
+    indices
+        .iter()
+        .find_map(|&i| ruleset.aliases[i].1.1.description.clone())
+}
+
+/// Whether any overload of `cat:name` carries a `### docs` description —
+/// the build-time gate for stamping `ResolveData::Alias` at all. Checked
+/// without cloning (unlike `alias_documentation`): this runs for every alias
+/// item built, so it must stay an allocation-free existence check, not a
+/// preview of the value resolve will fetch later.
+fn alias_has_description(ruleset: &RuleSet, cat: &str, name: &str) -> bool {
+    ruleset
+        .alias_exact
+        .get(cat)
+        .and_then(|m| m.get(name))
+        .is_some_and(|indices| {
+            indices
+                .iter()
+                .any(|&i| ruleset.aliases[i].1.1.description.is_some())
+        })
+}
+
 /// Scope names (`scope[country]` positions): one `VALUE` item per name.
 fn push_scope_names(items: &mut Vec<CompletionItem>, names: &[String]) {
     for name in names {
@@ -757,6 +892,22 @@ fn all_enum_values_cached<'c>(
         .or_insert_with(|| all_enum_values(ruleset, info, enum_name))
 }
 
+/// Recompute an enum-member item's `detail` on `completionItem/resolve`.
+/// `None` when `v` is no longer a member of enum `id` (static or
+/// dynamically-collected) — checked directly rather than through
+/// `all_enum_values`, which re-collects, sorts and dedups the whole set just
+/// to answer one membership question.
+pub(crate) fn enum_member_detail(
+    ruleset: &RuleSet,
+    info: &InfoService,
+    id: &str,
+    v: &str,
+) -> Option<String> {
+    let in_static = enum_values_for(ruleset, id).iter().any(|s| s == v);
+    let in_dynamic = info.type_index.complex_enum_values.contains(id, v);
+    (in_static || in_dynamic).then(|| format!("enum {}", id))
+}
+
 /// Completion items for a leaf VALUE position: enumerate what the matched
 /// rules' right-hand sides accept. `value_rules` comes from
 /// `position::rules_at_pos` (alias usages already expanded to their overloads,
@@ -777,9 +928,14 @@ pub(crate) fn value_completions(
     // Built (sort + clone) at most once per call even if several scope-typed
     // value rules arrive here (#44).
     let mut scope_names: Option<Vec<String>> = None;
+    // `detail`/`data` mirror the same deferral split as `completions_from_rules`:
+    // a category with a fresh per-item `format!` detail (type instance, enum
+    // member) passes `None` detail + `Some(data)` and lets resolve fill it in;
+    // a static one-word detail passes `Some(_)` + `None` and stays eager.
     let mut push = |label: String,
                     kind: CompletionItemKind,
-                    detail: String,
+                    detail: Option<String>,
+                    data: Option<Value>,
                     insert_text: Option<String>,
                     items: &mut Vec<CompletionItem>| {
         if seen.insert(label.clone()) {
@@ -787,7 +943,8 @@ pub(crate) fn value_completions(
             items.push(CompletionItem {
                 label,
                 kind: Some(kind),
-                detail: Some(detail),
+                detail,
+                data,
                 insert_text,
                 sort_text: sort_for_kind(Some(kind), &sort_label),
                 ..Default::default()
@@ -807,7 +964,8 @@ pub(crate) fn value_completions(
                     push(
                         inst.name.clone(),
                         CompletionItemKind::REFERENCE,
-                        format!("{} instance", t),
+                        None,
+                        ResolveData::Type { t: t.to_string() }.into_value(),
                         None,
                         &mut items,
                     );
@@ -818,11 +976,17 @@ pub(crate) fn value_completions(
                 name,
                 suffix,
             }) => {
+                // Not deferred: the label (`prefix + instance + suffix`)
+                // isn't the bare instance name, so resolve couldn't match it
+                // back to `info.type_index.instances(name)` the way the
+                // `Simple` case above does via its own `label`. Complex type
+                // refs are rare enough that this stays eager.
                 for (_, inst) in info.type_index.instances(name) {
                     push(
                         format!("{}{}{}", prefix, inst.name, suffix),
                         CompletionItemKind::REFERENCE,
-                        format!("{} instance", name),
+                        Some(format!("{} instance", name)),
+                        None,
                         None,
                         &mut items,
                     );
@@ -838,7 +1002,8 @@ pub(crate) fn value_completions(
                     push(
                         v.clone(),
                         CompletionItemKind::ENUM_MEMBER,
-                        format!("enum {}", e),
+                        None,
+                        ResolveData::Enum { id: e.to_string() }.into_value(),
                         insert_text,
                         &mut items,
                     );
@@ -852,7 +1017,8 @@ pub(crate) fn value_completions(
                     push(
                         k.to_string(),
                         CompletionItemKind::TEXT,
-                        "loc key".to_string(),
+                        Some("loc key".to_string()),
+                        None,
                         None,
                         &mut items,
                     );
@@ -863,7 +1029,8 @@ pub(crate) fn value_completions(
                     push(
                         v.to_string(),
                         CompletionItemKind::KEYWORD,
-                        "bool".to_string(),
+                        Some("bool".to_string()),
+                        None,
                         None,
                         &mut items,
                     );
@@ -878,7 +1045,8 @@ pub(crate) fn value_completions(
                     push(
                         name.clone(),
                         CompletionItemKind::VALUE,
-                        "scope".to_string(),
+                        Some("scope".to_string()),
+                        None,
                         None,
                         &mut items,
                     );
@@ -910,7 +1078,8 @@ pub(crate) fn value_completions(
                     push(
                         v,
                         CompletionItemKind::CONSTANT,
-                        format!("value[{}]", ns),
+                        Some(format!("value[{}]", ns)),
+                        None,
                         None,
                         &mut items,
                     );
@@ -921,7 +1090,8 @@ pub(crate) fn value_completions(
                     push(
                         v.clone(),
                         CompletionItemKind::CONSTANT,
-                        "variable".to_string(),
+                        Some("variable".to_string()),
+                        None,
                         None,
                         &mut items,
                     );
@@ -932,7 +1102,8 @@ pub(crate) fn value_completions(
                     push(
                         v.clone(),
                         CompletionItemKind::CONSTANT,
-                        "variable".to_string(),
+                        Some("variable".to_string()),
+                        None,
                         None,
                         &mut items,
                     );
@@ -941,7 +1112,8 @@ pub(crate) fn value_completions(
                     push(
                         format!("event_target:{}", et),
                         CompletionItemKind::VARIABLE,
-                        "event target".to_string(),
+                        Some("event target".to_string()),
+                        None,
                         None,
                         &mut items,
                     );
@@ -1017,4 +1189,168 @@ pub(crate) fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<C
     }
 
     items
+}
+
+#[cfg(test)]
+mod resolve_data_tests {
+    // Category tests for the completionItem/resolve deferral (perf/completion-
+    // responsiveness): each category that stamps `data` must (a) NOT carry the
+    // eager documentation/detail in the built item, and (b) the recompute
+    // helper resolve.rs calls must reproduce exactly what the OLD eager path
+    // used to put there — pinned against concrete strings, not just "is some".
+
+    use cwtools_rules::rules_types::{EnumDefinition, Options};
+
+    use super::*;
+
+    #[test]
+    fn alias_item_defers_documentation() {
+        let mut rs = RuleSet::new();
+        rs.aliases.push((
+            "effect:add_political_power".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[effect:add_political_power]".to_string()),
+                    right: NewField::ScalarField,
+                },
+                Options {
+                    description: Some("Adds political power to the country.".to_string()),
+                    ..Options::default()
+                },
+            ),
+        ));
+        rs.reindex();
+        let info = InfoService::new();
+        let rules = vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField("effect".to_string()),
+                right: NewField::AliasField("effect".to_string()),
+            },
+            Options::default(),
+        )];
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let item = items
+            .iter()
+            .find(|i| i.label == "add_political_power")
+            .expect("'add_political_power' item");
+        assert!(
+            item.documentation.is_none(),
+            "documentation must be deferred out of the built item, got: {:?}",
+            item.documentation
+        );
+        assert_eq!(
+            item.data,
+            Some(serde_json::Value::String(
+                "alias:effect:add_political_power".to_string()
+            ))
+        );
+        // What resolve.rs will recompute from that `data` must equal the OLD
+        // eager `opts.description.clone()` value exactly.
+        assert_eq!(
+            alias_documentation(&rs, "effect", "add_political_power").as_deref(),
+            Some("Adds political power to the country.")
+        );
+    }
+
+    #[test]
+    fn alias_item_without_description_carries_no_data() {
+        // Most aliases have no `### docs` at all — stamping `data` on them
+        // anyway would cost bytes resolve could never redeem (see
+        // `alias_has_description`), so those items must carry none.
+        let mut rs = RuleSet::new();
+        rs.aliases.push((
+            "effect:add_political_power".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[effect:add_political_power]".to_string()),
+                    right: NewField::ScalarField,
+                },
+                Options::default(),
+            ),
+        ));
+        rs.reindex();
+        let info = InfoService::new();
+        let rules = vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField("effect".to_string()),
+                right: NewField::AliasField("effect".to_string()),
+            },
+            Options::default(),
+        )];
+        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let item = items
+            .iter()
+            .find(|i| i.label == "add_political_power")
+            .expect("'add_political_power' item");
+        assert!(
+            item.data.is_none(),
+            "a doc-less alias must carry no data, got: {:?}",
+            item.data
+        );
+    }
+
+    #[test]
+    fn type_instance_item_defers_detail() {
+        let mut info = InfoService::new();
+        let mut per_type: std::collections::HashMap<String, Vec<cwtools_info::TypeInstance>> =
+            std::collections::HashMap::new();
+        per_type.insert(
+            "state".to_string(),
+            vec![cwtools_info::TypeInstance {
+                name: "STATE_1".to_string(),
+                location: cwtools_info::SourceLocation { line: 1, col: 0 },
+                primary_loc_key: None,
+            }],
+        );
+        info.type_index.merge("file:///states/s.txt", per_type);
+
+        let mut items = Vec::new();
+        push_type_instances(&mut items, &info, "state", TypeInstanceStyle::Reference);
+        let item = items.first().expect("one item");
+        assert!(
+            item.detail.is_none(),
+            "detail must be deferred out of the built item, got: {:?}",
+            item.detail
+        );
+        assert_eq!(
+            item.data,
+            Some(serde_json::Value::String("type:state".to_string()))
+        );
+        // The OLD eager path built exactly `format!("{} instance", t)`.
+        assert_eq!(
+            type_instance_detail(&info, "state", "STATE_1").as_deref(),
+            Some("state instance")
+        );
+    }
+
+    #[test]
+    fn enum_member_item_defers_detail() {
+        let mut rs = RuleSet::new();
+        rs.enums.push(EnumDefinition {
+            key: "my_enum".to_string(),
+            description: String::new(),
+            values: vec!["alpha".to_string()],
+        });
+        rs.reindex();
+        let info = InfoService::new();
+
+        let mut items = Vec::new();
+        let mut cache = std::collections::HashMap::new();
+        push_enum_leaf_values(&mut items, &mut cache, &rs, &info, "my_enum");
+        let item = items.first().expect("one item");
+        assert!(
+            item.detail.is_none(),
+            "detail must be deferred out of the built item, got: {:?}",
+            item.detail
+        );
+        assert_eq!(
+            item.data,
+            Some(serde_json::Value::String("enum:my_enum".to_string()))
+        );
+        // The OLD eager path built exactly `format!("enum {}", e)`.
+        assert_eq!(
+            enum_member_detail(&rs, &info, "my_enum", "alpha").as_deref(),
+            Some("enum my_enum")
+        );
+    }
 }
