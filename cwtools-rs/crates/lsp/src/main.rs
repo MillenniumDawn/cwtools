@@ -291,7 +291,10 @@ pub(crate) struct CompletionCacheEntry {
 
 pub(crate) struct ParsedDoc {
     pub(crate) version: i32,
-    pub(crate) text: String,
+    /// `Arc` so every reader that only needs to look at the text (completion,
+    /// hover, the cross-file dependent sweep) clones a refcount bump instead
+    /// of the whole document under the `documents` lock.
+    pub(crate) text: Arc<str>,
     /// Shared so the cross-file dependent sweep can validate against it without
     /// re-parsing (an `Arc` clone instead of a full re-parse per open file).
     pub(crate) ast: Option<Arc<ParsedFile>>,
@@ -860,7 +863,7 @@ impl LanguageServer for Backend {
                 uri.clone(),
                 ParsedDoc {
                     version,
-                    text: text.clone(),
+                    text: Arc::from(text),
                     ast,
                 },
             );
@@ -899,6 +902,7 @@ impl LanguageServer for Backend {
         };
         let text = change.text;
         tracing::debug!(%uri, version, bytes = text.len(), "did_change");
+        let text: Arc<str> = Arc::from(text);
 
         // Store the new text+version immediately (keep the prior AST until we
         // revalidate). The debounced task checks the version to know whether this
@@ -1442,7 +1446,7 @@ mod tests {
             "file:///test.txt".to_string(),
             ParsedDoc {
                 version: 0,
-                text: source.to_string(),
+                text: Arc::from(source),
                 ast: Some(Arc::new(parsed)),
             },
         );

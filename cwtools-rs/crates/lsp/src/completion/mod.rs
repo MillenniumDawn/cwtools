@@ -262,8 +262,10 @@ impl Backend {
         // being the user typing into a file whose previous validate is still
         // running. The same pattern for the rules guard: clone the Arcs and
         // drop the guard. The helpers below take borrows, so the Arcs carry
-        // the lifetime across the work without holding the lock.
-        let doc_text: String = {
+        // the lifetime across the work without holding the lock. `text` is an
+        // `Arc<str>`, so this clone is a refcount bump, not a copy of the
+        // whole document.
+        let doc_text: Arc<str> = {
             let docs = self.state.documents.lock();
             docs.get(&uri).map(|d| d.text.clone()).unwrap_or_default()
         };

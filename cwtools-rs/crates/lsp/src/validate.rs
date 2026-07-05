@@ -800,7 +800,7 @@ impl Backend {
     /// removed updates in the other open `.yml` files without a reload (#36).
     /// Bounded by the number of open loc files.
     async fn revalidate_other_open_loc_files(&self, except_uri: &str) {
-        let targets: Vec<(String, String)> = {
+        let targets: Vec<(String, Arc<str>)> = {
             let docs = self.state.documents.lock();
             docs.iter()
                 .filter(|(u, _)| u.as_str() != except_uri && crate::paths::is_loc_file(u))

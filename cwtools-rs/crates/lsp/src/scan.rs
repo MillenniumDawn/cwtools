@@ -595,7 +595,7 @@ impl Backend {
     /// index don't keep stale cross-file diagnostics, and on a live
     /// `didChangeConfiguration` so a changed suppression list re-filters at once.
     pub(crate) async fn revalidate_all_open_docs(&self) {
-        let open_docs: Vec<(String, String, i32)> = {
+        let open_docs: Vec<(String, Arc<str>, i32)> = {
             let docs = self.state.documents.lock();
             docs.iter()
                 .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
