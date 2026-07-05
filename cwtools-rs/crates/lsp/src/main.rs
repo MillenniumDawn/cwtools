@@ -987,6 +987,7 @@ impl LanguageServer for Backend {
         self.state.doc_tokens.write().remove(&uri);
         // Drop the closed loc file's live overlay contribution (#36).
         self.state.loc_live_overlay.write().remove(&uri);
+        self.state.completion_generation.lock().remove(&uri);
         cwtools_profiling::trim_memory();
         cwtools_profiling::log_rss("did_close");
         self.client
