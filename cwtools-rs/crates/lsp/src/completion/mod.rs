@@ -207,6 +207,7 @@ impl Backend {
         &self,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
+        self.mark_activity();
         let t_start = Instant::now();
         let mut ast_dur = Duration::ZERO;
         let mut rules_dur = Duration::ZERO;

@@ -86,6 +86,12 @@ pub(crate) struct Config {
     pub(crate) rules_dir: Option<std::path::PathBuf>,
     pub(crate) scope_checks: bool,
     pub(crate) var_checks: bool,
+    /// Minutes between quiet background re-index passes (0 = off, the
+    /// default). Sourced from `backgroundReindexIntervalMinutes` in
+    /// `initializationOptions` and `workspace/didChangeConfiguration`. A raw
+    /// client that never sends either keeps this at 0, so the periodic loop
+    /// stays disabled unless explicitly configured.
+    pub(crate) background_reindex_interval_minutes: u64,
 }
 
 impl Config {
@@ -103,6 +109,7 @@ impl Config {
             rules_dir: None,
             scope_checks,
             var_checks,
+            background_reindex_interval_minutes: 0,
         }
     }
 
@@ -285,11 +292,18 @@ struct DocumentState {
     /// latest one matters, the rest are wasted work.
     completion_generation: parking_lot::Mutex<HashMap<String, u64>>,
     /// Stat-only signature (path, size, mtime) over the loc files a scan last
-    /// rebuilt, so a future quiet background pass can skip
+    /// rebuilt, so the periodic background pass can skip
     /// `rebuild_and_publish_loc` (the biggest transient cost of a scan) when
     /// nothing loc-related has changed on disk. `None` until the first scan
     /// runs.
     last_loc_signature: parking_lot::Mutex<Option<u64>>,
+    /// Server start time, the epoch `last_activity_ms` is measured against.
+    start: std::time::Instant,
+    /// Milliseconds since `start` at the last `did_change` / `completion`
+    /// request — the idle clock the background reindex loop watches.
+    /// `Relaxed`: the periodic loop is the only reader and tolerates a
+    /// slightly-stale value.
+    last_activity_ms: AtomicU64,
 }
 
 /// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
@@ -376,6 +390,8 @@ impl DocumentState {
             fallback_cache: parking_lot::Mutex::new(None),
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
             last_loc_signature: parking_lot::Mutex::new(None),
+            start: std::time::Instant::now(),
+            last_activity_ms: AtomicU64::new(0),
         }
     }
 }
@@ -899,6 +915,20 @@ impl LanguageServer for Backend {
                 watch_client.send_notification::<LoadingBar>(payload).await;
             }
         });
+
+        // Periodic quiet re-scan so a long-running session doesn't accumulate
+        // stale index state. Off by default (background_reindex_interval_minutes
+        // == 0); runs only while the user is idle, and every notification the
+        // scan would normally send to the status bar is suppressed.
+        let reindex_client = self.client.clone();
+        let reindex_state = self.state.clone();
+        tokio::spawn(async move {
+            let backend = Backend {
+                client: reindex_client,
+                state: reindex_state,
+            };
+            backend.background_reindex_loop().await;
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -959,6 +989,7 @@ impl LanguageServer for Backend {
 
     #[tracing::instrument(skip_all)]
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        self.mark_activity();
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
 

@@ -3557,3 +3557,146 @@ fn test_rescan_prunes_deleted_file_from_index() {
         after
     );
 }
+
+// ── Periodic background reindex ───────────────────────────────────────────
+
+/// Read frames until a `publishDiagnostics` for a URI ending in `suffix`
+/// arrives whose codes no longer include `missing_code`. Fails immediately if
+/// a `loadingBar` notification is observed along the way — a quiet background
+/// pass must never touch the status bar, unlike the startup scan or
+/// `clearAllCaches`. Returns `Err` on a stray loadingBar or on timeout.
+fn wait_for_cleared_diag_quiet(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    suffix: &str,
+    missing_code: &str,
+) -> Result<(), String> {
+    for _ in 0..10_000 {
+        let raw = read_frame(reader).map_err(|e| format!("read error: {e}"))?;
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v["method"] == "loadingBar" {
+            return Err(format!(
+                "unexpected loadingBar notification during quiet background pass: {v}"
+            ));
+        }
+        if v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(suffix))
+        {
+            let codes: Vec<String> = v["params"]["diagnostics"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|d| d["code"].as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !codes.iter().any(|c| c == missing_code) {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "timed out waiting for {suffix} diagnostics without {missing_code}"
+    ))
+}
+
+#[test]
+fn test_background_reindex_picks_up_new_file_quietly() {
+    // The periodic background pass (CWTOOLS_REINDEX_INTERVAL_SECS=1,
+    // CWTOOLS_REINDEX_IDLE_SECS=0 so it fires almost immediately once the
+    // interval elapses) must discover a file created directly on disk — no
+    // didOpen, no didChangeWatchedFiles notification over stdio — the same
+    // way a real file-watcher gap would (a git checkout that raced the
+    // watcher, or a file appearing while the window had no focus). It must
+    // also run quiet: unlike the startup scan or `clearAllCaches`, no
+    // loadingBar notification should reach the client.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    // Only the caller exists on disk at first; the definition is added later,
+    // directly on disk, simulating a watcher-missed change.
+    let b_rel = "common/decisions/b.txt";
+    let b_path = ws.path().join(b_rel);
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &b_path,
+        "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n",
+    )
+    .unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .env("CWTOOLS_REINDEX_INTERVAL_SECS", "1")
+        .env("CWTOOLS_REINDEX_IDLE_SECS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // The startup scan runs non-quiet; drain its loadingBar traffic before the
+    // quiet-observation window starts.
+    wait_for_scan_done(&mut reader);
+
+    // Open the caller; the definition is absent, so B shows CW263.
+    let b_uri = format!("file://{}", b_path.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text":"my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n"}}),
+        ),
+    )
+    .unwrap();
+    let before = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics before background pass");
+    assert!(
+        before.contains(&"CW263".to_string()),
+        "expected CW263 before the definition exists, got: {:?}",
+        before
+    );
+
+    // Create the defining file directly on disk — no didOpen, no
+    // didChangeWatchedFiles notification. Only the periodic background
+    // pass's own filesystem walk can find it.
+    let a_rel = "common/scripted_effects/a.txt";
+    let a_path = ws.path().join(a_rel);
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, "my_se = { log = \"hi\" }\n").unwrap();
+
+    let result = wait_for_cleared_diag_quiet(&mut reader, "b.txt", "CW263");
+    child.kill().ok();
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+}
