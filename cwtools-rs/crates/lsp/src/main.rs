@@ -271,6 +271,12 @@ struct DocumentState {
     /// stacking N parallel AST walks when the user types fast — only the
     /// latest one matters, the rest are wasted work.
     completion_generation: parking_lot::Mutex<HashMap<String, u64>>,
+    /// Stat-only signature (path, size, mtime) over the loc files a scan last
+    /// rebuilt, so a future quiet background pass can skip
+    /// `rebuild_and_publish_loc` (the biggest transient cost of a scan) when
+    /// nothing loc-related has changed on disk. `None` until the first scan
+    /// runs.
+    last_loc_signature: parking_lot::Mutex<Option<u64>>,
 }
 
 /// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
@@ -320,6 +326,7 @@ impl DocumentState {
             loc_cache: parking_lot::Mutex::new(None),
             fallback_cache: parking_lot::Mutex::new(None),
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
+            last_loc_signature: parking_lot::Mutex::new(None),
         }
     }
 }

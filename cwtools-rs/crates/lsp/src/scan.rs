@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -504,7 +505,21 @@ impl Backend {
         // Build the loc-key index (workspace + vanilla) so pass 2's config
         // validation can check LocalisationField references (CW100/CW122), and
         // publish loc-file diagnostics (CW225 etc.) for the workspace loc files.
-        self.rebuild_and_publish_loc(&root_path).await;
+        // On a quiet background pass, skip this ~2M-entry rebuild (the biggest
+        // transient cost of a scan) when a stat-only signature over the same
+        // files says nothing loc-related changed since the last scan. A
+        // foreground scan (startup, clearAllCaches) always rebuilds, so a
+        // user-triggered rescan never serves stale loc diagnostics — it just
+        // also records the signature for the next quiet pass to compare
+        // against.
+        let loc_signature = tokio::task::block_in_place(|| self.compute_loc_signature(&root_path));
+        let loc_unchanged = *self.state.last_loc_signature.lock() == Some(loc_signature);
+        if quiet && loc_unchanged {
+            tracing::info!("quiet scan: loc signature unchanged, skipping loc rebuild");
+        } else {
+            self.rebuild_and_publish_loc(&root_path).await;
+        }
+        *self.state.last_loc_signature.lock() = Some(loc_signature);
 
         // The index (types + loc + vanilla) is now complete. Allow per-file
         // handlers to publish real diagnostics again: anything opened/edited
@@ -737,6 +752,33 @@ impl Backend {
         }
     }
 
+    /// Directories `rebuild_and_publish_loc` scans for loc files: the
+    /// workspace root plus the configured vanilla install, if any. Shared
+    /// with `compute_loc_signature` so the two can never walk different
+    /// trees.
+    fn loc_dirs(&self, root_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut dirs = vec![root_path.to_path_buf()];
+        if let Some(v) = self.state.config.read().vanilla_dir.clone() {
+            dirs.push(v);
+        }
+        dirs
+    }
+
+    /// Stat-only signature (path, size, mtime) over the loc files
+    /// `rebuild_and_publish_loc` would read. Lets a quiet background pass
+    /// detect "nothing loc-related changed" and skip the full rebuild without
+    /// reading or parsing a single file. Discovers files via
+    /// `LocService::discover_files` — the exact walk `rebuild_and_publish_loc`
+    /// uses via `LocService::from_folders` — so this can't drift from what it
+    /// actually reads. Blocking (stats every discovered file); call from
+    /// within `block_in_place`.
+    pub(crate) fn compute_loc_signature(&self, root_path: &std::path::Path) -> u64 {
+        let dirs = self.loc_dirs(root_path);
+        let dir_refs: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
+        let files = cwtools_localization::LocService::discover_files(&dir_refs);
+        loc_signature_for(files)
+    }
+
     /// Build the loc-key index from the workspace root plus the vanilla install,
     /// store it in state (for CW100/CW122 on config files), and publish loc-file
     /// diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace loc files.
@@ -747,10 +789,7 @@ impl Backend {
         // Always load the vanilla loc files when the dir is available so hover
         // shows translations for keys that exist only in the base game (#51).
         let cached_vanilla_loc = self.state.vanilla_loc_keys.lock().clone();
-        let mut loc_dirs: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
-        if let Some(v) = self.state.config.read().vanilla_dir.clone() {
-            loc_dirs.push(v);
-        }
+        let loc_dirs = self.loc_dirs(root_path);
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
         let loc_languages = self.state.config.read().loc_languages.clone();
 
@@ -1181,6 +1220,28 @@ impl Backend {
     }
 }
 
+/// Fold a stat-only signature (path, size, mtime) over `files` into one
+/// hash, in a deterministic (sorted-path) order so the result doesn't depend
+/// on directory-walk order. Split out from `Backend::compute_loc_signature`
+/// so it's unit-testable without a `Backend` (which needs a live
+/// `tower_lsp::Client`).
+fn loc_signature_for(mut files: Vec<std::path::PathBuf>) -> u64 {
+    files.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in &files {
+        path.to_string_lossy().hash(&mut hasher);
+        if let Ok(meta) = std::fs::metadata(path) {
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified()
+                && let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                since_epoch.as_nanos().hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1193,6 +1254,68 @@ mod tests {
     fn test_discover_vanilla_dir_unknown_game_is_none() {
         assert!(discover_vanilla_dir("not_a_real_game").is_none());
         assert!(discover_vanilla_dir("").is_none());
+    }
+
+    // ── loc_signature_for (quiet-scan loc-rebuild skip) ─────────────────────
+
+    #[test]
+    fn test_loc_signature_stable_for_unchanged_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.yml");
+        let b = tmp.path().join("b.yml");
+        std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
+        std::fs::write(&b, "l_english:\n other:0 \"value\"\n").unwrap();
+
+        let sig1 = loc_signature_for(vec![a.clone(), b.clone()]);
+        // Same files, reversed discovery order — the signature sorts paths
+        // first, so order of the input Vec must not matter.
+        let sig2 = loc_signature_for(vec![b, a]);
+        assert_eq!(sig1, sig2, "signature must not depend on discovery order");
+    }
+
+    #[test]
+    fn test_loc_signature_changes_when_a_file_is_touched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.yml");
+        std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
+
+        let before = loc_signature_for(vec![a.clone()]);
+        // Rewrite with different content (length changes) and bump mtime.
+        std::fs::write(&a, "l_english:\n key:0 \"a different, longer value\"\n").unwrap();
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        filetime_set(&a, newer);
+
+        let after = loc_signature_for(vec![a]);
+        assert_ne!(
+            before, after,
+            "touching a file's size/mtime should change the signature"
+        );
+    }
+
+    #[test]
+    fn test_loc_signature_changes_when_file_set_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.yml");
+        std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
+        let one_file = loc_signature_for(vec![a.clone()]);
+
+        let b = tmp.path().join("b.yml");
+        std::fs::write(&b, "l_english:\n other:0 \"value\"\n").unwrap();
+        let two_files = loc_signature_for(vec![a, b]);
+
+        assert_ne!(
+            one_file, two_files,
+            "adding a file to the set should change the signature"
+        );
+    }
+
+    /// Set a file's mtime forward without depending on filesystem mtime
+    /// resolution (some filesystems truncate to 1s), so the "touched" test
+    /// above is deterministic. `std::fs::File::set_modified` is stable since
+    /// Rust 1.75.
+    fn filetime_set(path: &std::path::Path, time: std::time::SystemTime) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(time).unwrap();
     }
 
     // ── ScanGuard (B1 re-entrancy guard) ──────────────────────────────────
