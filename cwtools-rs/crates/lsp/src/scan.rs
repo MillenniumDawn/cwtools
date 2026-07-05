@@ -396,6 +396,70 @@ impl Backend {
             )
             .await;
 
+        // Prune index entries for files that vanished since the last scan —
+        // deleted while the server had no watcher event (e.g. while closed),
+        // or newly excluded by an ignore glob (pruning that one is correct
+        // too: it matches what a restart would index). Pass 1 above only
+        // re-indexes what IS still on disk; without this, a stale definition
+        // keeps "resolving" against a file that no longer exists until a
+        // window reload.
+        let walked_uris: HashSet<String> =
+            files_to_validate.iter().map(|p| path_to_uri(p)).collect();
+        let removed_uris: Vec<String> = {
+            let mut info = self.state.info_service.write();
+            let stale: Vec<String> = info
+                .files
+                .keys()
+                // Only real per-file entries — synthetic keys like
+                // "<vanilla-cache>"/"<vanilla-dynamic>" never land in `files`
+                // (they're merged straight into `type_index`), but guard
+                // against that changing rather than pruning them by accident.
+                .filter(|&uri| {
+                    uri.starts_with("file://")
+                        && !walked_uris.contains(uri)
+                        && !open_uris.contains(uri)
+                })
+                .cloned()
+                .collect();
+            for uri in &stale {
+                info.clear_file(uri);
+            }
+            stale
+        };
+        if !removed_uris.is_empty() {
+            // Mirrors the DELETE branch of `did_change_watched_files_impl`:
+            // the symbol index and loc live-overlay are keyed per-file too and
+            // must forget the same URIs, or goto-def/loc checks keep serving
+            // stale entries for a file `info_service` just dropped.
+            {
+                let mut index = self.state.symbol_index.lock();
+                for uri in &removed_uris {
+                    index.clear_document(uri);
+                }
+            }
+            {
+                let mut overlay = self.state.loc_live_overlay.write();
+                for uri in &removed_uris {
+                    overlay.remove(uri);
+                }
+            }
+            self.bump_info_revision();
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "Pruned {} file(s) no longer on disk from the index",
+                        removed_uris.len()
+                    ),
+                )
+                .await;
+            for uri in &removed_uris {
+                if let Ok(uri_obj) = Url::parse(uri) {
+                    self.client.publish_diagnostics(uri_obj, vec![], None).await;
+                }
+            }
+        }
+
         // Build the base-game index from a `vanilla` dir (or auto-discovery) if
         // we have one and haven't indexed it yet. Populates `vanilla_index`.
         self.ensure_vanilla_index(false).await;
