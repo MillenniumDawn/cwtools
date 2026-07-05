@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde_json::Value;
 use tower_lsp::jsonrpc::Result;
@@ -250,6 +250,13 @@ struct DocumentState {
     /// is dropped to eliminate double residency; this flag prevents
     /// `ensure_vanilla_index` from re-running on subsequent workspace scans.
     vanilla_merged: std::sync::atomic::AtomicBool,
+    /// Guards `validate_entire_workspace` against re-entrant scans. The
+    /// startup scan, `clearAllCaches`, and (in a later phase) a periodic
+    /// background rescan all funnel through it; without this, two overlapping
+    /// scans would race serial `info_service` writes against each other.
+    /// `compare_exchange`-guarded on entry; a losing caller logs and returns
+    /// immediately instead of queueing behind the running scan.
+    scan_in_progress: AtomicBool,
     /// Per-URI debounce task handle. `did_change` aborts the previous sleeper for
     /// the same file before spawning a new one, so a burst of keystrokes coalesces
     /// to a single pending task instead of stacking hundreds of sleepers.
@@ -356,6 +363,7 @@ impl DocumentState {
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
             pending_changed_names: Mutex::new(HashSet::new()),
             vanilla_merged: std::sync::atomic::AtomicBool::new(false),
+            scan_in_progress: AtomicBool::new(false),
             debounce_handles: Mutex::new(HashMap::new()),
             info_revision: AtomicU64::new(0),
             loc_cache: parking_lot::Mutex::new(None),

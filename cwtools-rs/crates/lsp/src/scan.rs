@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tower_lsp::lsp_types::*;
 
@@ -47,6 +47,18 @@ pub(crate) fn index_vanilla_dir(
         .map(|(k, v)| (k, v.into_iter().map(|(_, inst)| inst).collect()))
         .collect();
     (per_type, aux)
+}
+
+/// RAII guard for `DocumentState::scan_in_progress`. Resets the flag to
+/// `false` on drop so a panicked scan can't wedge every later scan out
+/// forever — the guard lives inside the scanning future, so a panic
+/// unwinding through `validate_entire_workspace` still runs `Drop`.
+struct ScanGuard<'a>(&'a AtomicBool);
+
+impl Drop for ScanGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Backend {
@@ -143,7 +155,22 @@ impl Backend {
     /// previously left the bar spinning on "Indexing workspace…" forever. A
     /// panic inside the scan is handled separately by the watcher in
     /// `initialized`, which clears the bar too.
+    ///
+    /// Re-entrancy guarded: the startup scan, `clearAllCaches`, and a future
+    /// periodic rescan can all land here, and two overlapping scans would race
+    /// each other's serial `info_service` writes. A losing caller skips the
+    /// scan entirely rather than blocking behind the running one.
     pub(crate) async fn validate_entire_workspace(&self) {
+        if self
+            .state
+            .scan_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::debug!("workspace scan already in progress; skipping");
+            return;
+        }
+        let _guard = ScanGuard(&self.state.scan_in_progress);
         self.validate_entire_workspace_inner().await;
         self.send_loading_bar(false, "").await;
     }
@@ -1077,6 +1104,60 @@ mod tests {
     fn test_discover_vanilla_dir_unknown_game_is_none() {
         assert!(discover_vanilla_dir("not_a_real_game").is_none());
         assert!(discover_vanilla_dir("").is_none());
+    }
+
+    // ── ScanGuard (B1 re-entrancy guard) ──────────────────────────────────
+
+    #[test]
+    fn test_scan_guard_resets_flag_on_drop() {
+        let flag = AtomicBool::new(false);
+        assert!(
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        );
+        {
+            let _guard = ScanGuard(&flag);
+            assert!(flag.load(Ordering::SeqCst));
+        }
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "guard must reset the flag on drop"
+        );
+    }
+
+    #[test]
+    fn test_scan_guard_cas_rejects_second_entrant_while_held() {
+        let flag = AtomicBool::new(false);
+        assert!(
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+            "first scan should win the CAS"
+        );
+        // A second scan racing in while the first is still running loses the CAS,
+        // mirroring how `validate_entire_workspace` bails on a losing entrant.
+        assert!(
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err(),
+            "overlapping scan should lose the CAS while the first is in progress"
+        );
+    }
+
+    #[test]
+    fn test_scan_guard_drop_then_reacquire_succeeds() {
+        let flag = AtomicBool::new(false);
+        {
+            assert!(
+                flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            );
+            let _guard = ScanGuard(&flag);
+        }
+        // Guard dropped (scan finished, or panicked) — a later scan can acquire.
+        assert!(
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+            "flag should be free again once the guard is dropped"
+        );
     }
 
     /// Build a minimal `RuleSet` containing one type definition.
