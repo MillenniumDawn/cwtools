@@ -25,28 +25,26 @@ use crate::{Backend, LoadingBar, UpdateFileList};
 /// so the LSP and CLI discover and index vanilla the SAME way (the driver's
 /// `search_config_for` config, which is the broader, corpus-verified one). The
 /// discovered ASTs are used directly (no re-parse) because vanilla files are only
-/// indexed, never validated. Drops the per-instance file_uri; the merge slot only
-/// needs the instances.
+/// indexed, never validated. Each instance keeps its real source path so
+/// goto-definition / find-references into base-game content resolve to the right
+/// file (the merge maps the path to a `file://` URI).
 ///
 /// Also returns the cache aux payload (loc keys, file paths, variable names) so
 /// a cache written by the LSP is as complete as one from the CLI's
 /// `cache-vanilla`.
+#[allow(clippy::type_complexity)]
 pub(crate) fn index_vanilla_dir(
     dir: &std::path::Path,
     ruleset: &RuleSet,
     table: &cwtools_string_table::string_table::StringTable,
 ) -> (
-    HashMap<String, Vec<cwtools_info::TypeInstance>>,
+    HashMap<String, Vec<(Arc<str>, cwtools_info::TypeInstance)>>,
     cwtools_info::vanilla_cache::VanillaCacheAux,
 ) {
     let var_effects = cwtools_info::variable_defining_effects(ruleset);
     let index = cwtools_driver::index_game_dir(dir, ruleset, table, &var_effects);
     let aux = cwtools_driver::build_vanilla_cache_aux(dir, &index);
-    let per_type = index
-        .map
-        .into_iter()
-        .map(|(k, v)| (k, v.into_iter().map(|(_, inst)| inst).collect()))
-        .collect();
+    let per_type = index.map.into_iter().collect();
     (per_type, aux)
 }
 
@@ -94,9 +92,9 @@ impl Backend {
             return;
         }
         let mut info = self.state.info_service.write();
-        // NOT "<vanilla-cache>": the workspace scan's instance merge calls
-        // remove_file("<vanilla-cache>") before re-merging, which would wipe
-        // these as a side effect.
+        // Keyed under one synthetic file, distinct from the per-file URIs the
+        // vanilla type instances now merge under, so a re-merge replaces this
+        // contribution and the instance merge's `remove_files` never touches it.
         info.type_index
             .complex_enum_values
             .merge_file("<vanilla-dynamic>", complex_enums.into_iter().collect());
@@ -115,9 +113,41 @@ impl Backend {
     pub(crate) fn merge_pending_vanilla_index(&self) {
         let per_type = self.state.vanilla_index.lock().take();
         if let Some(per_type) = per_type {
+            // The vanilla index keys each instance by its raw source path (the
+            // driver / cache form). Convert those to `file://` URIs — matching
+            // how workspace files are keyed — so goto-definition, find-references
+            // and workspace-symbol resolve into the real base-game file. The old
+            // "<vanilla-cache>" sentinel failed to parse as a URI and silently
+            // fell back to whatever document the user had open (#62).
+            let mut uri_cache: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+            let mut converted: HashMap<String, Vec<(Arc<str>, cwtools_info::TypeInstance)>> =
+                HashMap::with_capacity(per_type.len());
+            for (type_name, instances) in per_type {
+                let mut out = Vec::with_capacity(instances.len());
+                for (path, inst) in instances {
+                    let uri = uri_cache
+                        .entry(path)
+                        .or_insert_with_key(|p| {
+                            Arc::from(path_to_uri(std::path::Path::new(p.as_ref())).as_str())
+                        })
+                        .clone();
+                    out.push((uri, inst));
+                }
+                converted.insert(type_name, out);
+            }
+            // Distinct vanilla source URIs, tracked so a later re-merge drops
+            // exactly this contribution in one index pass.
+            let uris: HashSet<Arc<str>> = uri_cache.into_values().collect();
+            let old = {
+                let mut merged = self.state.vanilla_merged_uris.lock();
+                std::mem::replace(&mut *merged, uris)
+            };
+
             let mut info_guard = self.state.info_service.write();
-            info_guard.type_index.remove_file("<vanilla-cache>");
-            info_guard.type_index.merge("<vanilla-cache>", per_type);
+            // Drop the previous base-game contribution (a re-merge after
+            // cacheVanilla / clearAllCaches) before merging the fresh one.
+            info_guard.type_index.remove_files(&old);
+            info_guard.type_index.merge_with_uris(converted);
             // Vanilla data is loaded, so the index now holds every base-game
             // instance. Mark it complete so the CW500/CW222 type-reference
             // checks fire (they're gated on `complete` to avoid false
@@ -432,10 +462,10 @@ impl Backend {
             let stale: Vec<String> = info
                 .files
                 .keys()
-                // Only real per-file entries — synthetic keys like
-                // "<vanilla-cache>"/"<vanilla-dynamic>" never land in `files`
-                // (they're merged straight into `type_index`), but guard
-                // against that changing rather than pruning them by accident.
+                // Only real per-file entries. Vanilla instances (and the
+                // "<vanilla-dynamic>" bucket) are merged straight into
+                // `type_index`, never `files`, so this workspace-scoped prune
+                // never sees them; the `file://` guard is belt-and-braces.
                 .filter(|&uri| {
                     uri.starts_with("file://")
                         && !walked_uris.contains(uri)
@@ -1567,7 +1597,7 @@ mod tests {
 
         let names: Vec<&str> = per_type
             .get("foo")
-            .map(|v| v.iter().map(|i| i.name.as_str()).collect())
+            .map(|v| v.iter().map(|(_, i)| i.name.as_str()).collect())
             .unwrap_or_default();
         assert!(names.contains(&"foo_one"), "got: {:?}", names);
         assert!(names.contains(&"foo_two"), "got: {:?}", names);
@@ -1592,7 +1622,7 @@ mod tests {
 
         let names: Vec<&str> = per_type
             .get("foo")
-            .map(|v| v.iter().map(|i| i.name.as_str()).collect())
+            .map(|v| v.iter().map(|(_, i)| i.name.as_str()).collect())
             .unwrap_or_default();
         assert!(
             names.contains(&"real_name_a"),
@@ -1644,14 +1674,20 @@ mod tests {
         let table = StringTable::new();
         let (per_type, _aux) = index_vanilla_dir(&root, &rs, &table);
 
-        let names: Vec<&str> = per_type
-            .get("foo")
-            .map(|v| v.iter().map(|i| i.name.as_str()).collect())
-            .unwrap_or_default();
+        let entries = per_type.get("foo").cloned().unwrap_or_default();
+        let names: Vec<&str> = entries.iter().map(|(_, i)| i.name.as_str()).collect();
         assert!(
             names.contains(&"foo_one"),
             "valid instance should still be collected despite a bad file: {:?}",
             names
+        );
+        // Each instance keeps its real source file (goto-into-vanilla).
+        assert!(
+            entries
+                .iter()
+                .any(|(uri, _)| uri.replace('\\', "/").ends_with("common/foos/good.txt")),
+            "instance should carry its source path, got: {:?}",
+            entries.iter().map(|(u, _)| u.as_ref()).collect::<Vec<_>>()
         );
     }
 
@@ -1700,7 +1736,7 @@ mod tests {
 
         let names: Vec<&str> = per_type
             .get("foo")
-            .map(|v| v.iter().map(|i| i.name.as_str()).collect())
+            .map(|v| v.iter().map(|(_, i)| i.name.as_str()).collect())
             .unwrap_or_default();
         assert!(names.contains(&"foo_one"), "got: {:?}", names);
         assert!(

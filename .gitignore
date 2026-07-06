@@ -16,6 +16,8 @@
 [Oo]bj/
 [Dd]ebug/
 [Rr]elease/
+# Stale .NET build output from the removed F# tree (the client repo ignores it too).
+artifacts/
 
 # Misc local artifacts
 *.bz2

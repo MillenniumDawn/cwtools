@@ -1,3 +1,18 @@
+# 1.21.0
+
+## Bug Fixes
+
+- Go-to-definition, find-references, and workspace-symbol on a base-game (vanilla) definition now land in the real vanilla file instead of a bogus line in whatever document happened to be open. Vanilla instances were indexed under a synthetic `<vanilla-cache>` key that failed to parse as a URI and silently fell back to the current document; each instance now carries its own source file through both the live-index and cache-load paths. This is the root cause behind the go-to-definition issue the earlier de-dup (see the pre-1.19.0 notes below) only papered over. (cwtools-vscode#62)
+
+## Notes
+
+- The vanilla cache format is bumped to v7 so a cache written by an older server (which left the per-file path blank) rebuilds on next load. No user action needed; the base game is re-indexed once.
+
+## Developer
+
+- The vanilla index (`vanilla_index`, `VanillaCacheData::per_type`) threads a per-instance source URI. `TypeIndex::merge_with_uris` merges each base-game instance under its real file, and `TypeIndex::remove_files` drops the whole contribution in one index pass on a re-merge (`cacheVanilla` / `clearAllCaches`). `parse_uri` now logs a warning when a string fails to parse instead of silently substituting the fallback (the failure mode that hid this bug).
+- Added a black-box goto test (a mod reference to a vanilla definition resolves into the vanilla file, not the request document) and a cache round-trip test (save + load preserves each instance's source file).
+
 # 1.20.0
 
 ## Improvements
@@ -43,7 +58,11 @@
 - `RuleSet.modifiers` now carries the modifier category (`Vec<(String, String)>`) and a new `modifier_categories` map is parsed from `modifier_categories.cwt`; `cwtools_validation::scope_matches_required` is now public so completion and validation agree on scope compatibility.
 - Added completion tests for the variable-dump guard (numeric and localisation value positions, two-overload `has_country_flag`), the `has_dlc` snippet escaping and quoting, MIO scope-link keys, and scope-aware ranking; navigation tests for nested document symbols, folding, document highlight, and cross-file references and rename including the trailing-comment case; and unit tests for error-code suppression and the loc-stub renderer.
 
-# 1.8.6
+---
+
+_Everything below predates the changelog being resumed at 1.19.0. The releases v1.9.0 through v1.18.0 shipped without changelog entries of their own. The two sections that follow were drafted under provisional "1.8.5" and "1.8.6" headings that never matched a real tag (tags jump from v1.8.4 straight to v1.9.0); their content actually shipped inside the v1.9.x+ tags. The headings are retitled below to say so; treat them as pre-1.19.0 history, not released versions._
+
+# Pre-1.19.0: loc linting, diagnostic positions, goto de-dup, Stellaris support
 
 ## Bug Fixes
 
@@ -92,7 +111,7 @@
 - Deleted `specs/code-review-findings.md`, a 38KB planning artifact that had been committed by accident.
 - Simplification pass over this branch's new code: dropped the dead `game` parameter threaded through the loc build/validate pipeline (both terminals ignored it), deleted the owned cache reverse path (`cached_to_arena` and its helpers; the CLI `deserialize` and the round-trip tests now reload through the zero-copy archived path), removed the production-dead `languages_for_game`/`key_to_language_for_game`, and collapsed the Stellaris `child_has_always_no`/`child_is_bool` pair into one `child_is_always_no`. Five now-dead language-list tests removed (suite 637); Kaiserreich corpus byte-identical.
 
-# 1.8.5
+# Pre-1.19.0: completion responsiveness and ordering
 
 ## Improvements
 

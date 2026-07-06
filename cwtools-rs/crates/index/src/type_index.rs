@@ -401,6 +401,60 @@ impl TypeIndex {
         }
     }
 
+    /// Merge instances that each carry their own source URI. Like [`merge`], but
+    /// the per-instance URI is stored as-is instead of a single shared key, so a
+    /// batch spanning many files (the vanilla index, where every base-game file
+    /// contributes a few instances) keeps each instance pointing at its real
+    /// source file. `remove_files` drops such a batch by URI.
+    pub fn merge_with_uris(
+        &mut self,
+        per_type: impl IntoIterator<Item = (String, Vec<(Arc<str>, TypeInstance)>)>,
+    ) {
+        for (type_name, instances) in per_type {
+            let subtype_key = is_subtype_key(&type_name);
+            let set = self.instance_sets.entry(type_name.clone()).or_default();
+            let entry = self.map.entry(type_name).or_default();
+            for (uri, inst) in instances {
+                let lower = inst.name.to_ascii_lowercase();
+                if !subtype_key {
+                    *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
+                }
+                *set.entry(lower).or_insert(0) += 1;
+                entry.push((uri, inst));
+            }
+        }
+    }
+
+    /// Remove every instance contributed by any file in `file_uris`, in a single
+    /// pass over the index. Use this to drop a large multi-file contribution (the
+    /// whole vanilla index) at once: [`remove_file`](Self::remove_file) re-scans
+    /// the map on every call, so removing thousands of files one at a time would
+    /// be quadratic. Only touches the type instances; the dynamic-value indexes
+    /// are keyed separately and untouched.
+    pub fn remove_files(&mut self, file_uris: &HashSet<Arc<str>>) {
+        if file_uris.is_empty() {
+            return;
+        }
+        for (type_name, v) in self.map.iter_mut() {
+            let subtype_key = is_subtype_key(type_name);
+            v.retain(|(uri, inst)| {
+                let keep = !file_uris.contains(uri);
+                if !keep {
+                    let lower = inst.name.to_ascii_lowercase();
+                    if !subtype_key {
+                        dec_ref(&mut self.name_counts, lower.as_str());
+                    }
+                    if let Some(set) = self.instance_sets.get_mut(type_name) {
+                        dec_ref(set, lower.as_str());
+                    }
+                }
+                keep
+            });
+        }
+        self.map.retain(|_, v| !v.is_empty());
+        self.instance_sets.retain(|_, names| !names.is_empty());
+    }
+
     /// Remove all instances contributed by `file_uri`.
     pub fn remove_file(&mut self, file_uri: &str) {
         self.complex_enum_values.remove_file(file_uri);

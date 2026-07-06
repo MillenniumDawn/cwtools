@@ -2671,6 +2671,131 @@ fn test_goto_scripted_effect_in_scripted_effect_body() {
     );
 }
 
+#[test]
+fn test_goto_vanilla_definition_resolves_to_vanilla_file() {
+    // Issue #62: goto-definition on a reference to a base-game (vanilla)
+    // definition must land in the real vanilla file, not fall back to a bogus
+    // line in whatever document the user has open. Before the fix, vanilla
+    // instances were merged under the "<vanilla-cache>" sentinel, which failed
+    // to parse as a URI and resolved to the request document.
+    let ws = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), GOTO_RULES).unwrap();
+
+    // A base-game focus defined only in the vanilla install.
+    let vfocus = vanilla.path().join("common/national_focus/base.txt");
+    std::fs::create_dir_all(vfocus.parent().unwrap()).unwrap();
+    std::fs::write(&vfocus, "VANILLA_FOCUS = { x = yes }\n").unwrap();
+
+    // A mod decision that references it.
+    let decision_rel = "common/decisions/d.txt";
+    let decision = ws.path().join(decision_rel);
+    std::fs::create_dir_all(decision.parent().unwrap()).unwrap();
+    let decision_text = "my_dec = {\n    has_focus = VANILLA_FOCUS\n}\n";
+    std::fs::write(&decision, decision_text).unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+                "cacheDir": cache.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    let doc_uri = format!("file://{}", decision.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": doc_uri, "languageId": "hoi4", "version": 1, "text": decision_text,
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, decision_rel);
+
+    // Cursor on VANILLA_FOCUS (line 1, col 16). Poll: the vanilla index lands
+    // via the async workspace scan, so goto is empty until the merge completes.
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for attempt in 0..50 {
+        let req = jsonrpc_request(
+            100 + attempt,
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "position": { "line": 1, "character": 16 },
+            }),
+        );
+        write_frame(&mut child, &req).unwrap();
+        let resp_str = read_response(&mut reader).expect("no definition response");
+        let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+        let arr = resp["result"]
+            .as_array()
+            .cloned()
+            .or_else(|| {
+                resp["result"]
+                    .as_object()
+                    .map(|o| vec![serde_json::Value::Object(o.clone())])
+            })
+            .unwrap_or_default();
+        out = arr
+            .iter()
+            .filter_map(|l| {
+                Some((
+                    l["uri"].as_str()?.to_string(),
+                    l["range"]["start"]["line"].as_u64()? as u32,
+                ))
+            })
+            .collect();
+        if !out.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    child.kill().ok();
+
+    assert!(
+        out.iter()
+            .any(|(u, _)| u.ends_with("national_focus/base.txt")),
+        "goto should resolve to the vanilla focus file, got: {:?}",
+        out
+    );
+    assert!(
+        !out.iter().any(|(u, _)| u.ends_with("decisions/d.txt")),
+        "goto must NOT fall back to the request document (the #62 bug), got: {:?}",
+        out
+    );
+}
+
 // ── did_open re-validates open dependents (stale scripted_effect bug) ─────────
 
 /// Read frames until a publishDiagnostics for a URI ending in `suffix` arrives

@@ -7,6 +7,7 @@ A library for parsing, editing, and validating Paradox Interactive script files.
 
 ## Documentation
 
+- [Architecture](cwtools-rs/docs/ARCHITECTURE.md) — the crate map, the batch pipeline, the CLI-vs-LSP split, and LSP features like the idle-gated background reindex.
 - [CWXXX error/warning code reference](cwtools-rs/docs/ERROR_CODES.md) — full catalog of diagnostic codes emitted by the Rust validator.
 - [Profiling guide](cwtools-rs/PROFILING.md) — how to measure validation performance.
 

@@ -67,12 +67,16 @@ pub(crate) fn lsp_pos_to_source(pos: tower_lsp::lsp_types::Position) -> (u32, u1
     (pos.line + 1, pos.character as u16)
 }
 
-/// Parse a string into an LSP Url, falling back to a clone of `fallback` on error.
+/// Parse a string into an LSP Url, falling back to a clone of `fallback` on
+/// error. A failed parse is logged: the fallback silently resolved a location to
+/// the wrong document once (the `"<vanilla-cache>"` sentinel, #62), so a stray
+/// non-URI reaching here is worth a breadcrumb rather than a silent wrong answer.
 pub(crate) fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
-    uri_str
-        .as_ref()
-        .parse()
-        .unwrap_or_else(|_| fallback.clone())
+    let uri_str = uri_str.as_ref();
+    uri_str.parse().unwrap_or_else(|_| {
+        tracing::warn!(uri = %uri_str, "parse_uri: not a valid URI, using fallback location");
+        fallback.clone()
+    })
 }
 
 /// When the line prefix before the cursor reads `key =` (value not typed yet,
