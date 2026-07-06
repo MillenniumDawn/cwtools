@@ -3700,3 +3700,75 @@ fn test_background_reindex_picks_up_new_file_quietly() {
         panic!("{e}");
     }
 }
+
+#[test]
+fn test_clear_all_caches_reports_reindexed_message() {
+    // clearAllCaches purges the caches then re-indexes. With no competing scan
+    // it wins the CAS on the first try, so the honest-reporting refactor (fix 1)
+    // must still surface the success message — not silently no-op. The rescan
+    // itself is covered by test_rescan_prunes_deleted_file_from_index; this
+    // pins the returned status string.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    let cache_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let seed_rel = "common/decisions/b.txt";
+    let seed_path = ws.path().join(seed_rel);
+    std::fs::create_dir_all(seed_path.parent().unwrap()).unwrap();
+    std::fs::write(&seed_path, "my_dec = {\n}\n").unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+                "cacheDir": cache_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({"command": "clearAllCaches", "arguments": []}),
+        ),
+    )
+    .unwrap();
+    let resp_str = read_response(&mut reader).expect("no clearAllCaches response");
+    child.kill().ok();
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(resp["id"], 2, "got: {}", resp_str);
+    assert_eq!(
+        resp["result"].as_str(),
+        Some("Caches cleared; workspace re-indexed."),
+        "clearAllCaches should report a successful re-index, got: {}",
+        resp_str
+    );
+}
