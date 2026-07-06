@@ -2,7 +2,7 @@
 
 ## Bug Fixes
 
-- Go-to-definition, find-references, and workspace-symbol on a base-game (vanilla) definition now land in the real vanilla file instead of a bogus line in whatever document happened to be open. Vanilla instances were indexed under a synthetic `<vanilla-cache>` key that failed to parse as a URI and silently fell back to the current document; each instance now carries its own source file through both the live-index and cache-load paths. This is the root cause behind the go-to-definition issue the 1.8.6 de-dup only papered over. (cwtools-vscode#62)
+- Go-to-definition, find-references, and workspace-symbol on a base-game (vanilla) definition now land in the real vanilla file instead of a bogus line in whatever document happened to be open. Vanilla instances were indexed under a synthetic `<vanilla-cache>` key that failed to parse as a URI and silently fell back to the current document; each instance now carries its own source file through both the live-index and cache-load paths. This is the root cause behind the go-to-definition issue the earlier de-dup (see the pre-1.19.0 notes below) only papered over. (cwtools-vscode#62)
 
 ## Notes
 
