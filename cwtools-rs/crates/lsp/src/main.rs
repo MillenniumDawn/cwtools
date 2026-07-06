@@ -876,6 +876,7 @@ impl LanguageServer for Backend {
     // --- Text document sync ---
     #[tracing::instrument(skip_all)]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        self.mark_activity();
         let uri = params.text_document.uri.to_string();
         let text = params.text_document.text;
         let version = params.text_document.version;
@@ -1029,6 +1030,7 @@ impl LanguageServer for Backend {
     // --- Language features ---
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        self.mark_activity();
         self.hover_impl(params).await
     }
 
@@ -1040,10 +1042,12 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        self.mark_activity();
         self.goto_definition_impl(params).await
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        self.mark_activity();
         self.references_impl(params).await
     }
 
@@ -1051,6 +1055,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
+        self.mark_activity();
         self.document_symbol_impl(params).await
     }
 
@@ -1058,6 +1063,7 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
+        self.mark_activity();
         self.symbol_impl(params).await
     }
 
