@@ -71,6 +71,31 @@ which doesn't fit `Session`'s load-once ownership. Instead the LSP holds its own
 workspace state and builds a `Prepared` from the same shared primitives per
 validation. Same sequence, different ownership.
 
+### Background reindex
+
+A long-running session drifts: files deleted while the server had no watcher event,
+a settings change that only lands on the next scan. To catch that, the LSP runs a
+periodic quiet rescan (`background_reindex_loop` in `scan.rs`, spawned once from
+`initialized`). It re-runs the same `validate_entire_workspace` the startup scan
+does, but `quiet`: no loading bar, though diagnostics still publish, so an error
+fixed outside the editor clears.
+
+The loop is idle-gated. Each cycle re-reads the effective interval, sleeps it out,
+then waits for the user to go idle before running (`should_run_background_pass`:
+the initial index is ready, no scan already running, and at least 15s since the
+last activity). `mark_activity` resets that idle clock on edits, completion, hover,
+and navigation, so a background pass never competes with a request the user is
+waiting on. The re-entrancy guard (`scan_in_progress`) means a background pass and a
+foreground scan can't overlap; the loser skips.
+
+The cadence is the `backgroundReindexIntervalMinutes` initializationOption (default
+30, `0` disables). It is also live-updatable through `workspace/didChangeConfiguration`
+(`config.rs`), so toggling the setting takes effect without a restart. The
+`reindexWorkspace` executeCommand forces an immediate foreground rescan on demand;
+it reports "already in progress" when it loses the guard instead of silently
+no-oping. `CWTOOLS_REINDEX_INTERVAL_SECS` / `CWTOOLS_REINDEX_IDLE_SECS` override the
+interval and idle window for tests.
+
 ## Per-game validators
 
 Generic rule validation runs first (the `.cwt` engine in `validation/src/rule_core`).
@@ -135,7 +160,8 @@ The four largest areas are directory modules, each a thin `mod`/`lib` over focus
 - `game/src/scope_engine/`: `engine` (`ScopeId`/`ScopeContext`/transitions) vs
   `links` (per-game hardcoded link tables), over `mod`.
 - `lsp/src/completion/`: `builders` (item construction), `snippets`, `scope_names`,
-  over `mod`.
+  `resolve` (lazy `completionItem/resolve`: documentation and detail filled in for
+  the one item the editor focuses, kept out of the initial list), over `mod`.
 - `index/src/`: `type_index`, `path_match`, `collect`, `variables`, `dynamic_values`,
   `vanilla_cache`, behind a thin `lib.rs` that re-exports the public surface.
 
