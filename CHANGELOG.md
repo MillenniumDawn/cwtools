@@ -1,3 +1,27 @@
+# 1.20.0
+
+## Improvements
+
+- The workspace index now refreshes itself in the background. An idle-gated loop re-scans on a client-set interval (`backgroundReindexIntervalMinutes` via initializationOptions or didChangeConfiguration, default 30 minutes, 0 disables), and only after 15s without activity; edits, completion, hover, and navigation all count as activity, so a pass never competes with a request the user is waiting on. Background passes are quiet: no loading bar, but diagnostics still publish, so errors fixed outside the editor clear.
+- Rescans prune files deleted on disk from the index, symmetrically with the watched-file delete path (diagnostics cleared; open buffers and vanilla entries untouched).
+- A rescan skips the localisation rebuild when the loc file set is unchanged by stat signature (paths, sizes, mtimes).
+- Added a `reindexWorkspace` command for an on-demand full rescan. It reports "already in progress" when it loses to a running scan instead of silently doing nothing.
+- The workspace scan is guarded against overlapping runs. `clearAllCaches` retries until it wins that guard (bounded at 3 minutes), so a cache purge can no longer skip the rebuild while still reporting success.
+- Completion responses are capped and prefiltered by a subsequence match against the typed token, so a large list no longer floods the editor. A resolved list is returned complete only when it is small and comes from a clean, current parse, so the editor filters it locally with no further requests; a filtered, capped, stale, or still-changing list stays incomplete, so the editor re-queries on the next keystroke and a stale popup stops sticking.
+- Completion item documentation and detail are resolved lazily, only for the item the editor focuses (`completionItem/resolve`), so responses carry a smaller payload and the popup opens faster.
+
+## Notes
+
+- `CWTOOLS_REINDEX_INTERVAL_SECS` / `CWTOOLS_REINDEX_IDLE_SECS` override the interval and idle window; both are test knobs, the client setting is the real channel.
+- The loc stat signature can miss a same-length edit landing in the same second on a coarse-mtime filesystem (FAT/NFS); the next foreground scan picks it up.
+
+## Developer
+
+- Black-box LSP tests cover the quiet background pass (new file picked up, no loading bar), scan re-entrancy, prune-on-rescan, the loc signature, and the clearAllCaches message; `is_idle` unit tests pin the gating math.
+- Completion is instrumented with tracing spans and a per-request `cwtools_completion` summary line (total/ast/rules/build timings, item count, strategy, path); an ignored MD-scale `perf_completion_md` baseline test spawns the real server against a full Millennium Dawn checkout and prints cold/warm timings.
+- `ParsedDoc.text` is now an `Arc<str>`, so a request that only reads the open buffer clones a refcount bump instead of copying the whole document under the documents lock.
+- `did_close` clears the closed document's `completion_generation` entry, which previously leaked across every close/reopen cycle.
+
 # 1.19.0
 
 ## Bug Fixes

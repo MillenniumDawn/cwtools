@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde_json::Value;
 use tower_lsp::jsonrpc::Result;
@@ -86,6 +86,12 @@ pub(crate) struct Config {
     pub(crate) rules_dir: Option<std::path::PathBuf>,
     pub(crate) scope_checks: bool,
     pub(crate) var_checks: bool,
+    /// Minutes between quiet background re-index passes (0 = off, the
+    /// default). Sourced from `backgroundReindexIntervalMinutes` in
+    /// `initializationOptions` and `workspace/didChangeConfiguration`. A raw
+    /// client that never sends either keeps this at 0, so the periodic loop
+    /// stays disabled unless explicitly configured.
+    pub(crate) background_reindex_interval_minutes: u64,
 }
 
 impl Config {
@@ -103,6 +109,7 @@ impl Config {
             rules_dir: None,
             scope_checks,
             var_checks,
+            background_reindex_interval_minutes: 0,
         }
     }
 
@@ -250,6 +257,13 @@ struct DocumentState {
     /// is dropped to eliminate double residency; this flag prevents
     /// `ensure_vanilla_index` from re-running on subsequent workspace scans.
     vanilla_merged: std::sync::atomic::AtomicBool,
+    /// Guards `validate_entire_workspace` against re-entrant scans. The
+    /// startup scan, `clearAllCaches`, and (in a later phase) a periodic
+    /// background rescan all funnel through it; without this, two overlapping
+    /// scans would race serial `info_service` writes against each other.
+    /// `compare_exchange`-guarded on entry; a losing caller logs and returns
+    /// immediately instead of queueing behind the running scan.
+    scan_in_progress: AtomicBool,
     /// Per-URI debounce task handle. `did_change` aborts the previous sleeper for
     /// the same file before spawning a new one, so a burst of keystrokes coalesces
     /// to a single pending task instead of stacking hundreds of sleepers.
@@ -277,6 +291,19 @@ struct DocumentState {
     /// stacking N parallel AST walks when the user types fast — only the
     /// latest one matters, the rest are wasted work.
     completion_generation: parking_lot::Mutex<HashMap<String, u64>>,
+    /// Stat-only signature (path, size, mtime) over the loc files a scan last
+    /// rebuilt, so the periodic background pass can skip
+    /// `rebuild_and_publish_loc` (the biggest transient cost of a scan) when
+    /// nothing loc-related has changed on disk. `None` until the first scan
+    /// runs.
+    last_loc_signature: parking_lot::Mutex<Option<u64>>,
+    /// Server start time, the epoch `last_activity_ms` is measured against.
+    start: std::time::Instant,
+    /// Milliseconds since `start` at the last `did_change` / `completion`
+    /// request — the idle clock the background reindex loop watches.
+    /// `Relaxed`: the periodic loop is the only reader and tolerates a
+    /// slightly-stale value.
+    last_activity_ms: AtomicU64,
 }
 
 /// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
@@ -291,10 +318,45 @@ pub(crate) struct CompletionCacheEntry {
 
 pub(crate) struct ParsedDoc {
     pub(crate) version: i32,
-    pub(crate) text: String,
+    /// `Arc` so every reader that only needs to look at the text (completion,
+    /// hover, the cross-file dependent sweep) clones a refcount bump instead
+    /// of the whole document under the `documents` lock.
+    pub(crate) text: Arc<str>,
     /// Shared so the cross-file dependent sweep can validate against it without
     /// re-parsing (an `Arc` clone instead of a full re-parse per open file).
     pub(crate) ast: Option<Arc<ParsedFile>>,
+    /// Document version the cached AST was parsed from. `None` means there is
+    /// no cached AST; a value different from `version` means completion/hover
+    /// are looking at the last good parse while debounce validation catches up.
+    pub(crate) ast_version: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AstSource {
+    StoredCurrent,
+    StoredStale,
+    FreshParse,
+    None,
+}
+
+impl AstSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AstSource::StoredCurrent => "stored_current",
+            AstSource::StoredStale => "stored_stale",
+            AstSource::FreshParse => "fresh_parse",
+            AstSource::None => "none",
+        }
+    }
+
+    pub(crate) fn is_current(self) -> bool {
+        matches!(self, AstSource::StoredCurrent | AstSource::FreshParse)
+    }
+}
+
+pub(crate) struct AstSnapshot {
+    pub(crate) ast: Arc<ParsedFile>,
+    pub(crate) source: AstSource,
 }
 
 impl DocumentState {
@@ -321,11 +383,15 @@ impl DocumentState {
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
             pending_changed_names: Mutex::new(HashSet::new()),
             vanilla_merged: std::sync::atomic::AtomicBool::new(false),
+            scan_in_progress: AtomicBool::new(false),
             debounce_handles: Mutex::new(HashMap::new()),
             info_revision: AtomicU64::new(0),
             loc_cache: parking_lot::Mutex::new(None),
             fallback_cache: parking_lot::Mutex::new(None),
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
+            last_loc_signature: parking_lot::Mutex::new(None),
+            start: std::time::Instant::now(),
+            last_activity_ms: AtomicU64::new(0),
         }
     }
 }
@@ -523,18 +589,26 @@ impl Backend {
 }
 
 impl Backend {
-    /// Snapshot the document AST for `uri`. Returns the last good parse when the
-    /// buffer currently parses; when the last parse failed (the user typed
-    /// something unparseable) it re-parses the live text for THIS request only,
-    /// so hover/goto/completion still resolve a context mid-edit. The fresh AST
-    /// is not written back — the debounced validate owns the long-term one. The
-    /// `documents` mutex is held only for the snapshot, never across the parse.
-    pub(crate) fn ast_for(&self, uri: &str) -> Option<Arc<ParsedFile>> {
+    /// Snapshot the document AST for `uri`, plus whether it came from the
+    /// current document version. When there is no cached AST, re-parse the live
+    /// text for THIS request only so hover/goto/completion still resolve a
+    /// context mid-edit. The fresh AST is not written back. The debounced
+    /// validate owns the long-term one. The `documents` mutex is held only for
+    /// the snapshot, never across the parse.
+    pub(crate) fn ast_snapshot_for(&self, uri: &str) -> Option<AstSnapshot> {
         let text = {
             let docs = self.state.documents.lock();
             let doc = docs.get(uri)?;
             if let Some(ast) = &doc.ast {
-                return Some(ast.clone());
+                let source = if doc.ast_version == Some(doc.version) {
+                    AstSource::StoredCurrent
+                } else {
+                    AstSource::StoredStale
+                };
+                return Some(AstSnapshot {
+                    ast: ast.clone(),
+                    source,
+                });
             }
             doc.text.clone()
         };
@@ -542,8 +616,17 @@ impl Backend {
         tokio::task::block_in_place(|| {
             cwtools_parser::parser::parse_string(&text, &table)
                 .ok()
-                .map(Arc::new)
+                .map(|ast| AstSnapshot {
+                    ast: Arc::new(ast),
+                    source: AstSource::FreshParse,
+                })
         })
+    }
+
+    /// Snapshot the document AST for `uri`, preserving the existing behavior for
+    /// hover/goto callers that do not need freshness metadata.
+    pub(crate) fn ast_for(&self, uri: &str) -> Option<Arc<ParsedFile>> {
+        self.ast_snapshot_for(uri).map(|snapshot| snapshot.ast)
     }
 
     /// The classified element under the cursor via `element_at_position`, run on
@@ -812,7 +895,7 @@ impl LanguageServer for Backend {
         let watch_client = self.client.clone();
         let handle = tokio::spawn(async move {
             let backend = Backend { client, state };
-            backend.validate_entire_workspace().await;
+            backend.validate_entire_workspace(false).await;
         });
         // Log if the workspace scan panics — without this, a panic is silently
         // swallowed (the JoinHandle is dropped) and the server runs in a
@@ -832,6 +915,20 @@ impl LanguageServer for Backend {
                 watch_client.send_notification::<LoadingBar>(payload).await;
             }
         });
+
+        // Periodic quiet re-scan so a long-running session doesn't accumulate
+        // stale index state. Off by default (background_reindex_interval_minutes
+        // == 0); runs only while the user is idle, and every notification the
+        // scan would normally send to the status bar is suppressed.
+        let reindex_client = self.client.clone();
+        let reindex_state = self.state.clone();
+        tokio::spawn(async move {
+            let backend = Backend {
+                client: reindex_client,
+                state: reindex_state,
+            };
+            backend.background_reindex_loop().await;
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -845,6 +942,7 @@ impl LanguageServer for Backend {
     // --- Text document sync ---
     #[tracing::instrument(skip_all)]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        self.mark_activity();
         let uri = params.text_document.uri.to_string();
         let text = params.text_document.text;
         let version = params.text_document.version;
@@ -854,14 +952,16 @@ impl LanguageServer for Backend {
 
         {
             let ast = parsed.map(Arc::new);
+            let ast_version = ast.as_ref().map(|_| version);
             self.update_doc_tokens(&uri, ast.as_ref());
             let mut docs = self.state.documents.lock();
             docs.insert(
                 uri.clone(),
                 ParsedDoc {
                     version,
-                    text: text.clone(),
+                    text: Arc::from(text),
                     ast,
+                    ast_version,
                 },
             );
         }
@@ -890,6 +990,7 @@ impl LanguageServer for Backend {
 
     #[tracing::instrument(skip_all)]
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        self.mark_activity();
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
 
@@ -899,6 +1000,7 @@ impl LanguageServer for Backend {
         };
         let text = change.text;
         tracing::debug!(%uri, version, bytes = text.len(), "did_change");
+        let text: Arc<str> = Arc::from(text);
 
         // Store the new text+version immediately (keep the prior AST until we
         // revalidate). The debounced task checks the version to know whether this
@@ -918,6 +1020,7 @@ impl LanguageServer for Backend {
                         version,
                         text,
                         ast: None,
+                        ast_version: None,
                     },
                 );
             }
@@ -987,6 +1090,7 @@ impl LanguageServer for Backend {
         self.state.doc_tokens.write().remove(&uri);
         // Drop the closed loc file's live overlay contribution (#36).
         self.state.loc_live_overlay.write().remove(&uri);
+        self.state.completion_generation.lock().remove(&uri);
         cwtools_profiling::trim_memory();
         cwtools_profiling::log_rss("did_close");
         self.client
@@ -997,6 +1101,7 @@ impl LanguageServer for Backend {
     // --- Language features ---
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        self.mark_activity();
         self.hover_impl(params).await
     }
 
@@ -1004,14 +1109,20 @@ impl LanguageServer for Backend {
         self.completion_impl(params).await
     }
 
+    async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {
+        Ok(self.completion_resolve_impl(item))
+    }
+
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        self.mark_activity();
         self.goto_definition_impl(params).await
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        self.mark_activity();
         self.references_impl(params).await
     }
 
@@ -1019,6 +1130,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
+        self.mark_activity();
         self.document_symbol_impl(params).await
     }
 
@@ -1026,6 +1138,7 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
+        self.mark_activity();
         self.symbol_impl(params).await
     }
 
@@ -1441,8 +1554,9 @@ mod tests {
             "file:///test.txt".to_string(),
             ParsedDoc {
                 version: 0,
-                text: source.to_string(),
+                text: Arc::from(source),
                 ast: Some(Arc::new(parsed)),
+                ast_version: Some(0),
             },
         );
 

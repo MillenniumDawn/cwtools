@@ -79,6 +79,7 @@ fn pos_in_range(line: u32, col: u16, range: &SourceRange) -> bool {
 /// top level, in a file no type covers, or under an index-only type with no
 /// rule body. Callers fall back to their generic behavior (e.g. root-type
 /// snippets) in that case.
+#[tracing::instrument(skip_all, fields(line, col))]
 pub fn rules_at_pos(
     ast: &ParsedFile,
     file_path: &str,

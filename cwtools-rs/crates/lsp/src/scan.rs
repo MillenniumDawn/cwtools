@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tower_lsp::lsp_types::*;
 
@@ -47,6 +48,18 @@ pub(crate) fn index_vanilla_dir(
         .map(|(k, v)| (k, v.into_iter().map(|(_, inst)| inst).collect()))
         .collect();
     (per_type, aux)
+}
+
+/// RAII guard for `DocumentState::scan_in_progress`. Resets the flag to
+/// `false` on drop so a panicked scan can't wedge every later scan out
+/// forever — the guard lives inside the scanning future, so a panic
+/// unwinding through `validate_entire_workspace` still runs `Drop`.
+struct ScanGuard<'a>(&'a AtomicBool);
+
+impl Drop for ScanGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Backend {
@@ -143,16 +156,43 @@ impl Backend {
     /// previously left the bar spinning on "Indexing workspace…" forever. A
     /// panic inside the scan is handled separately by the watcher in
     /// `initialized`, which clears the bar too.
-    pub(crate) async fn validate_entire_workspace(&self) {
-        self.validate_entire_workspace_inner().await;
-        self.send_loading_bar(false, "").await;
+    ///
+    /// Re-entrancy guarded: the startup scan, `clearAllCaches`, `reindexWorkspace`,
+    /// and the periodic background pass can all land here, and two overlapping
+    /// scans would race each other's serial `info_service` writes. A losing
+    /// caller skips the scan entirely rather than blocking behind the running
+    /// one — returns `false` so a caller like the `reindexWorkspace` command
+    /// can report that back instead of the scan silently no-oping.
+    ///
+    /// `quiet` suppresses every `loadingBar` notification the scan would
+    /// otherwise send, so the periodic background pass doesn't flash the
+    /// status bar while the user is working. `send_update_file_list` still
+    /// fires either way — it's cheap and keeps the file explorer honest.
+    pub(crate) async fn validate_entire_workspace(&self, quiet: bool) -> bool {
+        if self
+            .state
+            .scan_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::debug!("workspace scan already in progress; skipping");
+            return false;
+        }
+        let _guard = ScanGuard(&self.state.scan_in_progress);
+        self.validate_entire_workspace_inner(quiet).await;
+        if !quiet {
+            self.send_loading_bar(false, "").await;
+        }
+        true
     }
 
     /// Scan the entire workspace for relevant game files and validate them all.
     #[tracing::instrument(skip_all)]
-    async fn validate_entire_workspace_inner(&self) {
+    async fn validate_entire_workspace_inner(&self, quiet: bool) {
         cwtools_profiling::log_rss("workspace_scan_start");
-        self.send_loading_bar(true, "Indexing workspace…").await;
+        if !quiet {
+            self.send_loading_bar(true, "Indexing workspace…").await;
+        }
 
         let workspace_uri = self.state.config.read().workspace_uri.clone();
 
@@ -272,7 +312,9 @@ impl Backend {
         // persist for the next scan. The disk cache speeds the cold→warm scan
         // across restarts; keeping the AST resident avoids a pass-2 re-parse
         // within a single scan.
-        self.send_loading_bar(true, "Indexing workspace…").await;
+        if !quiet {
+            self.send_loading_bar(true, "Indexing workspace…").await;
+        }
         // Snapshot the set of currently-open document URIs so both passes can
         // skip them: open docs were already indexed by did_open/did_change and
         // their fresher in-memory diagnostics must not be clobbered by stale
@@ -342,7 +384,7 @@ impl Backend {
         // Serial index phase, in file order.
         let mut parsed_files: Vec<Option<cwtools_parser::ast::ParsedFile>> =
             Vec::with_capacity(files_to_validate.len());
-        for (file_path, outcome) in files_to_validate.iter().zip(outcomes) {
+        for (i, (file_path, outcome)) in files_to_validate.iter().zip(outcomes).enumerate() {
             let parsed = match outcome {
                 Some((cache_hit, parsed)) => {
                     let uri = path_to_uri(file_path);
@@ -357,6 +399,13 @@ impl Backend {
                 None => None,
             };
             parsed_files.push(parsed);
+            // A quiet background pass shares the runtime with live requests
+            // (hover, completion, did_change); yield periodically through this
+            // serial loop so it doesn't hog a worker thread for the whole
+            // index phase. Mirrors pass 2's yield-every-50 below.
+            if quiet && i % 64 == 63 {
+                tokio::task::yield_now().await;
+            }
         }
 
         self.client
@@ -369,9 +418,73 @@ impl Backend {
             )
             .await;
 
+        // Prune index entries for files that vanished since the last scan —
+        // deleted while the server had no watcher event (e.g. while closed),
+        // or newly excluded by an ignore glob (pruning that one is correct
+        // too: it matches what a restart would index). Pass 1 above only
+        // re-indexes what IS still on disk; without this, a stale definition
+        // keeps "resolving" against a file that no longer exists until a
+        // window reload.
+        let walked_uris: HashSet<String> =
+            files_to_validate.iter().map(|p| path_to_uri(p)).collect();
+        let removed_uris: Vec<String> = {
+            let mut info = self.state.info_service.write();
+            let stale: Vec<String> = info
+                .files
+                .keys()
+                // Only real per-file entries — synthetic keys like
+                // "<vanilla-cache>"/"<vanilla-dynamic>" never land in `files`
+                // (they're merged straight into `type_index`), but guard
+                // against that changing rather than pruning them by accident.
+                .filter(|&uri| {
+                    uri.starts_with("file://")
+                        && !walked_uris.contains(uri)
+                        && !open_uris.contains(uri)
+                })
+                .cloned()
+                .collect();
+            for uri in &stale {
+                info.clear_file(uri);
+            }
+            stale
+        };
+        if !removed_uris.is_empty() {
+            // Mirrors the DELETE branch of `did_change_watched_files_impl`:
+            // the symbol index and loc live-overlay are keyed per-file too and
+            // must forget the same URIs, or goto-def/loc checks keep serving
+            // stale entries for a file `info_service` just dropped.
+            {
+                let mut index = self.state.symbol_index.lock();
+                for uri in &removed_uris {
+                    index.clear_document(uri);
+                }
+            }
+            {
+                let mut overlay = self.state.loc_live_overlay.write();
+                for uri in &removed_uris {
+                    overlay.remove(uri);
+                }
+            }
+            self.bump_info_revision();
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!(
+                        "Pruned {} file(s) no longer on disk from the index",
+                        removed_uris.len()
+                    ),
+                )
+                .await;
+            for uri in &removed_uris {
+                if let Ok(uri_obj) = Url::parse(uri) {
+                    self.client.publish_diagnostics(uri_obj, vec![], None).await;
+                }
+            }
+        }
+
         // Build the base-game index from a `vanilla` dir (or auto-discovery) if
         // we have one and haven't indexed it yet. Populates `vanilla_index`.
-        self.ensure_vanilla_index(false).await;
+        self.ensure_vanilla_index(false, quiet).await;
 
         // Merge the pre-generated vanilla index (if loaded) so base-game
         // references resolve.
@@ -392,7 +505,21 @@ impl Backend {
         // Build the loc-key index (workspace + vanilla) so pass 2's config
         // validation can check LocalisationField references (CW100/CW122), and
         // publish loc-file diagnostics (CW225 etc.) for the workspace loc files.
-        self.rebuild_and_publish_loc(&root_path).await;
+        // On a quiet background pass, skip this ~2M-entry rebuild (the biggest
+        // transient cost of a scan) when a stat-only signature over the same
+        // files says nothing loc-related changed since the last scan. A
+        // foreground scan (startup, clearAllCaches, reindexWorkspace) always
+        // rebuilds, so a user-triggered rescan never serves stale loc
+        // diagnostics — it just also records the signature for the next
+        // quiet pass to compare against.
+        let loc_signature = tokio::task::block_in_place(|| self.compute_loc_signature(&root_path));
+        let loc_unchanged = *self.state.last_loc_signature.lock() == Some(loc_signature);
+        if quiet && loc_unchanged {
+            tracing::info!("quiet scan: loc signature unchanged, skipping loc rebuild");
+        } else {
+            self.rebuild_and_publish_loc(&root_path).await;
+        }
+        *self.state.last_loc_signature.lock() = Some(loc_signature);
 
         // The index (types + loc + vanilla) is now complete. Allow per-file
         // handlers to publish real diagnostics again: anything opened/edited
@@ -409,7 +536,9 @@ impl Backend {
         // open (populated by did_open) — the scan used to insert every
         // workspace file there, pinning all texts+ASTs in memory for the
         // whole session.
-        self.send_loading_bar(true, "Validating workspace…").await;
+        if !quiet {
+            self.send_loading_bar(true, "Validating workspace…").await;
+        }
         let mut total_errors = 0usize;
         let total_files = files_to_validate.len();
         // Build the scope registry + enum_map ONCE for the whole scan instead of
@@ -595,7 +724,7 @@ impl Backend {
     /// index don't keep stale cross-file diagnostics, and on a live
     /// `didChangeConfiguration` so a changed suppression list re-filters at once.
     pub(crate) async fn revalidate_all_open_docs(&self) {
-        let open_docs: Vec<(String, String, i32)> = {
+        let open_docs: Vec<(String, Arc<str>, i32)> = {
             let docs = self.state.documents.lock();
             docs.iter()
                 .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
@@ -621,6 +750,33 @@ impl Backend {
         }
     }
 
+    /// Directories `rebuild_and_publish_loc` scans for loc files: the
+    /// workspace root plus the configured vanilla install, if any. Shared
+    /// with `compute_loc_signature` so the two can never walk different
+    /// trees.
+    fn loc_dirs(&self, root_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut dirs = vec![root_path.to_path_buf()];
+        if let Some(v) = self.state.config.read().vanilla_dir.clone() {
+            dirs.push(v);
+        }
+        dirs
+    }
+
+    /// Stat-only signature (path, size, mtime) over the loc files
+    /// `rebuild_and_publish_loc` would read. Lets a quiet background pass
+    /// detect "nothing loc-related changed" and skip the full rebuild without
+    /// reading or parsing a single file. Discovers files via
+    /// `LocService::discover_files` — the exact walk `rebuild_and_publish_loc`
+    /// uses via `LocService::from_folders` — so this can't drift from what it
+    /// actually reads. Blocking (stats every discovered file); call from
+    /// within `block_in_place`.
+    pub(crate) fn compute_loc_signature(&self, root_path: &std::path::Path) -> u64 {
+        let dirs = self.loc_dirs(root_path);
+        let dir_refs: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
+        let files = cwtools_localization::LocService::discover_files(&dir_refs);
+        loc_signature_for(files)
+    }
+
     /// Build the loc-key index from the workspace root plus the vanilla install,
     /// store it in state (for CW100/CW122 on config files), and publish loc-file
     /// diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace loc files.
@@ -631,10 +787,7 @@ impl Backend {
         // Always load the vanilla loc files when the dir is available so hover
         // shows translations for keys that exist only in the base game (#51).
         let cached_vanilla_loc = self.state.vanilla_loc_keys.lock().clone();
-        let mut loc_dirs: Vec<std::path::PathBuf> = vec![root_path.to_path_buf()];
-        if let Some(v) = self.state.config.read().vanilla_dir.clone() {
-            loc_dirs.push(v);
-        }
+        let loc_dirs = self.loc_dirs(root_path);
         let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
         let loc_languages = self.state.config.read().loc_languages.clone();
 
@@ -771,7 +924,12 @@ impl Backend {
     /// `force_rebuild` skips the cache-load fast path (and the already-indexed
     /// check) so the install is re-indexed and the cache re-written — the
     /// `cacheVanilla` command.
-    pub(crate) async fn ensure_vanilla_index(&self, force_rebuild: bool) {
+    ///
+    /// `quiet` suppresses the "Indexing base game…" loading-bar notification so a
+    /// background pass that (re)indexes vanilla doesn't flash the status bar. The
+    /// scan wrapper only clears the bar on a non-quiet run, so a quiet caller
+    /// must not raise it or it would spin forever.
+    pub(crate) async fn ensure_vanilla_index(&self, force_rebuild: bool, quiet: bool) {
         // Already populated (or already merged into type_index and dropped)? Done.
         if !force_rebuild
             && (self.state.vanilla_index.lock().is_some()
@@ -869,7 +1027,9 @@ impl Backend {
             }
         }
 
-        self.send_loading_bar(true, "Indexing base game…").await;
+        if !quiet {
+            self.send_loading_bar(true, "Indexing base game…").await;
+        }
         self.client
             .log_message(
                 MessageType::INFO,
@@ -1063,6 +1223,130 @@ impl Backend {
             }
         }
     }
+
+    // ── Background reindex ──────────────────────────────────────────────
+
+    /// Record that the user just interacted with the editor (an edit or a
+    /// completion request), resetting the idle clock the background reindex
+    /// loop watches.
+    pub(crate) fn mark_activity(&self) {
+        let now_ms = self.state.start.elapsed().as_millis() as u64;
+        self.state.last_activity_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Whether a quiet background pass may run right now: the initial scan
+    /// has finished, no scan (foreground or background) is already running,
+    /// and the user has been idle for at least `idle_ms`.
+    pub(crate) fn should_run_background_pass(&self, idle_ms: u64) -> bool {
+        if !self.state.index_ready.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.state.scan_in_progress.load(Ordering::SeqCst) {
+            return false;
+        }
+        let now_ms = self.state.start.elapsed().as_millis() as u64;
+        let last_activity_ms = self.state.last_activity_ms.load(Ordering::Relaxed);
+        is_idle(now_ms, last_activity_ms, idle_ms)
+    }
+
+    /// The configured background-reindex cadence in seconds. `0` means off.
+    /// `CWTOOLS_REINDEX_INTERVAL_SECS` overrides the config value entirely
+    /// when set (including to re-enable a disabled config), so tests don't
+    /// have to wait out a real 30-minute default.
+    fn effective_reindex_interval_secs(&self) -> u64 {
+        if let Ok(v) = std::env::var("CWTOOLS_REINDEX_INTERVAL_SECS") {
+            return v.parse().unwrap_or(0);
+        }
+        self.state
+            .config
+            .read()
+            .background_reindex_interval_minutes
+            .saturating_mul(60)
+    }
+
+    /// How long the user must be idle before a background pass runs, in
+    /// milliseconds. `CWTOOLS_REINDEX_IDLE_SECS` overrides the default of 15s
+    /// (for tests).
+    fn reindex_idle_ms() -> u64 {
+        let secs = std::env::var("CWTOOLS_REINDEX_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(15);
+        secs * 1000
+    }
+
+    /// Periodic quiet re-scan so a long-running session doesn't accumulate
+    /// stale index state (deleted-file entries missed by the watcher, a
+    /// settings change that only takes effect on the next scan, …). Spawned
+    /// once from `initialized` alongside the startup scan; runs for the life
+    /// of the server.
+    ///
+    /// Each cycle re-reads the effective interval so toggling the setting (or
+    /// the env override, in tests) live takes effect without a restart: 0
+    /// means disabled, and the loop just polls every 60s waiting for it to
+    /// become positive. Once enabled, it sleeps out the interval, then waits
+    /// for the user to go idle — checking on each idle-window tick whether
+    /// background reindex got disabled in the meantime — before running a
+    /// quiet `validate_entire_workspace`. Never unwraps: a malformed env var
+    /// degrades to "disabled"/"default", it doesn't panic the loop.
+    pub(crate) async fn background_reindex_loop(&self) {
+        loop {
+            let interval_secs = self.effective_reindex_interval_secs();
+            if interval_secs == 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+
+            let idle_ms = Self::reindex_idle_ms();
+            loop {
+                if self.effective_reindex_interval_secs() == 0 {
+                    // Disabled while we were waiting for the interval or for
+                    // the user to go idle; the outer loop will pick that up
+                    // and fall back to polling.
+                    break;
+                }
+                if self.should_run_background_pass(idle_ms) {
+                    self.validate_entire_workspace(true).await;
+                    break;
+                }
+                // Not idle yet — slip forward and check again rather than
+                // skipping the whole interval.
+                tokio::time::sleep(std::time::Duration::from_millis(idle_ms.max(50))).await;
+            }
+        }
+    }
+}
+
+/// Whether at least `idle_ms` have passed since `last_activity_ms`, both
+/// measured in milliseconds on the same monotonic clock (`DocumentState::start`).
+/// Saturating so a `last_activity_ms` briefly ahead of `now_ms` (there is no
+/// such clock, but defend anyway) reads as "not idle" instead of wrapping.
+pub(crate) fn is_idle(now_ms: u64, last_activity_ms: u64, idle_ms: u64) -> bool {
+    now_ms.saturating_sub(last_activity_ms) >= idle_ms
+}
+
+/// Fold a stat-only signature (path, size, mtime) over `files` into one
+/// hash, in a deterministic (sorted-path) order so the result doesn't depend
+/// on directory-walk order. Split out from `Backend::compute_loc_signature`
+/// so it's unit-testable without a `Backend` (which needs a live
+/// `tower_lsp::Client`).
+fn loc_signature_for(mut files: Vec<std::path::PathBuf>) -> u64 {
+    // Limitation: a same-length edit in the same second on a coarse-mtime fs (FAT/NFS) false-negatives the skip; acceptable, we don't content-hash.
+    files.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in &files {
+        path.to_string_lossy().hash(&mut hasher);
+        if let Ok(meta) = std::fs::metadata(path) {
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified()
+                && let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                since_epoch.as_nanos().hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1077,6 +1361,159 @@ mod tests {
     fn test_discover_vanilla_dir_unknown_game_is_none() {
         assert!(discover_vanilla_dir("not_a_real_game").is_none());
         assert!(discover_vanilla_dir("").is_none());
+    }
+
+    // ── is_idle (background reindex gating) ────────────────────────────────
+
+    #[test]
+    fn test_is_idle_below_threshold_is_false() {
+        // 4999ms since last activity, 5000ms required — not idle yet.
+        assert!(!is_idle(5_000, 1, 5_000));
+    }
+
+    #[test]
+    fn test_is_idle_at_exact_threshold_is_true() {
+        // Exactly `idle_ms` elapsed counts as idle (>=, not >).
+        assert!(is_idle(6_000, 1_000, 5_000));
+    }
+
+    #[test]
+    fn test_is_idle_past_threshold_is_true() {
+        assert!(is_idle(10_000, 1_000, 5_000));
+    }
+
+    #[test]
+    fn test_is_idle_zero_threshold_is_always_true() {
+        // idle_ms = 0 means "never wait" — used by the e2e test to trigger
+        // the background pass immediately once the interval elapses.
+        assert!(is_idle(0, 0, 0));
+        assert!(is_idle(12_345, 12_345, 0));
+    }
+
+    #[test]
+    fn test_is_idle_last_activity_ahead_of_now_is_false() {
+        // Should never happen (last_activity_ms is derived from the same
+        // monotonic clock as now_ms), but the saturating subtraction must
+        // not wrap into "always idle" if it somehow does.
+        assert!(!is_idle(100, 200, 1));
+        // ...unless idle_ms is 0, where "no wait required" still holds.
+        assert!(is_idle(100, 200, 0));
+    }
+
+    // ── loc_signature_for (quiet-scan loc-rebuild skip) ─────────────────────
+
+    #[test]
+    fn test_loc_signature_stable_for_unchanged_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.yml");
+        let b = tmp.path().join("b.yml");
+        std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
+        std::fs::write(&b, "l_english:\n other:0 \"value\"\n").unwrap();
+
+        let sig1 = loc_signature_for(vec![a.clone(), b.clone()]);
+        // Same files, reversed discovery order — the signature sorts paths
+        // first, so order of the input Vec must not matter.
+        let sig2 = loc_signature_for(vec![b, a]);
+        assert_eq!(sig1, sig2, "signature must not depend on discovery order");
+    }
+
+    #[test]
+    fn test_loc_signature_changes_when_a_file_is_touched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.yml");
+        std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
+
+        let before = loc_signature_for(vec![a.clone()]);
+        // Rewrite with different content (length changes) and bump mtime.
+        std::fs::write(&a, "l_english:\n key:0 \"a different, longer value\"\n").unwrap();
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        filetime_set(&a, newer);
+
+        let after = loc_signature_for(vec![a]);
+        assert_ne!(
+            before, after,
+            "touching a file's size/mtime should change the signature"
+        );
+    }
+
+    #[test]
+    fn test_loc_signature_changes_when_file_set_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.yml");
+        std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
+        let one_file = loc_signature_for(vec![a.clone()]);
+
+        let b = tmp.path().join("b.yml");
+        std::fs::write(&b, "l_english:\n other:0 \"value\"\n").unwrap();
+        let two_files = loc_signature_for(vec![a, b]);
+
+        assert_ne!(
+            one_file, two_files,
+            "adding a file to the set should change the signature"
+        );
+    }
+
+    /// Set a file's mtime forward without depending on filesystem mtime
+    /// resolution (some filesystems truncate to 1s), so the "touched" test
+    /// above is deterministic. `std::fs::File::set_modified` is stable since
+    /// Rust 1.75.
+    fn filetime_set(path: &std::path::Path, time: std::time::SystemTime) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(time).unwrap();
+    }
+
+    // ── ScanGuard (B1 re-entrancy guard) ──────────────────────────────────
+
+    #[test]
+    fn test_scan_guard_resets_flag_on_drop() {
+        let flag = AtomicBool::new(false);
+        assert!(
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        );
+        {
+            let _guard = ScanGuard(&flag);
+            assert!(flag.load(Ordering::SeqCst));
+        }
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "guard must reset the flag on drop"
+        );
+    }
+
+    #[test]
+    fn test_scan_guard_cas_rejects_second_entrant_while_held() {
+        let flag = AtomicBool::new(false);
+        assert!(
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+            "first scan should win the CAS"
+        );
+        // A second scan racing in while the first is still running loses the CAS,
+        // mirroring how `validate_entire_workspace` bails on a losing entrant.
+        assert!(
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err(),
+            "overlapping scan should lose the CAS while the first is in progress"
+        );
+    }
+
+    #[test]
+    fn test_scan_guard_drop_then_reacquire_succeeds() {
+        let flag = AtomicBool::new(false);
+        {
+            assert!(
+                flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            );
+            let _guard = ScanGuard(&flag);
+        }
+        // Guard dropped (scan finished, or panicked) — a later scan can acquire.
+        assert!(
+            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+            "flag should be free again once the guard is dropped"
+        );
     }
 
     /// Build a minimal `RuleSet` containing one type definition.

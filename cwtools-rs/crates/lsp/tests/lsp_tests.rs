@@ -251,6 +251,7 @@ mio = {
     }
 }
 alias[trigger:has_completed_focus] = <focus>
+### Always evaluates to true.
 alias[trigger:always] = bool
 alias[effect:add_political_power] = int
 modifiers = {
@@ -357,6 +358,132 @@ fn test_completion_trigger_alias_in_allowed_block() {
     );
 }
 
+/// Send a `completionItem/resolve` request for `item` over an already-running
+/// session and return the resolved `CompletionItem` JSON. Mirrors the shape of
+/// `jsonrpc_request`/`write_frame`/`read_response` used by the completion
+/// helpers above — `completionItem/resolve`'s params ARE the completion item
+/// itself (no wrapper), per the LSP spec.
+fn resolve_request(
+    child: &mut std::process::Child,
+    reader: &mut BufReader<std::process::ChildStdout>,
+    id: i64,
+    item: serde_json::Value,
+) -> serde_json::Value {
+    let body = jsonrpc_request(id, "completionItem/resolve", item);
+    write_frame(child, &body).unwrap();
+    let resp_str = read_response(reader).expect("no resolve response");
+    serde_json::from_str(&resp_str).unwrap()
+}
+
+#[test]
+fn test_completion_resolve_fills_alias_documentation() {
+    // perf/completion-responsiveness: the `### docs` comment on an alias is
+    // deferred out of the initial completion response (payload shrink) and
+    // recomputed by `completionItem/resolve` — see `completion::resolve`.
+    // `always` carries a `### Always evaluates to true.` doc in COMPLETION_RULES.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), COMPLETION_RULES).unwrap();
+    let rel_path = "common/decisions/test.txt";
+    let text = "my_decision = {\n    allowed = {\n        \n    }\n    cost = 5\n}\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let init_resp = read_response(&mut reader).expect("no init response");
+    // The server must advertise resolve support so the client knows to call
+    // completionItem/resolve at all.
+    let init: serde_json::Value = serde_json::from_str(&init_resp).unwrap();
+    assert_eq!(
+        init["result"]["capabilities"]["completionProvider"]["resolveProvider"], true,
+        "server must advertise completion resolveProvider, got: {}",
+        init_resp
+    );
+
+    let body = jsonrpc_notification(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": {
+                "uri": doc_uri,
+                "languageId": "hoi4",
+                "version": 1,
+                "text": text,
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    wait_for_diagnostics(&mut reader, rel_path);
+
+    let body = jsonrpc_request(
+        2,
+        "textDocument/completion",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            // Blank line inside `allowed = { ... }` (line 2, col 8).
+            "position": { "line": 2, "character": 8 },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let resp_str = read_response(&mut reader).expect("no completion response");
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    let items = resp["result"]["items"]
+        .as_array()
+        .or_else(|| resp["result"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let always = items
+        .iter()
+        .find(|i| i["label"] == "always")
+        .unwrap_or_else(|| panic!("`always` not offered, got: {}", resp_str));
+    // The initial response must NOT carry the deferred documentation — this
+    // is the payload shrink the deferral exists for.
+    assert!(
+        always.get("documentation").is_none() || always["documentation"].is_null(),
+        "documentation must be deferred out of the initial response, got: {}",
+        always
+    );
+    assert!(
+        !always["data"].is_null(),
+        "a deferred item must carry `data` for resolve to key off, got: {}",
+        always
+    );
+
+    let resolved = resolve_request(&mut child, &mut reader, 3, always.clone());
+    child.kill().ok();
+    let doc = &resolved["result"]["documentation"];
+    let doc_text = doc.as_str().or_else(|| doc["value"].as_str());
+    assert_eq!(
+        doc_text,
+        Some("Always evaluates to true."),
+        "resolve should repopulate the alias's ### doc, got: {}",
+        resolved
+    );
+}
+
 #[test]
 fn test_completion_on_blank_line_after_field() {
     // Completing on a fresh line after `cost = 5` must offer the block's other
@@ -373,11 +500,14 @@ fn test_completion_on_blank_line_after_field() {
 }
 
 #[test]
-fn test_completion_response_marks_incomplete() {
-    // Context-aware completions must be flagged `is_incomplete` so the client
-    // re-queries on every keystroke. Without it, VS Code caches the list and
-    // filters client-side — the "popup sticks on a half-typed prefix"
-    // symptom when the user returns to a file with stale context.
+fn test_small_context_completion_is_complete() {
+    // Strategy A (perf/completion-responsiveness): a resolved-context list at
+    // or under CONTEXT_COMPLETE_THRESHOLD is returned unfiltered and marked
+    // `is_incomplete: false` — small enough that VS Code filters and
+    // re-filters it client-side for free as the user keeps typing, with zero
+    // further requests until a word boundary or trigger char forces a
+    // re-query. (Large/filtered/fallback lists still must stay
+    // `is_incomplete: true` — see test_completion_in_half_typed_state.)
     let resp = completion_response(
         "common/decisions/test.txt",
         "my_decision = {\n    cost = 5\n}\n",
@@ -389,8 +519,98 @@ fn test_completion_response_marks_incomplete() {
         .or_else(|| resp["result"]["is_incomplete"].as_bool());
     assert_eq!(
         is_incomplete,
+        Some(false),
+        "a small resolved-context list must be marked complete, got: {}",
+        resp
+    );
+}
+
+#[test]
+fn test_completion_after_change_with_stale_ast_stays_incomplete() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), COMPLETION_RULES).unwrap();
+    let rel_path = "common/decisions/test.txt";
+    let initial_text = "my_decision = {\n    cost = 5\n    \n}\n";
+    let changed_text = "my_decision = {\n    allowed = {\n        \n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, initial_text).unwrap();
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": initial_text,
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, rel_path);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri, "version": 2 },
+                "contentChanges": [{ "text": changed_text }]
+            }),
+        ),
+    )
+    .unwrap();
+
+    let body = jsonrpc_request(
+        2,
+        "textDocument/completion",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "position": { "line": 2, "character": 8 },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let resp_str = read_response(&mut reader).expect("no completion response");
+    child.kill().ok();
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    let is_incomplete = resp["result"]["isIncomplete"]
+        .as_bool()
+        .or_else(|| resp["result"]["is_incomplete"].as_bool());
+    assert_eq!(
+        is_incomplete,
         Some(true),
-        "context-aware completion must be marked is_incomplete, got: {}",
+        "completion resolved from a stale or dirty AST must stay incomplete, got: {}",
         resp
     );
 }
@@ -2912,4 +3132,643 @@ fn test_rename_targets_value_not_trailing_comment() {
         result
     );
     assert_eq!(edits[0]["newText"], "NEW_FOCUS");
+}
+
+// ── Phase A0: MD-scale completion baseline (ignored, manual) ─────────────────
+//
+// Not a correctness test — spawns the real server against a full Millennium
+// Dawn checkout (plus the real hoi4 rules and, if present, a vanilla HOI4
+// install) and prints the `cwtools_completion` summary line for three
+// representative cursor positions, fired twice each (cold/warm). Run with:
+//
+//   cargo test --release -p cwtools_lsp perf_completion_md -- --ignored --nocapture
+//
+// Paths default to this machine's checkouts; override with CWTOOLS_PERF_MOD /
+// CWTOOLS_PERF_VANILLA / CWTOOLS_PERF_RULES. Skips (does not fail) when the mod
+// dir isn't present, so it's harmless in CI.
+
+/// `~/rest` → `$HOME/rest`; anything else is returned unchanged.
+fn perf_expand_tilde(path: &str) -> std::path::PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => std::path::Path::new(&home).join(rest),
+            None => std::path::PathBuf::from(path),
+        },
+        None => std::path::PathBuf::from(path),
+    }
+}
+
+/// Like `wait_for_scan_done`, but bounded by wall-clock time instead of an
+/// iteration count. MD's workspace scan publishes one diagnostics notification
+/// per file (7000+) before the closing `loadingBar`, so a small fixed loop
+/// either times out early or runs out mid-scan; a real mod + vanilla install
+/// can take tens of seconds to a few minutes.
+fn perf_wait_for_scan_done(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    timeout: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!("workspace scan did not finish within {:?}", timeout);
+        }
+        let Ok(raw) = read_frame(reader) else {
+            panic!("server closed stdout before the workspace scan finished");
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            && v["method"] == "loadingBar"
+            && v["params"]["enable"] == serde_json::Value::Bool(false)
+        {
+            return;
+        }
+    }
+}
+
+/// Strip ANSI SGR escapes (`\x1b[...m`). The plain `RUST_LOG` (non-profile)
+/// path doesn't disable color on the fmt subscriber, and a piped stderr still
+/// gets them here, so the summary line arrives as e.g.
+/// `\x1b[3mtotal_us\x1b[2m=\x1b[0m161 ...`.
+fn perf_strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c2 in chars.by_ref() {
+                if c2 == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Parse one `cwtools_completion` summary line (see
+/// `log_completion_summary` in `completion/mod.rs`) into its `key=value`
+/// fields. Tolerant of whatever the subscriber puts before the fields
+/// (timestamp, level, target) since only whitespace-separated `k=v` tokens
+/// are taken; returns `None` for lines that aren't a summary line.
+fn perf_parse_summary(line: &str) -> Option<std::collections::HashMap<String, String>> {
+    let line = perf_strip_ansi(line);
+    let mut map = std::collections::HashMap::new();
+    for tok in line.split_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            map.insert(k.to_string(), v.trim_matches('"').to_string());
+        }
+    }
+    map.contains_key("total_us").then_some(map)
+}
+
+#[test]
+#[ignore]
+fn perf_completion_md() {
+    let mod_dir = std::env::var("CWTOOLS_PERF_MOD")
+        .unwrap_or_else(|_| "/mnt/Linux/Millennium-Dawn".to_string());
+    let mod_path = std::path::PathBuf::from(&mod_dir);
+    if !mod_path.is_dir() {
+        eprintln!(
+            "perf_completion_md: skipping, mod dir not found: {}",
+            mod_dir
+        );
+        return;
+    }
+
+    let vanilla_dir =
+        perf_expand_tilde(&std::env::var("CWTOOLS_PERF_VANILLA").unwrap_or_else(|_| {
+            "~/.local/share/Steam/steamapps/common/Hearts of Iron IV".to_string()
+        }));
+    let rules_repo = std::env::var("CWTOOLS_PERF_RULES")
+        .unwrap_or_else(|_| "/mnt/Linux/github-projects/cwtools-hoi4-config".to_string());
+    // The repo stores the raw `.cwt` files under `Config/`, not at the repo
+    // root — matches how `rulesCache` is consumed in config.rs.
+    let rules_dir = std::path::PathBuf::from(&rules_repo).join("Config");
+
+    let mut init_opts = serde_json::json!({ "language": "hoi4" });
+    if rules_dir.is_dir() {
+        init_opts["rulesCache"] = serde_json::json!(rules_dir.to_string_lossy());
+    } else {
+        eprintln!(
+            "perf_completion_md: rules dir not found: {} (context-aware completion will be empty)",
+            rules_dir.display()
+        );
+    }
+    if vanilla_dir.is_dir() {
+        init_opts["vanilla"] = serde_json::json!(vanilla_dir.to_string_lossy());
+    } else {
+        eprintln!(
+            "perf_completion_md: vanilla dir not found: {} (base-game references won't resolve)",
+            vanilla_dir.display()
+        );
+    }
+    let cache_dir = tempfile::tempdir().unwrap();
+    init_opts["cacheDir"] = serde_json::json!(cache_dir.path().to_string_lossy());
+
+    let ws_uri = format!("file://{}", mod_path.display());
+
+    let mut cmd = cwtools_server_cmd();
+    cmd.env("RUST_LOG", "cwtools_completion=info");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn cwtools-server");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    // Drain stderr on a background thread so a full run's worth of tracing
+    // output can't fill the pipe and stall the server; collected lines are
+    // parsed for the `cwtools_completion` summaries once the run is done.
+    let stderr = child.stderr.take().unwrap();
+    let stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let stderr_lines_bg = stderr_lines.clone();
+    let stderr_thread = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            stderr_lines_bg.lock().unwrap().push(line);
+        }
+    });
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": init_opts,
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    eprintln!("perf_completion_md: waiting for workspace scan to finish...");
+    perf_wait_for_scan_done(&mut reader, std::time::Duration::from_secs(600));
+    eprintln!("perf_completion_md: workspace scan done, firing completions");
+
+    // (relative path, 0-based line, 0-based char, label) — see the branch
+    // description for how each position was picked against a real MD file.
+    let positions: [(&str, u32, u32, &str); 4] = [
+        // Inside a small focus's block: cursor on the `cost` key column, a
+        // sibling-key context resolving through `completions_from_rules`.
+        (
+            "common/national_focus/eritrea_puppet.txt",
+            22,
+            2,
+            "block-key (focus)",
+        ),
+        // `add_state_core = 282`: cursor mid-value on a `<state>` reference,
+        // resolving through `value_completions` against every state instance.
+        (
+            "common/national_focus/05_botswana.txt",
+            1032,
+            21,
+            "state-ref (value)",
+        ),
+        // Cursor on the root key of a file under a path no type covers
+        // (`common/technology_tags` has no `type[...]` path in
+        // cwtools-hoi4-config): root_type_snippets is empty, so this falls
+        // through to the flat variable/event-target fallback.
+        (
+            "common/technology_tags/00_technology.txt",
+            3,
+            0,
+            "flat-fallback",
+        ),
+        // `add_dynamic_modifier` key inside `completion_reward = { ... }`: an
+        // effect-alias key context resolving through `completions_from_rules`
+        // (the `alias/effect/trigger ### docs` category). At MD's scale this
+        // list is dominated by `<scripted_effect>` pattern-expanded instances
+        // (thousands of them, never carrying docs either way) once capped/
+        // sorted to CONTEXT_CAP, so `bytes` here doesn't move — the doc
+        // deferral's payload win shows up whenever the returned list is
+        // mostly genuinely-named aliases instead (see the branch description
+        // for the controlled measurement against cwtools-hoi4-config's docs).
+        (
+            "common/national_focus/03_benelux_shared.txt",
+            23,
+            2,
+            "effect-alias (key)",
+        ),
+    ];
+
+    let mut next_id = 10i64;
+    // Serialized response size per request, in request order (1:1 with the
+    // `cwtools_completion` summaries collected below) — the payload-shrink
+    // half of the completionItem/resolve deferral isn't visible in
+    // total_us/build_us (the docs were strings, not compute), so measure it
+    // directly.
+    let mut response_bytes: Vec<usize> = Vec::new();
+    for (rel_path, line0, char0, label) in positions {
+        let file_path = mod_path.join(rel_path);
+        if !file_path.is_file() {
+            eprintln!(
+                "perf_completion_md: skipping missing sample file {}",
+                file_path.display()
+            );
+            continue;
+        }
+        let text = std::fs::read_to_string(&file_path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {}", file_path.display(), e));
+        let doc_uri = format!("file://{}", file_path.display());
+        write_frame(
+            &mut child,
+            &jsonrpc_notification(
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": doc_uri,
+                        "languageId": "hoi4",
+                        "version": 1,
+                        "text": text,
+                    }
+                }),
+            ),
+        )
+        .unwrap();
+        wait_for_diagnostics(&mut reader, rel_path);
+
+        for pass_label in ["cold", "warm"] {
+            let id = next_id;
+            next_id += 1;
+            let body = jsonrpc_request(
+                id,
+                "textDocument/completion",
+                serde_json::json!({
+                    "textDocument": { "uri": doc_uri },
+                    "position": { "line": line0, "character": char0 },
+                }),
+            );
+            write_frame(&mut child, &body).unwrap();
+            let resp_str = read_response(&mut reader).expect("no completion response");
+            response_bytes.push(resp_str.len());
+            let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+            assert_eq!(resp["id"], id, "{} {} got: {}", label, pass_label, resp_str);
+        }
+    }
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(999, "shutdown", serde_json::json!(null)),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader);
+    child.kill().ok();
+    stderr_thread.join().ok();
+
+    let lines = stderr_lines.lock().unwrap();
+    let summaries: Vec<_> = lines.iter().filter_map(|l| perf_parse_summary(l)).collect();
+
+    println!(
+        "\n{:<22} {:<6} {:>10} {:>10} {:>7} {:>9} {:<10} {:<10} {:<10}",
+        "position",
+        "pass",
+        "total_us",
+        "build_us",
+        "items",
+        "bytes",
+        "path",
+        "strategy",
+        "incomplete"
+    );
+    let labels: Vec<&str> = positions.iter().map(|(_, _, _, label)| *label).collect();
+    let passes = ["cold", "warm"];
+    // Each didOpen fires two completion requests; the summaries appear in
+    // request order, so pair them off positionally (labels × cold/warm).
+    for (i, summary) in summaries.iter().enumerate() {
+        let label = labels.get(i / 2).copied().unwrap_or("?");
+        let pass = passes.get(i % 2).copied().unwrap_or("?");
+        let bytes = response_bytes
+            .get(i)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "{:<22} {:<6} {:>10} {:>10} {:>7} {:>9} {:<10} {:<10} {:<10}",
+            label,
+            pass,
+            summary.get("total_us").map(String::as_str).unwrap_or("?"),
+            summary.get("build_us").map(String::as_str).unwrap_or("?"),
+            summary.get("items").map(String::as_str).unwrap_or("?"),
+            bytes,
+            summary.get("path").map(String::as_str).unwrap_or("?"),
+            summary.get("strategy").map(String::as_str).unwrap_or("?"),
+            summary.get("incomplete").map(String::as_str).unwrap_or("?"),
+        );
+    }
+    assert!(
+        !summaries.is_empty(),
+        "expected at least one cwtools_completion summary line in stderr"
+    );
+}
+
+#[test]
+fn test_rescan_prunes_deleted_file_from_index() {
+    // Definition file A holds scripted_effect my_se; caller B references it.
+    // A is deleted from disk (no watcher event — e.g. deleted while the server
+    // wasn't watching, or the file was never open) and a rescan is forced via
+    // `clearAllCaches`. The rescan re-indexes what's still on disk (just B) but
+    // must also PRUNE A's now-stale entries, or my_se keeps "resolving" forever
+    // and B's CW263 never comes back.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    let cache_dir = tempfile::tempdir().unwrap(); // isolate clearAllCaches from the real cache
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let a_rel = "common/scripted_effects/a.txt";
+    let a_path = ws.path().join(a_rel);
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, "my_se = { log = \"hi\" }\n").unwrap();
+
+    let b_rel = "common/decisions/b.txt";
+    let b_path = ws.path().join(b_rel);
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &b_path,
+        "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n",
+    )
+    .unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+                "cacheDir": cache_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    // Both files exist on disk for the initial scan, so my_se resolves.
+    let before = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics before delete");
+    assert!(
+        !before.contains(&"CW263".to_string()),
+        "expected my_se to resolve while A exists, got: {:?}",
+        before
+    );
+
+    // Delete the definition, then force a rescan (no file watcher in this test).
+    std::fs::remove_file(&a_path).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({"command": "clearAllCaches", "arguments": []}),
+        ),
+    )
+    .unwrap();
+
+    let after = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics after rescan");
+    child.kill().ok();
+    assert!(
+        after.contains(&"CW263".to_string()),
+        "deleting A should resurrect B's CW263 once the rescan prunes it, got: {:?}",
+        after
+    );
+}
+
+// ── Periodic background reindex ───────────────────────────────────────────
+
+/// Read frames until a `publishDiagnostics` for a URI ending in `suffix`
+/// arrives whose codes no longer include `missing_code`. Fails immediately if
+/// a `loadingBar` notification is observed along the way — a quiet background
+/// pass must never touch the status bar, unlike the startup scan or
+/// `clearAllCaches`. Returns `Err` on a stray loadingBar or on timeout.
+fn wait_for_cleared_diag_quiet(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    suffix: &str,
+    missing_code: &str,
+) -> Result<(), String> {
+    for _ in 0..10_000 {
+        let raw = read_frame(reader).map_err(|e| format!("read error: {e}"))?;
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v["method"] == "loadingBar" {
+            return Err(format!(
+                "unexpected loadingBar notification during quiet background pass: {v}"
+            ));
+        }
+        if v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(suffix))
+        {
+            let codes: Vec<String> = v["params"]["diagnostics"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|d| d["code"].as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !codes.iter().any(|c| c == missing_code) {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "timed out waiting for {suffix} diagnostics without {missing_code}"
+    ))
+}
+
+#[test]
+fn test_background_reindex_picks_up_new_file_quietly() {
+    // The periodic background pass (CWTOOLS_REINDEX_INTERVAL_SECS=1,
+    // CWTOOLS_REINDEX_IDLE_SECS=0 so it fires almost immediately once the
+    // interval elapses) must discover a file created directly on disk — no
+    // didOpen, no didChangeWatchedFiles notification over stdio — the same
+    // way a real file-watcher gap would (a git checkout that raced the
+    // watcher, or a file appearing while the window had no focus). It must
+    // also run quiet: unlike the startup scan or `clearAllCaches`, no
+    // loadingBar notification should reach the client.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    // Only the caller exists on disk at first; the definition is added later,
+    // directly on disk, simulating a watcher-missed change.
+    let b_rel = "common/decisions/b.txt";
+    let b_path = ws.path().join(b_rel);
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &b_path,
+        "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n",
+    )
+    .unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .env("CWTOOLS_REINDEX_INTERVAL_SECS", "1")
+        .env("CWTOOLS_REINDEX_IDLE_SECS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // The startup scan runs non-quiet; drain its loadingBar traffic before the
+    // quiet-observation window starts.
+    wait_for_scan_done(&mut reader);
+
+    // Open the caller; the definition is absent, so B shows CW263.
+    let b_uri = format!("file://{}", b_path.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text":"my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n"}}),
+        ),
+    )
+    .unwrap();
+    let before = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics before background pass");
+    assert!(
+        before.contains(&"CW263".to_string()),
+        "expected CW263 before the definition exists, got: {:?}",
+        before
+    );
+
+    // Create the defining file directly on disk — no didOpen, no
+    // didChangeWatchedFiles notification. Only the periodic background
+    // pass's own filesystem walk can find it.
+    let a_rel = "common/scripted_effects/a.txt";
+    let a_path = ws.path().join(a_rel);
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, "my_se = { log = \"hi\" }\n").unwrap();
+
+    let result = wait_for_cleared_diag_quiet(&mut reader, "b.txt", "CW263");
+    child.kill().ok();
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+}
+
+#[test]
+fn test_clear_all_caches_reports_reindexed_message() {
+    // clearAllCaches purges the caches then re-indexes. With no competing scan
+    // it wins the CAS on the first try, so the honest-reporting refactor (fix 1)
+    // must still surface the success message — not silently no-op. The rescan
+    // itself is covered by test_rescan_prunes_deleted_file_from_index; this
+    // pins the returned status string.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    let cache_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let seed_rel = "common/decisions/b.txt";
+    let seed_path = ws.path().join(seed_rel);
+    std::fs::create_dir_all(seed_path.parent().unwrap()).unwrap();
+    std::fs::write(&seed_path, "my_dec = {\n}\n").unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+                "cacheDir": cache_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({"command": "clearAllCaches", "arguments": []}),
+        ),
+    )
+    .unwrap();
+    let resp_str = read_response(&mut reader).expect("no clearAllCaches response");
+    child.kill().ok();
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(resp["id"], 2, "got: {}", resp_str);
+    assert_eq!(
+        resp["result"].as_str(),
+        Some("Caches cleared; workspace re-indexed."),
+        "clearAllCaches should report a successful re-index, got: {}",
+        resp_str
+    );
 }

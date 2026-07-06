@@ -369,7 +369,7 @@ impl Backend {
         {
             let docs = self.state.documents.lock();
             if let Some(doc) = docs.get(uri) {
-                return Some(doc.text.clone());
+                return Some(doc.text.to_string());
             }
         }
         let path = crate::paths::uri_to_path_str(uri);

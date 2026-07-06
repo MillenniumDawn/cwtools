@@ -172,6 +172,18 @@ impl Backend {
             if let Some(cd) = opts.get("cacheDir").and_then(|v| v.as_str()) {
                 self.state.config.write().cache_dir = Some(std::path::PathBuf::from(cd));
             }
+
+            // Minutes between quiet background re-index passes (0 disables).
+            // A live change comes through `did_change_configuration_impl`.
+            if let Some(mins) = opts
+                .get("backgroundReindexIntervalMinutes")
+                .and_then(|v| v.as_u64())
+            {
+                self.state
+                    .config
+                    .write()
+                    .background_reindex_interval_minutes = mins;
+            }
             self.client
                 .log_message(MessageType::INFO, format!("init options: {:?}", opts))
                 .await;
@@ -324,7 +336,11 @@ impl Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
-                    resolve_provider: Some(false),
+                    // `completionItem/resolve` fills in `documentation`/`detail`
+                    // for the one item the client focuses, deferred out of the
+                    // initial list to shrink every response (perf/completion-
+                    // responsiveness) — see `completion::resolve`.
+                    resolve_provider: Some(true),
                     trigger_characters: Some(vec!["=".to_string(), "<".to_string()]),
                     work_done_progress_options: Default::default(),
                     all_commit_characters: None,
@@ -340,6 +356,7 @@ impl Backend {
                         "clearAllCaches".to_string(),
                         "reloadrulesconfig".to_string(),
                         "genlocall".to_string(),
+                        "reindexWorkspace".to_string(),
                     ],
                     work_done_progress_options: Default::default(),
                 }),
@@ -461,12 +478,13 @@ impl Backend {
         loaded
     }
 
-    /// Re-read ignore globs when the extension's `cwtools.ignore.*` settings
-    /// change. The shape mirrors what we accept in `initializationOptions`:
-    /// the payload is the `cwtools` namespace object, with optional
-    /// `ignoreFilePatterns` and `ignoreDirectories` arrays. The next
-    /// full-workspace scan will pick up the new values; an in-flight scan
-    /// finishes with the snapshot it took.
+    /// Re-read ignore globs and the background-reindex interval when the
+    /// extension's `cwtools.*` settings change. The shape mirrors what we
+    /// accept in `initializationOptions`: the payload is the `cwtools`
+    /// namespace object, with optional `ignoreFilePatterns`,
+    /// `ignoreDirectories`, and `backgroundReindexIntervalMinutes`. The next
+    /// full-workspace scan (or reindex cycle) picks up the new values; an
+    /// in-flight scan finishes with the snapshot it took.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
         // The client may send either the whole `cwtools` section (when the
         // section is registered via `configurationSection`) or just the
@@ -475,17 +493,25 @@ impl Backend {
         let (files, dirs) = extract_ignore_patterns(&params.settings);
         let codes = extract_ignored_error_codes(&params.settings);
         let (n_files, n_dirs, n_codes) = (files.len(), dirs.len(), codes.len());
+        let reindex_minutes = params
+            .settings
+            .get("backgroundReindexIntervalMinutes")
+            .and_then(|v| v.as_u64());
         {
             let mut cfg = self.state.config.write();
             cfg.ignore_file_patterns = files;
             cfg.ignore_dir_patterns = dirs;
             cfg.ignored_error_codes = codes;
+            if let Some(mins) = reindex_minutes {
+                cfg.background_reindex_interval_minutes = mins;
+            }
         }
         tracing::info!(
             file_globs = n_files,
             dir_globs = n_dirs,
             ignored_codes = n_codes,
-            "ignore patterns updated via didChangeConfiguration"
+            reindex_minutes = ?reindex_minutes,
+            "config updated via didChangeConfiguration"
         );
         // Re-filter the open documents' diagnostics against the updated
         // suppression list without waiting for a reload. Gated on the initial
@@ -519,7 +545,7 @@ impl Backend {
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
-                self.ensure_vanilla_index(true).await;
+                self.ensure_vanilla_index(true, false).await;
                 self.merge_pending_vanilla_index();
                 self.rebuild_modifier_keys();
                 // ensure_vanilla_index turns the loading bar on but, unlike a full
@@ -567,12 +593,29 @@ impl Backend {
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
-                self.validate_entire_workspace().await;
+                // validate_entire_workspace's CAS guard returns false when a scan
+                // (e.g. the periodic background pass) is already running. That
+                // scan started before this purge and may already be past its
+                // vanilla-index phase, so it can't be trusted to rebuild what we
+                // just dropped — retry until we win the CAS and actually
+                // re-index, bounded so a perpetually-busy server reports honestly
+                // instead of hanging forever.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+                let mut reindexed = self.validate_entire_workspace(false).await;
+                while !reindexed && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    reindexed = self.validate_entire_workspace(false).await;
+                }
+                let status = if reindexed {
+                    "workspace re-indexed"
+                } else {
+                    "re-index still pending (another scan is running)"
+                };
                 let msg = if failures.is_empty() {
-                    "Caches cleared; workspace re-indexed.".to_string()
+                    format!("Caches cleared; {status}.")
                 } else {
                     format!(
-                        "Caches cleared with {} error(s); workspace re-indexed. Failed: {}",
+                        "Caches cleared with {} error(s); {status}. Failed: {}",
                         failures.len(),
                         failures.join("; ")
                     )
@@ -586,7 +629,7 @@ impl Backend {
                 match dir {
                     Some(dir) => {
                         let loaded = self.load_rules_config(&dir).await;
-                        self.validate_entire_workspace().await;
+                        self.validate_entire_workspace(false).await;
                         let msg = if loaded {
                             "Rules config reloaded; workspace re-validated.".to_string()
                         } else {
@@ -606,6 +649,19 @@ impl Backend {
             // and hand them back to the client to open for review (no files are
             // written server-side).
             "genlocall" => Ok(Some(Value::Array(self.generate_missing_loc()))),
+            // User-triggered re-index (no cache purge, unlike clearAllCaches).
+            // validate_entire_workspace's CAS guard returns false when a scan
+            // (foreground or the periodic background pass) is already
+            // running; surface that instead of silently no-oping.
+            "reindexWorkspace" => {
+                let ran = self.validate_entire_workspace(false).await;
+                let msg = if ran {
+                    "Workspace re-indexed."
+                } else {
+                    "Re-index already in progress."
+                };
+                Ok(Some(Value::String(msg.to_string())))
+            }
             _ => Ok(None),
         }
     }

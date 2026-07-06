@@ -74,11 +74,21 @@ impl LocService {
     /// install). Later folders' keys join the union; duplicate keys keep the
     /// first-seen entry per language.
     pub fn from_folders(folders: &[&Path]) -> Self {
+        Self::from_paths(Self::discover_files(folders))
+    }
+
+    /// Discover the on-disk loc file paths `from_folders` would parse,
+    /// without reading or parsing them. For callers that only need a cheap
+    /// stat-based signature over the loc tree (e.g. the LSP's quiet
+    /// background rescan deciding whether to skip a full loc rebuild) —
+    /// sharing this walk with `from_folders` means the two can't disagree on
+    /// what counts as a loc file.
+    pub fn discover_files(folders: &[&Path]) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for folder in folders {
             paths.extend(walk_folder(folder));
         }
-        Self::from_paths(paths)
+        paths
     }
 
     /// Read and parse a set of loc files in parallel. Reading (disk I/O) happens

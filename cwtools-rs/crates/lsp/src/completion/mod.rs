@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -8,11 +9,13 @@ use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 
-use crate::Backend;
-use crate::CompletionCacheEntry;
-use crate::paths::{current_token_range, line_value_key, logical_path_from_uri};
+use crate::paths::{
+    current_token_range, current_token_text, line_value_key, logical_path_from_uri,
+};
+use crate::{AstSource, Backend, CompletionCacheEntry};
 
 mod builders;
+mod resolve;
 mod scope_names;
 mod snippets;
 
@@ -68,6 +71,87 @@ fn anchor_items(items: &mut [CompletionItem], range: Range) {
     }
 }
 
+/// A resolved-context list at or under this size is returned unfiltered with
+/// `is_incomplete: false`: small enough that VS Code filters and re-filters it
+/// client-side for free as the user keeps typing, with zero further requests
+/// until a word boundary or trigger char forces a re-query.
+const CONTEXT_COMPLETE_THRESHOLD: usize = 750;
+/// Above the threshold, a resolved-context list is subsequence-filtered by the
+/// typed token and truncated to this many items (see [`filter_and_cap`])
+/// before it's marked `is_incomplete: true` — the response stays cheap to
+/// serialize and the client re-queries on the next keystroke anyway.
+const CONTEXT_CAP: usize = 1000;
+
+/// Case-insensitive subsequence match: every character of `needle` appears in
+/// `haystack` in the same order, not necessarily contiguously. This is a
+/// superset of VS Code's own fuzzy matcher, so filtering by it never hides an
+/// item the client would otherwise show — it only trims candidates the client
+/// would filter out anyway, shrinking the payload. An empty `needle` matches
+/// everything.
+fn subsequence_match(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut needle_it = needle.chars().flat_map(char::to_lowercase).peekable();
+    for c in haystack.chars().flat_map(char::to_lowercase) {
+        if needle_it.peek() == Some(&c) {
+            needle_it.next();
+        }
+    }
+    needle_it.peek().is_none()
+}
+
+/// Sort by `sort_text` (falling back to `label` when absent, same as the
+/// client would) so a later truncation keeps the most relevant items, then
+/// drop every item whose `filter_text` (or `label`) doesn't subsequence-match
+/// `token`. An empty `token` matches everything, so only the sort applies.
+fn filter_by_token(items: Vec<CompletionItem>, token: &str) -> Vec<CompletionItem> {
+    let mut items = items;
+    items.sort_by(|a, b| {
+        let ka = a.sort_text.as_deref().unwrap_or(a.label.as_str());
+        let kb = b.sort_text.as_deref().unwrap_or(b.label.as_str());
+        ka.cmp(kb)
+    });
+    if token.is_empty() {
+        return items;
+    }
+    items.retain(|it| {
+        let hay = it.filter_text.as_deref().unwrap_or(it.label.as_str());
+        subsequence_match(hay, token)
+    });
+    items
+}
+
+/// [`filter_by_token`] then truncate to `cap`. Returns the (possibly shrunk)
+/// list plus whether anything was dropped — by the filter, the cap, or both —
+/// so the caller can decide whether the result is safe to mark complete.
+fn filter_and_cap(
+    items: Vec<CompletionItem>,
+    token: &str,
+    cap: usize,
+) -> (Vec<CompletionItem>, bool) {
+    let total = items.len();
+    let mut filtered = filter_by_token(items, token);
+    let dropped = filtered.len() < total || filtered.len() > cap;
+    filtered.truncate(cap);
+    (filtered, dropped)
+}
+
+fn prepare_context_items(
+    items: Vec<CompletionItem>,
+    token: &str,
+    ast_clean: bool,
+    ast_current: bool,
+    complete_threshold: usize,
+    cap: usize,
+) -> (Vec<CompletionItem>, bool, &'static str) {
+    if ast_clean && ast_current && items.len() <= complete_threshold {
+        return (items, false, "complete");
+    }
+    let (items, _) = filter_and_cap(items, token, cap);
+    (items, true, "filtered")
+}
+
 /// Snapshotted ruleset-derived state for one completion request. The `Arc`s
 /// carry the lifetime across the request so the helpers can take borrows
 /// without holding the rules read guard.
@@ -77,16 +161,73 @@ type RulesSnapshot = (
     Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>,
 );
 
+/// One line per completion request on `target: "cwtools_completion"`, emitted
+/// before every return path. Cheap when the level is disabled — tracing
+/// checks that before formatting the fields — so it stays on unconditionally.
+/// `strategy` is one of `"complete"` (small unfiltered list), `"filtered"`
+/// (subsequence-prefiltered and capped), or `"none"` (nothing to offer);
+/// `incomplete` — whether the response is flagged `is_incomplete` — follows
+/// directly from it, so it isn't a separate parameter.
+#[allow(clippy::too_many_arguments)]
+fn log_completion_summary(
+    total: Duration,
+    ast: Duration,
+    rules: Duration,
+    build: Duration,
+    items: usize,
+    strategy: &str,
+    path: &str,
+    ast_source: &str,
+) {
+    let incomplete = strategy == "filtered";
+    tracing::info!(
+        target: "cwtools_completion",
+        total_us = total.as_micros() as u64,
+        ast_us = ast.as_micros() as u64,
+        rules_us = rules.as_micros() as u64,
+        build_us = build.as_micros() as u64,
+        items,
+        incomplete,
+        strategy,
+        path,
+        ast_source,
+    );
+}
+
 impl Backend {
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            uri = %params.text_document_position.text_document.uri,
+            line = params.text_document_position.position.line,
+            col = params.text_document_position.position.character,
+        )
+    )]
     pub(crate) async fn completion_impl(
         &self,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
+        self.mark_activity();
+        let t_start = Instant::now();
+        let mut ast_dur = Duration::ZERO;
+        let mut rules_dur = Duration::ZERO;
+        let mut build_dur = Duration::ZERO;
+
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
 
         // `.cwt` rule files aren't game content — no rule-driven completion. (#43)
         if crate::paths::is_cwt_file(&uri) {
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                0,
+                "none",
+                "none",
+                AstSource::None.as_str(),
+            );
             return Ok(None);
         }
 
@@ -105,6 +246,16 @@ impl Backend {
         let is_stale =
             || self.state.completion_generation.lock().get(&uri).copied() > Some(my_generation);
         if is_stale() {
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                0,
+                "none",
+                "none",
+                AstSource::None.as_str(),
+            );
             return Ok(None);
         }
 
@@ -132,8 +283,10 @@ impl Backend {
         // being the user typing into a file whose previous validate is still
         // running. The same pattern for the rules guard: clone the Arcs and
         // drop the guard. The helpers below take borrows, so the Arcs carry
-        // the lifetime across the work without holding the lock.
-        let doc_text: String = {
+        // the lifetime across the work without holding the lock. `text` is an
+        // `Arc<str>`, so this clone is a refcount bump, not a copy of the
+        // whole document.
+        let doc_text: Arc<str> = {
             let docs = self.state.documents.lock();
             docs.get(&uri).map(|d| d.text.clone()).unwrap_or_default()
         };
@@ -142,6 +295,16 @@ impl Backend {
         // cached items are shared and the token shape differs), so it is not
         // anchored here.
         let replace_range = current_token_range(&doc_text, pos.line, pos.character);
+        // The typed token so far (up to the cursor, not the whole replace
+        // range): the subsequence prefilter below matches candidates against
+        // this, not the range end, since the range may extend past the cursor
+        // mid-word.
+        let token = current_token_text(
+            &doc_text,
+            pos.line,
+            pos.character,
+            replace_range.start.character,
+        );
         let (ruleset_arc, modifier_keys_arc, scope_registry_arc): RulesSnapshot = {
             let rules_guard = self.state.rules.read();
             (
@@ -154,6 +317,16 @@ impl Backend {
         // check here too — the rule-snapshot block is cheap, but we want the
         // staleness gate to cover the full body of the function from here.
         if is_stale() {
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                0,
+                "none",
+                "none",
+                AstSource::None.as_str(),
+            );
             return Ok(None);
         }
 
@@ -174,6 +347,20 @@ impl Backend {
             {
                 let items = (*cached.items).clone();
                 if !items.is_empty() {
+                    // Filter the retrieved copy, never the cache: the cached
+                    // list is shared across every open `.yml` and every
+                    // token, so it must stay un-anchored and un-filtered.
+                    let items = filter_by_token(items, &token);
+                    log_completion_summary(
+                        t_start.elapsed(),
+                        ast_dur,
+                        rules_dur,
+                        build_dur,
+                        items.len(),
+                        "filtered",
+                        "loc",
+                        AstSource::None.as_str(),
+                    );
                     return Ok(Some(CompletionResponse::List(CompletionList {
                         is_incomplete: true,
                         items,
@@ -181,13 +368,26 @@ impl Backend {
                 }
             } else {
                 let info_guard = self.state.info_service.read();
+                let t_build = Instant::now();
                 let items = loc_completions(&info_guard, &language, scope_registry_arc.as_deref());
+                build_dur = t_build.elapsed();
                 if !items.is_empty() {
                     *self.state.loc_cache.lock() = Some(CompletionCacheEntry {
                         revision,
                         language: language.clone(),
                         items: std::sync::Arc::new(items.clone()),
                     });
+                    let items = filter_by_token(items, &token);
+                    log_completion_summary(
+                        t_start.elapsed(),
+                        ast_dur,
+                        rules_dur,
+                        build_dur,
+                        items.len(),
+                        "filtered",
+                        "loc",
+                        AstSource::None.as_str(),
+                    );
                     return Ok(Some(CompletionResponse::List(CompletionList {
                         is_incomplete: true,
                         items,
@@ -210,13 +410,36 @@ impl Backend {
         // the flat variable dump below must NOT stand in for it — that dump is
         // the #74/#75/#79 bug. Key positions and unresolved contexts keep the
         // bool false so the fallback still fires for them.
-        let effective_ast: Option<Arc<ParsedFile>> = self.ast_for(&uri);
+        let t_ast = Instant::now();
+        let mut ast_source = AstSource::None;
+        let effective_ast: Option<Arc<ParsedFile>> = self.ast_snapshot_for(&uri).map(|snapshot| {
+            ast_source = snapshot.source;
+            snapshot.ast
+        });
+        ast_dur = t_ast.elapsed();
+        // Whether the AST the context resolved against parsed with no errors.
+        // A buffer with an unclosed clause elsewhere is still in flux — the
+        // resolved context can flip on the very next keystroke — so a small
+        // list from a dirty parse must stay `is_incomplete: true` even though
+        // its size alone would otherwise qualify it as `"complete"` below.
+        let mut context_is_clean = false;
         let context_items: Option<(Vec<CompletionItem>, bool)> =
             match (effective_ast, ruleset_arc.as_ref()) {
                 (Some(ast), Some(rs)) => {
                     if is_stale() {
+                        log_completion_summary(
+                            t_start.elapsed(),
+                            ast_dur,
+                            rules_dur,
+                            build_dur,
+                            0,
+                            "none",
+                            "none",
+                            ast_source.as_str(),
+                        );
                         return Ok(None);
                     }
+                    context_is_clean = ast.errors.is_empty();
                     let info_guard = self.state.info_service.read();
                     let game = cwtools_game::constants::Game::from_str(&language);
                     let prepared = crate::validate::make_prepared(
@@ -231,7 +454,11 @@ impl Backend {
                         scope_checks,
                         var_checks,
                     );
-                    match rules_at_pos(&ast, &logical_path, &prepared, lsp_line, lsp_col) {
+                    let t_rules = Instant::now();
+                    let rctx_opt = rules_at_pos(&ast, &logical_path, &prepared, lsp_line, lsp_col);
+                    rules_dur = t_rules.elapsed();
+                    let t_build = Instant::now();
+                    let items = match rctx_opt {
                         // Outside any known entity — offer root-type snippets.
                         None => Some((root_type_snippets(rs, &logical_path), false)),
                         Some(rctx) => {
@@ -304,22 +531,36 @@ impl Backend {
                                 };
                             Some((items, resolved_value_pos))
                         }
-                    }
+                    };
+                    build_dur = t_build.elapsed();
+                    items
                 }
                 _ => None,
             };
 
-        if let Some((mut items, resolved_value_pos)) = context_items {
+        if let Some((items, resolved_value_pos)) = context_items {
             if !items.is_empty() {
+                let (mut items, is_incomplete, strategy) = prepare_context_items(
+                    items,
+                    &token,
+                    context_is_clean,
+                    ast_source.is_current(),
+                    CONTEXT_COMPLETE_THRESHOLD,
+                    CONTEXT_CAP,
+                );
                 anchor_items(&mut items, replace_range);
-                // `is_incomplete` so the client re-queries on every keystroke.
-                // Without it, VS Code caches the list and filters client-side —
-                // which feels right until the half-typed state recovers (a new
-                // block, a recovered parse) and the cached list stays stuck on
-                // the wrong context. The re-query is cheap: the server returns
-                // the same items for a stable cursor.
+                log_completion_summary(
+                    t_start.elapsed(),
+                    ast_dur,
+                    rules_dur,
+                    build_dur,
+                    items.len(),
+                    strategy,
+                    "context",
+                    ast_source.as_str(),
+                );
                 return Ok(Some(CompletionResponse::List(CompletionList {
-                    is_incomplete: true,
+                    is_incomplete,
                     items,
                 })));
             }
@@ -327,6 +568,16 @@ impl Backend {
             // (empty dynamic set, or a value type with no enumerable members):
             // return no completions rather than the flat variable dump.
             if resolved_value_pos {
+                log_completion_summary(
+                    t_start.elapsed(),
+                    ast_dur,
+                    rules_dur,
+                    build_dur,
+                    0,
+                    "none",
+                    "none",
+                    ast_source.as_str(),
+                );
                 return Ok(None);
             }
         }
@@ -344,6 +595,10 @@ impl Backend {
         // position the AST doesn't know about, context-aware returns None,
         // and the fallback is the only thing returned. Without the cache,
         // every keystroke re-walks every file's top-level keys.
+        // Only the dynamic value sets — variables and event targets — are
+        // capped this low; see the comment below on why the old fallback's
+        // full type/enum/key dump was cut down to just these.
+        const FALLBACK_CAP: usize = 2000;
         let revision = self
             .state
             .info_revision
@@ -351,9 +606,23 @@ impl Backend {
         if let Some(cached) = self.state.fallback_cache.lock().as_ref()
             && cached.revision == revision
         {
-            let mut items = (*cached.items).clone();
+            let items = (*cached.items).clone();
             if !items.is_empty() {
+                // Filter the retrieved copy, never the cache (see below): the
+                // cached list is shared across every request regardless of
+                // typed token.
+                let (mut items, _truncated) = filter_and_cap(items, &token, FALLBACK_CAP);
                 anchor_items(&mut items, replace_range);
+                log_completion_summary(
+                    t_start.elapsed(),
+                    ast_dur,
+                    rules_dur,
+                    build_dur,
+                    items.len(),
+                    "filtered",
+                    "fallback",
+                    ast_source.as_str(),
+                );
                 return Ok(Some(CompletionResponse::List(CompletionList {
                     is_incomplete: true,
                     items,
@@ -369,9 +638,9 @@ impl Backend {
         // anyway). Types/enums/keys are still offered wherever the context-aware
         // path resolves a real rule. The `text_edit` anchor below filters this
         // set to the typed token client-side.
-        const FALLBACK_CAP: usize = 2000;
         let mut items = Vec::new();
 
+        let t_fallback_build = Instant::now();
         let info = self.state.info_service.read();
         for var in info.variable_counts.keys() {
             if items.len() >= FALLBACK_CAP {
@@ -398,8 +667,19 @@ impl Backend {
                 ..Default::default()
             });
         }
+        build_dur += t_fallback_build.elapsed();
 
         if items.is_empty() {
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                0,
+                "none",
+                "none",
+                ast_source.as_str(),
+            );
             Ok(None)
         } else {
             // Always flag the fallback `is_incomplete` so the client re-requests
@@ -408,15 +688,26 @@ impl Backend {
             // real rule context becomes available — the "stuck on abc suggestions"
             // symptom. With is_incomplete, the next keystroke re-queries and the
             // context-aware list replaces it. (#41)
-            // Cache the un-anchored items: the replace-range is per-request
-            // (it moves with the cursor), so anchor the clone that is returned,
-            // not the cached copy.
+            // Cache the un-anchored, un-filtered items: the replace-range is
+            // per-request and the token narrows on every keystroke, so filter
+            // and anchor only the clone that is returned, not the cached copy.
             *self.state.fallback_cache.lock() = Some(CompletionCacheEntry {
                 revision,
                 language: String::new(),
                 items: std::sync::Arc::new(items.clone()),
             });
+            let (mut items, _truncated) = filter_and_cap(items, &token, FALLBACK_CAP);
             anchor_items(&mut items, replace_range);
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                items.len(),
+                "filtered",
+                "fallback",
+                ast_source.as_str(),
+            );
             Ok(Some(CompletionResponse::List(CompletionList {
                 is_incomplete: true,
                 items,
@@ -1242,6 +1533,108 @@ mod tests {
             "duplicate label 'active' must appear exactly once, got {} copies",
             count
         );
+    }
+
+    // ── A1a: subsequence prefilter + cap (perf/completion-responsiveness) ────
+
+    fn item(label: &str) -> CompletionItem {
+        CompletionItem {
+            label: label.to_string(),
+            sort_text: Some(label.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn subsequence_match_matches_in_order_non_contiguous() {
+        assert!(subsequence_match("has_completed_focus", "hcf"));
+        assert!(!subsequence_match("has_completed_focus", "xyz"));
+    }
+
+    #[test]
+    fn subsequence_match_is_case_insensitive() {
+        assert!(subsequence_match("HAS_COMPLETED_FOCUS", "hcf"));
+        assert!(subsequence_match("has_completed_focus", "HCF"));
+    }
+
+    #[test]
+    fn subsequence_match_empty_needle_matches_everything() {
+        assert!(subsequence_match("anything", ""));
+    }
+
+    #[test]
+    fn filter_and_cap_empty_token_is_passthrough_but_sorted() {
+        let items = vec![item("zebra"), item("apple"), item("mango")];
+        let (out, truncated) = filter_and_cap(items, "", 10);
+        assert_eq!(
+            out.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            vec!["apple", "mango", "zebra"]
+        );
+        assert!(!truncated, "nothing dropped, nothing capped");
+    }
+
+    #[test]
+    fn filter_and_cap_drops_non_matching_items_and_flags_truncated() {
+        let items = vec![item("has_completed_focus"), item("xyz_unrelated")];
+        let (out, truncated) = filter_and_cap(items, "hcf", 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label, "has_completed_focus");
+        assert!(
+            truncated,
+            "dropping a non-matching item must flag truncated"
+        );
+    }
+
+    #[test]
+    fn filter_and_cap_enforces_cap_and_flags_truncated() {
+        let items: Vec<CompletionItem> = (0..10).map(|i| item(&format!("item_{i}"))).collect();
+        let (out, truncated) = filter_and_cap(items, "", 3);
+        assert_eq!(out.len(), 3);
+        assert!(truncated, "truncating to the cap must flag truncated");
+    }
+
+    #[test]
+    fn filter_and_cap_no_drop_no_truncate() {
+        let items = vec![item("alpha"), item("beta")];
+        let (out, truncated) = filter_and_cap(items, "a", 10);
+        assert_eq!(out.len(), 2, "both labels subsequence-match 'a'");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn prepare_context_items_marks_small_current_clean_list_complete() {
+        let items = vec![item("allowed"), item("cost")];
+        let (out, incomplete, strategy) = prepare_context_items(items, "", true, true, 10, 10);
+        assert_eq!(out.len(), 2);
+        assert!(!incomplete);
+        assert_eq!(strategy, "complete");
+    }
+
+    #[test]
+    fn prepare_context_items_marks_small_stale_list_incomplete() {
+        let items = vec![item("allowed"), item("cost")];
+        let (out, incomplete, strategy) = prepare_context_items(items, "", true, false, 10, 10);
+        assert_eq!(out.len(), 2);
+        assert!(incomplete);
+        assert_eq!(strategy, "filtered");
+    }
+
+    #[test]
+    fn prepare_context_items_marks_dirty_list_incomplete() {
+        let items = vec![item("allowed"), item("cost")];
+        let (out, incomplete, strategy) = prepare_context_items(items, "", false, true, 10, 10);
+        assert_eq!(out.len(), 2);
+        assert!(incomplete);
+        assert_eq!(strategy, "filtered");
+    }
+
+    #[test]
+    fn prepare_context_items_filters_and_caps_large_list() {
+        let items: Vec<CompletionItem> = (0..10).map(|i| item(&format!("item_{i}"))).collect();
+        let (out, incomplete, strategy) = prepare_context_items(items, "", true, true, 3, 3);
+        assert_eq!(out.len(), 3);
+        assert!(incomplete);
+        assert_eq!(strategy, "filtered");
     }
 
     // keep Arc in scope to avoid unused-import warning when no test uses it
