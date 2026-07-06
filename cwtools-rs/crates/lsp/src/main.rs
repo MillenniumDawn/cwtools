@@ -180,8 +180,16 @@ struct DocumentState {
     info_service: parking_lot::RwLock<cwtools_info::InfoService>,
     /// pre-generated base-game type instances (from a vanilla cache OR a live
     /// index of `config.vanilla_dir`), merged into the workspace index so the
-    /// editor resolves base-game references.
-    vanilla_index: Mutex<Option<HashMap<String, Vec<TypeInstance>>>>,
+    /// editor resolves base-game references. Each instance keeps its real source
+    /// path (raw, the driver / cache form) so goto-definition into base-game
+    /// content lands in the right file once the merge maps it to a `file://` URI.
+    #[allow(clippy::type_complexity)]
+    vanilla_index: Mutex<Option<HashMap<String, Vec<(Arc<str>, TypeInstance)>>>>,
+    /// The distinct source URIs the current vanilla contribution was merged
+    /// under. Tracked so a re-merge (`cacheVanilla` / `clearAllCaches`) drops
+    /// exactly the previous base-game instances in one index pass, without a
+    /// `"<vanilla-cache>"` sentinel.
+    vanilla_merged_uris: Mutex<HashSet<Arc<str>>>,
     /// Vanilla loc keys per language (display name -> lowercased keys), from the
     /// vanilla cache or extracted when rebuilding it. When set, the loc rebuild
     /// skips walking the install's loc files and merges these instead.
@@ -369,6 +377,7 @@ impl DocumentState {
             symbol_index: Mutex::new(symbols::SymbolIndex::new()),
             info_service: parking_lot::RwLock::new(cwtools_info::InfoService::new()),
             vanilla_index: Mutex::new(None),
+            vanilla_merged_uris: Mutex::new(HashSet::new()),
             vanilla_loc_keys: Mutex::new(None),
             loc_index: parking_lot::RwLock::new(None),
             loc_text: parking_lot::RwLock::new(HashMap::new()),

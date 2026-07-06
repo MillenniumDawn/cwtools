@@ -237,7 +237,10 @@ impl Session {
         let has_vanilla_data = vanilla.is_some() || vanilla_cache.is_some();
         let mut cached_loc_keys: Option<Vec<(String, Vec<String>)>> = None;
         if let Some(cache) = vanilla_cache {
-            type_index.merge("<vanilla-cache>", cache.per_type);
+            // Merge each cached instance under its real source file (not a shared
+            // sentinel) so cross-file reference resolution keeps the base-game
+            // provenance the cache stored.
+            type_index.merge_with_uris(cache.per_type);
             for n in &cache.var_names {
                 type_index.var_index.add_name(n);
             }

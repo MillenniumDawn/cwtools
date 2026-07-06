@@ -829,11 +829,11 @@ pub(crate) fn is_type_ref_leaf(
 /// Remove duplicate `Location` values from a goto-definition result, keeping
 /// the first occurrence of each `(uri, start_line, start_char)` triple.
 ///
-/// Identical entries arise when the same entity is recorded in both the vanilla
-/// cache (whose synthetic `"<vanilla-cache>"` URI resolves to the fallback URL
-/// via `parse_uri`) and the mod file, and the caller happens to be in the same
-/// file. Genuinely distinct locations (different file or different position) are
-/// preserved.
+/// Identical entries arise when the same definition is reached through more than
+/// one path (the type-instance index and the heuristic node-key index, say).
+/// Genuinely distinct locations (different file or different position) are
+/// preserved — a mod and vanilla file defining the same entity are two real
+/// sites and both survive.
 fn dedup_locations(locs: Vec<Location>) -> Vec<Location> {
     let mut seen = HashSet::new();
     locs.into_iter()
@@ -1228,9 +1228,9 @@ mod tests {
 
     #[test]
     fn dedup_locations_collapses_identical() {
-        // Issue #62: same entity in mod + vanilla produces two Locations that
-        // resolve to the same (uri, line, char) when "<vanilla-cache>" falls
-        // back to the current file URI. They must collapse to one.
+        // Issue #62: the same definition reached through two index paths yields
+        // two Locations at the same (uri, line, char). They must collapse to one
+        // (distinct sites are covered by the tests below).
         let file = "file:///mod/events/a.txt";
         let locs = vec![
             make_location(file, 2, 0),

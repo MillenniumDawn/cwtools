@@ -19,6 +19,7 @@ use cwtools_cache::io::ZSTD_LEVEL;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use cwtools_rules::rules_types::{RuleSet, SkipRootKey};
 
@@ -42,7 +43,11 @@ const MAGIC: &[u8; 4] = b"CWV\x00";
 // instances so `<type.subtype>` references into base-game content resolve. v5
 // caches lack them, so they must rebuild (else e.g. naval equipment variants
 // referencing a vanilla archetype lose their subtype).
-const CACHE_VERSION: u8 = 6;
+// v7 carries the per-instance source file (`CachedInstance.f`) through `load`
+// into `per_type` so goto-definition / find-references into base-game content
+// land in the real vanilla file. The LSP's own writer (`save_per_type`) left
+// `f` blank in v6, so those caches must rebuild to gain the source paths.
+const CACHE_VERSION: u8 = 7;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CachedInstance {
@@ -50,7 +55,7 @@ struct CachedInstance {
     t: String,
     /// instance name
     n: String,
-    /// source file (kept for future goto-into-vanilla; unused on load today)
+    /// source file (the instance's real path, so goto-into-vanilla resolves)
     f: String,
     /// start line
     l: u32,
@@ -98,7 +103,10 @@ pub struct VanillaCacheAux {
 /// Everything a loaded cache provides, ready to merge into a session.
 #[derive(Debug)]
 pub struct VanillaCacheData {
-    pub per_type: HashMap<String, Vec<TypeInstance>>,
+    /// type name -> instances, each paired with its real source file (raw path,
+    /// the driver / `TypeIndex.map` form). Consumers that navigate convert the
+    /// path to a `file://` URI when merging into the live index.
+    pub per_type: HashMap<String, Vec<(Arc<str>, TypeInstance)>>,
     /// language name -> lowercased loc keys
     pub loc_keys: Vec<(String, Vec<String>)>,
     /// normalized relative file paths (FileIndex form)
@@ -279,9 +287,10 @@ pub fn save(
 }
 
 /// As [`save`], but from a per-type instance map (the form the LSP keeps its
-/// vanilla index in). The source-file field is left blank (unused on load).
+/// vanilla index in). Each instance's source file is preserved so a cache round
+/// trip keeps goto-into-vanilla working.
 pub fn save_per_type(
-    per_type: &HashMap<String, Vec<TypeInstance>>,
+    per_type: &HashMap<String, Vec<(Arc<str>, TypeInstance)>>,
     game: &str,
     fingerprint: &str,
     path: &Path,
@@ -290,10 +299,10 @@ pub fn save_per_type(
     let instances = per_type
         .iter()
         .flat_map(|(type_name, insts)| {
-            insts.iter().map(move |inst| CachedInstance {
+            insts.iter().map(move |(file_uri, inst)| CachedInstance {
                 t: type_name.clone(),
                 n: inst.name.clone(),
-                f: String::new(),
+                f: file_uri.to_string(),
                 l: inst.location.line,
                 c: inst.location.col,
             })
@@ -323,18 +332,22 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
     let bytes = zstd::decode_all(&data[MAGIC.len() + 1..])?;
     let cache: VanillaCacheFile = rkyv::from_bytes::<VanillaCacheFile, rkyv::rancor::Error>(&bytes)
         .map_err(std::io::Error::other)?;
-    let mut per_type: HashMap<String, Vec<TypeInstance>> = HashMap::new();
+    let mut per_type: HashMap<String, Vec<(Arc<str>, TypeInstance)>> = HashMap::new();
     for ci in cache.instances {
-        per_type.entry(ci.t).or_default().push(TypeInstance {
-            name: ci.n,
-            location: SourceLocation {
-                line: ci.l,
-                col: ci.c,
+        let file_uri: Arc<str> = Arc::from(ci.f.as_str());
+        per_type.entry(ci.t).or_default().push((
+            file_uri,
+            TypeInstance {
+                name: ci.n,
+                location: SourceLocation {
+                    line: ci.l,
+                    col: ci.c,
+                },
+                // The vanilla cache doesn't store primary loc keys; hover for
+                // vanilla instances falls back to name-derived keys.
+                primary_loc_key: None,
             },
-            // The vanilla cache doesn't store primary loc keys; hover for vanilla
-            // instances falls back to name-derived keys.
-            primary_loc_key: None,
-        });
+        ));
     }
     Ok((
         cache.game,
@@ -403,6 +416,10 @@ mod tests {
         assert_eq!(game, "hoi4");
         assert_eq!(fp, "v1.16.4");
         assert_eq!(loaded.per_type.get("spriteType").map(|v| v.len()), Some(2));
+        // The per-instance source file survives the round trip (goto-into-vanilla).
+        for (uri, _) in loaded.per_type.get("spriteType").unwrap() {
+            assert_eq!(uri.as_ref(), "vanilla/x.gfx");
+        }
         assert_eq!(loaded.loc_keys.len(), 1);
         assert_eq!(loaded.loc_keys[0].0, "english");
         assert_eq!(loaded.file_paths, vec!["gfx/interface/icon.dds"]);
@@ -411,9 +428,42 @@ mod tests {
         assert_eq!(loaded.value_set_values[0].0, "country_flag");
 
         let mut idx2 = TypeIndex::new();
-        idx2.merge("<vanilla-cache>", loaded.per_type);
+        idx2.merge_with_uris(loaded.per_type);
         assert!(idx2.contains("spriteType", "GFX_A"));
         assert!(idx2.contains("spriteType", "gfx_b"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_per_type_preserves_source_file() {
+        // The LSP writes its vanilla cache via `save_per_type`; the per-instance
+        // source path must survive save + load so a vanilla goto lands in the
+        // real base-game file (the "<vanilla-cache>" sentinel bug, #62).
+        let mut per: HashMap<String, Vec<(Arc<str>, TypeInstance)>> = HashMap::new();
+        per.insert(
+            "event".to_string(),
+            vec![(
+                Arc::from("/game/events/base.txt"),
+                TypeInstance {
+                    name: "base.1".into(),
+                    location: SourceLocation { line: 7, col: 0 },
+                    primary_loc_key: None,
+                },
+            )],
+        );
+        let path = std::env::temp_dir().join("cwtools_vanilla_cache_per_type_test.cwv");
+        let aux = VanillaCacheAux::default();
+        assert_eq!(save_per_type(&per, "hoi4", "vfp", &path, aux).unwrap(), 1);
+
+        let (_, _, loaded) = load(&path).unwrap();
+        let insts = loaded.per_type.get("event").expect("event instances");
+        assert_eq!(insts.len(), 1);
+        assert_eq!(
+            insts[0].0.as_ref(),
+            "/game/events/base.txt",
+            "source file must round-trip, not fall back to empty"
+        );
+        assert_eq!(insts[0].1.location.line, 7);
         let _ = std::fs::remove_file(&path);
     }
 
