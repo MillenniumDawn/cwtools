@@ -493,6 +493,7 @@ impl Backend {
                 // here, so their (absent) AST is unaffected.
                 if ast.is_some() {
                     d.ast = ast;
+                    d.ast_version = Some(expected_version);
                 }
             } else {
                 // Doc closed (or version changed) — discard results entirely.

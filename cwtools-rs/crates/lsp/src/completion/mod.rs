@@ -9,11 +9,10 @@ use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 
-use crate::Backend;
-use crate::CompletionCacheEntry;
 use crate::paths::{
     current_token_range, current_token_text, line_value_key, logical_path_from_uri,
 };
+use crate::{AstSource, Backend, CompletionCacheEntry};
 
 mod builders;
 mod resolve;
@@ -138,6 +137,21 @@ fn filter_and_cap(
     (filtered, dropped)
 }
 
+fn prepare_context_items(
+    items: Vec<CompletionItem>,
+    token: &str,
+    ast_clean: bool,
+    ast_current: bool,
+    complete_threshold: usize,
+    cap: usize,
+) -> (Vec<CompletionItem>, bool, &'static str) {
+    if ast_clean && ast_current && items.len() <= complete_threshold {
+        return (items, false, "complete");
+    }
+    let (items, _) = filter_and_cap(items, token, cap);
+    (items, true, "filtered")
+}
+
 /// Snapshotted ruleset-derived state for one completion request. The `Arc`s
 /// carry the lifetime across the request so the helpers can take borrows
 /// without holding the rules read guard.
@@ -154,6 +168,7 @@ type RulesSnapshot = (
 /// (subsequence-prefiltered and capped), or `"none"` (nothing to offer);
 /// `incomplete` — whether the response is flagged `is_incomplete` — follows
 /// directly from it, so it isn't a separate parameter.
+#[allow(clippy::too_many_arguments)]
 fn log_completion_summary(
     total: Duration,
     ast: Duration,
@@ -162,6 +177,7 @@ fn log_completion_summary(
     items: usize,
     strategy: &str,
     path: &str,
+    ast_source: &str,
 ) {
     let incomplete = strategy == "filtered";
     tracing::info!(
@@ -174,6 +190,7 @@ fn log_completion_summary(
         incomplete,
         strategy,
         path,
+        ast_source,
     );
 }
 
@@ -208,6 +225,7 @@ impl Backend {
                 0,
                 "none",
                 "none",
+                AstSource::None.as_str(),
             );
             return Ok(None);
         }
@@ -235,6 +253,7 @@ impl Backend {
                 0,
                 "none",
                 "none",
+                AstSource::None.as_str(),
             );
             return Ok(None);
         }
@@ -305,6 +324,7 @@ impl Backend {
                 0,
                 "none",
                 "none",
+                AstSource::None.as_str(),
             );
             return Ok(None);
         }
@@ -338,6 +358,7 @@ impl Backend {
                         items.len(),
                         "filtered",
                         "loc",
+                        AstSource::None.as_str(),
                     );
                     return Ok(Some(CompletionResponse::List(CompletionList {
                         is_incomplete: true,
@@ -364,6 +385,7 @@ impl Backend {
                         items.len(),
                         "filtered",
                         "loc",
+                        AstSource::None.as_str(),
                     );
                     return Ok(Some(CompletionResponse::List(CompletionList {
                         is_incomplete: true,
@@ -388,7 +410,11 @@ impl Backend {
         // the #74/#75/#79 bug. Key positions and unresolved contexts keep the
         // bool false so the fallback still fires for them.
         let t_ast = Instant::now();
-        let effective_ast: Option<Arc<ParsedFile>> = self.ast_for(&uri);
+        let mut ast_source = AstSource::None;
+        let effective_ast: Option<Arc<ParsedFile>> = self.ast_snapshot_for(&uri).map(|snapshot| {
+            ast_source = snapshot.source;
+            snapshot.ast
+        });
         ast_dur = t_ast.elapsed();
         // Whether the AST the context resolved against parsed with no errors.
         // A buffer with an unclosed clause elsewhere is still in flux — the
@@ -408,6 +434,7 @@ impl Backend {
                             0,
                             "none",
                             "none",
+                            ast_source.as_str(),
                         );
                         return Ok(None);
                     }
@@ -512,33 +539,14 @@ impl Backend {
 
         if let Some((items, resolved_value_pos)) = context_items {
             if !items.is_empty() {
-                if context_is_clean && items.len() <= CONTEXT_COMPLETE_THRESHOLD {
-                    // Small enough (and resolved against a clean parse) to hand
-                    // the client the whole list unfiltered and mark it complete:
-                    // VS Code filters and re-filters it client-side for free as
-                    // the user keeps typing, with zero further requests until a
-                    // word boundary or trigger char.
-                    let mut items = items;
-                    anchor_items(&mut items, replace_range);
-                    log_completion_summary(
-                        t_start.elapsed(),
-                        ast_dur,
-                        rules_dur,
-                        build_dur,
-                        items.len(),
-                        "complete",
-                        "context",
-                    );
-                    return Ok(Some(CompletionResponse::List(CompletionList {
-                        is_incomplete: false,
-                        items,
-                    })));
-                }
-                // Too large to hand over whole: prefilter by what's typed so far
-                // and cap it, but keep `is_incomplete` so the client re-queries on
-                // every keystroke — a filtered/truncated list must never look
-                // complete, or a later backspace would be stuck showing it (#41).
-                let (mut items, _truncated) = filter_and_cap(items, &token, CONTEXT_CAP);
+                let (mut items, is_incomplete, strategy) = prepare_context_items(
+                    items,
+                    &token,
+                    context_is_clean,
+                    ast_source.is_current(),
+                    CONTEXT_COMPLETE_THRESHOLD,
+                    CONTEXT_CAP,
+                );
                 anchor_items(&mut items, replace_range);
                 log_completion_summary(
                     t_start.elapsed(),
@@ -546,11 +554,12 @@ impl Backend {
                     rules_dur,
                     build_dur,
                     items.len(),
-                    "filtered",
+                    strategy,
                     "context",
+                    ast_source.as_str(),
                 );
                 return Ok(Some(CompletionResponse::List(CompletionList {
-                    is_incomplete: true,
+                    is_incomplete,
                     items,
                 })));
             }
@@ -566,6 +575,7 @@ impl Backend {
                     0,
                     "none",
                     "none",
+                    ast_source.as_str(),
                 );
                 return Ok(None);
             }
@@ -610,6 +620,7 @@ impl Backend {
                     items.len(),
                     "filtered",
                     "fallback",
+                    ast_source.as_str(),
                 );
                 return Ok(Some(CompletionResponse::List(CompletionList {
                     is_incomplete: true,
@@ -666,6 +677,7 @@ impl Backend {
                 0,
                 "none",
                 "none",
+                ast_source.as_str(),
             );
             Ok(None)
         } else {
@@ -693,6 +705,7 @@ impl Backend {
                 items.len(),
                 "filtered",
                 "fallback",
+                ast_source.as_str(),
             );
             Ok(Some(CompletionResponse::List(CompletionList {
                 is_incomplete: true,
@@ -1585,6 +1598,42 @@ mod tests {
         let (out, truncated) = filter_and_cap(items, "a", 10);
         assert_eq!(out.len(), 2, "both labels subsequence-match 'a'");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn prepare_context_items_marks_small_current_clean_list_complete() {
+        let items = vec![item("allowed"), item("cost")];
+        let (out, incomplete, strategy) = prepare_context_items(items, "", true, true, 10, 10);
+        assert_eq!(out.len(), 2);
+        assert!(!incomplete);
+        assert_eq!(strategy, "complete");
+    }
+
+    #[test]
+    fn prepare_context_items_marks_small_stale_list_incomplete() {
+        let items = vec![item("allowed"), item("cost")];
+        let (out, incomplete, strategy) = prepare_context_items(items, "", true, false, 10, 10);
+        assert_eq!(out.len(), 2);
+        assert!(incomplete);
+        assert_eq!(strategy, "filtered");
+    }
+
+    #[test]
+    fn prepare_context_items_marks_dirty_list_incomplete() {
+        let items = vec![item("allowed"), item("cost")];
+        let (out, incomplete, strategy) = prepare_context_items(items, "", false, true, 10, 10);
+        assert_eq!(out.len(), 2);
+        assert!(incomplete);
+        assert_eq!(strategy, "filtered");
+    }
+
+    #[test]
+    fn prepare_context_items_filters_and_caps_large_list() {
+        let items: Vec<CompletionItem> = (0..10).map(|i| item(&format!("item_{i}"))).collect();
+        let (out, incomplete, strategy) = prepare_context_items(items, "", true, true, 3, 3);
+        assert_eq!(out.len(), 3);
+        assert!(incomplete);
+        assert_eq!(strategy, "filtered");
     }
 
     // keep Arc in scope to avoid unused-import warning when no test uses it

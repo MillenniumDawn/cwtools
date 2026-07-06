@@ -298,6 +298,38 @@ pub(crate) struct ParsedDoc {
     /// Shared so the cross-file dependent sweep can validate against it without
     /// re-parsing (an `Arc` clone instead of a full re-parse per open file).
     pub(crate) ast: Option<Arc<ParsedFile>>,
+    /// Document version the cached AST was parsed from. `None` means there is
+    /// no cached AST; a value different from `version` means completion/hover
+    /// are looking at the last good parse while debounce validation catches up.
+    pub(crate) ast_version: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AstSource {
+    StoredCurrent,
+    StoredStale,
+    FreshParse,
+    None,
+}
+
+impl AstSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AstSource::StoredCurrent => "stored_current",
+            AstSource::StoredStale => "stored_stale",
+            AstSource::FreshParse => "fresh_parse",
+            AstSource::None => "none",
+        }
+    }
+
+    pub(crate) fn is_current(self) -> bool {
+        matches!(self, AstSource::StoredCurrent | AstSource::FreshParse)
+    }
+}
+
+pub(crate) struct AstSnapshot {
+    pub(crate) ast: Arc<ParsedFile>,
+    pub(crate) source: AstSource,
 }
 
 impl DocumentState {
@@ -526,18 +558,26 @@ impl Backend {
 }
 
 impl Backend {
-    /// Snapshot the document AST for `uri`. Returns the last good parse when the
-    /// buffer currently parses; when the last parse failed (the user typed
-    /// something unparseable) it re-parses the live text for THIS request only,
-    /// so hover/goto/completion still resolve a context mid-edit. The fresh AST
-    /// is not written back — the debounced validate owns the long-term one. The
-    /// `documents` mutex is held only for the snapshot, never across the parse.
-    pub(crate) fn ast_for(&self, uri: &str) -> Option<Arc<ParsedFile>> {
+    /// Snapshot the document AST for `uri`, plus whether it came from the
+    /// current document version. When there is no cached AST, re-parse the live
+    /// text for THIS request only so hover/goto/completion still resolve a
+    /// context mid-edit. The fresh AST is not written back. The debounced
+    /// validate owns the long-term one. The `documents` mutex is held only for
+    /// the snapshot, never across the parse.
+    pub(crate) fn ast_snapshot_for(&self, uri: &str) -> Option<AstSnapshot> {
         let text = {
             let docs = self.state.documents.lock();
             let doc = docs.get(uri)?;
             if let Some(ast) = &doc.ast {
-                return Some(ast.clone());
+                let source = if doc.ast_version == Some(doc.version) {
+                    AstSource::StoredCurrent
+                } else {
+                    AstSource::StoredStale
+                };
+                return Some(AstSnapshot {
+                    ast: ast.clone(),
+                    source,
+                });
             }
             doc.text.clone()
         };
@@ -545,8 +585,17 @@ impl Backend {
         tokio::task::block_in_place(|| {
             cwtools_parser::parser::parse_string(&text, &table)
                 .ok()
-                .map(Arc::new)
+                .map(|ast| AstSnapshot {
+                    ast: Arc::new(ast),
+                    source: AstSource::FreshParse,
+                })
         })
+    }
+
+    /// Snapshot the document AST for `uri`, preserving the existing behavior for
+    /// hover/goto callers that do not need freshness metadata.
+    pub(crate) fn ast_for(&self, uri: &str) -> Option<Arc<ParsedFile>> {
+        self.ast_snapshot_for(uri).map(|snapshot| snapshot.ast)
     }
 
     /// The classified element under the cursor via `element_at_position`, run on
@@ -857,6 +906,7 @@ impl LanguageServer for Backend {
 
         {
             let ast = parsed.map(Arc::new);
+            let ast_version = ast.as_ref().map(|_| version);
             self.update_doc_tokens(&uri, ast.as_ref());
             let mut docs = self.state.documents.lock();
             docs.insert(
@@ -865,6 +915,7 @@ impl LanguageServer for Backend {
                     version,
                     text: Arc::from(text),
                     ast,
+                    ast_version,
                 },
             );
         }
@@ -922,6 +973,7 @@ impl LanguageServer for Backend {
                         version,
                         text,
                         ast: None,
+                        ast_version: None,
                     },
                 );
             }
@@ -1452,6 +1504,7 @@ mod tests {
                 version: 0,
                 text: Arc::from(source),
                 ast: Some(Arc::new(parsed)),
+                ast_version: Some(0),
             },
         );
 
