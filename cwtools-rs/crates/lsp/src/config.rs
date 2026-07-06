@@ -460,7 +460,7 @@ impl Backend {
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
-                self.ensure_vanilla_index(true).await;
+                self.ensure_vanilla_index(true, false).await;
                 self.merge_pending_vanilla_index();
                 self.rebuild_modifier_keys();
                 // ensure_vanilla_index turns the loading bar on but, unlike a full
@@ -508,12 +508,29 @@ impl Backend {
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
-                self.validate_entire_workspace(false).await;
+                // validate_entire_workspace's CAS guard returns false when a scan
+                // (e.g. the periodic background pass) is already running. That
+                // scan started before this purge and may already be past its
+                // vanilla-index phase, so it can't be trusted to rebuild what we
+                // just dropped — retry until we win the CAS and actually
+                // re-index, bounded so a perpetually-busy server reports honestly
+                // instead of hanging forever.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+                let mut reindexed = self.validate_entire_workspace(false).await;
+                while !reindexed && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    reindexed = self.validate_entire_workspace(false).await;
+                }
+                let status = if reindexed {
+                    "workspace re-indexed"
+                } else {
+                    "re-index still pending (another scan is running)"
+                };
                 let msg = if failures.is_empty() {
-                    "Caches cleared; workspace re-indexed.".to_string()
+                    format!("Caches cleared; {status}.")
                 } else {
                     format!(
-                        "Caches cleared with {} error(s); workspace re-indexed. Failed: {}",
+                        "Caches cleared with {} error(s); {status}. Failed: {}",
                         failures.len(),
                         failures.join("; ")
                     )

@@ -484,7 +484,7 @@ impl Backend {
 
         // Build the base-game index from a `vanilla` dir (or auto-discovery) if
         // we have one and haven't indexed it yet. Populates `vanilla_index`.
-        self.ensure_vanilla_index(false).await;
+        self.ensure_vanilla_index(false, quiet).await;
 
         // Merge the pre-generated vanilla index (if loaded) so base-game
         // references resolve.
@@ -926,7 +926,12 @@ impl Backend {
     /// `force_rebuild` skips the cache-load fast path (and the already-indexed
     /// check) so the install is re-indexed and the cache re-written — the
     /// `cacheVanilla` command.
-    pub(crate) async fn ensure_vanilla_index(&self, force_rebuild: bool) {
+    ///
+    /// `quiet` suppresses the "Indexing base game…" loading-bar notification so a
+    /// background pass that (re)indexes vanilla doesn't flash the status bar. The
+    /// scan wrapper only clears the bar on a non-quiet run, so a quiet caller
+    /// must not raise it or it would spin forever.
+    pub(crate) async fn ensure_vanilla_index(&self, force_rebuild: bool, quiet: bool) {
         // Already populated (or already merged into type_index and dropped)? Done.
         if !force_rebuild
             && (self.state.vanilla_index.lock().is_some()
@@ -1024,7 +1029,9 @@ impl Backend {
             }
         }
 
-        self.send_loading_bar(true, "Indexing base game…").await;
+        if !quiet {
+            self.send_loading_bar(true, "Indexing base game…").await;
+        }
         self.client
             .log_message(
                 MessageType::INFO,
@@ -1252,7 +1259,11 @@ impl Backend {
         if let Ok(v) = std::env::var("CWTOOLS_REINDEX_INTERVAL_SECS") {
             return v.parse().unwrap_or(0);
         }
-        self.state.config.read().background_reindex_interval_minutes * 60
+        self.state
+            .config
+            .read()
+            .background_reindex_interval_minutes
+            .saturating_mul(60)
     }
 
     /// How long the user must be idle before a background pass runs, in
@@ -1323,6 +1334,7 @@ pub(crate) fn is_idle(now_ms: u64, last_activity_ms: u64, idle_ms: u64) -> bool 
 /// so it's unit-testable without a `Backend` (which needs a live
 /// `tower_lsp::Client`).
 fn loc_signature_for(mut files: Vec<std::path::PathBuf>) -> u64 {
+    // Limitation: a same-length edit in the same second on a coarse-mtime fs (FAT/NFS) false-negatives the skip; acceptable, we don't content-hash.
     files.sort();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for path in &files {
