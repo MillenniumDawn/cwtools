@@ -3,6 +3,8 @@
 ## Bug Fixes
 
 - Go-to-definition, find-references, and workspace-symbol on a base-game (vanilla) definition now land in the real vanilla file instead of a bogus line in whatever document happened to be open. Vanilla instances were indexed under a synthetic `<vanilla-cache>` key that failed to parse as a URI and silently fell back to the current document; each instance now carries its own source file through both the live-index and cache-load paths. This is the root cause behind the go-to-definition issue the earlier de-dup (see the pre-1.19.0 notes below) only papered over. (cwtools-vscode#62)
+- Completion now offers subtype-gated fields inside an entity body before the discriminator that would activate them is typed. Inside a decision, `days_remove` and the other `timed` fields are suggested even though `days_remove` is itself the discriminator; in a character body the role blocks (`corps_commander`, `country_leader`, ...) are suggested. Completion unions every subtype's rules, while validation still resolves the exact matching subtype, so a field belonging to an inactive subtype is still flagged. (cwtools-vscode#89)
+- Snippet insertion is hardened so a completion can't land in the document as literal `${...}` text. A raw config literal containing `$` or `}` is now escaped for snippet-text context, and a required nested block prefills as `key = { $1 }` instead of `key = ${1:{ }}`, whose brace closed the placeholder early.
 
 ## Notes
 
@@ -12,6 +14,7 @@
 
 - The vanilla index (`vanilla_index`, `VanillaCacheData::per_type`) threads a per-instance source URI. `TypeIndex::merge_with_uris` merges each base-game instance under its real file, and `TypeIndex::remove_files` drops the whole contribution in one index pass on a re-merge (`cacheVanilla` / `clearAllCaches`). `parse_uri` now logs a warning when a string fails to parse instead of silently substituting the fallback (the failure mode that hid this bug).
 - Added a black-box goto test (a mod reference to a vanilla definition resolves into the vanilla file, not the request document) and a cache round-trip test (save + load preserves each instance's source file).
+- `merged_rules_for_type` gains a `union_all_subtypes` mode threaded through `rules_at_pos(for_completion)` and `enter_entity`; only the completion call site opts in (hover/goto and validation pass `false`). Added position-resolver tests for the decision/character subtype union and its non-leak into the validation descent, a `validate_ast` test that an inactive subtype's field is still unexpected, and a hand-rolled VS Code snippet-grammar checker run over every generated snippet.
 
 # 1.20.0
 

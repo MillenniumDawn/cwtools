@@ -43,7 +43,9 @@ pub(crate) fn generate_node_snippet(
                     continue;
                 }
                 seen.insert(k.clone());
-                required_parts.push(format!("\t{} = ${{{}:{{ }}}}", k, tab_stop));
+                // Interior tab stop, not a `${n:{ }}` default: a literal `}` in a
+                // placeholder default closes it early, so `${1:{ }}` mis-parses.
+                required_parts.push(format!("\t{} = {{ ${} }}", k, tab_stop));
                 tab_stop += 1;
             }
             _ => {}
@@ -99,9 +101,25 @@ pub(crate) fn leaf_right_placeholder(right: &NewField, tab_stop: u32, ruleset: &
         }
         // A concrete literal value (e.g. `alias[effect:<se>] = yes`): insert it
         // directly so the snippet reads `my_se = yes` rather than `my_se = ${0}`.
-        NewField::SpecificField(s) if !s.is_empty() => s.clone(),
+        // Escaped in case the config literal carries a `$` or `}`.
+        NewField::SpecificField(s) if !s.is_empty() => escape_snippet_text(s),
         _ => format!("${{{}}}", tab_stop),
     }
+}
+
+/// Escape a raw literal for snippet *text* context: backslash first, then `$` and
+/// `}`, the characters VS Code's snippet parser treats as active outside a choice.
+/// Without this a config value containing `}` or `$…` truncates the snippet or
+/// starts a spurious tab stop, and VS Code inserts the whole thing literally.
+pub(super) fn escape_snippet_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '$' | '}') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Build the comma-joined body of a `${n|...|}` choice from enum values: quote

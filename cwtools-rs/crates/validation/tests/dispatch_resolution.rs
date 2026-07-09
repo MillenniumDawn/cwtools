@@ -59,7 +59,7 @@ fn navigate(rules: &str, script: &str, file_path: &str, marker: &str) -> Option<
         var_checks: false,
     };
     let (line, col) = pos_of(script, marker);
-    rules_at_pos(&parsed, file_path, &prepared, line, col)
+    rules_at_pos(&parsed, file_path, &prepared, line, col, false)
 }
 
 fn specific_keys(rules: &[(RuleType, Options)]) -> Vec<String> {

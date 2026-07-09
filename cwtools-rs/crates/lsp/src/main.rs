@@ -690,7 +690,7 @@ impl Backend {
             scope_checks,
             var_checks,
         );
-        let rctx = rules_at_pos(&ast, logical_path, &prepared, line, col)?;
+        let rctx = rules_at_pos(&ast, logical_path, &prepared, line, col, false)?;
         drop(info_guard);
         Some(CursorResolution { rctx, ruleset })
     }

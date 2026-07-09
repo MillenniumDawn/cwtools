@@ -455,7 +455,8 @@ impl Backend {
                         var_checks,
                     );
                     let t_rules = Instant::now();
-                    let rctx_opt = rules_at_pos(&ast, &logical_path, &prepared, lsp_line, lsp_col);
+                    let rctx_opt =
+                        rules_at_pos(&ast, &logical_path, &prepared, lsp_line, lsp_col, true);
                     rules_dur = t_rules.elapsed();
                     let t_build = Instant::now();
                     let items = match rctx_opt {
@@ -1635,6 +1636,255 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert!(incomplete);
         assert_eq!(strategy, "filtered");
+    }
+
+    // ── snippet grammar validity (cwtools-vscode#89 snippet hardening) ───────
+
+    /// A focused check mirroring VS Code's `snippetParser.ts`: rejects constructs
+    /// the editor inserts literally or mishandles. Stricter than the (lenient)
+    /// real parser about a literal `{`/`}` inside a placeholder default, which is
+    /// where the node-required prefill used to leak an unescaped `}`.
+    fn snippet_defect(s: &str) -> std::result::Result<(), String> {
+        let c: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i < c.len() {
+            match c[i] {
+                '\\' => i += 2,
+                '$' => i = scan_dollar(&c, i)?,
+                _ => i += 1,
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume a `$` construct at `i` (`c[i] == '$'`), returning the next index.
+    /// A bare `$` (or a `$name` variable) is literal text to the parser.
+    fn scan_dollar(c: &[char], i: usize) -> std::result::Result<usize, String> {
+        match c.get(i + 1) {
+            Some(d) if d.is_ascii_digit() => {
+                let mut j = i + 1;
+                while j < c.len() && c[j].is_ascii_digit() {
+                    j += 1;
+                }
+                Ok(j)
+            }
+            Some('{') => scan_brace(c, i),
+            _ => Ok(i + 1),
+        }
+    }
+
+    /// Consume a `${ … }` construct starting at `i` (`c[i..i+2] == "${"`).
+    fn scan_brace(c: &[char], i: usize) -> std::result::Result<usize, String> {
+        let digits_start = i + 2;
+        let mut j = digits_start;
+        while j < c.len() && c[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == digits_start {
+            return Err("`${` without a tab-stop number".into());
+        }
+        let is_zero = c[digits_start..j].iter().all(|d| *d == '0');
+        match c.get(j) {
+            Some('}') => Ok(j + 1),
+            Some('|') => scan_choice(c, j, is_zero),
+            Some(':') => scan_default(c, j + 1),
+            _ => Err("malformed `${…}`".into()),
+        }
+    }
+
+    /// Consume a choice body from its opening `|` (`c[j] == '|'`) to the `|}` close.
+    fn scan_choice(c: &[char], j: usize, is_zero: bool) -> std::result::Result<usize, String> {
+        if is_zero {
+            return Err("choice on tab stop $0 is inserted literally".into());
+        }
+        let mut k = j + 1;
+        while k < c.len() {
+            match c[k] {
+                '\\' => k += 2,
+                '|' if c.get(k + 1) == Some(&'}') => return Ok(k + 2),
+                '|' => return Err("unescaped `|` in a choice value".into()),
+                _ => k += 1,
+            }
+        }
+        Err("unterminated choice".into())
+    }
+
+    /// Consume a placeholder default from the first default char to the matching
+    /// unescaped `}`. A bare `{` here is the `${1:{ }}` defect (the `}` closes early).
+    fn scan_default(c: &[char], mut k: usize) -> std::result::Result<usize, String> {
+        while k < c.len() {
+            match c[k] {
+                '\\' => k += 2,
+                '}' => return Ok(k + 1),
+                '$' => k = scan_dollar(c, k)?,
+                '{' => return Err("bare `{` in a placeholder default".into()),
+                _ => k += 1,
+            }
+        }
+        Err("unterminated placeholder default".into())
+    }
+
+    #[test]
+    fn snippet_checker_accepts_valid_and_rejects_defects() {
+        for good in [
+            "k = { $1 }",
+            "k = {\n\t$0\n}",
+            "add = ${1}$0",
+            "always = ${1|yes,no|}$0",
+            "has_dlc = ${1|\"a b\",c|}",
+            "lit = a\\$b\\}c$0",
+            "plain = yes$0",
+        ] {
+            assert!(
+                snippet_defect(good).is_ok(),
+                "should accept {:?}: {:?}",
+                good,
+                snippet_defect(good)
+            );
+        }
+        for bad in [
+            "k = ${1:{ }}",  // bare `{` default — the old node-required bug
+            "c = ${0|a,b|}", // choice on $0
+            "u = ${1:foo",   // unterminated default
+            "u = ${1|a,b|",  // unterminated choice
+            "u = ${}",       // no tab-stop number
+        ] {
+            assert!(snippet_defect(bad).is_err(), "should reject {:?}", bad);
+        }
+    }
+
+    /// The SNIPPET-format `insert_text` of every item, for the sweep below.
+    fn snippet_texts(items: &[CompletionItem]) -> Vec<String> {
+        items
+            .iter()
+            .filter(|it| it.insert_text_format == Some(InsertTextFormat::SNIPPET))
+            .filter_map(|it| it.insert_text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn all_generated_snippets_are_grammar_valid() {
+        let info = cwtools_info::InfoService::new();
+        let empty = HashSet::new();
+        let mut snips: Vec<String> = Vec::new();
+
+        // Key-context snippets across the leaf/node/enum builder arms.
+        let rs = bool_enum_ruleset();
+        let rules = match rs.root_rules.first() {
+            Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) => rules.as_slice(),
+            _ => panic!("expected TypeRule"),
+        };
+        snips.extend(snippet_texts(&completions_from_rules(
+            rules, &rs, &info, "hoi4", &empty, None, None,
+        )));
+        snips.extend(snippet_texts(&root_type_snippets(&rs, "events/x.txt")));
+
+        // Alias block (required child prefill) + value alias.
+        let rs = alias_effect_ruleset();
+        snips.extend(snippet_texts(&completions_from_rules(
+            &effect_alias_usage(),
+            &rs,
+            &info,
+            "hoi4",
+            &empty,
+            None,
+            None,
+        )));
+
+        // Enum choice with spaced / comma / colon values.
+        let rs = dlc_enum_ruleset();
+        let trigger_usage = vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField("trigger".to_string()),
+                right: NewField::AliasField("trigger".to_string()),
+            },
+            Options::default(),
+        )];
+        snips.extend(snippet_texts(&completions_from_rules(
+            &trigger_usage,
+            &rs,
+            &info,
+            "hoi4",
+            &empty,
+            None,
+            None,
+        )));
+
+        // A required NODE child — the case that used to emit `${1:{ }}`.
+        let node_required = vec![(
+            RuleType::NodeRule {
+                left: NewField::SpecificField("child".to_string()),
+                rules: vec![],
+            },
+            Options {
+                min: 1,
+                ..Options::default()
+            },
+        )];
+        let node_snip = generate_node_snippet("outer", &node_required, &rs);
+        assert!(
+            node_snip.contains("child = { $1 }"),
+            "required node child must use an interior tab stop, got: {}",
+            node_snip
+        );
+        assert!(
+            !node_snip.contains("${1:{"),
+            "required node child must not use a brace default, got: {}",
+            node_snip
+        );
+        snips.push(node_snip);
+
+        assert!(!snips.is_empty(), "sweep produced no snippets");
+        for s in &snips {
+            assert!(
+                snippet_defect(s).is_ok(),
+                "generated snippet {:?} is invalid: {}",
+                s,
+                snippet_defect(s).unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn specific_field_literal_is_snippet_escaped() {
+        // A concrete alias value carrying `$`/`}` must be escaped so VS Code
+        // doesn't read it as a variable/tab stop or truncate the snippet.
+        let mut rs = RuleSet::new();
+        rs.aliases.push((
+            "effect:danger".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[effect:danger]".to_string()),
+                    right: NewField::SpecificField("a$b}c".to_string()),
+                },
+                Options::default(),
+            ),
+        ));
+        rs.reindex();
+        let info = cwtools_info::InfoService::new();
+        let usage = vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField("effect".to_string()),
+                right: NewField::AliasField("effect".to_string()),
+            },
+            Options::default(),
+        )];
+        let items = completions_from_rules(&usage, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let danger = items
+            .iter()
+            .find(|i| i.label == "danger")
+            .expect("danger completion");
+        let snip = danger.insert_text.as_deref().unwrap_or("");
+        assert!(
+            snip.contains("a\\$b\\}c"),
+            "literal must be snippet-escaped, got: {:?}",
+            snip
+        );
+        assert!(
+            snippet_defect(snip).is_ok(),
+            "escaped snippet must be valid, got: {:?}",
+            snip
+        );
     }
 
     // keep Arc in scope to avoid unused-import warning when no test uses it

@@ -58,7 +58,7 @@ pub(crate) fn validate_with_type(
     }
 
     let (merged, matched_subtype_names, push_scope) =
-        merged_rules_for_type(ctx, type_def, children, inner_rules, node_key);
+        merged_rules_for_type(ctx, type_def, children, inner_rules, node_key, false);
 
     // Step 3: if no subtypes matched and there are no base rules, there's nothing to validate.
     // This handles the case where a type is defined purely via subtypes: a script object that
@@ -111,12 +111,18 @@ pub(crate) type MergedTypeRules<'a> = (
 ///
 /// Returns `(merged rules, matched subtype names, push_scope)`. With no
 /// subtypes this is just `(inner_rules, [], None)`.
+///
+/// `union_all_subtypes` is the completion-only mode: instead of the exact matching
+/// set, `merged` is the union of every subtype's rules so discriminator-gated
+/// fields are offered before the discriminator is typed (see
+/// [`all_subtype_rules_union`]). Validation always passes `false`.
 pub(crate) fn merged_rules_for_type<'a>(
     ctx: &ValidationCtx,
     type_def: &'a TypeDefinition,
     children: &[Child],
     inner_rules: &'a [(RuleType, Options)],
     node_key: Option<&str>,
+    union_all_subtypes: bool,
 ) -> MergedTypeRules<'a> {
     if type_def.subtypes.is_empty() {
         return (Cow::Borrowed(inner_rules), Vec::new(), None);
@@ -150,6 +156,15 @@ pub(crate) fn merged_rules_for_type<'a>(
             .iter()
             .any(|excl| all_names_copy.contains(excl.as_str()))
     });
+
+    // Completion mode: union all subtypes instead of resolving the exact match.
+    // push_scope still comes from the actually-matching subtypes so scope seeding
+    // is unchanged.
+    if union_all_subtypes {
+        let merged = all_subtype_rules_union(type_def, inner_rules);
+        let push_scope = first_matching_push_scope(type_def, &matched_subtype_names);
+        return (merged, matched_subtype_names, push_scope);
+    }
 
     // Step 2: collect base rules (non-SubtypeRule entries) + matching SubtypeRule entries.
     // Expand SubtypeRule(key, shouldMatch, cfs) based on whether key is in the
@@ -227,13 +242,59 @@ pub(crate) fn merged_rules_for_type<'a>(
     }
 
     // Step 4: pick push_scope from the first matching subtype that has one.
-    let push_scope: Option<&str> = type_def
+    let push_scope = first_matching_push_scope(type_def, &matched_subtype_names);
+
+    (merged, matched_subtype_names, push_scope)
+}
+
+/// push_scope of the first matching subtype that declares one. Shared so the
+/// exact-match and union-all paths seed scope identically.
+fn first_matching_push_scope<'a>(
+    type_def: &'a TypeDefinition,
+    matched_subtype_names: &[&str],
+) -> Option<&'a str> {
+    type_def
         .subtypes
         .iter()
         .filter(|s| matched_subtype_names.contains(&s.name.as_str()))
-        .find_map(|s| s.push_scope.as_deref());
+        .find_map(|s| s.push_scope.as_deref())
+}
 
-    (merged, matched_subtype_names, push_scope)
+/// Union every subtype's rules for completion: both `subtype[x]` and `subtype[!x]`
+/// branches spliced from `inner_rules`, plus each SubTypeDefinition's own rules
+/// (the discriminators — so bootstrap keys like `days_remove` / `corps_commander`
+/// are themselves offered). `min` is zeroed so a subtype field is validated when
+/// present but never treated as required, matching the exact-match paths above.
+///
+/// This mirrors [`flatten_nested_subtype_rules`]'s union-both-branches behavior at
+/// the entity root: a strict superset of the matching set, so completion never
+/// under-offers. Completion-only; validation resolves the exact matching set.
+fn all_subtype_rules_union<'a>(
+    type_def: &TypeDefinition,
+    inner_rules: &[(RuleType, Options)],
+) -> Cow<'a, [(RuleType, Options)]> {
+    let mut v: Vec<(RuleType, Options)> = Vec::with_capacity(inner_rules.len());
+    for (rt, opts) in inner_rules {
+        if let RuleType::SubtypeRule {
+            rules: st_rules, ..
+        } = rt
+        {
+            v.extend(st_rules.iter().map(zero_min));
+        } else {
+            v.push((rt.clone(), opts.clone()));
+        }
+    }
+    for subtype in &type_def.subtypes {
+        v.extend(subtype.rules.iter().map(zero_min));
+    }
+    Cow::Owned(v)
+}
+
+/// Clone a rule with its cardinality `min` forced to 0.
+fn zero_min((rt, opts): &(RuleType, Options)) -> (RuleType, Options) {
+    let mut o = opts.clone();
+    o.min = 0;
+    (rt.clone(), o)
 }
 
 /// Expand nested `SubtypeRule` entries into their inner rules.

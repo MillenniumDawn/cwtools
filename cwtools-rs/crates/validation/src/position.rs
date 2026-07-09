@@ -79,6 +79,10 @@ fn pos_in_range(line: u32, col: u16, range: &SourceRange) -> bool {
 /// top level, in a file no type covers, or under an index-only type with no
 /// rule body. Callers fall back to their generic behavior (e.g. root-type
 /// snippets) in that case.
+///
+/// `for_completion` opts into the subtype union in `merged_rules_for_type`:
+/// completion offers every subtype's fields, while hover/goto pass `false` to
+/// mirror validation exactly.
 #[tracing::instrument(skip_all, fields(line, col))]
 pub fn rules_at_pos(
     ast: &ParsedFile,
@@ -86,6 +90,7 @@ pub fn rules_at_pos(
     prepared: &Prepared,
     line: u32,
     col: u16,
+    for_completion: bool,
 ) -> Option<RuleContext> {
     let ruleset = prepared.ruleset;
     let table = prepared.table;
@@ -123,6 +128,7 @@ pub fn rules_at_pos(
             &mut scope_context,
             line,
             col,
+            for_completion,
         ));
     }
 
@@ -176,6 +182,7 @@ pub fn rules_at_pos(
             &mut scope_context,
             line,
             col,
+            for_completion,
         )),
         ResolvedType::Wrapper {
             type_def,
@@ -191,6 +198,7 @@ pub fn rules_at_pos(
             &mut scope_context,
             line,
             col,
+            for_completion,
         ),
         ResolvedType::None => None,
     }
@@ -209,6 +217,7 @@ fn descend_wrapper(
     scope_context: &mut Option<ScopeContext>,
     line: u32,
     col: u16,
+    for_completion: bool,
 ) -> Option<RuleContext> {
     for grandchild in grandchildren {
         let Child::Leaf(gc_idx) = grandchild else {
@@ -241,6 +250,7 @@ fn descend_wrapper(
                     scope_context,
                     line,
                     col,
+                    for_completion,
                 );
             }
             return None;
@@ -276,6 +286,7 @@ fn descend_wrapper(
             scope_context,
             line,
             col,
+            for_completion,
         ));
     }
     None
@@ -293,9 +304,16 @@ fn enter_entity(
     scope_context: &mut Option<ScopeContext>,
     line: u32,
     col: u16,
+    for_completion: bool,
 ) -> RuleContext {
-    let (merged, _matched, push_scope) =
-        merged_rules_for_type(ctx, type_def, children, inner_rules, node_key);
+    let (merged, _matched, push_scope) = merged_rules_for_type(
+        ctx,
+        type_def,
+        children,
+        inner_rules,
+        node_key,
+        for_completion,
+    );
     if let Some(sc) = scope_context.as_mut() {
         seed_root_scope(sc, type_def, push_scope, node_key, ctx.ruleset, ctx.game);
     }

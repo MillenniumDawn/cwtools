@@ -41,13 +41,36 @@ fn type_index(entries: &[(&str, &str)]) -> TypeIndex {
     idx
 }
 
-/// Resolve the context at `marker` (first occurrence) in `script`.
+/// Resolve the context at `marker` (first occurrence) in `script`, mirroring
+/// validation (hover/goto behavior).
 fn resolve(
     cwt: &str,
     script: &str,
     file_path: &str,
     marker: &str,
     idx: Option<&TypeIndex>,
+) -> Option<RuleContext> {
+    resolve_with(cwt, script, file_path, marker, idx, false)
+}
+
+/// Like [`resolve`] but in completion mode (unions all subtype rules).
+fn resolve_for_completion(
+    cwt: &str,
+    script: &str,
+    file_path: &str,
+    marker: &str,
+    idx: Option<&TypeIndex>,
+) -> Option<RuleContext> {
+    resolve_with(cwt, script, file_path, marker, idx, true)
+}
+
+fn resolve_with(
+    cwt: &str,
+    script: &str,
+    file_path: &str,
+    marker: &str,
+    idx: Option<&TypeIndex>,
+    for_completion: bool,
 ) -> Option<RuleContext> {
     let table = StringTable::new();
     let parsed_cwt = parse_string(cwt, &table).unwrap();
@@ -67,7 +90,7 @@ fn resolve(
         var_checks: false,
     };
     let (line, col) = pos_of(script, marker);
-    rules_at_pos(&parsed, file_path, &prepared, line, col)
+    rules_at_pos(&parsed, file_path, &prepared, line, col, for_completion)
 }
 
 fn has_alias_left(rules: &[(RuleType, Options)], category: &str) -> bool {
@@ -84,6 +107,24 @@ fn has_specific_key(rules: &[(RuleType, Options)], key: &str) -> bool {
             RuleType::LeafRule { left: NewField::SpecificField(k), .. }
             | RuleType::NodeRule { left: NewField::SpecificField(k), .. } if k == key)
     })
+}
+
+/// The SpecificField keys in `rules` — for assertion messages.
+fn specific_keys(rules: &[(RuleType, Options)]) -> Vec<String> {
+    rules
+        .iter()
+        .filter_map(|(rt, _)| match rt {
+            RuleType::LeafRule {
+                left: NewField::SpecificField(k),
+                ..
+            }
+            | RuleType::NodeRule {
+                left: NewField::SpecificField(k),
+                ..
+            } => Some(k.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 const TRIGGER_RULES: &str = r#"
@@ -468,8 +509,15 @@ alias[trigger:always] = bool
         scope_checks: true,
         var_checks: false,
     };
-    let ctx =
-        rules_at_pos(&parsed, "game/common/decisions/test.txt", &prepared, 2, 6).expect("context");
+    let ctx = rules_at_pos(
+        &parsed,
+        "game/common/decisions/test.txt",
+        &prepared,
+        2,
+        6,
+        false,
+    )
+    .expect("context");
     assert!(ctx.leaf.is_none(), "insert position has no leaf");
     assert!(has_specific_key(&ctx.child_rules, "cost"));
     assert!(has_specific_key(&ctx.child_rules, "visible"));
@@ -592,8 +640,15 @@ fn cursor_on_blank_line_after_field_is_insert_position() {
         var_checks: false,
     };
     // The blank line is parser line 4 (1-based), col 1 (after the tab).
-    let ctx = rules_at_pos(&parsed, "common/national_focus/test.txt", &prepared, 4, 1)
-        .expect("should resolve a context on the blank line");
+    let ctx = rules_at_pos(
+        &parsed,
+        "common/national_focus/test.txt",
+        &prepared,
+        4,
+        1,
+        false,
+    )
+    .expect("should resolve a context on the blank line");
     assert!(
         ctx.leaf.as_ref().is_none_or(|l| !l.in_value),
         "blank line must not be an in-value position, got leaf: {:?}",
@@ -603,4 +658,120 @@ fn cursor_on_blank_line_after_field_is_insert_position() {
         has_specific_key(&ctx.child_rules, "cost"),
         "blank line should offer the block's fields"
     );
+}
+
+// ── subtype union for completion (cwtools-vscode#89) ─────────────────────────
+
+/// A decision type whose `timed` subtype (Path A: a `subtype[timed]` block inside
+/// the `decision` rule body) carries `days_remove` — itself the subtype's
+/// discriminator, so it can never bootstrap its own subtype from an empty body.
+const DECISION_TIMED_RULES: &str = r#"
+types = {
+    type[decision] = {
+        path = "game/common/decisions"
+        subtype[timed] = {
+            days_remove = int
+        }
+    }
+}
+decision = {
+    ## cardinality = 0..1
+    cost = int
+    subtype[timed] = {
+        days_remove = int
+        days_mission_timeout = int
+        modifier = { }
+    }
+}
+"#;
+
+#[test]
+fn completion_unions_timed_subtype_fields_in_empty_decision() {
+    // In an empty decision body, completion must offer the `timed` subtype's
+    // fields even though the discriminator (`days_remove`) is absent.
+    let script = "my_decision = {\n    HERE\n}\n";
+    let ctx = resolve_for_completion(
+        DECISION_TIMED_RULES,
+        script,
+        "game/common/decisions/test.txt",
+        "HERE",
+        None,
+    )
+    .expect("should resolve a completion context inside the decision");
+    for key in ["cost", "days_remove", "days_mission_timeout", "modifier"] {
+        assert!(
+            has_specific_key(&ctx.child_rules, key),
+            "completion should offer subtype-gated field {:?}, got: {:?}",
+            key,
+            specific_keys(&ctx.child_rules)
+        );
+    }
+}
+
+#[test]
+fn validation_descent_hides_inactive_subtype_fields_in_empty_decision() {
+    // The same position in validation/hover mode (for_completion=false) must NOT
+    // offer the inactive subtype's fields — the union is completion-only.
+    let script = "my_decision = {\n    HERE\n}\n";
+    let ctx = resolve(
+        DECISION_TIMED_RULES,
+        script,
+        "game/common/decisions/test.txt",
+        "HERE",
+        None,
+    )
+    .expect("should resolve a context inside the decision");
+    assert!(
+        has_specific_key(&ctx.child_rules, "cost"),
+        "base fields are always present"
+    );
+    assert!(
+        !has_specific_key(&ctx.child_rules, "days_remove"),
+        "inactive subtype field must not leak into the non-completion descent, got: {:?}",
+        specific_keys(&ctx.child_rules)
+    );
+}
+
+/// A character type whose subtypes are defined purely in the `types` block
+/// (Path B: `SubTypeDefinition.rules`), block-discriminated by the role key —
+/// like characters.cwt's `corps_commander` / `country_leader`.
+const CHARACTER_ROLE_RULES: &str = r#"
+types = {
+    type[character] = {
+        path = "game/common/characters"
+        subtype[corps_commander] = {
+            corps_commander = { }
+        }
+        subtype[country_leader] = {
+            country_leader = { }
+        }
+    }
+}
+character = {
+    ## cardinality = 0..1
+    name = scalar
+}
+"#;
+
+#[test]
+fn completion_unions_block_discriminated_role_subtypes() {
+    // In an empty character body, completion must offer the role-block keys
+    // (`corps_commander`, `country_leader`) that discriminate the subtypes.
+    let script = "my_character = {\n    HERE\n}\n";
+    let ctx = resolve_for_completion(
+        CHARACTER_ROLE_RULES,
+        script,
+        "game/common/characters/test.txt",
+        "HERE",
+        None,
+    )
+    .expect("should resolve a completion context inside the character");
+    for key in ["name", "corps_commander", "country_leader"] {
+        assert!(
+            has_specific_key(&ctx.child_rules, key),
+            "completion should offer role block {:?}, got: {:?}",
+            key,
+            specific_keys(&ctx.child_rules)
+        );
+    }
 }
