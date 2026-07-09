@@ -497,7 +497,27 @@ impl Backend {
             .settings
             .get("backgroundReindexIntervalMinutes")
             .and_then(|v| v.as_u64());
+
+        // No-op guard: the client re-sends the whole `cwtools` section on any
+        // change to an unrelated key, so an identical payload arrives often.
+        // Skip the write and the open-doc revalidate storm (#90) when nothing
+        // this handler mutates actually changed. `reindex_minutes` is `None`
+        // when the key is absent, and a missing key is never a change.
         {
+            let cfg = self.state.config.read();
+            let unchanged = cfg.ignore_file_patterns == files
+                && cfg.ignore_dir_patterns == dirs
+                && cfg.ignored_error_codes == codes
+                && reindex_minutes.is_none_or(|m| m == cfg.background_reindex_interval_minutes);
+            if unchanged {
+                tracing::debug!("didChangeConfiguration: no relevant change; skipping revalidate");
+                return;
+            }
+        }
+
+        {
+            // Any field written here must join the comparison above, or an
+            // identical re-send of a changed field will slip past the guard.
             let mut cfg = self.state.config.write();
             cfg.ignore_file_patterns = files;
             cfg.ignore_dir_patterns = dirs;
@@ -518,7 +538,8 @@ impl Backend {
         // index being ready so we don't publish partial cross-file results
         // before the first scan finishes (that scan republishes anyway).
         if self.state.index_ready.load(Ordering::Relaxed) {
-            self.revalidate_all_open_docs().await;
+            self.revalidate_all_open_docs(crate::ValidateTrigger::ConfigChange)
+                .await;
         }
     }
 

@@ -451,6 +451,7 @@ impl Backend {
         uri: String,
         expected_version: i32,
         generation: u64,
+        trigger: crate::ValidateTrigger,
     ) {
         // A newer change landed during the debounce — let that one validate.
         let text = {
@@ -470,7 +471,7 @@ impl Backend {
             (info.export_fingerprint(&uri), info.export_names(&uri))
         };
 
-        let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
+        let (diagnostics, parsed) = self.parse_and_validate(&uri, &text, trigger).await;
         {
             let ast = parsed.map(Arc::new);
             // Update tokens before taking documents lock (doc_tokens must be
@@ -500,7 +501,11 @@ impl Backend {
                 return;
             }
         }
-        if let Ok(uri_obj) = Url::parse(&uri) {
+        // Re-check the doc is still open right before publishing: did_close may
+        // have landed after the TOCTOU guard above, and publishing here would
+        // race its empty publish and leave a stale diagnostic behind.
+        let still_open = self.state.documents.lock().contains_key(&uri);
+        if still_open && let Ok(uri_obj) = Url::parse(&uri) {
             self.publish_gated(uri_obj, diagnostics, Some(expected_version))
                 .await;
         }
@@ -818,11 +823,12 @@ impl Backend {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(uri = %uri, bytes = text.len()))]
+    #[tracing::instrument(skip_all, fields(uri = %uri, bytes = text.len(), trigger = trigger.as_str()))]
     pub(crate) async fn parse_and_validate(
         &self,
         uri: &str,
         text: &str,
+        trigger: crate::ValidateTrigger,
     ) -> (Vec<Diagnostic>, Option<ParsedFile>) {
         let mut diagnostics = Vec::new();
         // Per-line end columns so every squiggle spans the whole statement line
@@ -989,7 +995,8 @@ impl Backend {
                         let elapsed = start.elapsed();
                         let total = truncate_validation_errors(&mut errs, uri);
                         let msg = format!(
-                            "[validate] {} errors in {:?} ({} types, {} enums, {} aliases)",
+                            "[validate] ({}) {} errors in {:?} ({} types, {} enums, {} aliases)",
+                            trigger.as_str(),
                             total,
                             elapsed,
                             ruleset.types.len(),

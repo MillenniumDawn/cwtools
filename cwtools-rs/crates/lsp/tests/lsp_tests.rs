@@ -3897,3 +3897,478 @@ fn test_clear_all_caches_reports_reindexed_message() {
         resp_str
     );
 }
+
+// ── #90: validate-storm coalescing (watched files, config, open/save) ────────
+
+/// A game file that validates under GOTO_RULES (references an undefined focus,
+/// so it produces one diagnostic). The storm tests count `[validate]` /
+/// publishDiagnostics frames, so its exact content only matters where a test
+/// checks for a non-empty diagnostic (the open-then-close race test).
+const STORM_FILE: &str = "my_dec = {\n    has_focus = my_focus\n}\n";
+
+/// Spin up a server on `ws` with GOTO_RULES and an empty vanilla, run the init
+/// handshake, and wait for the startup scan so `index_ready` is set and
+/// per-file validation publishes (and logs). Returns the child and its reader.
+fn storm_server(
+    ws: &std::path::Path,
+    rules_dir: &std::path::Path,
+    vanilla: &std::path::Path,
+) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
+    let ws_uri = format!("file://{}", ws.display());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.to_string_lossy(),
+                "vanilla": vanilla.to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    (child, reader)
+}
+
+/// Move `reader` into a background thread that forwards every non-empty frame
+/// onto a channel. The blocking reader can't detect "no more frames", so the
+/// storm tests poll the channel with a timeout to observe a whole coalescing
+/// window. Call after the init handshake (which must read responses directly).
+fn spawn_frame_collector(
+    mut reader: BufReader<std::process::ChildStdout>,
+) -> std::sync::mpsc::Receiver<serde_json::Value> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        loop {
+            match read_frame(&mut reader) {
+                Ok(raw) if raw.is_empty() => continue,
+                Ok(raw) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+                        && tx.send(v).is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+/// Collect frames from `rx` until none arrives for `quiet`, or `budget` elapses.
+/// `quiet` must exceed the coalescing window so the drain doesn't stop before it
+/// fires.
+fn drain_until_quiet(
+    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
+    quiet: std::time::Duration,
+    budget: std::time::Duration,
+) -> Vec<serde_json::Value> {
+    let start = std::time::Instant::now();
+    let mut out = Vec::new();
+    while start.elapsed() <= budget {
+        match rx.recv_timeout(quiet) {
+            Ok(v) => out.push(v),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+fn count_validate(frames: &[serde_json::Value], trigger: &str) -> usize {
+    let needle = format!("[validate] ({trigger})");
+    frames
+        .iter()
+        .filter(|v| {
+            v["method"] == "window/logMessage"
+                && v["params"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(&needle))
+        })
+        .count()
+}
+
+fn count_publishes(frames: &[serde_json::Value], suffix: &str) -> usize {
+    frames
+        .iter()
+        .filter(|v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with(suffix))
+        })
+        .count()
+}
+
+fn watched_changes(uris: &[String]) -> String {
+    let changes: Vec<serde_json::Value> = uris
+        .iter()
+        .map(|u| serde_json::json!({ "uri": u, "type": 2 }))
+        .collect();
+    jsonrpc_notification(
+        "workspace/didChangeWatchedFiles",
+        serde_json::json!({ "changes": changes }),
+    )
+}
+
+/// Write a decision file on disk (not opened) and return its `file://` URI.
+fn write_disk_file(ws: &std::path::Path, rel: &str, content: &str) -> String {
+    let path = ws.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, content).unwrap();
+    format!("file://{}", path.display())
+}
+
+#[test]
+fn test_watched_repeated_change_coalesces_to_one_validate() {
+    // Ten CHANGED events for the same non-open file, each in its own
+    // notification, must collapse into exactly one `(watched)` validation and
+    // one publish — the 1:1 amplification that drove the #90 storm is gone.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let uri = write_disk_file(ws.path(), "common/decisions/a.txt", STORM_FILE);
+    let rx = spawn_frame_collector(reader);
+
+    for _ in 0..10 {
+        write_frame(&mut child, &watched_changes(std::slice::from_ref(&uri))).unwrap();
+    }
+
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    child.kill().ok();
+
+    assert_eq!(
+        count_validate(&frames, "watched"),
+        1,
+        "10 repeated CHANGED events should coalesce to one validate"
+    );
+    assert_eq!(
+        count_publishes(&frames, "a.txt"),
+        1,
+        "should publish diagnostics for a.txt exactly once"
+    );
+}
+
+#[test]
+fn test_watched_distinct_files_each_validate_once() {
+    // A burst of distinct non-open files in one window: each validates exactly
+    // once, all after a single coalescing window.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let m = 8usize;
+    let uris: Vec<String> = (0..m)
+        .map(|i| write_disk_file(ws.path(), &format!("common/decisions/f{i}.txt"), STORM_FILE))
+        .collect();
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(&mut child, &watched_changes(&uris)).unwrap();
+
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(10),
+    );
+    child.kill().ok();
+
+    assert_eq!(
+        count_validate(&frames, "watched"),
+        m,
+        "each of {m} distinct files should validate exactly once"
+    );
+    for i in 0..m {
+        assert_eq!(
+            count_publishes(&frames, &format!("f{i}.txt")),
+            1,
+            "f{i}.txt should be published exactly once"
+        );
+    }
+}
+
+#[test]
+fn test_watched_bulk_flood_uses_rescan_not_per_file() {
+    // More than WATCHED_BULK_CAP (200) distinct CHANGED events collapse into a
+    // single workspace rescan (a rules re-clone / git checkout), so there are
+    // zero per-file `(watched)` validations — the direct #90 amplification kill.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let n = 205usize;
+    let uris: Vec<String> = (0..n)
+        .map(|i| write_disk_file(ws.path(), &format!("common/decisions/b{i}.txt"), STORM_FILE))
+        .collect();
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(&mut child, &watched_changes(&uris)).unwrap();
+
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1500),
+        std::time::Duration::from_secs(20),
+    );
+    child.kill().ok();
+
+    assert_eq!(
+        count_validate(&frames, "watched"),
+        0,
+        "an over-cap flood must not run any per-file watched validations"
+    );
+    let publishes = frames
+        .iter()
+        .filter(|v| v["method"] == "textDocument/publishDiagnostics")
+        .count();
+    assert!(
+        publishes > 0,
+        "the bulk rescan should still republish workspace diagnostics"
+    );
+}
+
+#[test]
+fn test_config_no_op_skips_revalidate_then_real_change_runs() {
+    // Identical didChangeConfiguration payloads must not trigger a revalidate on
+    // the second send; a genuinely changed ignoredErrorCodes must trigger
+    // exactly one `(configChange)` pass over the single open document.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+
+    // Open one game file so `revalidate_all_open_docs` has exactly one doc to
+    // validate — one `(configChange)` log per real pass.
+    let rel = "common/decisions/cfg.txt";
+    let path = ws.path().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, STORM_FILE).unwrap();
+    let uri = format!("file://{}", path.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":uri,"languageId":"hoi4","version":1,"text":STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+    // Drain the didOpen publish before starting the config observation window.
+    let _ = diags_for(&mut reader, "cfg.txt", 1);
+    let rx = spawn_frame_collector(reader);
+
+    let cfg = |codes: &[&str]| {
+        jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": { "ignoredErrorCodes": codes } }),
+        )
+    };
+    let quiet = std::time::Duration::from_millis(700);
+    let budget = std::time::Duration::from_secs(5);
+
+    // First send changes the (empty) live codes → one configChange pass.
+    write_frame(&mut child, &cfg(&["CW999"])).unwrap();
+    let f1 = drain_until_quiet(&rx, quiet, budget);
+    assert_eq!(
+        count_validate(&f1, "configChange"),
+        1,
+        "first (changed) config should revalidate the open doc once"
+    );
+
+    // Identical payload → no-op guard skips the revalidate.
+    write_frame(&mut child, &cfg(&["CW999"])).unwrap();
+    let f2 = drain_until_quiet(&rx, quiet, budget);
+    assert_eq!(
+        count_validate(&f2, "configChange"),
+        0,
+        "an identical config re-send must not revalidate"
+    );
+
+    // A real change → one more configChange pass.
+    write_frame(&mut child, &cfg(&["CW998"])).unwrap();
+    let f3 = drain_until_quiet(&rx, quiet, budget);
+    child.kill().ok();
+    assert_eq!(
+        count_validate(&f3, "configChange"),
+        1,
+        "a genuinely changed config should revalidate once"
+    );
+}
+
+#[test]
+fn test_get_file_types_answers_during_watched_flood() {
+    // The direct #90 regression: a large watched flood must not starve a cheap
+    // getFileTypes request. With validation off the message future, the request
+    // answers well under 2s.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let uris: Vec<String> = (0..80)
+        .map(|i| write_disk_file(ws.path(), &format!("common/decisions/g{i}.txt"), STORM_FILE))
+        .collect();
+    let rx = spawn_frame_collector(reader);
+
+    // Fire the flood, then immediately ask for file types.
+    write_frame(&mut child, &watched_changes(&uris)).unwrap();
+    let sent = std::time::Instant::now();
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            777,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "getFileTypes", "arguments": [uris[0]] }),
+        ),
+    )
+    .unwrap();
+
+    let mut elapsed = None;
+    let deadline = std::time::Duration::from_secs(5);
+    while sent.elapsed() < deadline {
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(v) => {
+                if v["id"] == 777 {
+                    elapsed = Some(sent.elapsed());
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    child.kill().ok();
+
+    let elapsed = elapsed.expect("getFileTypes never responded");
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "getFileTypes took {elapsed:?} during a watched flood (should be < 2s)"
+    );
+}
+
+#[test]
+fn test_did_open_validates_deferred() {
+    // did_open now offloads validation off the message future; the file must
+    // still get validated and its diagnostics published.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let rel = "common/decisions/o.txt";
+    let path = ws.path().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let uri = format!("file://{}", path.display());
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":uri,"languageId":"hoi4","version":1,"text":STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(800),
+        std::time::Duration::from_secs(6),
+    );
+    child.kill().ok();
+
+    assert_eq!(
+        count_validate(&frames, "didOpen"),
+        1,
+        "did_open should validate the file once, off the message future"
+    );
+    assert_eq!(
+        count_publishes(&frames, "o.txt"),
+        1,
+        "did_open should publish diagnostics for the opened file"
+    );
+}
+
+#[test]
+fn test_did_open_then_immediate_close_ends_empty() {
+    // Opening then immediately closing must leave the empty publish as the final
+    // state — no stale late diagnostics from the deferred open validate racing
+    // did_close.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let rel = "common/decisions/c.txt";
+    let path = ws.path().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let uri = format!("file://{}", path.display());
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":uri,"languageId":"hoi4","version":1,"text":STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didClose",
+            serde_json::json!({"textDocument":{"uri":uri}}),
+        ),
+    )
+    .unwrap();
+
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1000),
+        std::time::Duration::from_secs(6),
+    );
+    child.kill().ok();
+
+    let last_publish = frames.iter().rev().find(|v| {
+        v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with("c.txt"))
+    });
+    let last = last_publish.expect("expected at least the did_close empty publish for c.txt");
+    let diags = last["params"]["diagnostics"].as_array().unwrap();
+    assert!(
+        diags.is_empty(),
+        "final publish for a closed file must be empty, got: {:?}",
+        diags
+    );
+}
