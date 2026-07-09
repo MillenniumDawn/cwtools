@@ -312,6 +312,16 @@ struct DocumentState {
     /// `Relaxed`: the periodic loop is the only reader and tolerates a
     /// slightly-stale value.
     last_activity_ms: AtomicU64,
+    /// URIs of non-open watched files (create/modify) waiting for the next
+    /// coalescing window. A burst of `didChangeWatchedFiles` events (git
+    /// checkout, generator, AV/OneDrive churn) collapses into one drain
+    /// instead of validating 1:1 on the message future and starving the
+    /// bounded request queue (#90).
+    watched_pending: Mutex<HashSet<String>>,
+    /// The single in-flight watched-batch window, if one is armed. A live
+    /// (not-yet-finished) handle means a window is already scheduled, so a
+    /// continuous event stream can't keep pushing the trailing window back.
+    watched_debounce: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
@@ -367,6 +377,32 @@ pub(crate) struct AstSnapshot {
     pub(crate) source: AstSource,
 }
 
+/// What kicked off a `parse_and_validate` call. Threaded through so the
+/// `[validate]` log names its trigger, which makes a validate storm's source
+/// legible in the server log (issue #90) instead of a wall of identical lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValidateTrigger {
+    DidOpen,
+    DidSave,
+    Watched,
+    DidChange,
+    ConfigChange,
+    Reindex,
+}
+
+impl ValidateTrigger {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ValidateTrigger::DidOpen => "didOpen",
+            ValidateTrigger::DidSave => "didSave",
+            ValidateTrigger::Watched => "watched",
+            ValidateTrigger::DidChange => "didChange",
+            ValidateTrigger::ConfigChange => "configChange",
+            ValidateTrigger::Reindex => "reindex",
+        }
+    }
+}
+
 impl DocumentState {
     fn new() -> Self {
         Self {
@@ -401,6 +437,8 @@ impl DocumentState {
             last_loc_signature: parking_lot::Mutex::new(None),
             start: std::time::Instant::now(),
             last_activity_ms: AtomicU64::new(0),
+            watched_pending: Mutex::new(HashSet::new()),
+            watched_debounce: Mutex::new(None),
         }
     }
 }
@@ -424,6 +462,38 @@ const DEBOUNCE_MS: u64 = 250;
 //     extension side is ported.
 
 impl Backend {
+    /// Spawn a background validation for `uri` at `version` and register the
+    /// task in `debounce_handles`, aborting any predecessor for the same URI
+    /// (`did_close` aborts it too). `delay_ms` is the debounce sleep before
+    /// validating: `did_change` passes `DEBOUNCE_MS` to coalesce keystrokes,
+    /// open/save pass 0 to validate promptly. The task re-reads a
+    /// version-checked snapshot inside `debounced_validate`, so a newer edit
+    /// landing in the gap supersedes this one instead of publishing stale
+    /// results.
+    fn spawn_debounced_validate(
+        &self,
+        uri: String,
+        version: i32,
+        generation: u64,
+        trigger: ValidateTrigger,
+        delay_ms: u64,
+    ) {
+        let client = self.client.clone();
+        let state = self.state.clone();
+        let key = uri.clone();
+        let handle = tokio::spawn(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Backend { client, state }
+                .debounced_validate(uri, version, generation, trigger)
+                .await;
+        });
+        if let Some(prev) = self.state.debounce_handles.lock().insert(key, handle) {
+            prev.abort();
+        }
+    }
+
     /// Bump the info-revision counter. Called from every site that mutates
     /// `info_service` or `rules` (the two state sources the loc/fallback
     /// completion caches depend on), so the completion cache invalidates
@@ -957,44 +1027,31 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
         tracing::debug!(%uri, version, bytes = text.len(), "did_open");
 
-        let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
-
+        // Insert synchronously (no `.await` before the mutation) so a request in
+        // the gap sees the new text; `ast: None` is filled in by the spawned
+        // validate, and requests before then fresh-parse via `ast_snapshot_for`.
         {
-            let ast = parsed.map(Arc::new);
-            let ast_version = ast.as_ref().map(|_| version);
-            self.update_doc_tokens(&uri, ast.as_ref());
             let mut docs = self.state.documents.lock();
             docs.insert(
                 uri.clone(),
                 ParsedDoc {
                     version,
                     text: Arc::from(text),
-                    ast,
-                    ast_version,
+                    ast: None,
+                    ast_version: None,
                 },
             );
         }
 
-        self.publish_gated(params.text_document.uri, diagnostics, Some(version))
-            .await;
-
-        // Once the index is ready, opening a file makes its exports available to
-        // the rest of the session. An already-open file that references one of
-        // them (e.g. a caller of a scripted_effect whose defining file is opened
-        // afterwards) would still show those references as undefined; re-validate
-        // the open docs that reference any name this file exports. Before the
-        // index is ready the full scan handles this, so skip the sweep.
-        if self.state.index_ready.load(Ordering::Relaxed) {
-            let names = {
-                let info = self.state.info_service.read();
-                info.export_names(&uri)
-            };
-            if !names.is_empty() {
-                let generation = self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1;
-                self.revalidate_open_dependents(&uri, generation, Some(&names))
-                    .await;
-            }
-        }
+        // Offload validation off the message future so a burst of opens can't
+        // hold the bounded request queue (#90). `debounced_validate`'s
+        // export-diff-gated dependent sweep replaces the old inline sweep here:
+        // opening a file whose exports match what's already indexed skips the
+        // sweep entirely, and a changed export refreshes only real dependents.
+        // Bump the edit counter so that sweep is tagged and a later edit
+        // supersedes it.
+        let generation = self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.spawn_debounced_validate(uri, version, generation, ValidateTrigger::DidOpen, 0);
     }
 
     #[tracing::instrument(skip_all)]
@@ -1041,35 +1098,33 @@ impl LanguageServer for Backend {
 
         // Validate in the background after a short debounce so a burst of
         // keystrokes coalesces into one validation and the handler returns
-        // immediately (no per-keystroke re-parse lag).
-        let client = self.client.clone();
-        let state = self.state.clone();
-        let task_uri = uri.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(DEBOUNCE_MS)).await;
-            let backend = Backend { client, state };
-            backend
-                .debounced_validate(task_uri, version, generation)
-                .await;
-        });
-        // Replace and abort any pending sleeper for this file so a burst of
-        // keystrokes can't stack hundreds of debounce tasks (#47). The handle map
-        // is keyed by URI, so it stays bounded by the number of open files.
-        if let Some(prev) = self.state.debounce_handles.lock().insert(uri, handle) {
-            prev.abort();
-        }
+        // immediately (no per-keystroke re-parse lag). The helper aborts any
+        // pending sleeper for this file so a burst can't stack hundreds of
+        // debounce tasks (#47).
+        self.spawn_debounced_validate(
+            uri,
+            version,
+            generation,
+            ValidateTrigger::DidChange,
+            DEBOUNCE_MS,
+        );
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
-        if let Some(text) = {
+        // A save isn't an edit, so don't bump the edit counter, just re-read the
+        // current version and generation. Offload the validation like did_change
+        // (#90); the entry version guard in `debounced_validate` makes a racing
+        // did_change safe. The export-diff-gated dependent sweep also refreshes
+        // callers when a save changed this file's exports.
+        let Some(version) = ({
             let docs = self.state.documents.lock();
-            docs.get(&uri).map(|d| d.text.clone())
-        } {
-            let (diagnostics, _) = self.parse_and_validate(&uri, &text).await;
-            self.publish_gated(params.text_document.uri, diagnostics, None)
-                .await;
-        }
+            docs.get(&uri).map(|d| d.version)
+        }) else {
+            return;
+        };
+        let generation = self.state.edit_generation.load(Ordering::Acquire);
+        self.spawn_debounced_validate(uri, version, generation, ValidateTrigger::DidSave, 0);
     }
 
     #[tracing::instrument(skip_all)]

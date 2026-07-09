@@ -20,6 +20,13 @@ use crate::validate::{
 use crate::workspace_cache;
 use crate::{Backend, LoadingBar, UpdateFileList};
 
+/// Trailing window for coalescing `didChangeWatchedFiles` create/modify events.
+/// Fixed (not a sliding reset) so a continuous churn stream still drains.
+const WATCHED_DEBOUNCE_MS: u64 = 500;
+/// Above this many distinct files in one window, validate the whole workspace
+/// once (a rules re-clone / git checkout) instead of per file.
+const WATCHED_BULK_CAP: usize = 200;
+
 /// Index a base-game ("vanilla") install into per-type instances, ready to merge
 /// into the workspace TypeIndex. Delegates to the shared driver's `index_game_dir`
 /// so the LSP and CLI discover and index vanilla the SAME way (the driver's
@@ -742,7 +749,8 @@ impl Backend {
         // cross-file reference (e.g. a scripted_effect defined in a not-yet-indexed
         // file) shows as "not found" until a manual re-save. Now that the index is
         // complete, re-run them so those stale diagnostics clear on their own.
-        self.revalidate_all_open_docs().await;
+        self.revalidate_all_open_docs(crate::ValidateTrigger::Reindex)
+            .await;
         // The status bar is cleared by the `validate_entire_workspace` wrapper on
         // return, so every exit path (this one and the early returns above) clears
         // it uniformly.
@@ -753,7 +761,7 @@ impl Backend {
     /// once after the workspace scan so open docs validated against a partial
     /// index don't keep stale cross-file diagnostics, and on a live
     /// `didChangeConfiguration` so a changed suppression list re-filters at once.
-    pub(crate) async fn revalidate_all_open_docs(&self) {
+    pub(crate) async fn revalidate_all_open_docs(&self, trigger: crate::ValidateTrigger) {
         let open_docs: Vec<(String, Arc<str>, i32)> = {
             let docs = self.state.documents.lock();
             docs.iter()
@@ -761,7 +769,7 @@ impl Backend {
                 .collect()
         };
         for (uri, text, version) in open_docs {
-            let (diagnostics, _) = self.parse_and_validate(&uri, &text).await;
+            let (diagnostics, _) = self.parse_and_validate(&uri, &text, trigger).await;
             // Skip if the doc changed or closed while we were validating; its own
             // did_change/did_close handler owns the fresher result.
             let still_current = {
@@ -1187,8 +1195,15 @@ impl Backend {
     /// system — e.g. a git checkout, file move in the OS explorer, or rename
     /// outside the editor. Without this handler the index keeps stale entries
     /// for deleted/moved files until a window reload (#52).
+    ///
+    /// DELETED events are handled inline (cheap, and correctness matters: the
+    /// index must drop the file at once). CHANGED/CREATED events are queued and
+    /// coalesced into a single trailing window (#90) so a churn burst validates
+    /// once instead of 1:1 on the message future, which held the bounded
+    /// request queue and starved cheap requests like `getFileTypes`.
     #[tracing::instrument(skip_all)]
     pub(crate) async fn did_change_watched_files_impl(&self, params: DidChangeWatchedFilesParams) {
+        let mut enqueued = false;
         for event in params.changes {
             let uri = event.uri.to_string();
             match event.typ {
@@ -1209,48 +1224,95 @@ impl Backend {
                         .await;
                 }
                 FileChangeType::CHANGED | FileChangeType::CREATED => {
-                    let is_open = {
-                        let docs = self.state.documents.lock();
-                        docs.contains_key(&uri)
-                    };
-                    if is_open {
-                        continue;
-                    }
-                    tracing::debug!(%uri, "watched file changed/created");
-                    let path = uri_to_path_str(&uri);
-                    // Read on a blocking thread via the file manager so cp1252
-                    // script files are validated (not silently dropped) and the
-                    // async runtime isn't stalled on the sync read.
-                    let read = {
-                        let path = path.clone();
-                        tokio::task::spawn_blocking(move || {
-                            cwtools_file_manager::file_manager::read_text(std::path::Path::new(
-                                &path,
-                            ))
-                        })
-                        .await
-                    };
-                    match read {
-                        Ok(Ok(text)) => {
-                            let (diagnostics, parsed) = self.parse_and_validate(&uri, &text).await;
-                            if let Some(parsed) = parsed {
-                                let ast = Arc::new(parsed);
-                                self.update_doc_tokens(&uri, Some(&ast));
-                            }
-                            if let Ok(uri_obj) = Url::parse(&uri) {
-                                self.publish_gated(uri_obj, diagnostics, None).await;
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("could not read watched file {}: {}", path, e);
-                        }
-                        Err(e) => {
-                            tracing::warn!("read task panicked for watched file {}: {}", path, e);
-                        }
-                    }
+                    // Open state is re-checked at drain time (an open editor
+                    // buffer is authoritative), so just queue every event here.
+                    self.state.watched_pending.lock().insert(uri);
+                    enqueued = true;
                 }
                 _ => {}
             }
+        }
+        if enqueued {
+            self.arm_watched_batch();
+        }
+    }
+
+    /// Arm a single trailing window that drains `watched_pending`. A fixed
+    /// window: if one is already scheduled or running, do nothing, so a
+    /// continuous event stream can't keep pushing the drain further out.
+    fn arm_watched_batch(&self) {
+        let mut guard = self.state.watched_debounce.lock();
+        if guard.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let client = self.client.clone();
+        let state = self.state.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(WATCHED_DEBOUNCE_MS)).await;
+            Backend { client, state }.process_watched_batch().await;
+        });
+        *guard = Some(handle);
+    }
+
+    /// Drain the queued watched files and validate them off the message future.
+    /// A batch larger than `WATCHED_BULK_CAP` (a rules re-clone or git checkout
+    /// touching everything) collapses into one CAS-guarded rescan instead of
+    /// hundreds of per-file validations. Re-arms if new events landed while it
+    /// was running.
+    async fn process_watched_batch(&self) {
+        let batch: Vec<String> = { self.state.watched_pending.lock().drain().collect() };
+        if batch.is_empty() {
+            return;
+        }
+        if batch.len() > WATCHED_BULK_CAP {
+            tracing::info!(count = batch.len(), "watched batch over cap; full rescan");
+            self.validate_entire_workspace(true).await;
+        } else {
+            for uri in batch {
+                // An open editor buffer owns its diagnostics; skip files that
+                // are open now, regardless of open state when queued.
+                if self.state.documents.lock().contains_key(&uri) {
+                    continue;
+                }
+                let path = uri_to_path_str(&uri);
+                // Read on a blocking thread via the file manager so cp1252
+                // script files are validated (not silently dropped) and the
+                // async runtime isn't stalled on the sync read.
+                let read = {
+                    let path = path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        cwtools_file_manager::file_manager::read_text(std::path::Path::new(&path))
+                    })
+                    .await
+                };
+                match read {
+                    Ok(Ok(text)) => {
+                        let (diagnostics, parsed) = self
+                            .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched)
+                            .await;
+                        if let Some(parsed) = parsed {
+                            let ast = Arc::new(parsed);
+                            self.update_doc_tokens(&uri, Some(&ast));
+                        }
+                        if let Ok(uri_obj) = Url::parse(&uri) {
+                            self.publish_gated(uri_obj, diagnostics, None).await;
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("could not read watched file {}: {}", path, e);
+                    }
+                    Err(e) => {
+                        tracing::warn!("read task panicked for watched file {}: {}", path, e);
+                    }
+                }
+            }
+        }
+        // Clear our slot before the final check so a producer that queued an
+        // event while we ran can arm the next window (or we do it here). Setting
+        // the slot to `None` only detaches this finished task, it doesn't abort.
+        *self.state.watched_debounce.lock() = None;
+        if !self.state.watched_pending.lock().is_empty() {
+            self.arm_watched_batch();
         }
     }
 
