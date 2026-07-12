@@ -1357,14 +1357,14 @@ impl Backend {
     }
 
     /// How long the user must be idle before a background pass runs, in
-    /// milliseconds. `CWTOOLS_REINDEX_IDLE_SECS` overrides the default of 15s
-    /// (for tests).
-    fn reindex_idle_ms() -> u64 {
-        let secs = std::env::var("CWTOOLS_REINDEX_IDLE_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(15);
-        secs * 1000
+    /// milliseconds. The `CWTOOLS_REINDEX_IDLE_SECS` test override wins over
+    /// the configured `backgroundReindexIdleSeconds`, which wins over the 15s
+    /// default (`Config::new`). Re-read each cycle, so a live config change
+    /// applies on the next one.
+    fn reindex_idle_ms(&self) -> u64 {
+        let config_secs = self.state.config.read().background_reindex_idle_seconds;
+        let env_val = std::env::var("CWTOOLS_REINDEX_IDLE_SECS").ok();
+        resolve_reindex_idle_secs(env_val.as_deref(), config_secs) * 1000
     }
 
     /// Periodic quiet re-scan so a long-running session doesn't accumulate
@@ -1390,7 +1390,7 @@ impl Backend {
             }
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
 
-            let idle_ms = Self::reindex_idle_ms();
+            let idle_ms = self.reindex_idle_ms();
             loop {
                 if self.effective_reindex_interval_secs() == 0 {
                     // Disabled while we were waiting for the interval or for
@@ -1416,6 +1416,15 @@ impl Backend {
 /// such clock, but defend anyway) reads as "not idle" instead of wrapping.
 pub(crate) fn is_idle(now_ms: u64, last_activity_ms: u64, idle_ms: u64) -> bool {
     now_ms.saturating_sub(last_activity_ms) >= idle_ms
+}
+
+/// Env > config precedence for the reindex idle window, split out from
+/// `Backend::reindex_idle_ms` so it's unit-testable without a `Backend`.
+/// A malformed env value degrades to the config value, it doesn't panic.
+pub(crate) fn resolve_reindex_idle_secs(env_val: Option<&str>, config_secs: u64) -> u64 {
+    env_val
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(config_secs)
 }
 
 /// Fold a stat-only signature (path, size, mtime) over `files` into one
@@ -1490,6 +1499,34 @@ mod tests {
         assert!(!is_idle(100, 200, 1));
         // ...unless idle_ms is 0, where "no wait required" still holds.
         assert!(is_idle(100, 200, 0));
+    }
+
+    // ── resolve_reindex_idle_secs (env > config > default) ──────────────────
+
+    #[test]
+    fn test_reindex_idle_env_wins_over_config() {
+        assert_eq!(resolve_reindex_idle_secs(Some("3"), 40), 3);
+        // Including re-tightening a config-widened window down to zero.
+        assert_eq!(resolve_reindex_idle_secs(Some("0"), 40), 0);
+    }
+
+    #[test]
+    fn test_reindex_idle_config_wins_over_default() {
+        // No env override → the configured value, whatever the built-in
+        // default is.
+        assert_eq!(resolve_reindex_idle_secs(None, 40), 40);
+    }
+
+    #[test]
+    fn test_reindex_idle_malformed_env_degrades_to_config() {
+        assert_eq!(resolve_reindex_idle_secs(Some("junk"), 40), 40);
+        assert_eq!(resolve_reindex_idle_secs(Some(""), 40), 40);
+    }
+
+    #[test]
+    fn test_reindex_idle_default_is_15_seconds() {
+        // An untouched Config carries the documented 15s default.
+        assert_eq!(crate::Config::new().background_reindex_idle_seconds, 15);
     }
 
     // ── loc_signature_for (quiet-scan loc-rebuild skip) ─────────────────────

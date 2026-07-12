@@ -92,6 +92,12 @@ pub(crate) struct Config {
     /// client that never sends either keeps this at 0, so the periodic loop
     /// stays disabled unless explicitly configured.
     pub(crate) background_reindex_interval_minutes: u64,
+    /// Seconds the user must be idle before a background pass runs (default
+    /// 15). Sourced from `backgroundReindexIdleSeconds` in
+    /// `initializationOptions` and `workspace/didChangeConfiguration`; the
+    /// `CWTOOLS_REINDEX_IDLE_SECS` test override wins over this value. A live
+    /// change applies on the next reindex cycle.
+    pub(crate) background_reindex_idle_seconds: u64,
 }
 
 impl Config {
@@ -110,6 +116,7 @@ impl Config {
             scope_checks,
             var_checks,
             background_reindex_interval_minutes: 0,
+            background_reindex_idle_seconds: 15,
         }
     }
 

@@ -184,6 +184,16 @@ impl Backend {
                     .write()
                     .background_reindex_interval_minutes = mins;
             }
+
+            // Seconds of user inactivity a background pass waits for (default
+            // 15). A live change comes through `did_change_configuration_impl`
+            // and applies on the next reindex cycle.
+            if let Some(secs) = opts
+                .get("backgroundReindexIdleSeconds")
+                .and_then(|v| v.as_u64())
+            {
+                self.state.config.write().background_reindex_idle_seconds = secs;
+            }
             self.client
                 .log_message(MessageType::INFO, format!("init options: {:?}", opts))
                 .await;
@@ -478,13 +488,14 @@ impl Backend {
         loaded
     }
 
-    /// Re-read ignore globs and the background-reindex interval when the
-    /// extension's `cwtools.*` settings change. The shape mirrors what we
-    /// accept in `initializationOptions`: the payload is the `cwtools`
-    /// namespace object, with optional `ignoreFilePatterns`,
-    /// `ignoreDirectories`, and `backgroundReindexIntervalMinutes`. The next
-    /// full-workspace scan (or reindex cycle) picks up the new values; an
-    /// in-flight scan finishes with the snapshot it took.
+    /// Re-read ignore globs and the background-reindex interval/idle window
+    /// when the extension's `cwtools.*` settings change. The shape mirrors
+    /// what we accept in `initializationOptions`: the payload is the
+    /// `cwtools` namespace object, with optional `ignoreFilePatterns`,
+    /// `ignoreDirectories`, `backgroundReindexIntervalMinutes`, and
+    /// `backgroundReindexIdleSeconds`. The next full-workspace scan (or
+    /// reindex cycle) picks up the new values; an in-flight scan finishes
+    /// with the snapshot it took.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
         // The client may send either the whole `cwtools` section (when the
         // section is registered via `configurationSection`) or just the
@@ -497,6 +508,10 @@ impl Backend {
             .settings
             .get("backgroundReindexIntervalMinutes")
             .and_then(|v| v.as_u64());
+        let reindex_idle_secs = params
+            .settings
+            .get("backgroundReindexIdleSeconds")
+            .and_then(|v| v.as_u64());
 
         // No-op guard: the client re-sends the whole `cwtools` section on any
         // change to an unrelated key, so an identical payload arrives often.
@@ -508,7 +523,8 @@ impl Backend {
             let unchanged = cfg.ignore_file_patterns == files
                 && cfg.ignore_dir_patterns == dirs
                 && cfg.ignored_error_codes == codes
-                && reindex_minutes.is_none_or(|m| m == cfg.background_reindex_interval_minutes);
+                && reindex_minutes.is_none_or(|m| m == cfg.background_reindex_interval_minutes)
+                && reindex_idle_secs.is_none_or(|s| s == cfg.background_reindex_idle_seconds);
             if unchanged {
                 tracing::debug!("didChangeConfiguration: no relevant change; skipping revalidate");
                 return;
@@ -525,12 +541,16 @@ impl Backend {
             if let Some(mins) = reindex_minutes {
                 cfg.background_reindex_interval_minutes = mins;
             }
+            if let Some(secs) = reindex_idle_secs {
+                cfg.background_reindex_idle_seconds = secs;
+            }
         }
         tracing::info!(
             file_globs = n_files,
             dir_globs = n_dirs,
             ignored_codes = n_codes,
             reindex_minutes = ?reindex_minutes,
+            reindex_idle_secs = ?reindex_idle_secs,
             "config updated via didChangeConfiguration"
         );
         // Re-filter the open documents' diagnostics against the updated
