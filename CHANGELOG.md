@@ -15,12 +15,9 @@
 
 - The vanilla index (`vanilla_index`, `VanillaCacheData::per_type`) threads a per-instance source URI. `TypeIndex::merge_with_uris` merges each base-game instance under its real file, and `TypeIndex::remove_files` drops the whole contribution in one index pass on a re-merge (`cacheVanilla` / `clearAllCaches`). `parse_uri` now logs a warning when a string fails to parse instead of silently substituting the fallback (the failure mode that hid this bug).
 - Added a black-box goto test (a mod reference to a vanilla definition resolves into the vanilla file, not the request document) and a cache round-trip test (save + load preserves each instance's source file).
-<<<<<<< HEAD
 - `merged_rules_for_type` gains a `union_all_subtypes` mode threaded through `rules_at_pos(for_completion)` and `enter_entity`; only the completion call site opts in (hover/goto and validation pass `false`). Added position-resolver tests for the decision/character subtype union and its non-leak into the validation descent, a `validate_ast` test that an inactive subtype's field is still unexpected, and a hand-rolled VS Code snippet-grammar checker run over every generated snippet.
-=======
 - `parse_and_validate` / `debounced_validate` / `revalidate_all_open_docs` take a `ValidateTrigger`. `did_open` and `did_save` insert the buffer synchronously then spawn `debounced_validate` off the message future (open bumps the edit generation, save loads it), reusing its export-diff-gated dependent sweep instead of the old inline open sweep. `didChangeWatchedFiles` create/modify events queue into `watched_pending` behind a fixed 500ms window (`WATCHED_DEBOUNCE_MS`) that drains off the message future, with a `WATCHED_BULK_CAP` (200) full-rescan fast path; deletes stay inline. `didChangeConfiguration` returns early when nothing it writes actually changed.
 - Added black-box tests for watched coalescing (repeat, distinct-burst, over-cap rescan), the config no-op guard, getFileTypes latency under a watched flood, and deferred-open / open-then-immediate-close.
->>>>>>> fix/validate-storm
 
 # 1.20.0
 
