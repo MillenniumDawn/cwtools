@@ -4441,6 +4441,56 @@ fn test_get_file_types_answers_during_watched_flood() {
 }
 
 #[test]
+fn test_unknown_execute_command_returns_error() {
+    // An unrecognized workspace/executeCommand must surface a JSON-RPC error
+    // naming the command — a silent `null` success masks client/engine
+    // version drift (a newer client invoking a command this server lacks).
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            901,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "notARealCommand", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut response = None;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(v) if v["id"] == 901 => {
+                response = Some(v);
+                break;
+            }
+            _ => continue,
+        }
+    }
+    child.kill().ok();
+
+    let v = response.expect("no response to the unknown command");
+    assert!(
+        !v["error"].is_null(),
+        "unknown command must produce an error response, got: {v}"
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("notARealCommand")),
+        "the error should name the offending command, got: {}",
+        v["error"]
+    );
+}
+
+#[test]
 fn test_did_open_validates_deferred() {
     // did_open now offloads validation off the message future; the file must
     // still get validated and its diagnostics published.

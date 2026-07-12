@@ -514,9 +514,9 @@ impl Backend {
     }
 
     /// Called when the VS Code extension tells us the user switched to a file.
-    /// We receive it but don't act on it yet.
+    /// Focus is user activity: reset the background-reindex idle clock.
     async fn on_did_focus_file(&self, _params: Value) {
-        // C→S: accept silently.
+        self.mark_activity();
     }
 
     /// Resolve the leaf under the cursor with the position resolver and
@@ -1638,5 +1638,35 @@ mod tests {
             sites.iter().any(|(uri, _)| uri == "file:///test.txt"),
             "expected correct uri"
         );
+    }
+
+    // ── didFocusFile (background-reindex idle clock) ─────────────────────────
+
+    #[test]
+    fn test_did_focus_file_marks_activity() {
+        // A focus switch is user activity: the handler must reset the idle
+        // clock the background reindex loop watches, like edits and feature
+        // requests do. Sentinel u64::MAX can never be a real elapsed value.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (service, _socket) = LspService::build(|client| Backend {
+                client,
+                state: Arc::new(DocumentState::new()),
+            })
+            .finish();
+            let backend = service.inner();
+            backend
+                .state
+                .last_activity_ms
+                .store(u64::MAX, Ordering::Relaxed);
+            backend.on_did_focus_file(Value::Null).await;
+            assert_ne!(
+                backend.state.last_activity_ms.load(Ordering::Relaxed),
+                u64::MAX,
+                "didFocusFile must reset the background-reindex idle clock"
+            );
+        });
     }
 }

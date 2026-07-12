@@ -703,7 +703,11 @@ impl Backend {
                 };
                 Ok(Some(Value::String(msg.to_string())))
             }
-            _ => Ok(None),
+            // An error, not a silent `Ok(None)`: the VS Code client renders a
+            // null result as success, masking client/engine version drift.
+            other => Err(tower_lsp::jsonrpc::Error::invalid_params(format!(
+                "unknown command: {other}"
+            ))),
         }
     }
 
