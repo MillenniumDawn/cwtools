@@ -1,3 +1,19 @@
+# 1.23.0
+
+## Bug Fixes
+
+- An unknown `workspace/executeCommand` now returns a JSON-RPC error naming the command instead of a silent `null` success. The VS Code client rendered that null as the command working, which masked client/engine version drift (a newer client invoking a command the installed server doesn't have).
+
+## Improvements
+
+- The background reindex idle window is configurable: `backgroundReindexIdleSeconds` via initializationOptions or didChangeConfiguration, default unchanged at 15s. A live change applies on the next reindex cycle. `CWTOOLS_REINDEX_IDLE_SECS` stays the test override and wins over the setting. (cwtools#64)
+- Switching editor tabs (the `didFocusFile` notification, which the server previously discarded) now counts as user activity for the background-reindex idle clock, so a quiet pass doesn't start while the user is actively navigating between files.
+
+## Developer
+
+- CI runs the build and test job on Windows and macOS as well as Linux, so a platform-only break blocks a release before it ships. Lint and the release build stay Linux-only. (cwtools#66)
+- Pushing a `v*` tag now builds all three platforms and publishes the archives plus a SHA256SUMS file as the GitHub release; previous releases ended at upload-artifact and shipped no assets. workflow_dispatch remains for re-runs (idempotent: an existing release gets its assets replaced) and skips publish off a tag ref. The macOS archive is now aarch64 (`cwtools-rs-macos-arm64`), matching the arm64 runners and the client's osx-arm64 vsix. (cwtools#67)
+
 # 1.22.0
 
 ## Bug Fixes
