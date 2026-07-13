@@ -6,7 +6,7 @@
 
 ## Improvements
 
-- The background reindex idle window is configurable: `backgroundReindexIdleSeconds` via initializationOptions or didChangeConfiguration, default unchanged at 15s. A live change applies on the next reindex cycle. `CWTOOLS_REINDEX_IDLE_SECS` stays the test override and wins over the setting. (cwtools#64)
+- The background reindex idle window is configurable: `backgroundReindexIdleSeconds` via initializationOptions or didChangeConfiguration, default unchanged at 15s. A live change applies on the next reindex cycle. `CWTOOLS_REINDEX_IDLE_SECS` stays the test override and wins over the setting. The VS Code client does not send the setting yet (env var and other LSP clients only, client support to follow). (cwtools#64)
 - Switching editor tabs (the `didFocusFile` notification, which the server previously discarded) now counts as user activity for the background-reindex idle clock, so a quiet pass doesn't start while the user is actively navigating between files.
 
 ## Developer
