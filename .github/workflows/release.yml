@@ -31,19 +31,16 @@ jobs:
         include:
           - os: ubuntu-latest
             label: Linux x86_64
-            target: x86_64-unknown-linux-gnu
             artifact: cwtools-rs-linux-x86_64
             strip: true
           # macos-latest runners are arm64; the host build is aarch64 and the
           # client vsix ships osx-arm64.
           - os: macos-latest
             label: macOS arm64
-            target: aarch64-apple-darwin
             artifact: cwtools-rs-macos-arm64
             strip: true
           - os: windows-latest
             label: Windows x86_64
-            target: x86_64-pc-windows-msvc
             artifact: cwtools-rs-windows-x86_64
             strip: false
     runs-on: ${{ matrix.os }}
@@ -131,10 +128,13 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Passed via env rather than inline-interpolated into the script,
+          # per GitHub's script-injection hardening guidance.
+          TAG: ${{ github.ref_name }}
         # Idempotent for re-runs: upload into an existing release instead of
         # failing on create.
         run: |
-          tag='${{ github.ref_name }}'
+          tag="$TAG"
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" artifacts/* --clobber -R "$GITHUB_REPOSITORY"
           else
