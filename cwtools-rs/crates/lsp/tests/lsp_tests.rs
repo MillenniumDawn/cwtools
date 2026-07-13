@@ -3827,6 +3827,116 @@ fn test_background_reindex_picks_up_new_file_quietly() {
 }
 
 #[test]
+fn test_background_reindex_idle_window_from_init_option() {
+    // `backgroundReindexIdleSeconds` in initializationOptions must drive the
+    // idle gate — here 0, so the pass fires as soon as the 1s interval
+    // elapses — with no CWTOOLS_REINDEX_IDLE_SECS test override in play.
+    // Same shape as test_background_reindex_picks_up_new_file_quietly, but
+    // deadline-bounded: if the option were ignored, the built-in 15s idle
+    // window would blow the 10s budget.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let b_rel = "common/decisions/b.txt";
+    let b_path = ws.path().join(b_rel);
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &b_path,
+        "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n",
+    )
+    .unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let mut child = cwtools_server_cmd()
+        .env("CWTOOLS_REINDEX_INTERVAL_SECS", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+                "backgroundReindexIdleSeconds": 0,
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    let b_uri = format!("file://{}", b_path.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text":"my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n"}}),
+        ),
+    )
+    .unwrap();
+    let before = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics before background pass");
+    assert!(
+        before.contains(&"CW263".to_string()),
+        "expected CW263 before the definition exists, got: {:?}",
+        before
+    );
+
+    let a_path = ws.path().join("common/scripted_effects/a.txt");
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, "my_se = { log = \"hi\" }\n").unwrap();
+
+    let rx = spawn_frame_collector(reader);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut cleared = false;
+    while std::time::Instant::now() < deadline {
+        let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200)) else {
+            continue;
+        };
+        if v["method"] == "loadingBar" {
+            child.kill().ok();
+            panic!("unexpected loadingBar during quiet background pass: {v}");
+        }
+        if v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with("b.txt"))
+        {
+            let codes: Vec<&str> = v["params"]["diagnostics"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|d| d["code"].as_str()).collect())
+                .unwrap_or_default();
+            if !codes.contains(&"CW263") {
+                cleared = true;
+                break;
+            }
+        }
+    }
+    child.kill().ok();
+    assert!(
+        cleared,
+        "config-driven idle window of 0s should let the background pass clear CW263 within 10s"
+    );
+}
+
+#[test]
 fn test_clear_all_caches_reports_reindexed_message() {
     // clearAllCaches purges the caches then re-indexes. With no competing scan
     // it wins the CAS on the first try, so the honest-reporting refactor (fix 1)
@@ -4223,6 +4333,154 @@ fn test_config_no_op_skips_revalidate_then_real_change_runs() {
 }
 
 #[test]
+fn test_config_idle_only_change_passes_noop_guard() {
+    // A didChangeConfiguration mutating ONLY backgroundReindexIdleSeconds must
+    // count as a change (the no-op guard compares every field the handler
+    // writes); an identical re-send must then hit the guard.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+
+    let rel = "common/decisions/cfg.txt";
+    let path = ws.path().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, STORM_FILE).unwrap();
+    let uri = format!("file://{}", path.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":uri,"languageId":"hoi4","version":1,"text":STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, "cfg.txt", 1);
+    let rx = spawn_frame_collector(reader);
+
+    let cfg = |secs: u64| {
+        jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": { "backgroundReindexIdleSeconds": secs } }),
+        )
+    };
+    let quiet = std::time::Duration::from_millis(700);
+    let budget = std::time::Duration::from_secs(5);
+
+    // 5 differs from the 15s default → one configChange pass.
+    write_frame(&mut child, &cfg(5)).unwrap();
+    let f1 = drain_until_quiet(&rx, quiet, budget);
+    assert_eq!(
+        count_validate(&f1, "configChange"),
+        1,
+        "an idle-only config change must not be swallowed by the no-op guard"
+    );
+
+    // Identical payload → no-op guard skips the revalidate.
+    write_frame(&mut child, &cfg(5)).unwrap();
+    let f2 = drain_until_quiet(&rx, quiet, budget);
+    child.kill().ok();
+    assert_eq!(
+        count_validate(&f2, "configChange"),
+        0,
+        "an identical idle re-send must not revalidate"
+    );
+}
+
+#[test]
+fn test_config_partial_payload_keeps_ignore_lists() {
+    // A didChangeConfiguration carrying ONLY backgroundReindexIdleSeconds must
+    // leave the previously-set ignore lists intact (absent-means-keep in this
+    // handler), not wipe them to empty.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+
+    let rel = "common/decisions/cfg.txt";
+    let path = ws.path().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, STORM_FILE).unwrap();
+    let uri = format!("file://{}", path.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":uri,"languageId":"hoi4","version":1,"text":STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, "cfg.txt", 1);
+    let rx = spawn_frame_collector(reader);
+
+    let quiet = std::time::Duration::from_millis(700);
+    let budget = std::time::Duration::from_secs(5);
+
+    // Establish non-empty ignore lists → one configChange pass.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": {
+                "ignoredErrorCodes": ["CW999"],
+                "ignoreFilePatterns": ["**/skip.txt"],
+            }}),
+        ),
+    )
+    .unwrap();
+    let f1 = drain_until_quiet(&rx, quiet, budget);
+    assert_eq!(
+        count_validate(&f1, "configChange"),
+        1,
+        "setting the ignore lists should revalidate once"
+    );
+
+    // Idle-only partial payload → revalidates (idle changed) but must keep
+    // the ignore lists.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": { "backgroundReindexIdleSeconds": 5 } }),
+        ),
+    )
+    .unwrap();
+    let f2 = drain_until_quiet(&rx, quiet, budget);
+    assert_eq!(
+        count_validate(&f2, "configChange"),
+        1,
+        "an idle-only change should still revalidate once"
+    );
+
+    // Re-send the full payload (plus the now-current idle value). If the
+    // partial payload had wiped the lists, this would differ and revalidate;
+    // absent-means-keep makes it a no-op.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": {
+                "ignoredErrorCodes": ["CW999"],
+                "ignoreFilePatterns": ["**/skip.txt"],
+                "backgroundReindexIdleSeconds": 5,
+            }}),
+        ),
+    )
+    .unwrap();
+    let f3 = drain_until_quiet(&rx, quiet, budget);
+    child.kill().ok();
+    assert_eq!(
+        count_validate(&f3, "configChange"),
+        0,
+        "the partial payload must not have wiped the ignore lists"
+    );
+}
+
+#[test]
 fn test_get_file_types_answers_during_watched_flood() {
     // The direct #90 regression: a large watched flood must not starve a cheap
     // getFileTypes request. With validation off the message future, the request
@@ -4270,6 +4528,56 @@ fn test_get_file_types_answers_during_watched_flood() {
     assert!(
         elapsed < std::time::Duration::from_secs(2),
         "getFileTypes took {elapsed:?} during a watched flood (should be < 2s)"
+    );
+}
+
+#[test]
+fn test_unknown_execute_command_returns_error() {
+    // An unrecognized workspace/executeCommand must surface a JSON-RPC error
+    // naming the command — a silent `null` success masks client/engine
+    // version drift (a newer client invoking a command this server lacks).
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            901,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "notARealCommand", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut response = None;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(v) if v["id"] == 901 => {
+                response = Some(v);
+                break;
+            }
+            _ => continue,
+        }
+    }
+    child.kill().ok();
+
+    let v = response.expect("no response to the unknown command");
+    assert!(
+        !v["error"].is_null(),
+        "unknown command must produce an error response, got: {v}"
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("notARealCommand")),
+        "the error should name the offending command, got: {}",
+        v["error"]
     );
 }
 

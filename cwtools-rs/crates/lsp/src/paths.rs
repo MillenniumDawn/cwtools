@@ -551,8 +551,13 @@ mod tests {
 
     #[test]
     fn test_uri_to_path_percent_decode() {
-        // Paths with spaces must round-trip through percent-encoding.
+        // Paths with spaces must round-trip through percent-encoding. The path
+        // must be absolute for the platform, or Url::from_file_path rejects it
+        // and the non-encoding fallback kicks in.
+        #[cfg(not(windows))]
         let path = std::path::Path::new("/home/user/My Mod/events/foo.txt");
+        #[cfg(windows)]
+        let path = std::path::Path::new(r"C:\Users\user\My Mod\events\foo.txt");
         let uri = path_to_uri(path);
         // The URI must percent-encode the space.
         assert!(

@@ -63,9 +63,16 @@ jobs:
           cargo install cargo-machete --locked
           cargo machete
 
+  # Releases ship Linux, Windows, and macOS binaries, so a platform-only
+  # break must fail here before it ships (#66). Lint and the release build
+  # stay Linux-only.
   test-rs:
-    name: Rust build & test
-    runs-on: ubuntu-latest
+    name: Rust build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: cwtools-rs

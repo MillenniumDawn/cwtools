@@ -1,3 +1,19 @@
+# 1.23.0
+
+## Bug Fixes
+
+- An unknown `workspace/executeCommand` now returns a JSON-RPC error naming the command instead of a silent `null` success. The VS Code client rendered that null as the command working, which masked client/engine version drift (a newer client invoking a command the installed server doesn't have).
+
+## Improvements
+
+- The background reindex idle window is configurable: `backgroundReindexIdleSeconds` via initializationOptions or didChangeConfiguration, default unchanged at 15s. A live change applies on the next reindex cycle. `CWTOOLS_REINDEX_IDLE_SECS` stays the test override and wins over the setting. The VS Code client does not send the setting yet (env var and other LSP clients only, client support to follow). (cwtools#64)
+- Switching editor tabs (the `didFocusFile` notification, which the server previously discarded) now counts as user activity for the background-reindex idle clock, so a quiet pass doesn't start while the user is actively navigating between files.
+
+## Developer
+
+- CI runs the build and test job on Windows and macOS as well as Linux, so a platform-only break blocks a release before it ships. Lint and the release build stay Linux-only. (cwtools#66)
+- Pushing a `v*` tag now builds all three platforms and publishes the archives plus a SHA256SUMS file as the GitHub release; previous releases ended at upload-artifact and shipped no assets. workflow_dispatch remains for re-runs (idempotent: an existing release gets its assets replaced) and skips publish off a tag ref. The macOS archive is now aarch64 (`cwtools-rs-macos-arm64`), matching the arm64 runners and the client's osx-arm64 vsix. (cwtools#67)
+
 # 1.22.0
 
 ## Bug Fixes
@@ -15,12 +31,9 @@
 
 - The vanilla index (`vanilla_index`, `VanillaCacheData::per_type`) threads a per-instance source URI. `TypeIndex::merge_with_uris` merges each base-game instance under its real file, and `TypeIndex::remove_files` drops the whole contribution in one index pass on a re-merge (`cacheVanilla` / `clearAllCaches`). `parse_uri` now logs a warning when a string fails to parse instead of silently substituting the fallback (the failure mode that hid this bug).
 - Added a black-box goto test (a mod reference to a vanilla definition resolves into the vanilla file, not the request document) and a cache round-trip test (save + load preserves each instance's source file).
-<<<<<<< HEAD
 - `merged_rules_for_type` gains a `union_all_subtypes` mode threaded through `rules_at_pos(for_completion)` and `enter_entity`; only the completion call site opts in (hover/goto and validation pass `false`). Added position-resolver tests for the decision/character subtype union and its non-leak into the validation descent, a `validate_ast` test that an inactive subtype's field is still unexpected, and a hand-rolled VS Code snippet-grammar checker run over every generated snippet.
-=======
 - `parse_and_validate` / `debounced_validate` / `revalidate_all_open_docs` take a `ValidateTrigger`. `did_open` and `did_save` insert the buffer synchronously then spawn `debounced_validate` off the message future (open bumps the edit generation, save loads it), reusing its export-diff-gated dependent sweep instead of the old inline open sweep. `didChangeWatchedFiles` create/modify events queue into `watched_pending` behind a fixed 500ms window (`WATCHED_DEBOUNCE_MS`) that drains off the message future, with a `WATCHED_BULK_CAP` (200) full-rescan fast path; deletes stay inline. `didChangeConfiguration` returns early when nothing it writes actually changed.
 - Added black-box tests for watched coalescing (repeat, distinct-burst, over-cap rescan), the config no-op guard, getFileTypes latency under a watched flood, and deferred-open / open-then-immediate-close.
->>>>>>> fix/validate-storm
 
 # 1.20.0
 

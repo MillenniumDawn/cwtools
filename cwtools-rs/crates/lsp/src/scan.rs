@@ -1357,14 +1357,14 @@ impl Backend {
     }
 
     /// How long the user must be idle before a background pass runs, in
-    /// milliseconds. `CWTOOLS_REINDEX_IDLE_SECS` overrides the default of 15s
-    /// (for tests).
-    fn reindex_idle_ms() -> u64 {
-        let secs = std::env::var("CWTOOLS_REINDEX_IDLE_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(15);
-        secs * 1000
+    /// milliseconds. The `CWTOOLS_REINDEX_IDLE_SECS` test override wins over
+    /// the configured `backgroundReindexIdleSeconds`, which wins over the 15s
+    /// default (`Config::new`). Re-read on every not-idle tick, so a live
+    /// config change applies without waiting out the old window.
+    fn reindex_idle_ms(&self) -> u64 {
+        let config_secs = self.state.config.read().background_reindex_idle_seconds;
+        let env_val = std::env::var("CWTOOLS_REINDEX_IDLE_SECS").ok();
+        resolve_reindex_idle_ms(env_val.as_deref(), config_secs)
     }
 
     /// Periodic quiet re-scan so a long-running session doesn't accumulate
@@ -1377,9 +1377,11 @@ impl Backend {
     /// the env override, in tests) live takes effect without a restart: 0
     /// means disabled, and the loop just polls every 60s waiting for it to
     /// become positive. Once enabled, it sleeps out the interval, then waits
-    /// for the user to go idle — checking on each idle-window tick whether
-    /// background reindex got disabled in the meantime — before running a
-    /// quiet `validate_entire_workspace`. Never unwraps: a malformed env var
+    /// for the user to go idle — re-reading the idle window and the enabled
+    /// flag on each tick (bounded to 15s, see `reindex_wait_tick_ms`), so
+    /// lowering or disabling either setting is noticed promptly even when
+    /// the window is hours — before running a quiet
+    /// `validate_entire_workspace`. Never unwraps: a malformed env var
     /// degrades to "disabled"/"default", it doesn't panic the loop.
     pub(crate) async fn background_reindex_loop(&self) {
         loop {
@@ -1390,7 +1392,6 @@ impl Backend {
             }
             tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
 
-            let idle_ms = Self::reindex_idle_ms();
             loop {
                 if self.effective_reindex_interval_secs() == 0 {
                     // Disabled while we were waiting for the interval or for
@@ -1398,13 +1399,17 @@ impl Backend {
                     // and fall back to polling.
                     break;
                 }
+                let idle_ms = self.reindex_idle_ms();
                 if self.should_run_background_pass(idle_ms) {
                     self.validate_entire_workspace(true).await;
                     break;
                 }
                 // Not idle yet — slip forward and check again rather than
                 // skipping the whole interval.
-                tokio::time::sleep(std::time::Duration::from_millis(idle_ms.max(50))).await;
+                tokio::time::sleep(std::time::Duration::from_millis(reindex_wait_tick_ms(
+                    idle_ms,
+                )))
+                .await;
             }
         }
     }
@@ -1416,6 +1421,30 @@ impl Backend {
 /// such clock, but defend anyway) reads as "not idle" instead of wrapping.
 pub(crate) fn is_idle(now_ms: u64, last_activity_ms: u64, idle_ms: u64) -> bool {
     now_ms.saturating_sub(last_activity_ms) >= idle_ms
+}
+
+/// Env > config precedence for the reindex idle window, split out from
+/// `Backend::reindex_idle_ms` so it's unit-testable without a `Backend`.
+/// A malformed env value degrades to the config value, it doesn't panic.
+pub(crate) fn resolve_reindex_idle_secs(env_val: Option<&str>, config_secs: u64) -> u64 {
+    env_val
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(config_secs)
+}
+
+/// The resolved idle window in milliseconds. Saturating so an absurd
+/// configured value (u64::MAX seconds) pins at u64::MAX ms instead of
+/// wrapping into a tiny window.
+pub(crate) fn resolve_reindex_idle_ms(env_val: Option<&str>, config_secs: u64) -> u64 {
+    resolve_reindex_idle_secs(env_val, config_secs).saturating_mul(1000)
+}
+
+/// Sleep tick for the not-idle wait in `background_reindex_loop`. Capped at
+/// 15s so a lowered or disabled setting is noticed promptly even when the
+/// idle window is hours; floored at 50ms so `idle_ms` = 0 (the e2e override)
+/// doesn't busy-spin. The idleness comparison still uses the full window.
+pub(crate) fn reindex_wait_tick_ms(idle_ms: u64) -> u64 {
+    idle_ms.clamp(50, 15_000)
 }
 
 /// Fold a stat-only signature (path, size, mtime) over `files` into one
@@ -1490,6 +1519,59 @@ mod tests {
         assert!(!is_idle(100, 200, 1));
         // ...unless idle_ms is 0, where "no wait required" still holds.
         assert!(is_idle(100, 200, 0));
+    }
+
+    // ── resolve_reindex_idle_secs (env > config > default) ──────────────────
+
+    #[test]
+    fn test_reindex_idle_env_wins_over_config() {
+        assert_eq!(resolve_reindex_idle_secs(Some("3"), 40), 3);
+        // Including re-tightening a config-widened window down to zero.
+        assert_eq!(resolve_reindex_idle_secs(Some("0"), 40), 0);
+    }
+
+    #[test]
+    fn test_reindex_idle_config_wins_over_default() {
+        // No env override → the configured value, whatever the built-in
+        // default is.
+        assert_eq!(resolve_reindex_idle_secs(None, 40), 40);
+    }
+
+    #[test]
+    fn test_reindex_idle_malformed_env_degrades_to_config() {
+        assert_eq!(resolve_reindex_idle_secs(Some("junk"), 40), 40);
+        assert_eq!(resolve_reindex_idle_secs(Some(""), 40), 40);
+    }
+
+    #[test]
+    fn test_reindex_idle_default_is_15_seconds() {
+        // An untouched Config carries the documented 15s default.
+        assert_eq!(crate::Config::new().background_reindex_idle_seconds, 15);
+    }
+
+    #[test]
+    fn test_reindex_idle_ms_saturates_instead_of_wrapping() {
+        // A u64::MAX-ish window must pin at u64::MAX ms, not wrap into a
+        // near-zero window that would let a background pass fire mid-typing.
+        assert_eq!(resolve_reindex_idle_ms(None, u64::MAX), u64::MAX);
+        assert_eq!(resolve_reindex_idle_ms(None, u64::MAX / 999), u64::MAX);
+        // And the non-saturating path still converts normally.
+        assert_eq!(resolve_reindex_idle_ms(None, 15), 15_000);
+        assert_eq!(resolve_reindex_idle_ms(Some("3"), 40), 3_000);
+    }
+
+    // ── reindex_wait_tick_ms (not-idle sleep bounding) ──────────────────────
+
+    #[test]
+    fn test_reindex_wait_tick_is_bounded() {
+        // Small windows tick at the window itself...
+        assert_eq!(reindex_wait_tick_ms(5_000), 5_000);
+        // ...zero (the e2e override) floors at 50ms instead of busy-spinning...
+        assert_eq!(reindex_wait_tick_ms(0), 50);
+        // ...and huge windows cap at 15s so a live settings change is
+        // noticed promptly, not after the old window elapses.
+        assert_eq!(reindex_wait_tick_ms(3_600_000), 15_000);
+        assert_eq!(reindex_wait_tick_ms(u64::MAX), 15_000);
     }
 
     // ── loc_signature_for (quiet-scan loc-rebuild skip) ─────────────────────

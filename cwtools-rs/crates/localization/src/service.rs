@@ -384,9 +384,11 @@ mod tests {
 
         let svc = LocService::from_folder(tmp.path());
         assert_eq!(svc.files().len(), 1);
+        // Windows walks yield `\`-separated paths; compare normalised.
         assert!(
             svc.files()[0]
                 .path
+                .replace('\\', "/")
                 .ends_with("localisation/good_l_english.yml")
         );
     }
@@ -419,6 +421,7 @@ mod tests {
         assert!(
             svc.files()[0]
                 .path
+                .replace('\\', "/")
                 .ends_with("localisation/good_l_english.yml")
         );
     }

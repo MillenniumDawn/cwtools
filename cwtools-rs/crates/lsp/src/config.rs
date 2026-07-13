@@ -60,6 +60,19 @@ pub(crate) fn extract_ignored_error_codes(opts: &Value) -> Vec<String> {
     codes
 }
 
+/// Read an optional non-negative integer setting from the shared
+/// init/didChange payload. Absent → `None` silently; present but not a u64
+/// (string, float, negative) → `None` with a warning naming the key and the
+/// received value, so a mistyped setting doesn't just vanish.
+pub(crate) fn extract_u64_setting(opts: &Value, key: &str) -> Option<u64> {
+    let v = opts.get(key)?;
+    let parsed = v.as_u64();
+    if parsed.is_none() {
+        tracing::warn!(key, value = %v, "ignoring setting: expected a non-negative integer");
+    }
+    parsed
+}
+
 /// Render one localisation stub file for `lang` covering every `missing` key,
 /// as `{language, filename_suggestion, content}`. Standard Paradox loc shape:
 /// an `l_<lang>:` header then ` KEY:0 "TODO"` entries. The file needs a UTF-8
@@ -175,14 +188,18 @@ impl Backend {
 
             // Minutes between quiet background re-index passes (0 disables).
             // A live change comes through `did_change_configuration_impl`.
-            if let Some(mins) = opts
-                .get("backgroundReindexIntervalMinutes")
-                .and_then(|v| v.as_u64())
-            {
+            if let Some(mins) = extract_u64_setting(opts, "backgroundReindexIntervalMinutes") {
                 self.state
                     .config
                     .write()
                     .background_reindex_interval_minutes = mins;
+            }
+
+            // Seconds of user inactivity a background pass waits for (default
+            // 15). A live change comes through `did_change_configuration_impl`
+            // and applies on the next reindex cycle.
+            if let Some(secs) = extract_u64_setting(opts, "backgroundReindexIdleSeconds") {
+                self.state.config.write().background_reindex_idle_seconds = secs;
             }
             self.client
                 .log_message(MessageType::INFO, format!("init options: {:?}", opts))
@@ -478,37 +495,55 @@ impl Backend {
         loaded
     }
 
-    /// Re-read ignore globs and the background-reindex interval when the
-    /// extension's `cwtools.*` settings change. The shape mirrors what we
-    /// accept in `initializationOptions`: the payload is the `cwtools`
-    /// namespace object, with optional `ignoreFilePatterns`,
-    /// `ignoreDirectories`, and `backgroundReindexIntervalMinutes`. The next
-    /// full-workspace scan (or reindex cycle) picks up the new values; an
-    /// in-flight scan finishes with the snapshot it took.
+    /// Re-read ignore globs and the background-reindex interval/idle window
+    /// when the extension's `cwtools.*` settings change. The shape mirrors
+    /// what we accept in `initializationOptions`: the payload is the
+    /// `cwtools` namespace object, with optional `ignoreFilePatterns`,
+    /// `ignoreDirectories`, `backgroundReindexIntervalMinutes`, and
+    /// `backgroundReindexIdleSeconds` — each absent-means-keep, so a partial
+    /// payload only touches the keys it carries. The next full-workspace scan
+    /// (or reindex cycle) picks up the new values; an in-flight scan finishes
+    /// with the snapshot it took.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
         // The client may send either the whole `cwtools` section (when the
         // section is registered via `configurationSection`) or just the
         // changed slice. `extract_ignore_patterns` looks for the same two
-        // keys at the top level — works in both cases.
+        // keys at the top level — works in both cases. Every key here is
+        // absent-means-keep (unlike initialize, where absent means empty):
+        // a partial payload carrying only the reindex keys must not wipe
+        // the ignore lists. The shipped VS Code client always sends its
+        // full section, so this only matters for other clients.
         let (files, dirs) = extract_ignore_patterns(&params.settings);
-        let codes = extract_ignored_error_codes(&params.settings);
-        let (n_files, n_dirs, n_codes) = (files.len(), dirs.len(), codes.len());
-        let reindex_minutes = params
+        let files = params.settings.get("ignoreFilePatterns").map(|_| files);
+        let dirs = params.settings.get("ignoreDirectories").map(|_| dirs);
+        let codes = params
             .settings
-            .get("backgroundReindexIntervalMinutes")
-            .and_then(|v| v.as_u64());
+            .get("ignoredErrorCodes")
+            .map(|_| extract_ignored_error_codes(&params.settings));
+        let counts = (
+            files.as_ref().map(Vec::len),
+            dirs.as_ref().map(Vec::len),
+            codes.as_ref().map(Vec::len),
+        );
+        let reindex_minutes =
+            extract_u64_setting(&params.settings, "backgroundReindexIntervalMinutes");
+        let reindex_idle_secs =
+            extract_u64_setting(&params.settings, "backgroundReindexIdleSeconds");
 
         // No-op guard: the client re-sends the whole `cwtools` section on any
         // change to an unrelated key, so an identical payload arrives often.
         // Skip the write and the open-doc revalidate storm (#90) when nothing
-        // this handler mutates actually changed. `reindex_minutes` is `None`
-        // when the key is absent, and a missing key is never a change.
+        // this handler mutates actually changed. Every field is `None` when
+        // its key is absent, and a missing key is never a change.
         {
             let cfg = self.state.config.read();
-            let unchanged = cfg.ignore_file_patterns == files
-                && cfg.ignore_dir_patterns == dirs
-                && cfg.ignored_error_codes == codes
-                && reindex_minutes.is_none_or(|m| m == cfg.background_reindex_interval_minutes);
+            let unchanged = files
+                .as_ref()
+                .is_none_or(|f| *f == cfg.ignore_file_patterns)
+                && dirs.as_ref().is_none_or(|d| *d == cfg.ignore_dir_patterns)
+                && codes.as_ref().is_none_or(|c| *c == cfg.ignored_error_codes)
+                && reindex_minutes.is_none_or(|m| m == cfg.background_reindex_interval_minutes)
+                && reindex_idle_secs.is_none_or(|s| s == cfg.background_reindex_idle_seconds);
             if unchanged {
                 tracing::debug!("didChangeConfiguration: no relevant change; skipping revalidate");
                 return;
@@ -519,18 +554,29 @@ impl Backend {
             // Any field written here must join the comparison above, or an
             // identical re-send of a changed field will slip past the guard.
             let mut cfg = self.state.config.write();
-            cfg.ignore_file_patterns = files;
-            cfg.ignore_dir_patterns = dirs;
-            cfg.ignored_error_codes = codes;
+            if let Some(files) = files {
+                cfg.ignore_file_patterns = files;
+            }
+            if let Some(dirs) = dirs {
+                cfg.ignore_dir_patterns = dirs;
+            }
+            if let Some(codes) = codes {
+                cfg.ignored_error_codes = codes;
+            }
             if let Some(mins) = reindex_minutes {
                 cfg.background_reindex_interval_minutes = mins;
             }
+            if let Some(secs) = reindex_idle_secs {
+                cfg.background_reindex_idle_seconds = secs;
+            }
         }
+        let (n_files, n_dirs, n_codes) = counts;
         tracing::info!(
-            file_globs = n_files,
-            dir_globs = n_dirs,
-            ignored_codes = n_codes,
+            file_globs = ?n_files,
+            dir_globs = ?n_dirs,
+            ignored_codes = ?n_codes,
             reindex_minutes = ?reindex_minutes,
+            reindex_idle_secs = ?reindex_idle_secs,
             "config updated via didChangeConfiguration"
         );
         // Re-filter the open documents' diagnostics against the updated
@@ -683,7 +729,11 @@ impl Backend {
                 };
                 Ok(Some(Value::String(msg.to_string())))
             }
-            _ => Ok(None),
+            // An error, not a silent `Ok(None)`: the VS Code client renders a
+            // null result as success, masking client/engine version drift.
+            other => Err(tower_lsp::jsonrpc::Error::invalid_params(format!(
+                "unknown command: {other}"
+            ))),
         }
     }
 
@@ -806,6 +856,34 @@ mod tests {
     #[test]
     fn extract_ignored_error_codes_absent_is_empty() {
         assert!(extract_ignored_error_codes(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn extract_u64_setting_reads_valid_values() {
+        let opts = json!({ "backgroundReindexIdleSeconds": 30 });
+        assert_eq!(
+            extract_u64_setting(&opts, "backgroundReindexIdleSeconds"),
+            Some(30)
+        );
+        assert_eq!(
+            extract_u64_setting(&json!({ "k": 0 }), "k"),
+            Some(0),
+            "0 is a valid value (disables), not an error"
+        );
+    }
+
+    #[test]
+    fn extract_u64_setting_absent_is_silently_none() {
+        assert_eq!(extract_u64_setting(&json!({}), "k"), None);
+    }
+
+    #[test]
+    fn extract_u64_setting_invalid_types_are_none() {
+        // Present-but-wrong-type (string, float, negative, null) is ignored;
+        // the warn side effect isn't asserted here, just the ignoring.
+        for v in [json!("30"), json!(1.5), json!(-5), json!(null), json!([30])] {
+            assert_eq!(extract_u64_setting(&json!({ "k": v }), "k"), None);
+        }
     }
 
     #[test]

@@ -1,8 +1,14 @@
 name: Release
 
 on:
+  # Push a v* tag to build and publish the release. workflow_dispatch is a
+  # manual fallback for re-runs (off a tag ref it builds but skips publish).
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
 
+# Never cancel an in-flight release; queue instead.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -25,17 +31,16 @@ jobs:
         include:
           - os: ubuntu-latest
             label: Linux x86_64
-            target: x86_64-unknown-linux-gnu
             artifact: cwtools-rs-linux-x86_64
             strip: true
+          # macos-latest runners are arm64; the host build is aarch64 and the
+          # client vsix ships osx-arm64.
           - os: macos-latest
-            label: macOS x86_64
-            target: x86_64-apple-darwin
-            artifact: cwtools-rs-macos-x86_64
+            label: macOS arm64
+            artifact: cwtools-rs-macos-arm64
             strip: true
           - os: windows-latest
             label: Windows x86_64
-            target: x86_64-pc-windows-msvc
             artifact: cwtools-rs-windows-x86_64
             strip: false
     runs-on: ${{ matrix.os }}
@@ -87,14 +92,51 @@ jobs:
             }
           }
           if ($extOut -eq '.zip') {
-            Compress-Archive -Path dist\* -DestinationPath "cwtools-rs-${{ matrix.artifact }}.zip" -Force
+            Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.zip" -Force
           } else {
-            tar -C dist -czf "cwtools-rs-${{ matrix.artifact }}.tar.gz" .
+            tar -C dist -czf "${{ matrix.artifact }}.tar.gz" .
           }
 
       - name: Upload Rust binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.artifact }}
-          path: cwtools-rs/cwtools-rs-${{ matrix.artifact }}.*
+          path: cwtools-rs/${{ matrix.artifact }}.*
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish the archives + checksums as the GitHub release for the pushed tag.
+  # Skipped for a workflow_dispatch off a tag ref (build-only re-run).
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub release
+    needs: release-rs
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cwtools-rs-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum -- * > SHA256SUMS
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Passed via env rather than inline-interpolated into the script,
+          # per GitHub's script-injection hardening guidance.
+          TAG: ${{ github.ref_name }}
+        # Idempotent for re-runs: upload into an existing release instead of
+        # failing on create.
+        run: |
+          tag="$TAG"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/* --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" artifacts/* --verify-tag --title "$tag" --generate-notes -R "$GITHUB_REPOSITORY"
+          fi
