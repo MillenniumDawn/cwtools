@@ -4390,6 +4390,97 @@ fn test_config_idle_only_change_passes_noop_guard() {
 }
 
 #[test]
+fn test_config_partial_payload_keeps_ignore_lists() {
+    // A didChangeConfiguration carrying ONLY backgroundReindexIdleSeconds must
+    // leave the previously-set ignore lists intact (absent-means-keep in this
+    // handler), not wipe them to empty.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+
+    let rel = "common/decisions/cfg.txt";
+    let path = ws.path().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, STORM_FILE).unwrap();
+    let uri = format!("file://{}", path.display());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":uri,"languageId":"hoi4","version":1,"text":STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, "cfg.txt", 1);
+    let rx = spawn_frame_collector(reader);
+
+    let quiet = std::time::Duration::from_millis(700);
+    let budget = std::time::Duration::from_secs(5);
+
+    // Establish non-empty ignore lists → one configChange pass.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": {
+                "ignoredErrorCodes": ["CW999"],
+                "ignoreFilePatterns": ["**/skip.txt"],
+            }}),
+        ),
+    )
+    .unwrap();
+    let f1 = drain_until_quiet(&rx, quiet, budget);
+    assert_eq!(
+        count_validate(&f1, "configChange"),
+        1,
+        "setting the ignore lists should revalidate once"
+    );
+
+    // Idle-only partial payload → revalidates (idle changed) but must keep
+    // the ignore lists.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": { "backgroundReindexIdleSeconds": 5 } }),
+        ),
+    )
+    .unwrap();
+    let f2 = drain_until_quiet(&rx, quiet, budget);
+    assert_eq!(
+        count_validate(&f2, "configChange"),
+        1,
+        "an idle-only change should still revalidate once"
+    );
+
+    // Re-send the full payload (plus the now-current idle value). If the
+    // partial payload had wiped the lists, this would differ and revalidate;
+    // absent-means-keep makes it a no-op.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": {
+                "ignoredErrorCodes": ["CW999"],
+                "ignoreFilePatterns": ["**/skip.txt"],
+                "backgroundReindexIdleSeconds": 5,
+            }}),
+        ),
+    )
+    .unwrap();
+    let f3 = drain_until_quiet(&rx, quiet, budget);
+    child.kill().ok();
+    assert_eq!(
+        count_validate(&f3, "configChange"),
+        0,
+        "the partial payload must not have wiped the ignore lists"
+    );
+}
+
+#[test]
 fn test_get_file_types_answers_during_watched_flood() {
     // The direct #90 regression: a large watched flood must not starve a cheap
     // getFileTypes request. With validation off the message future, the request
