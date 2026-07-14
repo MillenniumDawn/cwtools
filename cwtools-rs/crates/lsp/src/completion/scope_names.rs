@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::*;
 
 use super::sort_for_kind;
-use crate::paths::{line_prefix, utf16_len};
+use crate::paths::{encoded_position_len, line_prefix_with_encoding};
 use cwtools_game::constants::Game;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,8 +11,12 @@ pub(crate) enum LocCompletionContext {
     Reference,
 }
 
-pub(crate) fn loc_completion_context(text: &str, pos: Position) -> LocCompletionContext {
-    let prefix = line_prefix(text, pos.line, pos.character);
+pub(crate) fn loc_completion_context(
+    text: &str,
+    pos: Position,
+    encoding: &PositionEncodingKind,
+) -> LocCompletionContext {
+    let prefix = line_prefix_with_encoding(text, pos.line, pos.character, encoding);
     if prefix.matches('$').count() % 2 == 1 {
         LocCompletionContext::Reference
     } else if prefix.rfind('[') > prefix.rfind(']') {
@@ -26,8 +30,9 @@ pub(crate) fn loc_completion_range(
     text: &str,
     pos: Position,
     context: LocCompletionContext,
+    encoding: &PositionEncodingKind,
 ) -> Range {
-    let prefix = line_prefix(text, pos.line, pos.character);
+    let prefix = line_prefix_with_encoding(text, pos.line, pos.character, encoding);
     let start_byte = prefix
         .char_indices()
         .rev()
@@ -39,8 +44,11 @@ pub(crate) fn loc_completion_range(
         })
         .unwrap_or(0);
     Range::new(
-        Position::new(pos.line, utf16_len(&prefix[..start_byte])),
-        Position::new(pos.line, utf16_len(prefix)),
+        Position::new(
+            pos.line,
+            encoded_position_len(&prefix[..start_byte], encoding),
+        ),
+        Position::new(pos.line, encoded_position_len(prefix, encoding)),
     )
 }
 
@@ -157,20 +165,21 @@ mod tests {
 
     #[test]
     fn localisation_context_is_cursor_sensitive() {
+        let encoding = &PositionEncodingKind::UTF16;
         assert_eq!(
-            loc_completion_context("key:0 text", Position::new(0, 10)),
+            loc_completion_context("key:0 text", Position::new(0, 10), encoding),
             LocCompletionContext::Key
         );
         assert_eq!(
-            loc_completion_context("key:0 [Get", Position::new(0, 10)),
+            loc_completion_context("key:0 [Get", Position::new(0, 10), encoding),
             LocCompletionContext::DataFunction
         );
         assert_eq!(
-            loc_completion_context("key:0 $OTHER", Position::new(0, 13)),
+            loc_completion_context("key:0 $OTHER", Position::new(0, 13), encoding),
             LocCompletionContext::Reference
         );
         assert_eq!(
-            loc_completion_context("key:0 [GetName]", Position::new(0, 16)),
+            loc_completion_context("key:0 [GetName]", Position::new(0, 16), encoding),
             LocCompletionContext::Key
         );
     }
@@ -194,14 +203,24 @@ mod tests {
         let reference = "key:0 $foo.bar";
         let pos = Position::new(0, reference.chars().count() as u32);
         assert_eq!(
-            loc_completion_range(reference, pos, LocCompletionContext::Reference),
+            loc_completion_range(
+                reference,
+                pos,
+                LocCompletionContext::Reference,
+                &PositionEncodingKind::UTF16,
+            ),
             Range::new(Position::new(0, 7), pos)
         );
 
         let function = "key:0 [GetName";
         let pos = Position::new(0, function.chars().count() as u32);
         assert_eq!(
-            loc_completion_range(function, pos, LocCompletionContext::DataFunction),
+            loc_completion_range(
+                function,
+                pos,
+                LocCompletionContext::DataFunction,
+                &PositionEncodingKind::UTF16,
+            ),
             Range::new(Position::new(0, 7), pos)
         );
     }
@@ -209,25 +228,54 @@ mod tests {
     #[test]
     fn localisation_context_and_range_use_utf16_columns() {
         let reference = "😀 key:0 $OTHER";
-        let pos = Position::new(0, utf16_len(reference));
+        let pos = Position::new(0, crate::paths::utf16_len(reference));
         assert_eq!(
-            loc_completion_context(reference, pos),
+            loc_completion_context(reference, pos, &PositionEncodingKind::UTF16),
             LocCompletionContext::Reference
         );
         assert_eq!(
-            loc_completion_range(reference, pos, LocCompletionContext::Reference),
+            loc_completion_range(
+                reference,
+                pos,
+                LocCompletionContext::Reference,
+                &PositionEncodingKind::UTF16,
+            ),
             Range::new(Position::new(0, 10), pos)
         );
 
         let function = "😀 key:0 [Get";
-        let pos = Position::new(0, utf16_len(function));
+        let pos = Position::new(0, crate::paths::utf16_len(function));
         assert_eq!(
-            loc_completion_context(function, pos),
+            loc_completion_context(function, pos, &PositionEncodingKind::UTF16),
             LocCompletionContext::DataFunction
         );
         assert_eq!(
-            loc_completion_range(function, pos, LocCompletionContext::DataFunction),
+            loc_completion_range(
+                function,
+                pos,
+                LocCompletionContext::DataFunction,
+                &PositionEncodingKind::UTF16,
+            ),
             Range::new(Position::new(0, 10), pos)
+        );
+    }
+
+    #[test]
+    fn localisation_context_and_range_use_utf32_columns() {
+        let reference = "😀 key:0 $OTHER";
+        let pos = Position::new(0, reference.chars().count() as u32);
+        assert_eq!(
+            loc_completion_context(reference, pos, &PositionEncodingKind::UTF32),
+            LocCompletionContext::Reference
+        );
+        assert_eq!(
+            loc_completion_range(
+                reference,
+                pos,
+                LocCompletionContext::Reference,
+                &PositionEncodingKind::UTF32,
+            ),
+            Range::new(Position::new(0, 9), pos)
         );
     }
 

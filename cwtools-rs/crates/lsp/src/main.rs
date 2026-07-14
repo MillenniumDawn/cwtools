@@ -98,6 +98,8 @@ pub(crate) struct Config {
     /// `CWTOOLS_REINDEX_IDLE_SECS` test override wins over this value. A live
     /// change applies on the next reindex cycle.
     pub(crate) background_reindex_idle_seconds: u64,
+    /// Position encoding negotiated with the client. LSP defaults to UTF-16.
+    pub(crate) position_encoding: tower_lsp::lsp_types::PositionEncodingKind,
 }
 
 impl Config {
@@ -117,6 +119,7 @@ impl Config {
             var_checks,
             background_reindex_interval_minutes: 0,
             background_reindex_idle_seconds: 15,
+            position_encoding: tower_lsp::lsp_types::PositionEncodingKind::UTF16,
         }
     }
 
@@ -724,7 +727,12 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
     ) -> Option<PositionElement> {
         let ast = self.ast_for(uri)?;
-        let (line, col) = crate::paths::lsp_pos_to_source(pos);
+        let text = {
+            let docs = self.state.documents.lock();
+            docs.get(uri).map(|doc| doc.text.clone())
+        }?;
+        let position_encoding = self.state.config.read().position_encoding.clone();
+        let (line, col) = crate::paths::lsp_pos_to_source_in_text(&text, pos, &position_encoding);
         cwtools_info::element_at_position(&ast, line, col, &self.state.string_table)
     }
 
@@ -751,7 +759,15 @@ impl Backend {
                 rules_guard.scope_registry.clone(),
             )
         };
-        let (line, col) = crate::paths::lsp_pos_to_source(pos);
+        let position_encoding = self.state.config.read().position_encoding.clone();
+        let document_text = {
+            let docs = self.state.documents.lock();
+            docs.get(uri).map(|doc| Arc::clone(&doc.text))
+        };
+        let (line, col) = document_text.as_deref().map_or_else(
+            || crate::paths::lsp_pos_to_source(pos),
+            |text| crate::paths::lsp_pos_to_source_in_text(text, pos, &position_encoding),
+        );
         // info_service read is held only for the resolve; `rules_at_pos` returns
         // owned data, so it is dropped before the caller runs.
         let info_guard = self.state.info_service.read();
@@ -773,17 +789,19 @@ impl Backend {
     }
 
     /// The `$KEY$` loc reference under the cursor in an open `.yml` document, plus
-    /// its `[start, end)` UTF-16 column range. `None` when the cursor isn't on a
-    /// reference (or the document isn't open). Shared by hover and goto.
+    /// its `[start, end)` range in the negotiated position encoding. `None` when
+    /// the cursor isn't on a reference (or the document isn't open). Shared by
+    /// hover and goto.
     pub(crate) fn loc_ref_at_cursor_doc(
         &self,
         uri: &str,
         pos: tower_lsp::lsp_types::Position,
     ) -> Option<(String, u32, u32)> {
+        let position_encoding = self.state.config.read().position_encoding.clone();
         let docs = self.state.documents.lock();
         let doc = docs.get(uri)?;
         let line = doc.text.lines().nth(pos.line as usize)?;
-        crate::paths::loc_ref_at_cursor(line, pos.character)
+        crate::paths::loc_ref_at_cursor_with_encoding(line, pos.character, &position_encoding)
     }
 }
 

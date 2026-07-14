@@ -828,6 +828,34 @@ fn test_localisation_completion_range_uses_utf16_columns() {
 }
 
 #[test]
+fn test_localisation_completion_range_uses_utf32_columns() {
+    let text = "l_english:\n KNOWN_KEY:0 \"known\"\n TEST:0 \"😀 $key\"";
+    let files = &[("localisation/test_l_english.yml", text)];
+    let caps = serde_json::json!({
+        "general": { "positionEncodings": ["utf-32"] }
+    });
+    let result = feature_request(
+        COMPLETION_RULES,
+        files,
+        &["localisation/test_l_english.yml"],
+        caps,
+        "localisation/test_l_english.yml",
+        "textDocument/completion",
+        serde_json::json!({ "position": { "line": 2, "character": 15 } }),
+    );
+    let items = result
+        .as_array()
+        .or_else(|| result["items"].as_array())
+        .unwrap_or_else(|| panic!("missing completion items: {result}"));
+    let item = items
+        .iter()
+        .find(|item| item["label"] == "known_key")
+        .unwrap_or_else(|| panic!("missing loc key: {result}"));
+    assert_eq!(item["textEdit"]["range"]["start"]["character"], 12);
+    assert_eq!(item["textEdit"]["range"]["end"]["character"], 15);
+}
+
+#[test]
 fn test_completion_skips_resource_files() {
     let response = completion_response("gfx/interface/test.dds", "anything", 0, 8);
     assert!(response["result"].is_null(), "{response}");

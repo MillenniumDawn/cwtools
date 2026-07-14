@@ -323,6 +323,9 @@ impl Backend {
             .and_then(|g| g.position_encodings.as_ref())
             .filter(|encs| encs.contains(&PositionEncodingKind::UTF32))
             .map(|_| PositionEncodingKind::UTF32);
+        self.state.config.write().position_encoding = position_encoding
+            .clone()
+            .unwrap_or(PositionEncodingKind::UTF16);
 
         // documentSymbol: return a nested tree only when the client advertises
         // support; otherwise the flat SymbolInformation list is served.

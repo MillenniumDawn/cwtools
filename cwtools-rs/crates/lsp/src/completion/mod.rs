@@ -10,8 +10,8 @@ use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 
 use crate::paths::{
-    current_token_range, current_token_text, line_value_key, logical_path_from_uri,
-    lsp_pos_to_source_in_text,
+    current_token_range_with_encoding, current_token_text_with_encoding,
+    line_value_key_with_encoding, logical_path_from_uri, lsp_pos_to_source_in_text,
 };
 use crate::{AstSource, Backend, CompletionCacheEntry};
 
@@ -232,6 +232,7 @@ impl Backend {
 
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
+        let position_encoding = self.state.config.read().position_encoding.clone();
 
         if crate::paths::is_cwt_file(&uri) {
             let text = self
@@ -241,12 +242,21 @@ impl Backend {
                 .get(&uri)
                 .map(|doc| Arc::clone(&doc.text))
                 .unwrap_or_default();
-            let range = cwt::cwt_completion_range(&text, pos);
-            let token = current_token_text(&text, pos.line, pos.character, range.start.character);
+            let range = cwt::cwt_completion_range(&text, pos, &position_encoding);
+            let token = current_token_text_with_encoding(
+                &text,
+                pos.line,
+                pos.character,
+                range.start.character,
+                &position_encoding,
+            );
             let filter_token = token
                 .split_once('[')
                 .map_or(token.as_str(), |(head, _)| head);
-            let mut items = filter_by_token(cwt::cwt_completions(&text, pos), filter_token);
+            let mut items = filter_by_token(
+                cwt::cwt_completions(&text, pos, &position_encoding),
+                filter_token,
+            );
             anchor_items(&mut items, range);
             let strategy = if items.is_empty() { "none" } else { "complete" };
             log_completion_summary(
@@ -340,21 +350,27 @@ impl Backend {
             let docs = self.state.documents.lock();
             docs.get(&uri).map(|d| d.text.clone()).unwrap_or_default()
         };
-        let (lsp_line, lsp_col) = lsp_pos_to_source_in_text(&doc_text, pos);
+        let (lsp_line, lsp_col) = lsp_pos_to_source_in_text(&doc_text, pos, &position_encoding);
         // Replace-range for every item the script paths return: the identifier
         // token under the cursor. Loc completion keeps its own behavior (the
         // cached items are shared and the token shape differs), so it is not
         // anchored here.
-        let replace_range = current_token_range(&doc_text, pos.line, pos.character);
+        let replace_range = current_token_range_with_encoding(
+            &doc_text,
+            pos.line,
+            pos.character,
+            &position_encoding,
+        );
         // The typed token so far (up to the cursor, not the whole replace
         // range): the subsequence prefilter below matches candidates against
         // this, not the range end, since the range may extend past the cursor
         // mid-word.
-        let token = current_token_text(
+        let token = current_token_text_with_encoding(
             &doc_text,
             pos.line,
             pos.character,
             replace_range.start.character,
+            &position_encoding,
         );
         let (ruleset_arc, modifier_keys_arc, scope_registry_arc): RulesSnapshot = {
             let rules_guard = self.state.rules.read();
@@ -388,13 +404,15 @@ impl Backend {
                 .state
                 .info_revision
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let context = scope_names::loc_completion_context(&doc_text, pos);
-            let loc_range = scope_names::loc_completion_range(&doc_text, pos, context);
-            let loc_token = current_token_text(
+            let context = scope_names::loc_completion_context(&doc_text, pos, &position_encoding);
+            let loc_range =
+                scope_names::loc_completion_range(&doc_text, pos, context, &position_encoding);
+            let loc_token = current_token_text_with_encoding(
                 &doc_text,
                 pos.line,
                 pos.character,
                 loc_range.start.character,
+                &position_encoding,
             );
             let cache_key = format!("{}:{context:?}", language);
             let cached_items = self
@@ -548,9 +566,12 @@ impl Backend {
                                             !rctx.value_rules.is_empty(),
                                         )
                                     }
-                                } else if let Some(key) =
-                                    line_value_key(&doc_text, pos.line, pos.character)
-                                {
+                                } else if let Some(key) = line_value_key_with_encoding(
+                                    &doc_text,
+                                    pos.line,
+                                    pos.character,
+                                    &position_encoding,
+                                ) {
                                     // Mid-edit `key = |`: the last good parse has no such
                                     // leaf yet; resolve the value rules from the live line.
                                     let vr = value_rules_for_key(

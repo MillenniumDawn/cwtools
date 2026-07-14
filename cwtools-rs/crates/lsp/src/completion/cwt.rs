@@ -1,7 +1,7 @@
 use tower_lsp::lsp_types::*;
 
 use super::sort_for_kind;
-use crate::paths::{line_prefix, utf16_len};
+use crate::paths::{encoded_position_len, line_prefix_with_encoding};
 
 const FIELD_TYPES: &[(&str, &str)] = &[
     ("scalar", "scalar"),
@@ -190,14 +190,15 @@ fn item(label: &str, insert_text: &str, kind: CompletionItemKind, detail: &str) 
     }
 }
 
-fn brace_stack(text: &str, pos: Position) -> Vec<String> {
+fn brace_stack(text: &str, pos: Position, encoding: &PositionEncodingKind) -> Vec<String> {
     let mut source = String::new();
     for (line, raw) in text.split('\n').enumerate() {
         if line < pos.line as usize {
             source.push_str(raw);
             source.push('\n');
         } else if line == pos.line as usize {
-            source.push_str(&raw[..crate::paths::utf16_byte_index(raw, pos.character)]);
+            source
+                .push_str(&raw[..crate::paths::position_byte_index(raw, pos.character, encoding)]);
             break;
         } else {
             break;
@@ -260,8 +261,12 @@ fn brace_stack(text: &str, pos: Position) -> Vec<String> {
     stack
 }
 
-pub(crate) fn cwt_completion_range(text: &str, pos: Position) -> Range {
-    let prefix = line_prefix(text, pos.line, pos.character);
+pub(crate) fn cwt_completion_range(
+    text: &str,
+    pos: Position,
+    encoding: &PositionEncodingKind,
+) -> Range {
+    let prefix = line_prefix_with_encoding(text, pos.line, pos.character, encoding);
     let start_byte = prefix
         .char_indices()
         .rev()
@@ -271,8 +276,11 @@ pub(crate) fn cwt_completion_range(text: &str, pos: Position) -> Range {
         })
         .unwrap_or(0);
     Range::new(
-        Position::new(pos.line, utf16_len(&prefix[..start_byte])),
-        Position::new(pos.line, utf16_len(prefix)),
+        Position::new(
+            pos.line,
+            encoded_position_len(&prefix[..start_byte], encoding),
+        ),
+        Position::new(pos.line, encoded_position_len(prefix, encoding)),
     )
 }
 
@@ -287,15 +295,19 @@ fn items_from(
         .collect()
 }
 
-pub(crate) fn cwt_completions(text: &str, pos: Position) -> Vec<CompletionItem> {
-    let prefix = line_prefix(text, pos.line, pos.character);
+pub(crate) fn cwt_completions(
+    text: &str,
+    pos: Position,
+    encoding: &PositionEncodingKind,
+) -> Vec<CompletionItem> {
+    let prefix = line_prefix_with_encoding(text, pos.line, pos.character, encoding);
     let trimmed = prefix.trim_start();
 
-    if trimmed.starts_with("##") {
+    if trimmed.starts_with("##") && !trimmed.starts_with("###") {
         return items_from(DIRECTIVES, CompletionItemKind::PROPERTY, "rule option");
     }
 
-    let stack = brace_stack(text, pos);
+    let stack = brace_stack(text, pos, encoding);
     let in_subtype_rules = stack.iter().any(|key| key.starts_with("subtype["));
     let in_metadata = matches!(
         stack.first().map(String::as_str),
@@ -373,7 +385,7 @@ mod tests {
     use super::*;
 
     fn labels(text: &str, line: u32, col: u32) -> Vec<String> {
-        cwt_completions(text, Position::new(line, col))
+        cwt_completions(text, Position::new(line, col), &PositionEncodingKind::UTF16)
             .into_iter()
             .map(|item| item.label)
             .collect()
@@ -421,17 +433,27 @@ mod tests {
     #[test]
     fn cwt_completion_range_replaces_bracketed_partial_and_uses_utf16() {
         let text = "😀 rule = filepath[";
-        let pos = Position::new(0, utf16_len(text));
+        let pos = Position::new(0, crate::paths::utf16_len(text));
         assert_eq!(
-            cwt_completion_range(text, pos),
+            cwt_completion_range(text, pos, &PositionEncodingKind::UTF16),
             Range::new(Position::new(0, 10), pos)
         );
 
         let directive = "## car";
-        let pos = Position::new(0, utf16_len(directive));
+        let pos = Position::new(0, crate::paths::utf16_len(directive));
         assert_eq!(
-            cwt_completion_range(directive, pos),
+            cwt_completion_range(directive, pos, &PositionEncodingKind::UTF16),
             Range::new(Position::new(0, 3), pos)
+        );
+    }
+
+    #[test]
+    fn cwt_completion_range_uses_utf32() {
+        let text = "😀 rule = filepath[";
+        let pos = Position::new(0, text.chars().count() as u32);
+        assert_eq!(
+            cwt_completion_range(text, pos, &PositionEncodingKind::UTF32),
+            Range::new(Position::new(0, 9), pos)
         );
     }
 
@@ -502,10 +524,15 @@ mod tests {
 
     #[test]
     fn directive_snippets_do_not_duplicate_comment_prefix() {
-        let item = cwt_completions("## car", Position::new(0, 6))
+        let item = cwt_completions("## car", Position::new(0, 6), &PositionEncodingKind::UTF16)
             .into_iter()
             .find(|item| item.label == "cardinality")
             .unwrap();
         assert_eq!(item.insert_text.as_deref(), Some("cardinality = ${1:0..1}"));
+    }
+
+    #[test]
+    fn documentation_comments_do_not_offer_directives() {
+        assert!(!labels("### car", 0, 7).contains(&"cardinality".to_string()));
     }
 }
