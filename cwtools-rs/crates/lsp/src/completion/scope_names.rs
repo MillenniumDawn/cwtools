@@ -1,149 +1,250 @@
 use tower_lsp::lsp_types::*;
 
-use cwtools_info::InfoService;
-
 use super::sort_for_kind;
+use crate::paths::{line_prefix, utf16_len};
+use cwtools_game::constants::Game;
 
-/// Build best-effort localisation-key completions for .yml files.
-///
-/// Offers all known loc keys from the InfoService.  Inside a `[...]` data-
-/// function block, offers scope/command names instead.  Best-effort only —
-/// full CWTools loc completion (F# locComplete:208-243) would need the loc
-/// database and scope tracking, which are not yet ported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocCompletionContext {
+    Key,
+    DataFunction,
+    Reference,
+}
+
+pub(crate) fn loc_completion_context(text: &str, pos: Position) -> LocCompletionContext {
+    let prefix = line_prefix(text, pos.line, pos.character);
+    if prefix.matches('$').count() % 2 == 1 {
+        LocCompletionContext::Reference
+    } else if prefix.rfind('[') > prefix.rfind(']') {
+        LocCompletionContext::DataFunction
+    } else {
+        LocCompletionContext::Key
+    }
+}
+
+pub(crate) fn loc_completion_range(
+    text: &str,
+    pos: Position,
+    context: LocCompletionContext,
+) -> Range {
+    let prefix = line_prefix(text, pos.line, pos.character);
+    let start_byte = prefix
+        .char_indices()
+        .rev()
+        .find_map(|(byte, ch)| {
+            let part_of_token = ch.is_alphanumeric()
+                || ch == '_'
+                || (context != LocCompletionContext::DataFunction && ch == '.');
+            (!part_of_token).then_some(byte + ch.len_utf8())
+        })
+        .unwrap_or(0);
+    Range::new(
+        Position::new(pos.line, utf16_len(&prefix[..start_byte])),
+        Position::new(pos.line, utf16_len(prefix)),
+    )
+}
+
+/// Build best-effort localisation completions for the syntax at the cursor.
+/// Scope tracking within localisation remains intentionally best-effort.
 pub(crate) fn loc_completions(
-    info: &InfoService,
+    loc_keys: &std::collections::HashSet<String>,
     language: &str,
     registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
+    context: LocCompletionContext,
 ) -> Vec<CompletionItem> {
-    // Collect all top-level keys from all files as potential loc keys. Dedup by
-    // borrowing &str (not cloning every key into the set) — this walks every
-    // workspace file per request, so the per-key String clone was the cost.
-    //
-    // NOTE: a cross-request cache (#20) is intentionally skipped. The obvious
-    // freshness key, `edit_generation`, is not bumped by all the mutations that
-    // change `info.files` (the initial scan, `did_close`, and validate's
-    // `clear_file` all mutate it without a bump), so keying on it would serve
-    // stale completions. The fix would have to live outside completion.rs.
-    let mut items: Vec<CompletionItem> = loc_key_names(info)
-        .collect::<std::collections::HashSet<&str>>()
-        .into_iter()
-        .map(|k| CompletionItem {
-            label: k.to_string(),
-            kind: Some(CompletionItemKind::TEXT),
-            detail: Some("loc key".to_string()),
-            sort_text: sort_for_kind(Some(CompletionItemKind::TEXT), k),
-            ..Default::default()
-        })
-        .collect();
-
-    // Offer scope names as data-function completions inside [...]
-    for name in scope_completion_names(language, registry) {
-        let sort_label = name.clone();
-        items.push(CompletionItem {
-            label: name,
-            kind: Some(CompletionItemKind::FUNCTION),
-            detail: Some("scope command".to_string()),
-            sort_text: sort_for_kind(Some(CompletionItemKind::FUNCTION), &sort_label),
-            ..Default::default()
-        });
+    match context {
+        LocCompletionContext::Key | LocCompletionContext::Reference => loc_keys
+            .iter()
+            .map(|k| CompletionItem {
+                label: k.clone(),
+                kind: Some(if context == LocCompletionContext::Reference {
+                    CompletionItemKind::REFERENCE
+                } else {
+                    CompletionItemKind::TEXT
+                }),
+                detail: Some("loc key".to_string()),
+                sort_text: sort_for_kind(Some(CompletionItemKind::TEXT), k),
+                ..Default::default()
+            })
+            .collect(),
+        LocCompletionContext::DataFunction => scope_completion_names(language, registry)
+            .into_iter()
+            .map(|name| {
+                let sort_text = sort_for_kind(Some(CompletionItemKind::FUNCTION), &name);
+                CompletionItem {
+                    label: name,
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    detail: Some("scope command".to_string()),
+                    sort_text,
+                    ..Default::default()
+                }
+            })
+            .collect(),
     }
-
-    items
 }
 
-/// Candidate localisation keys: the top-level clause keys (workspace entities)
-/// from every indexed file. Shared by loc-file completion and the value-position
-/// `localisation` field arm.
-pub(crate) fn loc_key_names(info: &InfoService) -> impl Iterator<Item = &str> {
-    info.files
-        .values()
-        .flat_map(|fi| fi.top_level_keys.iter().map(|(k, _)| k.as_str()))
+fn normalized_game(language: &str) -> Option<Game> {
+    Game::from_str(language)
 }
 
-/// Chain-keyword prelude for scope completions. These are runtime traversal
-/// keywords (`THIS`/`ROOT`/`PREV`/`FROM`) that are not scope types and will
-/// not appear in the registry. HOI4 convention is uppercase; other games use
-/// lowercase.
+/// Chain-keyword prelude for scope completions. HOI4 and EU4 configs conventionally
+/// spell these uppercase; other supported games use lowercase.
 fn scope_prelude(language: &str) -> &'static [&'static str] {
-    if language == "hoi4" {
-        &["THIS", "ROOT", "PREV", "FROM"]
-    } else {
-        &["this", "root", "prev", "from"]
+    match normalized_game(language) {
+        Some(Game::Hoi4 | Game::Eu4) => &["THIS", "ROOT", "PREV", "FROM"],
+        _ => &["this", "root", "prev", "from"],
     }
 }
 
 /// Derive scope completion names from the loaded registry when available, with
-/// `scope_names_for_game` as the fallback when no registry is loaded.
-///
-/// The returned list is: chain-keyword prelude + scope type names (from
-/// `registry.by_name` keys) + link names (from `registry.links` keys). All
-/// registry keys are lowercase; the prelude follows per-game casing.
+/// game scope definitions and a small link fallback when no registry is loaded.
 pub(crate) fn scope_completion_names(
     language: &str,
     registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
 ) -> Vec<String> {
-    let Some(reg) = registry else {
-        return scope_names_for_game(language)
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-    };
-
     let mut names: Vec<String> = scope_prelude(language)
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-    // Scope type names from the registry (lowercased). Use `by_id` to get the
-    // canonical name for each scope (avoids duplicating aliases).
-    let mut scope_names: Vec<String> = reg.by_id.values().map(|d| d.name.clone()).collect();
-    scope_names.sort_unstable();
-    names.extend(scope_names);
+    if let Some(reg) = registry {
+        names.extend(reg.by_id.values().map(|d| d.name.clone()));
+        names.extend(reg.links.keys().cloned());
+    } else {
+        names.extend(scope_names_for_game(language));
+    }
 
-    // Named links (owner, capital_scope, every_state, …).
-    let mut link_names: Vec<String> = reg.links.keys().cloned().collect();
-    link_names.sort_unstable();
-    names.extend(link_names);
-
+    let prelude_len = scope_prelude(language).len();
+    names[prelude_len..].sort_unstable();
+    names.dedup();
     names
 }
 
-/// Best-effort scope name list for the current game. Used as a fallback when
-/// no registry has been loaded.
-pub(crate) fn scope_names_for_game(language: &str) -> &'static [&'static str] {
-    match language {
-        "hoi4" => &[
-            "THIS",
-            "ROOT",
-            "PREV",
-            "FROM",
-            "OVERLORD",
-            "FACTION_LEADER",
-            "capital_scope",
-            "owner",
-        ],
-        "stellaris" => &[
-            "this",
-            "root",
-            "prev",
-            "from",
+pub(crate) fn scope_names_for_game(language: &str) -> Vec<String> {
+    let mut names: Vec<String> = normalized_game(language)
+        .map(|game| {
+            game.scope_defs()
+                .iter()
+                .flat_map(|scope| {
+                    std::iter::once(scope.name.to_ascii_lowercase())
+                        .chain(scope.aliases.iter().map(|alias| alias.to_ascii_lowercase()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let links: &[&str] = match normalized_game(language) {
+        Some(Game::Hoi4) => &["OVERLORD", "FACTION_LEADER", "capital_scope", "owner"],
+        Some(Game::Stellaris) => &[
             "owner",
             "controller",
             "space_owner",
             "space_controller",
             "solar_system",
         ],
-        "eu4" => &[
-            "THIS",
-            "ROOT",
-            "PREV",
-            "FROM",
-            "EMPEROR",
-            "capital_scope",
-            "owner",
-            "controller",
-        ],
-        "ck3" => &["this", "root", "prev", "from", "liege", "employer", "host"],
-        _ => &["this", "root", "prev", "from"],
+        Some(Game::Eu4) => &["EMPEROR", "capital_scope", "owner", "controller"],
+        Some(Game::Ck2 | Game::Ck3) => &["liege", "employer", "host"],
+        Some(Game::Ir) => &["owner", "controller", "capital_scope"],
+        _ => &[],
+    };
+    names.extend(links.iter().map(|s| s.to_string()));
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn localisation_context_is_cursor_sensitive() {
+        assert_eq!(
+            loc_completion_context("key:0 text", Position::new(0, 10)),
+            LocCompletionContext::Key
+        );
+        assert_eq!(
+            loc_completion_context("key:0 [Get", Position::new(0, 10)),
+            LocCompletionContext::DataFunction
+        );
+        assert_eq!(
+            loc_completion_context("key:0 $OTHER", Position::new(0, 13)),
+            LocCompletionContext::Reference
+        );
+        assert_eq!(
+            loc_completion_context("key:0 [GetName]", Position::new(0, 16)),
+            LocCompletionContext::Key
+        );
+    }
+
+    #[test]
+    fn localisation_items_follow_context() {
+        let loc_keys = std::collections::HashSet::from(["KNOWN_KEY".to_string()]);
+        let keys = loc_completions(&loc_keys, "hoi4", None, LocCompletionContext::Key);
+        assert!(keys.iter().any(|item| item.label == "KNOWN_KEY"));
+        assert!(!keys.iter().any(|item| item.label == "THIS"));
+        let functions =
+            loc_completions(&loc_keys, "hoi4", None, LocCompletionContext::DataFunction);
+        assert!(functions.iter().any(|item| item.label == "THIS"));
+        assert!(!functions.iter().any(|item| item.label == "KNOWN_KEY"));
+        let references = loc_completions(&loc_keys, "hoi4", None, LocCompletionContext::Reference);
+        assert!(references.iter().any(|item| item.label == "KNOWN_KEY"));
+    }
+
+    #[test]
+    fn localisation_ranges_exclude_syntax_delimiters() {
+        let reference = "key:0 $foo.bar";
+        let pos = Position::new(0, reference.chars().count() as u32);
+        assert_eq!(
+            loc_completion_range(reference, pos, LocCompletionContext::Reference),
+            Range::new(Position::new(0, 7), pos)
+        );
+
+        let function = "key:0 [GetName";
+        let pos = Position::new(0, function.chars().count() as u32);
+        assert_eq!(
+            loc_completion_range(function, pos, LocCompletionContext::DataFunction),
+            Range::new(Position::new(0, 7), pos)
+        );
+    }
+
+    #[test]
+    fn localisation_context_and_range_use_utf16_columns() {
+        let reference = "😀 key:0 $OTHER";
+        let pos = Position::new(0, utf16_len(reference));
+        assert_eq!(
+            loc_completion_context(reference, pos),
+            LocCompletionContext::Reference
+        );
+        assert_eq!(
+            loc_completion_range(reference, pos, LocCompletionContext::Reference),
+            Range::new(Position::new(0, 10), pos)
+        );
+
+        let function = "😀 key:0 [Get";
+        let pos = Position::new(0, utf16_len(function));
+        assert_eq!(
+            loc_completion_context(function, pos),
+            LocCompletionContext::DataFunction
+        );
+        assert_eq!(
+            loc_completion_range(function, pos, LocCompletionContext::DataFunction),
+            Range::new(Position::new(0, 10), pos)
+        );
+    }
+
+    #[test]
+    fn game_aliases_share_scope_fallback() {
+        assert_eq!(
+            scope_names_for_game("stellaris"),
+            scope_names_for_game("stl")
+        );
+        assert_eq!(
+            scope_names_for_game("ir"),
+            scope_names_for_game("imperator")
+        );
+        assert!(
+            scope_completion_names("HOI4", None)
+                .iter()
+                .any(|s| s == "THIS")
+        );
     }
 }

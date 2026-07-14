@@ -67,6 +67,14 @@ pub(crate) fn lsp_pos_to_source(pos: tower_lsp::lsp_types::Position) -> (u32, u1
     (pos.line + 1, pos.character as u16)
 }
 
+pub(crate) fn lsp_pos_to_source_in_text(
+    text: &str,
+    pos: tower_lsp::lsp_types::Position,
+) -> (u32, u16) {
+    let column = line_prefix(text, pos.line, pos.character).chars().count();
+    (pos.line + 1, column.min(u16::MAX as usize) as u16)
+}
+
 /// Parse a string into an LSP Url, falling back to a clone of `fallback` on
 /// error. A failed parse is logged: the fallback silently resolved a location to
 /// the wrong document once (the `"<vanilla-cache>"` sentinel, #62), so a stray
@@ -77,6 +85,27 @@ pub(crate) fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
         tracing::warn!(uri = %uri_str, "parse_uri: not a valid URI, using fallback location");
         fallback.clone()
     })
+}
+
+pub(crate) fn utf16_byte_index(text: &str, column: u32) -> usize {
+    let mut utf16 = 0_u32;
+    for (byte, ch) in text.char_indices() {
+        let next = utf16 + ch.len_utf16() as u32;
+        if next > column {
+            return byte;
+        }
+        utf16 = next;
+    }
+    text.len()
+}
+
+pub(crate) fn utf16_len(text: &str) -> u32 {
+    text.encode_utf16().count() as u32
+}
+
+pub(crate) fn line_prefix(text: &str, line0: u32, char0: u32) -> &str {
+    let line = text.lines().nth(line0 as usize).unwrap_or("");
+    &line[..utf16_byte_index(line, char0)]
 }
 
 /// When the line prefix before the cursor reads `key =` (value not typed yet,
@@ -97,9 +126,7 @@ pub(crate) fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
 /// characters.
 pub(crate) fn line_value_key(text: &str, line0: u32, char0: u32) -> Option<String> {
     let line = text.lines().nth(line0 as usize)?;
-    let n = line.len().min(char0 as usize);
-    let n = (0..=n).rev().find(|&i| line.is_char_boundary(i))?;
-    let upto = &line[..n];
+    let upto = &line[..utf16_byte_index(line, char0)];
     let trimmed = upto.trim_end();
     // Require the line to end with an operator: the value position is
     // recognisable by the `=` / `<` / `>` the user is sitting on (or has just
@@ -138,26 +165,20 @@ pub(crate) fn current_token_range(
     char0: u32,
 ) -> tower_lsp::lsp_types::Range {
     use tower_lsp::lsp_types::{Position, Range};
-    let line = text.lines().nth(line0 as usize).unwrap_or("");
-    let chars: Vec<char> = line.chars().collect();
-    let cur = (char0 as usize).min(chars.len());
-    let mut start = cur;
-    while start > 0 {
-        let c = chars[start - 1];
-        if c.is_alphanumeric() || c == '_' {
-            start -= 1;
-        } else {
-            break;
-        }
-    }
+    let prefix = line_prefix(text, line0, char0);
+    let start_byte = prefix
+        .char_indices()
+        .rev()
+        .find_map(|(byte, c)| (!(c.is_alphanumeric() || c == '_')).then_some(byte + c.len_utf8()))
+        .unwrap_or(0);
     Range {
         start: Position {
             line: line0,
-            character: start as u32,
+            character: utf16_len(&prefix[..start_byte]),
         },
         end: Position {
             line: line0,
-            character: char0,
+            character: utf16_len(prefix),
         },
     }
 }
@@ -171,14 +192,9 @@ pub(crate) fn current_token_range(
 /// are LSP 0-based.
 pub(crate) fn current_token_text(text: &str, line0: u32, char0: u32, start_char: u32) -> String {
     let line = text.lines().nth(line0 as usize).unwrap_or("");
-    let chars: Vec<char> = line.chars().collect();
-    let start = (start_char as usize).min(chars.len());
-    let end = (char0 as usize).min(chars.len());
-    if start >= end {
-        String::new()
-    } else {
-        chars[start..end].iter().collect()
-    }
+    let start = utf16_byte_index(line, start_char);
+    let end = utf16_byte_index(line, char0);
+    line.get(start..end).unwrap_or("").to_string()
 }
 
 /// Whether a URI is a localisation file (`.yml` / `.yaml` / `.csv`), where
@@ -200,6 +216,19 @@ pub(crate) fn is_loc_file(uri: &str) -> bool {
 /// all agree on what counts as a rule file.
 pub(crate) fn is_cwt_file(uri: &str) -> bool {
     uri.to_ascii_lowercase().ends_with(".cwt")
+}
+
+/// Whether a URI is one of the game-script file types discovered and validated
+/// by the shared file manager.
+pub(crate) fn is_script_file(uri: &str) -> bool {
+    std::path::Path::new(uri)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            cwtools_file_manager::SCRIPT_EXTENSIONS
+                .iter()
+                .any(|script_ext| ext.eq_ignore_ascii_case(script_ext))
+        })
 }
 
 /// Locate the `$KEY$` loc-reference token under the cursor in a localisation
@@ -406,6 +435,25 @@ mod tests {
     }
 
     #[test]
+    fn is_script_file_uses_shared_extension_inventory() {
+        for ext in cwtools_file_manager::SCRIPT_EXTENSIONS {
+            assert!(is_script_file(&format!("file:///mod/test.{ext}")), "{ext}");
+            assert!(
+                is_script_file(&format!("file:///mod/test.{}", ext.to_uppercase())),
+                "{ext}"
+            );
+        }
+        for uri in [
+            "file:///mod/icon.dds",
+            "file:///mod/localisation/test.yml",
+            "file:///rules/test.cwt",
+            "file:///mod/readme.md",
+        ] {
+            assert!(!is_script_file(uri), "{uri}");
+        }
+    }
+
+    #[test]
     fn test_line_value_key() {
         let text = "decision = {\n    has_completed_focus = \n}\n";
         // Cursor right after `= ` on line 1 (0-based), char 26.
@@ -487,6 +535,21 @@ mod tests {
             r3.start.character,
             "value = event_target:".chars().count() as u32,
             "`:` is a boundary; token is `foo`"
+        );
+    }
+
+    #[test]
+    fn current_token_helpers_use_utf16_columns() {
+        let line = "😀 value";
+        let cursor = utf16_len(line);
+        let range = current_token_range(line, 0, cursor);
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.character, 8);
+        assert_eq!(current_token_text(line, 0, cursor, 3), "value");
+        assert_eq!(line_prefix(line, 0, 2), "😀");
+        assert_eq!(
+            lsp_pos_to_source_in_text(line, tower_lsp::lsp_types::Position::new(0, cursor)),
+            (1, 7)
         );
     }
 
