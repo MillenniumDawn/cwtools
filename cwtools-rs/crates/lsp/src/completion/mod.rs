@@ -10,16 +10,21 @@ use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
 
 use crate::paths::{
-    current_token_range, current_token_text, line_value_key, logical_path_from_uri,
+    current_token_range_with_encoding, current_token_text_with_encoding,
+    line_value_key_with_encoding, logical_path_from_uri, lsp_pos_to_source_in_text,
 };
 use crate::{AstSource, Backend, CompletionCacheEntry};
 
 mod builders;
+mod cwt;
 mod resolve;
 mod scope_names;
 mod snippets;
 
-pub(crate) use builders::{completions_from_rules, root_type_snippets, value_completions};
+pub(crate) use builders::{
+    ValueCompletionSets, completions_from_rules, root_type_snippets, value_completions,
+    value_rules_need_loc_keys,
+};
 pub(crate) use scope_names::loc_completions;
 pub(crate) use snippets::generate_node_snippet;
 
@@ -195,6 +200,18 @@ fn log_completion_summary(
 }
 
 impl Backend {
+    fn completion_loc_keys(&self) -> HashSet<String> {
+        let mut keys = self
+            .state
+            .loc_index
+            .read()
+            .as_ref()
+            .map(|index| index.union().clone())
+            .unwrap_or_default();
+        keys.extend(self.loc_overlay_keys());
+        keys
+    }
+
     #[tracing::instrument(
         skip_all,
         fields(
@@ -215,9 +232,54 @@ impl Backend {
 
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
+        let position_encoding = self.state.config.read().position_encoding.clone();
 
-        // `.cwt` rule files aren't game content — no rule-driven completion. (#43)
         if crate::paths::is_cwt_file(&uri) {
+            let text = self
+                .state
+                .documents
+                .lock()
+                .get(&uri)
+                .map(|doc| Arc::clone(&doc.text))
+                .unwrap_or_default();
+            let range = cwt::cwt_completion_range(&text, pos, &position_encoding);
+            let token = current_token_text_with_encoding(
+                &text,
+                pos.line,
+                pos.character,
+                range.start.character,
+                &position_encoding,
+            );
+            let filter_token = token
+                .split_once('[')
+                .map_or(token.as_str(), |(head, _)| head);
+            let mut items = filter_by_token(
+                cwt::cwt_completions(&text, pos, &position_encoding),
+                filter_token,
+            );
+            anchor_items(&mut items, range);
+            let strategy = if items.is_empty() { "none" } else { "complete" };
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                items.len(),
+                strategy,
+                "cwt",
+                AstSource::None.as_str(),
+            );
+            return Ok(
+                (!items.is_empty()).then_some(CompletionResponse::List(CompletionList {
+                    is_incomplete: true,
+                    items,
+                })),
+            );
+        }
+
+        // Resource and unsupported files never enter the game-script fallback.
+        // Localisation has a separate path below.
+        if !crate::paths::is_loc_file(&uri) && !crate::paths::is_script_file(&uri) {
             log_completion_summary(
                 t_start.elapsed(),
                 ast_dur,
@@ -225,7 +287,7 @@ impl Backend {
                 build_dur,
                 0,
                 "none",
-                "none",
+                "unsupported",
                 AstSource::None.as_str(),
             );
             return Ok(None);
@@ -259,8 +321,6 @@ impl Backend {
             return Ok(None);
         }
 
-        let (lsp_line, lsp_col) = crate::paths::lsp_pos_to_source(pos);
-
         // Try context-aware completions first: resolve the rules at the cursor
         // with the validation engine's own descent (aliases, typed keys,
         // subtypes, skip_root_key — see cwtools_validation::position).
@@ -290,20 +350,27 @@ impl Backend {
             let docs = self.state.documents.lock();
             docs.get(&uri).map(|d| d.text.clone()).unwrap_or_default()
         };
+        let (lsp_line, lsp_col) = lsp_pos_to_source_in_text(&doc_text, pos, &position_encoding);
         // Replace-range for every item the script paths return: the identifier
         // token under the cursor. Loc completion keeps its own behavior (the
         // cached items are shared and the token shape differs), so it is not
         // anchored here.
-        let replace_range = current_token_range(&doc_text, pos.line, pos.character);
+        let replace_range = current_token_range_with_encoding(
+            &doc_text,
+            pos.line,
+            pos.character,
+            &position_encoding,
+        );
         // The typed token so far (up to the cursor, not the whole replace
         // range): the subsequence prefilter below matches candidates against
         // this, not the range end, since the range may extend past the cursor
         // mid-word.
-        let token = current_token_text(
+        let token = current_token_text_with_encoding(
             &doc_text,
             pos.line,
             pos.character,
             replace_range.start.character,
+            &position_encoding,
         );
         let (ruleset_arc, modifier_keys_arc, scope_registry_arc): RulesSnapshot = {
             let rules_guard = self.state.rules.read();
@@ -330,70 +397,64 @@ impl Backend {
             return Ok(None);
         }
 
-        // Localisation file — offer loc-key / data-function completions. The
-        // list is workspace-wide (every open `.yml` shares the same set), so
-        // cache it keyed by (info_revision, language) — a hit skips the
-        // `info.files` walk and the per-request scope-name build, both of
-        // which are expensive on a large mod and fire on every keystroke in
-        // the half-typed state.
+        // Localisation completion is syntax-sensitive: ordinary text and `$...$`
+        // references offer loc keys, while an open `[...]` offers data functions.
         if crate::paths::is_loc_file(&uri) {
             let revision = self
                 .state
                 .info_revision
                 .load(std::sync::atomic::Ordering::Relaxed);
-            if let Some(cached) = self.state.loc_cache.lock().as_ref()
-                && cached.revision == revision
-                && cached.language == language
-            {
-                let items = (*cached.items).clone();
-                if !items.is_empty() {
-                    // Filter the retrieved copy, never the cache: the cached
-                    // list is shared across every open `.yml` and every
-                    // token, so it must stay un-anchored and un-filtered.
-                    let items = filter_by_token(items, &token);
-                    log_completion_summary(
-                        t_start.elapsed(),
-                        ast_dur,
-                        rules_dur,
-                        build_dur,
-                        items.len(),
-                        "filtered",
-                        "loc",
-                        AstSource::None.as_str(),
-                    );
-                    return Ok(Some(CompletionResponse::List(CompletionList {
-                        is_incomplete: true,
-                        items,
-                    })));
-                }
+            let context = scope_names::loc_completion_context(&doc_text, pos, &position_encoding);
+            let loc_range =
+                scope_names::loc_completion_range(&doc_text, pos, context, &position_encoding);
+            let loc_token = current_token_text_with_encoding(
+                &doc_text,
+                pos.line,
+                pos.character,
+                loc_range.start.character,
+                &position_encoding,
+            );
+            let cache_key = format!("{}:{context:?}", language);
+            let cached_items = self
+                .state
+                .loc_cache
+                .lock()
+                .as_ref()
+                .filter(|cached| cached.revision == revision && cached.language == cache_key)
+                .map(|cached| (*cached.items).clone());
+            let items = if let Some(items) = cached_items {
+                items
             } else {
-                let info_guard = self.state.info_service.read();
+                let loc_keys = self.completion_loc_keys();
                 let t_build = Instant::now();
-                let items = loc_completions(&info_guard, &language, scope_registry_arc.as_deref());
+                let items =
+                    loc_completions(&loc_keys, &language, scope_registry_arc.as_deref(), context);
                 build_dur = t_build.elapsed();
-                if !items.is_empty() {
-                    *self.state.loc_cache.lock() = Some(CompletionCacheEntry {
-                        revision,
-                        language: language.clone(),
-                        items: std::sync::Arc::new(items.clone()),
-                    });
-                    let items = filter_by_token(items, &token);
-                    log_completion_summary(
-                        t_start.elapsed(),
-                        ast_dur,
-                        rules_dur,
-                        build_dur,
-                        items.len(),
-                        "filtered",
-                        "loc",
-                        AstSource::None.as_str(),
-                    );
-                    return Ok(Some(CompletionResponse::List(CompletionList {
-                        is_incomplete: true,
-                        items,
-                    })));
-                }
-            }
+                *self.state.loc_cache.lock() = Some(CompletionCacheEntry {
+                    revision,
+                    language: cache_key,
+                    items: std::sync::Arc::new(items.clone()),
+                });
+                items
+            };
+            let mut items = filter_by_token(items, &loc_token);
+            anchor_items(&mut items, loc_range);
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                items.len(),
+                if items.is_empty() { "none" } else { "filtered" },
+                "loc",
+                AstSource::None.as_str(),
+            );
+            return Ok(
+                (!items.is_empty()).then_some(CompletionResponse::List(CompletionList {
+                    is_incomplete: true,
+                    items,
+                })),
+            );
         }
 
         // `Some(items)` = the rule context resolved (items may still be empty:
@@ -483,6 +544,12 @@ impl Backend {
                                             false,
                                         )
                                     } else {
+                                        let loc_keys =
+                                            if value_rules_need_loc_keys(&rctx.value_rules) {
+                                                self.completion_loc_keys()
+                                            } else {
+                                                Default::default()
+                                            };
                                         (
                                             value_completions(
                                                 &rctx.value_rules,
@@ -490,13 +557,21 @@ impl Backend {
                                                 &info_guard,
                                                 scope_registry_arc.as_deref(),
                                                 &language,
+                                                ValueCompletionSets {
+                                                    modifier_keys: &modifier_keys_arc,
+                                                    loc_keys: &loc_keys,
+                                                },
+                                                rctx.scope.as_ref().map(|s| s.current()),
                                             ),
                                             !rctx.value_rules.is_empty(),
                                         )
                                     }
-                                } else if let Some(key) =
-                                    line_value_key(&doc_text, pos.line, pos.character)
-                                {
+                                } else if let Some(key) = line_value_key_with_encoding(
+                                    &doc_text,
+                                    pos.line,
+                                    pos.character,
+                                    &position_encoding,
+                                ) {
                                     // Mid-edit `key = |`: the last good parse has no such
                                     // leaf yet; resolve the value rules from the live line.
                                     let vr = value_rules_for_key(
@@ -506,6 +581,11 @@ impl Backend {
                                         &key,
                                     );
                                     let resolved = !vr.is_empty();
+                                    let loc_keys = if value_rules_need_loc_keys(&vr) {
+                                        self.completion_loc_keys()
+                                    } else {
+                                        Default::default()
+                                    };
                                     (
                                         value_completions(
                                             &vr,
@@ -513,6 +593,11 @@ impl Backend {
                                             &info_guard,
                                             scope_registry_arc.as_deref(),
                                             &language,
+                                            ValueCompletionSets {
+                                                modifier_keys: &modifier_keys_arc,
+                                                loc_keys: &loc_keys,
+                                            },
+                                            rctx.scope.as_ref().map(|s| s.current()),
                                         ),
                                         resolved,
                                     )
@@ -1360,7 +1445,18 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = value_completions(&value_rules, &rs, &info, None, "hoi4");
+        let items = value_completions(
+            &value_rules,
+            &rs,
+            &info,
+            None,
+            "hoi4",
+            ValueCompletionSets {
+                modifier_keys: &HashSet::new(),
+                loc_keys: &HashSet::new(),
+            },
+            None,
+        );
 
         let spaced = items
             .iter()

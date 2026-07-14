@@ -908,6 +908,106 @@ pub(crate) fn enum_member_detail(
     (in_static || in_dynamic).then(|| format!("enum {}", id))
 }
 
+fn normalized_path_part(value: &str) -> String {
+    value
+        .replace('\\', "/")
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn filepath_values(
+    index: &cwtools_info::FileIndex,
+    prefix: Option<&str>,
+    extension: Option<&str>,
+) -> Vec<String> {
+    let prefix = prefix
+        .map(normalized_path_part)
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string();
+    let extension = extension
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| {
+            format!(
+                ".{}",
+                extension.trim_start_matches('.').to_ascii_lowercase()
+            )
+        })
+        .unwrap_or_default();
+    let mut values: Vec<String> = index
+        .paths()
+        .filter_map(|path| {
+            let mut value = path.as_str();
+            if !prefix.is_empty() {
+                value = value.strip_prefix(&prefix)?;
+                if !value.starts_with('/') {
+                    return None;
+                }
+            }
+            if !extension.is_empty() {
+                value = value.strip_suffix(&extension)?;
+            }
+            let value = value.trim_start_matches('/');
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .collect();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn icon_values(index: &cwtools_info::FileIndex, folder: &str) -> Vec<String> {
+    let prefix = normalized_path_part(folder)
+        .trim_end_matches('/')
+        .to_string();
+    let mut values: Vec<String> = index
+        .paths()
+        .filter_map(|path| {
+            let mut value = path.as_str();
+            if !prefix.is_empty() {
+                value = value.strip_prefix(&prefix)?;
+                if !value.starts_with('/') {
+                    return None;
+                }
+                value = value.trim_start_matches('/');
+            }
+            let extension = [".dds", ".tga", ".png"]
+                .into_iter()
+                .find(|extension| value.ends_with(extension))?;
+            let value = value.strip_suffix(extension)?;
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .collect();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ValueCompletionSets<'a> {
+    pub modifier_keys: &'a HashSet<String>,
+    pub loc_keys: &'a HashSet<String>,
+}
+
+pub(crate) fn value_rules_need_loc_keys(
+    value_rules: &[(RuleType, cwtools_rules::rules_types::Options)],
+) -> bool {
+    fn field_needs_loc_keys(field: &NewField) -> bool {
+        match field {
+            NewField::LocalisationField { .. } => true,
+            NewField::IgnoreField(inner) => field_needs_loc_keys(inner),
+            _ => false,
+        }
+    }
+
+    value_rules.iter().any(|(rule, _)| match rule {
+        RuleType::LeafRule { right, .. } | RuleType::LeafValueRule { right } => {
+            field_needs_loc_keys(right)
+        }
+        _ => false,
+    })
+}
+
 /// Completion items for a leaf VALUE position: enumerate what the matched
 /// rules' right-hand sides accept. `value_rules` comes from
 /// `position::rules_at_pos` (alias usages already expanded to their overloads,
@@ -919,6 +1019,8 @@ pub(crate) fn value_completions(
     info: &InfoService,
     registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
     language: &str,
+    sets: ValueCompletionSets<'_>,
+    current_scope: Option<ScopeId>,
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -959,6 +1061,17 @@ pub(crate) fn value_completions(
             _ => continue,
         };
         match right {
+            NewField::SpecificField(value) => {
+                let quoted = quote_if_needed(value);
+                push(
+                    value.clone(),
+                    CompletionItemKind::VALUE,
+                    Some("literal".to_string()),
+                    None,
+                    (quoted != *value).then_some(quoted),
+                    &mut items,
+                );
+            }
             NewField::TypeField(TypeType::Simple(t)) => {
                 for (_, inst) in info.type_index.instances(t) {
                     push(
@@ -1013,13 +1126,43 @@ pub(crate) fn value_completions(
             // keys (workspace entities) rather than falling through to the flat
             // variable dump (cwtools-vscode#74).
             NewField::LocalisationField { .. } => {
-                for k in super::scope_names::loc_key_names(info) {
+                for k in sets.loc_keys {
                     push(
-                        k.to_string(),
+                        k.clone(),
                         CompletionItemKind::TEXT,
                         Some("loc key".to_string()),
                         None,
                         None,
+                        &mut items,
+                    );
+                }
+            }
+            NewField::FilepathField { prefix, extension } => {
+                for value in filepath_values(
+                    &info.type_index.file_index,
+                    prefix.as_deref(),
+                    extension.as_deref(),
+                ) {
+                    let quoted = quote_if_needed(&value);
+                    push(
+                        value.clone(),
+                        CompletionItemKind::FILE,
+                        Some("file path".to_string()),
+                        None,
+                        (quoted != value).then_some(quoted),
+                        &mut items,
+                    );
+                }
+            }
+            NewField::IconField(folder) => {
+                for value in icon_values(&info.type_index.file_index, folder) {
+                    let quoted = quote_if_needed(&value);
+                    push(
+                        value.clone(),
+                        CompletionItemKind::FILE,
+                        Some("icon".to_string()),
+                        None,
+                        (quoted != value).then_some(quoted),
                         &mut items,
                     );
                 }
@@ -1085,6 +1228,27 @@ pub(crate) fn value_completions(
                     );
                 }
             }
+            NewField::AliasField(cat) | NewField::AliasValueKeysField(cat) => {
+                let scope_ctx = match (current_scope, registry) {
+                    (Some(scope), Some(reg)) if scope != SCOPE_ANY => Some((scope, reg)),
+                    _ => None,
+                };
+                let mut aliases = Vec::new();
+                push_alias_keys(
+                    &mut aliases,
+                    ruleset,
+                    info,
+                    sets.modifier_keys,
+                    cat,
+                    scope_ctx,
+                );
+                for item in &mut aliases {
+                    let quoted = quote_if_needed(&item.label);
+                    item.insert_text = (quoted != item.label).then_some(quoted);
+                    item.insert_text_format = None;
+                }
+                items.extend(aliases);
+            }
             NewField::VariableField { .. } => {
                 for v in info.variable_counts.keys() {
                     push(
@@ -1119,10 +1283,45 @@ pub(crate) fn value_completions(
                     );
                 }
             }
-            _ => {}
+            NewField::IgnoreField(inner) => {
+                let nested_rules = vec![(
+                    RuleType::LeafValueRule {
+                        right: (**inner).clone(),
+                    },
+                    cwtools_rules::rules_types::Options::default(),
+                )];
+                items.extend(value_completions(
+                    &nested_rules,
+                    ruleset,
+                    info,
+                    registry,
+                    language,
+                    sets,
+                    current_scope,
+                ));
+            }
+            // Single aliases are expanded during rule post-processing. A residual
+            // reference is unresolved or cyclic, so it has no safe enumerable set.
+            NewField::SingleAliasField(_)
+            | NewField::ScalarField
+            | NewField::ValueField(
+                ValueType::Float { .. }
+                | ValueType::Int { .. }
+                | ValueType::Percent
+                | ValueType::Date
+                | ValueType::DateTime
+                | ValueType::Ck2Dna
+                | ValueType::Ck2DnaProperty
+                | ValueType::IrFamilyName
+                | ValueType::StlNameFormat(_),
+            )
+            | NewField::MarkerField(_)
+            | NewField::IgnoreMarkerField => {}
         }
     }
 
+    let mut final_seen = HashSet::new();
+    items.retain(|item| final_seen.insert(item.label.clone()));
     items
 }
 
@@ -1286,6 +1485,107 @@ mod resolve_data_tests {
             item.data.is_none(),
             "a doc-less alias must carry no data, got: {:?}",
             item.data
+        );
+    }
+
+    #[test]
+    fn alias_value_items_insert_bare_values() {
+        let mut rs = RuleSet::new();
+        rs.aliases.push((
+            "modifier:build cost".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[modifier:build cost]".to_string()),
+                    right: NewField::ScalarField,
+                },
+                Options::default(),
+            ),
+        ));
+        rs.reindex();
+        let info = InfoService::new();
+        for right in [
+            NewField::AliasField("modifier".to_string()),
+            NewField::AliasValueKeysField("modifier".to_string()),
+        ] {
+            let rules = vec![(RuleType::LeafValueRule { right }, Options::default())];
+            let items = value_completions(
+                &rules,
+                &rs,
+                &info,
+                None,
+                "hoi4",
+                ValueCompletionSets {
+                    modifier_keys: &HashSet::new(),
+                    loc_keys: &HashSet::new(),
+                },
+                None,
+            );
+            let item = items
+                .iter()
+                .find(|item| item.label == "build cost")
+                .expect("alias value");
+            assert_eq!(item.insert_text.as_deref(), Some("\"build cost\""));
+            assert_eq!(item.insert_text_format, None);
+        }
+    }
+
+    #[test]
+    fn localisation_values_use_the_localisation_index() {
+        let rs = RuleSet::new();
+        let info = InfoService::new();
+        let rules = vec![(
+            RuleType::LeafValueRule {
+                right: NewField::LocalisationField {
+                    synced: false,
+                    is_inline: false,
+                },
+            },
+            Options::default(),
+        )];
+        let loc_keys = HashSet::from(["known_key".to_string()]);
+        let items = value_completions(
+            &rules,
+            &rs,
+            &info,
+            None,
+            "hoi4",
+            ValueCompletionSets {
+                modifier_keys: &HashSet::new(),
+                loc_keys: &loc_keys,
+            },
+            None,
+        );
+        assert!(items.iter().any(|item| item.label == "known_key"));
+        assert!(value_rules_need_loc_keys(&rules));
+    }
+
+    #[test]
+    fn filepath_and_icon_values_follow_validation_shapes() {
+        let root = tempfile::tempdir().unwrap();
+        for path in [
+            "common/ships/alpha.txt",
+            "common/ships/nested/beta.TXT",
+            "common/ships/with space.txt",
+            "common/shipyard/not-a-ship.txt",
+            "gfx/interface/icons/alpha.dds",
+            "gfx/interface/icons/alpha.png",
+            "gfx/interface/icons/nested/beta.tga",
+            "gfx/interface/iconography/wrong.dds",
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let mut index = cwtools_info::FileIndex::new();
+        index.add_root(root.path());
+
+        assert_eq!(
+            filepath_values(&index, Some("common/ships/"), Some(".txt")),
+            vec!["alpha", "nested/beta", "with space"]
+        );
+        assert_eq!(
+            icon_values(&index, "gfx\\interface\\icons\\"),
+            vec!["alpha", "nested/beta"]
         );
     }
 

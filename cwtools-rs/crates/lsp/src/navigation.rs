@@ -7,7 +7,10 @@ use cwtools_info::PositionElement;
 use cwtools_rules::rules_types::{NewField, RootRule, RuleSet, RuleType};
 use cwtools_string_table::string_table::StringTable;
 
-use crate::paths::{logical_path_from_uri, parse_uri};
+use crate::paths::{
+    current_token_range_with_encoding, encoded_position_len, logical_path_from_uri,
+    lsp_pos_to_source_in_text, parse_uri, source_position_to_lsp,
+};
 use crate::{Backend, ParsedDoc, RuleCursorInfo};
 use cwtools_info::ReferenceHint;
 
@@ -40,15 +43,13 @@ impl Backend {
         fallback: &Url,
     ) -> Option<GotoDefinitionResponse> {
         let (key, _, _) = self.loc_ref_at_cursor_doc(uri, pos)?;
-        let map = self.state.loc_locations.read();
-        let (file_uri, line) = map.get(&key.to_lowercase())?;
-        Some(GotoDefinitionResponse::Array(vec![line_location(
-            file_uri,
-            *line,
-            0,
-            key.len(),
-            fallback,
-        )]))
+        let target = {
+            let map = self.state.loc_locations.read();
+            map.get(&key.to_lowercase()).cloned()
+        }?;
+        Some(GotoDefinitionResponse::Array(vec![
+            self.source_location_at(&target.0, target.1, 0, &key, fallback),
+        ]))
     }
 
     pub(crate) async fn goto_definition_impl(
@@ -83,19 +84,32 @@ impl Backend {
             let locations = match &info.hint {
                 ReferenceHint::TypeRef { type_name, value } => {
                     let value = unquote(value);
-                    let svc = self.state.info_service.read();
-                    type_instance_locations(&svc, type_name, value, fallback)
+                    let defs = {
+                        let svc = self.state.info_service.read();
+                        svc.type_index
+                            .instances(type_name)
+                            .iter()
+                            .filter(|(_, inst)| inst.name == value)
+                            .map(|(file_uri, inst)| (file_uri.to_string(), inst.location))
+                            .collect::<Vec<_>>()
+                    };
+                    locations_at(self, defs, value, fallback)
                 }
                 ReferenceHint::Variable { name, .. } => {
-                    let svc = self.state.info_service.read();
-                    let defs = svc.find_variable_definitions(name);
-                    locations_at(defs.iter().map(|(u, l)| (u.as_str(), *l)), name, fallback)
+                    let defs = {
+                        let svc = self.state.info_service.read();
+                        svc.find_variable_definitions(name)
+                    };
+                    locations_at(self, defs, name, fallback)
                 }
                 ReferenceHint::LocRef { key } => {
-                    let map = self.state.loc_locations.read();
-                    map.get(&key.to_lowercase())
+                    let target = {
+                        let map = self.state.loc_locations.read();
+                        map.get(&key.to_lowercase()).cloned()
+                    };
+                    target
                         .map(|(file_uri, line)| {
-                            vec![line_location(file_uri, *line, 0, key.len(), fallback)]
+                            vec![self.source_location_at(&file_uri, line, 0, key, fallback)]
                         })
                         .unwrap_or_default()
                 }
@@ -122,26 +136,34 @@ impl Backend {
                 PositionElement::Leaf { key, .. } => vec![key.clone()],
                 PositionElement::LeafValue { value } => vec![unquote(value).to_string()],
             };
-            let info = self.state.info_service.read();
-            for symbol in candidates {
-                // Type-instance index first: events/decisions are keyed by id.
-                let pairs = info.type_index.instance_locations(&symbol);
-                let mut locations = locations_at(
-                    pairs.iter().map(|(u, l)| (u.as_ref(), *l)),
-                    &symbol,
-                    fallback,
-                );
-                // Then the heuristic node-key def index (type-name definitions).
-                if locations.is_empty()
-                    && let Some(defs) = info.find_definitions(&symbol)
-                {
-                    locations = locations_at(
-                        defs.iter().map(|(u, l)| (u.as_str(), *l)),
-                        &symbol,
-                        fallback,
-                    );
-                }
-                let locations = dedup_locations(locations);
+            let candidates_with_locations = {
+                let info = self.state.info_service.read();
+                candidates
+                    .iter()
+                    .map(|symbol| {
+                        // Type-instance index first: events/decisions are keyed by id.
+                        let instances = info
+                            .type_index
+                            .instance_locations(symbol)
+                            .into_iter()
+                            .map(|(uri, loc)| (uri.to_string(), loc))
+                            .collect::<Vec<_>>();
+                        let definitions = if instances.is_empty() {
+                            info.find_definitions(symbol).cloned().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        (symbol.clone(), instances, definitions)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (symbol, instances, definitions) in candidates_with_locations {
+                let pairs = if instances.is_empty() {
+                    definitions
+                } else {
+                    instances
+                };
+                let locations = dedup_locations(locations_at(self, pairs, &symbol, fallback));
                 if !locations.is_empty() {
                     return Ok(Some(GotoDefinitionResponse::Array(locations)));
                 }
@@ -206,28 +228,23 @@ impl Backend {
             let mut all_locs: Vec<Location> = Vec::new();
 
             // 1. Definition location(s) from TypeIndex.
-            {
+            let definitions = {
                 let info = self.state.info_service.read();
-                let instances = info.type_index.instances(&type_name);
-                for (file_uri, inst) in instances
+                info.type_index
+                    .instances(&type_name)
                     .iter()
                     .filter(|(_, inst)| inst.name == instance_name)
-                {
-                    all_locs.push(source_loc_location(
-                        file_uri.as_ref(),
-                        inst.location,
-                        instance_name.chars().count(),
-                        fallback,
-                    ));
-                }
-            }
+                    .map(|(file_uri, inst)| (file_uri.to_string(), inst.location))
+                    .collect::<Vec<_>>()
+            };
+            all_locs.extend(locations_at(self, definitions, &instance_name, fallback));
 
             // 2. Use-sites (open docs via live AST + closed files via index).
             let sites = self.collect_use_sites(&type_name, &instance_name);
             for (file_uri, line0, col, _) in self.resolve_value_sites(&sites, &instance_name) {
                 all_locs.push(Location {
                     uri: parse_uri(&file_uri, fallback),
-                    range: source_loc_to_range_at(line0, col, instance_name.chars().count()),
+                    range: self.source_range_at(&file_uri, line0, col, &instance_name),
                 });
             }
 
@@ -243,30 +260,29 @@ impl Backend {
                 PositionElement::Leaf { key, .. } => key.clone(),
                 PositionElement::LeafValue { value } => value.clone(),
             };
-            let info = self.state.info_service.read();
-            let mut all_locs = Vec::new();
             let fallback = &params.text_document_position.text_document.uri;
-            if let Some(defs) = info.find_definitions(&symbol) {
-                all_locs.extend(defs.iter().map(|(file_uri, loc)| {
-                    source_loc_location(file_uri, *loc, symbol.len(), fallback)
-                }));
-            }
-            if let Some(refs) = info.find_references(&symbol) {
-                all_locs.extend(refs.iter().map(|(file_uri, loc)| {
-                    source_loc_location(file_uri, *loc, symbol.len(), fallback)
-                }));
-            }
-            let index = self.state.symbol_index.lock();
-            if let Some(locs) = index.find_references(&symbol) {
-                all_locs.extend(locs.iter().map(|l| Location {
-                    uri: parse_uri(&l.uri, fallback),
-                    range: source_loc_to_range_at(
-                        l.line.saturating_sub(1),
-                        l.col as u32,
-                        symbol.len(),
-                    ),
-                }));
-            }
+            let (definitions, references) = {
+                let info = self.state.info_service.read();
+                (
+                    info.find_definitions(&symbol).cloned().unwrap_or_default(),
+                    info.find_references(&symbol).unwrap_or_default(),
+                )
+            };
+            let indexed_references = {
+                let index = self.state.symbol_index.lock();
+                index.find_references(&symbol).cloned().unwrap_or_default()
+            };
+            let mut all_locs = locations_at(self, definitions, &symbol, fallback);
+            all_locs.extend(locations_at(self, references, &symbol, fallback));
+            all_locs.extend(indexed_references.into_iter().map(|l| Location {
+                uri: parse_uri(&l.uri, fallback),
+                range: self.source_range_at(
+                    &l.uri,
+                    l.line.saturating_sub(1),
+                    l.col as u32,
+                    &symbol,
+                ),
+            }));
             if !all_locs.is_empty() {
                 return Ok(Some(all_locs));
             }
@@ -376,6 +392,48 @@ impl Backend {
         cwtools_file_manager::file_manager::read_text(std::path::Path::new(&path)).ok()
     }
 
+    fn source_range(&self, uri: &str, loc: cwtools_info::SourceLocation, token: &str) -> Range {
+        self.source_range_at(uri, loc.line.saturating_sub(1), loc.col as u32, token)
+    }
+
+    fn source_range_at(&self, uri: &str, line: u32, column: u32, token: &str) -> Range {
+        let encoding = self.state.config.read().position_encoding.clone();
+        self.file_text_for(uri).map_or_else(
+            || source_range_without_text(line, column, token, &encoding),
+            |text| source_range_in_text(&text, line, column, token, &encoding),
+        )
+    }
+
+    fn source_location(
+        &self,
+        uri: &str,
+        loc: cwtools_info::SourceLocation,
+        token: &str,
+        fallback: &Url,
+    ) -> Location {
+        self.source_location_at(
+            uri,
+            loc.line.saturating_sub(1),
+            loc.col as u32,
+            token,
+            fallback,
+        )
+    }
+
+    fn source_location_at(
+        &self,
+        uri: &str,
+        line: u32,
+        column: u32,
+        token: &str,
+        fallback: &Url,
+    ) -> Location {
+        Location {
+            uri: parse_uri(uri, fallback),
+            range: self.source_range_at(uri, line, column, token),
+        }
+    }
+
     pub(crate) async fn folding_range_impl(
         &self,
         params: FoldingRangeParams,
@@ -412,23 +470,33 @@ impl Backend {
         // instance name, falling back to the raw token in the text.
         let ws_uri = self.state.config.read().workspace_uri.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let position_encoding = self.state.config.read().position_encoding.clone();
+        let (_, source_col) = lsp_pos_to_source_in_text(&text, pos, &position_encoding);
         let symbol = self
             .type_ref_at_cursor(&uri, pos, &logical_path)
             .map(|(_, name)| name)
-            .or_else(|| word_at_position(&text, pos.line, pos.character))
+            .or_else(|| word_at_position(&text, pos.line, source_col as u32))
             .filter(|s| !s.is_empty());
         let Some(symbol) = symbol else {
             return Ok(None);
         };
-        let sym_len = symbol.chars().count();
+        let symbol = symbol.as_str();
         let highlights: Vec<DocumentHighlight> = text
             .lines()
             .enumerate()
             .flat_map(|(line0, line)| {
-                all_token_cols_in_line(line, &symbol)
+                let position_encoding = &position_encoding;
+                let text = &text;
+                all_token_cols_in_line(line, symbol)
                     .into_iter()
                     .map(move |col| DocumentHighlight {
-                        range: source_loc_to_range_at(line0 as u32, col, sym_len),
+                        range: source_range_in_text(
+                            text,
+                            line0 as u32,
+                            col,
+                            symbol,
+                            position_encoding,
+                        ),
                         kind: Some(DocumentHighlightKind::TEXT),
                     })
             })
@@ -455,45 +523,62 @@ impl Backend {
             .load(std::sync::atomic::Ordering::Relaxed)
             && let Some(ast) = self.ast_for(&uri)
         {
-            let syms = build_doc_symbols(&ast.root_children, &ast.arena, &self.state.string_table);
+            let text = self.file_text_for(&uri).unwrap_or_default();
+            let position_encoding = self.state.config.read().position_encoding.clone();
+            let syms = build_doc_symbols(
+                &ast.root_children,
+                &ast.arena,
+                &self.state.string_table,
+                &text,
+                &position_encoding,
+            );
             if !syms.is_empty() {
                 return Ok(Some(DocumentSymbolResponse::Nested(syms)));
             }
         }
 
-        let info = self.state.info_service.read();
+        let (instances, variables) = {
+            let info = self.state.info_service.read();
+            let instances = info
+                .type_index
+                .instances_in_file(&uri)
+                .into_iter()
+                .map(|(type_name, inst)| (type_name.to_string(), inst.name.clone(), inst.location))
+                .collect::<Vec<_>>();
+            let variables = info
+                .files
+                .get(&uri)
+                .map(|file_info| file_info.defined_variables.clone())
+                .unwrap_or_default();
+            (instances, variables)
+        };
 
         // Emit type instances as document symbols (one per named instance),
         // derived from the cross-file index — `FileInfo` no longer keeps a
         // per-file copy of these.
-        let mut symbols: Vec<SymbolInformation> = Vec::new();
-        for (type_name, inst) in info.type_index.instances_in_file(&uri) {
-            symbols.push(make_symbol(
-                inst.name.clone(),
-                SymbolKind::STRUCT,
-                Location {
-                    uri: params.text_document.uri.clone(),
-                    range: source_loc_to_range(inst.location, inst.name.len()),
-                },
-                Some(type_name.to_string()),
-            ));
-        }
+        let mut symbols: Vec<SymbolInformation> = instances
+            .into_iter()
+            .map(|(type_name, name, loc)| {
+                make_symbol(
+                    name.clone(),
+                    SymbolKind::STRUCT,
+                    Location {
+                        uri: params.text_document.uri.clone(),
+                        range: self.source_range(&uri, loc, &name),
+                    },
+                    Some(type_name),
+                )
+            })
+            .collect();
 
         // Also include @-variables as symbols (still tracked per-file).
-        let Some(file_info) = info.files.get(&uri) else {
-            return Ok(if symbols.is_empty() {
-                None
-            } else {
-                Some(DocumentSymbolResponse::Flat(symbols))
-            });
-        };
-        for (name, loc) in &file_info.defined_variables {
+        for (name, loc) in variables {
             symbols.push(make_symbol(
                 name.clone(),
                 SymbolKind::CONSTANT,
                 Location {
                     uri: params.text_document.uri.clone(),
-                    range: source_loc_to_range(*loc, name.len()),
+                    range: self.source_range(&uri, loc, &name),
                 },
                 None,
             ));
@@ -511,34 +596,39 @@ impl Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
-        let info = self.state.info_service.read();
-        let mut symbols: Vec<SymbolInformation> = Vec::new();
-        // No request document to fall back to for a workspace-wide query.
-        let fallback = Url::parse("file:///unknown").expect("static URI");
-
-        for (type_name, instances) in &info.type_index.map {
-            for (file_uri, inst) in instances {
-                if query.is_empty() || inst.name.to_lowercase().contains(&query) {
-                    symbols.push(make_symbol(
-                        inst.name.clone(),
-                        SymbolKind::STRUCT,
-                        source_loc_location(
-                            file_uri.as_ref(),
+        let indexed_symbols = {
+            let info = self.state.info_service.read();
+            let mut entries = Vec::new();
+            for (type_name, instances) in &info.type_index.map {
+                for (file_uri, inst) in instances {
+                    if query.is_empty() || inst.name.to_lowercase().contains(&query) {
+                        entries.push((
+                            type_name.clone(),
+                            file_uri.to_string(),
+                            inst.name.clone(),
                             inst.location,
-                            inst.name.len(),
-                            &fallback,
-                        ),
-                        Some(type_name.clone()),
-                    ));
+                        ));
+                    }
+                    if entries.len() >= 500 {
+                        break;
+                    }
                 }
-                // Cap at 500 to avoid flooding the client.
-                if symbols.len() >= 500 {
+                if entries.len() >= 500 {
                     break;
                 }
             }
-            if symbols.len() >= 500 {
-                break;
-            }
+            entries
+        };
+        let mut symbols: Vec<SymbolInformation> = Vec::with_capacity(indexed_symbols.len());
+        // No request document to fall back to for a workspace-wide query.
+        let fallback = Url::parse("file:///unknown").expect("static URI");
+        for (type_name, file_uri, name, loc) in indexed_symbols {
+            symbols.push(make_symbol(
+                name.clone(),
+                SymbolKind::STRUCT,
+                self.source_location(&file_uri, loc, &name, &fallback),
+                Some(type_name),
+            ));
         }
 
         if symbols.is_empty() {
@@ -567,20 +657,9 @@ impl Backend {
                 let docs = self.state.documents.lock();
                 docs.get(&uri).map(|d| d.text.clone())
             };
-            let start = match &text {
-                Some(t) => crate::paths::current_token_range(t, pos.line, pos.character).start,
-                None => Position {
-                    line: pos.line,
-                    character: pos.character,
-                },
-            };
-            let range = Range {
-                start,
-                end: Position {
-                    line: pos.line,
-                    character: start.character + instance_name.len() as u32,
-                },
-            };
+            let position_encoding = self.state.config.read().position_encoding.clone();
+            let range =
+                prepare_rename_range(text.as_deref(), pos, &instance_name, &position_encoding);
             return Ok(Some(PrepareRenameResponse::Range(range)));
         }
         Ok(None)
@@ -659,7 +738,7 @@ impl Backend {
                 Err(_) => continue,
             };
             let edit = TextEdit {
-                range: source_loc_to_range_at(line0, col, instance_name.chars().count()),
+                range: self.source_range_at(&file_uri, line0, col, &instance_name),
                 new_text: new_name.clone(),
             };
             changes.entry(url).or_default().push(edit);
@@ -1033,6 +1112,8 @@ fn build_doc_symbols(
     children: &[cwtools_parser::ast::Child],
     arena: &cwtools_parser::ast::Arena,
     table: &StringTable,
+    text: &str,
+    encoding: &PositionEncodingKind,
 ) -> Vec<DocumentSymbol> {
     let mut syms: Vec<DocumentSymbol> = Vec::new();
     for child in children {
@@ -1043,23 +1124,31 @@ fn build_doc_symbols(
         if key.is_empty() {
             continue;
         }
-        let child_syms = build_doc_symbols(kc.children, arena, table);
+        let child_syms = build_doc_symbols(kc.children, arena, table, text, encoding);
         let (name, detail) = match identity_value(kc.children, arena, table) {
             Some(v) if v != key => (v, Some(key.clone())),
             _ => (key.clone(), None),
         };
-        let start = Position {
-            line: kc.pos.start.line.saturating_sub(1),
-            character: kc.pos.start.col as u32,
-        };
-        let end = Position {
-            line: kc.pos.end.line.saturating_sub(1),
-            character: kc.pos.end.col as u32,
-        };
-        let selection_end = Position {
-            line: start.line,
-            character: start.character + key.chars().count() as u32,
-        };
+        let start = source_position_to_lsp(
+            text,
+            kc.pos.start.line.saturating_sub(1),
+            kc.pos.start.col as u32,
+            encoding,
+        );
+        let end = source_position_to_lsp(
+            text,
+            kc.pos.end.line.saturating_sub(1),
+            kc.pos.end.col as u32,
+            encoding,
+        );
+        let selection_end = source_range_in_text(
+            text,
+            kc.pos.start.line.saturating_sub(1),
+            kc.pos.start.col as u32,
+            &key,
+            encoding,
+        )
+        .end;
         #[allow(deprecated)]
         syms.push(DocumentSymbol {
             name,
@@ -1100,91 +1189,63 @@ pub(crate) fn unquote(s: &str) -> &str {
         .unwrap_or(s)
 }
 
-/// Build goto Locations for every definition of `instance_name` of `type_name`
-/// in the type index.
-fn type_instance_locations(
-    svc: &cwtools_info::InfoService,
-    type_name: &str,
-    instance_name: &str,
-    fallback: &Url,
-) -> Vec<Location> {
-    let instances = svc.type_index.instances(type_name);
-    instances
-        .iter()
-        .filter(|(_, inst)| inst.name == instance_name)
-        .map(|(file_uri, inst)| {
-            line_location(
-                file_uri,
-                inst.location.line.saturating_sub(1),
-                inst.location.col as u32,
-                instance_name.len(),
-                fallback,
-            )
-        })
-        .collect()
-}
-
 /// Build Locations from `(file_uri, location)` pairs, each highlighting a token
-/// of `name`'s length.
-fn locations_at<'a>(
-    pairs: impl Iterator<Item = (&'a str, cwtools_info::SourceLocation)>,
+/// of `name`'s length. Callers snapshot indexed data before invoking this helper
+/// so range conversion never runs while an index guard is held.
+fn locations_at(
+    backend: &Backend,
+    pairs: impl IntoIterator<Item = (String, cwtools_info::SourceLocation)>,
     name: &str,
     fallback: &Url,
 ) -> Vec<Location> {
     pairs
-        .map(|(file_uri, loc)| {
-            line_location(
-                file_uri,
-                loc.line.saturating_sub(1),
-                loc.col as u32,
-                name.len(),
-                fallback,
-            )
-        })
+        .into_iter()
+        .map(|(file_uri, loc)| backend.source_location(&file_uri, loc, name, fallback))
         .collect()
 }
 
-/// A single-line Location at `(line0, col)` spanning `len` characters.
-fn line_location(file_uri: &str, line0: u32, col: u32, len: usize, fallback: &Url) -> Location {
-    Location {
-        uri: parse_uri(file_uri, fallback),
-        range: source_loc_to_range_at(line0, col, len),
-    }
-}
-
-/// The LSP range for a `len`-char token at a 1-based `SourceLocation`. All
-/// arithmetic is `u32`-first so a long line or column can't wrap (the old
-/// `(col + len as u16) as u32` form truncated past 65535).
-pub(crate) fn source_loc_to_range(loc: cwtools_info::SourceLocation, len: usize) -> Range {
-    source_loc_to_range_at(loc.line.saturating_sub(1), loc.col as u32, len)
-}
-
-/// The LSP range for a `len`-char token at an already-0-based `(line0, col)`.
-fn source_loc_to_range_at(line0: u32, col: u32, len: usize) -> Range {
+fn prepare_rename_range(
+    text: Option<&str>,
+    pos: Position,
+    instance_name: &str,
+    encoding: &PositionEncodingKind,
+) -> Range {
+    let start = text.map_or(pos, |text| {
+        current_token_range_with_encoding(text, pos.line, pos.character, encoding).start
+    });
     Range {
-        start: Position {
-            line: line0,
-            character: col,
-        },
+        start,
         end: Position {
-            line: line0,
-            character: col + len as u32,
+            line: start.line,
+            character: start.character + encoded_position_len(instance_name, encoding),
         },
     }
 }
 
-/// A `Location` for a `len`-char token at a 1-based `SourceLocation` in
-/// `file_uri`, falling back to `fallback` when the URI won't parse.
-pub(crate) fn source_loc_location(
-    file_uri: &str,
-    loc: cwtools_info::SourceLocation,
-    len: usize,
-    fallback: &Url,
-) -> Location {
-    Location {
-        uri: parse_uri(file_uri, fallback),
-        range: source_loc_to_range(loc, len),
+fn source_range_in_text(
+    text: &str,
+    line: u32,
+    column: u32,
+    token: &str,
+    encoding: &PositionEncodingKind,
+) -> Range {
+    Range {
+        start: source_position_to_lsp(text, line, column, encoding),
+        end: source_position_to_lsp(text, line, column + token.chars().count() as u32, encoding),
     }
+}
+
+fn source_range_without_text(
+    line: u32,
+    column: u32,
+    token: &str,
+    encoding: &PositionEncodingKind,
+) -> Range {
+    let start = Position::new(line, column);
+    Range::new(
+        start,
+        Position::new(line, column + encoded_position_len(token, encoding)),
+    )
 }
 
 /// Build a `SymbolInformation` (the `deprecated` field is required by the
@@ -1224,6 +1285,65 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn prepare_rename_range_uses_negotiated_encoding() {
+        let text = "😀 target";
+        assert_eq!(
+            prepare_rename_range(
+                Some(text),
+                Position::new(0, 9),
+                "target",
+                &PositionEncodingKind::UTF16,
+            ),
+            Range::new(Position::new(0, 3), Position::new(0, 9))
+        );
+        assert_eq!(
+            prepare_rename_range(
+                Some(text),
+                Position::new(0, 8),
+                "target",
+                &PositionEncodingKind::UTF32,
+            ),
+            Range::new(Position::new(0, 2), Position::new(0, 8))
+        );
+    }
+
+    #[test]
+    fn prepare_rename_range_counts_non_bmp_name_units() {
+        let text = "name𐐀";
+        assert_eq!(
+            prepare_rename_range(
+                Some(text),
+                Position::new(0, 6),
+                "name𐐀",
+                &PositionEncodingKind::UTF16,
+            ),
+            Range::new(Position::new(0, 0), Position::new(0, 6))
+        );
+        assert_eq!(
+            prepare_rename_range(
+                Some(text),
+                Position::new(0, 5),
+                "name𐐀",
+                &PositionEncodingKind::UTF32,
+            ),
+            Range::new(Position::new(0, 0), Position::new(0, 5))
+        );
+    }
+
+    #[test]
+    fn source_ranges_use_negotiated_encoding() {
+        let text = "😀 name𐐀";
+        assert_eq!(
+            source_range_in_text(text, 0, 2, "name𐐀", &PositionEncodingKind::UTF16),
+            Range::new(Position::new(0, 3), Position::new(0, 9))
+        );
+        assert_eq!(
+            source_range_in_text(text, 0, 2, "name𐐀", &PositionEncodingKind::UTF32),
+            Range::new(Position::new(0, 2), Position::new(0, 7))
+        );
     }
 
     #[test]

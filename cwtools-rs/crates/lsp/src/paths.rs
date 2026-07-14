@@ -67,6 +67,17 @@ pub(crate) fn lsp_pos_to_source(pos: tower_lsp::lsp_types::Position) -> (u32, u1
     (pos.line + 1, pos.character as u16)
 }
 
+pub(crate) fn lsp_pos_to_source_in_text(
+    text: &str,
+    pos: tower_lsp::lsp_types::Position,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> (u32, u16) {
+    let column = line_prefix_with_encoding(text, pos.line, pos.character, encoding)
+        .chars()
+        .count();
+    (pos.line + 1, column.min(u16::MAX as usize) as u16)
+}
+
 /// Parse a string into an LSP Url, falling back to a clone of `fallback` on
 /// error. A failed parse is logged: the fallback silently resolved a location to
 /// the wrong document once (the `"<vanilla-cache>"` sentinel, #62), so a stray
@@ -77,6 +88,92 @@ pub(crate) fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
         tracing::warn!(uri = %uri_str, "parse_uri: not a valid URI, using fallback location");
         fallback.clone()
     })
+}
+
+pub(crate) fn utf16_byte_index(text: &str, column: u32) -> usize {
+    let mut utf16 = 0_u32;
+    for (byte, ch) in text.char_indices() {
+        let next = utf16 + ch.len_utf16() as u32;
+        if next > column {
+            return byte;
+        }
+        utf16 = next;
+    }
+    text.len()
+}
+
+fn utf32_byte_index(text: &str, column: u32) -> usize {
+    text.char_indices()
+        .nth(column as usize)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+pub(crate) fn utf16_len(text: &str) -> u32 {
+    text.encode_utf16().count() as u32
+}
+
+pub(crate) fn encoded_position_len(
+    text: &str,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> u32 {
+    if encoding == &tower_lsp::lsp_types::PositionEncodingKind::UTF32 {
+        text.chars().count() as u32
+    } else {
+        utf16_len(text)
+    }
+}
+
+pub(crate) fn source_position_to_lsp(
+    text: &str,
+    line: u32,
+    source_column: u32,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> tower_lsp::lsp_types::Position {
+    let character = text
+        .lines()
+        .nth(line as usize)
+        .map_or(source_column, |line| {
+            let chars = line.chars().take(source_column as usize);
+            if encoding == &tower_lsp::lsp_types::PositionEncodingKind::UTF32 {
+                chars.count() as u32
+            } else {
+                chars.map(|ch| ch.len_utf16() as u32).sum()
+            }
+        });
+    tower_lsp::lsp_types::Position { line, character }
+}
+
+#[cfg(test)]
+pub(crate) fn line_prefix(text: &str, line0: u32, char0: u32) -> &str {
+    line_prefix_with_encoding(
+        text,
+        line0,
+        char0,
+        &tower_lsp::lsp_types::PositionEncodingKind::UTF16,
+    )
+}
+
+pub(crate) fn line_prefix_with_encoding<'a>(
+    text: &'a str,
+    line0: u32,
+    char0: u32,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> &'a str {
+    let line = text.lines().nth(line0 as usize).unwrap_or("");
+    let byte = position_byte_index(line, char0, encoding);
+    &line[..byte]
+}
+
+pub(crate) fn position_byte_index(
+    text: &str,
+    column: u32,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> usize {
+    if encoding == &tower_lsp::lsp_types::PositionEncodingKind::UTF32 {
+        utf32_byte_index(text, column)
+    } else {
+        utf16_byte_index(text, column)
+    }
 }
 
 /// When the line prefix before the cursor reads `key =` (value not typed yet,
@@ -95,11 +192,24 @@ pub(crate) fn parse_uri(uri_str: impl AsRef<str>, fallback: &Url) -> Url {
 /// is also robust against multi-character comparison operators (`==`, `>=`,
 /// `!=`, `?=`) which the previous logic treated as a sequence of single
 /// characters.
+#[cfg(test)]
 pub(crate) fn line_value_key(text: &str, line0: u32, char0: u32) -> Option<String> {
-    let line = text.lines().nth(line0 as usize)?;
-    let n = line.len().min(char0 as usize);
-    let n = (0..=n).rev().find(|&i| line.is_char_boundary(i))?;
-    let upto = &line[..n];
+    line_value_key_with_encoding(
+        text,
+        line0,
+        char0,
+        &tower_lsp::lsp_types::PositionEncodingKind::UTF16,
+    )
+}
+
+pub(crate) fn line_value_key_with_encoding(
+    text: &str,
+    line0: u32,
+    char0: u32,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> Option<String> {
+    text.lines().nth(line0 as usize)?;
+    let upto = line_prefix_with_encoding(text, line0, char0, encoding);
     let trimmed = upto.trim_end();
     // Require the line to end with an operator: the value position is
     // recognisable by the `=` / `<` / `>` the user is sitting on (or has just
@@ -132,32 +242,41 @@ pub(crate) fn line_value_key(text: &str, line0: u32, char0: u32) -> Option<Strin
 /// exactly the typed text. The charset is the bare identifier (`A-Za-z0-9_`):
 /// `.` / `:` are token boundaries so member/scope-chain completion restarts the
 /// word after them. `line0` / `char0` are LSP 0-based.
+#[cfg(test)]
 pub(crate) fn current_token_range(
     text: &str,
     line0: u32,
     char0: u32,
 ) -> tower_lsp::lsp_types::Range {
+    current_token_range_with_encoding(
+        text,
+        line0,
+        char0,
+        &tower_lsp::lsp_types::PositionEncodingKind::UTF16,
+    )
+}
+
+pub(crate) fn current_token_range_with_encoding(
+    text: &str,
+    line0: u32,
+    char0: u32,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> tower_lsp::lsp_types::Range {
     use tower_lsp::lsp_types::{Position, Range};
-    let line = text.lines().nth(line0 as usize).unwrap_or("");
-    let chars: Vec<char> = line.chars().collect();
-    let cur = (char0 as usize).min(chars.len());
-    let mut start = cur;
-    while start > 0 {
-        let c = chars[start - 1];
-        if c.is_alphanumeric() || c == '_' {
-            start -= 1;
-        } else {
-            break;
-        }
-    }
+    let prefix = line_prefix_with_encoding(text, line0, char0, encoding);
+    let start_byte = prefix
+        .char_indices()
+        .rev()
+        .find_map(|(byte, c)| (!(c.is_alphanumeric() || c == '_')).then_some(byte + c.len_utf8()))
+        .unwrap_or(0);
     Range {
         start: Position {
             line: line0,
-            character: start as u32,
+            character: encoded_position_len(&prefix[..start_byte], encoding),
         },
         end: Position {
             line: line0,
-            character: char0,
+            character: encoded_position_len(prefix, encoding),
         },
     }
 }
@@ -169,16 +288,29 @@ pub(crate) fn current_token_range(
 /// mid-word edit, and filtering completions against characters the user
 /// hasn't typed yet would hide items they could still reach. `line0`/`char0`
 /// are LSP 0-based.
+#[cfg(test)]
 pub(crate) fn current_token_text(text: &str, line0: u32, char0: u32, start_char: u32) -> String {
+    current_token_text_with_encoding(
+        text,
+        line0,
+        char0,
+        start_char,
+        &tower_lsp::lsp_types::PositionEncodingKind::UTF16,
+    )
+}
+
+pub(crate) fn current_token_text_with_encoding(
+    text: &str,
+    line0: u32,
+    char0: u32,
+    start_char: u32,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> String {
     let line = text.lines().nth(line0 as usize).unwrap_or("");
-    let chars: Vec<char> = line.chars().collect();
-    let start = (start_char as usize).min(chars.len());
-    let end = (char0 as usize).min(chars.len());
-    if start >= end {
-        String::new()
-    } else {
-        chars[start..end].iter().collect()
-    }
+    let index = |column| position_byte_index(line, column, encoding);
+    let start = index(start_char);
+    let end = index(char0);
+    line.get(start..end).unwrap_or("").to_string()
 }
 
 /// Whether a URI is a localisation file (`.yml` / `.yaml` / `.csv`), where
@@ -202,21 +334,51 @@ pub(crate) fn is_cwt_file(uri: &str) -> bool {
     uri.to_ascii_lowercase().ends_with(".cwt")
 }
 
+/// Whether a URI is one of the game-script file types discovered and validated
+/// by the shared file manager.
+pub(crate) fn is_script_file(uri: &str) -> bool {
+    std::path::Path::new(uri)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            cwtools_file_manager::SCRIPT_EXTENSIONS
+                .iter()
+                .any(|script_ext| ext.eq_ignore_ascii_case(script_ext))
+        })
+}
+
 /// Locate the `$KEY$` loc-reference token under the cursor in a localisation
-/// line. `col` is the LSP (UTF-16) character offset. Returns the referenced key
-/// plus the token's `[start, end)` range in UTF-16 columns (for the editor to
-/// highlight). Mirrors the loc parser: the body must be an identifier
-/// (`[A-Za-z0-9_.]`, optionally with a `|colour` suffix) or it's literal text
-/// (a currency `$`), not a reference.
+/// line. `col` uses the negotiated LSP position encoding. Returns the
+/// referenced key plus the token's `[start, end)` range in that encoding.
+/// Mirrors the loc parser: the body must be an identifier (`[A-Za-z0-9_.]`,
+/// optionally with a `|colour` suffix) or it's literal text (a currency `$`),
+/// not a reference.
+#[cfg(test)]
 pub(crate) fn loc_ref_at_cursor(line: &str, col: u32) -> Option<(String, u32, u32)> {
-    // Record every `$`'s (utf16 column, byte index).
+    loc_ref_at_cursor_with_encoding(
+        line,
+        col,
+        &tower_lsp::lsp_types::PositionEncodingKind::UTF16,
+    )
+}
+
+pub(crate) fn loc_ref_at_cursor_with_encoding(
+    line: &str,
+    col: u32,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> Option<(String, u32, u32)> {
+    // Record every `$`'s (encoded column, byte index).
     let mut dollars: Vec<(u32, usize)> = Vec::new();
-    let mut u16col: u32 = 0;
+    let mut encoded_col: u32 = 0;
     for (b, ch) in line.char_indices() {
         if ch == '$' {
-            dollars.push((u16col, b));
+            dollars.push((encoded_col, b));
         }
-        u16col += ch.len_utf16() as u32;
+        encoded_col += if encoding == &tower_lsp::lsp_types::PositionEncodingKind::UTF32 {
+            1
+        } else {
+            ch.len_utf16() as u32
+        };
     }
     // Pair consecutive dollars into `$…$` tokens. A non-identifier body (e.g.
     // `$5 today $`) is a stray currency `$`: skip just the opening one so the
@@ -406,6 +568,48 @@ mod tests {
     }
 
     #[test]
+    fn is_script_file_uses_shared_extension_inventory() {
+        for ext in cwtools_file_manager::SCRIPT_EXTENSIONS {
+            assert!(is_script_file(&format!("file:///mod/test.{ext}")), "{ext}");
+            assert!(
+                is_script_file(&format!("file:///mod/test.{}", ext.to_uppercase())),
+                "{ext}"
+            );
+        }
+        for uri in [
+            "file:///mod/icon.dds",
+            "file:///mod/localisation/test.yml",
+            "file:///rules/test.cwt",
+            "file:///mod/readme.md",
+        ] {
+            assert!(!is_script_file(uri), "{uri}");
+        }
+    }
+
+    #[test]
+    fn source_positions_use_negotiated_encoding() {
+        let text = "😀 alpha";
+        assert_eq!(
+            source_position_to_lsp(
+                text,
+                0,
+                2,
+                &tower_lsp::lsp_types::PositionEncodingKind::UTF16,
+            ),
+            tower_lsp::lsp_types::Position::new(0, 3)
+        );
+        assert_eq!(
+            source_position_to_lsp(
+                text,
+                0,
+                2,
+                &tower_lsp::lsp_types::PositionEncodingKind::UTF32,
+            ),
+            tower_lsp::lsp_types::Position::new(0, 2)
+        );
+    }
+
+    #[test]
     fn test_line_value_key() {
         let text = "decision = {\n    has_completed_focus = \n}\n";
         // Cursor right after `= ` on line 1 (0-based), char 26.
@@ -491,6 +695,53 @@ mod tests {
     }
 
     #[test]
+    fn current_token_helpers_use_utf16_columns() {
+        let line = "😀 value";
+        let cursor = utf16_len(line);
+        let range = current_token_range_with_encoding(
+            line,
+            0,
+            cursor,
+            &tower_lsp::lsp_types::PositionEncodingKind::UTF16,
+        );
+        assert_eq!(range.start.character, 3);
+        assert_eq!(range.end.character, 8);
+        assert_eq!(current_token_text(line, 0, cursor, 3), "value");
+        assert_eq!(line_prefix(line, 0, 2), "😀");
+        assert_eq!(
+            lsp_pos_to_source_in_text(
+                line,
+                tower_lsp::lsp_types::Position::new(0, cursor),
+                &tower_lsp::lsp_types::PositionEncodingKind::UTF16,
+            ),
+            (1, 7)
+        );
+    }
+
+    #[test]
+    fn current_token_helpers_use_utf32_columns() {
+        let line = "😀 value";
+        let encoding = tower_lsp::lsp_types::PositionEncodingKind::UTF32;
+        let cursor = line.chars().count() as u32;
+        let range = current_token_range_with_encoding(line, 0, cursor, &encoding);
+        assert_eq!(range.start.character, 2);
+        assert_eq!(range.end.character, 7);
+        assert_eq!(
+            current_token_text_with_encoding(line, 0, cursor, 2, &encoding),
+            "value"
+        );
+        assert_eq!(line_prefix_with_encoding(line, 0, 1, &encoding), "😀");
+        assert_eq!(
+            lsp_pos_to_source_in_text(
+                line,
+                tower_lsp::lsp_types::Position::new(0, cursor),
+                &encoding,
+            ),
+            (1, 7)
+        );
+    }
+
+    #[test]
     fn test_current_token_text() {
         // Half-typed token: only the characters left of the cursor count, not
         // the rest of the identifier if the cursor sits mid-word.
@@ -515,6 +766,21 @@ mod tests {
         assert_eq!((start, end), (9, 14));
         // Cursor outside any ref.
         assert!(loc_ref_at_cursor(line, 2).is_none());
+    }
+
+    #[test]
+    fn test_loc_ref_at_cursor_uses_negotiated_encoding() {
+        let line = "  😀 $FOO$";
+        let utf16 = tower_lsp::lsp_types::PositionEncodingKind::UTF16;
+        let utf32 = tower_lsp::lsp_types::PositionEncodingKind::UTF32;
+        assert_eq!(
+            loc_ref_at_cursor_with_encoding(line, 7, &utf16),
+            Some(("FOO".to_string(), 5, 10))
+        );
+        assert_eq!(
+            loc_ref_at_cursor_with_encoding(line, 6, &utf32),
+            Some(("FOO".to_string(), 4, 9))
+        );
     }
 
     #[test]

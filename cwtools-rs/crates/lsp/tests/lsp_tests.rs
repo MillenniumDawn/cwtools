@@ -791,6 +791,77 @@ fn completion_response(rel_path: &str, text: &str, line0: u32, char0: u32) -> se
 }
 
 #[test]
+fn test_cwt_completion_replaces_partial_constructs() {
+    for (text, line, character, label, start) in [
+        ("alias[", 0, 6, "alias", 0),
+        ("types = {\n  type[", 1, 7, "type", 2),
+        ("enums = {\n  enum[", 1, 7, "enum", 2),
+        ("rule = filepath[", 0, 16, "filepath[folder,extension]", 7),
+    ] {
+        let response = completion_response("config/test.cwt", text, line, character);
+        assert_eq!(response["result"]["isIncomplete"], true, "{response}");
+        let item = response["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["label"] == label)
+            .unwrap_or_else(|| panic!("missing {label}: {response}"));
+        assert_eq!(item["textEdit"]["range"]["start"]["character"], start);
+        assert_eq!(item["textEdit"]["range"]["end"]["character"], character);
+    }
+}
+
+#[test]
+fn test_localisation_completion_range_uses_utf16_columns() {
+    let text = "l_english:\n KNOWN_KEY:0 \"known\"\n TEST:0 \"😀 $key\"";
+    let response = completion_response("localisation/test_l_english.yml", text, 2, 16);
+    let items = response["result"]
+        .as_array()
+        .or_else(|| response["result"]["items"].as_array())
+        .unwrap_or_else(|| panic!("missing completion items: {response}"));
+    let item = items
+        .iter()
+        .find(|item| item["label"] == "known_key")
+        .unwrap_or_else(|| panic!("missing loc key: {response}"));
+    assert_eq!(item["textEdit"]["range"]["start"]["character"], 13);
+    assert_eq!(item["textEdit"]["range"]["end"]["character"], 16);
+}
+
+#[test]
+fn test_localisation_completion_range_uses_utf32_columns() {
+    let text = "l_english:\n KNOWN_KEY:0 \"known\"\n TEST:0 \"😀 $key\"";
+    let files = &[("localisation/test_l_english.yml", text)];
+    let caps = serde_json::json!({
+        "general": { "positionEncodings": ["utf-32"] }
+    });
+    let result = feature_request(
+        COMPLETION_RULES,
+        files,
+        &["localisation/test_l_english.yml"],
+        caps,
+        "localisation/test_l_english.yml",
+        "textDocument/completion",
+        serde_json::json!({ "position": { "line": 2, "character": 15 } }),
+    );
+    let items = result
+        .as_array()
+        .or_else(|| result["items"].as_array())
+        .unwrap_or_else(|| panic!("missing completion items: {result}"));
+    let item = items
+        .iter()
+        .find(|item| item["label"] == "known_key")
+        .unwrap_or_else(|| panic!("missing loc key: {result}"));
+    assert_eq!(item["textEdit"]["range"]["start"]["character"], 12);
+    assert_eq!(item["textEdit"]["range"]["end"]["character"], 15);
+}
+
+#[test]
+fn test_completion_skips_resource_files() {
+    let response = completion_response("gfx/interface/test.dds", "anything", 0, 8);
+    assert!(response["result"].is_null(), "{response}");
+}
+
+#[test]
 fn test_completion_modifiers_in_mio_equipment_bonus() {
     let text = "my_org = {\n    name = org\n    equipment_bonus = {\n        some_equipment = {\n            \n        }\n    }\n}\n";
     // Cursor on the blank line inside the equipment block (line 4, col 12).
@@ -1167,27 +1238,27 @@ focus = {
 
 #[test]
 fn test_completion_localisation_value_offers_keys_not_variable_dump() {
-    // #74: a `localisation`-typed value position must offer loc keys (workspace
-    // entities), not the flat variable dump.
+    // #74: a `localisation`-typed value position must offer indexed loc keys,
+    // not the flat variable dump.
     let vars = (
         "common/decisions/vars.txt",
         "seed_dec = {\n    set_math = {\n        my_saved_var = 5\n    }\n}\n",
     );
-    let focus = (
-        "common/national_focus/f.txt",
-        "MY_FOCUS = {\n    id = f1\n}\n",
+    let loc = (
+        "localisation/test_l_english.yml",
+        "l_english:\n MY_FOCUS:0 \"A focus\"\n",
     );
     let labels = completion_labels_custom_rules(
         LOCALISATION_RULES,
         "common/decisions/test.txt",
         "my_dec = {\n    loc_name = \n}\n",
-        &[vars, focus],
+        &[vars, loc],
         1,
         15,
     );
     assert!(
-        labels.iter().any(|l| l == "MY_FOCUS"),
-        "localisation value should offer loc keys (entities), got: {:?}",
+        labels.iter().any(|l| l == "my_focus"),
+        "localisation value should offer indexed loc keys, got: {:?}",
         labels
     );
     assert!(

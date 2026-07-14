@@ -864,6 +864,7 @@ impl Backend {
             // overlay now feeds the game-file loc checks, so they resolve the new
             // key without a full rescan. (#36)
             if changed {
+                self.bump_info_revision();
                 self.revalidate_other_open_loc_files(uri).await;
                 let generation = self
                     .state
