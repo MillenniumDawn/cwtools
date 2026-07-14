@@ -15,6 +15,3 @@ cwtools_localization = { workspace = true }
 tracing = { workspace = true }
 rustc-hash = { workspace = true }
 smallvec = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3"

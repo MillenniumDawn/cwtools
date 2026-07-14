@@ -276,17 +276,6 @@ impl Backend {
             )
         });
 
-        if files_to_validate.is_empty() {
-            self.client
-                .log_message(MessageType::INFO, "No workspace files found to validate.")
-                .await;
-            // Nothing to index — let single-file diagnostics publish normally.
-            self.state
-                .index_ready
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-
         self.client
             .log_message(
                 MessageType::INFO,
@@ -462,8 +451,12 @@ impl Backend {
         // re-indexes what IS still on disk; without this, a stale definition
         // keeps "resolving" against a file that no longer exists until a
         // window reload.
-        let walked_uris: HashSet<String> =
-            files_to_validate.iter().map(|p| path_to_uri(p)).collect();
+        let indexed_uris: HashSet<String> = files_to_validate
+            .iter()
+            .zip(parsed_files.iter())
+            .filter(|(_, parsed)| parsed.is_some())
+            .map(|(path, _)| path_to_uri(path))
+            .collect();
         let removed_uris: Vec<String> = {
             let mut info = self.state.info_service.write();
             let stale: Vec<String> = info
@@ -475,7 +468,7 @@ impl Backend {
                 // never sees them; the `file://` guard is belt-and-braces.
                 .filter(|&uri| {
                     uri.starts_with("file://")
-                        && !walked_uris.contains(uri)
+                        && !indexed_uris.contains(uri)
                         && !open_uris.contains(uri)
                 })
                 .cloned()
@@ -531,13 +524,6 @@ impl Backend {
         // complete (templated modifiers like production_speed_<building>_factor
         // expand against the full instance list).
         self.rebuild_modifier_keys();
-
-        // Pass 1 just dropped every file's parsed AST; glibc may still be
-        // holding onto the heap pages. Trim now so the loc service's ~2M-entry
-        // allocation in rebuild_and_publish_loc doesn't sit on top of pages
-        // we're never going to touch again.
-        cwtools_profiling::trim_memory();
-        cwtools_profiling::log_rss("scan: post-index trim");
 
         // Build the loc-key index (workspace + vanilla) so pass 2's config
         // validation can check LocalisationField references (CW100/CW122), and
@@ -906,6 +892,9 @@ impl Backend {
                     HashMap::new();
                 let mut ll: HashMap<String, (String, u32)> = HashMap::new();
                 for file in service.files() {
+                    if file.path.starts_with(&root_str) {
+                        by_file.entry(file.path.clone()).or_default();
+                    }
                     let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
                     let lang_included = hover_all || lang == primary_lang;
                     // Every entry in a file shares the same source path.
@@ -1266,7 +1255,9 @@ impl Backend {
         }
         if batch.len() > WATCHED_BULK_CAP {
             tracing::info!(count = batch.len(), "watched batch over cap; full rescan");
-            self.validate_entire_workspace(true).await;
+            if !self.validate_entire_workspace(true).await {
+                self.state.watched_pending.lock().extend(batch);
+            }
         } else {
             for uri in batch {
                 // An open editor buffer owns its diagnostics; skip files that
@@ -1287,13 +1278,9 @@ impl Backend {
                 };
                 match read {
                     Ok(Ok(text)) => {
-                        let (diagnostics, parsed) = self
+                        let (diagnostics, _) = self
                             .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched)
                             .await;
-                        if let Some(parsed) = parsed {
-                            let ast = Arc::new(parsed);
-                            self.update_doc_tokens(&uri, Some(&ast));
-                        }
                         if let Ok(uri_obj) = Url::parse(&uri) {
                             self.publish_gated(uri_obj, diagnostics, None).await;
                         }

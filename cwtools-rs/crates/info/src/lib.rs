@@ -226,9 +226,8 @@ struct TypeRefRule {
 }
 
 /// Precompute the leaf-key → referenced-type map from a ruleset. Built once per
-/// ruleset load (keyed by a cheap `(root_rules, types)` count signature) and
-/// reused across every file's index pass. Keyed by lowercased leaf key (rule
-/// keys match case-insensitively).
+/// ruleset load and reused across every file's index pass. Keyed by lowercased
+/// leaf key (rule keys match case-insensitively).
 fn build_type_ref_keys(ruleset: &RuleSet) -> HashMap<String, Vec<TypeRefRule>> {
     let mut map: HashMap<String, Vec<TypeRefRule>> = HashMap::new();
     for root_rule in &ruleset.root_rules {
@@ -355,19 +354,15 @@ pub struct InfoService {
     /// Effect/trigger names that DEFINE a `value_set[variable]` (e.g.
     /// `set_variable`). Cached so per-file indexing can scan `set_variable`
     /// blocks for defined names (and their values) without recomputing it from
-    /// the ruleset each time. Set by [`InfoService::set_var_effects`] at ruleset
+    /// the ruleset each time. Set by [`InfoService::update_ruleset_data`] at ruleset
     /// load; empty until then, which leaves the variable index untouched.
     var_effects: HashSet<String>,
     /// Workspace-wide reverse index of type-instance use sites, so
     /// `references`/`rename` reach files that aren't open. Built incrementally
     /// during the index pass and cleared per file on reindex.
     pub reference_index: ReferenceIndex,
-    /// Cached leaf-key → referenced-type map ([`build_type_ref_keys`]), rebuilt
-    /// when the ruleset changes (detected via `type_ref_keys_sig`).
-    type_ref_keys: HashMap<String, Vec<TypeRefRule>>,
-    /// Cheap ruleset signature `(root_rules.len(), types.len())`; a change
-    /// triggers a `type_ref_keys` rebuild on the next index pass.
-    type_ref_keys_sig: (usize, usize),
+    /// Cached leaf-key → referenced-type map ([`build_type_ref_keys`]).
+    type_ref_keys: Option<HashMap<String, Vec<TypeRefRule>>>,
 }
 
 impl Default for InfoService {
@@ -387,17 +382,14 @@ impl InfoService {
             inline_script_counts: HashMap::new(),
             var_effects: HashSet::new(),
             reference_index: ReferenceIndex::default(),
-            type_ref_keys: HashMap::new(),
-            type_ref_keys_sig: (usize::MAX, usize::MAX),
+            type_ref_keys: None,
         }
     }
 
-    /// Cache the set of variable-defining effects (from
-    /// [`cwtools_index::variable_defining_effects`]). The LSP calls this once at
-    /// ruleset load so per-file indexing can populate the variable index that the
-    /// CW246/VariableGetField checks consult.
-    pub fn set_var_effects(&mut self, effects: HashSet<String>) {
+    /// Update data derived from the active ruleset.
+    pub fn update_ruleset_data(&mut self, effects: HashSet<String>) {
         self.var_effects = effects;
+        self.type_ref_keys = None;
     }
 
     /// One-line size summary for profiling (counts only, not bytes).
@@ -554,18 +546,16 @@ impl InfoService {
         // Rebuild the leaf-key → type map when the ruleset changed, then record
         // this file's type-instance use sites. `clear_file` (run before every
         // reindex) drops the file's previous sites.
-        let sig = (ruleset.root_rules.len(), ruleset.types.len());
-        if self.type_ref_keys_sig != sig {
-            self.type_ref_keys = build_type_ref_keys(ruleset);
-            self.type_ref_keys_sig = sig;
-        }
-        if !self.type_ref_keys.is_empty() {
+        let type_ref_keys = self
+            .type_ref_keys
+            .get_or_insert_with(|| build_type_ref_keys(ruleset));
+        if !type_ref_keys.is_empty() {
             let mut refs = Vec::new();
             collect_type_ref_uses(
                 &ast.root_children,
                 &ast.arena,
                 table,
-                &self.type_ref_keys,
+                type_ref_keys,
                 ruleset,
                 logical_path,
                 &mut refs,
@@ -1400,6 +1390,52 @@ alias[effect:set_temp_variable] = {
             .find(|d| d.name == "my_shorthand")
             .expect("my_shorthand");
         assert_eq!(shorthand.value.as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn ruleset_change_invalidates_type_reference_keys() {
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+
+        let table = StringTable::new();
+        let old_rules = ast_to_ruleset(
+            &parse_string(
+                "types = { type[decision] = { path = \"common/decisions\" } }\
+                 decision = { old_ref = <focus> }",
+                &table,
+            )
+            .unwrap(),
+            &table,
+        );
+        let new_rules = ast_to_ruleset(
+            &parse_string(
+                "types = { type[decision] = { path = \"common/decisions\" } }\
+                 decision = { new_ref = <focus> }",
+                &table,
+            )
+            .unwrap(),
+            &table,
+        );
+        assert_eq!(old_rules.root_rules.len(), new_rules.root_rules.len());
+        assert_eq!(old_rules.types.len(), new_rules.types.len());
+
+        let mut service = InfoService::new();
+        service.index_file_with_path(
+            "old.txt",
+            &parse_string("test = { old_ref = OLD }", &table).unwrap(),
+            &table,
+            &old_rules,
+            "common/decisions/old.txt",
+        );
+
+        service.update_ruleset_data(HashSet::new());
+        service.index_file_with_path(
+            "new.txt",
+            &parse_string("test = { new_ref = NEW }", &table).unwrap(),
+            &table,
+            &new_rules,
+            "common/decisions/new.txt",
+        );
+        assert_eq!(service.reference_index.references("focus", "NEW").len(), 1);
     }
 
     // ── Item 2.7 — value_set var removed from variable_counts on clear_file ──

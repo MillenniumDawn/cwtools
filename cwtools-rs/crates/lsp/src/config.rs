@@ -108,7 +108,10 @@ impl Backend {
         let mut rules = self.state.rules.write();
         rules.ruleset = Some(Arc::new(ruleset));
         rules.scope_registry = registry;
-        self.state.info_service.write().set_var_effects(var_effects);
+        self.state
+            .info_service
+            .write()
+            .update_ruleset_data(var_effects);
         drop(rules);
         self.bump_info_revision();
     }
