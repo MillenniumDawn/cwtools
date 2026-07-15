@@ -847,7 +847,6 @@ impl Backend {
             extra
         };
 
-        let root_str = root_path.to_string_lossy().to_string();
         // block_in_place: the loc service reads and parses hundreds of loc files
         // from disk — synchronous I/O that must not starve the async executor.
         let (loc_index, mut by_file, loc_text_map, loc_loc_map) =
@@ -875,7 +874,7 @@ impl Backend {
                     idx.union(),
                     &extra_valid_refs,
                 ) {
-                    if !d.file.starts_with(&root_str) {
+                    if !std::path::Path::new(&d.file).starts_with(root_path) {
                         continue;
                     }
                     let ve = loc_diag_to_validation_error(&d);
@@ -892,7 +891,7 @@ impl Backend {
                     HashMap::new();
                 let mut ll: HashMap<String, (String, u32)> = HashMap::new();
                 for file in service.files() {
-                    if file.path.starts_with(&root_str) {
+                    if std::path::Path::new(&file.path).starts_with(root_path) {
                         by_file.entry(file.path.clone()).or_default();
                     }
                     let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);

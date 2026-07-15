@@ -1149,44 +1149,83 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         tracing::debug!(%uri, "did_close");
-        {
-            let mut docs = self.state.documents.lock();
-            docs.remove(&uri);
-        }
+        self.state.documents.lock().remove(&uri);
         let pending_validation = self.state.debounce_handles.lock().remove(&uri);
         if let Some(handle) = pending_validation {
             handle.abort();
             let _ = handle.await;
         }
-        {
-            let mut index = self.state.symbol_index.lock();
-            index.clear_document(&uri);
+
+        if self.state.documents.lock().contains_key(&uri) {
+            return;
         }
-        {
-            let mut info = self.state.info_service.write();
-            info.clear_file(&uri);
-        }
-        self.bump_info_revision();
-        if !crate::paths::is_loc_file(&uri) && !crate::paths::is_cwt_file(&uri) {
+
+        let (exports_before, names_before) = {
+            let info = self.state.info_service.read();
+            (info.export_fingerprint(&uri), info.export_names(&uri))
+        };
+        let disk_ast = if !crate::paths::is_loc_file(&uri) && !crate::paths::is_cwt_file(&uri) {
             let path = crate::paths::uri_to_path_str(&uri);
-            if let Ok(Ok(text)) = tokio::task::spawn_blocking(move || {
-                cwtools_file_manager::file_manager::read_text(std::path::Path::new(&path))
+            let table = self.state.string_table.clone();
+            tokio::task::spawn_blocking(move || {
+                let text =
+                    cwtools_file_manager::file_manager::read_text(std::path::Path::new(&path))
+                        .ok()?;
+                cwtools_parser::parser::parse_string(&text, &table).ok()
             })
             .await
-                && let Ok(parsed) =
-                    cwtools_parser::parser::parse_string(&text, &self.state.string_table)
-            {
-                self.index_parsed_file(&uri, &parsed);
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
+        let (exports_after, names_after, generation) = {
+            let mut doc_tokens = self.state.doc_tokens.write();
+            let documents = self.state.documents.lock();
+            if documents.contains_key(&uri) {
+                return;
             }
-        }
-        self.state.doc_tokens.write().remove(&uri);
-        // Drop the closed loc file's live overlay contribution (#36).
-        self.state.loc_live_overlay.write().remove(&uri);
-        self.state.completion_generation.lock().remove(&uri);
+
+            if let Some(parsed) = disk_ast.as_ref() {
+                self.index_parsed_file(&uri, parsed);
+            } else {
+                self.state.symbol_index.lock().clear_document(&uri);
+                self.state.info_service.write().clear_file(&uri);
+                self.bump_info_revision();
+            }
+            doc_tokens.remove(&uri);
+            self.state.loc_live_overlay.write().remove(&uri);
+            self.state.completion_generation.lock().remove(&uri);
+
+            let info = self.state.info_service.read();
+            (
+                info.export_fingerprint(&uri),
+                info.export_names(&uri),
+                self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1,
+            )
+        };
+
         cwtools_profiling::log_rss("did_close");
-        self.client
-            .publish_diagnostics(params.text_document.uri, vec![], None)
+        if !self.state.documents.lock().contains_key(&uri) {
+            self.client
+                .publish_diagnostics(params.text_document.uri, vec![], None)
+                .await;
+        }
+
+        if exports_before != exports_after {
+            let mut changed_names: HashSet<String> = names_before
+                .symmetric_difference(&names_after)
+                .cloned()
+                .collect();
+            changed_names.extend(self.state.pending_changed_names.lock().drain());
+            self.revalidate_open_dependents(
+                &uri,
+                generation,
+                (!changed_names.is_empty()).then_some(&changed_names),
+            )
             .await;
+        }
     }
 
     // --- Language features ---

@@ -4809,13 +4809,12 @@ fn test_did_close_restores_disk_definition() {
     let raw = read_response(&mut reader).expect("no definition response after didClose");
     child.kill().ok();
     let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    let is_disk_definition = |location: &serde_json::Value| location["uri"] == definition_uri;
     let result = &response["result"];
     assert!(
-        result
-            .as_array()
-            .is_some_and(|locations| locations.iter().any(is_disk_definition))
-            || is_disk_definition(result),
+        result.as_array().is_some_and(|locations| locations
+            .iter()
+            .any(|location| location["uri"] == definition_uri))
+            || result["uri"] == definition_uri,
         "closing the live buffer should restore the disk definition, got: {result:?}"
     );
 }

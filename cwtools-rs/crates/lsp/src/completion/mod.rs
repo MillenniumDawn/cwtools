@@ -201,25 +201,34 @@ fn log_completion_summary(
 
 impl Backend {
     fn completion_loc_keys(&self, token: &str) -> HashSet<String> {
+        let overlay_keys = self.loc_overlay_keys();
         let index_guard = self.state.loc_index.read();
-        let overlay_guard = self.state.loc_live_overlay.read();
         let keys = index_guard
             .as_ref()
             .map(|index| index.union())
             .into_iter()
             .flat_map(|keys| keys.iter())
-            .chain(overlay_guard.values().flat_map(|keys| keys.iter()));
+            .chain(overlay_keys.iter());
         let mut selected = BTreeSet::new();
         for key in keys.filter(|key| subsequence_match(key, token)) {
             let key = key.as_str();
+            let ranked = (
+                !key.get(..token.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(token)),
+                key,
+            );
             if selected.len() < CONTEXT_CAP {
-                selected.insert(key);
-            } else if selected.last().is_some_and(|largest| key < *largest) && selected.insert(key)
+                selected.insert(ranked);
+            } else if selected.last().is_some_and(|largest| ranked < *largest)
+                && selected.insert(ranked)
             {
                 selected.pop_last();
             }
         }
-        selected.into_iter().map(str::to_owned).collect()
+        selected
+            .into_iter()
+            .map(|(_, key)| key.to_owned())
+            .collect()
     }
 
     #[tracing::instrument(
