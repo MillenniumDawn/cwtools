@@ -4751,3 +4751,70 @@ fn test_did_open_then_immediate_close_ends_empty() {
         diags
     );
 }
+
+#[test]
+fn test_did_close_restores_disk_definition() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let definition_rel = "common/national_focus/f.txt";
+    let usage_rel = "common/decisions/d.txt";
+    let definition_uri = write_disk_file(ws.path(), definition_rel, "DISK_FOCUS = { x = yes }\n");
+    let usage = "my_dec = {\n    has_focus = DISK_FOCUS\n}\n";
+    let usage_uri = write_disk_file(ws.path(), usage_rel, usage);
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":usage_uri,"languageId":"hoi4","version":1,"text":usage}}),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, usage_rel);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":definition_uri,"languageId":"hoi4","version":1,"text":"LIVE_FOCUS = { x = yes }\n"}}),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, definition_rel);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didClose",
+            serde_json::json!({"textDocument":{"uri":definition_uri}}),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, definition_rel);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            902,
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": {"uri": usage_uri},
+                "position": {"line": 1, "character": 20},
+            }),
+        ),
+    )
+    .unwrap();
+    let raw = read_response(&mut reader).expect("no definition response after didClose");
+    child.kill().ok();
+    let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let result = &response["result"];
+    assert!(
+        result.as_array().is_some_and(|locations| locations
+            .iter()
+            .any(|location| location["uri"] == definition_uri))
+            || result["uri"] == definition_uri,
+        "closing the live buffer should restore the disk definition, got: {result:?}"
+    );
+}

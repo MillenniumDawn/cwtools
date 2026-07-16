@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -200,16 +200,35 @@ fn log_completion_summary(
 }
 
 impl Backend {
-    fn completion_loc_keys(&self) -> HashSet<String> {
-        let mut keys = self
-            .state
-            .loc_index
-            .read()
+    fn completion_loc_keys(&self, token: &str) -> HashSet<String> {
+        let overlay_keys = self.loc_overlay_keys();
+        let index_guard = self.state.loc_index.read();
+        let keys = index_guard
             .as_ref()
-            .map(|index| index.union().clone())
-            .unwrap_or_default();
-        keys.extend(self.loc_overlay_keys());
-        keys
+            .map(|index| index.union())
+            .into_iter()
+            .flat_map(|keys| keys.iter())
+            .chain(overlay_keys.iter());
+        let mut selected = BTreeSet::new();
+        for key in keys.filter(|key| subsequence_match(key, token)) {
+            let key = key.as_str();
+            let ranked = (
+                !key.get(..token.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(token)),
+                key,
+            );
+            if selected.len() < CONTEXT_CAP {
+                selected.insert(ranked);
+            } else if selected.last().is_some_and(|largest| ranked < *largest)
+                && selected.insert(ranked)
+            {
+                selected.pop_last();
+            }
+        }
+        selected
+            .into_iter()
+            .map(|(_, key)| key.to_owned())
+            .collect()
     }
 
     #[tracing::instrument(
@@ -400,10 +419,6 @@ impl Backend {
         // Localisation completion is syntax-sensitive: ordinary text and `$...$`
         // references offer loc keys, while an open `[...]` offers data functions.
         if crate::paths::is_loc_file(&uri) {
-            let revision = self
-                .state
-                .info_revision
-                .load(std::sync::atomic::Ordering::Relaxed);
             let context = scope_names::loc_completion_context(&doc_text, pos, &position_encoding);
             let loc_range =
                 scope_names::loc_completion_range(&doc_text, pos, context, &position_encoding);
@@ -414,29 +429,15 @@ impl Backend {
                 loc_range.start.character,
                 &position_encoding,
             );
-            let cache_key = format!("{}:{context:?}", language);
-            let cached_items = self
-                .state
-                .loc_cache
-                .lock()
-                .as_ref()
-                .filter(|cached| cached.revision == revision && cached.language == cache_key)
-                .map(|cached| (*cached.items).clone());
-            let items = if let Some(items) = cached_items {
-                items
+            let t_build = Instant::now();
+            let loc_keys = if context == scope_names::LocCompletionContext::DataFunction {
+                HashSet::new()
             } else {
-                let loc_keys = self.completion_loc_keys();
-                let t_build = Instant::now();
-                let items =
-                    loc_completions(&loc_keys, &language, scope_registry_arc.as_deref(), context);
-                build_dur = t_build.elapsed();
-                *self.state.loc_cache.lock() = Some(CompletionCacheEntry {
-                    revision,
-                    language: cache_key,
-                    items: std::sync::Arc::new(items.clone()),
-                });
-                items
+                self.completion_loc_keys(&loc_token)
             };
+            let items =
+                loc_completions(&loc_keys, &language, scope_registry_arc.as_deref(), context);
+            build_dur = t_build.elapsed();
             let mut items = filter_by_token(items, &loc_token);
             anchor_items(&mut items, loc_range);
             log_completion_summary(
@@ -546,7 +547,7 @@ impl Backend {
                                     } else {
                                         let loc_keys =
                                             if value_rules_need_loc_keys(&rctx.value_rules) {
-                                                self.completion_loc_keys()
+                                                self.completion_loc_keys(&token)
                                             } else {
                                                 Default::default()
                                             };
@@ -582,7 +583,7 @@ impl Backend {
                                     );
                                     let resolved = !vr.is_empty();
                                     let loc_keys = if value_rules_need_loc_keys(&vr) {
-                                        self.completion_loc_keys()
+                                        self.completion_loc_keys(&token)
                                     } else {
                                         Default::default()
                                     };
@@ -692,7 +693,7 @@ impl Backend {
         if let Some(cached) = self.state.fallback_cache.lock().as_ref()
             && cached.revision == revision
         {
-            let items = (*cached.items).clone();
+            let items = cached.items.clone();
             if !items.is_empty() {
                 // Filter the retrieved copy, never the cache (see below): the
                 // cached list is shared across every request regardless of
@@ -779,8 +780,7 @@ impl Backend {
             // and anchor only the clone that is returned, not the cached copy.
             *self.state.fallback_cache.lock() = Some(CompletionCacheEntry {
                 revision,
-                language: String::new(),
-                items: std::sync::Arc::new(items.clone()),
+                items: items.clone(),
             });
             let (mut items, _truncated) = filter_and_cap(items, &token, FALLBACK_CAP);
             anchor_items(&mut items, replace_range);

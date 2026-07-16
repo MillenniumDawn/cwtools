@@ -287,20 +287,16 @@ struct DocumentState {
     /// to a single pending task instead of stacking hundreds of sleepers.
     debounce_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Monotonic counter bumped on every mutation of `info_service` or
-    /// `rules` (the two state sources the loc/fallback completion caches
-    /// depend on). The completion handler reads this on each request; when
+    /// `rules` (the two state sources the fallback completion cache depends
+    /// on). The completion handler reads this on each request; when
     /// the value matches a cached entry, it can return the cached list
     /// without walking `info.files` again. Hot in the half-typed case: the
     /// user is in a state where the AST is stale and every completion
     /// falls through to the fallback, but info/rules haven't moved since
     /// the last build, so the cache hit saves a full workspace walk.
     info_revision: AtomicU64,
-    /// Cached loc-completion list (`loc_completions`). Workspace-wide, not
-    /// per-URI, so a single entry covers every open `.yml`. The language
-    /// field disambiguates games with different scope-chain casing.
-    loc_cache: parking_lot::Mutex<Option<CompletionCacheEntry>>,
     /// Cached fallback list (the flat type/enum/var dump reached when
-    /// context-aware matching returns nothing). Same shape as `loc_cache`.
+    /// context-aware matching returns nothing).
     fallback_cache: parking_lot::Mutex<Option<CompletionCacheEntry>>,
     /// Per-URI generation counter for in-flight completion requests. Each new
     /// `completion` request for a URI increments this and captures the value;
@@ -336,12 +332,10 @@ struct DocumentState {
 
 /// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
 /// completion handler can swap a freshly built list in on cache miss without
-/// holding any other lock. `items` is an `Arc` so the per-request clone is a
-/// refcount bump, not a deep copy of every item.
+/// holding any other lock.
 pub(crate) struct CompletionCacheEntry {
     pub(crate) revision: u64,
-    pub(crate) language: String,
-    pub(crate) items: std::sync::Arc<Vec<CompletionItem>>,
+    pub(crate) items: Vec<CompletionItem>,
 }
 
 pub(crate) struct ParsedDoc {
@@ -441,7 +435,6 @@ impl DocumentState {
             scan_in_progress: AtomicBool::new(false),
             debounce_handles: Mutex::new(HashMap::new()),
             info_revision: AtomicU64::new(0),
-            loc_cache: parking_lot::Mutex::new(None),
             fallback_cache: parking_lot::Mutex::new(None),
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
             last_loc_signature: parking_lot::Mutex::new(None),
@@ -1156,35 +1149,83 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         tracing::debug!(%uri, "did_close");
-        {
-            let mut docs = self.state.documents.lock();
-            docs.remove(&uri);
-        }
-        // Drop any pending debounce task for the closed file (#47).
-        if let Some(handle) = self.state.debounce_handles.lock().remove(&uri) {
+        self.state.documents.lock().remove(&uri);
+        let pending_validation = self.state.debounce_handles.lock().remove(&uri);
+        if let Some(handle) = pending_validation {
             handle.abort();
+            let _ = handle.await;
         }
-        // Release the closed file's entries from the global indexes. Without
-        // this, opening then closing a file leaves its type instances,
-        // variables, event targets, and symbols in memory permanently.
-        {
-            let mut index = self.state.symbol_index.lock();
-            index.clear_document(&uri);
+
+        if self.state.documents.lock().contains_key(&uri) {
+            return;
         }
-        {
-            let mut info = self.state.info_service.write();
-            info.clear_file(&uri);
-        }
-        self.bump_info_revision();
-        self.state.doc_tokens.write().remove(&uri);
-        // Drop the closed loc file's live overlay contribution (#36).
-        self.state.loc_live_overlay.write().remove(&uri);
-        self.state.completion_generation.lock().remove(&uri);
-        cwtools_profiling::trim_memory();
+
+        let (exports_before, names_before) = {
+            let info = self.state.info_service.read();
+            (info.export_fingerprint(&uri), info.export_names(&uri))
+        };
+        let disk_ast = if !crate::paths::is_loc_file(&uri) && !crate::paths::is_cwt_file(&uri) {
+            let path = crate::paths::uri_to_path_str(&uri);
+            let table = self.state.string_table.clone();
+            tokio::task::spawn_blocking(move || {
+                let text =
+                    cwtools_file_manager::file_manager::read_text(std::path::Path::new(&path))
+                        .ok()?;
+                cwtools_parser::parser::parse_string(&text, &table).ok()
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
+        let (exports_after, names_after, generation) = {
+            let mut doc_tokens = self.state.doc_tokens.write();
+            let documents = self.state.documents.lock();
+            if documents.contains_key(&uri) {
+                return;
+            }
+
+            if let Some(parsed) = disk_ast.as_ref() {
+                self.index_parsed_file(&uri, parsed);
+            } else {
+                self.state.symbol_index.lock().clear_document(&uri);
+                self.state.info_service.write().clear_file(&uri);
+                self.bump_info_revision();
+            }
+            doc_tokens.remove(&uri);
+            self.state.loc_live_overlay.write().remove(&uri);
+            self.state.completion_generation.lock().remove(&uri);
+
+            let info = self.state.info_service.read();
+            (
+                info.export_fingerprint(&uri),
+                info.export_names(&uri),
+                self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1,
+            )
+        };
+
         cwtools_profiling::log_rss("did_close");
-        self.client
-            .publish_diagnostics(params.text_document.uri, vec![], None)
+        if !self.state.documents.lock().contains_key(&uri) {
+            self.client
+                .publish_diagnostics(params.text_document.uri, vec![], None)
+                .await;
+        }
+
+        if exports_before != exports_after {
+            let mut changed_names: HashSet<String> = names_before
+                .symmetric_difference(&names_after)
+                .cloned()
+                .collect();
+            changed_names.extend(self.state.pending_changed_names.lock().drain());
+            self.revalidate_open_dependents(
+                &uri,
+                generation,
+                (!changed_names.is_empty()).then_some(&changed_names),
+            )
             .await;
+        }
     }
 
     // --- Language features ---
