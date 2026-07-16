@@ -1,3 +1,28 @@
+# 1.24.0
+
+## Bug Fixes
+
+- Closing a file that had unsaved edits no longer breaks navigation to the symbols it defines. `did_close` used to drop the file from the index until the next full rescan, so go-to-definition and find-references across the workspace stopped resolving anything the closed file declared. It now re-indexes the on-disk version of the file on close (or clears it if the file is gone), and when reverting the buffer to disk changes what the file exports, the open files that reference it are revalidated.
+- A full workspace rescan is more conservative about pruning stale index entries, closing two ways it could drop live definitions. It no longer prunes anything when the file walk returns empty: the walk swallows I/O errors and hands back an empty list, which is indistinguishable from an empty workspace, so a transient read error on the workspace root during a background pass could otherwise wipe every cross-file definition. And it keys the prune off the files the walk actually found on disk rather than the ones that parsed this pass, so a closed file with a syntax error keeps its last-good definitions instead of dropping out of go-to-definition mid-edit. Real deletions still prune through the per-file watched-delete path.
+- References and rename keep resolving after a ruleset reload. The leaf-key to referenced-type map was cached behind a `(root_rules, types)` count signature, so a rules edit that left both counts unchanged reused the stale map and missed the new references. The map is now rebuilt whenever the ruleset is reloaded.
+
+## Improvements
+
+- When the localisation-completion candidate list is capped, keys whose start matches the typed token (case-insensitive) are kept ahead of looser subsequence matches, so the closest keys are not the ones dropped.
+
+## Notes
+
+- The cwtools engine version is now 2.1.0. It is reported as `serverInfo.version` on initialize, by `cwtools-server --version`, and in the startup log line, all sourced from `CARGO_PKG_VERSION` (previously the `0.1.0` workspace placeholder).
+
+## Developer
+
+- `did_close` was reworked. It aborts and awaits any pending debounced validate before touching the index (so an in-flight validation cannot race the close), re-indexes the on-disk file or clears it under a single `documents` guard that bails on a concurrent reopen, bumps the edit generation, and runs the export-diff-gated dependent sweep that `did_change` already uses. Added a black-box test that a definition stays resolvable after its live buffer is closed.
+- `type_ref_keys` is now an `Option` cleared by `update_ruleset_data` (renamed from `set_var_effects`) on ruleset load, replacing the count-signature memoization that could not see a same-shape rules change. Added an info-crate test that a same-count, different-content ruleset swap re-resolves references.
+- A watched-file bulk rescan (a batch over `WATCHED_BULK_CAP`) that loses the scan-in-progress guard re-queues its batch into `watched_pending` and re-arms instead of dropping the events. The workspace-scan prune skips entirely on an empty walk.
+- Workspace-root filtering for loc diagnostics and loc files uses `Path::starts_with` (component-wise) instead of a string prefix, so a sibling directory like `mod-backup/` no longer matches against `mod/`.
+- The separate loc-completion cache is gone (`loc_cache`, `CompletionCacheEntry.language`). Loc completion filters the loc-key set against the typed token per request and caps it, and `CompletionCacheEntry.items` is a plain `Vec` (the `Arc` around it was not saving the per-request clone). `did_close` also drops the closed file's `doc_tokens`, and watched per-file validation stops maintaining `doc_tokens` for closed files.
+- Removed unused workspace dependencies (walkdir, globset, memmap2, anyhow, bumpalo, bytecheck, serde) and dev-dependencies (predicates in lsp, tempfile in rules and validation). rkyv is trimmed to default features, which still include `std` and `bytecheck` (the checked `rkyv::access` path is unchanged).
+
 # 1.23.0
 
 ## Bug Fixes

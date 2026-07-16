@@ -447,17 +447,23 @@ impl Backend {
         // Prune index entries for files that vanished since the last scan —
         // deleted while the server had no watcher event (e.g. while closed),
         // or newly excluded by an ignore glob (pruning that one is correct
-        // too: it matches what a restart would index). Pass 1 above only
-        // re-indexes what IS still on disk; without this, a stale definition
-        // keeps "resolving" against a file that no longer exists until a
-        // window reload.
-        let indexed_uris: HashSet<String> = files_to_validate
-            .iter()
-            .zip(parsed_files.iter())
-            .filter(|(_, parsed)| parsed.is_some())
-            .map(|(path, _)| path_to_uri(path))
-            .collect();
-        let removed_uris: Vec<String> = {
+        // too: it matches what a restart would index). Without this, a stale
+        // definition keeps "resolving" against a file that no longer exists
+        // until a window reload.
+        //
+        // Key off what the walk FOUND on disk, not what parsed: a file with a
+        // syntax error is still there and keeps its last-good index entry, so
+        // cross-file goto/references don't drop out while it's mid-edit.
+        let discovered_uris: HashSet<String> =
+            files_to_validate.iter().map(|p| path_to_uri(p)).collect();
+        // An empty walk almost always means the root was transiently
+        // unreadable — walk_workspace_files swallows I/O errors and returns an
+        // empty Vec — not that the user deleted every file. Pruning against an
+        // empty set would wipe the whole index on a hiccup, so skip it; real
+        // deletions still arrive as per-file DELETE watched events.
+        let removed_uris: Vec<String> = if files_to_validate.is_empty() {
+            Vec::new()
+        } else {
             let mut info = self.state.info_service.write();
             let stale: Vec<String> = info
                 .files
@@ -468,7 +474,7 @@ impl Backend {
                 // never sees them; the `file://` guard is belt-and-braces.
                 .filter(|&uri| {
                     uri.starts_with("file://")
-                        && !indexed_uris.contains(uri)
+                        && !discovered_uris.contains(uri)
                         && !open_uris.contains(uri)
                 })
                 .cloned()
