@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use tower_lsp::lsp_types::*;
@@ -36,7 +36,8 @@ fn is_specific_requirement(required: &[String]) -> bool {
 /// stale one at the bottom of the list); it only sinks below the normal buckets.
 #[derive(Clone, Copy)]
 enum ScopeRank {
-    /// Matches a scope-specific `## scope` — leads the list (bucket `0`).
+    /// Matches a scope-specific `## scope`, or is a control-flow wrapper valid
+    /// in any scope (see `recurses_into_category`) — leads the list (bucket `0`).
     SpecificMatch,
     /// No scope info, or a scope-agnostic match — keeps the kind bucket.
     Neutral,
@@ -204,7 +205,7 @@ pub(crate) fn completions_from_rules(
     info: &InfoService,
     language: &str,
     modifier_keys: &HashSet<String>,
-    modifier_scopes: &std::collections::HashMap<String, Vec<String>>,
+    modifier_scopes: &HashMap<String, Vec<String>>,
     registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
     current_scope: Option<ScopeId>,
     token: &str,
@@ -212,8 +213,7 @@ pub(crate) fn completions_from_rules(
     let mut flt = BuildFilter::new(token);
     let mut items: Vec<CompletionItem> = Vec::new();
     // Per-request memo so a repeated enum is only collected/sorted once (#46).
-    let mut enum_cache: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut enum_cache: HashMap<String, Vec<String>> = HashMap::new();
     // Built (sort + clone) at most once per call even if several scope rules
     // appear in this block (#44).
     let mut scope_names: Option<Vec<String>> = None;
@@ -453,7 +453,7 @@ fn push_specific_node_key(
 /// the rule's right-hand side.
 fn push_enum_keyed_leaf(
     items: &mut Vec<CompletionItem>,
-    enum_cache: &mut std::collections::HashMap<String, Vec<String>>,
+    enum_cache: &mut HashMap<String, Vec<String>>,
     ruleset: &RuleSet,
     info: &InfoService,
     e: &str,
@@ -485,7 +485,7 @@ fn push_enum_keyed_leaf(
 /// `member = { $0 }`.
 fn push_enum_keyed_node(
     items: &mut Vec<CompletionItem>,
-    enum_cache: &mut std::collections::HashMap<String, Vec<String>>,
+    enum_cache: &mut HashMap<String, Vec<String>>,
     ruleset: &RuleSet,
     info: &InfoService,
     e: &str,
@@ -511,7 +511,7 @@ fn push_enum_keyed_node(
 /// insert-text (the value is the label itself).
 fn push_enum_leaf_values(
     items: &mut Vec<CompletionItem>,
-    enum_cache: &mut std::collections::HashMap<String, Vec<String>>,
+    enum_cache: &mut HashMap<String, Vec<String>>,
     ruleset: &RuleSet,
     info: &InfoService,
     e: &str,
@@ -618,7 +618,7 @@ fn push_alias_keys(
     ruleset: &RuleSet,
     info: &InfoService,
     modifier_keys: &HashSet<String>,
-    modifier_scopes: &std::collections::HashMap<String, Vec<String>>,
+    modifier_scopes: &HashMap<String, Vec<String>>,
     cat: &str,
     scope: ScopeCtx,
     flt: &mut BuildFilter,
@@ -628,28 +628,26 @@ fn push_alias_keys(
     // overloads (`(any_match, any_specific_match)`). A key survives if ANY overload
     // is in scope; it ranks top if ANY overload matches a scope-specific `## scope`.
     // Mirrors the validator's per-key `.any(...)` scope check (rule_core/alias.rs).
-    let verdicts: Option<std::collections::HashMap<&str, (bool, bool)>> =
-        scope.map(|(current, reg)| {
-            let mut m: std::collections::HashMap<&str, (bool, bool)> =
-                std::collections::HashMap::new();
-            for (alias_name, (_, opts)) in &ruleset.aliases {
-                let Some(k) = alias_name.strip_prefix(&prefix) else {
-                    continue;
-                };
-                if k == "scope_field" || ParsedAliasPattern::parse(k, 0).is_some() {
-                    continue;
-                }
-                let matches = scope_matches_required(current, reg, &opts.required_scopes);
-                let specific = matches && is_specific_requirement(&opts.required_scopes);
-                let e = m.entry(k).or_insert((false, false));
-                e.0 |= matches;
-                e.1 |= specific;
+    let verdicts: Option<HashMap<&str, (bool, bool)>> = scope.map(|(current, reg)| {
+        let mut m: HashMap<&str, (bool, bool)> = HashMap::new();
+        for (alias_name, (_, opts)) in &ruleset.aliases {
+            let Some(k) = alias_name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if k == "scope_field" || ParsedAliasPattern::parse(k, 0).is_some() {
+                continue;
             }
-            m
-        });
+            let matches = scope_matches_required(current, reg, &opts.required_scopes);
+            let specific = matches && is_specific_requirement(&opts.required_scopes);
+            let e = m.entry(k).or_insert((false, false));
+            e.0 |= matches;
+            e.1 |= specific;
+        }
+        m
+    });
     // Own the keys so that instance names (borrowed from the type index, not from
     // `ruleset.aliases`) can also participate in the seen-check below.
-    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
     for (alias_name, (rule, _)) in &ruleset.aliases {
         let Some(k) = alias_name.strip_prefix(&prefix) else {
             continue;
@@ -859,8 +857,8 @@ fn push_alias_keys(
 pub(crate) fn expanded_modifier_scopes(
     ruleset: &RuleSet,
     type_index: &cwtools_info::TypeIndex,
-) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for (name, category) in &ruleset.modifiers {
         let scopes = ruleset
             .modifier_categories
@@ -1027,7 +1025,7 @@ pub(crate) fn all_enum_values(
 /// `equipment_stat`), and `all_enum_values` re-collects + sorts + dedups each
 /// time. Cache by enum name within a single call so it only happens once.
 fn all_enum_values_cached<'c>(
-    cache: &'c mut std::collections::HashMap<String, Vec<String>>,
+    cache: &'c mut HashMap<String, Vec<String>>,
     ruleset: &RuleSet,
     info: &InfoService,
     enum_name: &str,
@@ -1131,7 +1129,7 @@ fn icon_values(index: &cwtools_info::FileIndex, folder: &str) -> Vec<String> {
 #[derive(Clone, Copy)]
 pub(crate) struct ValueCompletionSets<'a> {
     pub modifier_keys: &'a HashSet<String>,
-    pub modifier_scopes: &'a std::collections::HashMap<String, Vec<String>>,
+    pub modifier_scopes: &'a HashMap<String, Vec<String>>,
     pub loc_keys: &'a HashSet<String>,
 }
 
@@ -1176,8 +1174,7 @@ pub(crate) fn value_completions(
     // See the same guard in completions_from_rules: expand each category once.
     let mut seen_alias_cats: HashSet<&str> = HashSet::new();
     // Per-request memo so a repeated enum is only collected/sorted once (#46).
-    let mut enum_cache: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut enum_cache: HashMap<String, Vec<String>> = HashMap::new();
     // Built (sort + clone) at most once per call even if several scope-typed
     // value rules arrive here (#44).
     let mut scope_names: Option<Vec<String>> = None;
@@ -1808,8 +1805,7 @@ mod resolve_data_tests {
     #[test]
     fn type_instance_item_defers_detail() {
         let mut info = InfoService::new();
-        let mut per_type: std::collections::HashMap<String, Vec<cwtools_info::TypeInstance>> =
-            std::collections::HashMap::new();
+        let mut per_type: HashMap<String, Vec<cwtools_info::TypeInstance>> = HashMap::new();
         per_type.insert(
             "state".to_string(),
             vec![cwtools_info::TypeInstance {
@@ -1857,7 +1853,7 @@ mod resolve_data_tests {
         let info = InfoService::new();
 
         let mut items = Vec::new();
-        let mut cache = std::collections::HashMap::new();
+        let mut cache = HashMap::new();
         push_enum_leaf_values(
             &mut items,
             &mut cache,
