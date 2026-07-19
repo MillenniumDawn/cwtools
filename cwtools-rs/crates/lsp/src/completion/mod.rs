@@ -106,23 +106,46 @@ fn subsequence_match(haystack: &str, needle: &str) -> bool {
     needle_it.peek().is_none()
 }
 
-/// Sort by `sort_text` (falling back to `label` when absent, same as the
-/// client would) so a later truncation keeps the most relevant items, then
-/// drop every item whose `filter_text` (or `label`) doesn't subsequence-match
-/// `token`. An empty `token` matches everything, so only the sort applies.
+/// How well `hay` matches the typed token: exact (0) ahead of prefix (1)
+/// ahead of mere subsequence (2), case-insensitively.
+fn token_match_rank(hay: &str, token: &str) -> u8 {
+    if hay.eq_ignore_ascii_case(token) {
+        0
+    } else if hay
+        .get(..token.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(token))
+    {
+        1
+    } else {
+        2
+    }
+}
+
+/// Drop every item whose `filter_text` (or `label`) doesn't subsequence-match
+/// `token`, then sort by match quality ([`token_match_rank`]) and `sort_text`
+/// (falling back to `label`, same as the client would) so a later truncation
+/// keeps the most relevant items — in particular an exact match for the typed
+/// token can never be truncated away behind better-bucketed items (#94). An
+/// empty `token` matches everything, so only the `sort_text` order applies.
 fn filter_by_token(items: Vec<CompletionItem>, token: &str) -> Vec<CompletionItem> {
     let mut items = items;
+    fn hay(it: &CompletionItem) -> &str {
+        it.filter_text.as_deref().unwrap_or(it.label.as_str())
+    }
+    if !token.is_empty() {
+        items.retain(|it| subsequence_match(hay(it), token));
+    }
     items.sort_by(|a, b| {
+        if !token.is_empty() {
+            let ra = token_match_rank(hay(a), token);
+            let rb = token_match_rank(hay(b), token);
+            if ra != rb {
+                return ra.cmp(&rb);
+            }
+        }
         let ka = a.sort_text.as_deref().unwrap_or(a.label.as_str());
         let kb = b.sort_text.as_deref().unwrap_or(b.label.as_str());
         ka.cmp(kb)
-    });
-    if token.is_empty() {
-        return items;
-    }
-    items.retain(|it| {
-        let hay = it.filter_text.as_deref().unwrap_or(it.label.as_str());
-        subsequence_match(hay, token)
     });
     items
 }
@@ -1262,6 +1285,142 @@ mod tests {
         // A value effect is a single line, not a `{ … }` block.
         assert!(!snip.contains('\n'), "should not be a block: {}", snip);
         assert!(!snip.contains("= {"), "should not open a clause: {}", snip);
+    }
+
+    // ── #94: control-flow keys must not sink below scope-matched effects ─────
+
+    /// Effect ruleset mirroring the real hoi4 config shape: a plain effect
+    /// carrying `## scope = country`, `if` carrying `## scope = any`, and
+    /// `else` with no scope annotation at all. Both `if` and `else` recurse
+    /// into `alias_name[effect]`.
+    fn scoped_effect_ruleset() -> RuleSet {
+        let mut rs = RuleSet::new();
+        let recursive_body = || {
+            vec![(
+                RuleType::LeafRule {
+                    left: NewField::AliasField("effect".to_string()),
+                    right: NewField::AliasField("effect".to_string()),
+                },
+                Options::default(),
+            )]
+        };
+        rs.aliases.push((
+            "effect:if".to_string(),
+            (
+                RuleType::NodeRule {
+                    left: NewField::SpecificField("alias[effect:if]".to_string()),
+                    rules: recursive_body(),
+                },
+                Options {
+                    required_scopes: vec!["any".to_string()],
+                    ..Options::default()
+                },
+            ),
+        ));
+        rs.aliases.push((
+            "effect:else".to_string(),
+            (
+                RuleType::NodeRule {
+                    left: NewField::SpecificField("alias[effect:else]".to_string()),
+                    rules: recursive_body(),
+                },
+                Options::default(),
+            ),
+        ));
+        rs.aliases.push((
+            "effect:add_political_power".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[effect:add_political_power]".to_string()),
+                    right: NewField::ScalarField,
+                },
+                Options {
+                    required_scopes: vec!["country".to_string()],
+                    ..Options::default()
+                },
+            ),
+        ));
+        rs.reindex();
+        rs
+    }
+
+    #[test]
+    fn control_flow_effects_rank_with_scope_matched_effects() {
+        // In a country-scope effect block every `## scope = country` effect
+        // ranks in the top bucket, and `if`/`else` (valid in ANY scope) must
+        // not sink below them (#94).
+        let rs = scoped_effect_ruleset();
+        let info = cwtools_info::InfoService::new();
+        // Hoi4's registry is config-driven (empty here); Stellaris has the same
+        // country scope hardcoded, which is all this test needs.
+        let reg = cwtools_game::scope_registry::ScopeRegistry::from_hardcoded(
+            cwtools_game::constants::Game::Stellaris,
+        );
+        let country = reg.id_of("country").expect("country scope");
+        let items = completions_from_rules(
+            &effect_alias_usage(),
+            &rs,
+            &info,
+            "stellaris",
+            &HashSet::new(),
+            Some(&reg),
+            Some(country),
+        );
+        let sort = |label: &str| {
+            items
+                .iter()
+                .find(|i| i.label == label)
+                .unwrap_or_else(|| panic!("no '{}' item", label))
+                .sort_text
+                .clone()
+                .expect("sort_text")
+        };
+        let plain = sort("add_political_power");
+        assert!(plain.starts_with("0_"), "scope match bucket: {}", plain);
+        for label in ["if", "else"] {
+            let s = sort(label);
+            assert!(
+                s.starts_with("0_"),
+                "'{}' must rank with scope-matched effects, got sort_text {:?}",
+                label,
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn typed_token_ranks_exact_match_first_and_survives_cap() {
+        // A capped list must keep and lead with the exact match for the typed
+        // token, even when >cap better-bucketed items subsequence-match it —
+        // otherwise typing `if` in a big effect block buries or drops `if` (#94).
+        let mut items: Vec<CompletionItem> = (0..1500)
+            .map(|i| {
+                let label = format!("ai_f_{:04}", i);
+                CompletionItem {
+                    sort_text: Some(format!("0_{}", label)),
+                    label,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        items.push(CompletionItem {
+            label: "if".to_string(),
+            sort_text: Some("3_if".to_string()),
+            ..Default::default()
+        });
+        items.push(CompletionItem {
+            label: "iff_prefixed".to_string(),
+            sort_text: Some("3_iff_prefixed".to_string()),
+            ..Default::default()
+        });
+        let (filtered, dropped) = filter_and_cap(items, "if", 1000);
+        assert!(dropped);
+        assert_eq!(filtered.len(), 1000);
+        assert_eq!(filtered[0].label, "if", "exact match must lead");
+        assert_eq!(
+            filtered[1].label, "iff_prefixed",
+            "prefix match ranks ahead of subsequence matches"
+        );
     }
 
     // ── root-type snippets tests ─────────────────────────────────────────────

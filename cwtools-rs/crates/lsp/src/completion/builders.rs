@@ -54,6 +54,25 @@ impl ScopeRank {
     }
 }
 
+/// Whether an alias rule's body recurses into its own category
+/// (`alias_name[effect]` anywhere inside an `alias[effect:...]` block).
+/// Marks the structural wrapper/control-flow constructs — `if`, `else_if`,
+/// `else`, `hidden_effect`, `random_list`, … — which are valid wherever the
+/// category itself is.
+fn recurses_into_category(rule: &RuleType, cat: &str) -> bool {
+    let is_cat = |f: &NewField| matches!(f, NewField::AliasField(c) if c == cat);
+    match rule {
+        RuleType::LeafRule { left, right } => is_cat(left) || is_cat(right),
+        RuleType::LeafValueRule { right } => is_cat(right),
+        RuleType::NodeRule { left, rules } => {
+            is_cat(left) || rules.iter().any(|(r, _)| recurses_into_category(r, cat))
+        }
+        RuleType::ValueClauseRule { rules } | RuleType::SubtypeRule { rules, .. } => {
+            rules.iter().any(|(r, _)| recurses_into_category(r, cat))
+        }
+    }
+}
+
 /// Self-describing payload stamped as a completion item's `data` when its
 /// `documentation`/`detail` is deferred to `completionItem/resolve` (see
 /// `completion::resolve`) instead of computed here. Carries only what's
@@ -544,11 +563,17 @@ fn push_alias_keys(
         // a scope mismatch sinks to the bottom bucket, everything else keeps its
         // kind bucket. Scope tracking is imperfect (nested/event_target/half-typed
         // contexts), so a valid key must never silently vanish (#78).
-        let scope_rank = match verdicts.as_ref().and_then(|v| v.get(k)) {
+        let mut scope_rank = match verdicts.as_ref().and_then(|v| v.get(k)) {
             Some(&(false, _)) => ScopeRank::Mismatch,
             Some(&(true, true)) => ScopeRank::SpecificMatch,
             _ => ScopeRank::Neutral,
         };
+        // Control-flow wrappers (`if`/`else`/`hidden_effect`/…) are valid in any
+        // scope but carry no scope-specific `## scope`, so without this they sink
+        // below every scope-matched plain effect (#94).
+        if !matches!(scope_rank, ScopeRank::Mismatch) && recurses_into_category(rule, cat) {
+            scope_rank = ScopeRank::SpecificMatch;
+        }
         if let Some(&idx) = seen.get(k) {
             let item: &mut CompletionItem = &mut items[idx];
             // First overload wins the snippet; adopt a later one only
