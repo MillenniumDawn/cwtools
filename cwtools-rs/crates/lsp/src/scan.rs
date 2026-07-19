@@ -204,7 +204,9 @@ impl Backend {
     /// `quiet` suppresses every `loadingBar` notification the scan would
     /// otherwise send, so the periodic background pass doesn't flash the
     /// status bar while the user is working. `send_update_file_list` still
-    /// fires either way — it's cheap and keeps the file explorer honest.
+    /// fires either way — it's cheap and keeps the file explorer honest —
+    /// except when the quiet short-circuit returns early: the file set is
+    /// unchanged by definition, so the list it would send is identical.
     pub(crate) async fn validate_entire_workspace(&self, quiet: bool) -> bool {
         if self
             .state
