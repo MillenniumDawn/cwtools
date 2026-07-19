@@ -716,12 +716,12 @@ impl Backend {
             .await;
 
         // Build and send the file list for the extension's file explorer.
-        let ws_uri = self.state.config.read().workspace_uri.clone();
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let file_list: Vec<serde_json::Value> = files_to_validate
             .iter()
             .map(|file_path| {
                 let uri = path_to_uri(file_path);
-                let logical_path = logical_path_from_uri(&uri, &ws_uri);
+                let logical_path = logical_path_from_uri(&uri, &ws_prefix);
                 let scope = logical_path
                     .split('/')
                     .next()

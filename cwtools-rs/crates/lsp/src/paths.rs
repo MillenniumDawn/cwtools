@@ -22,12 +22,20 @@ pub(crate) fn path_to_uri(path: &std::path::Path) -> String {
         .unwrap_or_else(|_| format!("file://{}", path.display()))
 }
 
+/// Normalized, decoded workspace path prefix for [`logical_path_from_uri`],
+/// computed ONCE when the workspace URI is set (`Config::workspace_prefix`)
+/// instead of re-parsing the constant workspace URI on every request.
+pub(crate) fn workspace_prefix_of(workspace_uri: &str) -> std::sync::Arc<str> {
+    let ws_path = normalize_separators(uri_to_path_str(workspace_uri));
+    std::sync::Arc::from(ws_path.trim_end_matches('/'))
+}
+
 /// Derive the logical path (relative to mod root) from a file:// URI and the
-/// workspace root URI.  Falls back to the raw path if the workspace prefix
-/// cannot be stripped.
+/// precomputed workspace prefix ([`workspace_prefix_of`]). Falls back to the
+/// raw path if the workspace prefix cannot be stripped.
 pub(crate) fn logical_path_from_uri(
     uri: &str,
-    workspace_uri: &Option<std::sync::Arc<str>>,
+    workspace_prefix: &Option<std::sync::Arc<str>>,
 ) -> String {
     // Logical paths are `/`-separated everywhere downstream (type-instance
     // indexing, path matching). On Windows `uri_to_path_str` yields backslashes,
@@ -35,13 +43,10 @@ pub(crate) fn logical_path_from_uri(
     // separator survives `trim_start_matches('/')` and the path leaks into name
     // extraction (e.g. `load_oob` false positives).
     let path = normalize_separators(uri_to_path_str(uri));
-    if let Some(ws) = workspace_uri {
-        let ws_path = normalize_separators(uri_to_path_str(ws));
-        // Strip leading slash-terminated prefix
-        let prefix = ws_path.trim_end_matches('/');
-        if let Some(rel) = path.strip_prefix(prefix) {
-            return rel.trim_start_matches('/').to_string();
-        }
+    if let Some(prefix) = workspace_prefix
+        && let Some(rel) = path.strip_prefix(prefix.as_ref())
+    {
+        return rel.trim_start_matches('/').to_string();
     }
     // Fallback: use the decoded path as-is
     path
@@ -804,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_logical_path_from_uri_strips_workspace() {
-        let ws: Option<std::sync::Arc<str>> = Some("file:///home/user/mod".into());
+        let ws = Some(workspace_prefix_of("file:///home/user/mod"));
         let lp = logical_path_from_uri("file:///home/user/mod/events/foo.txt", &ws);
         assert_eq!(lp, "events/foo.txt");
     }
@@ -844,7 +849,7 @@ mod tests {
     #[test]
     fn test_logical_path_from_uri_percent_decode() {
         // Workspace and file URIs with percent-encoded spaces.
-        let ws: Option<std::sync::Arc<str>> = Some("file:///home/user/My%20Mod".into());
+        let ws = Some(workspace_prefix_of("file:///home/user/My%20Mod"));
         let lp = logical_path_from_uri("file:///home/user/My%20Mod/events/foo.txt", &ws);
         assert_eq!(lp, "events/foo.txt", "got: {}", lp);
     }

@@ -371,16 +371,16 @@ impl Backend {
         // Try context-aware completions first: resolve the rules at the cursor
         // with the validation engine's own descent (aliases, typed keys,
         // subtypes, skip_root_key — see cwtools_validation::position).
-        let (ws_uri, language, scope_checks, var_checks) = {
+        let (ws_prefix, language, scope_checks, var_checks) = {
             let cfg = self.state.config.read();
             (
-                cfg.workspace_uri.clone(),
+                cfg.workspace_prefix.clone(),
                 cfg.language.clone(),
                 cfg.scope_checks,
                 cfg.var_checks,
             )
         };
-        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let logical_path = logical_path_from_uri(&uri, &ws_prefix);
 
         // Snapshot the doc text + AST into owned data, then drop the
         // `documents` guard before any heavy work. `documents.lock()` is the

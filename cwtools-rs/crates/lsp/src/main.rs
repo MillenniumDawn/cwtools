@@ -55,6 +55,10 @@ pub(crate) struct Config {
     /// workspace folder URI captured from initialize params. `Arc<str>` so the
     /// per-handler reads clone a cheap refcount bump, not the whole string.
     pub(crate) workspace_uri: Option<Arc<str>>,
+    /// Normalized, decoded workspace path prefix, precomputed from
+    /// `workspace_uri` so per-request logical-path derivation doesn't re-parse
+    /// the constant workspace URI (see `paths::workspace_prefix_of`).
+    pub(crate) workspace_prefix: Option<Arc<str>>,
     /// base-game install dir (from the `vanilla` init option, or auto-discovered).
     /// Indexed lazily into `vanilla_index` on the first full-workspace scan.
     pub(crate) vanilla_dir: Option<std::path::PathBuf>,
@@ -108,6 +112,7 @@ impl Config {
         Self {
             language: "paradox".to_string(),
             workspace_uri: None,
+            workspace_prefix: None,
             vanilla_dir: None,
             cache_dir: None,
             loc_languages: None,

@@ -365,8 +365,8 @@ impl Backend {
             index.clear_document(uri);
             index.index_document(uri, parsed, &self.state.string_table);
         }
-        let ws_uri = self.state.config.read().workspace_uri.clone();
-        let logical_path = logical_path_from_uri(uri, &ws_uri);
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let logical_path = logical_path_from_uri(uri, &ws_prefix);
         // Lock order: rules -> info_service.
         let rules_guard = self.state.rules.read();
         let mut info = self.state.info_service.write();
@@ -987,8 +987,8 @@ impl Backend {
                 }
 
                 // Derive logical path for type-instance indexing
-                let ws_uri = self.state.config.read().workspace_uri.clone();
-                let logical_path = logical_path_from_uri(uri, &ws_uri);
+                let ws_prefix = self.state.config.read().workspace_prefix.clone();
+                let logical_path = logical_path_from_uri(uri, &ws_prefix);
 
                 // Update info service. Lock order: rules -> info_service.
                 {
@@ -1148,7 +1148,9 @@ mod perf_bench {
             collect_doc_tokens(&parsed).len()
         });
 
-        let ws: Option<Arc<str>> = Some(Arc::from("file:///mnt/mods/millennium_dawn"));
+        let ws: Option<Arc<str>> = Some(crate::paths::workspace_prefix_of(
+            "file:///mnt/mods/millennium_dawn",
+        ));
         let uri = "file:///mnt/mods/millennium_dawn/events/some_event_file.txt";
         bench("logical_path_from_uri x1000", 30, || {
             let mut total = 0usize;

@@ -281,12 +281,17 @@ impl Backend {
 
         // Store workspace URI: prefer workspace_folders (multi-root aware), fall
         // back to the legacy root_uri field for clients that only send that.
-        if let Some(folders) = &params.workspace_folders
+        let root = if let Some(folders) = &params.workspace_folders
             && let Some(first) = folders.first()
         {
-            self.state.config.write().workspace_uri = Some(first.uri.to_string().into());
-        } else if let Some(root_uri) = &params.root_uri {
-            self.state.config.write().workspace_uri = Some(root_uri.to_string().into());
+            Some(first.uri.to_string())
+        } else {
+            params.root_uri.as_ref().map(|u| u.to_string())
+        };
+        if let Some(root) = root {
+            let mut cfg = self.state.config.write();
+            cfg.workspace_prefix = Some(crate::paths::workspace_prefix_of(&root));
+            cfg.workspace_uri = Some(root.into());
         }
 
         // Per-workspace ignore globs from the extension. The extension
@@ -819,13 +824,13 @@ impl Backend {
     }
 
     pub(crate) async fn determine_file_types(&self, uri: &str) -> Vec<String> {
-        let ws_uri = self.state.config.read().workspace_uri.clone();
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let rules = self.state.rules.read();
 
         // Derive from the loaded ruleset when available: any TypeDefinition whose
         // path matches the logical path contributes its name to the result.
         if let Some(rs) = rules.ruleset.as_ref() {
-            let logical_path = crate::paths::logical_path_from_uri(uri, &ws_uri);
+            let logical_path = crate::paths::logical_path_from_uri(uri, &ws_prefix);
             let types: Vec<String> = rs
                 .types
                 .iter()
