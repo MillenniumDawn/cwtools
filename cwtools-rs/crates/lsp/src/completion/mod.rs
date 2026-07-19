@@ -2147,3 +2147,256 @@ mod tests {
         let _ = Arc::new(());
     };
 }
+
+// ── MD-scale completion micro-benchmark (ignored, manual) ────────────────────
+//
+// Synthetic ruleset + type index sized like Millennium Dawn (thousands of
+// pattern-expanded scripted effects, thousands of modifiers, high-cardinality
+// type refs). Run with:
+//
+//   cargo test --release -p cwtools_lsp --bin cwtools-server -- \
+//     --ignored --nocapture perf_completion_synthetic
+#[cfg(test)]
+mod perf_bench {
+    use std::collections::{HashMap, HashSet};
+
+    use cwtools_rules::rules_types::{NewField, NewRule, Options, RuleSet, RuleType};
+
+    use super::*;
+
+    const EXACT_EFFECTS: usize = 600;
+    const SCRIPTED_EFFECTS: usize = 8_000;
+    const PLAIN_MODIFIERS: usize = 5_000;
+    const TEMPLATED_BUILDINGS: usize = 3_000;
+    const STATES: usize = 2_000;
+
+    fn alias_usage(cat: &str) -> Vec<NewRule> {
+        vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField(cat.to_string()),
+                right: NewField::AliasField(cat.to_string()),
+            },
+            Options::default(),
+        )]
+    }
+
+    fn synthetic_ruleset() -> RuleSet {
+        let mut rs = RuleSet::new();
+        for i in 0..EXACT_EFFECTS {
+            let scopes = if i % 2 == 0 {
+                vec!["country".to_string()]
+            } else {
+                Vec::new()
+            };
+            rs.aliases.push((
+                format!("effect:eff_{:04}", i),
+                (
+                    RuleType::LeafRule {
+                        left: NewField::SpecificField(format!("alias[effect:eff_{:04}]", i)),
+                        right: NewField::ScalarField,
+                    },
+                    Options {
+                        required_scopes: scopes,
+                        ..Options::default()
+                    },
+                ),
+            ));
+        }
+        for name in ["if", "else_if", "else"] {
+            rs.aliases.push((
+                format!("effect:{}", name),
+                (
+                    RuleType::NodeRule {
+                        left: NewField::SpecificField(format!("alias[effect:{}]", name)),
+                        rules: alias_usage("effect"),
+                    },
+                    Options::default(),
+                ),
+            ));
+        }
+        // Pattern alias expanded against the type index (scripted effects).
+        rs.aliases.push((
+            "effect:<scripted_effect>".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[effect:<scripted_effect>]".to_string()),
+                    right: NewField::ValueField(cwtools_rules::rules_types::ValueType::Bool),
+                },
+                Options::default(),
+            ),
+        ));
+        for i in 0..PLAIN_MODIFIERS {
+            rs.modifiers
+                .push((format!("mod_{:04}", i), "country".to_string()));
+        }
+        rs.modifiers.push((
+            "production_speed_<building>_factor".to_string(),
+            "state".to_string(),
+        ));
+        rs.modifier_categories
+            .insert("country".to_string(), vec!["country".to_string()]);
+        rs.modifier_categories
+            .insert("state".to_string(), vec!["state".to_string()]);
+        rs.reindex();
+        rs
+    }
+
+    fn synthetic_info() -> cwtools_info::InfoService {
+        let mut info = cwtools_info::InfoService::new();
+        let inst = |name: String| cwtools_info::TypeInstance {
+            name,
+            location: cwtools_info::SourceLocation { line: 1, col: 0 },
+            primary_loc_key: None,
+        };
+        let mut per_type: HashMap<String, Vec<cwtools_info::TypeInstance>> = HashMap::new();
+        per_type.insert(
+            "scripted_effect".to_string(),
+            (0..SCRIPTED_EFFECTS)
+                .map(|i| inst(format!("se_do_things_{:05}", i)))
+                .collect(),
+        );
+        per_type.insert(
+            "building".to_string(),
+            (0..TEMPLATED_BUILDINGS)
+                .map(|i| inst(format!("building_{:04}", i)))
+                .collect(),
+        );
+        per_type.insert(
+            "state".to_string(),
+            (0..STATES).map(|i| inst(format!("{}", i + 1))).collect(),
+        );
+        info.type_index.merge("file:///bench/defs.txt", per_type);
+        info
+    }
+
+    fn bench<F: FnMut() -> usize>(label: &str, mut f: F) {
+        const WARMUP: usize = 3;
+        const ITERS: usize = 30;
+        for _ in 0..WARMUP {
+            f();
+        }
+        let mut times = Vec::with_capacity(ITERS);
+        let mut items = 0;
+        for _ in 0..ITERS {
+            let t = std::time::Instant::now();
+            items = f();
+            times.push(t.elapsed());
+        }
+        times.sort();
+        let mean = times.iter().sum::<std::time::Duration>() / ITERS as u32;
+        eprintln!(
+            "{:>28}: mean {:>10.1?}  min {:>10.1?}  max {:>10.1?}  ({} items, n={})",
+            label,
+            mean,
+            times[0],
+            times[ITERS - 1],
+            items,
+            ITERS
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_completion_synthetic() {
+        let rs = synthetic_ruleset();
+        let info = synthetic_info();
+        let reg = cwtools_game::scope_registry::ScopeRegistry::from_hardcoded(
+            cwtools_game::constants::Game::Stellaris,
+        );
+        let country = reg.id_of("country").expect("country scope");
+        let modifier_keys: HashSet<String> =
+            cwtools_validation::build_modifier_keys(&rs, &info.type_index);
+        eprintln!(
+            "fixture: {} aliases, {} modifier keys, {} scripted effects, {} states",
+            rs.aliases.len(),
+            modifier_keys.len(),
+            SCRIPTED_EFFECTS,
+            STATES
+        );
+
+        let effect_rules = alias_usage("effect");
+        let modifier_rules = alias_usage("modifier");
+
+        for token in ["", "if", "add_p"] {
+            let label = if token.is_empty() {
+                "effect key (no token)".to_string()
+            } else {
+                format!("effect key (token {:?})", token)
+            };
+            bench(&label, || {
+                let items = completions_from_rules(
+                    &effect_rules,
+                    &rs,
+                    &info,
+                    "stellaris",
+                    &modifier_keys,
+                    Some(&reg),
+                    Some(country),
+                );
+                let (items, _, _) = prepare_context_items(
+                    items,
+                    token,
+                    true,
+                    true,
+                    CONTEXT_COMPLETE_THRESHOLD,
+                    CONTEXT_CAP,
+                );
+                items.len()
+            });
+        }
+
+        bench("modifier key (scoped)", || {
+            let items = completions_from_rules(
+                &modifier_rules,
+                &rs,
+                &info,
+                "stellaris",
+                &modifier_keys,
+                Some(&reg),
+                Some(country),
+            );
+            let (items, _, _) = prepare_context_items(
+                items,
+                "",
+                true,
+                true,
+                CONTEXT_COMPLETE_THRESHOLD,
+                CONTEXT_CAP,
+            );
+            items.len()
+        });
+
+        let state_value_rules: Vec<NewRule> = vec![(
+            RuleType::LeafRule {
+                left: NewField::SpecificField("add_state_core".to_string()),
+                right: NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(
+                    "state".to_string(),
+                )),
+            },
+            Options::default(),
+        )];
+        bench("state value (token 28)", || {
+            let items = value_completions(
+                &state_value_rules,
+                &rs,
+                &info,
+                Some(&reg),
+                "stellaris",
+                ValueCompletionSets {
+                    modifier_keys: &modifier_keys,
+                    loc_keys: &HashSet::new(),
+                },
+                Some(country),
+            );
+            let (items, _, _) = prepare_context_items(
+                items,
+                "28",
+                true,
+                true,
+                CONTEXT_COMPLETE_THRESHOLD,
+                CONTEXT_CAP,
+            );
+            items.len()
+        });
+    }
+}

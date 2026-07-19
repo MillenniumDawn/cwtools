@@ -1043,6 +1043,71 @@ impl Backend {
     }
 }
 
+// ── Keystroke-validate micro-benchmark (ignored, manual) ─────────────────────
+//
+// Per-edit costs on a large real fixture (cc_colony_events.txt, ~165KB,
+// concatenated 8x to match MD's largest script file ~1.3MB): the doc-token
+// rebuild that runs after every debounced validate, and the per-request
+// logical-path derivation. Run with:
+//
+//   cargo test --release -p cwtools_lsp --bin cwtools-server -- \
+//     --ignored --nocapture perf_keystroke_validate
+#[cfg(test)]
+mod perf_bench {
+    use super::*;
+
+    fn bench<F: FnMut() -> usize>(label: &str, iters: usize, mut f: F) {
+        for _ in 0..3 {
+            f();
+        }
+        let mut times = Vec::with_capacity(iters);
+        let mut n = 0;
+        for _ in 0..iters {
+            let t = std::time::Instant::now();
+            n = f();
+            times.push(t.elapsed());
+        }
+        times.sort();
+        let mean = times.iter().sum::<std::time::Duration>() / iters as u32;
+        eprintln!(
+            "{:>28}: mean {:>10.1?}  min {:>10.1?}  max {:>10.1?}  (count {}, n={})",
+            label,
+            mean,
+            times[0],
+            times[iters - 1],
+            n,
+            iters
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_keystroke_validate() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testfiles/performancetest2/events/cc_colony_events.txt"
+        );
+        let text = std::fs::read_to_string(fixture).expect("fixture").repeat(8);
+        eprintln!("fixture: {} bytes", text.len());
+        let table = cwtools_string_table::string_table::StringTable::new();
+        let parsed = parse_string(&text, &table).expect("parse");
+
+        bench("collect_doc_tokens", 30, || {
+            collect_doc_tokens(&parsed, &table).len()
+        });
+
+        let ws: Option<Arc<str>> = Some(Arc::from("file:///mnt/mods/millennium_dawn"));
+        let uri = "file:///mnt/mods/millennium_dawn/events/some_event_file.txt";
+        bench("logical_path_from_uri x1000", 30, || {
+            let mut total = 0usize;
+            for _ in 0..1000 {
+                total += logical_path_from_uri(uri, &ws).len();
+            }
+            total
+        });
+    }
+}
+
 #[cfg(test)]
 mod whole_line_range_tests {
     use super::*;
