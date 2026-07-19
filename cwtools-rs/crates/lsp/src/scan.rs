@@ -278,15 +278,10 @@ impl Backend {
             )
         });
 
-        // Quiet-pass short-circuit: fold a stat-only fingerprint over the
-        // walked files and pair it with the settings generation. When a QUIET
-        // background pass finds nothing changed since the last full pass — no
-        // file added / removed / touched, and no rules/config change bumping
-        // the generation — skip the whole reindex + revalidate + re-publish +
-        // updateFileList (pass 1 alone serially re-indexes ~7,400 files for no
-        // gain). A foreground scan always runs and re-records the fingerprint
-        // below; an empty walk (transiently-unreadable root) never
-        // short-circuits and never records (see the store guard).
+        // Quiet-pass short-circuit: skip reindex + revalidate + re-publish when
+        // the walked-files fingerprint and settings generation both match the
+        // last full pass. Empty walk (transiently-unreadable root) never
+        // short-circuits or records — see the store guard below.
         let scan_fingerprint =
             tokio::task::block_in_place(|| stat_signature_for(&files_to_validate));
         let scan_generation = self
@@ -736,11 +731,8 @@ impl Backend {
             .collect();
         self.send_update_file_list(file_list).await;
 
-        // Record the fingerprint + generation this pass validated against so the
-        // next quiet pass can short-circuit if nothing changed. Never for an
-        // empty walk: a transiently-unreadable root would otherwise pin a bogus
-        // fingerprint and suppress the pass that recovers once the root is
-        // readable again (mirrors the empty-walk prune guard above).
+        // Never record for an empty walk: a transiently-unreadable root would
+        // otherwise pin a bogus fingerprint and suppress the recovery pass.
         if !files_to_validate.is_empty() {
             *self.state.last_scan_fingerprint.lock() = Some((scan_fingerprint, scan_generation));
         }
@@ -1229,13 +1221,12 @@ impl Backend {
     /// outside the editor. Without this handler the index keeps stale entries
     /// for deleted/moved files until a window reload (#52).
     ///
-    /// Both DELETED and CHANGED/CREATED events are queued and coalesced into a
-    /// single trailing window (#90) so a churn burst drains once instead of 1:1
-    /// on the message future, which held the bounded request queue and starved
-    /// cheap requests like `getFileTypes`. DELETEs used to run inline — per file
-    /// a `clear_file` (O(whole index)) plus an awaited publish — which stalled
-    /// the message future for seconds on a 2,000-file branch switch. The drain
-    /// applies deletions first, batched under one `info_service` write.
+    /// DELETED and CHANGED/CREATED events are both queued and coalesced into a
+    /// single trailing window (#90) instead of applying inline on the message
+    /// future — DELETEs used to run a synchronous O(whole-index) `clear_file`
+    /// per file, which stalled the message future for seconds on a large
+    /// branch switch. The drain applies deletions first, batched under one
+    /// `info_service` write.
     #[tracing::instrument(skip_all)]
     pub(crate) async fn did_change_watched_files_impl(&self, params: DidChangeWatchedFilesParams) {
         let mut enqueued = false;
@@ -1243,10 +1234,6 @@ impl Backend {
             let uri = event.uri.to_string();
             match event.typ {
                 FileChangeType::DELETED => {
-                    // Queue instead of doing inline O(whole-index) work + an
-                    // awaited publish on the message future. A delete that
-                    // coincides with a CHANGED/CREATED for the same URI in this
-                    // window is resolved as a change at drain time.
                     tracing::debug!(%uri, "watched file deleted; queued");
                     self.state.watched_deleted.lock().insert(uri);
                     enqueued = true;
@@ -1284,18 +1271,15 @@ impl Backend {
     }
 
     /// Drain the queued watched events (changes + deletes) and apply them off
-    /// the message future. A batch larger than `WATCHED_BULK_CAP` (a rules
-    /// re-clone or git checkout touching everything) collapses into one
-    /// CAS-guarded rescan instead of hundreds of per-file validations —
-    /// the rescan's on-disk prune drops the deleted URIs too, so the deletes
+    /// the message future. A batch larger than `WATCHED_BULK_CAP` collapses
+    /// into one CAS-guarded rescan instead of hundreds of per-file
+    /// validations — its on-disk prune drops the deleted URIs too, so deletes
     /// need no separate handling on that path. Below the cap, deletions apply
-    /// first (batched under one `info_service` write), then per-file
-    /// validation. Re-arms if new events landed while it was running.
+    /// first (one `info_service` write), then per-file validation. Re-arms if
+    /// new events landed while it was running.
     async fn process_watched_batch(&self) {
         let changes: HashSet<String> = { self.state.watched_pending.lock().drain().collect() };
-        // A URI that both changed and was deleted this window is treated as a
-        // change (validate the current on-disk file), so filter those out of
-        // the delete set before doing any O(index) removal work.
+        // A URI both changed and deleted this window is treated as a change.
         let deletes: Vec<String> = {
             let mut deleted = self.state.watched_deleted.lock();
             resolve_watched_deletes(&changes, deleted.drain())
@@ -1310,15 +1294,13 @@ impl Backend {
                 "watched batch over cap; full rescan"
             );
             if !self.validate_entire_workspace(true).await {
-                // Lost the CAS to a running scan — requeue both sides so the
-                // next window retries, exactly as the changes-only path did.
+                // Lost the CAS to a running scan — requeue both sides.
                 self.state.watched_pending.lock().extend(changes);
                 self.state.watched_deleted.lock().extend(deletes);
             }
         } else {
-            // Deletions first, in ONE info_service write scope, so a re-created
-            // file's later change validates against an index that already
-            // forgot the stale entry.
+            // Deletions first, so a re-created file's later change validates
+            // against an index that already forgot the stale entry.
             if !deletes.is_empty() {
                 self.process_watched_deletes(&deletes).await;
             }
@@ -1329,12 +1311,9 @@ impl Backend {
                     continue;
                 }
                 let path = uri_to_path_str(&uri);
-                // Stat-gate before the read: a toucher that rewrote identical
-                // bytes (cloud sync, git, the running game) leaves size+mtime
-                // unchanged, so skip the whole read + `clear_file` (O(index)) +
-                // revalidate. `None` (vanished/unreadable) can't be proven
-                // unchanged, so it falls through to the read; the first-ever
-                // event for a URI has no recorded signature and always validates.
+                // Stat-gate: a toucher that rewrote identical bytes leaves
+                // size+mtime unchanged, so skip the read + revalidate. `None`
+                // (vanished/unreadable, or first-ever event) falls through.
                 let sig = watched_stat_sig(std::path::Path::new(&path));
                 if let Some(sig) = sig
                     && self.state.watched_signatures.lock().get(&uri) == Some(&sig)
@@ -1357,10 +1336,8 @@ impl Backend {
                         let (diagnostics, _) = self
                             .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched)
                             .await;
-                        // Record the validated signature so a later no-op
-                        // toucher for this URI is skipped. Only after a
-                        // successful read+validate, so a transient read failure
-                        // doesn't poison the record.
+                        // Record only after a successful validate, so a
+                        // transient read failure doesn't poison the record.
                         if let Some(sig) = sig {
                             self.state
                                 .watched_signatures
@@ -1384,8 +1361,8 @@ impl Backend {
         // event while we ran can arm the next window (or we do it here). Setting
         // the slot to `None` only detaches this finished task, it doesn't abort.
         *self.state.watched_debounce.lock() = None;
-        // Each guard is scoped to its own `let` so the two queue locks are never
-        // held at once (they're taken pending-then-deleted everywhere).
+        // Each guard scoped to its own `let` so the two queue locks are never
+        // held at once.
         let pending_more = !self.state.watched_pending.lock().is_empty();
         let deleted_more = !self.state.watched_deleted.lock().is_empty();
         if pending_more || deleted_more {
@@ -1396,10 +1373,8 @@ impl Backend {
     /// Apply a coalesced batch of DELETE events off the message future: forget
     /// each URI from the symbol index, the info service (one write scope), the
     /// loc overlay, and the watched-signature record, bump the info revision
-    /// ONCE for the whole batch, then publish empty diagnostics per URI outside
-    /// every lock. Same side effects the old inline per-file DELETE path had,
-    /// batched — one `info_service` write and one revision bump for the whole
-    /// branch switch instead of one per file.
+    /// once for the whole batch, then publish empty diagnostics per URI outside
+    /// every lock.
     async fn process_watched_deletes(&self, deletes: &[String]) {
         {
             let mut index = self.state.symbol_index.lock();
@@ -1566,11 +1541,9 @@ pub(crate) fn reindex_wait_tick_ms(idle_ms: u64) -> u64 {
 
 /// Fold a stat-only signature (path, size, mtime) over `files` into one hash,
 /// in a deterministic (sorted-path) order so the result doesn't depend on
-/// directory-walk order. Shared by the quiet-scan loc-rebuild skip
-/// (`compute_loc_signature`) and the quiet-scan whole-pass short-circuit
-/// (`validate_entire_workspace_inner`). Takes a slice so the caller keeps
-/// ownership of its file list; split out from `Backend` so it's unit-testable
-/// without a live `tower_lsp::Client`.
+/// directory-walk order. Shared by the loc-rebuild skip and the whole-pass
+/// short-circuit; split out from `Backend` so it's unit-testable without a
+/// live `tower_lsp::Client`.
 fn stat_signature_for(files: &[std::path::PathBuf]) -> u64 {
     // Sort by reference — the caller still owns `files`.
     let mut sorted: Vec<&std::path::Path> = files.iter().map(|p| p.as_path()).collect();
@@ -1593,9 +1566,7 @@ fn stat_signature_for(files: &[std::path::PathBuf]) -> u64 {
 
 /// Drop from `deletes` any URI that also arrived as a CHANGED/CREATED this
 /// window: a delete coincident with a re-create (an atomic save's
-/// remove+rewrite, a git checkout that deletes then restores) is a change —
-/// validate the current on-disk file rather than dropping its index entry.
-/// Split out so the overlap rule is unit-testable without a live `Backend`.
+/// remove+rewrite) is a change, not a delete of the index entry.
 fn resolve_watched_deletes(
     changes: &HashSet<String>,
     deletes: impl Iterator<Item = String>,
@@ -1604,21 +1575,17 @@ fn resolve_watched_deletes(
 }
 
 /// Whether a coalesced watched batch (changes + deletes together) exceeds the
-/// per-file cap and should collapse into one workspace rescan instead. Counts
-/// both sides so a delete-heavy branch switch trips the cap the same way a
-/// change-heavy one does. Saturating so an absurd count can't wrap.
+/// per-file cap and should collapse into one workspace rescan instead.
+/// Saturating so an absurd count can't wrap.
 fn watched_batch_over_cap(changes: usize, deletes: usize) -> bool {
     changes.saturating_add(deletes) > WATCHED_BULK_CAP
 }
 
 /// Whether a QUIET background pass can short-circuit the whole reindex +
-/// revalidate. True only when: it's a quiet pass; the walk found files (an
-/// empty walk is a transiently-unreadable root, not "everything deleted", so
-/// it must still run); and the freshly-computed `(content fingerprint,
-/// settings generation)` matches the pair the last successful full pass
-/// stored. A foreground pass (startup, clearAllCaches, reindexWorkspace,
-/// reloadrulesconfig) always returns false and runs in full. Split out so the
-/// decision is unit-testable without a live `Backend`.
+/// revalidate: true only for a quiet pass with a non-empty walk (an empty
+/// walk is a transiently-unreadable root, not "everything deleted", so it
+/// must still run) whose fingerprint matches the last stored one. A
+/// foreground pass always returns false.
 fn quiet_pass_can_skip(
     quiet: bool,
     files_empty: bool,
@@ -1629,11 +1596,8 @@ fn quiet_pass_can_skip(
 }
 
 /// Stat-only signature (file size, mtime-nanos) for a single watched file —
-/// the per-file analogue of `stat_signature_for`. `None` when the file can't be
-/// stat'd (vanished or unreadable), so the caller can't prove it's unchanged
-/// and revalidates. mtime folds in as 0 when the platform doesn't report it,
-/// leaving the size to carry the signal (best-effort, same coarse-mtime
-/// tradeoff the loc signature accepts).
+/// the per-file analogue of `stat_signature_for`. `None` when the file can't
+/// be stat'd, so the caller can't prove it's unchanged and revalidates.
 fn watched_stat_sig(path: &std::path::Path) -> Option<(u64, u128)> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta
@@ -1802,7 +1766,7 @@ mod tests {
         );
     }
 
-    // ── quiet_pass_can_skip (B3 whole-pass short-circuit) ───────────────────
+    // ── quiet_pass_can_skip (whole-pass short-circuit) ──────────────────────
 
     #[test]
     fn test_quiet_pass_skips_on_matching_fingerprint() {
@@ -1868,7 +1832,7 @@ mod tests {
         file.set_modified(time).unwrap();
     }
 
-    // ── watched_stat_sig (B1 stat-gate for watched CHANGED validation) ─────
+    // ── watched_stat_sig (stat-gate for watched CHANGED validation) ────────
 
     #[test]
     fn test_watched_stat_sig_stable_for_unchanged_file() {
@@ -1916,7 +1880,7 @@ mod tests {
         );
     }
 
-    // ── watched batch coalescing (B2: delete + change in one window) ───────
+    // ── watched batch coalescing (delete + change in one window) ───────────
 
     #[test]
     fn test_resolve_watched_deletes_excludes_changed_uris() {
