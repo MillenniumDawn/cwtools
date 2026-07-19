@@ -311,6 +311,21 @@ struct DocumentState {
     /// nothing loc-related has changed on disk. `None` until the first scan
     /// runs.
     last_loc_signature: parking_lot::Mutex<Option<u64>>,
+    /// Whole-workspace content fingerprint + settings generation stored after
+    /// the last successful full pass. `(stat_signature_for(walked files),
+    /// settings_generation)`. A QUIET background pass whose freshly-computed
+    /// pair matches this short-circuits — nothing on disk changed and no
+    /// rules/config change invalidated it, so there's nothing to reindex,
+    /// revalidate, or re-publish. `None` until the first pass; never stored for
+    /// an empty walk (a transiently-unreadable root).
+    last_scan_fingerprint: parking_lot::Mutex<Option<(u64, u64)>>,
+    /// Bumped whenever a rules or config change could alter validation output
+    /// (rules reload, ignore globs, suppressed error codes, …). Folded into
+    /// `last_scan_fingerprint` so such a change forces the next quiet pass to
+    /// run even when no file on disk moved. `SeqCst`: the background loop is
+    /// the only reader and a rare config write the only writer, so ordering
+    /// cost is irrelevant and correctness is clearer.
+    settings_generation: AtomicU64,
     /// Server start time, the epoch `last_activity_ms` is measured against.
     start: std::time::Instant,
     /// Milliseconds since `start` at the last `did_change` / `completion`
@@ -453,6 +468,8 @@ impl DocumentState {
             fallback_cache: parking_lot::Mutex::new(None),
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
             last_loc_signature: parking_lot::Mutex::new(None),
+            last_scan_fingerprint: parking_lot::Mutex::new(None),
+            settings_generation: AtomicU64::new(0),
             start: std::time::Instant::now(),
             last_activity_ms: AtomicU64::new(0),
             watched_pending: Mutex::new(HashSet::new()),

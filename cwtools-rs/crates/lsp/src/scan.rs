@@ -276,6 +276,34 @@ impl Backend {
             )
         });
 
+        // Quiet-pass short-circuit: fold a stat-only fingerprint over the
+        // walked files and pair it with the settings generation. When a QUIET
+        // background pass finds nothing changed since the last full pass — no
+        // file added / removed / touched, and no rules/config change bumping
+        // the generation — skip the whole reindex + revalidate + re-publish +
+        // updateFileList (pass 1 alone serially re-indexes ~7,400 files for no
+        // gain). A foreground scan always runs and re-records the fingerprint
+        // below; an empty walk (transiently-unreadable root) never
+        // short-circuits and never records (see the store guard).
+        let scan_fingerprint =
+            tokio::task::block_in_place(|| stat_signature_for(&files_to_validate));
+        let scan_generation = self
+            .state
+            .settings_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if quiet_pass_can_skip(
+            quiet,
+            files_to_validate.is_empty(),
+            (scan_fingerprint, scan_generation),
+            *self.state.last_scan_fingerprint.lock(),
+        ) {
+            tracing::info!(
+                files = files_to_validate.len(),
+                "quiet scan: workspace fingerprint unchanged, skipping reindex"
+            );
+            return;
+        }
+
         self.client
             .log_message(
                 MessageType::INFO,
@@ -706,6 +734,15 @@ impl Backend {
             .collect();
         self.send_update_file_list(file_list).await;
 
+        // Record the fingerprint + generation this pass validated against so the
+        // next quiet pass can short-circuit if nothing changed. Never for an
+        // empty walk: a transiently-unreadable root would otherwise pin a bogus
+        // fingerprint and suppress the pass that recovers once the root is
+        // readable again (mirrors the empty-walk prune guard above).
+        if !files_to_validate.is_empty() {
+            *self.state.last_scan_fingerprint.lock() = Some((scan_fingerprint, scan_generation));
+        }
+
         if cwtools_profiling::profile_enabled() {
             let st = self.state.string_table.stats();
             let info_summary = self.state.info_service.read().profile_summary();
@@ -804,7 +841,7 @@ impl Backend {
         let dirs = self.loc_dirs(root_path);
         let dir_refs: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
         let files = cwtools_localization::LocService::discover_files(&dir_refs);
-        loc_signature_for(files)
+        stat_signature_for(&files)
     }
 
     /// Build the loc-key index from the workspace root plus the vanilla install,
@@ -1525,16 +1562,20 @@ pub(crate) fn reindex_wait_tick_ms(idle_ms: u64) -> u64 {
     idle_ms.clamp(50, 15_000)
 }
 
-/// Fold a stat-only signature (path, size, mtime) over `files` into one
-/// hash, in a deterministic (sorted-path) order so the result doesn't depend
-/// on directory-walk order. Split out from `Backend::compute_loc_signature`
-/// so it's unit-testable without a `Backend` (which needs a live
-/// `tower_lsp::Client`).
-fn loc_signature_for(mut files: Vec<std::path::PathBuf>) -> u64 {
+/// Fold a stat-only signature (path, size, mtime) over `files` into one hash,
+/// in a deterministic (sorted-path) order so the result doesn't depend on
+/// directory-walk order. Shared by the quiet-scan loc-rebuild skip
+/// (`compute_loc_signature`) and the quiet-scan whole-pass short-circuit
+/// (`validate_entire_workspace_inner`). Takes a slice so the caller keeps
+/// ownership of its file list; split out from `Backend` so it's unit-testable
+/// without a live `tower_lsp::Client`.
+fn stat_signature_for(files: &[std::path::PathBuf]) -> u64 {
+    // Sort by reference — the caller still owns `files`.
+    let mut sorted: Vec<&std::path::Path> = files.iter().map(|p| p.as_path()).collect();
+    sorted.sort_unstable();
     // Limitation: a same-length edit in the same second on a coarse-mtime fs (FAT/NFS) false-negatives the skip; acceptable, we don't content-hash.
-    files.sort();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for path in &files {
+    for path in sorted {
         path.to_string_lossy().hash(&mut hasher);
         if let Ok(meta) = std::fs::metadata(path) {
             meta.len().hash(&mut hasher);
@@ -1568,8 +1609,25 @@ fn watched_batch_over_cap(changes: usize, deletes: usize) -> bool {
     changes.saturating_add(deletes) > WATCHED_BULK_CAP
 }
 
+/// Whether a QUIET background pass can short-circuit the whole reindex +
+/// revalidate. True only when: it's a quiet pass; the walk found files (an
+/// empty walk is a transiently-unreadable root, not "everything deleted", so
+/// it must still run); and the freshly-computed `(content fingerprint,
+/// settings generation)` matches the pair the last successful full pass
+/// stored. A foreground pass (startup, clearAllCaches, reindexWorkspace,
+/// reloadrulesconfig) always returns false and runs in full. Split out so the
+/// decision is unit-testable without a live `Backend`.
+fn quiet_pass_can_skip(
+    quiet: bool,
+    files_empty: bool,
+    current: (u64, u64),
+    stored: Option<(u64, u64)>,
+) -> bool {
+    quiet && !files_empty && stored == Some(current)
+}
+
 /// Stat-only signature (file size, mtime-nanos) for a single watched file —
-/// the per-file analogue of `loc_signature_for`. `None` when the file can't be
+/// the per-file analogue of `stat_signature_for`. `None` when the file can't be
 /// stat'd (vanished or unreadable), so the caller can't prove it's unchanged
 /// and revalidates. mtime folds in as 0 when the platform doesn't report it,
 /// leaving the size to carry the signal (best-effort, same coarse-mtime
@@ -1689,36 +1747,36 @@ mod tests {
         assert_eq!(reindex_wait_tick_ms(u64::MAX), 15_000);
     }
 
-    // ── loc_signature_for (quiet-scan loc-rebuild skip) ─────────────────────
+    // ── stat_signature_for (quiet-scan loc-rebuild + whole-pass skip) ───────
 
     #[test]
-    fn test_loc_signature_stable_for_unchanged_files() {
+    fn test_stat_signature_stable_for_unchanged_files() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.yml");
         let b = tmp.path().join("b.yml");
         std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
         std::fs::write(&b, "l_english:\n other:0 \"value\"\n").unwrap();
 
-        let sig1 = loc_signature_for(vec![a.clone(), b.clone()]);
+        let sig1 = stat_signature_for(&[a.clone(), b.clone()]);
         // Same files, reversed discovery order — the signature sorts paths
-        // first, so order of the input Vec must not matter.
-        let sig2 = loc_signature_for(vec![b, a]);
+        // first, so order of the input slice must not matter.
+        let sig2 = stat_signature_for(&[b, a]);
         assert_eq!(sig1, sig2, "signature must not depend on discovery order");
     }
 
     #[test]
-    fn test_loc_signature_changes_when_a_file_is_touched() {
+    fn test_stat_signature_changes_when_a_file_is_touched() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.yml");
         std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
 
-        let before = loc_signature_for(vec![a.clone()]);
+        let before = stat_signature_for(std::slice::from_ref(&a));
         // Rewrite with different content (length changes) and bump mtime.
         std::fs::write(&a, "l_english:\n key:0 \"a different, longer value\"\n").unwrap();
         let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         filetime_set(&a, newer);
 
-        let after = loc_signature_for(vec![a]);
+        let after = stat_signature_for(&[a]);
         assert_ne!(
             before, after,
             "touching a file's size/mtime should change the signature"
@@ -1726,19 +1784,76 @@ mod tests {
     }
 
     #[test]
-    fn test_loc_signature_changes_when_file_set_changes() {
+    fn test_stat_signature_changes_when_file_set_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.yml");
         std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
-        let one_file = loc_signature_for(vec![a.clone()]);
+        let one_file = stat_signature_for(std::slice::from_ref(&a));
 
         let b = tmp.path().join("b.yml");
         std::fs::write(&b, "l_english:\n other:0 \"value\"\n").unwrap();
-        let two_files = loc_signature_for(vec![a, b]);
+        let two_files = stat_signature_for(&[a, b]);
 
         assert_ne!(
             one_file, two_files,
             "adding a file to the set should change the signature"
+        );
+    }
+
+    // ── quiet_pass_can_skip (B3 whole-pass short-circuit) ───────────────────
+
+    #[test]
+    fn test_quiet_pass_skips_on_matching_fingerprint() {
+        assert!(
+            quiet_pass_can_skip(true, false, (7, 1), Some((7, 1))),
+            "a quiet pass with an unchanged fingerprint + generation must skip"
+        );
+    }
+
+    #[test]
+    fn test_quiet_pass_runs_when_file_fingerprint_differs() {
+        // A changed/added/removed/touched file moves the content fingerprint.
+        assert!(
+            !quiet_pass_can_skip(true, false, (8, 1), Some((7, 1))),
+            "a changed file fingerprint must run the pass"
+        );
+    }
+
+    #[test]
+    fn test_quiet_pass_runs_when_generation_differs() {
+        // A rules/config change bumps the generation even if the file set is
+        // byte-for-byte identical on disk.
+        assert!(
+            !quiet_pass_can_skip(true, false, (7, 2), Some((7, 1))),
+            "a bumped settings generation must run the pass"
+        );
+    }
+
+    #[test]
+    fn test_quiet_pass_runs_on_first_pass_with_no_stored_fingerprint() {
+        assert!(
+            !quiet_pass_can_skip(true, false, (7, 1), None),
+            "the first pass has nothing to compare against and must run"
+        );
+    }
+
+    #[test]
+    fn test_foreground_pass_never_skips() {
+        // Even with a matching fingerprint, a user-invoked (non-quiet) scan runs
+        // in full — reindexWorkspace / clearAllCaches / reloadrulesconfig.
+        assert!(
+            !quiet_pass_can_skip(false, false, (7, 1), Some((7, 1))),
+            "a foreground pass must always run"
+        );
+    }
+
+    #[test]
+    fn test_quiet_pass_does_not_skip_empty_walk() {
+        // A transiently-unreadable root yields an empty walk; short-circuiting
+        // (or recording) a fingerprint for it would suppress the recovery pass.
+        assert!(
+            !quiet_pass_can_skip(true, true, (7, 1), Some((7, 1))),
+            "an empty walk must not short-circuit"
         );
     }
 
