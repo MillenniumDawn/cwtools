@@ -172,9 +172,8 @@ pub struct ReferenceIndex {
     map: HashMap<Arc<str>, Vec<ReferenceSite>>,
     /// file_uri → the set of `map` bucket keys (referenced type names) that file
     /// has use sites under. Lets [`remove_file`](Self::remove_file) touch only
-    /// the file's own buckets (O(the file's own references)) instead of scanning
-    /// every referenced-type bucket in the workspace. Maintained by `merge` and
-    /// pruned by `remove_file`, mirroring `TypeIndex::file_buckets`.
+    /// the file's own buckets instead of scanning the whole workspace, mirroring
+    /// `TypeIndex::file_buckets`.
     file_types: HashMap<Arc<str>, HashSet<Arc<str>>>,
 }
 
@@ -199,11 +198,9 @@ impl ReferenceIndex {
 
     /// Remove every site contributed by `file_uri` (called on reindex/close).
     ///
-    /// Visits only the referenced-type buckets the reverse map (`file_types`)
-    /// records for this file, so it is proportional to the file's own reference
-    /// count. A bucket empties only when its last contributing file is removed,
-    /// and that file always has the bucket in its `file_types` set, so emptied
-    /// buckets are always visited and dropped here (no lingering empty bucket).
+    /// Visits only the referenced-type buckets `file_types` records for this
+    /// file, proportional to its own reference count rather than the whole
+    /// index — same reverse-map removal as `TypeIndex::remove_file`.
     fn remove_file(&mut self, file_uri: &str) {
         let Some(types) = self.file_types.remove(file_uri) else {
             return;
