@@ -170,19 +170,24 @@ impl Backend {
         }
     }
 
-    /// Rebuild the cached modifier-key set from the current ruleset and type index.
+    /// Rebuild the cached modifier-key set and the expanded modifier→scopes map
+    /// from the current ruleset and type index.
     pub(crate) fn rebuild_modifier_keys(&self) {
         // Lock order: rules -> info_service. One `rules` write guard holds the
-        // ruleset we read from and the modifier_keys we write into.
+        // ruleset we read from and the modifier data we write into.
         let mut rules = self.state.rules.write();
-        let keys = match rules.ruleset.as_ref() {
+        let (keys, scopes) = match rules.ruleset.as_ref() {
             Some(rs) => {
                 let info_guard = self.state.info_service.read();
-                build_modifier_keys(rs, &info_guard.type_index)
+                (
+                    build_modifier_keys(rs, &info_guard.type_index),
+                    crate::completion::expanded_modifier_scopes(rs, &info_guard.type_index),
+                )
             }
-            None => HashSet::new(),
+            None => Default::default(),
         };
         rules.modifier_keys = Arc::new(keys);
+        rules.modifier_scopes = Arc::new(scopes);
         drop(rules);
         self.bump_info_revision();
     }

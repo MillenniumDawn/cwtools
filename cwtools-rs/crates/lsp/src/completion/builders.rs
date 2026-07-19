@@ -149,12 +149,14 @@ impl ResolveData {
 /// position (the rules come from `position::rules_at_pos`, which resolves
 /// aliases, typed keys, and subtypes the same way validation does).
 #[tracing::instrument(skip_all, fields(rules = rules.len()))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn completions_from_rules(
     rules: &[(RuleType, cwtools_rules::rules_types::Options)],
     ruleset: &RuleSet,
     info: &InfoService,
     language: &str,
     modifier_keys: &HashSet<String>,
+    modifier_scopes: &std::collections::HashMap<String, Vec<String>>,
     registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
     current_scope: Option<ScopeId>,
 ) -> Vec<CompletionItem> {
@@ -239,7 +241,15 @@ pub(crate) fn completions_from_rules(
                 left: NewField::AliasField(cat),
                 ..
             } => {
-                push_alias_keys(&mut items, ruleset, info, modifier_keys, cat, scope_ctx);
+                push_alias_keys(
+                    &mut items,
+                    ruleset,
+                    info,
+                    modifier_keys,
+                    modifier_scopes,
+                    cat,
+                    scope_ctx,
+                );
                 // A category with a `scope_field` alias (effect/trigger) accepts a
                 // scope-switch key here (`mio:ORG = { … }`), so offer those keys too
                 // (#76). The resolution machinery already backs goto/hover.
@@ -260,7 +270,15 @@ pub(crate) fn completions_from_rules(
             RuleType::LeafRule {
                 left: NewField::AliasValueKeysField(cat),
                 ..
-            } => push_alias_keys(&mut items, ruleset, info, modifier_keys, cat, scope_ctx),
+            } => push_alias_keys(
+                &mut items,
+                ruleset,
+                info,
+                modifier_keys,
+                modifier_scopes,
+                cat,
+                scope_ctx,
+            ),
             // Scope names
             RuleType::LeafRule {
                 right: NewField::ScopeField(_),
@@ -517,6 +535,7 @@ fn push_alias_keys(
     ruleset: &RuleSet,
     info: &InfoService,
     modifier_keys: &HashSet<String>,
+    modifier_scopes: &std::collections::HashMap<String, Vec<String>>,
     cat: &str,
     scope: ScopeCtx,
 ) {
@@ -703,17 +722,13 @@ fn push_alias_keys(
         // When the scope is known, resolve each modifier to its category's
         // `supported_scopes` (modifier_categories.cwt) so a scope-specific modifier
         // ranks ahead and a scope-mismatched one sinks to the bottom bucket (never
-        // dropped — see the alias path). The map is keyed by the SAME
+        // dropped — see the alias path). The prebuilt map is keyed by the SAME
         // expanded/lowercased names as `modifier_keys`, so nothing shifts when the
         // scope is unknown (#78).
-        let modifier_scopes = scope.map(|_| expanded_modifier_scopes(ruleset, info));
         for m in modifier_keys {
             let scope_rank = match scope {
                 Some((current, reg)) => {
-                    let scopes = modifier_scopes
-                        .as_ref()
-                        .and_then(|map| map.get(m).copied())
-                        .unwrap_or(&[]);
+                    let scopes = modifier_scopes.get(m).map(Vec::as_slice).unwrap_or(&[]);
                     if !scope_matches_required(current, reg, scopes) {
                         ScopeRank::Mismatch
                     } else if is_specific_requirement(scopes) {
@@ -743,12 +758,13 @@ fn push_alias_keys(
 /// expand against the type index one instance each — the same expansion
 /// `build_modifier_keys` performs, so the keys line up with the modifier-key set.
 /// Names whose category has no `modifier_categories.cwt` entry map to an empty
-/// (unrestricted) scope list.
-fn expanded_modifier_scopes<'a>(
-    ruleset: &'a RuleSet,
-    info: &InfoService,
-) -> std::collections::HashMap<String, &'a [String]> {
-    let mut map: std::collections::HashMap<String, &'a [String]> = std::collections::HashMap::new();
+/// (unrestricted) scope list. Rebuilt alongside `modifier_keys` (ruleset load +
+/// post-scan) and read prebuilt on every completion, not recomputed per request.
+pub(crate) fn expanded_modifier_scopes(
+    ruleset: &RuleSet,
+    type_index: &cwtools_info::TypeIndex,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for (name, category) in &ruleset.modifiers {
         let scopes = ruleset
             .modifier_categories
@@ -760,15 +776,15 @@ fn expanded_modifier_scopes<'a>(
                 let tn = &name[open + 1..close];
                 let pre = &name[..open];
                 let suf = &name[close + 1..];
-                for (_, inst) in info.type_index.instances(tn) {
+                for (_, inst) in type_index.instances(tn) {
                     map.insert(
                         format!("{}{}{}", pre, inst.name, suf).to_lowercase(),
-                        scopes,
+                        scopes.to_vec(),
                     );
                 }
             }
             _ => {
-                map.insert(name.to_lowercase(), scopes);
+                map.insert(name.to_lowercase(), scopes.to_vec());
             }
         }
     }
@@ -1011,6 +1027,7 @@ fn icon_values(index: &cwtools_info::FileIndex, folder: &str) -> Vec<String> {
 #[derive(Clone, Copy)]
 pub(crate) struct ValueCompletionSets<'a> {
     pub modifier_keys: &'a HashSet<String>,
+    pub modifier_scopes: &'a std::collections::HashMap<String, Vec<String>>,
     pub loc_keys: &'a HashSet<String>,
 }
 
@@ -1264,6 +1281,7 @@ pub(crate) fn value_completions(
                     ruleset,
                     info,
                     sets.modifier_keys,
+                    sets.modifier_scopes,
                     cat,
                     scope_ctx,
                 );
@@ -1452,7 +1470,16 @@ mod resolve_data_tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
         let item = items
             .iter()
             .find(|i| i.label == "add_political_power")
@@ -1501,7 +1528,16 @@ mod resolve_data_tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
         let item = items
             .iter()
             .find(|i| i.label == "add_political_power")
@@ -1541,6 +1577,7 @@ mod resolve_data_tests {
                 "hoi4",
                 ValueCompletionSets {
                     modifier_keys: &HashSet::new(),
+                    modifier_scopes: &Default::default(),
                     loc_keys: &HashSet::new(),
                 },
                 None,
@@ -1576,6 +1613,7 @@ mod resolve_data_tests {
             "hoi4",
             ValueCompletionSets {
                 modifier_keys: &HashSet::new(),
+                modifier_scopes: &Default::default(),
                 loc_keys: &loc_keys,
             },
             None,

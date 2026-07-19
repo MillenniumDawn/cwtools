@@ -149,6 +149,11 @@ pub(crate) struct RuleData {
     /// scan snapshots it with a cheap refcount bump instead of deep-copying the
     /// whole set (#78).
     pub(crate) modifier_keys: Arc<HashSet<String>>,
+    /// expanded modifier name → its category's `supported_scopes`, for
+    /// scope-aware modifier ranking in completion. A pure function of
+    /// ruleset + type index, rebuilt together with `modifier_keys` so the two
+    /// can never disagree.
+    pub(crate) modifier_scopes: Arc<HashMap<String, Vec<String>>>,
 }
 
 impl RuleData {
@@ -157,6 +162,7 @@ impl RuleData {
             ruleset: None,
             scope_registry: None,
             modifier_keys: Arc::new(HashSet::new()),
+            modifier_scopes: Arc::new(HashMap::new()),
         }
     }
 }
@@ -1479,8 +1485,16 @@ mod tests {
             panic!("expected TypeRule");
         };
 
-        let items =
-            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            rules,
+            &rs,
+            &info,
+            "stellaris",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");

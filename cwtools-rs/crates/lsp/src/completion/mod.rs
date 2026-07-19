@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,8 +22,8 @@ mod scope_names;
 mod snippets;
 
 pub(crate) use builders::{
-    ValueCompletionSets, completions_from_rules, root_type_snippets, value_completions,
-    value_rules_need_loc_keys,
+    ValueCompletionSets, completions_from_rules, expanded_modifier_scopes, root_type_snippets,
+    value_completions, value_rules_need_loc_keys,
 };
 pub(crate) use scope_names::loc_completions;
 pub(crate) use snippets::generate_node_snippet;
@@ -186,6 +186,7 @@ fn prepare_context_items(
 type RulesSnapshot = (
     Option<Arc<RuleSet>>,
     Arc<HashSet<String>>,
+    Arc<HashMap<String, Vec<String>>>,
     Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>,
 );
 
@@ -414,11 +415,12 @@ impl Backend {
             replace_range.start.character,
             &position_encoding,
         );
-        let (ruleset_arc, modifier_keys_arc, scope_registry_arc): RulesSnapshot = {
+        let (ruleset_arc, modifier_keys_arc, modifier_scopes_arc, scope_registry_arc): RulesSnapshot = {
             let rules_guard = self.state.rules.read();
             (
                 rules_guard.ruleset.clone(),
                 rules_guard.modifier_keys.clone(),
+                rules_guard.modifier_scopes.clone(),
                 rules_guard.scope_registry.clone(),
             )
         };
@@ -562,6 +564,7 @@ impl Backend {
                                                 &info_guard,
                                                 &language,
                                                 &modifier_keys_arc,
+                                                &modifier_scopes_arc,
                                                 scope_registry_arc.as_deref(),
                                                 rctx.scope.as_ref().map(|s| s.current()),
                                             ),
@@ -583,6 +586,7 @@ impl Backend {
                                                 &language,
                                                 ValueCompletionSets {
                                                     modifier_keys: &modifier_keys_arc,
+                                                    modifier_scopes: &modifier_scopes_arc,
                                                     loc_keys: &loc_keys,
                                                 },
                                                 rctx.scope.as_ref().map(|s| s.current()),
@@ -619,6 +623,7 @@ impl Backend {
                                             &language,
                                             ValueCompletionSets {
                                                 modifier_keys: &modifier_keys_arc,
+                                                modifier_scopes: &modifier_scopes_arc,
                                                 loc_keys: &loc_keys,
                                             },
                                             rctx.scope.as_ref().map(|s| s.current()),
@@ -633,6 +638,7 @@ impl Backend {
                                             &info_guard,
                                             &language,
                                             &modifier_keys_arc,
+                                            &modifier_scopes_arc,
                                             scope_registry_arc.as_deref(),
                                             rctx.scope.as_ref().map(|s| s.current()),
                                         ),
@@ -931,8 +937,16 @@ mod tests {
             panic!("expected TypeRule");
         };
 
-        let items =
-            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            rules,
+            &rs,
+            &info,
+            "stellaris",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");
@@ -965,8 +979,16 @@ mod tests {
             RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _)) => rules.as_slice(),
             _ => panic!("expected TypeRule"),
         };
-        let items =
-            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            rules,
+            &rs,
+            &info,
+            "stellaris",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
         let name = items
             .iter()
             .find(|i| i.label == "name")
@@ -997,8 +1019,16 @@ mod tests {
             } else {
                 panic!("expected TypeRule");
             };
-        let items =
-            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            rules,
+            &rs,
+            &info,
+            "stellaris",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
         assert!(!items.is_empty(), "expected some completions");
         for item in &items {
             assert!(
@@ -1246,7 +1276,16 @@ mod tests {
         let rs = alias_effect_ruleset();
         let info = cwtools_info::InfoService::new();
         let rules = effect_alias_usage();
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
 
         let if_item = items
             .iter()
@@ -1269,7 +1308,16 @@ mod tests {
         let rs = alias_effect_ruleset();
         let info = cwtools_info::InfoService::new();
         let rules = effect_alias_usage();
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
 
         let appp = items
             .iter()
@@ -1363,6 +1411,7 @@ mod tests {
             &info,
             "stellaris",
             &HashSet::new(),
+            &Default::default(),
             Some(&reg),
             Some(country),
         );
@@ -1481,7 +1530,16 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
 
         let always = items
             .iter()
@@ -1553,7 +1611,16 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
 
         let has_dlc = items
             .iter()
@@ -1612,6 +1679,7 @@ mod tests {
             "hoi4",
             ValueCompletionSets {
                 modifier_keys: &HashSet::new(),
+                modifier_scopes: &Default::default(),
                 loc_keys: &HashSet::new(),
             },
             None,
@@ -1708,7 +1776,16 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
 
         assert!(
             items.iter().any(|i| i.label == "my_special_effect"),
@@ -1755,7 +1832,16 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &modifier_keys, None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &modifier_keys,
+            &Default::default(),
+            None,
+            None,
+        );
 
         assert!(
             items.iter().any(|i| i.label == "my_modifier"),
@@ -1782,7 +1868,16 @@ mod tests {
             make_leaf_rule("active", NewField::ValueField(ValueType::Bool)),
             make_leaf_rule("active", NewField::ValueField(ValueType::Bool)),
         ];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
         let count = items.iter().filter(|i| i.label == "active").count();
         assert_eq!(
             count, 1,
@@ -2030,7 +2125,14 @@ mod tests {
             _ => panic!("expected TypeRule"),
         };
         snips.extend(snippet_texts(&completions_from_rules(
-            rules, &rs, &info, "hoi4", &empty, None, None,
+            rules,
+            &rs,
+            &info,
+            "hoi4",
+            &empty,
+            &Default::default(),
+            None,
+            None,
         )));
         snips.extend(snippet_texts(&root_type_snippets(&rs, "events/x.txt")));
 
@@ -2042,6 +2144,7 @@ mod tests {
             &info,
             "hoi4",
             &empty,
+            &Default::default(),
             None,
             None,
         )));
@@ -2061,6 +2164,7 @@ mod tests {
             &info,
             "hoi4",
             &empty,
+            &Default::default(),
             None,
             None,
         )));
@@ -2124,7 +2228,16 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&usage, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &usage,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+        );
         let danger = items
             .iter()
             .find(|i| i.label == "danger")
@@ -2314,6 +2427,7 @@ mod perf_bench {
             STATES
         );
 
+        let modifier_scopes = expanded_modifier_scopes(&rs, &info.type_index);
         let effect_rules = alias_usage("effect");
         let modifier_rules = alias_usage("modifier");
 
@@ -2330,6 +2444,7 @@ mod perf_bench {
                     &info,
                     "stellaris",
                     &modifier_keys,
+                    &modifier_scopes,
                     Some(&reg),
                     Some(country),
                 );
@@ -2352,6 +2467,7 @@ mod perf_bench {
                 &info,
                 "stellaris",
                 &modifier_keys,
+                &modifier_scopes,
                 Some(&reg),
                 Some(country),
             );
@@ -2384,6 +2500,7 @@ mod perf_bench {
                 "stellaris",
                 ValueCompletionSets {
                     modifier_keys: &modifier_keys,
+                    modifier_scopes: &modifier_scopes,
                     loc_keys: &HashSet::new(),
                 },
                 Some(country),
