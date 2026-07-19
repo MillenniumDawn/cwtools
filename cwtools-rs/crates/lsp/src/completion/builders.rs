@@ -915,6 +915,9 @@ fn push_scope_link_keys(
             };
             for (_, inst) in info.type_index.instances(t) {
                 if count >= SCOPE_LINK_KEY_CAP {
+                    // Keeps is_incomplete honest without relying on the cap
+                    // exceeding CONTEXT_COMPLETE_THRESHOLD.
+                    flt.dropped += 1;
                     return;
                 }
                 let label = format!("{}{}", prefix, inst.name);
