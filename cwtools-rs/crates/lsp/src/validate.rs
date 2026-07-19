@@ -6,6 +6,7 @@ use tower_lsp::lsp_types::*;
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::RuleSet;
+use cwtools_string_table::string_table::StringId;
 use cwtools_validation::{Prepared, ValidationError, validate_prepared};
 
 use crate::Backend;
@@ -263,40 +264,34 @@ pub(crate) fn validation_error_to_diagnostic(
     )
 }
 
-/// Collect the lowercased identifier-like tokens a parsed file mentions: every
-/// key and every (quoted or unquoted) string value, plus key/value prefixes.
+/// Collect the identifier-like tokens a parsed file mentions — every key and
+/// every (quoted or unquoted) string value — as interned `.lower` [`StringId`]s
+/// straight from the arena, so no string-table locks or allocations are paid.
 /// Used by the dependent sweep to decide which open docs reference a changed
-/// export. Deliberately broad (an over-approximation): including a token that
-/// isn't really a cross-file reference only costs an extra revalidation, while
+/// export (the sweep interns the changed names once at the comparison site).
+/// Deliberately broad (an over-approximation): including a token that isn't
+/// really a cross-file reference only costs an extra revalidation, while
 /// missing one would silently skip a file that should be revalidated.
-pub(crate) fn collect_doc_tokens(
-    ast: &ParsedFile,
-    table: &cwtools_string_table::string_table::StringTable,
-) -> HashSet<String> {
+pub(crate) fn collect_doc_tokens(ast: &ParsedFile) -> HashSet<StringId> {
     use cwtools_parser::ast::Value;
-    let mut tokens = HashSet::new();
-    let push = |id: cwtools_string_table::string_table::StringId, set: &mut HashSet<String>| {
-        if let Some(s) = table.get_string(id)
-            && !s.is_empty()
-        {
-            set.insert(s);
-        }
-    };
     // The arena holds every element flatly, so iterating the per-kind vectors
     // covers the whole tree without a recursive walk. `.lower` is the canonical
     // lowercased form, so the resulting set is already case-folded.
     let arena = &ast.arena;
+    let mut tokens = HashSet::new();
     for leaf in &arena.leaves {
-        push(leaf.key.lower, &mut tokens);
+        tokens.insert(leaf.key.lower);
         if let Value::String(t) | Value::QString(t) = &leaf.value {
-            push(t.lower, &mut tokens);
+            tokens.insert(t.lower);
         }
     }
     for lv in &arena.leaf_values {
         if let Value::String(t) | Value::QString(t) = &lv.value {
-            push(t.lower, &mut tokens);
+            tokens.insert(t.lower);
         }
     }
+    // Reserved slot 0 is the empty string; changed names are never empty.
+    tokens.remove(&StringId(0));
     tokens
 }
 
@@ -310,7 +305,7 @@ impl Backend {
         // dependent sweep's readers (doc_tokens.read()) for the whole walk.
         match ast {
             Some(ast) => {
-                let toks = collect_doc_tokens(ast, &self.state.string_table);
+                let toks = collect_doc_tokens(ast);
                 self.state.doc_tokens.write().insert(uri.to_string(), toks);
             }
             None => {
@@ -583,6 +578,14 @@ impl Backend {
     ) {
         use std::sync::atomic::Ordering;
 
+        // Doc token sets store interned `.lower` ids, so intern each changed
+        // name once here instead of resolving every doc token to a fresh String.
+        let changed_ids: Option<Vec<StringId>> = changed_names.map(|names| {
+            names
+                .iter()
+                .map(|n| self.state.string_table.intern(n).lower)
+                .collect()
+        });
         // Snapshot each open dependent's cached AST (a cheap `Arc` clone) with
         // its version. The dependents' own text didn't change, so they don't
         // need re-parsing or re-indexing — only re-validation against the
@@ -596,13 +599,13 @@ impl Backend {
             let docs = self.state.documents.lock();
             docs.iter()
                 .filter(|(u, _)| u.as_str() != changed_uri)
-                .filter(|(u, _)| match changed_names {
+                .filter(|(u, _)| match &changed_ids {
                     None => true,
-                    Some(names) => match tokens.get(u.as_str()) {
+                    Some(ids) => match tokens.get(u.as_str()) {
                         // No token set recorded for this doc — include it rather
                         // than risk missing a real dependent.
                         None => true,
-                        Some(doc_set) => names.iter().any(|n| doc_set.contains(n)),
+                        Some(doc_set) => ids.iter().any(|id| doc_set.contains(id)),
                     },
                 })
                 .filter_map(|(u, d)| {
@@ -1093,7 +1096,7 @@ mod perf_bench {
         let parsed = parse_string(&text, &table).expect("parse");
 
         bench("collect_doc_tokens", 30, || {
-            collect_doc_tokens(&parsed, &table).len()
+            collect_doc_tokens(&parsed).len()
         });
 
         let ws: Option<Arc<str>> = Some(Arc::from("file:///mnt/mods/millennium_dawn"));

@@ -11,7 +11,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use cwtools_info::{PositionElement, ReferenceHint, TypeInstance};
 use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::{NewField, RuleSet, RuleType, TypeType, ValueType};
-use cwtools_string_table::string_table::StringTable;
+use cwtools_string_table::string_table::{StringId, StringTable};
 use cwtools_validation::position::rules_at_pos;
 
 mod completion;
@@ -258,13 +258,13 @@ struct DocumentState {
     /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
     /// into the latest one instead of stacking up and double-validating.
     edit_generation: AtomicU64,
-    /// Per open document, the set of lowercased identifier-like tokens it
-    /// mentions (keys + string values from its parsed AST). Used by the
-    /// dependent sweep to revalidate only the open docs that actually reference a
-    /// changed export, instead of every open doc. A SOUND OVER-APPROXIMATION:
-    /// when a doc's token set is missing, it's always included. Updated on
-    /// did_open / did_change, removed on did_close.
-    doc_tokens: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
+    /// Per open document, the interned `.lower` ids of the identifier-like
+    /// tokens it mentions (keys + string values from its parsed AST). Used by
+    /// the dependent sweep to revalidate only the open docs that actually
+    /// reference a changed export, instead of every open doc. A SOUND
+    /// OVER-APPROXIMATION: when a doc's token set is missing, it's always
+    /// included. Updated on did_open / did_change, removed on did_close.
+    doc_tokens: parking_lot::RwLock<HashMap<String, HashSet<StringId>>>,
     /// Names that changed during a preempted dependent sweep. When a sweep is
     /// aborted because a newer edit landed, the union of names it was processing
     /// is merged here so the next sweep (triggered by the newer edit) drains and
