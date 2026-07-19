@@ -170,6 +170,12 @@ struct ReferenceSite {
 #[derive(Debug, Default)]
 pub struct ReferenceIndex {
     map: HashMap<Arc<str>, Vec<ReferenceSite>>,
+    /// file_uri → the set of `map` bucket keys (referenced type names) that file
+    /// has use sites under. Lets [`remove_file`](Self::remove_file) touch only
+    /// the file's own buckets (O(the file's own references)) instead of scanning
+    /// every referenced-type bucket in the workspace. Maintained by `merge` and
+    /// pruned by `remove_file`, mirroring `TypeIndex::file_buckets`.
+    file_types: HashMap<Arc<str>, HashSet<Arc<str>>>,
 }
 
 impl ReferenceIndex {
@@ -179,6 +185,10 @@ impl ReferenceIndex {
         }
         let uri: Arc<str> = Arc::from(file_uri);
         for (ty, name, location) in refs {
+            self.file_types
+                .entry(Arc::clone(&uri))
+                .or_default()
+                .insert(Arc::clone(&ty));
             self.map.entry(ty).or_default().push(ReferenceSite {
                 file: Arc::clone(&uri),
                 name,
@@ -188,11 +198,25 @@ impl ReferenceIndex {
     }
 
     /// Remove every site contributed by `file_uri` (called on reindex/close).
+    ///
+    /// Visits only the referenced-type buckets the reverse map (`file_types`)
+    /// records for this file, so it is proportional to the file's own reference
+    /// count. A bucket empties only when its last contributing file is removed,
+    /// and that file always has the bucket in its `file_types` set, so emptied
+    /// buckets are always visited and dropped here (no lingering empty bucket).
     fn remove_file(&mut self, file_uri: &str) {
-        for sites in self.map.values_mut() {
+        let Some(types) = self.file_types.remove(file_uri) else {
+            return;
+        };
+        for ty in &types {
+            let Some(sites) = self.map.get_mut(ty) else {
+                continue;
+            };
             sites.retain(|s| s.file.as_ref() != file_uri);
+            if sites.is_empty() {
+                self.map.remove(ty);
+            }
         }
-        self.map.retain(|_, v| !v.is_empty());
     }
 
     /// `(file_uri, key_location)` for every recorded reference to instance
@@ -1476,6 +1500,103 @@ alias[effect:set_temp_variable] = {
         assert!(
             !svc.variable_counts.contains_key("my_var"),
             "my_var should be gone after clear_file"
+        );
+    }
+
+    // ── ReferenceIndex narrowed removal (via clear_file) ─────────────────────
+
+    /// `clear_file` must drop only the cleared file's reference sites, across
+    /// merge → clear → re-merge → clear cycles, and a clear of an unknown file
+    /// must be a no-op.
+    #[test]
+    fn reference_index_clear_file_removes_only_that_files_sites() {
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        let table = StringTable::new();
+        let rules = ast_to_ruleset(
+            &parse_string(
+                "types = { type[decision] = { path = \"common/decisions\" } }\
+                 decision = { my_ref = <focus> }",
+                &table,
+            )
+            .unwrap(),
+            &table,
+        );
+        let script = |t: &StringTable| parse_string("test = { my_ref = SHARED }", t).unwrap();
+
+        let mut svc = InfoService::new();
+        svc.index_file_with_path(
+            "a.txt",
+            &script(&table),
+            &table,
+            &rules,
+            "common/decisions/a.txt",
+        );
+        svc.index_file_with_path(
+            "b.txt",
+            &script(&table),
+            &table,
+            &rules,
+            "common/decisions/b.txt",
+        );
+        assert_eq!(svc.reference_index.references("focus", "SHARED").len(), 2);
+
+        svc.clear_file("a.txt");
+        let refs = svc.reference_index.references("focus", "SHARED");
+        assert_eq!(refs.len(), 1, "only b's site should remain");
+        assert_eq!(refs[0].0.as_ref(), "b.txt");
+
+        // Re-index a, then clear both → fully empty.
+        svc.index_file_with_path(
+            "a.txt",
+            &script(&table),
+            &table,
+            &rules,
+            "common/decisions/a.txt",
+        );
+        assert_eq!(svc.reference_index.references("focus", "SHARED").len(), 2);
+        svc.clear_file("never.txt"); // unknown file: no-op
+        svc.clear_file("b.txt");
+        svc.clear_file("a.txt");
+        assert!(svc.reference_index.references("focus", "SHARED").is_empty());
+    }
+
+    /// The completion-only dynamic-value indexes (`value_set_values`) drop a
+    /// file's members on `clear_file`, keeping them consistent through reindex.
+    #[test]
+    fn dynamic_values_consistent_through_clear_file() {
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        let table = StringTable::new();
+        let mut rules = ast_to_ruleset(
+            &parse_string(
+                "alias[effect:set_country_flag] = value_set[country_flag]",
+                &table,
+            )
+            .unwrap(),
+            &table,
+        );
+        rules.reindex();
+
+        let mut svc = InfoService::new();
+        svc.index_file_with_path(
+            "f.txt",
+            &parse_string("my_effect = { set_country_flag = my_flag }", &table).unwrap(),
+            &table,
+            &rules,
+            "common/f.txt",
+        );
+        assert!(
+            svc.type_index
+                .value_set_values
+                .contains("country_flag", "my_flag"),
+            "value_set member must be collected on index"
+        );
+
+        svc.clear_file("f.txt");
+        assert!(
+            !svc.type_index
+                .value_set_values
+                .contains("country_flag", "my_flag"),
+            "value_set member must be gone after clear_file"
         );
     }
 }

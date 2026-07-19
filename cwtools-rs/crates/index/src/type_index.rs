@@ -1,7 +1,7 @@
 //! The index data structures: cross-file type-instance index plus the file-path
 //! and variable-name indexes it owns.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -244,6 +244,17 @@ pub struct TypeIndex {
     /// country_event). The refcount lets `remove_file` drop a name only when its
     /// last definition in that type goes.
     instance_sets: FxHashMap<String, FxHashMap<String, usize>>,
+    /// file_uri → the set of `map` bucket keys (type names) that file contributes
+    /// instances to. Lets [`remove_file`](Self::remove_file) visit only the
+    /// buckets the file actually touched (O(the file's own entries)) instead of
+    /// scanning every bucket of `self.map` (O(total instances) — the single
+    /// largest cost of a reindex at Millennium Dawn scale). Every insertion path
+    /// (`merge`, `merge_with_uris`) records its buckets here, and every removal
+    /// path (`remove_file`, `remove_files`) prunes them, so the reverse map stays
+    /// a faithful inverse of `map`'s uris. Not serialized: the vanilla cache
+    /// stores only instances and reloads them through `merge_with_uris`, which
+    /// rebuilds this map (same as `name_counts` / `instance_sets`).
+    file_buckets: FxHashMap<Arc<str>, FxHashSet<String>>,
     /// Index of every asset/file path under the game roots, for `filepath`
     /// reference checks (CW113). Empty unless the CLI populated it.
     pub file_index: FileIndex,
@@ -388,6 +399,13 @@ impl TypeIndex {
         let uri: Arc<str> = Arc::from(file_uri);
         for (type_name, instances) in per_type {
             let subtype_key = is_subtype_key(&type_name);
+            // Record the bucket in the reverse map so `remove_file` can find it
+            // without scanning every bucket. All of this file's instances share
+            // the one `uri`, so a single insert per type covers them.
+            self.file_buckets
+                .entry(Arc::clone(&uri))
+                .or_default()
+                .insert(type_name.clone());
             let set = self.instance_sets.entry(type_name.clone()).or_default();
             let entry = self.map.entry(type_name).or_default();
             for inst in instances {
@@ -413,13 +431,21 @@ impl TypeIndex {
         for (type_name, instances) in per_type {
             let subtype_key = is_subtype_key(&type_name);
             let set = self.instance_sets.entry(type_name.clone()).or_default();
-            let entry = self.map.entry(type_name).or_default();
+            let entry = self.map.entry(type_name.clone()).or_default();
             for (uri, inst) in instances {
                 let lower = inst.name.to_ascii_lowercase();
                 if !subtype_key {
                     *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
                 }
                 *set.entry(lower).or_insert(0) += 1;
+                // Each instance can come from a different file, so record this
+                // bucket under its own uri. Clone the type name only the first
+                // time a uri contributes to it (the batch's common case is many
+                // instances of one type per file).
+                let bucket = self.file_buckets.entry(Arc::clone(&uri)).or_default();
+                if !bucket.contains(type_name.as_str()) {
+                    bucket.insert(type_name.clone());
+                }
                 entry.push((uri, inst));
             }
         }
@@ -453,16 +479,40 @@ impl TypeIndex {
         }
         self.map.retain(|_, v| !v.is_empty());
         self.instance_sets.retain(|_, names| !names.is_empty());
+        // Drop the reverse-map entries for the removed files. Surviving files
+        // still contribute to exactly the buckets they did before (their
+        // instances were untouched), and any bucket emptied here had no
+        // surviving contributor, so no survivor's `file_buckets` set is left
+        // pointing at a bucket that no longer exists.
+        for uri in file_uris {
+            self.file_buckets.remove(uri);
+        }
     }
 
     /// Remove all instances contributed by `file_uri`.
+    ///
+    /// Visits only the `map` buckets the reverse map (`file_buckets`) records for
+    /// this file, so the cost is proportional to the file's own entries rather
+    /// than the whole index. Empty buckets are pruned exactly as the old
+    /// scan-everything version did: a `map` bucket empties only when its last
+    /// contributor is removed, and that contributor always has the bucket in its
+    /// `file_buckets` set, so the emptied bucket is always visited and dropped
+    /// here — no lingering empty bucket survives (matching `remove_files`).
     pub fn remove_file(&mut self, file_uri: &str) {
         self.complex_enum_values.remove_file(file_uri);
         self.value_set_values.remove_file(file_uri);
-        for (type_name, v) in self.map.iter_mut() {
+        // Take the file's bucket set out of the reverse map (dropping its entry).
+        // A file that contributed no type instances has no entry: nothing to do.
+        let Some(buckets) = self.file_buckets.remove(file_uri) else {
+            return;
+        };
+        for type_name in &buckets {
             // Subtype-qualified keys never contributed to `name_counts` (see
             // `merge`), so they must not decrement it here.
             let subtype_key = is_subtype_key(type_name);
+            let Some(v) = self.map.get_mut(type_name) else {
+                continue;
+            };
             v.retain(|(uri, inst)| {
                 let keep = uri.as_ref() != file_uri;
                 if !keep {
@@ -476,9 +526,11 @@ impl TypeIndex {
                 }
                 keep
             });
+            if v.is_empty() {
+                self.map.remove(type_name);
+                self.instance_sets.remove(type_name);
+            }
         }
-        self.map.retain(|_, v| !v.is_empty());
-        self.instance_sets.retain(|_, names| !names.is_empty());
     }
 }
 
@@ -547,6 +599,228 @@ mod tests {
             "defined variables (lowercased) must be bindable, got {:?}",
             names
         );
+    }
+
+    // ── removal parity (reverse-map narrowed removal) ────────────────────────
+
+    fn inst(name: &str, line: u32) -> TypeInstance {
+        TypeInstance {
+            name: name.to_string(),
+            location: SourceLocation { line, col: 0 },
+            primary_loc_key: None,
+        }
+    }
+
+    /// Comparable projection of every observable index structure. Sorted so the
+    /// comparison is order-independent (removal preserves order, a from-scratch
+    /// rebuild reproduces it, but sorting keeps the assertion robust either way).
+    type Snap = (
+        std::collections::BTreeMap<String, Vec<(String, String, u32)>>,
+        std::collections::BTreeMap<String, usize>,
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>>,
+    );
+
+    fn snapshot(idx: &TypeIndex) -> Snap {
+        use std::collections::BTreeMap;
+        let mut map = BTreeMap::new();
+        for (ty, entries) in &idx.map {
+            let mut v: Vec<(String, String, u32)> = entries
+                .iter()
+                .map(|(uri, i)| (uri.to_string(), i.name.clone(), i.location.line))
+                .collect();
+            v.sort();
+            map.insert(ty.clone(), v);
+        }
+        let name_counts: BTreeMap<String, usize> = idx
+            .name_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let instance_sets: BTreeMap<String, BTreeMap<String, usize>> = idx
+            .instance_sets
+            .iter()
+            .map(|(k, m)| {
+                (
+                    k.clone(),
+                    m.iter().map(|(kk, vv)| (kk.clone(), *vv)).collect(),
+                )
+            })
+            .collect();
+        (map, name_counts, instance_sets)
+    }
+
+    /// Removing a `merge`-contributed file must leave exactly the state of a
+    /// rebuild that never saw it. Exercises the single-uri insertion path.
+    #[test]
+    fn remove_file_parity_removing_merge_file() {
+        let build = |include_b: bool| -> TypeIndex {
+            let mut idx = TypeIndex::new();
+            idx.merge(
+                "file://a.txt",
+                HashMap::from([
+                    (
+                        "event".to_string(),
+                        vec![inst("shared_ev", 1), inst("a_only", 2)],
+                    ),
+                    ("tech".to_string(), vec![inst("a_tech", 3)]),
+                ]),
+            );
+            if include_b {
+                idx.merge(
+                    "file://b.txt",
+                    HashMap::from([("event".to_string(), vec![inst("shared_ev", 5)])]),
+                );
+            }
+            idx.merge_with_uris(vec![
+                (
+                    "event".to_string(),
+                    vec![
+                        (Arc::<str>::from("file://c.txt"), inst("shared_ev", 7)),
+                        (Arc::<str>::from("file://d.txt"), inst("d_ev", 8)),
+                    ],
+                ),
+                (
+                    "event.subt".to_string(),
+                    vec![(Arc::<str>::from("file://c.txt"), inst("shared_ev", 7))],
+                ),
+            ]);
+            idx
+        };
+
+        let mut full = build(true);
+        full.remove_file("file://b.txt");
+        assert_eq!(snapshot(&full), snapshot(&build(false)));
+        assert!(full.contains("event", "shared_ev"));
+        assert!(full.is_any_instance("shared_ev"));
+    }
+
+    /// Removing a `merge_with_uris`-contributed file must likewise match a
+    /// rebuild without it. Exercises the per-instance-uri insertion path, whose
+    /// reverse-map bookkeeping differs from the single-uri path.
+    #[test]
+    fn remove_file_parity_removing_merge_with_uris_file() {
+        let build = |include_c: bool| -> TypeIndex {
+            let mut idx = TypeIndex::new();
+            idx.merge(
+                "file://a.txt",
+                HashMap::from([("event".to_string(), vec![inst("shared_ev", 1)])]),
+            );
+            let mut batch = vec![(
+                "event".to_string(),
+                vec![(Arc::<str>::from("file://d.txt"), inst("d_ev", 8))],
+            )];
+            if include_c {
+                batch.push((
+                    "event".to_string(),
+                    vec![(Arc::<str>::from("file://c.txt"), inst("shared_ev", 7))],
+                ));
+                batch.push((
+                    "event.subt".to_string(),
+                    vec![(Arc::<str>::from("file://c.txt"), inst("shared_ev", 7))],
+                ));
+            }
+            idx.merge_with_uris(batch);
+            idx
+        };
+
+        let mut full = build(true);
+        full.remove_file("file://c.txt");
+        assert_eq!(snapshot(&full), snapshot(&build(false)));
+        // c was the only source of the subtype membership.
+        assert!(!full.contains("event.subt", "shared_ev"));
+        assert!(full.contains("event", "shared_ev")); // still via a
+    }
+
+    /// merge → remove → re-merge → remove cycles leave the index bit-empty each
+    /// time, including the reverse map, with empty buckets pruned.
+    #[test]
+    fn merge_remove_remerge_cycles_stay_clean() {
+        let mut idx = TypeIndex::new();
+        let payload = || HashMap::from([("event".to_string(), vec![inst("ev", 1)])]);
+        for _ in 0..3 {
+            idx.merge("file://x.txt", payload());
+            assert!(idx.contains("event", "ev"));
+            idx.remove_file("file://x.txt");
+            assert!(!idx.contains("event", "ev"));
+            assert!(!idx.is_any_instance("ev"));
+            assert!(idx.instances("event").is_empty());
+            assert!(
+                !idx.map.contains_key("event"),
+                "empty bucket must be pruned"
+            );
+        }
+        assert!(idx.map.is_empty());
+        assert!(idx.name_counts.is_empty());
+        assert!(idx.instance_sets.is_empty());
+    }
+
+    /// Bulk `remove_files` followed by a singular `remove_file`: the vanilla
+    /// batch drops in one pass, then the last mod file drops, leaving nothing.
+    #[test]
+    fn remove_files_bulk_then_remove_file_singular() {
+        let mut idx = TypeIndex::new();
+        idx.merge_with_uris(vec![(
+            "event".to_string(),
+            vec![
+                (Arc::<str>::from("v1"), inst("e1", 1)),
+                (Arc::<str>::from("v2"), inst("e2", 2)),
+            ],
+        )]);
+        idx.merge(
+            "m.txt",
+            HashMap::from([("event".to_string(), vec![inst("me", 3)])]),
+        );
+
+        let mut bulk = HashSet::new();
+        bulk.insert(Arc::<str>::from("v1"));
+        bulk.insert(Arc::<str>::from("v2"));
+        idx.remove_files(&bulk);
+        assert!(!idx.contains("event", "e1"));
+        assert!(!idx.contains("event", "e2"));
+        assert!(idx.contains("event", "me"));
+
+        idx.remove_file("m.txt");
+        assert!(!idx.contains("event", "me"));
+        assert!(idx.map.is_empty());
+        assert!(idx.name_counts.is_empty());
+        assert!(idx.instance_sets.is_empty());
+    }
+
+    /// Removing a URI that never contributed anything is a no-op.
+    #[test]
+    fn remove_file_with_no_entries_is_noop() {
+        let mut idx = TypeIndex::new();
+        idx.merge(
+            "file://a.txt",
+            HashMap::from([("event".to_string(), vec![inst("ev", 1)])]),
+        );
+        let before = snapshot(&idx);
+        idx.remove_file("file://never-merged.txt");
+        assert_eq!(before, snapshot(&idx));
+        assert!(idx.contains("event", "ev"));
+    }
+
+    /// A subtype-qualified membership key never feeds `name_counts`, so removing
+    /// the file must drive the base name's count to zero exactly once.
+    #[test]
+    fn subtype_key_removal_preserves_name_counts_exemption() {
+        let mut idx = TypeIndex::new();
+        idx.merge_with_uris(vec![
+            (
+                "event".to_string(),
+                vec![(Arc::<str>::from("f.txt"), inst("ev", 1))],
+            ),
+            (
+                "event.subt".to_string(),
+                vec![(Arc::<str>::from("f.txt"), inst("ev", 1))],
+            ),
+        ]);
+        assert_eq!(idx.name_counts.get("ev").copied(), Some(1));
+        assert!(idx.contains("event.subt", "ev"));
+        idx.remove_file("f.txt");
+        assert!(!idx.name_counts.contains_key("ev"));
+        assert!(idx.map.is_empty());
+        assert!(idx.instance_sets.is_empty());
     }
 
     #[test]
