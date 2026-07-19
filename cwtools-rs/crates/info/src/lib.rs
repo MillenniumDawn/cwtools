@@ -170,6 +170,12 @@ struct ReferenceSite {
 #[derive(Debug, Default)]
 pub struct ReferenceIndex {
     map: HashMap<Arc<str>, Vec<ReferenceSite>>,
+    /// file_uri → the set of `map` bucket keys (referenced type names) that file
+    /// has use sites under. Lets [`remove_file`](Self::remove_file) touch only
+    /// the file's own buckets (O(the file's own references)) instead of scanning
+    /// every referenced-type bucket in the workspace. Maintained by `merge` and
+    /// pruned by `remove_file`, mirroring `TypeIndex::file_buckets`.
+    file_types: HashMap<Arc<str>, HashSet<Arc<str>>>,
 }
 
 impl ReferenceIndex {
@@ -179,6 +185,10 @@ impl ReferenceIndex {
         }
         let uri: Arc<str> = Arc::from(file_uri);
         for (ty, name, location) in refs {
+            self.file_types
+                .entry(Arc::clone(&uri))
+                .or_default()
+                .insert(Arc::clone(&ty));
             self.map.entry(ty).or_default().push(ReferenceSite {
                 file: Arc::clone(&uri),
                 name,
@@ -188,11 +198,25 @@ impl ReferenceIndex {
     }
 
     /// Remove every site contributed by `file_uri` (called on reindex/close).
+    ///
+    /// Visits only the referenced-type buckets the reverse map (`file_types`)
+    /// records for this file, so it is proportional to the file's own reference
+    /// count. A bucket empties only when its last contributing file is removed,
+    /// and that file always has the bucket in its `file_types` set, so emptied
+    /// buckets are always visited and dropped here (no lingering empty bucket).
     fn remove_file(&mut self, file_uri: &str) {
-        for sites in self.map.values_mut() {
+        let Some(types) = self.file_types.remove(file_uri) else {
+            return;
+        };
+        for ty in &types {
+            let Some(sites) = self.map.get_mut(ty) else {
+                continue;
+            };
             sites.retain(|s| s.file.as_ref() != file_uri);
+            if sites.is_empty() {
+                self.map.remove(ty);
+            }
         }
-        self.map.retain(|_, v| !v.is_empty());
     }
 
     /// `(file_uri, key_location)` for every recorded reference to instance
