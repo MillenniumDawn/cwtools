@@ -549,6 +549,228 @@ mod tests {
         );
     }
 
+    // ── removal parity (reverse-map narrowed removal) ────────────────────────
+
+    fn inst(name: &str, line: u32) -> TypeInstance {
+        TypeInstance {
+            name: name.to_string(),
+            location: SourceLocation { line, col: 0 },
+            primary_loc_key: None,
+        }
+    }
+
+    /// Comparable projection of every observable index structure. Sorted so the
+    /// comparison is order-independent (removal preserves order, a from-scratch
+    /// rebuild reproduces it, but sorting keeps the assertion robust either way).
+    type Snap = (
+        std::collections::BTreeMap<String, Vec<(String, String, u32)>>,
+        std::collections::BTreeMap<String, usize>,
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>>,
+    );
+
+    fn snapshot(idx: &TypeIndex) -> Snap {
+        use std::collections::BTreeMap;
+        let mut map = BTreeMap::new();
+        for (ty, entries) in &idx.map {
+            let mut v: Vec<(String, String, u32)> = entries
+                .iter()
+                .map(|(uri, i)| (uri.to_string(), i.name.clone(), i.location.line))
+                .collect();
+            v.sort();
+            map.insert(ty.clone(), v);
+        }
+        let name_counts: BTreeMap<String, usize> = idx
+            .name_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let instance_sets: BTreeMap<String, BTreeMap<String, usize>> = idx
+            .instance_sets
+            .iter()
+            .map(|(k, m)| {
+                (
+                    k.clone(),
+                    m.iter().map(|(kk, vv)| (kk.clone(), *vv)).collect(),
+                )
+            })
+            .collect();
+        (map, name_counts, instance_sets)
+    }
+
+    /// Removing a `merge`-contributed file must leave exactly the state of a
+    /// rebuild that never saw it. Exercises the single-uri insertion path.
+    #[test]
+    fn remove_file_parity_removing_merge_file() {
+        let build = |include_b: bool| -> TypeIndex {
+            let mut idx = TypeIndex::new();
+            idx.merge(
+                "file://a.txt",
+                HashMap::from([
+                    (
+                        "event".to_string(),
+                        vec![inst("shared_ev", 1), inst("a_only", 2)],
+                    ),
+                    ("tech".to_string(), vec![inst("a_tech", 3)]),
+                ]),
+            );
+            if include_b {
+                idx.merge(
+                    "file://b.txt",
+                    HashMap::from([("event".to_string(), vec![inst("shared_ev", 5)])]),
+                );
+            }
+            idx.merge_with_uris(vec![
+                (
+                    "event".to_string(),
+                    vec![
+                        (Arc::<str>::from("file://c.txt"), inst("shared_ev", 7)),
+                        (Arc::<str>::from("file://d.txt"), inst("d_ev", 8)),
+                    ],
+                ),
+                (
+                    "event.subt".to_string(),
+                    vec![(Arc::<str>::from("file://c.txt"), inst("shared_ev", 7))],
+                ),
+            ]);
+            idx
+        };
+
+        let mut full = build(true);
+        full.remove_file("file://b.txt");
+        assert_eq!(snapshot(&full), snapshot(&build(false)));
+        assert!(full.contains("event", "shared_ev"));
+        assert!(full.is_any_instance("shared_ev"));
+    }
+
+    /// Removing a `merge_with_uris`-contributed file must likewise match a
+    /// rebuild without it. Exercises the per-instance-uri insertion path, whose
+    /// reverse-map bookkeeping differs from the single-uri path.
+    #[test]
+    fn remove_file_parity_removing_merge_with_uris_file() {
+        let build = |include_c: bool| -> TypeIndex {
+            let mut idx = TypeIndex::new();
+            idx.merge(
+                "file://a.txt",
+                HashMap::from([("event".to_string(), vec![inst("shared_ev", 1)])]),
+            );
+            let mut batch = vec![(
+                "event".to_string(),
+                vec![(Arc::<str>::from("file://d.txt"), inst("d_ev", 8))],
+            )];
+            if include_c {
+                batch.push((
+                    "event".to_string(),
+                    vec![(Arc::<str>::from("file://c.txt"), inst("shared_ev", 7))],
+                ));
+                batch.push((
+                    "event.subt".to_string(),
+                    vec![(Arc::<str>::from("file://c.txt"), inst("shared_ev", 7))],
+                ));
+            }
+            idx.merge_with_uris(batch);
+            idx
+        };
+
+        let mut full = build(true);
+        full.remove_file("file://c.txt");
+        assert_eq!(snapshot(&full), snapshot(&build(false)));
+        // c was the only source of the subtype membership.
+        assert!(!full.contains("event.subt", "shared_ev"));
+        assert!(full.contains("event", "shared_ev")); // still via a
+    }
+
+    /// merge → remove → re-merge → remove cycles leave the index bit-empty each
+    /// time, including the reverse map, with empty buckets pruned.
+    #[test]
+    fn merge_remove_remerge_cycles_stay_clean() {
+        let mut idx = TypeIndex::new();
+        let payload = || HashMap::from([("event".to_string(), vec![inst("ev", 1)])]);
+        for _ in 0..3 {
+            idx.merge("file://x.txt", payload());
+            assert!(idx.contains("event", "ev"));
+            idx.remove_file("file://x.txt");
+            assert!(!idx.contains("event", "ev"));
+            assert!(!idx.is_any_instance("ev"));
+            assert!(idx.instances("event").is_empty());
+            assert!(
+                !idx.map.contains_key("event"),
+                "empty bucket must be pruned"
+            );
+        }
+        assert!(idx.map.is_empty());
+        assert!(idx.name_counts.is_empty());
+        assert!(idx.instance_sets.is_empty());
+    }
+
+    /// Bulk `remove_files` followed by a singular `remove_file`: the vanilla
+    /// batch drops in one pass, then the last mod file drops, leaving nothing.
+    #[test]
+    fn remove_files_bulk_then_remove_file_singular() {
+        let mut idx = TypeIndex::new();
+        idx.merge_with_uris(vec![(
+            "event".to_string(),
+            vec![
+                (Arc::<str>::from("v1"), inst("e1", 1)),
+                (Arc::<str>::from("v2"), inst("e2", 2)),
+            ],
+        )]);
+        idx.merge(
+            "m.txt",
+            HashMap::from([("event".to_string(), vec![inst("me", 3)])]),
+        );
+
+        let mut bulk = HashSet::new();
+        bulk.insert(Arc::<str>::from("v1"));
+        bulk.insert(Arc::<str>::from("v2"));
+        idx.remove_files(&bulk);
+        assert!(!idx.contains("event", "e1"));
+        assert!(!idx.contains("event", "e2"));
+        assert!(idx.contains("event", "me"));
+
+        idx.remove_file("m.txt");
+        assert!(!idx.contains("event", "me"));
+        assert!(idx.map.is_empty());
+        assert!(idx.name_counts.is_empty());
+        assert!(idx.instance_sets.is_empty());
+    }
+
+    /// Removing a URI that never contributed anything is a no-op.
+    #[test]
+    fn remove_file_with_no_entries_is_noop() {
+        let mut idx = TypeIndex::new();
+        idx.merge(
+            "file://a.txt",
+            HashMap::from([("event".to_string(), vec![inst("ev", 1)])]),
+        );
+        let before = snapshot(&idx);
+        idx.remove_file("file://never-merged.txt");
+        assert_eq!(before, snapshot(&idx));
+        assert!(idx.contains("event", "ev"));
+    }
+
+    /// A subtype-qualified membership key never feeds `name_counts`, so removing
+    /// the file must drive the base name's count to zero exactly once.
+    #[test]
+    fn subtype_key_removal_preserves_name_counts_exemption() {
+        let mut idx = TypeIndex::new();
+        idx.merge_with_uris(vec![
+            (
+                "event".to_string(),
+                vec![(Arc::<str>::from("f.txt"), inst("ev", 1))],
+            ),
+            (
+                "event.subt".to_string(),
+                vec![(Arc::<str>::from("f.txt"), inst("ev", 1))],
+            ),
+        ]);
+        assert_eq!(idx.name_counts.get("ev").copied(), Some(1));
+        assert!(idx.contains("event.subt", "ev"));
+        idx.remove_file("f.txt");
+        assert!(!idx.name_counts.contains_key("ev"));
+        assert!(idx.map.is_empty());
+        assert!(idx.instance_sets.is_empty());
+    }
+
     #[test]
     fn file_index_resolves_reference_relative_to_asset_dir() {
         // A sound `.asset` `file =` resolves beside the .asset, not under the

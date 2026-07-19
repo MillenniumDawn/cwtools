@@ -1478,4 +1478,101 @@ alias[effect:set_temp_variable] = {
             "my_var should be gone after clear_file"
         );
     }
+
+    // ── ReferenceIndex narrowed removal (via clear_file) ─────────────────────
+
+    /// `clear_file` must drop only the cleared file's reference sites, across
+    /// merge → clear → re-merge → clear cycles, and a clear of an unknown file
+    /// must be a no-op.
+    #[test]
+    fn reference_index_clear_file_removes_only_that_files_sites() {
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        let table = StringTable::new();
+        let rules = ast_to_ruleset(
+            &parse_string(
+                "types = { type[decision] = { path = \"common/decisions\" } }\
+                 decision = { my_ref = <focus> }",
+                &table,
+            )
+            .unwrap(),
+            &table,
+        );
+        let script = |t: &StringTable| parse_string("test = { my_ref = SHARED }", t).unwrap();
+
+        let mut svc = InfoService::new();
+        svc.index_file_with_path(
+            "a.txt",
+            &script(&table),
+            &table,
+            &rules,
+            "common/decisions/a.txt",
+        );
+        svc.index_file_with_path(
+            "b.txt",
+            &script(&table),
+            &table,
+            &rules,
+            "common/decisions/b.txt",
+        );
+        assert_eq!(svc.reference_index.references("focus", "SHARED").len(), 2);
+
+        svc.clear_file("a.txt");
+        let refs = svc.reference_index.references("focus", "SHARED");
+        assert_eq!(refs.len(), 1, "only b's site should remain");
+        assert_eq!(refs[0].0.as_ref(), "b.txt");
+
+        // Re-index a, then clear both → fully empty.
+        svc.index_file_with_path(
+            "a.txt",
+            &script(&table),
+            &table,
+            &rules,
+            "common/decisions/a.txt",
+        );
+        assert_eq!(svc.reference_index.references("focus", "SHARED").len(), 2);
+        svc.clear_file("never.txt"); // unknown file: no-op
+        svc.clear_file("b.txt");
+        svc.clear_file("a.txt");
+        assert!(svc.reference_index.references("focus", "SHARED").is_empty());
+    }
+
+    /// The completion-only dynamic-value indexes (`value_set_values`) drop a
+    /// file's members on `clear_file`, keeping them consistent through reindex.
+    #[test]
+    fn dynamic_values_consistent_through_clear_file() {
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        let table = StringTable::new();
+        let mut rules = ast_to_ruleset(
+            &parse_string(
+                "alias[effect:set_country_flag] = value_set[country_flag]",
+                &table,
+            )
+            .unwrap(),
+            &table,
+        );
+        rules.reindex();
+
+        let mut svc = InfoService::new();
+        svc.index_file_with_path(
+            "f.txt",
+            &parse_string("my_effect = { set_country_flag = my_flag }", &table).unwrap(),
+            &table,
+            &rules,
+            "common/f.txt",
+        );
+        assert!(
+            svc.type_index
+                .value_set_values
+                .contains("country_flag", "my_flag"),
+            "value_set member must be collected on index"
+        );
+
+        svc.clear_file("f.txt");
+        assert!(
+            !svc.type_index
+                .value_set_values
+                .contains("country_flag", "my_flag"),
+            "value_set member must be gone after clear_file"
+        );
+    }
 }
