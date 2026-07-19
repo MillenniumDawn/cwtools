@@ -73,6 +73,48 @@ fn loc_keys_of(text: &str, path: &str) -> HashSet<String> {
     keys
 }
 
+/// Names whose dependents a loc-key change may affect: the changed keys
+/// themselves (literal loc references, CW122) plus, for every name-derived
+/// `localisation = { … }` rule in the ruleset, the definition name a changed
+/// key would be derived from (`prefix$suffix` stripped — CW100 flags
+/// `<name>_desc`-style keys, and a game file's token set contains `<name>`,
+/// not the derived key). Everything is compared lowercased, matching both the
+/// loc index and the doc token sets.
+fn loc_change_candidate_names(
+    ruleset: Option<&RuleSet>,
+    changed_keys: &HashSet<String>,
+) -> HashSet<String> {
+    let mut names = changed_keys.clone();
+    let Some(rs) = ruleset else {
+        return names;
+    };
+    let mut affixes: HashSet<(String, String)> = HashSet::new();
+    for td in &rs.types {
+        let subtype_locs = td.subtypes.iter().flat_map(|st| st.localisation.iter());
+        for loc in td.localisation.iter().chain(subtype_locs) {
+            if !loc.required || loc.optional || loc.explicit_field.is_some() {
+                continue;
+            }
+            if loc.prefix.is_empty() && loc.suffix.is_empty() {
+                continue;
+            }
+            affixes.insert((loc.prefix.to_lowercase(), loc.suffix.to_lowercase()));
+        }
+    }
+    for (prefix, suffix) in &affixes {
+        for key in changed_keys {
+            if let Some(mid) = key
+                .strip_prefix(prefix.as_str())
+                .and_then(|m| m.strip_suffix(suffix.as_str()))
+                && !mid.is_empty()
+            {
+                names.insert(mid.to_string());
+            }
+        }
+    }
+    names
+}
+
 /// Cap a file's validation errors at [`MAX_FILE_ERRORS`], appending a summary
 /// marker for the remainder. Returns the pre-truncation total (for logging).
 /// Shared by the batch and single-file paths so the cap stays consistent.
@@ -843,16 +885,16 @@ impl Backend {
             let path = uri_to_path_str(uri);
             // Keep the live overlay current so this file's own keys (and any just
             // added) resolve immediately in `$ref$` checks, without waiting for a
-            // full rescan. Record whether the key set actually changed. (#36)
-            let changed = {
+            // full rescan. Record which keys were added or removed. (#36)
+            let changed_keys: HashSet<String> = {
                 let new_keys = loc_keys_of(text, &path);
                 let mut overlay = self.state.loc_live_overlay.write();
-                let changed = overlay
-                    .get(uri)
-                    .map(|prev| prev != &new_keys)
-                    .unwrap_or(true);
+                let diff = match overlay.get(uri) {
+                    Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
+                    None => new_keys.clone(),
+                };
                 overlay.insert(uri.to_string(), new_keys);
-                changed
+                diff
             };
             let diagnostics = self.validate_loc_text(&path, text, &line_ends);
             // Update the hover loc_text map so tooltips reflect the latest
@@ -865,15 +907,22 @@ impl Backend {
             // diagnostic on open GAME files that reference the added/removed key
             // (e.g. a new event option's loc), so re-validate those too — the
             // overlay now feeds the game-file loc checks, so they resolve the new
-            // key without a full rescan. (#36)
-            if changed {
+            // key without a full rescan. (#36) The sweep is scoped to the docs
+            // whose tokens mention a changed key or a definition name it derives
+            // from, instead of every open game file.
+            if !changed_keys.is_empty() {
                 self.bump_info_revision();
                 self.revalidate_other_open_loc_files(uri).await;
                 let generation = self
                     .state
                     .edit_generation
                     .load(std::sync::atomic::Ordering::SeqCst);
-                self.revalidate_open_dependents(uri, generation, None).await;
+                let scope = {
+                    let rules_guard = self.state.rules.read();
+                    loc_change_candidate_names(rules_guard.ruleset.as_deref(), &changed_keys)
+                };
+                self.revalidate_open_dependents(uri, generation, Some(&scope))
+                    .await;
             }
             return (diagnostics, None);
         }
@@ -1127,6 +1176,62 @@ mod whole_line_range_tests {
         assert!(keys.contains("my_key"), "got: {:?}", keys);
         assert!(keys.contains("other_key"), "got: {:?}", keys);
         assert!(!keys.contains("absent"));
+    }
+
+    #[test]
+    fn loc_change_candidates_cover_derived_cw100_keys() {
+        // CW100 keys are derived (`prefix + name + suffix`), so a changed key
+        // `my_focus_desc` must scope the sweep to docs mentioning `my_focus`
+        // (the definition name), not just the literal key.
+        use cwtools_rules::rules_types::{TypeDefinition, TypeLocalisation};
+        let mut rs = RuleSet::new();
+        let loc = |prefix: &str, suffix: &str, required: bool, optional: bool| TypeLocalisation {
+            name: "x".into(),
+            prefix: prefix.into(),
+            suffix: suffix.into(),
+            required,
+            optional,
+            explicit_field: None,
+            replace_scopes: None,
+            primary: false,
+        };
+        rs.types.push(TypeDefinition {
+            name: "thing".to_string(),
+            name_field: None,
+            path_options: Default::default(),
+            subtypes: Vec::new(),
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: false,
+            localisation: vec![
+                loc("", "_desc", true, false),
+                loc("mod_", "", true, false),
+                // Optional / explicit-field entries are not CW100-flagged.
+                loc("", "_opt", true, true),
+            ],
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        });
+        let changed: HashSet<String> = ["my_focus_desc".to_string(), "plainkey".to_string()]
+            .into_iter()
+            .collect();
+        let names = loc_change_candidate_names(Some(&rs), &changed);
+        // Literal keys always included (CW122); derived names stripped per affix.
+        assert!(names.contains("my_focus_desc"));
+        assert!(names.contains("plainkey"));
+        assert!(names.contains("my_focus"), "got: {:?}", names);
+        assert!(
+            !names.contains("my_focus_desc_opt") && !names.contains("my_focus_d"),
+            "optional affixes must not expand: {:?}",
+            names
+        );
+        // No ruleset: literal keys only.
+        assert_eq!(loc_change_candidate_names(None, &changed), changed);
     }
 
     #[test]
