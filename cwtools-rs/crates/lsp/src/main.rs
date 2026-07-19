@@ -328,6 +328,14 @@ struct DocumentState {
     /// (not-yet-finished) handle means a window is already scheduled, so a
     /// continuous event stream can't keep pushing the trailing window back.
     watched_debounce: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Per-URI stat signature (file size, mtime-nanos) of the last watched
+    /// validation. A CHANGED event whose bytes never moved (a toucher: cloud
+    /// sync, git, the running game rewriting identical content) matches the
+    /// recorded signature and skips the whole re-read + `clear_file`
+    /// (O(index)) + revalidate. The per-file analogue of `last_loc_signature`.
+    /// A DELETE drops the URI's entry; the first-ever event for a URI (no
+    /// entry) always validates.
+    watched_signatures: Mutex<HashMap<String, (u64, u128)>>,
 }
 
 /// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
@@ -442,6 +450,7 @@ impl DocumentState {
             last_activity_ms: AtomicU64::new(0),
             watched_pending: Mutex::new(HashSet::new()),
             watched_debounce: Mutex::new(None),
+            watched_signatures: Mutex::new(HashMap::new()),
         }
     }
 }

@@ -1212,6 +1212,9 @@ impl Backend {
                         info.clear_file(&uri);
                     }
                     self.state.loc_live_overlay.write().remove(&uri);
+                    // Forget any recorded watched signature so a later re-create
+                    // of this URI validates instead of matching a stale skip.
+                    self.state.watched_signatures.lock().remove(&uri);
                     self.bump_info_revision();
                     self.client
                         .publish_diagnostics(event.uri, vec![], None)
@@ -1271,6 +1274,19 @@ impl Backend {
                     continue;
                 }
                 let path = uri_to_path_str(&uri);
+                // Stat-gate before the read: a toucher that rewrote identical
+                // bytes (cloud sync, git, the running game) leaves size+mtime
+                // unchanged, so skip the whole read + `clear_file` (O(index)) +
+                // revalidate. `None` (vanished/unreadable) can't be proven
+                // unchanged, so it falls through to the read; the first-ever
+                // event for a URI has no recorded signature and always validates.
+                let sig = watched_stat_sig(std::path::Path::new(&path));
+                if let Some(sig) = sig
+                    && self.state.watched_signatures.lock().get(&uri) == Some(&sig)
+                {
+                    tracing::debug!(%uri, "watched file unchanged (stat match); skipping");
+                    continue;
+                }
                 // Read on a blocking thread via the file manager so cp1252
                 // script files are validated (not silently dropped) and the
                 // async runtime isn't stalled on the sync read.
@@ -1286,6 +1302,16 @@ impl Backend {
                         let (diagnostics, _) = self
                             .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched)
                             .await;
+                        // Record the validated signature so a later no-op
+                        // toucher for this URI is skipped. Only after a
+                        // successful read+validate, so a transient read failure
+                        // doesn't poison the record.
+                        if let Some(sig) = sig {
+                            self.state
+                                .watched_signatures
+                                .lock()
+                                .insert(uri.clone(), sig);
+                        }
                         if let Ok(uri_obj) = Url::parse(&uri) {
                             self.publish_gated(uri_obj, diagnostics, None).await;
                         }
@@ -1462,6 +1488,23 @@ fn loc_signature_for(mut files: Vec<std::path::PathBuf>) -> u64 {
     hasher.finish()
 }
 
+/// Stat-only signature (file size, mtime-nanos) for a single watched file —
+/// the per-file analogue of `loc_signature_for`. `None` when the file can't be
+/// stat'd (vanished or unreadable), so the caller can't prove it's unchanged
+/// and revalidates. mtime folds in as 0 when the platform doesn't report it,
+/// leaving the size to carry the signal (best-effort, same coarse-mtime
+/// tradeoff the loc signature accepts).
+fn watched_stat_sig(path: &std::path::Path) -> Option<(u64, u128)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((meta.len(), mtime))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1626,6 +1669,54 @@ mod tests {
     fn filetime_set(path: &std::path::Path, time: std::time::SystemTime) {
         let file = std::fs::File::options().write(true).open(path).unwrap();
         file.set_modified(time).unwrap();
+    }
+
+    // ── watched_stat_sig (B1 stat-gate for watched CHANGED validation) ─────
+
+    #[test]
+    fn test_watched_stat_sig_stable_for_unchanged_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo = { }\n").unwrap();
+        let s1 = watched_stat_sig(&f);
+        let s2 = watched_stat_sig(&f);
+        assert!(s1.is_some(), "an existing file must have a signature");
+        assert_eq!(s1, s2, "unchanged file must produce a stable signature");
+    }
+
+    #[test]
+    fn test_watched_stat_sig_changes_on_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo = { }\n").unwrap();
+        let before = watched_stat_sig(&f);
+        std::fs::write(&f, "foo = { }\nbar = { }\n").unwrap();
+        let after = watched_stat_sig(&f);
+        assert_ne!(before, after, "a size change must change the signature");
+    }
+
+    #[test]
+    fn test_watched_stat_sig_changes_on_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo = { }\n").unwrap();
+        let before = watched_stat_sig(&f);
+        // Same length, bumped mtime — a same-size rewrite (common with
+        // formatters / atomic saves) must still invalidate the skip.
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        filetime_set(&f, newer);
+        let after = watched_stat_sig(&f);
+        assert_ne!(before, after, "an mtime bump must change the signature");
+    }
+
+    #[test]
+    fn test_watched_stat_sig_none_for_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("does_not_exist.txt");
+        assert!(
+            watched_stat_sig(&f).is_none(),
+            "a missing file has no signature, so the caller can't skip it"
+        );
     }
 
     // ── ScanGuard (B1 re-entrancy guard) ──────────────────────────────────
