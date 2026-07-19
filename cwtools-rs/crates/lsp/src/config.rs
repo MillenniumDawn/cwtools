@@ -114,6 +114,13 @@ impl Backend {
             .update_ruleset_data(var_effects);
         drop(rules);
         self.bump_info_revision();
+        // A new ruleset changes what validation produces, so invalidate the
+        // quiet-pass short-circuit fingerprint (reloadrulesconfig re-scans in
+        // the foreground right after, but the bump keeps this honest even if a
+        // future caller doesn't).
+        self.state
+            .settings_generation
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) async fn initialize_impl(
@@ -582,6 +589,13 @@ impl Backend {
                 cfg.background_reindex_idle_seconds = secs;
             }
         }
+        // Something the validation pass observes (ignore globs, suppressed
+        // codes) may have changed, so invalidate the quiet-pass short-circuit
+        // fingerprint: the next background pass must re-run and re-publish the
+        // non-open files with the new config, not skip on an unchanged file set.
+        self.state
+            .settings_generation
+            .fetch_add(1, Ordering::SeqCst);
         let (n_files, n_dirs, n_codes) = counts;
         tracing::info!(
             file_globs = ?n_files,

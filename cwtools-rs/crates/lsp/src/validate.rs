@@ -1011,7 +1011,14 @@ impl Backend {
                 };
 
                 if let Some(msg) = log_msg {
-                    self.client.log_message(MessageType::INFO, msg).await;
+                    // Demoted from a client `log_message` to tracing: this
+                    // per-validation line fired on every debounced keystroke and
+                    // every watched-file validation, and was the dominant
+                    // output-channel "log spam" the user reported. It still
+                    // lands in the CWTOOLS_PROFILE ring buffer (exportProfilingLog)
+                    // and on stderr under RUST_LOG — where a profiling capture
+                    // wants it — but no longer floods the client.
+                    tracing::info!(target: "cwtools::profile", "{}", msg);
                 }
 
                 for err in &errors {
