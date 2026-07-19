@@ -247,13 +247,11 @@ pub struct TypeIndex {
     /// file_uri → the set of `map` bucket keys (type names) that file contributes
     /// instances to. Lets [`remove_file`](Self::remove_file) visit only the
     /// buckets the file actually touched (O(the file's own entries)) instead of
-    /// scanning every bucket of `self.map` (O(total instances) — the single
-    /// largest cost of a reindex at Millennium Dawn scale). Every insertion path
-    /// (`merge`, `merge_with_uris`) records its buckets here, and every removal
-    /// path (`remove_file`, `remove_files`) prunes them, so the reverse map stays
-    /// a faithful inverse of `map`'s uris. Not serialized: the vanilla cache
-    /// stores only instances and reloads them through `merge_with_uris`, which
-    /// rebuilds this map (same as `name_counts` / `instance_sets`).
+    /// scanning every bucket of `self.map` (O(total instances)). Kept in sync by
+    /// every insertion (`merge`, `merge_with_uris`) and removal (`remove_file`,
+    /// `remove_files`) path. Not serialized: the vanilla cache reloads through
+    /// `merge_with_uris`, which rebuilds this map (same as `name_counts` /
+    /// `instance_sets`).
     file_buckets: FxHashMap<Arc<str>, FxHashSet<String>>,
     /// Index of every asset/file path under the game roots, for `filepath`
     /// reference checks (CW113). Empty unless the CLI populated it.
@@ -399,9 +397,8 @@ impl TypeIndex {
         let uri: Arc<str> = Arc::from(file_uri);
         for (type_name, instances) in per_type {
             let subtype_key = is_subtype_key(&type_name);
-            // Record the bucket in the reverse map so `remove_file` can find it
-            // without scanning every bucket. All of this file's instances share
-            // the one `uri`, so a single insert per type covers them.
+            // All of this file's instances share the one `uri`, so a single
+            // reverse-map insert per type covers them.
             self.file_buckets
                 .entry(Arc::clone(&uri))
                 .or_default()
@@ -438,10 +435,8 @@ impl TypeIndex {
                     *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
                 }
                 *set.entry(lower).or_insert(0) += 1;
-                // Each instance can come from a different file, so record this
-                // bucket under its own uri. Clone the type name only the first
-                // time a uri contributes to it (the batch's common case is many
-                // instances of one type per file).
+                // Each instance can come from a different file, so key on its own
+                // uri; clone the type name only the first time it's seen per uri.
                 let bucket = self.file_buckets.entry(Arc::clone(&uri)).or_default();
                 if !bucket.contains(type_name.as_str()) {
                     bucket.insert(type_name.clone());
@@ -479,11 +474,8 @@ impl TypeIndex {
         }
         self.map.retain(|_, v| !v.is_empty());
         self.instance_sets.retain(|_, names| !names.is_empty());
-        // Drop the reverse-map entries for the removed files. Surviving files
-        // still contribute to exactly the buckets they did before (their
-        // instances were untouched), and any bucket emptied here had no
-        // surviving contributor, so no survivor's `file_buckets` set is left
-        // pointing at a bucket that no longer exists.
+        // Surviving files' buckets are untouched, so dropping just the removed
+        // files' entries keeps the reverse map a faithful inverse of `map`.
         for uri in file_uris {
             self.file_buckets.remove(uri);
         }
@@ -493,16 +485,13 @@ impl TypeIndex {
     ///
     /// Visits only the `map` buckets the reverse map (`file_buckets`) records for
     /// this file, so the cost is proportional to the file's own entries rather
-    /// than the whole index. Empty buckets are pruned exactly as the old
-    /// scan-everything version did: a `map` bucket empties only when its last
-    /// contributor is removed, and that contributor always has the bucket in its
-    /// `file_buckets` set, so the emptied bucket is always visited and dropped
-    /// here — no lingering empty bucket survives (matching `remove_files`).
+    /// than the whole index. A bucket empties only when its last contributor is
+    /// removed, and that contributor always has the bucket in its `file_buckets`
+    /// set, so every emptied bucket is still visited and pruned here.
     pub fn remove_file(&mut self, file_uri: &str) {
         self.complex_enum_values.remove_file(file_uri);
         self.value_set_values.remove_file(file_uri);
-        // Take the file's bucket set out of the reverse map (dropping its entry).
-        // A file that contributed no type instances has no entry: nothing to do.
+        // No entry means the file contributed no type instances.
         let Some(buckets) = self.file_buckets.remove(file_uri) else {
             return;
         };
