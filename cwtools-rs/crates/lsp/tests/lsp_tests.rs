@@ -4097,11 +4097,9 @@ fn storm_server(
 ) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
     let ws_uri = format!("file://{}", ws.display());
     let mut child = cwtools_server_cmd()
-        // The per-validation `[validate]` line is a tracing event now, not a
-        // client log_message, so route it into the in-memory profiling ring
-        // buffer where the storm tests read it via exportProfilingLog.
-        // env_remove so init_tracing installs the `info` filter instead of the
-        // empty RUST_LOG="" one (which would capture nothing).
+        // The `[validate]` line is a tracing event now, read back via
+        // exportProfilingLog. env_remove so init_tracing installs the `info`
+        // filter instead of an empty RUST_LOG="" that would capture nothing.
         .env_remove("RUST_LOG")
         .env("CWTOOLS_PROFILE", "1")
         .stdin(Stdio::piped())
@@ -4210,9 +4208,7 @@ fn fetch_profiling_log(
     panic!("no exportProfilingLog response for id {id}");
 }
 
-/// Count `[validate] (trigger)` lines in a fetched profiling log — the
-/// per-validation signal that used to be a client `window/logMessage` before it
-/// was demoted to a `tracing::info!` event.
+/// Count `[validate] (trigger)` lines in a fetched profiling log.
 fn count_validate_log(log: &str, trigger: &str) -> usize {
     log.matches(&format!("[validate] ({trigger})")).count()
 }
