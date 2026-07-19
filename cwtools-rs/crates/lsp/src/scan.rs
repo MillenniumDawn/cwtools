@@ -1190,11 +1190,13 @@ impl Backend {
     /// outside the editor. Without this handler the index keeps stale entries
     /// for deleted/moved files until a window reload (#52).
     ///
-    /// DELETED events are handled inline (cheap, and correctness matters: the
-    /// index must drop the file at once). CHANGED/CREATED events are queued and
-    /// coalesced into a single trailing window (#90) so a churn burst validates
-    /// once instead of 1:1 on the message future, which held the bounded
-    /// request queue and starved cheap requests like `getFileTypes`.
+    /// Both DELETED and CHANGED/CREATED events are queued and coalesced into a
+    /// single trailing window (#90) so a churn burst drains once instead of 1:1
+    /// on the message future, which held the bounded request queue and starved
+    /// cheap requests like `getFileTypes`. DELETEs used to run inline — per file
+    /// a `clear_file` (O(whole index)) plus an awaited publish — which stalled
+    /// the message future for seconds on a 2,000-file branch switch. The drain
+    /// applies deletions first, batched under one `info_service` write.
     #[tracing::instrument(skip_all)]
     pub(crate) async fn did_change_watched_files_impl(&self, params: DidChangeWatchedFilesParams) {
         let mut enqueued = false;
@@ -1202,23 +1204,13 @@ impl Backend {
             let uri = event.uri.to_string();
             match event.typ {
                 FileChangeType::DELETED => {
-                    tracing::debug!(%uri, "watched file deleted");
-                    {
-                        let mut index = self.state.symbol_index.lock();
-                        index.clear_document(&uri);
-                    }
-                    {
-                        let mut info = self.state.info_service.write();
-                        info.clear_file(&uri);
-                    }
-                    self.state.loc_live_overlay.write().remove(&uri);
-                    // Forget any recorded watched signature so a later re-create
-                    // of this URI validates instead of matching a stale skip.
-                    self.state.watched_signatures.lock().remove(&uri);
-                    self.bump_info_revision();
-                    self.client
-                        .publish_diagnostics(event.uri, vec![], None)
-                        .await;
+                    // Queue instead of doing inline O(whole-index) work + an
+                    // awaited publish on the message future. A delete that
+                    // coincides with a CHANGED/CREATED for the same URI in this
+                    // window is resolved as a change at drain time.
+                    tracing::debug!(%uri, "watched file deleted; queued");
+                    self.state.watched_deleted.lock().insert(uri);
+                    enqueued = true;
                 }
                 FileChangeType::CHANGED | FileChangeType::CREATED => {
                     // Open state is re-checked at drain time (an open editor
@@ -1234,9 +1226,10 @@ impl Backend {
         }
     }
 
-    /// Arm a single trailing window that drains `watched_pending`. A fixed
-    /// window: if one is already scheduled or running, do nothing, so a
-    /// continuous event stream can't keep pushing the drain further out.
+    /// Arm a single trailing window that drains the queued watched events
+    /// (`watched_pending` + `watched_deleted`). A fixed window: if one is
+    /// already scheduled or running, do nothing, so a continuous event stream
+    /// can't keep pushing the drain further out.
     fn arm_watched_batch(&self) {
         let mut guard = self.state.watched_debounce.lock();
         if guard.as_ref().is_some_and(|h| !h.is_finished()) {
@@ -1251,23 +1244,46 @@ impl Backend {
         *guard = Some(handle);
     }
 
-    /// Drain the queued watched files and validate them off the message future.
-    /// A batch larger than `WATCHED_BULK_CAP` (a rules re-clone or git checkout
-    /// touching everything) collapses into one CAS-guarded rescan instead of
-    /// hundreds of per-file validations. Re-arms if new events landed while it
-    /// was running.
+    /// Drain the queued watched events (changes + deletes) and apply them off
+    /// the message future. A batch larger than `WATCHED_BULK_CAP` (a rules
+    /// re-clone or git checkout touching everything) collapses into one
+    /// CAS-guarded rescan instead of hundreds of per-file validations —
+    /// the rescan's on-disk prune drops the deleted URIs too, so the deletes
+    /// need no separate handling on that path. Below the cap, deletions apply
+    /// first (batched under one `info_service` write), then per-file
+    /// validation. Re-arms if new events landed while it was running.
     async fn process_watched_batch(&self) {
-        let batch: Vec<String> = { self.state.watched_pending.lock().drain().collect() };
-        if batch.is_empty() {
+        let changes: HashSet<String> = { self.state.watched_pending.lock().drain().collect() };
+        // A URI that both changed and was deleted this window is treated as a
+        // change (validate the current on-disk file), so filter those out of
+        // the delete set before doing any O(index) removal work.
+        let deletes: Vec<String> = {
+            let mut deleted = self.state.watched_deleted.lock();
+            resolve_watched_deletes(&changes, deleted.drain())
+        };
+        if changes.is_empty() && deletes.is_empty() {
             return;
         }
-        if batch.len() > WATCHED_BULK_CAP {
-            tracing::info!(count = batch.len(), "watched batch over cap; full rescan");
+        if watched_batch_over_cap(changes.len(), deletes.len()) {
+            tracing::info!(
+                changes = changes.len(),
+                deletes = deletes.len(),
+                "watched batch over cap; full rescan"
+            );
             if !self.validate_entire_workspace(true).await {
-                self.state.watched_pending.lock().extend(batch);
+                // Lost the CAS to a running scan — requeue both sides so the
+                // next window retries, exactly as the changes-only path did.
+                self.state.watched_pending.lock().extend(changes);
+                self.state.watched_deleted.lock().extend(deletes);
             }
         } else {
-            for uri in batch {
+            // Deletions first, in ONE info_service write scope, so a re-created
+            // file's later change validates against an index that already
+            // forgot the stale entry.
+            if !deletes.is_empty() {
+                self.process_watched_deletes(&deletes).await;
+            }
+            for uri in changes {
                 // An open editor buffer owns its diagnostics; skip files that
                 // are open now, regardless of open state when queued.
                 if self.state.documents.lock().contains_key(&uri) {
@@ -1329,8 +1345,52 @@ impl Backend {
         // event while we ran can arm the next window (or we do it here). Setting
         // the slot to `None` only detaches this finished task, it doesn't abort.
         *self.state.watched_debounce.lock() = None;
-        if !self.state.watched_pending.lock().is_empty() {
+        // Each guard is scoped to its own `let` so the two queue locks are never
+        // held at once (they're taken pending-then-deleted everywhere).
+        let pending_more = !self.state.watched_pending.lock().is_empty();
+        let deleted_more = !self.state.watched_deleted.lock().is_empty();
+        if pending_more || deleted_more {
             self.arm_watched_batch();
+        }
+    }
+
+    /// Apply a coalesced batch of DELETE events off the message future: forget
+    /// each URI from the symbol index, the info service (one write scope), the
+    /// loc overlay, and the watched-signature record, bump the info revision
+    /// ONCE for the whole batch, then publish empty diagnostics per URI outside
+    /// every lock. Same side effects the old inline per-file DELETE path had,
+    /// batched — one `info_service` write and one revision bump for the whole
+    /// branch switch instead of one per file.
+    async fn process_watched_deletes(&self, deletes: &[String]) {
+        {
+            let mut index = self.state.symbol_index.lock();
+            for uri in deletes {
+                index.clear_document(uri);
+            }
+        }
+        {
+            let mut info = self.state.info_service.write();
+            for uri in deletes {
+                info.clear_file(uri);
+            }
+        }
+        {
+            let mut overlay = self.state.loc_live_overlay.write();
+            for uri in deletes {
+                overlay.remove(uri);
+            }
+        }
+        {
+            let mut sigs = self.state.watched_signatures.lock();
+            for uri in deletes {
+                sigs.remove(uri);
+            }
+        }
+        self.bump_info_revision();
+        for uri in deletes {
+            if let Ok(uri_obj) = Url::parse(uri) {
+                self.client.publish_diagnostics(uri_obj, vec![], None).await;
+            }
         }
     }
 
@@ -1486,6 +1546,26 @@ fn loc_signature_for(mut files: Vec<std::path::PathBuf>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+/// Drop from `deletes` any URI that also arrived as a CHANGED/CREATED this
+/// window: a delete coincident with a re-create (an atomic save's
+/// remove+rewrite, a git checkout that deletes then restores) is a change —
+/// validate the current on-disk file rather than dropping its index entry.
+/// Split out so the overlap rule is unit-testable without a live `Backend`.
+fn resolve_watched_deletes(
+    changes: &HashSet<String>,
+    deletes: impl Iterator<Item = String>,
+) -> Vec<String> {
+    deletes.filter(|uri| !changes.contains(uri)).collect()
+}
+
+/// Whether a coalesced watched batch (changes + deletes together) exceeds the
+/// per-file cap and should collapse into one workspace rescan instead. Counts
+/// both sides so a delete-heavy branch switch trips the cap the same way a
+/// change-heavy one does. Saturating so an absurd count can't wrap.
+fn watched_batch_over_cap(changes: usize, deletes: usize) -> bool {
+    changes.saturating_add(deletes) > WATCHED_BULK_CAP
 }
 
 /// Stat-only signature (file size, mtime-nanos) for a single watched file —
@@ -1717,6 +1797,51 @@ mod tests {
             watched_stat_sig(&f).is_none(),
             "a missing file has no signature, so the caller can't skip it"
         );
+    }
+
+    // ── watched batch coalescing (B2: delete + change in one window) ───────
+
+    #[test]
+    fn test_resolve_watched_deletes_excludes_changed_uris() {
+        let changes: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let deletes: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        let out = resolve_watched_deletes(&changes, deletes.into_iter());
+        assert_eq!(
+            out,
+            vec!["b".to_string()],
+            "a URI both deleted and changed in one window is a change, not a delete"
+        );
+    }
+
+    #[test]
+    fn test_resolve_watched_deletes_passes_through_pure_deletes() {
+        let changes: HashSet<String> = HashSet::new();
+        let deletes: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        let mut out = resolve_watched_deletes(&changes, deletes.into_iter());
+        out.sort();
+        assert_eq!(
+            out,
+            vec!["a".to_string(), "b".to_string()],
+            "deletes with no coincident change pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn test_watched_batch_over_cap_counts_deletes_and_changes() {
+        // At the cap is not over it (matches the changes-only `> CAP` today).
+        assert!(!watched_batch_over_cap(WATCHED_BULK_CAP, 0));
+        assert!(watched_batch_over_cap(WATCHED_BULK_CAP, 1));
+        // Deletes alone can trip the cap, and so can a delete+change mix that
+        // neither side would trip on its own.
+        assert!(watched_batch_over_cap(0, WATCHED_BULK_CAP + 1));
+        assert!(watched_batch_over_cap(
+            WATCHED_BULK_CAP / 2 + 1,
+            WATCHED_BULK_CAP / 2 + 1
+        ));
+        assert!(!watched_batch_over_cap(
+            WATCHED_BULK_CAP / 2,
+            WATCHED_BULK_CAP / 2
+        ));
     }
 
     // ── ScanGuard (B1 re-entrancy guard) ──────────────────────────────────

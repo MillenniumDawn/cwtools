@@ -324,6 +324,13 @@ struct DocumentState {
     /// instead of validating 1:1 on the message future and starving the
     /// bounded request queue (#90).
     watched_pending: Mutex<HashSet<String>>,
+    /// URIs of watched files DELETED since the last drain, queued into the same
+    /// coalescing window as `watched_pending` instead of doing inline
+    /// O(whole-index) `clear_file` + a publish round-trip on the message
+    /// future. The drain processes these first, in one `info_service` write
+    /// scope; a URI that also arrived as a CHANGED/CREATED in the same window
+    /// is treated as a change (validated), not a delete.
+    watched_deleted: Mutex<HashSet<String>>,
     /// The single in-flight watched-batch window, if one is armed. A live
     /// (not-yet-finished) handle means a window is already scheduled, so a
     /// continuous event stream can't keep pushing the trailing window back.
@@ -449,6 +456,7 @@ impl DocumentState {
             start: std::time::Instant::now(),
             last_activity_ms: AtomicU64::new(0),
             watched_pending: Mutex::new(HashSet::new()),
+            watched_deleted: Mutex::new(HashSet::new()),
             watched_debounce: Mutex::new(None),
             watched_signatures: Mutex::new(HashMap::new()),
         }
