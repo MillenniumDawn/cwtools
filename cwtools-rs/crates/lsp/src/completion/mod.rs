@@ -167,13 +167,17 @@ fn filter_and_cap(
 
 fn prepare_context_items(
     items: Vec<CompletionItem>,
+    built_dropped: usize,
     token: &str,
     ast_clean: bool,
     ast_current: bool,
     complete_threshold: usize,
     cap: usize,
 ) -> (Vec<CompletionItem>, bool, &'static str) {
-    if ast_clean && ast_current && items.len() <= complete_threshold {
+    // A list is only "complete" (client filters it locally with no further
+    // requests) if the builders dropped nothing: any build-time prefiltered
+    // candidate could match a different token after a backspace.
+    if built_dropped == 0 && ast_clean && ast_current && items.len() <= complete_threshold {
         return (items, false, "complete");
     }
     let (items, _) = filter_and_cap(items, token, cap);
@@ -510,7 +514,7 @@ impl Backend {
         // list from a dirty parse must stay `is_incomplete: true` even though
         // its size alone would otherwise qualify it as `"complete"` below.
         let mut context_is_clean = false;
-        let context_items: Option<(Vec<CompletionItem>, bool)> =
+        let context_items: Option<(Vec<CompletionItem>, usize, bool)> =
             match (effective_ast, ruleset_arc.as_ref()) {
                 (Some(ast), Some(rs)) => {
                     if is_stale() {
@@ -548,9 +552,9 @@ impl Backend {
                     let t_build = Instant::now();
                     let items = match rctx_opt {
                         // Outside any known entity — offer root-type snippets.
-                        None => Some((root_type_snippets(rs, &logical_path), false)),
+                        None => Some((root_type_snippets(rs, &logical_path), 0, false)),
                         Some(rctx) => {
-                            let (items, resolved_value_pos) =
+                            let ((items, built_dropped), resolved_value_pos) =
                                 if rctx.leaf.as_ref().is_some_and(|l| l.in_value) {
                                     let is_bare_key = rctx.leaf.as_ref().is_some_and(|l| {
                                         l.key.is_empty() && rctx.value_rules.is_empty()
@@ -567,6 +571,7 @@ impl Backend {
                                                 &modifier_scopes_arc,
                                                 scope_registry_arc.as_deref(),
                                                 rctx.scope.as_ref().map(|s| s.current()),
+                                                &token,
                                             ),
                                             false,
                                         )
@@ -590,6 +595,7 @@ impl Backend {
                                                     loc_keys: &loc_keys,
                                                 },
                                                 rctx.scope.as_ref().map(|s| s.current()),
+                                                &token,
                                             ),
                                             !rctx.value_rules.is_empty(),
                                         )
@@ -627,6 +633,7 @@ impl Backend {
                                                 loc_keys: &loc_keys,
                                             },
                                             rctx.scope.as_ref().map(|s| s.current()),
+                                            &token,
                                         ),
                                         resolved,
                                     )
@@ -641,11 +648,12 @@ impl Backend {
                                             &modifier_scopes_arc,
                                             scope_registry_arc.as_deref(),
                                             rctx.scope.as_ref().map(|s| s.current()),
+                                            &token,
                                         ),
                                         false,
                                     )
                                 };
-                            Some((items, resolved_value_pos))
+                            Some((items, built_dropped, resolved_value_pos))
                         }
                     };
                     build_dur = t_build.elapsed();
@@ -654,10 +662,14 @@ impl Backend {
                 _ => None,
             };
 
-        if let Some((items, resolved_value_pos)) = context_items {
-            if !items.is_empty() {
+        if let Some((items, built_dropped, resolved_value_pos)) = context_items {
+            // `built_dropped > 0` with an empty list still means the context
+            // resolved (every candidate was prefiltered out) — return the empty
+            // incomplete list rather than falling into the flat fallback dump.
+            if !items.is_empty() || built_dropped > 0 {
                 let (mut items, is_incomplete, strategy) = prepare_context_items(
                     items,
+                    built_dropped,
                     &token,
                     context_is_clean,
                     ast_source.is_current(),
@@ -946,7 +958,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");
@@ -988,7 +1002,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
         let name = items
             .iter()
             .find(|i| i.label == "name")
@@ -1028,7 +1044,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
         assert!(!items.is_empty(), "expected some completions");
         for item in &items {
             assert!(
@@ -1285,7 +1303,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
 
         let if_item = items
             .iter()
@@ -1317,7 +1337,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
 
         let appp = items
             .iter()
@@ -1414,7 +1436,9 @@ mod tests {
             &Default::default(),
             Some(&reg),
             Some(country),
-        );
+            "",
+        )
+        .0;
         let sort = |label: &str| {
             items
                 .iter()
@@ -1539,7 +1563,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
 
         let always = items
             .iter()
@@ -1620,7 +1646,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
 
         let has_dlc = items
             .iter()
@@ -1683,7 +1711,9 @@ mod tests {
                 loc_keys: &HashSet::new(),
             },
             None,
-        );
+            "",
+        )
+        .0;
 
         let spaced = items
             .iter()
@@ -1785,7 +1815,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
 
         assert!(
             items.iter().any(|i| i.label == "my_special_effect"),
@@ -1841,7 +1873,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
 
         assert!(
             items.iter().any(|i| i.label == "my_modifier"),
@@ -1877,7 +1911,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
         let count = items.iter().filter(|i| i.label == "active").count();
         assert_eq!(
             count, 1,
@@ -1955,7 +1991,7 @@ mod tests {
     #[test]
     fn prepare_context_items_marks_small_current_clean_list_complete() {
         let items = vec![item("allowed"), item("cost")];
-        let (out, incomplete, strategy) = prepare_context_items(items, "", true, true, 10, 10);
+        let (out, incomplete, strategy) = prepare_context_items(items, 0, "", true, true, 10, 10);
         assert_eq!(out.len(), 2);
         assert!(!incomplete);
         assert_eq!(strategy, "complete");
@@ -1964,7 +2000,7 @@ mod tests {
     #[test]
     fn prepare_context_items_marks_small_stale_list_incomplete() {
         let items = vec![item("allowed"), item("cost")];
-        let (out, incomplete, strategy) = prepare_context_items(items, "", true, false, 10, 10);
+        let (out, incomplete, strategy) = prepare_context_items(items, 0, "", true, false, 10, 10);
         assert_eq!(out.len(), 2);
         assert!(incomplete);
         assert_eq!(strategy, "filtered");
@@ -1973,7 +2009,7 @@ mod tests {
     #[test]
     fn prepare_context_items_marks_dirty_list_incomplete() {
         let items = vec![item("allowed"), item("cost")];
-        let (out, incomplete, strategy) = prepare_context_items(items, "", false, true, 10, 10);
+        let (out, incomplete, strategy) = prepare_context_items(items, 0, "", false, true, 10, 10);
         assert_eq!(out.len(), 2);
         assert!(incomplete);
         assert_eq!(strategy, "filtered");
@@ -1982,7 +2018,7 @@ mod tests {
     #[test]
     fn prepare_context_items_filters_and_caps_large_list() {
         let items: Vec<CompletionItem> = (0..10).map(|i| item(&format!("item_{i}"))).collect();
-        let (out, incomplete, strategy) = prepare_context_items(items, "", true, true, 3, 3);
+        let (out, incomplete, strategy) = prepare_context_items(items, 0, "", true, true, 3, 3);
         assert_eq!(out.len(), 3);
         assert!(incomplete);
         assert_eq!(strategy, "filtered");
@@ -2124,30 +2160,38 @@ mod tests {
             Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) => rules.as_slice(),
             _ => panic!("expected TypeRule"),
         };
-        snips.extend(snippet_texts(&completions_from_rules(
-            rules,
-            &rs,
-            &info,
-            "hoi4",
-            &empty,
-            &Default::default(),
-            None,
-            None,
-        )));
+        snips.extend(snippet_texts(
+            &completions_from_rules(
+                rules,
+                &rs,
+                &info,
+                "hoi4",
+                &empty,
+                &Default::default(),
+                None,
+                None,
+                "",
+            )
+            .0,
+        ));
         snips.extend(snippet_texts(&root_type_snippets(&rs, "events/x.txt")));
 
         // Alias block (required child prefill) + value alias.
         let rs = alias_effect_ruleset();
-        snips.extend(snippet_texts(&completions_from_rules(
-            &effect_alias_usage(),
-            &rs,
-            &info,
-            "hoi4",
-            &empty,
-            &Default::default(),
-            None,
-            None,
-        )));
+        snips.extend(snippet_texts(
+            &completions_from_rules(
+                &effect_alias_usage(),
+                &rs,
+                &info,
+                "hoi4",
+                &empty,
+                &Default::default(),
+                None,
+                None,
+                "",
+            )
+            .0,
+        ));
 
         // Enum choice with spaced / comma / colon values.
         let rs = dlc_enum_ruleset();
@@ -2158,16 +2202,20 @@ mod tests {
             },
             Options::default(),
         )];
-        snips.extend(snippet_texts(&completions_from_rules(
-            &trigger_usage,
-            &rs,
-            &info,
-            "hoi4",
-            &empty,
-            &Default::default(),
-            None,
-            None,
-        )));
+        snips.extend(snippet_texts(
+            &completions_from_rules(
+                &trigger_usage,
+                &rs,
+                &info,
+                "hoi4",
+                &empty,
+                &Default::default(),
+                None,
+                None,
+                "",
+            )
+            .0,
+        ));
 
         // A required NODE child — the case that used to emit `${1:{ }}`.
         let node_required = vec![(
@@ -2237,7 +2285,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
         let danger = items
             .iter()
             .find(|i| i.label == "danger")
@@ -2438,7 +2488,7 @@ mod perf_bench {
                 format!("effect key (token {:?})", token)
             };
             bench(&label, || {
-                let items = completions_from_rules(
+                let (items, dropped) = completions_from_rules(
                     &effect_rules,
                     &rs,
                     &info,
@@ -2447,9 +2497,11 @@ mod perf_bench {
                     &modifier_scopes,
                     Some(&reg),
                     Some(country),
+                    token,
                 );
                 let (items, _, _) = prepare_context_items(
                     items,
+                    dropped,
                     token,
                     true,
                     true,
@@ -2461,7 +2513,7 @@ mod perf_bench {
         }
 
         bench("modifier key (scoped)", || {
-            let items = completions_from_rules(
+            let (items, dropped) = completions_from_rules(
                 &modifier_rules,
                 &rs,
                 &info,
@@ -2470,9 +2522,11 @@ mod perf_bench {
                 &modifier_scopes,
                 Some(&reg),
                 Some(country),
+                "",
             );
             let (items, _, _) = prepare_context_items(
                 items,
+                dropped,
                 "",
                 true,
                 true,
@@ -2492,7 +2546,7 @@ mod perf_bench {
             Options::default(),
         )];
         bench("state value (token 28)", || {
-            let items = value_completions(
+            let (items, dropped) = value_completions(
                 &state_value_rules,
                 &rs,
                 &info,
@@ -2504,9 +2558,11 @@ mod perf_bench {
                     loc_keys: &HashSet::new(),
                 },
                 Some(country),
+                "28",
             );
             let (items, _, _) = prepare_context_items(
                 items,
+                dropped,
                 "28",
                 true,
                 true,

@@ -54,6 +54,54 @@ impl ScopeRank {
     }
 }
 
+/// Build-time prefilter for the unbounded candidate sources (type instances,
+/// pattern-expanded aliases, enum members, modifiers, dynamic value sets).
+/// Skips a candidate that can't survive the response filter BEFORE its item is
+/// allocated, and bounds how many unbounded-source items are built at all, so
+/// a keystroke in an MD-scale block doesn't construct thousands of items only
+/// for the post-sort cap to discard them. Bounded sources (concrete keys,
+/// exact alias keys, scope names) are never filtered here.
+///
+/// `dropped` counts every skipped candidate; any non-zero value must force
+/// `is_incomplete` on the response, so the client re-queries instead of
+/// treating the list as complete.
+pub(crate) struct BuildFilter<'a> {
+    token: &'a str,
+    budget: usize,
+    dropped: usize,
+}
+
+impl<'a> BuildFilter<'a> {
+    /// Unbounded-source item budget per request. Well above the response cap so
+    /// the post-build sort still sees a meaningful pool, while bounding the
+    /// worst-case (empty token, tens of thousands of candidates) build cost.
+    const BUDGET: usize = 4 * super::CONTEXT_CAP;
+
+    pub(crate) fn new(token: &'a str) -> Self {
+        Self {
+            token,
+            budget: Self::BUDGET,
+            dropped: 0,
+        }
+    }
+
+    pub(crate) fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Whether an unbounded-source candidate is worth building.
+    fn admit(&mut self, label: &str) -> bool {
+        let ok = self.budget > 0
+            && (self.token.is_empty() || super::subsequence_match(label, self.token));
+        if ok {
+            self.budget -= 1;
+        } else {
+            self.dropped += 1;
+        }
+        ok
+    }
+}
+
 /// Whether an alias rule's body recurses into its own category
 /// (`alias_name[effect]` anywhere inside an `alias[effect:...]` block).
 /// Marks the structural wrapper/control-flow constructs — `if`, `else_if`,
@@ -159,7 +207,9 @@ pub(crate) fn completions_from_rules(
     modifier_scopes: &std::collections::HashMap<String, Vec<String>>,
     registry: Option<&cwtools_game::scope_registry::ScopeRegistry>,
     current_scope: Option<ScopeId>,
-) -> Vec<CompletionItem> {
+    token: &str,
+) -> (Vec<CompletionItem>, usize) {
+    let mut flt = BuildFilter::new(token);
     let mut items: Vec<CompletionItem> = Vec::new();
     // Per-request memo so a repeated enum is only collected/sorted once (#46).
     let mut enum_cache: std::collections::HashMap<String, Vec<String>> =
@@ -194,11 +244,19 @@ pub(crate) fn completions_from_rules(
             RuleType::LeafRule {
                 left: NewField::ValueField(ValueType::Enum(e)),
                 right,
-            } => push_enum_keyed_leaf(&mut items, &mut enum_cache, ruleset, info, e, right),
+            } => push_enum_keyed_leaf(
+                &mut items,
+                &mut enum_cache,
+                ruleset,
+                info,
+                e,
+                right,
+                &mut flt,
+            ),
             RuleType::NodeRule {
                 left: NewField::ValueField(ValueType::Enum(e)),
                 ..
-            } => push_enum_keyed_node(&mut items, &mut enum_cache, ruleset, info, e),
+            } => push_enum_keyed_node(&mut items, &mut enum_cache, ruleset, info, e, &mut flt),
             // A typed key: every instance of the type is a valid key here
             // (e.g. `equipment_type = { <equipment_group> }` blocks, or
             // `<equipment> = { ... }` entries).
@@ -215,12 +273,12 @@ pub(crate) fn completions_from_rules(
                 } else {
                     TypeInstanceStyle::LeafKey
                 };
-                push_type_instances(&mut items, info, t, style);
+                push_type_instances(&mut items, info, t, style, &mut flt);
             }
             // An enum value at the leaf level
             RuleType::LeafValueRule {
                 right: NewField::ValueField(ValueType::Enum(e)),
-            } => push_enum_leaf_values(&mut items, &mut enum_cache, ruleset, info, e),
+            } => push_enum_leaf_values(&mut items, &mut enum_cache, ruleset, info, e, &mut flt),
             // A bare type reference value
             RuleType::LeafValueRule {
                 right: NewField::TypeField(TypeType::Simple(t)),
@@ -228,7 +286,7 @@ pub(crate) fn completions_from_rules(
             | RuleType::LeafRule {
                 right: NewField::TypeField(TypeType::Simple(t)),
                 ..
-            } => push_type_instances(&mut items, info, t, TypeInstanceStyle::Reference),
+            } => push_type_instances(&mut items, info, t, TypeInstanceStyle::Reference, &mut flt),
             // An alias expansion
             RuleType::LeafRule {
                 right: NewField::AliasField(cat),
@@ -249,6 +307,7 @@ pub(crate) fn completions_from_rules(
                     modifier_scopes,
                     cat,
                     scope_ctx,
+                    &mut flt,
                 );
                 // A category with a `scope_field` alias (effect/trigger) accepts a
                 // scope-switch key here (`mio:ORG = { … }`), so offer those keys too
@@ -259,7 +318,7 @@ pub(crate) fn completions_from_rules(
                         .get(cat)
                         .is_some_and(|c| c.scope_field_idx.is_some())
                 {
-                    push_scope_link_keys(&mut items, ruleset, info);
+                    push_scope_link_keys(&mut items, ruleset, info, &mut flt);
                     scope_links_emitted = true;
                 }
             }
@@ -278,6 +337,7 @@ pub(crate) fn completions_from_rules(
                 modifier_scopes,
                 cat,
                 scope_ctx,
+                &mut flt,
             ),
             // Scope names
             RuleType::LeafRule {
@@ -305,7 +365,7 @@ pub(crate) fn completions_from_rules(
     let mut seen_labels: HashSet<String> = HashSet::new();
     items.retain(|item| seen_labels.insert(item.label.clone()));
 
-    items
+    (items, flt.dropped())
 }
 
 /// A concrete leaf key (`key = <value>`): one `FIELD` item completing to
@@ -392,12 +452,16 @@ fn push_enum_keyed_leaf(
     info: &InfoService,
     e: &str,
     right: &NewField,
+    flt: &mut BuildFilter,
 ) {
     let snippet_value = match right {
         NewField::ValueField(ValueType::Bool) => "${1|yes,no|}".to_string(),
         _ => "${1}".to_string(),
     };
     for v in all_enum_values_cached(enum_cache, ruleset, info, e) {
+        if !flt.admit(v) {
+            continue;
+        }
         items.push(CompletionItem {
             label: v.clone(),
             kind: Some(CompletionItemKind::FIELD),
@@ -419,8 +483,12 @@ fn push_enum_keyed_node(
     ruleset: &RuleSet,
     info: &InfoService,
     e: &str,
+    flt: &mut BuildFilter,
 ) {
     for v in all_enum_values_cached(enum_cache, ruleset, info, e) {
+        if !flt.admit(v) {
+            continue;
+        }
         items.push(CompletionItem {
             label: v.clone(),
             kind: Some(CompletionItemKind::STRUCT),
@@ -441,8 +509,12 @@ fn push_enum_leaf_values(
     ruleset: &RuleSet,
     info: &InfoService,
     e: &str,
+    flt: &mut BuildFilter,
 ) {
     for v in all_enum_values_cached(enum_cache, ruleset, info, e) {
+        if !flt.admit(v) {
+            continue;
+        }
         items.push(CompletionItem {
             label: v.clone(),
             kind: Some(CompletionItemKind::ENUM_MEMBER),
@@ -473,8 +545,12 @@ fn push_type_instances(
     info: &InfoService,
     t: &str,
     style: TypeInstanceStyle,
+    flt: &mut BuildFilter,
 ) {
     for (_, inst) in info.type_index.instances(t) {
+        if !flt.admit(&inst.name) {
+            continue;
+        }
         let (kind, insert_text) = match style {
             TypeInstanceStyle::NodeKey => (
                 CompletionItemKind::STRUCT,
@@ -530,6 +606,7 @@ pub(crate) fn type_instance_detail(info: &InfoService, t: &str, name: &str) -> O
 /// scope-specific requirement is ranked into the top bucket (#78). The scope test
 /// reuses the validator's `scope_matches_required`, so completion and validation
 /// agree on what is in scope.
+#[allow(clippy::too_many_arguments)]
 fn push_alias_keys(
     items: &mut Vec<CompletionItem>,
     ruleset: &RuleSet,
@@ -538,6 +615,7 @@ fn push_alias_keys(
     modifier_scopes: &std::collections::HashMap<String, Vec<String>>,
     cat: &str,
     scope: ScopeCtx,
+    flt: &mut BuildFilter,
 ) {
     let prefix = format!("{}:", cat);
     // Pre-pass: aggregate a scope verdict per exact-alias key across all its
@@ -660,6 +738,9 @@ fn push_alias_keys(
                         if seen.contains_key(&inst.name) {
                             continue;
                         }
+                        if !flt.admit(&inst.name) {
+                            continue;
+                        }
                         let snippet = alias_completion_snippet(&inst.name, rule, ruleset);
                         items.push(CompletionItem {
                             label: inst.name.clone(),
@@ -675,6 +756,9 @@ fn push_alias_keys(
                 PatternKind::Enum => {
                     for v in all_enum_values(ruleset, info, &pattern.placeholder_name) {
                         if seen.contains_key(&v) {
+                            continue;
+                        }
+                        if !flt.admit(&v) {
                             continue;
                         }
                         let snippet = alias_completion_snippet(&v, rule, ruleset);
@@ -696,6 +780,9 @@ fn push_alias_keys(
                         .values(&pattern.placeholder_name)
                     {
                         if seen.contains_key(v) {
+                            continue;
+                        }
+                        if !flt.admit(v) {
                             continue;
                         }
                         let snippet = alias_completion_snippet(v, rule, ruleset);
@@ -726,6 +813,9 @@ fn push_alias_keys(
         // expanded/lowercased names as `modifier_keys`, so nothing shifts when the
         // scope is unknown (#78).
         for m in modifier_keys {
+            if !flt.admit(m) {
+                continue;
+            }
             let scope_rank = match scope {
                 Some((current, reg)) => {
                     let scopes = modifier_scopes.get(m).map(Vec::as_slice).unwrap_or(&[]);
@@ -800,7 +890,12 @@ pub(crate) fn expanded_modifier_scopes(
 /// scope switch is rarely completed by typing a raw country tag / state id, and
 /// goto/hover still resolve those. Capped so a mod with thousands of MIOs can't
 /// bury the block's real effects.
-fn push_scope_link_keys(items: &mut Vec<CompletionItem>, ruleset: &RuleSet, info: &InfoService) {
+fn push_scope_link_keys(
+    items: &mut Vec<CompletionItem>,
+    ruleset: &RuleSet,
+    info: &InfoService,
+    flt: &mut BuildFilter,
+) {
     const SCOPE_LINK_KEY_CAP: usize = 2000;
     let mut count = 0usize;
     for li in &ruleset.link_inputs {
@@ -819,6 +914,9 @@ fn push_scope_link_keys(items: &mut Vec<CompletionItem>, ruleset: &RuleSet, info
                     return;
                 }
                 let label = format!("{}{}", prefix, inst.name);
+                if !flt.admit(&label) {
+                    continue;
+                }
                 items.push(CompletionItem {
                     label: label.clone(),
                     kind: Some(CompletionItemKind::REFERENCE),
@@ -1055,6 +1153,7 @@ pub(crate) fn value_rules_need_loc_keys(
 /// `position::rules_at_pos` (alias usages already expanded to their overloads,
 /// so `has_completed_focus = |` arrives here as a `TypeField("focus")` rule).
 #[tracing::instrument(skip_all, fields(value_rules = value_rules.len()))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn value_completions(
     value_rules: &[(RuleType, cwtools_rules::rules_types::Options)],
     ruleset: &RuleSet,
@@ -1063,7 +1162,9 @@ pub(crate) fn value_completions(
     language: &str,
     sets: ValueCompletionSets<'_>,
     current_scope: Option<ScopeId>,
-) -> Vec<CompletionItem> {
+    token: &str,
+) -> (Vec<CompletionItem>, usize) {
+    let mut flt = BuildFilter::new(token);
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     // Per-request memo so a repeated enum is only collected/sorted once (#46).
@@ -1116,6 +1217,9 @@ pub(crate) fn value_completions(
             }
             NewField::TypeField(TypeType::Simple(t)) => {
                 for (_, inst) in info.type_index.instances(t) {
+                    if !flt.admit(&inst.name) {
+                        continue;
+                    }
                     push(
                         inst.name.clone(),
                         CompletionItemKind::REFERENCE,
@@ -1137,8 +1241,12 @@ pub(crate) fn value_completions(
                 // `Simple` case above does via its own `label`. Complex type
                 // refs are rare enough that this stays eager.
                 for (_, inst) in info.type_index.instances(name) {
+                    let label = format!("{}{}{}", prefix, inst.name, suffix);
+                    if !flt.admit(&label) {
+                        continue;
+                    }
                     push(
-                        format!("{}{}{}", prefix, inst.name, suffix),
+                        label,
                         CompletionItemKind::REFERENCE,
                         Some(format!("{} instance", name)),
                         None,
@@ -1149,6 +1257,9 @@ pub(crate) fn value_completions(
             }
             NewField::ValueField(ValueType::Enum(e)) => {
                 for v in all_enum_values_cached(&mut enum_cache, ruleset, info, e) {
+                    if !flt.admit(v) {
+                        continue;
+                    }
                     // A value with whitespace/special chars must insert quoted so
                     // it parses as one token (`"No Compromise, No Surrender"`); a
                     // bare identifier inserts as its own label.
@@ -1185,6 +1296,9 @@ pub(crate) fn value_completions(
                     prefix.as_deref(),
                     extension.as_deref(),
                 ) {
+                    if !flt.admit(&value) {
+                        continue;
+                    }
                     let quoted = quote_if_needed(&value);
                     push(
                         value.clone(),
@@ -1198,6 +1312,9 @@ pub(crate) fn value_completions(
             }
             NewField::IconField(folder) => {
                 for value in icon_values(&info.type_index.file_index, folder) {
+                    if !flt.admit(&value) {
+                        continue;
+                    }
                     let quoted = quote_if_needed(&value);
                     push(
                         value.clone(),
@@ -1242,26 +1359,29 @@ pub(crate) fn value_completions(
             // list is a "did you mean an existing one" hint rather than a closed
             // set; reads (`value[x]`) want exactly these. Same source either way.
             NewField::VariableGetField(ns) | NewField::VariableSetField(ns) => {
-                let source: Vec<String> = match ns.as_str() {
-                    "event_target" => info.event_target_counts.keys().cloned().collect(),
-                    "variable" => info.variable_counts.keys().cloned().collect(),
+                // Iterated per source (no collected Vec<String> clone of the
+                // whole set) so the prefilter skips before any allocation.
+                let member_iter: Box<dyn Iterator<Item = &str>> = match ns.as_str() {
+                    "event_target" => Box::new(info.event_target_counts.keys().map(String::as_str)),
+                    "variable" => Box::new(info.variable_counts.keys().map(String::as_str)),
                     // Flags/tokens/…: config-declared values plus the members
                     // collected from mod+vanilla effects (set_country_flag etc.).
-                    other => {
-                        let mut vals: Vec<String> =
-                            ruleset.values.get(other).cloned().unwrap_or_default();
-                        vals.extend(
-                            info.type_index
-                                .value_set_values
-                                .values(other)
-                                .map(str::to_string),
-                        );
-                        vals
-                    }
+                    other => Box::new(
+                        ruleset
+                            .values
+                            .get(other)
+                            .into_iter()
+                            .flatten()
+                            .map(String::as_str)
+                            .chain(info.type_index.value_set_values.values(other)),
+                    ),
                 };
-                for v in source {
+                for v in member_iter {
+                    if !flt.admit(v) {
+                        continue;
+                    }
                     push(
-                        v,
+                        v.to_string(),
                         CompletionItemKind::CONSTANT,
                         Some(format!("value[{}]", ns)),
                         None,
@@ -1284,6 +1404,7 @@ pub(crate) fn value_completions(
                     sets.modifier_scopes,
                     cat,
                     scope_ctx,
+                    &mut flt,
                 );
                 for item in &mut aliases {
                     let quoted = quote_if_needed(&item.label);
@@ -1294,6 +1415,9 @@ pub(crate) fn value_completions(
             }
             NewField::VariableField { .. } => {
                 for v in info.variable_counts.keys() {
+                    if !flt.admit(v) {
+                        continue;
+                    }
                     push(
                         v.clone(),
                         CompletionItemKind::CONSTANT,
@@ -1306,6 +1430,9 @@ pub(crate) fn value_completions(
             }
             NewField::ValueField(ValueType::MathExpr) => {
                 for v in info.variable_counts.keys() {
+                    if !flt.admit(v) {
+                        continue;
+                    }
                     push(
                         v.clone(),
                         CompletionItemKind::CONSTANT,
@@ -1316,8 +1443,12 @@ pub(crate) fn value_completions(
                     );
                 }
                 for et in info.event_target_counts.keys() {
+                    let label = format!("event_target:{}", et);
+                    if !flt.admit(&label) {
+                        continue;
+                    }
                     push(
-                        format!("event_target:{}", et),
+                        label,
                         CompletionItemKind::VARIABLE,
                         Some("event target".to_string()),
                         None,
@@ -1333,7 +1464,7 @@ pub(crate) fn value_completions(
                     },
                     cwtools_rules::rules_types::Options::default(),
                 )];
-                items.extend(value_completions(
+                let (nested, nested_dropped) = value_completions(
                     &nested_rules,
                     ruleset,
                     info,
@@ -1341,7 +1472,10 @@ pub(crate) fn value_completions(
                     language,
                     sets,
                     current_scope,
-                ));
+                    token,
+                );
+                flt.dropped += nested_dropped;
+                items.extend(nested);
             }
             // Single aliases are expanded during rule post-processing. A residual
             // reference is unresolved or cyclic, so it has no safe enumerable set.
@@ -1365,7 +1499,7 @@ pub(crate) fn value_completions(
 
     let mut final_seen = HashSet::new();
     items.retain(|item| final_seen.insert(item.label.clone()));
-    items
+    (items, flt.dropped())
 }
 
 /// Build root-level type snippets for types whose path matches `logical_path`.
@@ -1479,7 +1613,9 @@ mod resolve_data_tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
         let item = items
             .iter()
             .find(|i| i.label == "add_political_power")
@@ -1537,7 +1673,9 @@ mod resolve_data_tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
         let item = items
             .iter()
             .find(|i| i.label == "add_political_power")
@@ -1581,7 +1719,9 @@ mod resolve_data_tests {
                     loc_keys: &HashSet::new(),
                 },
                 None,
-            );
+                "",
+            )
+            .0;
             let item = items
                 .iter()
                 .find(|item| item.label == "build cost")
@@ -1617,7 +1757,9 @@ mod resolve_data_tests {
                 loc_keys: &loc_keys,
             },
             None,
-        );
+            "",
+        )
+        .0;
         assert!(items.iter().any(|item| item.label == "known_key"));
         assert!(value_rules_need_loc_keys(&rules));
     }
@@ -1668,7 +1810,13 @@ mod resolve_data_tests {
         info.type_index.merge("file:///states/s.txt", per_type);
 
         let mut items = Vec::new();
-        push_type_instances(&mut items, &info, "state", TypeInstanceStyle::Reference);
+        push_type_instances(
+            &mut items,
+            &info,
+            "state",
+            TypeInstanceStyle::Reference,
+            &mut BuildFilter::new(""),
+        );
         let item = items.first().expect("one item");
         assert!(
             item.detail.is_none(),
@@ -1699,7 +1847,14 @@ mod resolve_data_tests {
 
         let mut items = Vec::new();
         let mut cache = std::collections::HashMap::new();
-        push_enum_leaf_values(&mut items, &mut cache, &rs, &info, "my_enum");
+        push_enum_leaf_values(
+            &mut items,
+            &mut cache,
+            &rs,
+            &info,
+            "my_enum",
+            &mut BuildFilter::new(""),
+        );
         let item = items.first().expect("one item");
         assert!(
             item.detail.is_none(),

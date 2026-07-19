@@ -1494,7 +1494,9 @@ mod tests {
             &Default::default(),
             None,
             None,
-        );
+            "",
+        )
+        .0;
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");
