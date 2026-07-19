@@ -2512,6 +2512,37 @@ mod perf_bench {
             });
         }
 
+        // Duplicated alias rule (subtype flattening can repeat one): the
+        // seen-categories guard should make the repeat free.
+        let effect_rules_dup: Vec<NewRule> = effect_rules
+            .iter()
+            .cloned()
+            .chain(effect_rules.iter().cloned())
+            .collect();
+        bench("effect key (dup arm)", || {
+            let (items, dropped) = completions_from_rules(
+                &effect_rules_dup,
+                &rs,
+                &info,
+                "stellaris",
+                &modifier_keys,
+                &modifier_scopes,
+                Some(&reg),
+                Some(country),
+                "",
+            );
+            let (items, _, _) = prepare_context_items(
+                items,
+                dropped,
+                "",
+                true,
+                true,
+                CONTEXT_COMPLETE_THRESHOLD,
+                CONTEXT_CAP,
+            );
+            items.len()
+        });
+
         bench("modifier key (scoped)", || {
             let (items, dropped) = completions_from_rules(
                 &modifier_rules,

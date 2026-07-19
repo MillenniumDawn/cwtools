@@ -226,6 +226,10 @@ pub(crate) fn completions_from_rules(
     // Scope-link keys (`mio:ORG = { … }`) are the same regardless of which alias
     // category triggered them, so emit them at most once per block (#76).
     let mut scope_links_emitted = false;
+    // Subtype flattening can repeat the same alias rule in one block; a repeat
+    // rebuilds the whole category's items (and burns the build budget) only for
+    // the label dedup below to discard them, so expand each category once.
+    let mut seen_alias_cats: HashSet<&str> = HashSet::new();
 
     for (rule_type, opts) in rules {
         match rule_type {
@@ -299,16 +303,18 @@ pub(crate) fn completions_from_rules(
                 left: NewField::AliasField(cat),
                 ..
             } => {
-                push_alias_keys(
-                    &mut items,
-                    ruleset,
-                    info,
-                    modifier_keys,
-                    modifier_scopes,
-                    cat,
-                    scope_ctx,
-                    &mut flt,
-                );
+                if seen_alias_cats.insert(cat.as_str()) {
+                    push_alias_keys(
+                        &mut items,
+                        ruleset,
+                        info,
+                        modifier_keys,
+                        modifier_scopes,
+                        cat,
+                        scope_ctx,
+                        &mut flt,
+                    );
+                }
                 // A category with a `scope_field` alias (effect/trigger) accepts a
                 // scope-switch key here (`mio:ORG = { … }`), so offer those keys too
                 // (#76). The resolution machinery already backs goto/hover.
@@ -329,7 +335,7 @@ pub(crate) fn completions_from_rules(
             RuleType::LeafRule {
                 left: NewField::AliasValueKeysField(cat),
                 ..
-            } => push_alias_keys(
+            } if seen_alias_cats.insert(cat.as_str()) => push_alias_keys(
                 &mut items,
                 ruleset,
                 info,
@@ -1167,6 +1173,8 @@ pub(crate) fn value_completions(
     let mut flt = BuildFilter::new(token);
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // See the same guard in completions_from_rules: expand each category once.
+    let mut seen_alias_cats: HashSet<&str> = HashSet::new();
     // Per-request memo so a repeated enum is only collected/sorted once (#46).
     let mut enum_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -1391,6 +1399,9 @@ pub(crate) fn value_completions(
                 }
             }
             NewField::AliasField(cat) | NewField::AliasValueKeysField(cat) => {
+                if !seen_alias_cats.insert(cat.as_str()) {
+                    continue;
+                }
                 let scope_ctx = match (current_scope, registry) {
                     (Some(scope), Some(reg)) if scope != SCOPE_ANY => Some((scope, reg)),
                     _ => None,
