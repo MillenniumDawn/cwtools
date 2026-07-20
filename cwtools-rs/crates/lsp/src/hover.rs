@@ -32,8 +32,8 @@ impl Backend {
             return Ok(None);
         }
 
-        let ws_uri = self.state.config.read().workspace_uri.clone();
-        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_prefix);
 
         if let Some(RuleCursorInfo {
             element,

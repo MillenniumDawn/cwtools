@@ -6,6 +6,7 @@ use tower_lsp::lsp_types::*;
 use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::RuleSet;
+use cwtools_string_table::string_table::StringId;
 use cwtools_validation::{Prepared, ValidationError, validate_prepared};
 
 use crate::Backend;
@@ -70,6 +71,48 @@ fn loc_keys_of(text: &str, path: &str) -> HashSet<String> {
         }
     }
     keys
+}
+
+/// Names whose dependents a loc-key change may affect: the changed keys
+/// themselves (literal loc references, CW122) plus, for every name-derived
+/// `localisation = { … }` rule in the ruleset, the definition name a changed
+/// key would be derived from (`prefix$suffix` stripped — CW100 flags
+/// `<name>_desc`-style keys, and a game file's token set contains `<name>`,
+/// not the derived key). Everything is compared lowercased, matching both the
+/// loc index and the doc token sets.
+fn loc_change_candidate_names(
+    ruleset: Option<&RuleSet>,
+    changed_keys: &HashSet<String>,
+) -> HashSet<String> {
+    let mut names = changed_keys.clone();
+    let Some(rs) = ruleset else {
+        return names;
+    };
+    let mut affixes: HashSet<(String, String)> = HashSet::new();
+    for td in &rs.types {
+        let subtype_locs = td.subtypes.iter().flat_map(|st| st.localisation.iter());
+        for loc in td.localisation.iter().chain(subtype_locs) {
+            if !loc.required || loc.optional || loc.explicit_field.is_some() {
+                continue;
+            }
+            if loc.prefix.is_empty() && loc.suffix.is_empty() {
+                continue;
+            }
+            affixes.insert((loc.prefix.to_lowercase(), loc.suffix.to_lowercase()));
+        }
+    }
+    for (prefix, suffix) in &affixes {
+        for key in changed_keys {
+            if let Some(mid) = key
+                .strip_prefix(prefix.as_str())
+                .and_then(|m| m.strip_suffix(suffix.as_str()))
+                && !mid.is_empty()
+            {
+                names.insert(mid.to_string());
+            }
+        }
+    }
+    names
 }
 
 /// Cap a file's validation errors at [`MAX_FILE_ERRORS`], appending a summary
@@ -263,40 +306,34 @@ pub(crate) fn validation_error_to_diagnostic(
     )
 }
 
-/// Collect the lowercased identifier-like tokens a parsed file mentions: every
-/// key and every (quoted or unquoted) string value, plus key/value prefixes.
+/// Collect the identifier-like tokens a parsed file mentions — every key and
+/// every (quoted or unquoted) string value — as interned `.lower` [`StringId`]s
+/// straight from the arena, so no string-table locks or allocations are paid.
 /// Used by the dependent sweep to decide which open docs reference a changed
-/// export. Deliberately broad (an over-approximation): including a token that
-/// isn't really a cross-file reference only costs an extra revalidation, while
+/// export (the sweep interns the changed names once at the comparison site).
+/// Deliberately broad (an over-approximation): including a token that isn't
+/// really a cross-file reference only costs an extra revalidation, while
 /// missing one would silently skip a file that should be revalidated.
-pub(crate) fn collect_doc_tokens(
-    ast: &ParsedFile,
-    table: &cwtools_string_table::string_table::StringTable,
-) -> HashSet<String> {
+pub(crate) fn collect_doc_tokens(ast: &ParsedFile) -> HashSet<StringId> {
     use cwtools_parser::ast::Value;
-    let mut tokens = HashSet::new();
-    let push = |id: cwtools_string_table::string_table::StringId, set: &mut HashSet<String>| {
-        if let Some(s) = table.get_string(id)
-            && !s.is_empty()
-        {
-            set.insert(s);
-        }
-    };
     // The arena holds every element flatly, so iterating the per-kind vectors
     // covers the whole tree without a recursive walk. `.lower` is the canonical
     // lowercased form, so the resulting set is already case-folded.
     let arena = &ast.arena;
+    let mut tokens = HashSet::new();
     for leaf in &arena.leaves {
-        push(leaf.key.lower, &mut tokens);
+        tokens.insert(leaf.key.lower);
         if let Value::String(t) | Value::QString(t) = &leaf.value {
-            push(t.lower, &mut tokens);
+            tokens.insert(t.lower);
         }
     }
     for lv in &arena.leaf_values {
         if let Value::String(t) | Value::QString(t) = &lv.value {
-            push(t.lower, &mut tokens);
+            tokens.insert(t.lower);
         }
     }
+    // Reserved slot 0 is the empty string; changed names are never empty.
+    tokens.remove(&StringId(0));
     tokens
 }
 
@@ -310,7 +347,7 @@ impl Backend {
         // dependent sweep's readers (doc_tokens.read()) for the whole walk.
         match ast {
             Some(ast) => {
-                let toks = collect_doc_tokens(ast, &self.state.string_table);
+                let toks = collect_doc_tokens(ast);
                 self.state.doc_tokens.write().insert(uri.to_string(), toks);
             }
             None => {
@@ -328,8 +365,8 @@ impl Backend {
             index.clear_document(uri);
             index.index_document(uri, parsed, &self.state.string_table);
         }
-        let ws_uri = self.state.config.read().workspace_uri.clone();
-        let logical_path = logical_path_from_uri(uri, &ws_uri);
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let logical_path = logical_path_from_uri(uri, &ws_prefix);
         // Lock order: rules -> info_service.
         let rules_guard = self.state.rules.read();
         let mut info = self.state.info_service.write();
@@ -583,6 +620,14 @@ impl Backend {
     ) {
         use std::sync::atomic::Ordering;
 
+        // Doc token sets store interned `.lower` ids, so intern each changed
+        // name once here instead of resolving every doc token to a fresh String.
+        let changed_ids: Option<Vec<StringId>> = changed_names.map(|names| {
+            names
+                .iter()
+                .map(|n| self.state.string_table.intern(n).lower)
+                .collect()
+        });
         // Snapshot each open dependent's cached AST (a cheap `Arc` clone) with
         // its version. The dependents' own text didn't change, so they don't
         // need re-parsing or re-indexing — only re-validation against the
@@ -596,13 +641,13 @@ impl Backend {
             let docs = self.state.documents.lock();
             docs.iter()
                 .filter(|(u, _)| u.as_str() != changed_uri)
-                .filter(|(u, _)| match changed_names {
+                .filter(|(u, _)| match &changed_ids {
                     None => true,
-                    Some(names) => match tokens.get(u.as_str()) {
+                    Some(ids) => match tokens.get(u.as_str()) {
                         // No token set recorded for this doc — include it rather
                         // than risk missing a real dependent.
                         None => true,
-                        Some(doc_set) => names.iter().any(|n| doc_set.contains(n)),
+                        Some(doc_set) => ids.iter().any(|id| doc_set.contains(id)),
                     },
                 })
                 .filter_map(|(u, d)| {
@@ -840,16 +885,16 @@ impl Backend {
             let path = uri_to_path_str(uri);
             // Keep the live overlay current so this file's own keys (and any just
             // added) resolve immediately in `$ref$` checks, without waiting for a
-            // full rescan. Record whether the key set actually changed. (#36)
-            let changed = {
+            // full rescan. Record which keys were added or removed. (#36)
+            let changed_keys: HashSet<String> = {
                 let new_keys = loc_keys_of(text, &path);
                 let mut overlay = self.state.loc_live_overlay.write();
-                let changed = overlay
-                    .get(uri)
-                    .map(|prev| prev != &new_keys)
-                    .unwrap_or(true);
+                let diff = match overlay.get(uri) {
+                    Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
+                    None => new_keys.clone(),
+                };
                 overlay.insert(uri.to_string(), new_keys);
-                changed
+                diff
             };
             let diagnostics = self.validate_loc_text(&path, text, &line_ends);
             // Update the hover loc_text map so tooltips reflect the latest
@@ -862,15 +907,22 @@ impl Backend {
             // diagnostic on open GAME files that reference the added/removed key
             // (e.g. a new event option's loc), so re-validate those too — the
             // overlay now feeds the game-file loc checks, so they resolve the new
-            // key without a full rescan. (#36)
-            if changed {
+            // key without a full rescan. (#36) The sweep is scoped to the docs
+            // whose tokens mention a changed key or a definition name it derives
+            // from, instead of every open game file.
+            if !changed_keys.is_empty() {
                 self.bump_info_revision();
                 self.revalidate_other_open_loc_files(uri).await;
                 let generation = self
                     .state
                     .edit_generation
                     .load(std::sync::atomic::Ordering::SeqCst);
-                self.revalidate_open_dependents(uri, generation, None).await;
+                let scope = {
+                    let rules_guard = self.state.rules.read();
+                    loc_change_candidate_names(rules_guard.ruleset.as_deref(), &changed_keys)
+                };
+                self.revalidate_open_dependents(uri, generation, Some(&scope))
+                    .await;
             }
             return (diagnostics, None);
         }
@@ -935,8 +987,8 @@ impl Backend {
                 }
 
                 // Derive logical path for type-instance indexing
-                let ws_uri = self.state.config.read().workspace_uri.clone();
-                let logical_path = logical_path_from_uri(uri, &ws_uri);
+                let ws_prefix = self.state.config.read().workspace_prefix.clone();
+                let logical_path = logical_path_from_uri(uri, &ws_prefix);
 
                 // Update info service. Lock order: rules -> info_service.
                 {
@@ -1043,6 +1095,73 @@ impl Backend {
     }
 }
 
+// ── Keystroke-validate micro-benchmark (ignored, manual) ─────────────────────
+//
+// Per-edit costs on a large real fixture (cc_colony_events.txt, ~165KB,
+// concatenated 8x to match MD's largest script file ~1.3MB): the doc-token
+// rebuild that runs after every debounced validate, and the per-request
+// logical-path derivation. Run with:
+//
+//   cargo test --release -p cwtools_lsp --bin cwtools-server -- \
+//     --ignored --nocapture perf_keystroke_validate
+#[cfg(test)]
+mod perf_bench {
+    use super::*;
+
+    fn bench<F: FnMut() -> usize>(label: &str, iters: usize, mut f: F) {
+        for _ in 0..3 {
+            f();
+        }
+        let mut times = Vec::with_capacity(iters);
+        let mut n = 0;
+        for _ in 0..iters {
+            let t = std::time::Instant::now();
+            n = f();
+            times.push(t.elapsed());
+        }
+        times.sort();
+        let mean = times.iter().sum::<std::time::Duration>() / iters as u32;
+        eprintln!(
+            "{:>28}: mean {:>10.1?}  min {:>10.1?}  max {:>10.1?}  (count {}, n={})",
+            label,
+            mean,
+            times[0],
+            times[iters - 1],
+            n,
+            iters
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_keystroke_validate() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testfiles/performancetest2/events/cc_colony_events.txt"
+        );
+        let text = std::fs::read_to_string(fixture).expect("fixture").repeat(8);
+        eprintln!("fixture: {} bytes", text.len());
+        let table = cwtools_string_table::string_table::StringTable::new();
+        let parsed = parse_string(&text, &table).expect("parse");
+
+        bench("collect_doc_tokens", 30, || {
+            collect_doc_tokens(&parsed).len()
+        });
+
+        let ws: Option<Arc<str>> = Some(crate::paths::workspace_prefix_of(
+            "file:///mnt/mods/millennium_dawn",
+        ));
+        let uri = "file:///mnt/mods/millennium_dawn/events/some_event_file.txt";
+        bench("logical_path_from_uri x1000", 30, || {
+            let mut total = 0usize;
+            for _ in 0..1000 {
+                total += logical_path_from_uri(uri, &ws).len();
+            }
+            total
+        });
+    }
+}
+
 #[cfg(test)]
 mod whole_line_range_tests {
     use super::*;
@@ -1059,6 +1178,62 @@ mod whole_line_range_tests {
         assert!(keys.contains("my_key"), "got: {:?}", keys);
         assert!(keys.contains("other_key"), "got: {:?}", keys);
         assert!(!keys.contains("absent"));
+    }
+
+    #[test]
+    fn loc_change_candidates_cover_derived_cw100_keys() {
+        // CW100 keys are derived (`prefix + name + suffix`), so a changed key
+        // `my_focus_desc` must scope the sweep to docs mentioning `my_focus`
+        // (the definition name), not just the literal key.
+        use cwtools_rules::rules_types::{TypeDefinition, TypeLocalisation};
+        let mut rs = RuleSet::new();
+        let loc = |prefix: &str, suffix: &str, required: bool, optional: bool| TypeLocalisation {
+            name: "x".into(),
+            prefix: prefix.into(),
+            suffix: suffix.into(),
+            required,
+            optional,
+            explicit_field: None,
+            replace_scopes: None,
+            primary: false,
+        };
+        rs.types.push(TypeDefinition {
+            name: "thing".to_string(),
+            name_field: None,
+            path_options: Default::default(),
+            subtypes: Vec::new(),
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: false,
+            localisation: vec![
+                loc("", "_desc", true, false),
+                loc("mod_", "", true, false),
+                // Optional / explicit-field entries are not CW100-flagged.
+                loc("", "_opt", true, true),
+            ],
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        });
+        let changed: HashSet<String> = ["my_focus_desc".to_string(), "plainkey".to_string()]
+            .into_iter()
+            .collect();
+        let names = loc_change_candidate_names(Some(&rs), &changed);
+        // Literal keys always included (CW122); derived names stripped per affix.
+        assert!(names.contains("my_focus_desc"));
+        assert!(names.contains("plainkey"));
+        assert!(names.contains("my_focus"), "got: {:?}", names);
+        assert!(
+            !names.contains("my_focus_desc_opt") && !names.contains("my_focus_d"),
+            "optional affixes must not expand: {:?}",
+            names
+        );
+        // No ruleset: literal keys only.
+        assert_eq!(loc_change_candidate_names(None, &changed), changed);
     }
 
     #[test]

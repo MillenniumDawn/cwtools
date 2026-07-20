@@ -63,8 +63,8 @@ impl Backend {
             .uri
             .to_string();
 
-        let ws_uri = self.state.config.read().workspace_uri.clone();
-        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_prefix);
         let fallback = &params.text_document_position_params.text_document.uri;
 
         // Localisation file: goto on a `$KEY$` reference jumps to the loc entry
@@ -213,8 +213,8 @@ impl Backend {
         let pos = params.text_document_position.position;
         let uri = params.text_document_position.text_document.uri.to_string();
 
-        let ws_uri = self.state.config.read().workspace_uri.clone();
-        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_prefix);
 
         // Rule-aware: identify a TypeRef at cursor, then gather every location
         // where that instance is defined or used. Definitions come from the
@@ -308,14 +308,14 @@ impl Backend {
         {
             let docs = self.state.documents.lock();
             let rules_guard = self.state.rules.read();
-            let ws_uri = self.state.config.read().workspace_uri.clone();
+            let ws_prefix = self.state.config.read().workspace_prefix.clone();
             if let Some(rs) = rules_guard.ruleset.as_ref() {
                 sites.extend(scan_use_sites(
                     type_name,
                     instance_name,
                     &docs,
                     rs,
-                    &ws_uri,
+                    &ws_prefix,
                     &self.state.string_table,
                 ));
             }
@@ -468,8 +468,8 @@ impl Backend {
         };
         // The identifier under the cursor: prefer the rule-resolved type-ref
         // instance name, falling back to the raw token in the text.
-        let ws_uri = self.state.config.read().workspace_uri.clone();
-        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_prefix);
         let position_encoding = self.state.config.read().position_encoding.clone();
         let (_, source_col) = lsp_pos_to_source_in_text(&text, pos, &position_encoding);
         let symbol = self
@@ -644,8 +644,8 @@ impl Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri.to_string();
         let pos = params.position;
-        let ws_uri = self.state.config.read().workspace_uri.clone();
-        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_prefix);
 
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
@@ -669,8 +669,8 @@ impl Backend {
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
         let new_name = params.new_name.clone();
-        let ws_uri = self.state.config.read().workspace_uri.clone();
-        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let logical_path = logical_path_from_uri(&uri, &ws_prefix);
 
         // Identify what's under the cursor
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
@@ -771,7 +771,7 @@ pub(crate) fn scan_use_sites(
     instance_name: &str,
     docs: &HashMap<String, ParsedDoc>,
     ruleset: &RuleSet,
-    workspace_uri: &Option<std::sync::Arc<str>>,
+    workspace_prefix: &Option<std::sync::Arc<str>>,
     string_table: &cwtools_string_table::string_table::StringTable,
 ) -> Vec<(String, cwtools_info::SourceLocation)> {
     let mut results = Vec::new();
@@ -781,7 +781,7 @@ pub(crate) fn scan_use_sites(
             Some(a) => a,
             None => continue,
         };
-        let logical_path = logical_path_from_uri(file_uri, workspace_uri);
+        let logical_path = logical_path_from_uri(file_uri, workspace_prefix);
 
         scan_ast_for_type_ref(
             &ast.root_children,

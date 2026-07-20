@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,8 +22,8 @@ mod scope_names;
 mod snippets;
 
 pub(crate) use builders::{
-    ValueCompletionSets, completions_from_rules, root_type_snippets, value_completions,
-    value_rules_need_loc_keys,
+    ValueCompletionSets, completions_from_rules, expanded_modifier_scopes, root_type_snippets,
+    value_completions, value_rules_need_loc_keys,
 };
 pub(crate) use scope_names::loc_completions;
 pub(crate) use snippets::generate_node_snippet;
@@ -106,23 +106,46 @@ fn subsequence_match(haystack: &str, needle: &str) -> bool {
     needle_it.peek().is_none()
 }
 
-/// Sort by `sort_text` (falling back to `label` when absent, same as the
-/// client would) so a later truncation keeps the most relevant items, then
-/// drop every item whose `filter_text` (or `label`) doesn't subsequence-match
-/// `token`. An empty `token` matches everything, so only the sort applies.
+/// How well `hay` matches the typed token: exact (0) ahead of prefix (1)
+/// ahead of mere subsequence (2), case-insensitively.
+fn token_match_rank(hay: &str, token: &str) -> u8 {
+    if hay.eq_ignore_ascii_case(token) {
+        0
+    } else if hay
+        .get(..token.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(token))
+    {
+        1
+    } else {
+        2
+    }
+}
+
+/// Drop every item whose `filter_text` (or `label`) doesn't subsequence-match
+/// `token`, then sort by match quality ([`token_match_rank`]) and `sort_text`
+/// (falling back to `label`, same as the client would) so a later truncation
+/// keeps the most relevant items — in particular an exact match for the typed
+/// token can never be truncated away behind better-bucketed items (#94). An
+/// empty `token` matches everything, so only the `sort_text` order applies.
 fn filter_by_token(items: Vec<CompletionItem>, token: &str) -> Vec<CompletionItem> {
     let mut items = items;
+    fn hay(it: &CompletionItem) -> &str {
+        it.filter_text.as_deref().unwrap_or(it.label.as_str())
+    }
+    if !token.is_empty() {
+        items.retain(|it| subsequence_match(hay(it), token));
+    }
     items.sort_by(|a, b| {
+        if !token.is_empty() {
+            let ra = token_match_rank(hay(a), token);
+            let rb = token_match_rank(hay(b), token);
+            if ra != rb {
+                return ra.cmp(&rb);
+            }
+        }
         let ka = a.sort_text.as_deref().unwrap_or(a.label.as_str());
         let kb = b.sort_text.as_deref().unwrap_or(b.label.as_str());
         ka.cmp(kb)
-    });
-    if token.is_empty() {
-        return items;
-    }
-    items.retain(|it| {
-        let hay = it.filter_text.as_deref().unwrap_or(it.label.as_str());
-        subsequence_match(hay, token)
     });
     items
 }
@@ -144,13 +167,17 @@ fn filter_and_cap(
 
 fn prepare_context_items(
     items: Vec<CompletionItem>,
+    built_dropped: usize,
     token: &str,
     ast_clean: bool,
     ast_current: bool,
     complete_threshold: usize,
     cap: usize,
 ) -> (Vec<CompletionItem>, bool, &'static str) {
-    if ast_clean && ast_current && items.len() <= complete_threshold {
+    // A list is only "complete" (client filters it locally with no further
+    // requests) if the builders dropped nothing: any build-time prefiltered
+    // candidate could match a different token after a backspace.
+    if built_dropped == 0 && ast_clean && ast_current && items.len() <= complete_threshold {
         return (items, false, "complete");
     }
     let (items, _) = filter_and_cap(items, token, cap);
@@ -163,6 +190,7 @@ fn prepare_context_items(
 type RulesSnapshot = (
     Option<Arc<RuleSet>>,
     Arc<HashSet<String>>,
+    Arc<HashMap<String, Vec<String>>>,
     Option<Arc<cwtools_game::scope_registry::ScopeRegistry>>,
 );
 
@@ -343,16 +371,16 @@ impl Backend {
         // Try context-aware completions first: resolve the rules at the cursor
         // with the validation engine's own descent (aliases, typed keys,
         // subtypes, skip_root_key — see cwtools_validation::position).
-        let (ws_uri, language, scope_checks, var_checks) = {
+        let (ws_prefix, language, scope_checks, var_checks) = {
             let cfg = self.state.config.read();
             (
-                cfg.workspace_uri.clone(),
+                cfg.workspace_prefix.clone(),
                 cfg.language.clone(),
                 cfg.scope_checks,
                 cfg.var_checks,
             )
         };
-        let logical_path = logical_path_from_uri(&uri, &ws_uri);
+        let logical_path = logical_path_from_uri(&uri, &ws_prefix);
 
         // Snapshot the doc text + AST into owned data, then drop the
         // `documents` guard before any heavy work. `documents.lock()` is the
@@ -391,11 +419,12 @@ impl Backend {
             replace_range.start.character,
             &position_encoding,
         );
-        let (ruleset_arc, modifier_keys_arc, scope_registry_arc): RulesSnapshot = {
+        let (ruleset_arc, modifier_keys_arc, modifier_scopes_arc, scope_registry_arc): RulesSnapshot = {
             let rules_guard = self.state.rules.read();
             (
                 rules_guard.ruleset.clone(),
                 rules_guard.modifier_keys.clone(),
+                rules_guard.modifier_scopes.clone(),
                 rules_guard.scope_registry.clone(),
             )
         };
@@ -485,7 +514,7 @@ impl Backend {
         // list from a dirty parse must stay `is_incomplete: true` even though
         // its size alone would otherwise qualify it as `"complete"` below.
         let mut context_is_clean = false;
-        let context_items: Option<(Vec<CompletionItem>, bool)> =
+        let context_items: Option<(Vec<CompletionItem>, usize, bool)> =
             match (effective_ast, ruleset_arc.as_ref()) {
                 (Some(ast), Some(rs)) => {
                     if is_stale() {
@@ -523,9 +552,9 @@ impl Backend {
                     let t_build = Instant::now();
                     let items = match rctx_opt {
                         // Outside any known entity — offer root-type snippets.
-                        None => Some((root_type_snippets(rs, &logical_path), false)),
+                        None => Some((root_type_snippets(rs, &logical_path), 0, false)),
                         Some(rctx) => {
-                            let (items, resolved_value_pos) =
+                            let ((items, built_dropped), resolved_value_pos) =
                                 if rctx.leaf.as_ref().is_some_and(|l| l.in_value) {
                                     let is_bare_key = rctx.leaf.as_ref().is_some_and(|l| {
                                         l.key.is_empty() && rctx.value_rules.is_empty()
@@ -539,8 +568,10 @@ impl Backend {
                                                 &info_guard,
                                                 &language,
                                                 &modifier_keys_arc,
+                                                &modifier_scopes_arc,
                                                 scope_registry_arc.as_deref(),
                                                 rctx.scope.as_ref().map(|s| s.current()),
+                                                &token,
                                             ),
                                             false,
                                         )
@@ -560,9 +591,11 @@ impl Backend {
                                                 &language,
                                                 ValueCompletionSets {
                                                     modifier_keys: &modifier_keys_arc,
+                                                    modifier_scopes: &modifier_scopes_arc,
                                                     loc_keys: &loc_keys,
                                                 },
                                                 rctx.scope.as_ref().map(|s| s.current()),
+                                                &token,
                                             ),
                                             !rctx.value_rules.is_empty(),
                                         )
@@ -596,9 +629,11 @@ impl Backend {
                                             &language,
                                             ValueCompletionSets {
                                                 modifier_keys: &modifier_keys_arc,
+                                                modifier_scopes: &modifier_scopes_arc,
                                                 loc_keys: &loc_keys,
                                             },
                                             rctx.scope.as_ref().map(|s| s.current()),
+                                            &token,
                                         ),
                                         resolved,
                                     )
@@ -610,13 +645,15 @@ impl Backend {
                                             &info_guard,
                                             &language,
                                             &modifier_keys_arc,
+                                            &modifier_scopes_arc,
                                             scope_registry_arc.as_deref(),
                                             rctx.scope.as_ref().map(|s| s.current()),
+                                            &token,
                                         ),
                                         false,
                                     )
                                 };
-                            Some((items, resolved_value_pos))
+                            Some((items, built_dropped, resolved_value_pos))
                         }
                     };
                     build_dur = t_build.elapsed();
@@ -625,10 +662,14 @@ impl Backend {
                 _ => None,
             };
 
-        if let Some((items, resolved_value_pos)) = context_items {
-            if !items.is_empty() {
+        if let Some((items, built_dropped, resolved_value_pos)) = context_items {
+            // `built_dropped > 0` with an empty list still means the context
+            // resolved (every candidate was prefiltered out) — return the empty
+            // incomplete list rather than falling into the flat fallback dump.
+            if !items.is_empty() || built_dropped > 0 {
                 let (mut items, is_incomplete, strategy) = prepare_context_items(
                     items,
+                    built_dropped,
                     &token,
                     context_is_clean,
                     ast_source.is_current(),
@@ -908,8 +949,18 @@ mod tests {
             panic!("expected TypeRule");
         };
 
-        let items =
-            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            rules,
+            &rs,
+            &info,
+            "stellaris",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
 
         // "kind" should appear with a snippet containing enum values
         let kind_item = items.iter().find(|i| i.label == "kind");
@@ -942,8 +993,18 @@ mod tests {
             RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _)) => rules.as_slice(),
             _ => panic!("expected TypeRule"),
         };
-        let items =
-            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            rules,
+            &rs,
+            &info,
+            "stellaris",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
         let name = items
             .iter()
             .find(|i| i.label == "name")
@@ -974,8 +1035,18 @@ mod tests {
             } else {
                 panic!("expected TypeRule");
             };
-        let items =
-            completions_from_rules(rules, &rs, &info, "stellaris", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            rules,
+            &rs,
+            &info,
+            "stellaris",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
         assert!(!items.is_empty(), "expected some completions");
         for item in &items {
             assert!(
@@ -1223,7 +1294,18 @@ mod tests {
         let rs = alias_effect_ruleset();
         let info = cwtools_info::InfoService::new();
         let rules = effect_alias_usage();
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
 
         let if_item = items
             .iter()
@@ -1246,7 +1328,18 @@ mod tests {
         let rs = alias_effect_ruleset();
         let info = cwtools_info::InfoService::new();
         let rules = effect_alias_usage();
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
 
         let appp = items
             .iter()
@@ -1262,6 +1355,145 @@ mod tests {
         // A value effect is a single line, not a `{ … }` block.
         assert!(!snip.contains('\n'), "should not be a block: {}", snip);
         assert!(!snip.contains("= {"), "should not open a clause: {}", snip);
+    }
+
+    // ── #94: control-flow keys must not sink below scope-matched effects ─────
+
+    /// Effect ruleset mirroring the real hoi4 config shape: a plain effect
+    /// carrying `## scope = country`, `if` carrying `## scope = any`, and
+    /// `else` with no scope annotation at all. Both `if` and `else` recurse
+    /// into `alias_name[effect]`.
+    fn scoped_effect_ruleset() -> RuleSet {
+        let mut rs = RuleSet::new();
+        let recursive_body = || {
+            vec![(
+                RuleType::LeafRule {
+                    left: NewField::AliasField("effect".to_string()),
+                    right: NewField::AliasField("effect".to_string()),
+                },
+                Options::default(),
+            )]
+        };
+        rs.aliases.push((
+            "effect:if".to_string(),
+            (
+                RuleType::NodeRule {
+                    left: NewField::SpecificField("alias[effect:if]".to_string()),
+                    rules: recursive_body(),
+                },
+                Options {
+                    required_scopes: vec!["any".to_string()],
+                    ..Options::default()
+                },
+            ),
+        ));
+        rs.aliases.push((
+            "effect:else".to_string(),
+            (
+                RuleType::NodeRule {
+                    left: NewField::SpecificField("alias[effect:else]".to_string()),
+                    rules: recursive_body(),
+                },
+                Options::default(),
+            ),
+        ));
+        rs.aliases.push((
+            "effect:add_political_power".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[effect:add_political_power]".to_string()),
+                    right: NewField::ScalarField,
+                },
+                Options {
+                    required_scopes: vec!["country".to_string()],
+                    ..Options::default()
+                },
+            ),
+        ));
+        rs.reindex();
+        rs
+    }
+
+    #[test]
+    fn control_flow_effects_rank_with_scope_matched_effects() {
+        // In a country-scope effect block every `## scope = country` effect
+        // ranks in the top bucket, and `if`/`else` (valid in ANY scope) must
+        // not sink below them (#94).
+        let rs = scoped_effect_ruleset();
+        let info = cwtools_info::InfoService::new();
+        // Hoi4's registry is config-driven (empty here); Stellaris has the same
+        // country scope hardcoded, which is all this test needs.
+        let reg = cwtools_game::scope_registry::ScopeRegistry::from_hardcoded(
+            cwtools_game::constants::Game::Stellaris,
+        );
+        let country = reg.id_of("country").expect("country scope");
+        let items = completions_from_rules(
+            &effect_alias_usage(),
+            &rs,
+            &info,
+            "stellaris",
+            &HashSet::new(),
+            &Default::default(),
+            Some(&reg),
+            Some(country),
+            "",
+        )
+        .0;
+        let sort = |label: &str| {
+            items
+                .iter()
+                .find(|i| i.label == label)
+                .unwrap_or_else(|| panic!("no '{}' item", label))
+                .sort_text
+                .clone()
+                .expect("sort_text")
+        };
+        let plain = sort("add_political_power");
+        assert!(plain.starts_with("0_"), "scope match bucket: {}", plain);
+        for label in ["if", "else"] {
+            let s = sort(label);
+            assert!(
+                s.starts_with("0_"),
+                "'{}' must rank with scope-matched effects, got sort_text {:?}",
+                label,
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn typed_token_ranks_exact_match_first_and_survives_cap() {
+        // A capped list must keep and lead with the exact match for the typed
+        // token, even when >cap better-bucketed items subsequence-match it —
+        // otherwise typing `if` in a big effect block buries or drops `if` (#94).
+        let mut items: Vec<CompletionItem> = (0..1500)
+            .map(|i| {
+                let label = format!("ai_f_{:04}", i);
+                CompletionItem {
+                    sort_text: Some(format!("0_{}", label)),
+                    label,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        items.push(CompletionItem {
+            label: "if".to_string(),
+            sort_text: Some("3_if".to_string()),
+            ..Default::default()
+        });
+        items.push(CompletionItem {
+            label: "iff_prefixed".to_string(),
+            sort_text: Some("3_iff_prefixed".to_string()),
+            ..Default::default()
+        });
+        let (filtered, dropped) = filter_and_cap(items, "if", 1000);
+        assert!(dropped);
+        assert_eq!(filtered.len(), 1000);
+        assert_eq!(filtered[0].label, "if", "exact match must lead");
+        assert_eq!(
+            filtered[1].label, "iff_prefixed",
+            "prefix match ranks ahead of subsequence matches"
+        );
     }
 
     // ── root-type snippets tests ─────────────────────────────────────────────
@@ -1322,7 +1554,18 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
 
         let always = items
             .iter()
@@ -1394,7 +1637,18 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
 
         let has_dlc = items
             .iter()
@@ -1453,10 +1707,13 @@ mod tests {
             "hoi4",
             ValueCompletionSets {
                 modifier_keys: &HashSet::new(),
+                modifier_scopes: &Default::default(),
                 loc_keys: &HashSet::new(),
             },
             None,
-        );
+            "",
+        )
+        .0;
 
         let spaced = items
             .iter()
@@ -1549,7 +1806,18 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
 
         assert!(
             items.iter().any(|i| i.label == "my_special_effect"),
@@ -1596,7 +1864,18 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &modifier_keys, None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &modifier_keys,
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
 
         assert!(
             items.iter().any(|i| i.label == "my_modifier"),
@@ -1623,7 +1902,18 @@ mod tests {
             make_leaf_rule("active", NewField::ValueField(ValueType::Bool)),
             make_leaf_rule("active", NewField::ValueField(ValueType::Bool)),
         ];
-        let items = completions_from_rules(&rules, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &rules,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
         let count = items.iter().filter(|i| i.label == "active").count();
         assert_eq!(
             count, 1,
@@ -1701,7 +1991,7 @@ mod tests {
     #[test]
     fn prepare_context_items_marks_small_current_clean_list_complete() {
         let items = vec![item("allowed"), item("cost")];
-        let (out, incomplete, strategy) = prepare_context_items(items, "", true, true, 10, 10);
+        let (out, incomplete, strategy) = prepare_context_items(items, 0, "", true, true, 10, 10);
         assert_eq!(out.len(), 2);
         assert!(!incomplete);
         assert_eq!(strategy, "complete");
@@ -1710,7 +2000,7 @@ mod tests {
     #[test]
     fn prepare_context_items_marks_small_stale_list_incomplete() {
         let items = vec![item("allowed"), item("cost")];
-        let (out, incomplete, strategy) = prepare_context_items(items, "", true, false, 10, 10);
+        let (out, incomplete, strategy) = prepare_context_items(items, 0, "", true, false, 10, 10);
         assert_eq!(out.len(), 2);
         assert!(incomplete);
         assert_eq!(strategy, "filtered");
@@ -1719,7 +2009,7 @@ mod tests {
     #[test]
     fn prepare_context_items_marks_dirty_list_incomplete() {
         let items = vec![item("allowed"), item("cost")];
-        let (out, incomplete, strategy) = prepare_context_items(items, "", false, true, 10, 10);
+        let (out, incomplete, strategy) = prepare_context_items(items, 0, "", false, true, 10, 10);
         assert_eq!(out.len(), 2);
         assert!(incomplete);
         assert_eq!(strategy, "filtered");
@@ -1728,7 +2018,7 @@ mod tests {
     #[test]
     fn prepare_context_items_filters_and_caps_large_list() {
         let items: Vec<CompletionItem> = (0..10).map(|i| item(&format!("item_{i}"))).collect();
-        let (out, incomplete, strategy) = prepare_context_items(items, "", true, true, 3, 3);
+        let (out, incomplete, strategy) = prepare_context_items(items, 0, "", true, true, 3, 3);
         assert_eq!(out.len(), 3);
         assert!(incomplete);
         assert_eq!(strategy, "filtered");
@@ -1870,22 +2160,38 @@ mod tests {
             Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) => rules.as_slice(),
             _ => panic!("expected TypeRule"),
         };
-        snips.extend(snippet_texts(&completions_from_rules(
-            rules, &rs, &info, "hoi4", &empty, None, None,
-        )));
+        snips.extend(snippet_texts(
+            &completions_from_rules(
+                rules,
+                &rs,
+                &info,
+                "hoi4",
+                &empty,
+                &Default::default(),
+                None,
+                None,
+                "",
+            )
+            .0,
+        ));
         snips.extend(snippet_texts(&root_type_snippets(&rs, "events/x.txt")));
 
         // Alias block (required child prefill) + value alias.
         let rs = alias_effect_ruleset();
-        snips.extend(snippet_texts(&completions_from_rules(
-            &effect_alias_usage(),
-            &rs,
-            &info,
-            "hoi4",
-            &empty,
-            None,
-            None,
-        )));
+        snips.extend(snippet_texts(
+            &completions_from_rules(
+                &effect_alias_usage(),
+                &rs,
+                &info,
+                "hoi4",
+                &empty,
+                &Default::default(),
+                None,
+                None,
+                "",
+            )
+            .0,
+        ));
 
         // Enum choice with spaced / comma / colon values.
         let rs = dlc_enum_ruleset();
@@ -1896,15 +2202,20 @@ mod tests {
             },
             Options::default(),
         )];
-        snips.extend(snippet_texts(&completions_from_rules(
-            &trigger_usage,
-            &rs,
-            &info,
-            "hoi4",
-            &empty,
-            None,
-            None,
-        )));
+        snips.extend(snippet_texts(
+            &completions_from_rules(
+                &trigger_usage,
+                &rs,
+                &info,
+                "hoi4",
+                &empty,
+                &Default::default(),
+                None,
+                None,
+                "",
+            )
+            .0,
+        ));
 
         // A required NODE child — the case that used to emit `${1:{ }}`.
         let node_required = vec![(
@@ -1965,7 +2276,18 @@ mod tests {
             },
             Options::default(),
         )];
-        let items = completions_from_rules(&usage, &rs, &info, "hoi4", &HashSet::new(), None, None);
+        let items = completions_from_rules(
+            &usage,
+            &rs,
+            &info,
+            "hoi4",
+            &HashSet::new(),
+            &Default::default(),
+            None,
+            None,
+            "",
+        )
+        .0;
         let danger = items
             .iter()
             .find(|i| i.label == "danger")
@@ -1987,4 +2309,298 @@ mod tests {
     const _: fn() = || {
         let _ = Arc::new(());
     };
+}
+
+// ── MD-scale completion micro-benchmark (ignored, manual) ────────────────────
+//
+// Synthetic ruleset + type index sized like Millennium Dawn (thousands of
+// pattern-expanded scripted effects, thousands of modifiers, high-cardinality
+// type refs). Run with:
+//
+//   cargo test --release -p cwtools_lsp --bin cwtools-server -- \
+//     --ignored --nocapture perf_completion_synthetic
+#[cfg(test)]
+mod perf_bench {
+    use std::collections::{HashMap, HashSet};
+
+    use cwtools_rules::rules_types::{NewField, NewRule, Options, RuleSet, RuleType};
+
+    use super::*;
+
+    const EXACT_EFFECTS: usize = 600;
+    const SCRIPTED_EFFECTS: usize = 8_000;
+    const PLAIN_MODIFIERS: usize = 5_000;
+    const TEMPLATED_BUILDINGS: usize = 3_000;
+    const STATES: usize = 2_000;
+
+    fn alias_usage(cat: &str) -> Vec<NewRule> {
+        vec![(
+            RuleType::LeafRule {
+                left: NewField::AliasField(cat.to_string()),
+                right: NewField::AliasField(cat.to_string()),
+            },
+            Options::default(),
+        )]
+    }
+
+    fn synthetic_ruleset() -> RuleSet {
+        let mut rs = RuleSet::new();
+        for i in 0..EXACT_EFFECTS {
+            let scopes = if i % 2 == 0 {
+                vec!["country".to_string()]
+            } else {
+                Vec::new()
+            };
+            rs.aliases.push((
+                format!("effect:eff_{:04}", i),
+                (
+                    RuleType::LeafRule {
+                        left: NewField::SpecificField(format!("alias[effect:eff_{:04}]", i)),
+                        right: NewField::ScalarField,
+                    },
+                    Options {
+                        required_scopes: scopes,
+                        ..Options::default()
+                    },
+                ),
+            ));
+        }
+        for name in ["if", "else_if", "else"] {
+            rs.aliases.push((
+                format!("effect:{}", name),
+                (
+                    RuleType::NodeRule {
+                        left: NewField::SpecificField(format!("alias[effect:{}]", name)),
+                        rules: alias_usage("effect"),
+                    },
+                    Options::default(),
+                ),
+            ));
+        }
+        // Pattern alias expanded against the type index (scripted effects).
+        rs.aliases.push((
+            "effect:<scripted_effect>".to_string(),
+            (
+                RuleType::LeafRule {
+                    left: NewField::SpecificField("alias[effect:<scripted_effect>]".to_string()),
+                    right: NewField::ValueField(cwtools_rules::rules_types::ValueType::Bool),
+                },
+                Options::default(),
+            ),
+        ));
+        for i in 0..PLAIN_MODIFIERS {
+            rs.modifiers
+                .push((format!("mod_{:04}", i), "country".to_string()));
+        }
+        rs.modifiers.push((
+            "production_speed_<building>_factor".to_string(),
+            "state".to_string(),
+        ));
+        rs.modifier_categories
+            .insert("country".to_string(), vec!["country".to_string()]);
+        rs.modifier_categories
+            .insert("state".to_string(), vec!["state".to_string()]);
+        rs.reindex();
+        rs
+    }
+
+    fn synthetic_info() -> cwtools_info::InfoService {
+        let mut info = cwtools_info::InfoService::new();
+        let inst = |name: String| cwtools_info::TypeInstance {
+            name,
+            location: cwtools_info::SourceLocation { line: 1, col: 0 },
+            primary_loc_key: None,
+        };
+        let mut per_type: HashMap<String, Vec<cwtools_info::TypeInstance>> = HashMap::new();
+        per_type.insert(
+            "scripted_effect".to_string(),
+            (0..SCRIPTED_EFFECTS)
+                .map(|i| inst(format!("se_do_things_{:05}", i)))
+                .collect(),
+        );
+        per_type.insert(
+            "building".to_string(),
+            (0..TEMPLATED_BUILDINGS)
+                .map(|i| inst(format!("building_{:04}", i)))
+                .collect(),
+        );
+        per_type.insert(
+            "state".to_string(),
+            (0..STATES).map(|i| inst(format!("{}", i + 1))).collect(),
+        );
+        info.type_index.merge("file:///bench/defs.txt", per_type);
+        info
+    }
+
+    fn bench<F: FnMut() -> usize>(label: &str, mut f: F) {
+        const WARMUP: usize = 3;
+        const ITERS: usize = 30;
+        for _ in 0..WARMUP {
+            f();
+        }
+        let mut times = Vec::with_capacity(ITERS);
+        let mut items = 0;
+        for _ in 0..ITERS {
+            let t = std::time::Instant::now();
+            items = f();
+            times.push(t.elapsed());
+        }
+        times.sort();
+        let mean = times.iter().sum::<std::time::Duration>() / ITERS as u32;
+        eprintln!(
+            "{:>28}: mean {:>10.1?}  min {:>10.1?}  max {:>10.1?}  ({} items, n={})",
+            label,
+            mean,
+            times[0],
+            times[ITERS - 1],
+            items,
+            ITERS
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_completion_synthetic() {
+        let rs = synthetic_ruleset();
+        let info = synthetic_info();
+        let reg = cwtools_game::scope_registry::ScopeRegistry::from_hardcoded(
+            cwtools_game::constants::Game::Stellaris,
+        );
+        let country = reg.id_of("country").expect("country scope");
+        let modifier_keys: HashSet<String> =
+            cwtools_validation::build_modifier_keys(&rs, &info.type_index);
+        eprintln!(
+            "fixture: {} aliases, {} modifier keys, {} scripted effects, {} states",
+            rs.aliases.len(),
+            modifier_keys.len(),
+            SCRIPTED_EFFECTS,
+            STATES
+        );
+
+        let modifier_scopes = expanded_modifier_scopes(&rs, &info.type_index);
+        let effect_rules = alias_usage("effect");
+        let modifier_rules = alias_usage("modifier");
+
+        for token in ["", "if", "add_p"] {
+            let label = if token.is_empty() {
+                "effect key (no token)".to_string()
+            } else {
+                format!("effect key (token {:?})", token)
+            };
+            bench(&label, || {
+                let (items, dropped) = completions_from_rules(
+                    &effect_rules,
+                    &rs,
+                    &info,
+                    "stellaris",
+                    &modifier_keys,
+                    &modifier_scopes,
+                    Some(&reg),
+                    Some(country),
+                    token,
+                );
+                let (items, _, _) = prepare_context_items(
+                    items,
+                    dropped,
+                    token,
+                    true,
+                    true,
+                    CONTEXT_COMPLETE_THRESHOLD,
+                    CONTEXT_CAP,
+                );
+                items.len()
+            });
+        }
+
+        // Duplicated alias rule (subtype flattening can repeat one): the
+        // seen-categories guard should make the repeat free.
+        let effect_rules_dup: Vec<NewRule> = effect_rules
+            .iter()
+            .cloned()
+            .chain(effect_rules.iter().cloned())
+            .collect();
+        bench("effect key (dup arm)", || {
+            let (items, dropped) = completions_from_rules(
+                &effect_rules_dup,
+                &rs,
+                &info,
+                "stellaris",
+                &modifier_keys,
+                &modifier_scopes,
+                Some(&reg),
+                Some(country),
+                "",
+            );
+            let (items, _, _) = prepare_context_items(
+                items,
+                dropped,
+                "",
+                true,
+                true,
+                CONTEXT_COMPLETE_THRESHOLD,
+                CONTEXT_CAP,
+            );
+            items.len()
+        });
+
+        bench("modifier key (scoped)", || {
+            let (items, dropped) = completions_from_rules(
+                &modifier_rules,
+                &rs,
+                &info,
+                "stellaris",
+                &modifier_keys,
+                &modifier_scopes,
+                Some(&reg),
+                Some(country),
+                "",
+            );
+            let (items, _, _) = prepare_context_items(
+                items,
+                dropped,
+                "",
+                true,
+                true,
+                CONTEXT_COMPLETE_THRESHOLD,
+                CONTEXT_CAP,
+            );
+            items.len()
+        });
+
+        let state_value_rules: Vec<NewRule> = vec![(
+            RuleType::LeafRule {
+                left: NewField::SpecificField("add_state_core".to_string()),
+                right: NewField::TypeField(cwtools_rules::rules_types::TypeType::Simple(
+                    "state".to_string(),
+                )),
+            },
+            Options::default(),
+        )];
+        bench("state value (token 28)", || {
+            let (items, dropped) = value_completions(
+                &state_value_rules,
+                &rs,
+                &info,
+                Some(&reg),
+                "stellaris",
+                ValueCompletionSets {
+                    modifier_keys: &modifier_keys,
+                    modifier_scopes: &modifier_scopes,
+                    loc_keys: &HashSet::new(),
+                },
+                Some(country),
+                "28",
+            );
+            let (items, _, _) = prepare_context_items(
+                items,
+                dropped,
+                "28",
+                true,
+                true,
+                CONTEXT_COMPLETE_THRESHOLD,
+                CONTEXT_CAP,
+            );
+            items.len()
+        });
+    }
 }
