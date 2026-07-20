@@ -311,6 +311,16 @@ struct DocumentState {
     /// nothing loc-related has changed on disk. `None` until the first scan
     /// runs.
     last_loc_signature: parking_lot::Mutex<Option<u64>>,
+    /// `(stat_signature_for(walked files), settings_generation)` stored after
+    /// the last successful full pass. A QUIET pass whose freshly-computed pair
+    /// matches this short-circuits the whole reindex. `None` until the first
+    /// pass; never stored for an empty walk (a transiently-unreadable root).
+    last_scan_fingerprint: parking_lot::Mutex<Option<(u64, u64)>>,
+    /// Bumped whenever a rules or config change could alter validation output,
+    /// folded into `last_scan_fingerprint` so such a change forces the next
+    /// quiet pass to run. `SeqCst`: rare writer, single reader, so ordering
+    /// cost doesn't matter — chosen for clarity.
+    settings_generation: AtomicU64,
     /// Server start time, the epoch `last_activity_ms` is measured against.
     start: std::time::Instant,
     /// Milliseconds since `start` at the last `did_change` / `completion`
@@ -324,10 +334,21 @@ struct DocumentState {
     /// instead of validating 1:1 on the message future and starving the
     /// bounded request queue (#90).
     watched_pending: Mutex<HashSet<String>>,
+    /// URIs of watched files DELETED since the last drain, coalesced into the
+    /// same window as `watched_pending` instead of clearing inline per event.
+    /// A URI that also arrived as a CHANGED/CREATED this window is treated as
+    /// a change, not a delete.
+    watched_deleted: Mutex<HashSet<String>>,
     /// The single in-flight watched-batch window, if one is armed. A live
     /// (not-yet-finished) handle means a window is already scheduled, so a
     /// continuous event stream can't keep pushing the trailing window back.
     watched_debounce: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Per-URI stat signature (file size, mtime-nanos) of the last watched
+    /// validation — the per-file analogue of `last_loc_signature`. A CHANGED
+    /// event whose bytes never moved (cloud sync, git, the running game
+    /// rewriting identical content) matches and skips the revalidate. A DELETE
+    /// drops the entry; a URI with no entry always validates.
+    watched_signatures: Mutex<HashMap<String, (u64, u128)>>,
 }
 
 /// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
@@ -438,10 +459,14 @@ impl DocumentState {
             fallback_cache: parking_lot::Mutex::new(None),
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
             last_loc_signature: parking_lot::Mutex::new(None),
+            last_scan_fingerprint: parking_lot::Mutex::new(None),
+            settings_generation: AtomicU64::new(0),
             start: std::time::Instant::now(),
             last_activity_ms: AtomicU64::new(0),
             watched_pending: Mutex::new(HashSet::new()),
+            watched_deleted: Mutex::new(HashSet::new()),
             watched_debounce: Mutex::new(None),
+            watched_signatures: Mutex::new(HashMap::new()),
         }
     }
 }

@@ -4097,6 +4097,11 @@ fn storm_server(
 ) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
     let ws_uri = format!("file://{}", ws.display());
     let mut child = cwtools_server_cmd()
+        // The `[validate]` line is a tracing event now, read back via
+        // exportProfilingLog. env_remove so init_tracing installs the `info`
+        // filter instead of an empty RUST_LOG="" that would capture nothing.
+        .env_remove("RUST_LOG")
+        .env("CWTOOLS_PROFILE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -4173,17 +4178,39 @@ fn drain_until_quiet(
     out
 }
 
-fn count_validate(frames: &[serde_json::Value], trigger: &str) -> usize {
-    let needle = format!("[validate] ({trigger})");
-    frames
-        .iter()
-        .filter(|v| {
-            v["method"] == "window/logMessage"
-                && v["params"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains(&needle))
-        })
-        .count()
+/// Fetch the server's in-memory profiling log (requires `CWTOOLS_PROFILE`,
+/// which `storm_server` sets). Sends `exportProfilingLog` and reads its
+/// response off the frame channel, skipping any publishes that arrive first.
+/// The buffer is cumulative and non-draining, so callers compare CUMULATIVE
+/// `[validate]` counts across successive windows.
+fn fetch_profiling_log(
+    child: &mut std::process::Child,
+    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
+    id: i64,
+) -> String {
+    write_frame(
+        child,
+        &jsonrpc_request(
+            id,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "exportProfilingLog", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
+            && v["id"] == id
+        {
+            return v["result"].as_str().unwrap_or("").to_string();
+        }
+    }
+    panic!("no exportProfilingLog response for id {id}");
+}
+
+/// Count `[validate] (trigger)` lines in a fetched profiling log.
+fn count_validate_log(log: &str, trigger: &str) -> usize {
+    log.matches(&format!("[validate] ({trigger})")).count()
 }
 
 fn count_publishes(frames: &[serde_json::Value], suffix: &str) -> usize {
@@ -4240,10 +4267,11 @@ fn test_watched_repeated_change_coalesces_to_one_validate() {
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(8),
     );
+    let log = fetch_profiling_log(&mut child, &rx, 1001);
     child.kill().ok();
 
     assert_eq!(
-        count_validate(&frames, "watched"),
+        count_validate_log(&log, "watched"),
         1,
         "10 repeated CHANGED events should coalesce to one validate"
     );
@@ -4277,10 +4305,11 @@ fn test_watched_distinct_files_each_validate_once() {
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(10),
     );
+    let log = fetch_profiling_log(&mut child, &rx, 1002);
     child.kill().ok();
 
     assert_eq!(
-        count_validate(&frames, "watched"),
+        count_validate_log(&log, "watched"),
         m,
         "each of {m} distinct files should validate exactly once"
     );
@@ -4317,10 +4346,11 @@ fn test_watched_bulk_flood_uses_rescan_not_per_file() {
         std::time::Duration::from_millis(1500),
         std::time::Duration::from_secs(20),
     );
+    let log = fetch_profiling_log(&mut child, &rx, 1003);
     child.kill().ok();
 
     assert_eq!(
-        count_validate(&frames, "watched"),
+        count_validate_log(&log, "watched"),
         0,
         "an over-cap flood must not run any per-file watched validations"
     );
@@ -4374,31 +4404,37 @@ fn test_config_no_op_skips_revalidate_then_real_change_runs() {
     let quiet = std::time::Duration::from_millis(700);
     let budget = std::time::Duration::from_secs(5);
 
+    // Counts are cumulative over the non-draining profiling buffer, so each
+    // window asserts the running total of `(configChange)` validations.
+
     // First send changes the (empty) live codes → one configChange pass.
     write_frame(&mut child, &cfg(&["CW999"])).unwrap();
-    let f1 = drain_until_quiet(&rx, quiet, budget);
+    drain_until_quiet(&rx, quiet, budget);
+    let log1 = fetch_profiling_log(&mut child, &rx, 1101);
     assert_eq!(
-        count_validate(&f1, "configChange"),
+        count_validate_log(&log1, "configChange"),
         1,
         "first (changed) config should revalidate the open doc once"
     );
 
-    // Identical payload → no-op guard skips the revalidate.
+    // Identical payload → no-op guard skips the revalidate (total stays 1).
     write_frame(&mut child, &cfg(&["CW999"])).unwrap();
-    let f2 = drain_until_quiet(&rx, quiet, budget);
+    drain_until_quiet(&rx, quiet, budget);
+    let log2 = fetch_profiling_log(&mut child, &rx, 1102);
     assert_eq!(
-        count_validate(&f2, "configChange"),
-        0,
+        count_validate_log(&log2, "configChange"),
+        1,
         "an identical config re-send must not revalidate"
     );
 
-    // A real change → one more configChange pass.
+    // A real change → one more configChange pass (total 2).
     write_frame(&mut child, &cfg(&["CW998"])).unwrap();
-    let f3 = drain_until_quiet(&rx, quiet, budget);
+    drain_until_quiet(&rx, quiet, budget);
+    let log3 = fetch_profiling_log(&mut child, &rx, 1103);
     child.kill().ok();
     assert_eq!(
-        count_validate(&f3, "configChange"),
-        1,
+        count_validate_log(&log3, "configChange"),
+        2,
         "a genuinely changed config should revalidate once"
     );
 }
@@ -4440,22 +4476,26 @@ fn test_config_idle_only_change_passes_noop_guard() {
     let quiet = std::time::Duration::from_millis(700);
     let budget = std::time::Duration::from_secs(5);
 
+    // Cumulative `(configChange)` counts over the non-draining profiling buffer.
+
     // 5 differs from the 15s default → one configChange pass.
     write_frame(&mut child, &cfg(5)).unwrap();
-    let f1 = drain_until_quiet(&rx, quiet, budget);
+    drain_until_quiet(&rx, quiet, budget);
+    let log1 = fetch_profiling_log(&mut child, &rx, 1201);
     assert_eq!(
-        count_validate(&f1, "configChange"),
+        count_validate_log(&log1, "configChange"),
         1,
         "an idle-only config change must not be swallowed by the no-op guard"
     );
 
-    // Identical payload → no-op guard skips the revalidate.
+    // Identical payload → no-op guard skips the revalidate (total stays 1).
     write_frame(&mut child, &cfg(5)).unwrap();
-    let f2 = drain_until_quiet(&rx, quiet, budget);
+    drain_until_quiet(&rx, quiet, budget);
+    let log2 = fetch_profiling_log(&mut child, &rx, 1202);
     child.kill().ok();
     assert_eq!(
-        count_validate(&f2, "configChange"),
-        0,
+        count_validate_log(&log2, "configChange"),
+        1,
         "an identical idle re-send must not revalidate"
     );
 }
@@ -4503,9 +4543,10 @@ fn test_config_partial_payload_keeps_ignore_lists() {
         ),
     )
     .unwrap();
-    let f1 = drain_until_quiet(&rx, quiet, budget);
+    drain_until_quiet(&rx, quiet, budget);
+    let log1 = fetch_profiling_log(&mut child, &rx, 1301);
     assert_eq!(
-        count_validate(&f1, "configChange"),
+        count_validate_log(&log1, "configChange"),
         1,
         "setting the ignore lists should revalidate once"
     );
@@ -4520,11 +4561,12 @@ fn test_config_partial_payload_keeps_ignore_lists() {
         ),
     )
     .unwrap();
-    let f2 = drain_until_quiet(&rx, quiet, budget);
+    drain_until_quiet(&rx, quiet, budget);
+    let log2 = fetch_profiling_log(&mut child, &rx, 1302);
     assert_eq!(
-        count_validate(&f2, "configChange"),
-        1,
-        "an idle-only change should still revalidate once"
+        count_validate_log(&log2, "configChange"),
+        2,
+        "an idle-only change should still revalidate once (cumulative 2)"
     );
 
     // Re-send the full payload (plus the now-current idle value). If the
@@ -4542,12 +4584,13 @@ fn test_config_partial_payload_keeps_ignore_lists() {
         ),
     )
     .unwrap();
-    let f3 = drain_until_quiet(&rx, quiet, budget);
+    drain_until_quiet(&rx, quiet, budget);
+    let log3 = fetch_profiling_log(&mut child, &rx, 1303);
     child.kill().ok();
     assert_eq!(
-        count_validate(&f3, "configChange"),
-        0,
-        "the partial payload must not have wiped the ignore lists"
+        count_validate_log(&log3, "configChange"),
+        2,
+        "the partial payload must not have wiped the ignore lists (no new pass; cumulative stays 2)"
     );
 }
 
@@ -4682,10 +4725,11 @@ fn test_did_open_validates_deferred() {
         std::time::Duration::from_millis(800),
         std::time::Duration::from_secs(6),
     );
+    let log = fetch_profiling_log(&mut child, &rx, 1004);
     child.kill().ok();
 
     assert_eq!(
-        count_validate(&frames, "didOpen"),
+        count_validate_log(&log, "didOpen"),
         1,
         "did_open should validate the file once, off the message future"
     );

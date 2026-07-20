@@ -204,7 +204,9 @@ impl Backend {
     /// `quiet` suppresses every `loadingBar` notification the scan would
     /// otherwise send, so the periodic background pass doesn't flash the
     /// status bar while the user is working. `send_update_file_list` still
-    /// fires either way — it's cheap and keeps the file explorer honest.
+    /// fires either way — it's cheap and keeps the file explorer honest —
+    /// except when the quiet short-circuit returns early: the file set is
+    /// unchanged by definition, so the list it would send is identical.
     pub(crate) async fn validate_entire_workspace(&self, quiet: bool) -> bool {
         if self
             .state
@@ -275,6 +277,29 @@ impl Backend {
                 &extra_dir_globs,
             )
         });
+
+        // Quiet-pass short-circuit: skip reindex + revalidate + re-publish when
+        // the walked-files fingerprint and settings generation both match the
+        // last full pass. Empty walk (transiently-unreadable root) never
+        // short-circuits or records — see the store guard below.
+        let scan_fingerprint =
+            tokio::task::block_in_place(|| stat_signature_for(&files_to_validate));
+        let scan_generation = self
+            .state
+            .settings_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if quiet_pass_can_skip(
+            quiet,
+            files_to_validate.is_empty(),
+            (scan_fingerprint, scan_generation),
+            *self.state.last_scan_fingerprint.lock(),
+        ) {
+            tracing::info!(
+                files = files_to_validate.len(),
+                "quiet scan: workspace fingerprint unchanged, skipping reindex"
+            );
+            return;
+        }
 
         self.client
             .log_message(
@@ -706,6 +731,12 @@ impl Backend {
             .collect();
         self.send_update_file_list(file_list).await;
 
+        // Never record for an empty walk: a transiently-unreadable root would
+        // otherwise pin a bogus fingerprint and suppress the recovery pass.
+        if !files_to_validate.is_empty() {
+            *self.state.last_scan_fingerprint.lock() = Some((scan_fingerprint, scan_generation));
+        }
+
         if cwtools_profiling::profile_enabled() {
             let st = self.state.string_table.stats();
             let info_summary = self.state.info_service.read().profile_summary();
@@ -804,7 +835,7 @@ impl Backend {
         let dirs = self.loc_dirs(root_path);
         let dir_refs: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
         let files = cwtools_localization::LocService::discover_files(&dir_refs);
-        loc_signature_for(files)
+        stat_signature_for(&files)
     }
 
     /// Build the loc-key index from the workspace root plus the vanilla install,
@@ -1190,11 +1221,12 @@ impl Backend {
     /// outside the editor. Without this handler the index keeps stale entries
     /// for deleted/moved files until a window reload (#52).
     ///
-    /// DELETED events are handled inline (cheap, and correctness matters: the
-    /// index must drop the file at once). CHANGED/CREATED events are queued and
-    /// coalesced into a single trailing window (#90) so a churn burst validates
-    /// once instead of 1:1 on the message future, which held the bounded
-    /// request queue and starved cheap requests like `getFileTypes`.
+    /// DELETED and CHANGED/CREATED events are both queued and coalesced into a
+    /// single trailing window (#90) instead of applying inline on the message
+    /// future — DELETEs used to run a synchronous O(whole-index) `clear_file`
+    /// per file, which stalled the message future for seconds on a large
+    /// branch switch. The drain applies deletions first, batched under one
+    /// `info_service` write.
     #[tracing::instrument(skip_all)]
     pub(crate) async fn did_change_watched_files_impl(&self, params: DidChangeWatchedFilesParams) {
         let mut enqueued = false;
@@ -1202,20 +1234,9 @@ impl Backend {
             let uri = event.uri.to_string();
             match event.typ {
                 FileChangeType::DELETED => {
-                    tracing::debug!(%uri, "watched file deleted");
-                    {
-                        let mut index = self.state.symbol_index.lock();
-                        index.clear_document(&uri);
-                    }
-                    {
-                        let mut info = self.state.info_service.write();
-                        info.clear_file(&uri);
-                    }
-                    self.state.loc_live_overlay.write().remove(&uri);
-                    self.bump_info_revision();
-                    self.client
-                        .publish_diagnostics(event.uri, vec![], None)
-                        .await;
+                    tracing::debug!(%uri, "watched file deleted; queued");
+                    self.state.watched_deleted.lock().insert(uri);
+                    enqueued = true;
                 }
                 FileChangeType::CHANGED | FileChangeType::CREATED => {
                     // Open state is re-checked at drain time (an open editor
@@ -1231,9 +1252,10 @@ impl Backend {
         }
     }
 
-    /// Arm a single trailing window that drains `watched_pending`. A fixed
-    /// window: if one is already scheduled or running, do nothing, so a
-    /// continuous event stream can't keep pushing the drain further out.
+    /// Arm a single trailing window that drains the queued watched events
+    /// (`watched_pending` + `watched_deleted`). A fixed window: if one is
+    /// already scheduled or running, do nothing, so a continuous event stream
+    /// can't keep pushing the drain further out.
     fn arm_watched_batch(&self) {
         let mut guard = self.state.watched_debounce.lock();
         if guard.as_ref().is_some_and(|h| !h.is_finished()) {
@@ -1248,29 +1270,57 @@ impl Backend {
         *guard = Some(handle);
     }
 
-    /// Drain the queued watched files and validate them off the message future.
-    /// A batch larger than `WATCHED_BULK_CAP` (a rules re-clone or git checkout
-    /// touching everything) collapses into one CAS-guarded rescan instead of
-    /// hundreds of per-file validations. Re-arms if new events landed while it
-    /// was running.
+    /// Drain the queued watched events (changes + deletes) and apply them off
+    /// the message future. A batch larger than `WATCHED_BULK_CAP` collapses
+    /// into one CAS-guarded rescan instead of hundreds of per-file
+    /// validations — its on-disk prune drops the deleted URIs too, so deletes
+    /// need no separate handling on that path. Below the cap, deletions apply
+    /// first (one `info_service` write), then per-file validation. Re-arms if
+    /// new events landed while it was running.
     async fn process_watched_batch(&self) {
-        let batch: Vec<String> = { self.state.watched_pending.lock().drain().collect() };
-        if batch.is_empty() {
+        let changes: HashSet<String> = { self.state.watched_pending.lock().drain().collect() };
+        // A URI both changed and deleted this window is treated as a change.
+        let deletes: Vec<String> = {
+            let mut deleted = self.state.watched_deleted.lock();
+            resolve_watched_deletes(&changes, deleted.drain())
+        };
+        if changes.is_empty() && deletes.is_empty() {
             return;
         }
-        if batch.len() > WATCHED_BULK_CAP {
-            tracing::info!(count = batch.len(), "watched batch over cap; full rescan");
+        if watched_batch_over_cap(changes.len(), deletes.len()) {
+            tracing::info!(
+                changes = changes.len(),
+                deletes = deletes.len(),
+                "watched batch over cap; full rescan"
+            );
             if !self.validate_entire_workspace(true).await {
-                self.state.watched_pending.lock().extend(batch);
+                // Lost the CAS to a running scan — requeue both sides.
+                self.state.watched_pending.lock().extend(changes);
+                self.state.watched_deleted.lock().extend(deletes);
             }
         } else {
-            for uri in batch {
+            // Deletions first, so a re-created file's later change validates
+            // against an index that already forgot the stale entry.
+            if !deletes.is_empty() {
+                self.process_watched_deletes(&deletes).await;
+            }
+            for uri in changes {
                 // An open editor buffer owns its diagnostics; skip files that
                 // are open now, regardless of open state when queued.
                 if self.state.documents.lock().contains_key(&uri) {
                     continue;
                 }
                 let path = uri_to_path_str(&uri);
+                // Stat-gate: a toucher that rewrote identical bytes leaves
+                // size+mtime unchanged, so skip the read + revalidate. `None`
+                // (vanished/unreadable, or first-ever event) falls through.
+                let sig = watched_stat_sig(std::path::Path::new(&path));
+                if let Some(sig) = sig
+                    && self.state.watched_signatures.lock().get(&uri) == Some(&sig)
+                {
+                    tracing::debug!(%uri, "watched file unchanged (stat match); skipping");
+                    continue;
+                }
                 // Read on a blocking thread via the file manager so cp1252
                 // script files are validated (not silently dropped) and the
                 // async runtime isn't stalled on the sync read.
@@ -1286,6 +1336,14 @@ impl Backend {
                         let (diagnostics, _) = self
                             .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched)
                             .await;
+                        // Record only after a successful validate, so a
+                        // transient read failure doesn't poison the record.
+                        if let Some(sig) = sig {
+                            self.state
+                                .watched_signatures
+                                .lock()
+                                .insert(uri.clone(), sig);
+                        }
                         if let Ok(uri_obj) = Url::parse(&uri) {
                             self.publish_gated(uri_obj, diagnostics, None).await;
                         }
@@ -1303,8 +1361,50 @@ impl Backend {
         // event while we ran can arm the next window (or we do it here). Setting
         // the slot to `None` only detaches this finished task, it doesn't abort.
         *self.state.watched_debounce.lock() = None;
-        if !self.state.watched_pending.lock().is_empty() {
+        // Each guard scoped to its own `let` so the two queue locks are never
+        // held at once.
+        let pending_more = !self.state.watched_pending.lock().is_empty();
+        let deleted_more = !self.state.watched_deleted.lock().is_empty();
+        if pending_more || deleted_more {
             self.arm_watched_batch();
+        }
+    }
+
+    /// Apply a coalesced batch of DELETE events off the message future: forget
+    /// each URI from the symbol index, the info service (one write scope), the
+    /// loc overlay, and the watched-signature record, bump the info revision
+    /// once for the whole batch, then publish empty diagnostics per URI outside
+    /// every lock.
+    async fn process_watched_deletes(&self, deletes: &[String]) {
+        {
+            let mut index = self.state.symbol_index.lock();
+            for uri in deletes {
+                index.clear_document(uri);
+            }
+        }
+        {
+            let mut info = self.state.info_service.write();
+            for uri in deletes {
+                info.clear_file(uri);
+            }
+        }
+        {
+            let mut overlay = self.state.loc_live_overlay.write();
+            for uri in deletes {
+                overlay.remove(uri);
+            }
+        }
+        {
+            let mut sigs = self.state.watched_signatures.lock();
+            for uri in deletes {
+                sigs.remove(uri);
+            }
+        }
+        self.bump_info_revision();
+        for uri in deletes {
+            if let Ok(uri_obj) = Url::parse(uri) {
+                self.client.publish_diagnostics(uri_obj, vec![], None).await;
+            }
         }
     }
 
@@ -1439,16 +1539,18 @@ pub(crate) fn reindex_wait_tick_ms(idle_ms: u64) -> u64 {
     idle_ms.clamp(50, 15_000)
 }
 
-/// Fold a stat-only signature (path, size, mtime) over `files` into one
-/// hash, in a deterministic (sorted-path) order so the result doesn't depend
-/// on directory-walk order. Split out from `Backend::compute_loc_signature`
-/// so it's unit-testable without a `Backend` (which needs a live
-/// `tower_lsp::Client`).
-fn loc_signature_for(mut files: Vec<std::path::PathBuf>) -> u64 {
+/// Fold a stat-only signature (path, size, mtime) over `files` into one hash,
+/// in a deterministic (sorted-path) order so the result doesn't depend on
+/// directory-walk order. Shared by the loc-rebuild skip and the whole-pass
+/// short-circuit; split out from `Backend` so it's unit-testable without a
+/// live `tower_lsp::Client`.
+fn stat_signature_for(files: &[std::path::PathBuf]) -> u64 {
+    // Sort by reference — the caller still owns `files`.
+    let mut sorted: Vec<&std::path::Path> = files.iter().map(|p| p.as_path()).collect();
+    sorted.sort_unstable();
     // Limitation: a same-length edit in the same second on a coarse-mtime fs (FAT/NFS) false-negatives the skip; acceptable, we don't content-hash.
-    files.sort();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for path in &files {
+    for path in sorted {
         path.to_string_lossy().hash(&mut hasher);
         if let Ok(meta) = std::fs::metadata(path) {
             meta.len().hash(&mut hasher);
@@ -1460,6 +1562,51 @@ fn loc_signature_for(mut files: Vec<std::path::PathBuf>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+/// Drop from `deletes` any URI that also arrived as a CHANGED/CREATED this
+/// window: a delete coincident with a re-create (an atomic save's
+/// remove+rewrite) is a change, not a delete of the index entry.
+fn resolve_watched_deletes(
+    changes: &HashSet<String>,
+    deletes: impl Iterator<Item = String>,
+) -> Vec<String> {
+    deletes.filter(|uri| !changes.contains(uri)).collect()
+}
+
+/// Whether a coalesced watched batch (changes + deletes together) exceeds the
+/// per-file cap and should collapse into one workspace rescan instead.
+/// Saturating so an absurd count can't wrap.
+fn watched_batch_over_cap(changes: usize, deletes: usize) -> bool {
+    changes.saturating_add(deletes) > WATCHED_BULK_CAP
+}
+
+/// Whether a QUIET background pass can short-circuit the whole reindex +
+/// revalidate: true only for a quiet pass with a non-empty walk (an empty
+/// walk is a transiently-unreadable root, not "everything deleted", so it
+/// must still run) whose fingerprint matches the last stored one. A
+/// foreground pass always returns false.
+fn quiet_pass_can_skip(
+    quiet: bool,
+    files_empty: bool,
+    current: (u64, u64),
+    stored: Option<(u64, u64)>,
+) -> bool {
+    quiet && !files_empty && stored == Some(current)
+}
+
+/// Stat-only signature (file size, mtime-nanos) for a single watched file —
+/// the per-file analogue of `stat_signature_for`. `None` when the file can't
+/// be stat'd, so the caller can't prove it's unchanged and revalidates.
+fn watched_stat_sig(path: &std::path::Path) -> Option<(u64, u128)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((meta.len(), mtime))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1566,36 +1713,36 @@ mod tests {
         assert_eq!(reindex_wait_tick_ms(u64::MAX), 15_000);
     }
 
-    // ── loc_signature_for (quiet-scan loc-rebuild skip) ─────────────────────
+    // ── stat_signature_for (quiet-scan loc-rebuild + whole-pass skip) ───────
 
     #[test]
-    fn test_loc_signature_stable_for_unchanged_files() {
+    fn test_stat_signature_stable_for_unchanged_files() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.yml");
         let b = tmp.path().join("b.yml");
         std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
         std::fs::write(&b, "l_english:\n other:0 \"value\"\n").unwrap();
 
-        let sig1 = loc_signature_for(vec![a.clone(), b.clone()]);
+        let sig1 = stat_signature_for(&[a.clone(), b.clone()]);
         // Same files, reversed discovery order — the signature sorts paths
-        // first, so order of the input Vec must not matter.
-        let sig2 = loc_signature_for(vec![b, a]);
+        // first, so order of the input slice must not matter.
+        let sig2 = stat_signature_for(&[b, a]);
         assert_eq!(sig1, sig2, "signature must not depend on discovery order");
     }
 
     #[test]
-    fn test_loc_signature_changes_when_a_file_is_touched() {
+    fn test_stat_signature_changes_when_a_file_is_touched() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.yml");
         std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
 
-        let before = loc_signature_for(vec![a.clone()]);
+        let before = stat_signature_for(std::slice::from_ref(&a));
         // Rewrite with different content (length changes) and bump mtime.
         std::fs::write(&a, "l_english:\n key:0 \"a different, longer value\"\n").unwrap();
         let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         filetime_set(&a, newer);
 
-        let after = loc_signature_for(vec![a]);
+        let after = stat_signature_for(&[a]);
         assert_ne!(
             before, after,
             "touching a file's size/mtime should change the signature"
@@ -1603,19 +1750,76 @@ mod tests {
     }
 
     #[test]
-    fn test_loc_signature_changes_when_file_set_changes() {
+    fn test_stat_signature_changes_when_file_set_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.yml");
         std::fs::write(&a, "l_english:\n key:0 \"value\"\n").unwrap();
-        let one_file = loc_signature_for(vec![a.clone()]);
+        let one_file = stat_signature_for(std::slice::from_ref(&a));
 
         let b = tmp.path().join("b.yml");
         std::fs::write(&b, "l_english:\n other:0 \"value\"\n").unwrap();
-        let two_files = loc_signature_for(vec![a, b]);
+        let two_files = stat_signature_for(&[a, b]);
 
         assert_ne!(
             one_file, two_files,
             "adding a file to the set should change the signature"
+        );
+    }
+
+    // ── quiet_pass_can_skip (whole-pass short-circuit) ──────────────────────
+
+    #[test]
+    fn test_quiet_pass_skips_on_matching_fingerprint() {
+        assert!(
+            quiet_pass_can_skip(true, false, (7, 1), Some((7, 1))),
+            "a quiet pass with an unchanged fingerprint + generation must skip"
+        );
+    }
+
+    #[test]
+    fn test_quiet_pass_runs_when_file_fingerprint_differs() {
+        // A changed/added/removed/touched file moves the content fingerprint.
+        assert!(
+            !quiet_pass_can_skip(true, false, (8, 1), Some((7, 1))),
+            "a changed file fingerprint must run the pass"
+        );
+    }
+
+    #[test]
+    fn test_quiet_pass_runs_when_generation_differs() {
+        // A rules/config change bumps the generation even if the file set is
+        // byte-for-byte identical on disk.
+        assert!(
+            !quiet_pass_can_skip(true, false, (7, 2), Some((7, 1))),
+            "a bumped settings generation must run the pass"
+        );
+    }
+
+    #[test]
+    fn test_quiet_pass_runs_on_first_pass_with_no_stored_fingerprint() {
+        assert!(
+            !quiet_pass_can_skip(true, false, (7, 1), None),
+            "the first pass has nothing to compare against and must run"
+        );
+    }
+
+    #[test]
+    fn test_foreground_pass_never_skips() {
+        // Even with a matching fingerprint, a user-invoked (non-quiet) scan runs
+        // in full — reindexWorkspace / clearAllCaches / reloadrulesconfig.
+        assert!(
+            !quiet_pass_can_skip(false, false, (7, 1), Some((7, 1))),
+            "a foreground pass must always run"
+        );
+    }
+
+    #[test]
+    fn test_quiet_pass_does_not_skip_empty_walk() {
+        // A transiently-unreadable root yields an empty walk; short-circuiting
+        // (or recording) a fingerprint for it would suppress the recovery pass.
+        assert!(
+            !quiet_pass_can_skip(true, true, (7, 1), Some((7, 1))),
+            "an empty walk must not short-circuit"
         );
     }
 
@@ -1626,6 +1830,99 @@ mod tests {
     fn filetime_set(path: &std::path::Path, time: std::time::SystemTime) {
         let file = std::fs::File::options().write(true).open(path).unwrap();
         file.set_modified(time).unwrap();
+    }
+
+    // ── watched_stat_sig (stat-gate for watched CHANGED validation) ────────
+
+    #[test]
+    fn test_watched_stat_sig_stable_for_unchanged_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo = { }\n").unwrap();
+        let s1 = watched_stat_sig(&f);
+        let s2 = watched_stat_sig(&f);
+        assert!(s1.is_some(), "an existing file must have a signature");
+        assert_eq!(s1, s2, "unchanged file must produce a stable signature");
+    }
+
+    #[test]
+    fn test_watched_stat_sig_changes_on_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo = { }\n").unwrap();
+        let before = watched_stat_sig(&f);
+        std::fs::write(&f, "foo = { }\nbar = { }\n").unwrap();
+        let after = watched_stat_sig(&f);
+        assert_ne!(before, after, "a size change must change the signature");
+    }
+
+    #[test]
+    fn test_watched_stat_sig_changes_on_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, "foo = { }\n").unwrap();
+        let before = watched_stat_sig(&f);
+        // Same length, bumped mtime — a same-size rewrite (common with
+        // formatters / atomic saves) must still invalidate the skip.
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        filetime_set(&f, newer);
+        let after = watched_stat_sig(&f);
+        assert_ne!(before, after, "an mtime bump must change the signature");
+    }
+
+    #[test]
+    fn test_watched_stat_sig_none_for_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("does_not_exist.txt");
+        assert!(
+            watched_stat_sig(&f).is_none(),
+            "a missing file has no signature, so the caller can't skip it"
+        );
+    }
+
+    // ── watched batch coalescing (delete + change in one window) ───────────
+
+    #[test]
+    fn test_resolve_watched_deletes_excludes_changed_uris() {
+        let changes: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let deletes: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        let out = resolve_watched_deletes(&changes, deletes.into_iter());
+        assert_eq!(
+            out,
+            vec!["b".to_string()],
+            "a URI both deleted and changed in one window is a change, not a delete"
+        );
+    }
+
+    #[test]
+    fn test_resolve_watched_deletes_passes_through_pure_deletes() {
+        let changes: HashSet<String> = HashSet::new();
+        let deletes: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        let mut out = resolve_watched_deletes(&changes, deletes.into_iter());
+        out.sort();
+        assert_eq!(
+            out,
+            vec!["a".to_string(), "b".to_string()],
+            "deletes with no coincident change pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn test_watched_batch_over_cap_counts_deletes_and_changes() {
+        // At the cap is not over it (matches the changes-only `> CAP` today).
+        assert!(!watched_batch_over_cap(WATCHED_BULK_CAP, 0));
+        assert!(watched_batch_over_cap(WATCHED_BULK_CAP, 1));
+        // Deletes alone can trip the cap, and so can a delete+change mix that
+        // neither side would trip on its own.
+        assert!(watched_batch_over_cap(0, WATCHED_BULK_CAP + 1));
+        assert!(watched_batch_over_cap(
+            WATCHED_BULK_CAP / 2 + 1,
+            WATCHED_BULK_CAP / 2 + 1
+        ));
+        assert!(!watched_batch_over_cap(
+            WATCHED_BULK_CAP / 2,
+            WATCHED_BULK_CAP / 2
+        ));
     }
 
     // ── ScanGuard (B1 re-entrancy guard) ──────────────────────────────────
