@@ -1,4 +1,27 @@
-# 1.24.0
+# 1.26.0
+
+## Bug Fixes
+
+- Completion in effect blocks (focus `completion_reward` and similar) no longer buries `if`/`else_if`/`else` below plain effects. Control-flow wrappers now rank alongside scope-matched plain effects instead of falling into the keyword bucket, and an exact match for the typed token can no longer be dropped from the capped response entirely. (cwtools-vscode#94)
+- Completion's "complete list" marking is exact again: any candidate dropped by the prefilter now forces the response incomplete, so the client re-queries correctly while typing instead of trusting a stale complete list.
+
+## Improvements
+
+- Watched-file changes whose size and mtime are unchanged are skipped instead of re-read and revalidated.
+- File deletions are batched into the watched-file debounce window instead of running a whole-index update inline per file.
+- The periodic background reindex short-circuits when a workspace stat fingerprint shows nothing changed on disk, skipping the reindex, revalidate, and republish entirely.
+- Removing a single file from the index is proportional to that file's own entries instead of scanning the whole index under the write lock.
+- A localisation key edit revalidates only the open files it actually affects, instead of every open game file.
+- The expanded modifier-scope map is computed once per scan instead of rebuilt on every completion keystroke.
+- Per-file `[validate]` log lines moved from the client output channel to tracing; they're still captured by the profiling ring buffer.
+
+## Developer
+
+- Micro-benchmarks are committed as ignored tests, run with `cargo test --release -p cwtools_lsp --bin cwtools-server -- --ignored --nocapture perf_`.
+- A workspace stat fingerprint plus a settings generation counter gate the quiet background pass.
+- `TypeIndex` and `ReferenceIndex` gained reverse maps (file to bucket keys), making single-file removal proportional to the file instead of the whole index.
+
+# 1.25.0
 
 ## Bug Fixes
 
