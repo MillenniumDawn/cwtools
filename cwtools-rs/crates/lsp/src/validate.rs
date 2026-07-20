@@ -1011,7 +1011,10 @@ impl Backend {
                 };
 
                 if let Some(msg) = log_msg {
-                    self.client.log_message(MessageType::INFO, msg).await;
+                    // tracing, not a client log_message, so a per-keystroke/
+                    // per-watched-file line doesn't flood the output channel.
+                    // Still captured by exportProfilingLog and stderr (RUST_LOG).
+                    tracing::info!(target: "cwtools::profile", "{}", msg);
                 }
 
                 for err in &errors {

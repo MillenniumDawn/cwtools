@@ -114,6 +114,11 @@ impl Backend {
             .update_ruleset_data(var_effects);
         drop(rules);
         self.bump_info_revision();
+        // Bump the quiet-pass fingerprint generation: a new ruleset changes
+        // validation output, even though reloadrulesconfig also rescans right away.
+        self.state
+            .settings_generation
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) async fn initialize_impl(
@@ -582,6 +587,11 @@ impl Backend {
                 cfg.background_reindex_idle_seconds = secs;
             }
         }
+        // Bump the quiet-pass fingerprint generation: ignore globs or suppressed
+        // codes may have changed, so the next background pass must re-run.
+        self.state
+            .settings_generation
+            .fetch_add(1, Ordering::SeqCst);
         let (n_files, n_dirs, n_codes) = counts;
         tracing::info!(
             file_globs = ?n_files,
