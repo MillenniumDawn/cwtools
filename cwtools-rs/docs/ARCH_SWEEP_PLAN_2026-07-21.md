@@ -253,3 +253,112 @@ Add `pub fix: Option<SuggestedFix>` to `ValidationError` (default `None`; keep a
 - **End-position plumbing (V8, R9):** `ValidationError.end` would give precise LSP squiggles (~30 emit sites); index `SourceLocation.end` (+ cache version bump) unlocks rename/delete-definition cleanups. Not needed by cleanup v1 (fixes carry their own ranges).
 - **R6 single-walk index fusion:** high value, large risk; do as its own corpus-guarded branch.
 - **R2 ruleset-load AST pinning**, **L6 revalidate via stored AST**, **L9 inlay hints**, **V10/V11 did-you-mean + related-location diagnostics** (V11 pairs with a small edit-distance helper and upgrades CW262/263/240 fixes), **Ft2 report-type/hash parity for `loc`**, **R10 lowercase-name storage on index entries**.
+
+---
+
+## Continuation (user-authorized 2026-07-21): multi-mod + deferred items
+
+Same global constraints as above, with one amendment: Task 17 is EXPECTED to move the corpus (69 config uses). Its gate is a reviewed diff, not an empty one; after it lands, the analyzed post-T17 CSV becomes the new guard baseline for later tasks.
+
+### Task 16: Wire the multi-mod discovery subsystem [opus]
+
+**Files:** `crates/file_manager/src/file_manager.rs` (dead subsystem at ~212-878: `ModDescriptor`, `DirectoryType`, `ResolvedMod`, `expand_multiple_mods`, `discover_files_multi_mod`, `classify_directory`), `crates/driver/src/lib.rs` (Session), `crates/cli/src/main.rs`.
+
+- [ ] Study the dead subsystem and the F# behavior it ports (git history around its landing commit, `8110be1f`); record the intended semantics (workspace containing multiple mods, descriptor parsing, load-order/override rules) with evidence.
+- [ ] Wire it end to end for the CLI+driver only (LSP multi-root is out of scope, record as such): when the `--directory` target is not itself a mod root but contains mods (per `classify_directory`), expand via `expand_multiple_mods` and discover via `discover_files_multi_mod`; a plain single-mod directory must take the EXACT existing path (byte-identical corpus).
+- [ ] TDD: fixture workspace with 2 tiny mods (one overriding a file of the other, if the F# semantics say later-wins) proving expansion, load order, and single-mod passthrough.
+- [ ] Un-dead the subsystem's tests if they still describe the wired behavior; delete any that describe abandoned semantics.
+- [ ] Full suite, fmt+clippy, corpus guard (single-dir KR run byte-identical). Commit: `file_manager: wire multi-mod workspace discovery into Session and CLI`
+
+### Task 17: Wire `## error_if_only_match` (CW272) [opus]
+
+**Files:** `crates/validation/src/rule_core/children.rs` (`pick_best_candidate` ~167 pre-sweep), `crates/validation/src/rule_core/alias.rs` (best/temp loop ~310-391), `crates/error_codes/src/lib.rs` (CW272 exists as `CW272_FROM_RULES_CUSTOM_ERROR`).
+
+- [ ] Establish F# semantics from git history/config docs first (like Task 13): when does the custom message replace raw errors — only-one-candidate-matched? Record evidence.
+- [ ] Implement per that evidence; the `Options.error_if_only_match` field already carries the message.
+- [ ] TDD with fixtures for: only-match-fails (custom message emitted), multiple candidates (unchanged), no directive (unchanged).
+- [ ] EXPECTED corpus movement: run the KR guard, save the sorted before/after diff to the scratchpad, and summarize it in the report (counts per code, 5 sample rows). Do NOT try to make it empty.
+- [ ] Full suite, fmt+clippy. Commit: `validation: honor error_if_only_match (CW272 custom messages)`
+
+### Task 18: ValidationError end positions + precise LSP ranges (V8) [opus]
+
+**Files:** `crates/validation/src/common.rs`, emit sites holding a `SourceRange` (~30), `crates/lsp/src/validate.rs` (`diagnostic_at`).
+
+- [ ] Add `end: Option<(u32, u16)>` to `ValidationError` (constructors unchanged; `with_end` builder or populate in `from_code*` where the range is already passed). Populate at every emit site where the node's range is in hand; leave `None` elsewhere.
+- [ ] `error_hash`, CSV/JSON/CLI rows must not read `end` (extend the Task 8 inertness guard test).
+- [ ] LSP: when `end` is Some, publish the real range instead of the whole-line squiggle.
+- [ ] Full suite, fmt+clippy, corpus guard vs post-T17 baseline (byte-identical). Commit: `validation: carry end positions; lsp: precise diagnostic ranges`
+
+### Task 19: Did-you-mean suggested fixes for CW240/CW262/CW263 (V11 as fix metadata) [opus]
+
+**Files:** `crates/validation/src/rule_core/children.rs` (~495-505 unknown key), `crates/validation/src/rule_core/leaf.rs` (~410 enum value), small edit-distance helper (new, in validation).
+
+- [ ] Add a bounded edit-distance helper (no new dependency; classic DP, early-exit on threshold; threshold ~2, min key length guard).
+- [ ] At the CW262/263 emit sites the sibling rule-key set is in hand; at CW240 the enum member set is in hand. When a unique close match exists, attach a `SuggestedFix` replacing the key/value token (span already available per Task 8 conventions). Message text UNCHANGED (corpus-safe; the suggestion lives in the fix title/edit).
+- [ ] TDD per code: close match → fix attached + applies + revalidates clean; no close match → no fix; ambiguous (two equal-distance matches) → no fix.
+- [ ] Full suite, fmt+clippy, corpus guard byte-identical vs post-T17 baseline. Commit: `validation: did-you-mean suggested fixes for unknown keys and enum values`
+
+### Task 20: Index SourceLocation end + cache bump (R9) [opus]
+
+**Files:** `crates/index/src/lib.rs` (~107-111 `SourceLocation`), `crates/index/src/collect.rs`, `crates/index/src/vanilla_cache.rs` (version const).
+
+- [ ] Widen `SourceLocation` with `end: (u32, u16)` captured from the keyed clause's range at collection; bump the vanilla-cache version const so stale caches miss cleanly.
+- [ ] Update constructors/readers; goto/hover consumers may ignore it for now (this is enabling plumbing).
+- [ ] Full suite, fmt+clippy, corpus guard byte-identical. Commit: `index: carry definition end positions, bump vanilla cache version`
+
+### Task 21: `loc` subcommand report/hash parity (Ft2 remainder) [sonnet]
+
+**Files:** `crates/cli/src/main.rs`.
+
+- [ ] Add `--report-type` (cli/csv/json) and `--ignore-hashes`/`--output-hashes` to `Commands::Loc`, reusing the exact machinery `validate` uses (extract shared helpers rather than duplicating row rendering). Default plain-text output unchanged.
+- [ ] Tests mirroring the validate-side CLI tests for the new flags.
+- [ ] Full suite, fmt+clippy. Commit: `cli: report-type and hash baselining for loc`
+
+### Task 22: Subtype display_name/abbreviation in completion+hover [sonnet]
+
+**Files:** `crates/rules/src/rules_types.rs` (fields exist), `crates/lsp/src/completion/`, `crates/lsp/src/hover.rs`.
+
+- [ ] Where subtype-qualified completions/hovers render a subtype name, prefer `display_name` when the definition carries one (abbreviation as completion filter-text alias if the plumbing is cheap; skip if not, record).
+- [ ] `graph_related_types`/`reference_details` stay dormant: add one doc line on each field noting "parsed for .cwt spec compatibility; not consumed".
+- [ ] Tests for the display_name path. Full suite, fmt+clippy. Commit: `lsp: honor subtype display_name in completion and hover`
+
+### Task 23: Revalidate open docs from stored AST (L6) [opus]
+
+**Files:** `crates/lsp/src/scan.rs` (`revalidate_all_open_docs` ~792-817 pre-sweep).
+
+- [ ] After a full scan / config change, revalidate open docs against their stored AST (`validate_parsed_prebuilt`, as the dependent sweep does) instead of re-parsing and re-indexing text that was already indexed.
+- [ ] Preserve the current behavior when no stored AST exists (fall back to parse).
+- [ ] Tests: an open doc with an in-memory AST revalidates without a fresh parse (observable via the existing test hooks if any; otherwise structural assertion + existing integration tests green).
+- [ ] Full suite, fmt+clippy. Commit: `lsp: revalidate open docs from stored AST after scans`
+
+### Task 24: Stop pinning all .cwt ASTs during ruleset load (R2) [opus]
+
+**Files:** `crates/rules/src/ruleset_loader.rs` (~96-151), `crates/rules/src/config_validation.rs`.
+
+- [ ] Collect lightweight reference candidates (path, line, col, field string) during the conversion walk; validate them against the merged ruleset afterward; drop each AST as converted. Identical diagnostics required (order included, or sort if already sorted).
+- [ ] Tests: existing config_validation tests unchanged and green; add one asserting diagnostics equality on a fixture with cross-file references.
+- [ ] Full suite, fmt+clippy, corpus guard byte-identical. Commit: `rules: single-walk config validation, stop pinning parsed .cwt ASTs`
+
+### Task 25: Single-walk index construction (R6) [opus]
+
+**Files:** `crates/index/src/collect.rs` (`index_discovered_files` ~368-396 pre-sweep and the collectors it calls).
+
+- [ ] Fuse the per-file collector walks (type instances via the unified skeleton, subtype collector, set-variable names, complex-enum values, value-set members) into one traversal dispatching per node. Stage carefully; ABANDON with a recorded reason if byte-identity cannot be preserved without distortion.
+- [ ] Corpus guard byte-identical vs post-T17 baseline is the hard gate; run it yourself before committing.
+- [ ] Full suite, fmt+clippy. Commit: `index: fuse per-file collector walks into one traversal`
+
+### Task 26: Inlay hints (L9) [opus]
+
+**Files:** `crates/lsp/src/config.rs` (capability + setting), new `crates/lsp/src/inlay.rs`, `crates/lsp/src/main.rs`.
+
+- [ ] `inlay_hint_provider` capability behind a config setting (`cwtools.inlayHints`, default ON only for the loc-title hint; scope hints OFF by default). Hints: (a) localised title after a bare event/idea/focus id leaf (loc_text lookup), (b) resolved scope after scope-changing keys (reuse the position resolver) when enabled.
+- [ ] Respect the request range; cap hints per request; no per-keystroke recompute beyond what the request demands.
+- [ ] Tests: unit-test hint computation on a fixture AST; integration test if the harness supports the request cheaply.
+- [ ] Full suite, fmt+clippy. Commit: `lsp: inlay hints for loc titles and resolved scopes`
+
+### Task 27: Continuation release chores [sonnet]
+
+- [ ] Fold the continuation into the existing unreleased 2.2.0 changelog entry (same voice); explicitly note the CW272 behavioral change and the multi-mod feature.
+- [ ] Final full gate: fmt, clippy, workspace tests, corpus guard vs post-T17 baseline. Commit: `Changelog: fold continuation work into 2.2.0`
+
+**Skipped by decision (record):** R10 lowercase-name storage on index entries (adds a String per instance; tier-5 lesson says measure central-type memory changes first — not worth it blind).
