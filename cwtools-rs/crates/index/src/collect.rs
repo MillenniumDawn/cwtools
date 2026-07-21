@@ -49,6 +49,20 @@ fn starts_with_matches(td: &TypeDefinition, key: &str) -> bool {
     }
 }
 
+// F# `type_key_prefix` compares the type's prefix against a node's own KeyPrefix
+// token from Imperator-style prefixed nodes (`prefix key = { .. }`), which this
+// AST doesn't model. We take the conservative reading: the key must carry the
+// declared prefix (ASCII case-insensitive, like `starts_with`), name unchanged.
+fn key_prefix_matches(td: &TypeDefinition, key: &str) -> bool {
+    match &td.key_prefix {
+        None => true,
+        Some(prefix) => {
+            key.len() >= prefix.len()
+                && key.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        }
+    }
+}
+
 /// The field name an instance's `## primary` localisation is taken from, when it
 /// is an explicit field (e.g. an event's `title = title` → `Some("title")`).
 /// `None` for name-derived (`$`-pattern) primary keys or types with no primary
@@ -137,6 +151,7 @@ fn walk_skip_root_child<V>(
             // We are at the instance node.
             if type_key_filter_matches(td, key)
                 && starts_with_matches(td, key)
+                && key_prefix_matches(td, key)
                 && let Some(name) =
                     instance_name_from_children(td, key, clause_children, arena, table)
             {
@@ -382,4 +397,78 @@ pub fn index_discovered_files(
         index.value_set_values.merge_file(&path, value_sets);
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cwtools_parser::parser::parse_string;
+    use cwtools_rules::rules_types::PathOptions;
+
+    fn type_def(name: &str, path: &str) -> TypeDefinition {
+        TypeDefinition {
+            name: name.to_string(),
+            name_field: None,
+            path_options: PathOptions {
+                paths: vec![path.to_string()],
+                ..Default::default()
+            },
+            subtypes: Vec::new(),
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: false,
+            localisation: Vec::new(),
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        }
+    }
+
+    fn ruleset_with(td: TypeDefinition) -> RuleSet {
+        let mut rs = RuleSet::new();
+        rs.types.push(td);
+        rs
+    }
+
+    fn names(result: &HashMap<String, Vec<TypeInstance>>, ty: &str) -> Vec<String> {
+        let mut v: Vec<String> = result
+            .get(ty)
+            .map(|is| is.iter().map(|i| i.name.clone()).collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    // A type declaring `type_key_prefix` collects only prefixed keys (case-
+    // insensitive), and the instance name keeps the prefix intact.
+    #[test]
+    fn key_prefix_filters_and_keeps_name_intact() {
+        let source = "MY_thing = { } my_other = { } NOPE_thing = { }";
+        let table = StringTable::new();
+        let parsed = parse_string(source, &table).unwrap();
+
+        let mut td = type_def("thing", "common/things");
+        td.key_prefix = Some("MY_".to_string());
+        let rs = ruleset_with(td);
+
+        let result = collect_type_instances(&rs, &parsed, "common/things/00_things.txt", &table);
+        assert_eq!(names(&result, "thing"), vec!["MY_thing", "my_other"]);
+    }
+
+    // A type with no `type_key_prefix` is unaffected — every key is collected.
+    #[test]
+    fn no_key_prefix_collects_all() {
+        let source = "MY_thing = { } NOPE_thing = { }";
+        let table = StringTable::new();
+        let parsed = parse_string(source, &table).unwrap();
+
+        let rs = ruleset_with(type_def("thing", "common/things"));
+
+        let result = collect_type_instances(&rs, &parsed, "common/things/00_things.txt", &table);
+        assert_eq!(names(&result, "thing"), vec!["MY_thing", "NOPE_thing"]);
+    }
 }
