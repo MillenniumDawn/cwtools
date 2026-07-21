@@ -88,6 +88,10 @@ pub struct LocEntry {
     pub value: Option<u32>,
     pub desc: String,
     pub position: Position,
+    /// 0-based char column where `desc` starts on its line. `position.column` is
+    /// always 1 (line anchor); this locates the value for a span-precise fix
+    /// (CW268 quote-wrapping). See `yaml_parser::parse_entry`.
+    pub desc_column: usize,
     pub error_range: Option<Position>,
     // Parsed elements (lazy, computed on demand)
     pub refs: Vec<String>,

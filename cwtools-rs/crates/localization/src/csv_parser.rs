@@ -66,6 +66,9 @@ pub(crate) fn parse_csv_loc_per_lang(
             continue;
         }
 
+        // 0-based char column of `trimmed` within the original line.
+        let leading_ws = line.chars().count() - line.trim_start().chars().count();
+
         // Emit one LocEntry per language column that has a value
         for (col_idx, maybe_lang) in column_langs.iter().enumerate().skip(1) {
             let Some(lang) = *maybe_lang else { continue };
@@ -73,6 +76,14 @@ pub(crate) fn parse_csv_loc_per_lang(
             let desc = parts.get(col_idx).copied().unwrap_or("").to_string();
 
             let position = Position::new(Arc::clone(&stream_name), line_num + 1, 1);
+            // Char column where this cell begins: preceding cells plus their `;`
+            // separators, offset by any leading whitespace on the line.
+            let prefix_chars: usize = parts[..col_idx.min(parts.len())]
+                .iter()
+                .map(|p| p.chars().count())
+                .sum::<usize>()
+                + col_idx;
+            let desc_column = leading_ws + prefix_chars;
 
             out.push((
                 key.clone(),
@@ -82,6 +93,7 @@ pub(crate) fn parse_csv_loc_per_lang(
                     value: None,
                     desc,
                     position,
+                    desc_column,
                     error_range: None,
                     refs: Vec::new(),
                     commands: Vec::new(),

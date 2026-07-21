@@ -3,6 +3,7 @@
 
 use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
+use cwtools_parser::fix::SuggestedFix;
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
 
@@ -19,6 +20,11 @@ pub struct ValidationError {
     /// CW### error code, e.g. "CW262" for an unexpected property node. The id is
     /// `&'static` (the catalog `ErrorCode.id`), so no per-error allocation.
     pub code: Option<&'static str>,
+    /// Optional machine-applicable fix. Pure metadata: the report/hash path
+    /// never reads it (see `error_hash` and the CLI `Diag`), so a diagnostic
+    /// hashes and renders identically with or without one. The CLI `fix`
+    /// subcommand and the LSP code-action provider consume it.
+    pub fix: Option<SuggestedFix>,
 }
 
 impl ValidationError {
@@ -39,6 +45,7 @@ impl ValidationError {
             col,
             file: file.to_string(),
             code: Some(code.id),
+            fix: None,
         }
     }
 
@@ -61,7 +68,16 @@ impl ValidationError {
             col,
             file: file.to_string(),
             code: Some(code.id),
+            fix: None,
         }
+    }
+
+    /// Attach a machine-applicable fix at the emit site, where the AST node's
+    /// span is in scope. Chains onto a `from_code` / `from_code_with` call so the
+    /// existing constructor signatures stay unchanged.
+    pub(crate) fn with_fix(mut self, fix: SuggestedFix) -> Self {
+        self.fix = Some(fix);
+        self
     }
 }
 

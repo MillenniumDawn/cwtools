@@ -56,6 +56,7 @@ pub(crate) fn loc_diag_to_validation_error(
         col: d.col.saturating_sub(1) as u16,
         file: d.file.clone(),
         code: Some(d.code),
+        fix: None,
     }
 }
 
@@ -135,6 +136,7 @@ pub(crate) fn truncate_validation_errors(
             col: 0,
             file: uri.to_string(),
             code: None,
+            fix: None,
         });
     }
     total
@@ -1229,6 +1231,7 @@ mod whole_line_range_tests {
             col: 4,  // start of the field, after the indentation
             file: "f".into(),
             code: Some("CW242"),
+            fix: None,
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.start.line, 1);
@@ -1247,6 +1250,7 @@ mod whole_line_range_tests {
             col: 2,
             file: "f".into(),
             code: None,
+            fix: None,
         };
         let diag = validation_error_to_diagnostic(&err, &[]);
         assert_eq!(diag.range.start.character, 2);

@@ -9,6 +9,8 @@
 //! Mirrors F# `LocalisationString.fs`.
 
 use crate::commands::{LocEntry, LocFile};
+use cwtools_parser::ast::{SourcePos, SourceRange};
+use cwtools_parser::fix::SuggestedFix;
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -40,6 +42,47 @@ pub struct LocValidationError {
     pub col: usize,
     pub key: String,
     pub kind: LocErrorKind,
+    /// Optional machine-applicable fix, carried through to `LocDiagnostic`. Pure
+    /// metadata; the report/hash path never reads it.
+    pub fix: Option<SuggestedFix>,
+}
+
+/// Build the CW268 "wrap the value in quotes" fix for an entry whose desc has an
+/// unbalanced quote. The span covers the trimmed desc; the replacement strips any
+/// stray surrounding quotes and re-wraps. Returns `None` (no fix, don't
+/// approximate) when the value carries an embedded quote or a trailing comment,
+/// where a single wrap would be wrong. Ranges use the parser convention: 1-based
+/// line, 0-based char column.
+fn cw268_quote_fix(entry: &LocEntry) -> Option<SuggestedFix> {
+    let desc = &entry.desc;
+    let lead = desc.chars().count() - desc.trim_start().chars().count();
+    let trimmed = desc.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let inner = trimmed.trim_matches('"');
+    // A comment or an interior quote makes the single-wrap ambiguous — skip.
+    if inner.contains('"') || trimmed.contains('#') {
+        return None;
+    }
+    let start_col = entry.desc_column + lead;
+    let end_col = start_col + trimmed.chars().count();
+    let line = entry.position.line as u32;
+    let range = SourceRange {
+        start: SourcePos {
+            line,
+            col: start_col as u16,
+        },
+        end: SourcePos {
+            line,
+            col: end_col as u16,
+        },
+    };
+    Some(SuggestedFix::replace(
+        "Wrap the value in quotes",
+        range,
+        format!("\"{inner}\""),
+    ))
 }
 
 /// Validate a loaded loc file against a set of known keys.
@@ -95,6 +138,7 @@ pub(crate) fn validate_loc_file_with_hardcoded(
                 col: entry.position.column,
                 key: entry.key.clone(),
                 kind: LocErrorKind::LocMissingQuote,
+                fix: cw268_quote_fix(entry),
             });
         }
 
@@ -109,6 +153,7 @@ pub(crate) fn validate_loc_file_with_hardcoded(
                         col: entry.position.column,
                         key: entry.key.clone(),
                         kind: LocErrorKind::RecursiveLocRef,
+                        fix: None,
                     });
                 }
             } else if extra_valid_refs.contains(&lowercase) {
@@ -134,6 +179,7 @@ pub(crate) fn validate_loc_file_with_hardcoded(
                         kind: LocErrorKind::UndefinedLocReference {
                             other_key: r.clone(),
                         },
+                        fix: None,
                     });
                 }
             }
@@ -146,6 +192,7 @@ pub(crate) fn validate_loc_file_with_hardcoded(
                 col: entry.position.column,
                 key: entry.key.clone(),
                 kind: LocErrorKind::ReplaceMe,
+                fix: None,
             });
         }
     }
@@ -165,6 +212,7 @@ pub fn validate_invalid_chars(entry: &LocEntry, errors: &mut Vec<LocValidationEr
             col: range.column,
             key: entry.key.clone(),
             kind: LocErrorKind::LocInvalidChars,
+            fix: None,
         });
     }
 }
@@ -180,6 +228,7 @@ pub fn validate_key_chars(entry: &LocEntry, errors: &mut Vec<LocValidationError>
             col: entry.position.column,
             key: entry.key.clone(),
             kind: LocErrorKind::LocKeyInvalidChars,
+            fix: None,
         });
     }
 }
@@ -382,6 +431,33 @@ mod tests {
     }
 
     // ---- unterminated string (CW268) bug fix --------------------------------
+
+    #[test]
+    fn cw268_fix_wraps_value_in_quotes() {
+        use cwtools_parser::fix::apply_edits;
+        let text = "l_english:\n key: \"unclosed\n";
+        let file = parse_loc_text(text, "test.yml").unwrap();
+        let keys: HashSet<String> = HashSet::new();
+        let errors = validate_loc_file(&file, &keys, &HashSet::new(), &Vec::<String>::new());
+
+        let err = errors
+            .iter()
+            .find(|e| e.kind == LocErrorKind::LocMissingQuote)
+            .expect("CW268 emitted");
+        let fix = err.fix.as_ref().expect("CW268 carries a fix");
+        let fixed = apply_edits(text, &fix.edits);
+        assert_eq!(fixed, "l_english:\n key: \"unclosed\"\n");
+
+        // Revalidation of the fixed text no longer emits CW268.
+        let file2 = parse_loc_text(&fixed, "test.yml").unwrap();
+        let errors2 = validate_loc_file(&file2, &keys, &HashSet::new(), &Vec::<String>::new());
+        assert!(
+            !errors2
+                .iter()
+                .any(|e| e.kind == LocErrorKind::LocMissingQuote),
+            "CW268 must be gone after applying the fix"
+        );
+    }
 
     #[test]
     fn test_unterminated_string_emits_cw268() {

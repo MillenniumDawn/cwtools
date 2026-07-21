@@ -104,11 +104,46 @@ fn test_error_hash() {
         col: 10,
         file: "test.txt".to_string(),
         code: None,
+        fix: None,
     };
     let hash = error_hash(&error);
     assert_eq!(
         hash,
         "error|test.txt|3|Field 'cost' has value 'not_a_number', expected Int"
+    );
+}
+
+// Inertness guard (Task 8, step 2): a `SuggestedFix` payload is pure metadata.
+// `error_hash` must read only severity/file/line/message, so a diagnostic with
+// and without a fix hashes identically. This is the corpus-safety net — it must
+// pass both before the emit-site changes and after they populate real fixes.
+#[test]
+fn fix_payload_does_not_change_error_hash() {
+    use cwtools_parser::ast::{SourcePos, SourceRange};
+    use cwtools_parser::fix::SuggestedFix;
+
+    let base = cwtools_validation::ValidationError {
+        message: "redundant default".to_string(),
+        severity: ErrorSeverity::Warning,
+        line: 7,
+        col: 4,
+        file: "common/ideas/x.txt".to_string(),
+        code: Some("CW282"),
+        fix: None,
+    };
+    let mut with_fix = base.clone();
+    with_fix.fix = Some(SuggestedFix::delete(
+        "Remove redundant default",
+        SourceRange {
+            start: SourcePos { line: 7, col: 4 },
+            end: SourcePos { line: 8, col: 0 },
+        },
+    ));
+
+    assert_eq!(
+        error_hash(&base),
+        error_hash(&with_fix),
+        "fix payload must not affect the diagnostic hash"
     );
 }
 

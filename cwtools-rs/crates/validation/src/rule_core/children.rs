@@ -98,13 +98,23 @@ fn validate_leaf_against_rule(
                         };
                         if is_default {
                             let code = &error_codes::CW282_REDUNDANT_DEFAULT_BOOL;
-                            errors.push(ValidationError::from_code(
-                                code,
-                                ctx.file_path,
-                                leaf.pos.start.line,
-                                leaf.pos.start.col,
-                                &[v],
-                            ));
+                            // Fix: delete the redundant `key = <default>` leaf.
+                            // `leaf.pos` spans key→value; its end lands at the next
+                            // token, taking the line and its newline with it.
+                            let fix = cwtools_parser::fix::SuggestedFix::delete(
+                                "Remove redundant default",
+                                leaf.pos,
+                            );
+                            errors.push(
+                                ValidationError::from_code(
+                                    code,
+                                    ctx.file_path,
+                                    leaf.pos.start.line,
+                                    leaf.pos.start.col,
+                                    &[v],
+                                )
+                                .with_fix(fix),
+                            );
                         }
                     });
                 }

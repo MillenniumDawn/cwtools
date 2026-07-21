@@ -6,7 +6,7 @@ use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::ErrorSeverity;
+use cwtools_validation::{ErrorSeverity, ValidationError};
 use std::borrow::Cow;
 use std::path::PathBuf;
 
@@ -128,6 +128,120 @@ enum Commands {
         /// Directory containing localisation .yml files
         directory: PathBuf,
     },
+    /// Apply machine-applicable fixes for the curated fixable diagnostics.
+    /// Dry-run by default (prints a unified-diff preview); pass `--apply` to write.
+    Fix {
+        /// Game identifier (hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom)
+        #[arg(long, short)]
+        game: String,
+        /// Directory containing game files
+        #[arg(long, short)]
+        directory: PathBuf,
+        /// Path to a .cwt rules file OR a directory containing .cwt rule files
+        #[arg(long, short)]
+        rules: PathBuf,
+        /// Optional path to the base game install, indexed for reference
+        /// resolution (see `validate --vanilla`).
+        #[arg(long)]
+        vanilla: Option<PathBuf>,
+        /// Optional pre-generated vanilla index (see `cache-vanilla`).
+        #[arg(long)]
+        vanilla_cache: Option<PathBuf>,
+        /// Extra filename glob patterns to skip. May be repeated.
+        #[arg(long = "ignore-file", value_name = "GLOB")]
+        ignore_files: Vec<String>,
+        /// Extra directory glob patterns to skip. May be repeated.
+        #[arg(long = "ignore-dir", value_name = "GLOB")]
+        ignore_dirs: Vec<String>,
+        /// Restrict loc validation/lookup to this language (repeatable).
+        #[arg(long = "loc-language", value_name = "LANG", value_parser = parse_lang)]
+        loc_language: Vec<Lang>,
+        /// Only fix diagnostics with this CW code (repeatable). Omit to fix every
+        /// fixable diagnostic. Example: --code CW282 --code CW280
+        #[arg(long = "code", value_name = "CWxxx")]
+        codes: Vec<String>,
+        /// Write the fixes to disk. Without this the command is a dry run and
+        /// prints a preview only.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+/// A fix to apply to one file: the underlying edit plus the diagnostic code /
+/// title for the preview. Grouped per file by the `fix` subcommand.
+struct PlannedFix {
+    code: String,
+    edit: cwtools_parser::fix::SpanEdit,
+}
+
+/// Resolve a planned file's edits: drop any that overlap an already-kept edit
+/// (skip-and-warn, so a later edit never corrupts an earlier one), returning the
+/// surviving edits in file order plus the codes of the skipped ones.
+fn plan_file_edits(
+    text: &str,
+    mut planned: Vec<PlannedFix>,
+) -> (Vec<cwtools_parser::fix::SpanEdit>, Vec<String>) {
+    use cwtools_parser::fix::{line_start_bytes, pos_to_byte};
+    let starts = line_start_bytes(text);
+    // Sort by start byte ascending so overlap detection is a single forward scan.
+    planned.sort_by_key(|p| pos_to_byte(text, &starts, p.edit.range.start));
+    let mut kept: Vec<cwtools_parser::fix::SpanEdit> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut last_end = 0usize;
+    let mut first = true;
+    for p in planned {
+        let s = pos_to_byte(text, &starts, p.edit.range.start);
+        let e = pos_to_byte(text, &starts, p.edit.range.end);
+        if !first && s < last_end {
+            skipped.push(p.code);
+            continue;
+        }
+        last_end = e;
+        first = false;
+        kept.push(p.edit);
+    }
+    (kept, skipped)
+}
+
+/// A unified-diff-style preview of applying `edits` to `old` under `path`. One
+/// hunk per edit (edits are already non-overlapping), showing the touched old
+/// lines (`-`) and the resulting new lines (`+`).
+fn fix_preview(path: &str, old: &str, edits: &[cwtools_parser::fix::SpanEdit]) -> String {
+    use cwtools_parser::fix::{line_start_bytes, pos_to_byte};
+    let starts = line_start_bytes(old);
+    let line_of = |byte: usize| match starts.binary_search(&byte) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    };
+    let mut resolved: Vec<(usize, usize, &str)> = edits
+        .iter()
+        .map(|edit| {
+            (
+                pos_to_byte(old, &starts, edit.range.start),
+                pos_to_byte(old, &starts, edit.range.end),
+                edit.replacement.as_str(),
+            )
+        })
+        .collect();
+    resolved.sort_by_key(|r| r.0);
+
+    let mut out = format!("--- {path}\n+++ {path}\n");
+    for (s, e, repl) in resolved {
+        let start_line = line_of(s);
+        let end_line = if e > s { line_of(e - 1) } else { start_line };
+        let hunk_start = starts[start_line];
+        let hunk_end = starts.get(end_line + 1).copied().unwrap_or(old.len());
+        let old_seg = &old[hunk_start..hunk_end];
+        let new_seg = format!("{}{}{}", &old[hunk_start..s], repl, &old[e..hunk_end]);
+        out.push_str(&format!("@@ -{} +{} @@\n", start_line + 1, start_line + 1));
+        for l in old_seg.split_inclusive('\n') {
+            out.push_str(&format!("-{}\n", l.strip_suffix('\n').unwrap_or(l)));
+        }
+        for l in new_seg.split_inclusive('\n') {
+            out.push_str(&format!("+{}\n", l.strip_suffix('\n').unwrap_or(l)));
+        }
+    }
+    out
 }
 
 /// Stable FNV-1a-64 hex digest of a diagnostic, for baseline/ignore matching.
@@ -173,6 +287,73 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// One rendered diagnostic row for the `validate` report. Reads only
+/// file/severity/code/message/line/hash — never a diagnostic's `fix`, so a
+/// `SuggestedFix` payload is inert here (locked in by `fix_payload_is_inert`).
+struct Diag {
+    file: String,
+    severity: cwtools_validation::ErrorSeverity,
+    code: String,
+    message: String,
+    line: u32,
+    hash: String,
+}
+
+/// Map a `ValidationError` to a report `Diag`, computing its hash. Consumes the
+/// error (moves the message). The `fix` field is deliberately dropped.
+fn validation_to_diag(file: &str, err: ValidationError) -> Diag {
+    let code = err.code.unwrap_or_default().to_string();
+    let hash = diag_hash(file, &code, &err.message, err.line);
+    Diag {
+        file: file.to_string(),
+        severity: err.severity,
+        code,
+        message: err.message,
+        line: err.line,
+        hash,
+    }
+}
+
+/// One CSV report row (trailing newline included).
+fn csv_row(d: &Diag) -> String {
+    format!(
+        "{},{},{:?},{},{},{}\n",
+        csv_escape(&d.file),
+        d.line,
+        d.severity,
+        csv_escape(&d.code),
+        csv_escape(&d.message),
+        d.hash
+    )
+}
+
+/// One JSON report row (trailing newline included); `last` suppresses the comma.
+fn json_row(d: &Diag, last: bool) -> String {
+    format!(
+        "  {{\"file\":\"{}\",\"line\":{},\"severity\":\"{:?}\",\"code\":\"{}\",\"message\":\"{}\",\"hash\":\"{}\"}}{}\n",
+        json_escape(&d.file),
+        d.line,
+        d.severity,
+        json_escape(&d.code),
+        json_escape(&d.message),
+        d.hash,
+        if last { "" } else { "," }
+    )
+}
+
+/// One grouped-CLI report row (the per-diagnostic line, not the file header).
+fn cli_row(d: &Diag) -> String {
+    let code_part = if d.code.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", d.code)
+    };
+    format!(
+        "    [{:?}] {}{} (line {})\n",
+        d.severity, code_part, d.message, d.line
+    )
 }
 
 /// Load a RuleSet from either a single `.cwt` file or a directory of `.cwt`
@@ -533,15 +714,6 @@ fn main() {
                 })
                 .unwrap_or_default();
 
-            // Validate each file, collecting all (file, error, hash) diagnostics.
-            struct Diag {
-                file: String,
-                severity: cwtools_validation::ErrorSeverity,
-                code: String,
-                message: String,
-                line: u32,
-                hash: String,
-            }
             // The driver validates files in parallel, in input order, so the
             // report is byte-for-byte identical to the sequential version.
             let ignored_ref = &ignored;
@@ -551,19 +723,11 @@ fn main() {
                 .flat_map(|(path, errors)| {
                     let file_str = path.to_str().unwrap_or("").to_string();
                     errors.into_iter().filter_map(move |err| {
-                        let code = err.code.unwrap_or_default().to_string();
-                        let hash = diag_hash(&file_str, &code, &err.message, err.line);
-                        if ignored_ref.contains(&hash) {
+                        let d = validation_to_diag(&file_str, err);
+                        if ignored_ref.contains(&d.hash) {
                             return None;
                         }
-                        Some(Diag {
-                            file: file_str.clone(),
-                            severity: err.severity,
-                            code,
-                            message: err.message,
-                            line: err.line,
-                            hash,
-                        })
+                        Some(d)
                     })
                 })
                 .collect();
@@ -669,24 +833,13 @@ fn main() {
                 "csv" => {
                     out.push_str("file,line,severity,code,message,hash\n");
                     for d in &diags {
-                        out.push_str(&format!(
-                            "{},{},{:?},{},{},{}\n",
-                            csv_escape(&d.file),
-                            d.line,
-                            d.severity,
-                            csv_escape(&d.code),
-                            csv_escape(&d.message),
-                            d.hash
-                        ));
+                        out.push_str(&csv_row(d));
                     }
                 }
                 "json" => {
                     out.push_str("[\n");
                     for (i, d) in diags.iter().enumerate() {
-                        out.push_str(&format!(
-                            "  {{\"file\":\"{}\",\"line\":{},\"severity\":\"{:?}\",\"code\":\"{}\",\"message\":\"{}\",\"hash\":\"{}\"}}{}\n",
-                            json_escape(&d.file), d.line, d.severity, json_escape(&d.code), json_escape(&d.message), d.hash,
-                            if i + 1 < diags.len() { "," } else { "" }));
+                        out.push_str(&json_row(d, i + 1 >= diags.len()));
                     }
                     out.push_str("]\n");
                 }
@@ -698,15 +851,7 @@ fn main() {
                             out.push_str(&format!("\n  {}:\n", d.file));
                             current = &d.file;
                         }
-                        let code_part = if d.code.is_empty() {
-                            String::new()
-                        } else {
-                            format!("[{}] ", d.code)
-                        };
-                        out.push_str(&format!(
-                            "    [{:?}] {}{} (line {})\n",
-                            d.severity, code_part, d.message, d.line
-                        ));
+                        out.push_str(&cli_row(d));
                     }
                     out.push_str(&format!(
                         "\nValidation complete: {} errors, {} warnings\n",
@@ -845,12 +990,155 @@ fn main() {
                 std::process::exit(code);
             }
         }
+        Commands::Fix {
+            game,
+            directory,
+            rules,
+            vanilla,
+            vanilla_cache,
+            ignore_files,
+            ignore_dirs,
+            loc_language,
+            codes,
+            apply,
+        } => {
+            use cwtools_driver::{RulesInput, Session, SessionConfig};
+            use cwtools_game::constants::Game;
+            use std::collections::BTreeMap;
+
+            let game_id = Game::from_str(&game).unwrap_or_else(|| {
+                eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
+                std::process::exit(1);
+            });
+
+            // Uppercased code filter; empty means "every fixable diagnostic".
+            let code_filter: std::collections::HashSet<String> =
+                codes.iter().map(|c| c.to_ascii_uppercase()).collect();
+            let want = |code: &str| code_filter.is_empty() || code_filter.contains(code);
+
+            let vanilla_cache_index = vanilla_cache
+                .as_ref()
+                .and_then(|p| vanilla_cache::load(p).ok())
+                .map(|(_, fp, data)| (fp, data));
+            let (_fp, vanilla_cache_index) = vanilla_cache_index.unzip();
+
+            let session = Session::load(SessionConfig {
+                game: game_id,
+                rules: RulesInput::from_path(rules.clone()),
+                directory: directory.clone(),
+                vanilla: vanilla.clone(),
+                vanilla_cache: vanilla_cache_index,
+                ignore_files: &ignore_files,
+                ignore_dirs: &ignore_dirs,
+                loc_languages: if loc_language.is_empty() {
+                    None
+                } else {
+                    Some(loc_language)
+                },
+                on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
+            });
+
+            // Gather fixable diagnostics, grouped per file in deterministic order.
+            let mut by_file: BTreeMap<String, Vec<PlannedFix>> = BTreeMap::new();
+            for (path, errors) in session.validate_all() {
+                let file_str = path.to_str().unwrap_or("").to_string();
+                for err in errors {
+                    let code = err.code.unwrap_or_default();
+                    if !want(code) {
+                        continue;
+                    }
+                    if let Some(fix) = err.fix {
+                        for edit in fix.edits {
+                            by_file
+                                .entry(file_str.clone())
+                                .or_default()
+                                .push(PlannedFix {
+                                    code: code.to_string(),
+                                    edit,
+                                });
+                        }
+                    }
+                }
+            }
+            // Loc diagnostics: only mod-path files (mirror `validate`'s filter).
+            let dir_prefix = {
+                let s = directory.to_string_lossy();
+                if s.ends_with(std::path::MAIN_SEPARATOR) {
+                    s.into_owned()
+                } else {
+                    format!("{}{}", s, std::path::MAIN_SEPARATOR)
+                }
+            };
+            for d in session.loc_project_diagnostics() {
+                if !d.file.starts_with(&dir_prefix) || !want(d.code) {
+                    continue;
+                }
+                if let Some(fix) = d.fix {
+                    for edit in fix.edits {
+                        by_file.entry(d.file.clone()).or_default().push(PlannedFix {
+                            code: d.code.to_string(),
+                            edit,
+                        });
+                    }
+                }
+            }
+
+            let mut files_changed = 0usize;
+            let mut edits_applied = 0usize;
+            let mut write_failed = false;
+            for (file, planned) in by_file {
+                let Ok(text) = std::fs::read_to_string(&file) else {
+                    eprintln!("warn: could not read {file}; skipping its fixes");
+                    continue;
+                };
+                let (kept, skipped) = plan_file_edits(&text, planned);
+                for code in &skipped {
+                    eprintln!("warn: {file}: skipped a {code} fix (overlaps another edit)");
+                }
+                if kept.is_empty() {
+                    continue;
+                }
+                if apply {
+                    let fixed = cwtools_parser::fix::apply_edits(&text, &kept);
+                    if let Err(e) = std::fs::write(&file, &fixed) {
+                        eprintln!("Error writing {file}: {e}");
+                        write_failed = true;
+                    } else {
+                        files_changed += 1;
+                        edits_applied += kept.len();
+                        println!("fixed {file} ({} edit(s))", kept.len());
+                    }
+                } else {
+                    print!("{}", fix_preview(&file, &text, &kept));
+                    files_changed += 1;
+                    edits_applied += kept.len();
+                }
+            }
+
+            if apply {
+                println!(
+                    "\nApplied {} fix(es) across {} file(s)",
+                    edits_applied, files_changed
+                );
+            } else {
+                println!(
+                    "\nDry run: {} fix(es) across {} file(s) would be applied (pass --apply to write)",
+                    edits_applied, files_changed
+                );
+            }
+
+            if write_failed {
+                std::process::exit(2);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::exit_code;
+    use super::*;
+    use cwtools_parser::ast::{SourcePos, SourceRange};
+    use cwtools_parser::fix::{SpanEdit, SuggestedFix};
 
     #[test]
     fn exit_code_separates_operational_from_validation() {
@@ -861,5 +1149,105 @@ mod tests {
         // operational failures take precedence over validation errors
         assert_eq!(exit_code(5, false, true), 2);
         assert_eq!(exit_code(5, true, true), 3);
+    }
+
+    fn err_base() -> ValidationError {
+        ValidationError {
+            message: "redundant default, remove it".to_string(),
+            severity: ErrorSeverity::Information,
+            line: 12,
+            col: 4,
+            file: "common/ideas/x.txt".to_string(),
+            code: Some("CW282"),
+            fix: None,
+        }
+    }
+
+    // Inertness guard (Task 8, step 2): a fix payload must not change the report.
+    // The `Diag` mapping and every report row read no fix data — locked in here so
+    // populating the emit sites keeps validate output byte-identical.
+    #[test]
+    fn fix_payload_is_inert_in_report() {
+        let base = err_base();
+        let mut with_fix = base.clone();
+        with_fix.fix = Some(SuggestedFix::delete(
+            "Remove redundant default",
+            SourceRange {
+                start: SourcePos { line: 12, col: 4 },
+                end: SourcePos { line: 13, col: 0 },
+            },
+        ));
+
+        let d0 = validation_to_diag(&base.file.clone(), base);
+        let d1 = validation_to_diag(&with_fix.file.clone(), with_fix);
+
+        assert_eq!(d0.hash, d1.hash, "hash must ignore the fix");
+        assert_eq!(csv_row(&d0), csv_row(&d1), "csv row must ignore the fix");
+        assert_eq!(json_row(&d0, true), json_row(&d1, true));
+        assert_eq!(cli_row(&d0), cli_row(&d1), "cli row must ignore the fix");
+    }
+
+    fn edit(l0: u32, c0: u16, l1: u32, c1: u16, repl: &str) -> SpanEdit {
+        SpanEdit {
+            range: SourceRange {
+                start: SourcePos { line: l0, col: c0 },
+                end: SourcePos { line: l1, col: c1 },
+            },
+            replacement: repl.to_string(),
+        }
+    }
+
+    // Step 5: multi-edit-per-file ordering. Two non-overlapping edits on one file
+    // apply to the same result regardless of the order they were queued.
+    #[test]
+    fn multiple_edits_per_file_apply_in_descending_order() {
+        let text = "aaaa bbbb\n";
+        let forward = vec![
+            PlannedFix {
+                code: "CWA".into(),
+                edit: edit(1, 0, 1, 4, "X"),
+            },
+            PlannedFix {
+                code: "CWB".into(),
+                edit: edit(1, 5, 1, 9, "Y"),
+            },
+        ];
+        let reversed = vec![
+            PlannedFix {
+                code: "CWB".into(),
+                edit: edit(1, 5, 1, 9, "Y"),
+            },
+            PlannedFix {
+                code: "CWA".into(),
+                edit: edit(1, 0, 1, 4, "X"),
+            },
+        ];
+        for planned in [forward, reversed] {
+            let (kept, skipped) = plan_file_edits(text, planned);
+            assert!(skipped.is_empty(), "no overlap expected");
+            assert_eq!(kept.len(), 2);
+            assert_eq!(cwtools_parser::fix::apply_edits(text, &kept), "X Y\n");
+        }
+    }
+
+    // Step 5: overlap skip. When two edits overlap, the later one is dropped (and
+    // reported) so it can't corrupt the kept edit.
+    #[test]
+    fn overlapping_edits_skip_and_warn() {
+        let text = "aaaa bbbb\n";
+        let planned = vec![
+            PlannedFix {
+                code: "CWA".into(),
+                edit: edit(1, 0, 1, 6, "X"), // covers "aaaa b"
+            },
+            PlannedFix {
+                code: "CWB".into(),
+                edit: edit(1, 5, 1, 9, "Y"), // overlaps at col 5
+            },
+        ];
+        let (kept, skipped) = plan_file_edits(text, planned);
+        assert_eq!(kept.len(), 1, "one edit kept");
+        assert_eq!(skipped, vec!["CWB".to_string()], "overlapping edit skipped");
+        assert_eq!(cwtools_parser::fix::apply_edits(text, &kept), "Xbbb\n");
     }
 }

@@ -105,6 +105,12 @@ pub(crate) fn validate_localisation_field(
         // F# four-way logic for inline loc keys.
         match (was_quoted, exists) {
             (true, true) => {
+                // No fix attached: the fix would replace the quoted value with the
+                // bare `key_raw`, but the AST `Leaf` stores a single `pos` covering
+                // key→value and never the value's own start column, and `pos.end`
+                // absorbs trailing whitespace (a QString leaf's end lands on the
+                // next line). The value's exact span can't be derived here without
+                // re-lexing, so we skip rather than approximate.
                 let code = &error_codes::CW122_LOC_KEY_IN_INLINE;
                 errors.push(ValidationError::from_code(
                     code,

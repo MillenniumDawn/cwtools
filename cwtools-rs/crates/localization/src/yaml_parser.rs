@@ -361,6 +361,7 @@ fn parse_entry(
         value: version,
         desc: desc.to_string(),
         position,
+        desc_column: desc_col_offset,
         error_range, // set by isLocValueChar check above
         refs,
         commands,

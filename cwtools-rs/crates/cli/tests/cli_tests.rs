@@ -399,6 +399,103 @@ fn test_loc_empty_directory() {
         .stdout(predicate::str::contains("0 entries"));
 }
 
+// ── Fix ──────────────────────────────────────────────────────────────────────
+
+/// A temp mod with one `common/` file carrying an empty `if` (CW121, fixable).
+fn fix_mod() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let common = tmp.path().join("common");
+    std::fs::create_dir_all(&common).unwrap();
+    std::fs::write(common.join("hint.txt"), "x = { if = { } }\n").unwrap();
+    tmp
+}
+
+#[test]
+fn test_fix_dry_run_previews_without_writing() {
+    let tmp = fix_mod();
+    let rules_dir = fixtures_dir().join("rules");
+    let file = tmp.path().join("common").join("hint.txt");
+    cwtools()
+        .args([
+            "fix",
+            "--game",
+            "stellaris",
+            "--directory",
+            tmp.path().to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("@@"));
+    // Dry run must not touch the file.
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "x = { if = { } }\n"
+    );
+}
+
+#[test]
+fn test_fix_apply_writes_and_is_idempotent() {
+    let tmp = fix_mod();
+    let rules_dir = fixtures_dir().join("rules");
+    let file = tmp.path().join("common").join("hint.txt");
+    cwtools()
+        .args([
+            "fix",
+            "--game",
+            "stellaris",
+            "--directory",
+            tmp.path().to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--apply",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Applied"));
+    // The empty if is gone.
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(after, "x = { }\n", "empty if should be removed");
+    // A second run finds nothing left to fix.
+    cwtools()
+        .args([
+            "fix",
+            "--game",
+            "stellaris",
+            "--directory",
+            tmp.path().to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 fix(es)"));
+}
+
+#[test]
+fn test_fix_code_filter_excludes_unmatched() {
+    let tmp = fix_mod();
+    let rules_dir = fixtures_dir().join("rules");
+    // Filtering to a code that isn't present leaves nothing to fix.
+    cwtools()
+        .args([
+            "fix",
+            "--game",
+            "stellaris",
+            "--directory",
+            tmp.path().to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--code",
+            "CW999",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 fix(es)"));
+}
+
 // ── Error handling ───────────────────────────────────────────────────────────
 
 #[test]

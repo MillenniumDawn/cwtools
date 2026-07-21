@@ -24,6 +24,10 @@ pub struct LocDiagnostic {
     pub code: &'static str,
     pub severity: ErrorSeverity,
     pub message: String,
+    /// Optional machine-applicable fix (CW268). Pure metadata; the CLI `fix`
+    /// subcommand and the LSP code-action provider consume it. The report/hash
+    /// path never reads it.
+    pub fix: Option<cwtools_parser::fix::SuggestedFix>,
 }
 
 /// Single source of truth for a scope-independent loc-entry error's code and
@@ -160,6 +164,7 @@ fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
         code,
         severity,
         message,
+        fix: None,
     })
 }
 
@@ -203,6 +208,7 @@ fn build_diagnostics(
             code: cwtools_error_codes::CW254_WRONG_ENCODING.id,
             severity: ErrorSeverity::Error,
             message: "Localisation files must be UTF-8 BOM, this file is not".to_string(),
+            fix: None,
         });
     }
 
@@ -215,6 +221,7 @@ fn build_diagnostics(
             code: cwtools_error_codes::CW001_PARSE_ERROR.id,
             severity: ErrorSeverity::Error,
             message: cwtools_error_codes::CW001_PARSE_ERROR.format(&[pe.message.as_str()]),
+            fix: None,
         });
     }
 
@@ -227,6 +234,7 @@ fn build_diagnostics(
             code,
             severity,
             message,
+            fix: err.fix,
         });
     }
     out

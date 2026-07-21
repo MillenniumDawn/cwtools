@@ -8,6 +8,7 @@ license.workspace = true
 cwtools_error_codes = { workspace = true }
 cwtools_game = { workspace = true }
 cwtools_file_manager = { workspace = true }
+cwtools_parser = { workspace = true }
 rayon = { workspace = true }
 tracing = { workspace = true }
 

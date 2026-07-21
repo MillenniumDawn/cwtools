@@ -9,6 +9,7 @@ repository.workspace = true
 tracing = { workspace = true }
 cwtools_string_table = { workspace = true }
 thiserror = { workspace = true }
+smallvec = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

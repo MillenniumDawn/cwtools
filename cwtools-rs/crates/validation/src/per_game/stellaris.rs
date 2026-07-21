@@ -2,6 +2,7 @@ use super::common::{as_block, walk_blocks};
 use crate::{ErrorSeverity, ValidationError, error_codes};
 use cwtools_index::TypeIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
+use cwtools_parser::fix::{SuggestedFix, key_token_range};
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 
@@ -132,13 +133,23 @@ fn walk_if_else(
 
         // CW253 — deprecated set_empire_name / set_planet_name.
         if key == "set_empire_name" || key == "set_planet_name" {
-            errors.push(ValidationError::from_code(
-                &error_codes::CW253_DEPRECATED_SET_NAME,
-                file_path,
-                line,
-                col,
-                &[],
-            ));
+            // Fix: rename just the key token to `set_name` (the block body is
+            // unchanged). Span covers the key on its start line.
+            let fix = SuggestedFix::replace(
+                "Rename to set_name",
+                key_token_range(block.range.start, key.chars().count()),
+                "set_name",
+            );
+            errors.push(
+                ValidationError::from_code(
+                    &error_codes::CW253_DEPRECATED_SET_NAME,
+                    file_path,
+                    line,
+                    col,
+                    &[],
+                )
+                .with_fix(fix),
+            );
         }
 
         if key != "limit" && key != "modifier" {
@@ -694,6 +705,41 @@ mod tests {
 
     fn has_code(codes: &[(String, u32, u16)], code: &str) -> bool {
         codes.iter().any(|(c, _, _)| c == code)
+    }
+
+    #[test]
+    fn cw253_fix_renames_key_to_set_name() {
+        use cwtools_parser::fix::apply_edits;
+        let src = "set_empire_name = { key = \"NAME\" }\n";
+        let table = StringTable::new();
+        let ast = parse_string(src, &table).unwrap();
+        let ruleset = RuleSet::new();
+        let mut errors = Vec::new();
+        validate_stellaris(&ast, &ruleset, &table, "events/test.txt", None, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW253"))
+            .expect("CW253 emitted");
+        let fix = err.fix.as_ref().expect("CW253 carries a fix");
+        let fixed = apply_edits(src, &fix.edits);
+        assert_eq!(fixed, "set_name = { key = \"NAME\" }\n");
+
+        // Revalidation of the fixed text no longer emits CW253.
+        let ast2 = parse_string(&fixed, &table).unwrap();
+        let mut errors2 = Vec::new();
+        validate_stellaris(
+            &ast2,
+            &ruleset,
+            &table,
+            "events/test.txt",
+            None,
+            &mut errors2,
+        );
+        assert!(
+            !errors2.iter().any(|e| e.code == Some("CW253")),
+            "CW253 must be gone after applying the fix"
+        );
     }
 
     fn count_code(codes: &[(String, u32, u16)], code: &str) -> usize {
