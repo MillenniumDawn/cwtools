@@ -15,8 +15,7 @@
 //! behind an `RwLock`, with no whole-workspace re-parse), which doesn't fit
 //! `Session`'s load-once/immutable ownership. Instead the LSP holds its own
 //! workspace state and builds a [`Prepared`] from the same shared primitives per
-//! validation. [`Session::validate_file`] offers the incremental shape for any
-//! caller whose index IS owned by the session.
+//! validation.
 //!
 //! Loc-file diagnostics (CW225 etc.) need the parsed `LocService`, so the session
 //! keeps it resident and serves both the loc-key index and the project lint from
@@ -353,12 +352,6 @@ impl Session {
             scope_checks,
             var_checks,
         }
-    }
-
-    /// Validate one already-parsed file against this session's prebuilt indexes
-    /// and registry. The single-file (incremental) entry point.
-    pub fn validate_file(&self, file_path: &str, parsed: &ParsedFile) -> Vec<ValidationError> {
-        validate_prepared(parsed, file_path, &self.prepared())
     }
 
     /// Loc-project diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace,

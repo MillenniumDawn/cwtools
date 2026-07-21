@@ -3,14 +3,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A unique identifier for an interned string.
-/// `NULL` (u32::MAX) is reserved and never assigned.
+/// `u32::MAX` is reserved and never assigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct StringId(pub u32);
-
-impl StringId {
-    pub const NULL: StringId = StringId(u32::MAX);
-}
 
 /// Mirrors the F# `StringTokens` struct.
 /// `lower`  → ID of the lower‑cased canonical form.
