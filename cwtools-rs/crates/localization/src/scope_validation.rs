@@ -112,7 +112,14 @@ pub fn validate_loc_commands(
         return Vec::new();
     }
 
-    let engine_game = game_to_engine(data.game);
+    // `build_loc_ctx` ignores `engine_game` whenever a config-driven registry
+    // is present (it takes the `from_registry` branch), so computing it — and
+    // the no-mapping warn inside it — is dead work per leaf in that case.
+    let engine_game = if data.registry.is_some() {
+        EngineGame::Hoi4 // unused: build_loc_ctx takes the registry branch
+    } else {
+        game_to_engine(data.game)
+    };
     let mut diags = Vec::new();
 
     // Lowercased terminal-command set, built once per entry. The membership test
@@ -158,6 +165,7 @@ pub fn validate_loc_commands(
 /// The seven games with a scope table map to themselves; everything else
 /// (`None`, CK2, VIC2, Custom) falls back to Hoi4 (lenient).
 fn game_to_engine(game: Option<EngineGame>) -> EngineGame {
+    static NO_MAPPING_WARNED: std::sync::Once = std::sync::Once::new();
     match game {
         Some(
             g @ (EngineGame::Hoi4
@@ -169,10 +177,14 @@ fn game_to_engine(game: Option<EngineGame>) -> EngineGame {
             | EngineGame::Eu5),
         ) => g,
         other => {
-            tracing::warn!(
-                "localization game {:?} has no engine mapping; defaulting to Hoi4",
-                other
-            );
+            // Without a registry this can run once per loc-referencing leaf;
+            // warn only the first time per run rather than flooding the log.
+            NO_MAPPING_WARNED.call_once(|| {
+                tracing::warn!(
+                    "localization game {:?} has no engine mapping; defaulting to Hoi4",
+                    other
+                );
+            });
             EngineGame::Hoi4 // fallback: lenient
         }
     }

@@ -255,6 +255,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         path: name.to_string(),
         language_prefix: language_key.to_string(),
         lang,
+        is_csv: false,
         entries,
         file_diagnostics,
         parse_errors,

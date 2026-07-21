@@ -137,6 +137,10 @@ pub struct LocFile {
     pub path: String,
     pub language_prefix: String,
     pub lang: Option<Lang>,
+    /// True for CK2/VIC2-style CSV loc (routed through `csv_parser`), false for
+    /// the default YAML format. CSV files have no `l_xxx:` header line, so the
+    /// YAML-only lang-header check (CW255/256/257) must skip them.
+    pub is_csv: bool,
     pub entries: Vec<LocEntry>,
     /// File-level diagnostics (BOM, header/filename mismatches, etc.).
     /// Empty when there are no issues.

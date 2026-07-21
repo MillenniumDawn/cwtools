@@ -116,8 +116,13 @@ fn lang_fsharp_name(lang: Lang) -> &'static str {
 ///
 /// Mirrors F# `STLLocalisationString.checkLocFileName`: a loc file's name must
 /// carry a recognised `l_xxx` tag, the first line must be a recognised
-/// `l_xxx:` header, and the two must agree.
+/// `l_xxx:` header, and the two must agree. CSV loc (CK2/VIC2) has no YAML
+/// header line at all, so the check doesn't apply — `language_prefix` there is
+/// a bare language name ("english"), which `key_to_language` never matches.
 fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
+    if file.is_csv {
+        return None;
+    }
     let (code, severity, message): (&'static str, ErrorSeverity, String) = match check_loc_file_lang(
         &file.path,
         &file.language_prefix,
@@ -413,6 +418,23 @@ mod tests {
                 .iter()
                 .all(|d| !matches!(d.code, "CW255" | "CW256" | "CW257")),
             "got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn csv_loc_file_skips_yaml_lang_header_check() {
+        // CK2/VIC2-style CSV loc: `language_prefix` is a bare name ("english"),
+        // which the YAML-only `l_xxx` header check never matches. It must not
+        // fire CW255/256/257.
+        let csv = "#CODE;English;French;German;;Spanish\nKEY_A;Hello;Bonjour;Hallo;;Hola\n";
+        let svc = service_from(&[("mod/localisation/localisation.csv", csv)]);
+        let diags = validate_loc_project(&svc);
+        assert!(
+            diags
+                .iter()
+                .all(|d| !matches!(d.code, "CW255" | "CW256" | "CW257")),
+            "CSV loc files must not trigger the YAML lang-header check: {:?}",
             diags
         );
     }
