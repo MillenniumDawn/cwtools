@@ -359,6 +359,7 @@ impl FileManager {
     /// parallel; this pass is just filesystem traversal.
     fn collect_paths(&self, dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), FileError> {
         let root_prefix = normalize_root_prefix(&self.config.root);
+        let is_root_level = dir == self.config.root.as_path();
         let cfg = &self.config;
         // Accept only script files that match the include patterns, aren't
         // excluded, and pass the size guard; each yields (path, logical_path).
@@ -393,7 +394,7 @@ impl FileManager {
         let mut on_err = |path: &Path, e: std::io::Error| {
             eprintln!("warn: skipping {}: {}", path.display(), FileError::from(e));
         };
-        walk_dir_generic(dir, &root_prefix, cfg, &[], &mut accept, &mut on_err, out)
+        walk_dir_generic(dir, is_root_level, cfg, &[], &mut accept, &mut on_err, out)
             .map_err(FileError::from)
     }
 
@@ -704,7 +705,6 @@ pub fn walk_workspace_files(
     extra_dir_globs: &[String],
 ) -> Vec<PathBuf> {
     let cfg = FileManagerConfig::default();
-    let root_prefix = normalize_root_prefix(root);
     let mut out = Vec::new();
     // Accept any file whose extension is requested and which isn't a free-form
     // excluded filename. No size guard (unlike the CLI walker).
@@ -730,7 +730,7 @@ pub fn walk_workspace_files(
     let mut on_err = |_: &Path, _: std::io::Error| {};
     let _ = walk_dir_generic(
         root,
-        &root_prefix,
+        true,
         &cfg,
         extra_dir_globs,
         &mut accept,
@@ -747,10 +747,12 @@ pub fn walk_workspace_files(
 /// `out`. Symlinked directories are followed (matching the previous
 /// `path.is_dir()` behaviour); regular entries reuse the `file_type` from
 /// `read_dir` to avoid a second stat. Read errors on child directories go to
-/// `on_dir_err`; the top-level read error is returned.
+/// `on_dir_err`; the top-level read error is returned. `is_root_level` is true
+/// only when `dir` itself is the walk root, so its direct children are the
+/// ones `exclude_root_dirs` applies to; every recursive call passes `false`.
 fn walk_dir_generic<T>(
     dir: &Path,
-    root_prefix: &str,
+    is_root_level: bool,
     cfg: &FileManagerConfig,
     extra_dir_globs: &[String],
     accept: &mut dyn FnMut(&Path) -> Option<T>,
@@ -778,8 +780,6 @@ fn walk_dir_generic<T>(
         if is_dir {
             let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // Root-anchored excludes apply only to direct children of the root.
-            let rel = compute_logical_path_with_root(&path, root_prefix);
-            let root_level = !rel.contains('/');
             let skip = cfg
                 .exclude_dirs
                 .iter()
@@ -789,21 +789,14 @@ fn walk_dir_generic<T>(
                     .iter()
                     .any(|pat| glob_match(pat, dir_name))
                 || extra_dir_globs.iter().any(|pat| glob_match(pat, dir_name))
-                || (root_level
+                || (is_root_level
                     && cfg
                         .exclude_root_dirs
                         .iter()
                         .any(|ex| dir_name.eq_ignore_ascii_case(ex)));
             if !skip
-                && let Err(e) = walk_dir_generic(
-                    &path,
-                    root_prefix,
-                    cfg,
-                    extra_dir_globs,
-                    accept,
-                    on_dir_err,
-                    out,
-                )
+                && let Err(e) =
+                    walk_dir_generic(&path, false, cfg, extra_dir_globs, accept, on_dir_err, out)
             {
                 on_dir_err(&path, e);
             }

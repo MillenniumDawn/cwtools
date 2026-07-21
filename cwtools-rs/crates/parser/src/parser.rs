@@ -66,7 +66,7 @@ impl<'a> Parser<'a> {
             self.col = 0;
         } else if c != '\r' {
             // '\r' is not counted toward column (CRLF line endings: \r\n is one newline).
-            self.col += 1;
+            self.col = self.col.saturating_add(1);
         }
         Some(c)
     }
@@ -1298,5 +1298,16 @@ ENG = {
                 other => panic!("`{}`: expected a Leaf, got {:?}", src, other),
             }
         }
+    }
+
+    #[test]
+    fn single_line_over_u16_max_chars_does_not_panic() {
+        // col is a u16; a single line past 65,535 chars must saturate instead
+        // of overflowing (debug builds panic on overflow, release wraps and
+        // corrupts positions). Regression for the col += 1 add in advance().
+        let table = StringTable::new();
+        let src = format!("foo = {}", "a".repeat(70_000));
+        let result = parse_string(&src, &table);
+        assert!(result.is_ok(), "parse must complete without panicking");
     }
 }
