@@ -536,14 +536,14 @@ fn main() {
                 cwtools_cache::convert::archived_to_arena(archived, &table)
             });
             match result {
-                Ok((arena, root)) => {
+                Ok(Ok((arena, root))) => {
                     println!("Deserialized from {}", input.display());
                     println!("  Leaves:   {}", arena.leaves.len());
                     println!("  Values:   {}", arena.leaf_values.len());
                     println!("  Comments: {}", arena.comments.len());
                     println!("  Root children: {}", root.len());
                 }
-                Err(e) => {
+                Ok(Err(e)) | Err(e) => {
                     eprintln!("Error deserializing {}: {}", input.display(), e);
                     std::process::exit(1);
                 }

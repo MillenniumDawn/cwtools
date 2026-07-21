@@ -1,4 +1,5 @@
 use crate::cache_format::*;
+use crate::io::CacheError;
 use cwtools_parser::ast::{
     Arena, Child, Comment, Leaf, LeafValue, Operator, SourcePos, SourceRange, Value,
 };
@@ -33,10 +34,15 @@ pub fn arena_to_cached(
 /// [`StringTable::intern_batch`](cwtools_string_table::string_table::StringTable::intern_batch),
 /// then re-walk the nodes drawing the resulting tokens in the same order. The
 /// token assignment is identical to per-string interning.
+///
+/// The rebuilt child references are bounds-checked against the arena vectors
+/// once here (see [`validate_child_bounds`]); a corrupted or truncated cache
+/// yields a [`CacheError`] so the caller's miss/re-parse fallback engages
+/// rather than a panic deep inside a downstream consumer.
 pub fn archived_to_arena(
     cached: &ArchivedCachedFile,
     string_table: &StringTable,
-) -> (Arena, Vec<Child>) {
+) -> Result<(Arena, Vec<Child>), CacheError> {
     let mut to_intern: Vec<&str> = Vec::new();
     for l in cached.leaves.iter() {
         to_intern.push(l.key.as_str());
@@ -51,7 +57,7 @@ pub fn archived_to_arena(
 
     let mut arena = Arena::new();
     for l in cached.leaves.iter() {
-        let idx = arena.push_leaf(Leaf {
+        arena.push_leaf(Leaf {
             key: next_token(&mut tokens),
             value: archived_value_to_value(&l.value, &mut tokens),
             op: archived_op_to_op(&l.op),
@@ -62,10 +68,9 @@ pub fn archived_to_arena(
                 l.end_col.to_native(),
             ),
         });
-        assert_eq!(idx as usize, arena.leaves.len() - 1);
     }
     for lv in cached.leaf_values.iter() {
-        let idx = arena.push_leaf_value(LeafValue {
+        arena.push_leaf_value(LeafValue {
             value: archived_value_to_value(&lv.value, &mut tokens),
             pos: cached_to_range(
                 lv.start_line.to_native(),
@@ -74,10 +79,9 @@ pub fn archived_to_arena(
                 lv.end_col.to_native(),
             ),
         });
-        assert_eq!(idx as usize, arena.leaf_values.len() - 1);
     }
     for c in cached.comments.iter() {
-        let idx = arena.push_comment(Comment {
+        arena.push_comment(Comment {
             text: c.text.as_str().to_string(),
             pos: cached_to_range(
                 c.start_line.to_native(),
@@ -86,12 +90,50 @@ pub fn archived_to_arena(
                 c.end_col.to_native(),
             ),
         });
-        assert_eq!(idx as usize, arena.comments.len() - 1);
     }
     debug_assert!(tokens.next().is_none(), "interned token count mismatch");
 
     let root = children_from_archived(&cached.root_children);
-    (arena, root)
+    validate_child_bounds(&arena, &root)?;
+    Ok((arena, root))
+}
+
+/// Reject a cache whose child references fall outside the rebuilt arena vectors.
+/// Downstream consumers index `arena.leaves[i]` (see [`Arena::keyed_clause`])
+/// with no bounds checks, so a corrupted/truncated cache would panic far from
+/// the load site. This runs once at the load boundary; every child list is
+/// visited exactly once (`root` plus each node's `Value::Clause` children).
+/// Indices are never followed, so a corrupt self-referential index can't loop.
+fn validate_child_bounds(arena: &Arena, root: &[Child]) -> Result<(), CacheError> {
+    check_child_list(arena, root)?;
+    for l in &arena.leaves {
+        if let Value::Clause(children) = &l.value {
+            check_child_list(arena, children)?;
+        }
+    }
+    for lv in &arena.leaf_values {
+        if let Value::Clause(children) = &lv.value {
+            check_child_list(arena, children)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_child_list(arena: &Arena, children: &[Child]) -> Result<(), CacheError> {
+    for child in children {
+        let in_bounds = match child {
+            Child::Leaf(i) => (*i as usize) < arena.leaves.len(),
+            Child::LeafValue(i) => (*i as usize) < arena.leaf_values.len(),
+            Child::Comment(i) => (*i as usize) < arena.comments.len(),
+        };
+        if !in_bounds {
+            return Err(CacheError::Deserialize {
+                msg: "cache child index out of bounds",
+                source: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn collect_archived_value_strings<'a>(v: &'a ArchivedCachedValue, out: &mut Vec<&'a str>) {

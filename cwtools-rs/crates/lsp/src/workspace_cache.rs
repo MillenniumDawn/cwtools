@@ -299,15 +299,16 @@ pub fn load(
 
     // Zero-copy hit path: intern straight from the archived buffer instead of
     // materializing an owned CachedFile first (halves per-string allocation).
-    with_archived_file(&path, |archived| {
-        let (arena, root_children) = archived_to_arena(archived, table);
-        ParsedFile {
+    // Either an IO/rkyv failure or an out-of-bounds child index collapses to a
+    // cache miss so the caller re-parses.
+    with_archived_file(&path, |archived| archived_to_arena(archived, table))
+        .ok()
+        .and_then(Result::ok)
+        .map(|(arena, root_children)| ParsedFile {
             arena,
             root_children,
             errors: vec![],
-        }
-    })
-    .ok()
+        })
 }
 
 /// Persist a successfully parsed (error-free) `ParsedFile` to the cache.
