@@ -148,6 +148,33 @@ pub(crate) fn truncate_validation_errors(
     total
 }
 
+/// CW100: objects defined here whose `## required` localisation keys aren't
+/// provided by any loc file. Gated on the loc index being built — before the
+/// initial scan finishes it's empty and everything would falsely report
+/// missing. Shared by the batch/scan path and the single-file keystroke path
+/// so both apply the same gate (a prior drift left the keystroke path without
+/// this check, so CW100 would flicker off on every edit until the next scan).
+pub(crate) fn append_missing_loc_errors(
+    parsed: &ParsedFile,
+    uri: &str,
+    prepared: &Prepared,
+    errs: &mut Vec<cwtools_validation::ValidationError>,
+) {
+    if let Some(loc) = prepared.loc_index
+        && !loc.union().is_empty()
+    {
+        let overlay = prepared.extra_loc_keys;
+        errs.extend(cwtools_validation::missing_loc::check_missing_localisation(
+            parsed,
+            uri,
+            uri,
+            prepared.ruleset,
+            prepared.table,
+            |k| loc.exists_any(k) || overlay.is_some_and(|o| o.contains(k)),
+        ));
+    }
+}
+
 /// Validate one already-parsed file against a caller-supplied [`Prepared`],
 /// returning LSP diagnostics. The prebuilt state is passed in (not re-locked
 /// here) so the full-workspace pass can take its read guards once and share the
@@ -164,23 +191,7 @@ pub(crate) fn validate_parsed_with_indexes(
         .map(|e| parse_error_to_diagnostic(e, line_ends))
         .collect();
     let mut errs = validate_prepared(parsed, uri, prepared);
-    // CW100: objects defined here whose `## required` localisation keys aren't
-    // provided by any loc file. Gated on the loc index being built — before the
-    // initial scan finishes it's empty and everything would falsely report
-    // missing.
-    if let Some(loc) = prepared.loc_index
-        && !loc.union().is_empty()
-    {
-        let overlay = prepared.extra_loc_keys;
-        errs.extend(cwtools_validation::missing_loc::check_missing_localisation(
-            parsed,
-            uri,
-            uri,
-            prepared.ruleset,
-            prepared.table,
-            |k| loc.exists_any(k) || overlay.is_some_and(|o| o.contains(k)),
-        ));
-    }
+    append_missing_loc_errors(parsed, uri, prepared, &mut errs);
     truncate_validation_errors(&mut errs, uri);
     for err in &errs {
         diagnostics.push(validation_error_to_diagnostic(err, line_ends));
@@ -1040,6 +1051,7 @@ impl Backend {
                             var_checks,
                         );
                         let mut errs = validate_prepared(&parsed, uri, &prepared);
+                        append_missing_loc_errors(&parsed, uri, &prepared, &mut errs);
                         drop(loc_guard);
                         drop(info_guard);
                         let elapsed = start.elapsed();

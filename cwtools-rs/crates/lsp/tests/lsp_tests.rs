@@ -5038,6 +5038,134 @@ fn did_open_indexes_own_subtype_membership() {
     );
 }
 
+// ── Keystroke path runs CW100 too (open-doc missing-loc flicker) ─────────────
+
+const MISSING_LOC_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        localisation = {
+            ## required
+            name = "$"
+            ## required
+            desc = "$_desc"
+        }
+    }
+}
+thing = { x = scalar }
+"#;
+
+#[test]
+fn test_keystroke_edit_reports_missing_loc_once_loc_index_is_built() {
+    // CW100 (missing localisation) is gated on the loc index being non-empty
+    // (`validate.rs::append_missing_loc_errors`). Before this fix the gate was
+    // applied only in the scan/dependent-sweep path
+    // (`validate_parsed_with_indexes`), not in the keystroke path
+    // (`parse_and_validate`) — so an open doc's CW100 would appear after a scan
+    // or dependent revalidation and then vanish on the very next edit, until the
+    // next scan. This is the flicker's kill test: once the loc index is built,
+    // a didChange (the keystroke path) must still report CW100, not clear it.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    // Explicit empty vanilla dir so a real host game install (if any) can't
+    // merge in loc data that would mask the missing `my_thing_desc` key.
+    let vanilla_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), MISSING_LOC_RULES).unwrap();
+
+    // Non-empty loc union (the CW100 gate), but missing `my_thing_desc`.
+    let loc_dir = ws.path().join("localisation");
+    std::fs::create_dir_all(&loc_dir).unwrap();
+    let mut loc_bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    loc_bytes.extend_from_slice(b"l_english:\n my_thing:0 \"My Thing\"\n");
+    std::fs::write(loc_dir.join("test_l_english.yml"), &loc_bytes).unwrap();
+
+    let rel_path = "common/things/test.txt";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    // Empty on disk: the initial scan must not see `my_thing`, so the CW100
+    // this test checks for can only have come from the didChange below (the
+    // keystroke path), not a diagnostic left over from the scan.
+    std::fs::write(&file_path, "").unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // The loc index (built from `localisation/` above) is complete by the time
+    // the scan flips `index_ready` and the loading bar closes.
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": "",
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, rel_path);
+
+    // The keystroke path: didChange runs through `parse_and_validate`, not the
+    // scan/dependent-sweep's `validate_parsed_with_indexes`.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri, "version": 2 },
+                "contentChanges": [{ "text": "my_thing = { x = 1 }\n" }],
+            }),
+        ),
+    )
+    .unwrap();
+
+    let codes = diags_for(&mut reader, rel_path, 1).expect("diagnostics after keystroke edit");
+    child.kill().ok();
+
+    assert!(
+        codes.contains(&"CW100".to_string()),
+        "a didChange (keystroke) edit must report CW100 for my_thing's missing \
+         required `my_thing_desc` loc key once the loc index is non-empty, \
+         got: {:?}",
+        codes
+    );
+}
+
 // ── Code actions (quick-fixes from SuggestedFix payloads) ────────────────────
 
 /// Read frames until a publishDiagnostics for `suffix` arrives carrying a
