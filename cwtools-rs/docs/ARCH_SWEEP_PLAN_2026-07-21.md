@@ -21,7 +21,7 @@
 
 ## Phase 1 — parallel sonnet tasks (disjoint crates)
 
-### Task T1: LSP indexing dedup, SymbolIndex removal, micro-perf [sonnet]
+### Task 1: LSP indexing dedup, SymbolIndex removal, micro-perf [sonnet]
 
 **Files:**
 - Delete: `crates/lsp/src/symbols.rs`
@@ -37,7 +37,7 @@
 
 **Interfaces:** Produces: `parse_and_validate` now calls `index_parsed_file(...)`; `SymbolIndex` no longer exists (T9 touches `validate.rs` later and must not resurrect it).
 
-### Task T2: Dead-code sweep [sonnet]
+### Task 2: Dead-code sweep [sonnet]
 
 **Files:**
 - Delete: `crates/info/src/inline_expansion.rs`
@@ -52,7 +52,7 @@
 - [ ] **Step 5 (PP7):** Remove `StringId::NULL` (never read; the two debug_assert message strings mention it textually but do not reference it).
 - [ ] **Step 6:** `cargo test --workspace`, fmt+clippy. Commit: `dead code: drop inline_expansion, FileInfo block vecs, Session::validate_file, orphan error codes, StringId::NULL`
 
-### Task T3: Localisation bug fixes [sonnet]
+### Task 3: Localisation bug fixes [sonnet]
 
 **Files:**
 - Modify: `crates/localization/src/pipeline.rs` (~120-159, ~186-188), `crates/localization/src/service.rs` (~156-167), `crates/localization/src/scope_validation.rs` (~87-92, ~115, ~160-179)
@@ -64,7 +64,7 @@
 - [ ] **Step 2 (P1):** `validate_loc_commands` computes `game_to_engine(data.game)` per loc-referencing leaf even when `data.registry.is_some()` makes it dead, and for Ck2/Vic2/Custom that fires `tracing::warn!` per leaf. Skip the computation when `registry.is_some()`; hoist the no-engine-mapping warning so it logs once per run (e.g. a `Once`/session-level guard), not per leaf.
 - [ ] **Step 3:** `cargo test -p cwtools_localization`, fmt+clippy. Commit: `loc: skip YAML lang-header check for CSV files (CW256 FP), stop per-leaf engine warn`
 
-### Task T4: CLI features [sonnet]
+### Task 4: CLI features [sonnet]
 
 **Files:**
 - Modify: `crates/cli/src/main.rs` (Validate args ~429, exit/severity ~205-215 and ~554-561, Loc command ~741-779)
@@ -78,7 +78,7 @@
 
 **Interfaces:** Consumes `SessionConfig.loc_languages` (`crates/driver/src/lib.rs:91`, already plumbed). T8 adds a `fix` subcommand to the same file later; keep `main.rs` command wiring tidy.
 
-### Task T5: Foundation robustness [sonnet]
+### Task 5: Foundation robustness [sonnet]
 
 **Files:**
 - Modify: `crates/parser/src/parser.rs` (:69), `crates/file_manager/src/file_manager.rs` (~778-796)
@@ -90,7 +90,7 @@
 - [ ] **Step 2 (PP4):** `walk_dir_generic` calls `compute_logical_path_with_root` (allocating) on every directory only to compute `root_level`. Thread an `is_root_level: bool` through the recursion instead (true only for direct children of the walk root). Existing tests `exclude_dir_patterns_skips_matching_dirs` and `root_resources_skipped_but_common_resources_indexed` must stay green.
 - [ ] **Step 3:** `cargo test -p cwtools_parser -p cwtools_file_manager`, fmt+clippy. Commit: `parser: saturate col past u16 max; file_manager: drop per-dir path alloc in walk`
 
-### Task T6: Validation quick perf [sonnet]
+### Task 6: Validation quick perf [sonnet]
 
 **Files:**
 - Modify: `crates/validation/src/lib.rs` (~121-148, ~351-352), `crates/validation/src/position.rs` (~114, ~165, ~261-279), `crates/validation/src/resolve.rs`
@@ -101,7 +101,7 @@
 - [ ] **Step 2 (V4):** Extract the duplicated grandchild refinement block (`find_grandchild_type` + `None` -> `type_key_filter` fallback gate) from `validate_wrapper_grandchildren` (lib.rs ~121-148) and `descend_wrapper` (position.rs ~261-279) into one helper in `resolve.rs` (e.g. `refine_grandchild_type(...) -> Option<(&TypeDefinition, &[...])>`, `None` = skip). Both callers delegate.
 - [ ] **Step 3:** `cargo test -p cwtools_validation`, fmt+clippy. Commit: `validation: reuse path candidates in dispatch, unify grandchild refinement`
 
-### Task T7: Rules/index perf + config diagnostics [sonnet]
+### Task 7: Rules/index perf + config diagnostics [sonnet]
 
 **Files:**
 - Modify: `crates/index/src/type_index.rs` (~370-386), `crates/rules/src/rules_types.rs` (~346-379), `crates/rules/src/rules_converter/comment_directives.rs` (~107-127, ~143-152)
@@ -124,7 +124,7 @@
 
 ## Phase 2 — parallel opus tasks (disjoint files)
 
-### Task T8: Cleanup v1 — SuggestedFix engine + `cwtools fix` subcommand [opus]
+### Task 8: Cleanup v1 — SuggestedFix engine + `cwtools fix` subcommand [opus]
 
 **Files:**
 - Create: fix types module (put `SpanEdit`/`SuggestedFix` next to `SourceRange`, i.e. in `cwtools_parser` — e.g. `crates/parser/src/fix.rs` — since both validation and localization must reference it; add the parser dep to `cwtools_localization` if missing, else re-export)
@@ -154,7 +154,7 @@ Add `pub fix: Option<SuggestedFix>` to `ValidationError` (default `None`; keep a
 
 **Interfaces:** Produces `SpanEdit`/`SuggestedFix` types and `ValidationError.fix`/`LocDiagnostic.fix` — T12 (LSP code actions) consumes exactly these. Produces `Commands::Fix` in the CLI.
 
-### Task T9: Parser quoted-key hardening + ParseError cleanup [opus]
+### Task 9: Parser quoted-key hardening + ParseError cleanup [opus]
 
 **Files:**
 - Modify: `crates/parser/src/parser.rs` (~170-227 quoted-key branch, ~331-405 quoted-value for the shared helper, constructors at ~391, ~549, ~599, ~701), `crates/parser/src/ast.rs` (:4-9), consumers `crates/lsp/src/validate.rs` (~241), `crates/driver/src/lib.rs` (~489), `crates/rules/src/ruleset_loader.rs` (~117)
@@ -167,7 +167,7 @@ Add `pub fix: Option<SuggestedFix>` to `ValidationError` (default `None`; keep a
 - [ ] **Step 3 (PP6):** `ParseError::Pos`'s first field is always `""` and every consumer discards it. Drop the field, update the 4 constructors and 3 consumers. Check the derived `Display` format string still renders sensibly (`{0}:{1}: {2}` form).
 - [ ] **Step 4:** `cargo test --workspace` (parser changes ripple), fmt+clippy. Commit: `parser: unclosed quoted keys terminate at newline with error; drop dead ParseError filename field`
 
-### Task T10: Cache load bounds validation [opus]
+### Task 10: Cache load bounds validation [opus]
 
 **Files:**
 - Modify: `crates/cache/src/convert.rs` (~107-116, and the tautological asserts at ~65, ~77), `crates/cache/src/io.rs` (~64-105) as needed
@@ -179,7 +179,7 @@ Add `pub fix: Option<SuggestedFix>` to `ValidationError` (default `None`; keep a
 - [ ] **Step 2:** After rebuilding children in `archived_to_arena`/`children_from_archived`, validate every `Child::Leaf/LeafValue/Comment` index against the corresponding arena vector length once at the load boundary; return `CacheError` on violation (existing miss/re-parse fallback handles it). Keep it one pass over the child lists — no per-lookup overhead downstream. Replace the tautological `assert_eq!` scaffolding with the real check or delete it.
 - [ ] **Step 3:** `cargo test -p cwtools_cache`, fmt+clippy. Commit: `cache: reject out-of-bounds child indices at load instead of panicking downstream`
 
-### Task T11: Index walker dedup [opus]
+### Task 11: Index walker dedup [opus]
 
 **Files:**
 - Modify: `crates/index/src/collect.rs` (~110-156 vs ~202-238)
@@ -198,7 +198,7 @@ Add `pub fix: Option<SuggestedFix>` to `ValidationError` (default `None`; keep a
 
 ## Phase 3 — sequenced
 
-### Task T12: LSP quick-fix code actions [opus] (requires T8)
+### Task 12: LSP quick-fix code actions [opus] (requires T8)
 
 **Files:**
 - Modify: `crates/lsp/src/config.rs` (ServerCapabilities ~357), `crates/lsp/src/validate.rs` (`validation_error_to_diagnostic` ~286, `data` currently `None` at ~235), `crates/lsp/src/main.rs` (handler registration)
@@ -212,7 +212,7 @@ Add `pub fix: Option<SuggestedFix>` to `ValidationError` (default `None`; keep a
 - [ ] **Step 4 (stretch, only if the above lands cleanly):** a non-edit code action on CW100 diagnostics titled "Generate missing localisation" that invokes the existing `genlocall` command machinery (`config.rs` ~772-824) via `execute_command`.
 - [ ] **Step 5:** Test: unit-test the handler mapping (diagnostic-with-data -> CodeAction) directly. `cargo test -p cwtools_lsp`, fmt+clippy. Commit: `lsp: quick-fix code actions from SuggestedFix payloads`
 
-### Task T13: Wire type_key_prefix in instance collection [opus]
+### Task 13: Wire type_key_prefix in instance collection [opus]
 
 **Files:**
 - Modify: `crates/index/src/collect.rs` (collector gate, ~124-145 pre-T11 numbering — re-locate after T11's refactor), `crates/rules/src/rules_converter/types.rs` (~121-123, read side only)
@@ -234,7 +234,7 @@ Add `pub fix: Option<SuggestedFix>` to `ValidationError` (default `None`; keep a
 - [ ] **Step 2 (V3):** Fuse `count_children` and `validate_each_child` into one pass that tallies and validates (phase-2 validation does not read phase-1 counts; only `enforce_cardinality` does). Preserve emission content exactly; row order may shift (guard diff is sorted, so only content changes would surface).
 - [ ] **Step 3:** Corpus guard byte-identical, `cargo test -p cwtools_validation`, fmt+clippy. Commit: `validation: fuse child count+validate passes, stop rebuilding static lowercased rule keys`
 
-### Task T15: Release chores [sonnet]
+### Task 15: Release chores [sonnet]
 
 **Files:**
 - Modify: `CHANGELOG.md` (repo root), `cwtools-rs/Cargo.toml` (workspace version 2.1.0 -> 2.2.0)
