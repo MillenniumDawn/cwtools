@@ -1,3 +1,34 @@
+# 2.2.0
+
+## Features
+
+- Six diagnostics now carry a suggested fix: CW253 (deprecated `set_empire_name`/`set_planet_name` -> `set_name`), CW282 (redundant explicit default bool), CW280 (redundant `{ always = <default> }` field), CW121 (empty if/else_if), CW281 (empty `limit = { }`), and CW268 (unquoted loc value). New `cwtools fix` subcommand applies them: dry-run by default (prints a unified-diff preview), `--apply` writes the changes, and a repeatable `--code` filters to specific diagnostics (omit to fix everything fixable). Overlapping edits in the same file are skipped and reported rather than corrupting each other.
+- The LSP offers the same fixes as quick-fix code actions (`CodeActionKind::QUICKFIX`), built from a `fix` payload now carried in each diagnostic's `data` field.
+- `cwtools validate` gets `--loc-language` (repeatable, restricts loc validation/lookup to the given languages) and `--min-severity` (filters diagnostics below the given severity out of the report and hash).
+- A malformed `## cardinality` bound or an unrecognized `## severity` value in a `.cwt` rule file now produces a diagnostic at rules-load time instead of silently falling back to a default.
+- `type_key_prefix` on a `.cwt` type definition is now honored during instance collection: only keys matching the prefix (case-insensitive) are collected as instances of that type, with the prefix kept intact in the instance name.
+
+## Bug Fixes
+
+- A file being actively edited no longer loses `<type.subtype>` membership partway through. The live-edit indexing path had drifted from the workspace-scan/did_close path and skipped the subtype-instance merge, so a subtype discriminated through an archetype reference (e.g. naval equipment via `archetype = <equipment.naval_equip>`) could stop resolving while the file was open. Both paths now go through the same `index_parsed_file`.
+- An unclosed quoted key (`"foo = { ... }` with no closing quote) now terminates at end of line with an "unclosed quoted string" error instead of silently swallowing every statement that follows.
+- A column past 65,535 saturates instead of overflowing a `u16` and panicking a debug build.
+- CW256 (missing loc-file language header) no longer false-fires on CSV-based localisation (CK2/VIC2), which has no YAML header line to check.
+- A corrupted `.cwb` cache file with an out-of-bounds child index now falls back to re-parsing the source instead of panicking.
+
+## Notes
+
+- **Behavioral:** `cwtools loc` now exits 1 only on an Error-severity diagnostic (or a real parse failure), matching `validate`. Previously it exited 1 on any diagnostic, so an Information- or Warning-only run (e.g. a lone CW234 placeholder, or a CW268 missing-quote warning) now exits 0.
+
+## Developer
+
+- Dropped the dead `SymbolIndex` (it was rebuilt on every keystroke and nothing read it), `inline_expansion`, unused `FileInfo` block vecs, `Session::validate_file`, orphaned error codes, and `StringId::NULL`: about 650 lines gone.
+- Rule validation fuses its child-count and per-child-validate passes into one walk and stops rebuilding a rule's lowercased key on every visit.
+- `instances_in_file` is now O(file) via a reverse map instead of scanning the whole index.
+- The two skip-root-key navigation walkers in the index (instance collection and the per-node callback) are unified behind one visitor.
+- The file-walk no longer allocates a path per directory entry.
+- Corpus output stayed byte-identical throughout, checked against the Kaiserreich guard corpus.
+
 # 1.26.0
 
 ## Bug Fixes
