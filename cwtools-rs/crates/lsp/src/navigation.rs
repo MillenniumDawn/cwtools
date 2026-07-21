@@ -964,7 +964,7 @@ fn all_token_cols_in_line(line: &str, name: &str) -> Vec<u32> {
 /// (the operator of a `key = value` leaf; also the `=` in `>=`/`?=`/etc.). The
 /// value token scan starts here so nothing in the key can be mistaken for the
 /// value. `None` when no `=` follows the key.
-fn value_start_after_eq(line: &str, key_col: u32) -> Option<u32> {
+pub(crate) fn value_start_after_eq(line: &str, key_col: u32) -> Option<u32> {
     line.chars()
         .enumerate()
         .skip(key_col as usize)
@@ -978,7 +978,7 @@ fn value_start_after_eq(line: &str, key_col: u32) -> Option<u32> {
 /// trailing comment (`x = MY_FOCUS # keep MY_FOCUS`) or a second `key = value`
 /// pair later on the line can't be mistaken for the value. Quoted values
 /// (`"MY_FOCUS"`) match the inner token. `None` when `name` doesn't occur here.
-fn value_col_in_line(line: &str, name: &str, from: u32) -> Option<u32> {
+pub(crate) fn value_col_in_line(line: &str, name: &str, from: u32) -> Option<u32> {
     let chars: Vec<char> = line.chars().collect();
     let needle: Vec<char> = name.chars().collect();
     if needle.is_empty() {

@@ -5195,3 +5195,122 @@ types = {
         "applied edit must delete the empty limit"
     );
 }
+
+// ── Inlay hints: loc titles ──────────────────────────────────────────────────
+
+#[test]
+fn test_inlay_hint_shows_loc_title_after_known_id() {
+    // End-to-end: the server advertises the inlayHint capability, and a request
+    // over a script that references a known decision id (with a localised title)
+    // returns one hint carrying that title, positioned just past the id.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    // The definition (indexed as a `decision` instance named `my_decision`).
+    let defs = ws.path().join("common/decisions/defs.txt");
+    std::fs::create_dir_all(defs.parent().unwrap()).unwrap();
+    std::fs::write(&defs, "my_decision = { cost = 1 }\n").unwrap();
+
+    // Its localised title.
+    let loc_dir = ws.path().join("localisation");
+    std::fs::create_dir_all(&loc_dir).unwrap();
+    let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice("l_english:\n my_decision:0 \"My Decision\"\n".as_bytes());
+    std::fs::write(loc_dir.join("test_l_english.yml"), &bytes).unwrap();
+
+    // The opened script referencing the id as a value on line 1.
+    let rel_path = "common/decisions/use.txt";
+    let text = "wrapper = {\n    ref = my_decision\n}\n";
+    let use_path = ws.path().join(rel_path);
+    std::fs::write(&use_path, text).unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", use_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let init_resp_str = read_response(&mut reader).expect("no init response");
+    let init_resp: serde_json::Value = serde_json::from_str(&init_resp_str).unwrap();
+    // Capability advertised.
+    assert_eq!(
+        init_resp["result"]["capabilities"]["inlayHintProvider"], true,
+        "inlayHint capability must be advertised: {init_resp_str}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    // Poll the inlay request until the loc map + type index are populated.
+    let mut hint = serde_json::Value::Null;
+    for attempt in 0..30 {
+        let req = jsonrpc_request(
+            2 + attempt,
+            "textDocument/inlayHint",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 100, "character": 0 },
+                },
+            }),
+        );
+        write_frame(&mut child, &req).unwrap();
+        let resp_str = read_response(&mut reader).expect("no inlayHint response");
+        let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+        if let Some(arr) = resp["result"].as_array()
+            && !arr.is_empty()
+        {
+            hint = arr[0].clone();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    child.kill().ok();
+
+    assert_eq!(hint["label"], "My Decision", "got: {hint}");
+    // Anchored just past `my_decision` on line 1: "    ref = my_decision" ends at col 21.
+    assert_eq!(hint["position"]["line"], 1, "got: {hint}");
+    assert_eq!(hint["position"]["character"], 21, "got: {hint}");
+    assert_eq!(hint["paddingLeft"], true, "got: {hint}");
+}

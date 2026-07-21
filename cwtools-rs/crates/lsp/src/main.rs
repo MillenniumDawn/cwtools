@@ -18,6 +18,7 @@ mod code_action;
 mod completion;
 mod config;
 mod hover;
+mod inlay;
 mod navigation;
 mod paths;
 mod scan;
@@ -251,6 +252,15 @@ struct DocumentState {
     /// (run through `change_scope`), alongside the ambient current scope. Off by
     /// default — the ambient scope is shown alone. (#37)
     hover_resolved_scope: std::sync::atomic::AtomicBool,
+    /// Loc-title inlay hints (`cwtools.inlayHints.locTitles` init option, default
+    /// ON). When `true`, `textDocument/inlayHint` annotates a leaf whose value is
+    /// a known type-instance id with its localised title. Read on each request.
+    inlay_hints_loc_titles: std::sync::atomic::AtomicBool,
+    /// Resolved-scope inlay hints (`cwtools.inlayHints.scopes` init option,
+    /// default OFF). Scaffolded but not yet produced: the resolved scope needs a
+    /// per-position resolver invocation per leaf, too costly over a viewport
+    /// range. See `inlay.rs`.
+    inlay_hints_scopes: std::sync::atomic::AtomicBool,
     /// Whether the client advertised `hierarchicalDocumentSymbolSupport` at
     /// initialize. When `true`, documentSymbol returns a nested `DocumentSymbol`
     /// tree; otherwise it falls back to the flat `SymbolInformation` list.
@@ -455,6 +465,8 @@ impl DocumentState {
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
             hover_resolved_scope: std::sync::atomic::AtomicBool::new(false),
+            inlay_hints_loc_titles: std::sync::atomic::AtomicBool::new(true),
+            inlay_hints_scopes: std::sync::atomic::AtomicBool::new(false),
             hierarchical_symbols: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             edit_generation: AtomicU64::new(0),
@@ -1334,6 +1346,10 @@ impl LanguageServer for Backend {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         self.mark_activity();
         self.code_action_impl(params).await
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        self.inlay_hint_impl(params).await
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {

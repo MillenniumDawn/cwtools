@@ -187,6 +187,21 @@ impl Backend {
                     .store(mode == "resolved", std::sync::atomic::Ordering::Relaxed);
             }
 
+            // Inlay hints. Loc-title hints (`cwtools.inlayHints.locTitles`) default
+            // ON; resolved-scope hints (`cwtools.inlayHints.scopes`) default OFF.
+            // Absent leaves the constructor defaults untouched. Read once at init,
+            // matching the hover toggles above.
+            if let Some(on) = opts.get("inlayHintsLocTitles").and_then(|v| v.as_bool()) {
+                self.state
+                    .inlay_hints_loc_titles
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(on) = opts.get("inlayHintsScopes").and_then(|v| v.as_bool()) {
+                self.state
+                    .inlay_hints_scopes
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+            }
+
             // Persistent cache directory for the base-game index (so it isn't
             // re-parsed every startup). The client should pass its global
             // storage path; we fall back to an OS cache dir otherwise.
@@ -417,6 +432,10 @@ impl Backend {
                         work_done_progress_options: Default::default(),
                     },
                 )),
+                // Inlay hints: declared statically (loc-title hints default on).
+                // The handler gates each kind on its setting and returns nothing
+                // when both are off, so a client always-on capability is harmless.
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 // `position_encoding` (above): utf-32 when the client supports
                 // it, else the LSP default (utf-16). The parser counts chars,
                 // so on utf-16 clients column offsets are off by the number of
