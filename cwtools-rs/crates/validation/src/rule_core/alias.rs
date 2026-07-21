@@ -298,7 +298,7 @@ pub(super) fn validate_alias_usage(
     // permissive sibling overload — typically a pattern alias whose backing enum
     // is unpopulated, so it matches any key with a `variable_field` that accepts
     // the block cleanly — would win clean and discard the strict math
-    // diagnostic. Mirrors the same authoritative bypass in `validate_each_child`.
+    // diagnostic. Mirrors the same authoritative bypass in `count_and_validate_children`.
     if let Some(leaf) = leaf
         && matches!(&leaf.value, Value::Clause(_))
         && let Some((mrt, _)) = overloads.iter().find(|(rt, _)| rule_right_is_math_expr(rt))
