@@ -364,18 +364,27 @@ impl TypeIndex {
         self.name_counts.contains_key(name) || self.var_index.names.contains_key(name)
     }
 
-    /// Every `(type_name, instance)` defined in `file_uri`. Scans the whole
-    /// index (O(total instances)); used by document-symbol/outline, which is
-    /// on-demand and infrequent. Lets `FileInfo` avoid a second per-file copy.
+    /// Every `(type_name, instance)` defined in `file_uri`. Used by
+    /// document-symbol/outline, which is on-demand and infrequent. Lets
+    /// `FileInfo` avoid a second per-file copy. Visits only the buckets the
+    /// reverse map (`file_buckets`) records for this file, so the cost is
+    /// proportional to the file's own entries rather than the whole index
+    /// (same narrowing as `remove_file`).
     pub fn instances_in_file<'a>(&'a self, file_uri: &str) -> Vec<(&'a str, &'a TypeInstance)> {
+        let Some(type_names) = self.file_buckets.get(file_uri) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
-        for (type_name, entries) in &self.map {
+        for type_name in type_names {
             // Skip subtype-qualified membership keys: the instance already
             // appears under its base `type`, so listing it again would duplicate
             // the outline / document-symbol entry.
             if is_subtype_key(type_name) {
                 continue;
             }
+            let Some(entries) = self.map.get(type_name.as_str()) else {
+                continue;
+            };
             for (uri, inst) in entries {
                 if uri.as_ref() == file_uri {
                     out.push((type_name.as_str(), inst));
@@ -560,6 +569,38 @@ mod tests {
         assert_eq!(locs.len(), 1, "should resolve case-insensitively");
         assert_eq!(locs[0].1.line, 7);
         assert!(idx.instance_locations("nope.1").is_empty());
+    }
+
+    #[test]
+    fn instances_in_file_only_this_files_entries_excludes_subtype_keys() {
+        let mut idx = TypeIndex::new();
+        idx.merge(
+            "file://a.txt",
+            HashMap::from([
+                ("event".to_string(), vec![inst("a_ev", 1)]),
+                ("tech".to_string(), vec![inst("a_tech", 2)]),
+            ]),
+        );
+        idx.merge_with_uris(vec![
+            (
+                "event".to_string(),
+                vec![(Arc::<str>::from("file://b.txt"), inst("b_ev", 3))],
+            ),
+            (
+                "event.subt".to_string(),
+                vec![(Arc::<str>::from("file://a.txt"), inst("a_ev", 1))],
+            ),
+        ]);
+
+        let mut got: Vec<(&str, &str)> = idx
+            .instances_in_file("file://a.txt")
+            .into_iter()
+            .map(|(ty, i)| (ty, i.name.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![("event", "a_ev"), ("tech", "a_tech")]);
+
+        assert!(idx.instances_in_file("file://never.txt").is_empty());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::post_process::post_process;
 #[cfg(test)]
 use crate::rules_converter::ast_to_ruleset;
-use crate::rules_converter::ast_to_ruleset_raw;
+use crate::rules_converter::{ast_to_ruleset_raw, validate_comment_directives};
 use crate::rules_types::RuleSet;
 use cwtools_parser::ast::ParseError;
 use cwtools_parser::parser::parse_string;
@@ -108,6 +108,7 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
             }
             Ok(content) => match parse_string(&content, table) {
                 Ok(parsed) => {
+                    errors.extend(validate_comment_directives(&parsed, path));
                     let ruleset = ast_to_ruleset_raw(&parsed, table);
                     merge_ruleset(&mut combined, ruleset);
                     asts.push((path.clone(), parsed));
