@@ -4416,6 +4416,12 @@ fn test_config_no_op_skips_revalidate_then_real_change_runs() {
         1,
         "first (changed) config should revalidate the open doc once"
     );
+    // The open doc's AST is current (opened, never edited), so the revalidate
+    // must reuse the stored AST via the prebuilt path — no fresh parse.
+    assert!(
+        log1.contains("(configChange)") && log1.contains("(prebuilt, no reparse)"),
+        "an unedited open doc should revalidate from its stored AST, not re-parse: {log1}"
+    );
 
     // Identical payload → no-op guard skips the revalidate (total stays 1).
     write_frame(&mut child, &cfg(&["CW999"])).unwrap();
