@@ -365,7 +365,7 @@ impl Backend {
 
     /// The current text of `uri`: the open-doc buffer if open, else read from
     /// disk (encoding-aware). `None` when neither is available.
-    fn file_text_for(&self, uri: &str) -> Option<String> {
+    pub(crate) fn file_text_for(&self, uri: &str) -> Option<String> {
         {
             let docs = self.state.documents.lock();
             if let Some(doc) = docs.get(uri) {

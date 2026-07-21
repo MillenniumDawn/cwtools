@@ -56,7 +56,9 @@ pub(crate) fn loc_diag_to_validation_error(
         col: d.col.saturating_sub(1) as u16,
         file: d.file.clone(),
         code: Some(d.code),
-        fix: None,
+        // Carry the loc fix (CW268 quote-wrap) so it reaches the code-action
+        // path through the shared `validation_error_to_diagnostic` renderer.
+        fix: d.fix.clone(),
     }
 }
 
@@ -297,7 +299,7 @@ pub(crate) fn validation_error_to_diagnostic(
         cwtools_validation::ErrorSeverity::Information => DiagnosticSeverity::INFORMATION,
         cwtools_validation::ErrorSeverity::Hint => DiagnosticSeverity::HINT,
     };
-    diagnostic_at(
+    let mut diag = diagnostic_at(
         line,
         col,
         line_ends,
@@ -305,7 +307,14 @@ pub(crate) fn validation_error_to_diagnostic(
         "cwtools",
         err.code.map(|c| NumberOrString::String(c.to_string())),
         err.message.clone(),
-    )
+    );
+    // Carry any machine-applicable fix into `data` so the code-action handler
+    // can round-trip it back into a QUICKFIX WorkspaceEdit. Covers both the
+    // validation and loc paths (loc diagnostics flow through here too).
+    if let Some(fix) = &err.fix {
+        diag.data = Some(crate::code_action::fix_to_data(fix));
+    }
+    diag
 }
 
 /// Collect the identifier-like tokens a parsed file mentions — every key and

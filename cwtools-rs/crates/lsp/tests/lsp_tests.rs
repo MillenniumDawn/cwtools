@@ -5031,3 +5031,161 @@ fn did_open_indexes_own_subtype_membership() {
         codes
     );
 }
+
+// ── Code actions (quick-fixes from SuggestedFix payloads) ────────────────────
+
+/// Read frames until a publishDiagnostics for `suffix` arrives carrying a
+/// diagnostic whose `code` matches, returning that full diagnostic JSON object
+/// (range + data included). None on timeout.
+fn wait_for_diag_object(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    suffix: &str,
+    code: &str,
+) -> Option<serde_json::Value> {
+    for _ in 0..2000 {
+        let raw = read_frame(reader).ok()?;
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(suffix))
+            && let Some(d) = v["params"]["diagnostics"]
+                .as_array()
+                .and_then(|a| a.iter().find(|d| d["code"] == code))
+        {
+            return Some(d.clone());
+        }
+    }
+    None
+}
+
+#[test]
+fn test_code_action_quickfix_from_diagnostic() {
+    // End-to-end: an empty `limit = { }` produces a CW281 diagnostic carrying a
+    // fix payload in `data`. Round-tripping that diagnostic back through
+    // textDocument/codeAction must yield one QUICKFIX whose edit, applied to the
+    // source, deletes the empty limit — the same result as the CLI `fix`.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/decisions/test.txt";
+    let text = "x = { limit = { } }\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let init_resp_str = read_response(&mut reader).expect("no init response");
+    let init_resp: serde_json::Value = serde_json::from_str(&init_resp_str).unwrap();
+    // Capability advertised: quickfix code actions, no resolve step.
+    let ca = &init_resp["result"]["capabilities"]["codeActionProvider"];
+    assert_eq!(ca["codeActionKinds"][0], "quickfix", "got: {ca}");
+    assert_eq!(ca["resolveProvider"], false, "got: {ca}");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW281")
+        .expect("CW281 diagnostic published for the empty limit");
+    assert!(
+        diag.get("data").is_some(),
+        "the diagnostic must carry a fix payload in `data`: {diag}"
+    );
+
+    let ca_req = jsonrpc_request(
+        2,
+        "textDocument/codeAction",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "range": diag["range"],
+            "context": { "diagnostics": [diag] },
+        }),
+    );
+    write_frame(&mut child, &ca_req).unwrap();
+    let resp_str = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(resp["id"], 2, "got: {resp_str}");
+    let actions = resp["result"].as_array().expect("array result");
+    assert_eq!(actions.len(), 1, "one quickfix expected: {resp_str}");
+    let action = &actions[0];
+    assert_eq!(action["kind"], "quickfix");
+    assert_eq!(action["title"], "Remove empty limit");
+
+    // The edit must reproduce the CLI `fix` output when applied.
+    let changes = action["edit"]["changes"]
+        .as_object()
+        .expect("edit carries a changes map");
+    let edits = changes
+        .values()
+        .next()
+        .and_then(|v| v.as_array())
+        .expect("edits for the document");
+    assert_eq!(edits.len(), 1, "one text edit: {resp_str}");
+    let e = &edits[0];
+    let sc = e["range"]["start"]["character"].as_u64().unwrap() as usize;
+    let ec = e["range"]["end"]["character"].as_u64().unwrap() as usize;
+    let new_text = e["newText"].as_str().unwrap();
+    // The fix is confined to line 0; splice the char range on that line.
+    let nl = text.find('\n').unwrap();
+    let chars: Vec<char> = text[..nl].chars().collect();
+    let mut fixed: String = chars[..sc].iter().collect();
+    fixed.push_str(new_text);
+    fixed.extend(chars[ec..].iter());
+    fixed.push_str(&text[nl..]);
+    assert_eq!(
+        fixed, "x = { }\n",
+        "applied edit must delete the empty limit"
+    );
+}

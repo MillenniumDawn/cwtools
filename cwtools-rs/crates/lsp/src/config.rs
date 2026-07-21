@@ -407,6 +407,16 @@ impl Backend {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
+                // Quick-fixes from diagnostics that carry a `SuggestedFix`
+                // payload (CW253/CW282/CW280/CW121/CW281/CW268). No resolve
+                // step: the WorkspaceEdit is built up-front in the handler.
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        resolve_provider: Some(false),
+                        work_done_progress_options: Default::default(),
+                    },
+                )),
                 // `position_encoding` (above): utf-32 when the client supports
                 // it, else the LSP default (utf-16). The parser counts chars,
                 // so on utf-16 clients column offsets are off by the number of

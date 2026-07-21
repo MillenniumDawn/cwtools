@@ -14,6 +14,7 @@ use cwtools_rules::rules_types::{NewField, RuleSet, RuleType, TypeType, ValueTyp
 use cwtools_string_table::string_table::{StringId, StringTable};
 use cwtools_validation::position::rules_at_pos;
 
+mod code_action;
 mod completion;
 mod config;
 mod hover;
@@ -490,7 +491,8 @@ const DEBOUNCE_MS: u64 = 250;
 
 // ── Custom notification stubs ─────────────────────────────────────────────────
 
-// NOT PORTED — code-actions, pre-trigger refactor, techGraph / event-graph.
+// NOT PORTED — pre-trigger refactor, techGraph / event-graph.
+// (code-actions are handled in `code_action.rs`: QUICKFIX from SuggestedFix.)
 // See the F# LanguageFeatures.fs module if these are needed later.
 //   - getEmbeddedMetadata: per-file metadata bundle sent to the extension on
 //     open (F# LanguageFeatures.getEmbeddedMetadata).  Low priority until the
@@ -1327,6 +1329,11 @@ impl LanguageServer for Backend {
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         self.rename_impl(params).await
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        self.mark_activity();
+        self.code_action_impl(params).await
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
