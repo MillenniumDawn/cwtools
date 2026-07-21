@@ -231,6 +231,93 @@ fn test_validate_csv_report() {
 }
 
 #[test]
+fn test_validate_loc_language_valid_accepted() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--loc-language",
+            "english",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Validation complete"));
+}
+
+#[test]
+fn test_validate_loc_language_unknown_fails() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--loc-language",
+            "klingon",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid language 'klingon'"))
+        .stderr(predicate::str::contains("english"));
+}
+
+#[test]
+fn test_validate_min_severity_filters_lower_severities() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    // mod_a's event triggers an Information-severity CW107; --min-severity
+    // error should drop it from the report.
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--min-severity",
+            "error",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW107").not());
+}
+
+#[test]
+fn test_validate_min_severity_unknown_fails() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--min-severity",
+            "bogus",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid severity 'bogus'"));
+}
+
+#[test]
 fn test_validate_output_file() {
     let tmp = tempfile::tempdir().unwrap();
     let report = tmp.path().join("report.txt");
@@ -268,14 +355,38 @@ fn test_loc_valid_directory() {
 
 #[test]
 fn test_loc_detects_unterminated_quote() {
+    // CW268 is Warning-severity, so this now exits 0 (severity-aware exit,
+    // like `validate`) even though the issue is still reported.
     let loc_dir = fixtures_dir().join("loc_invalid");
     cwtools()
         .args(["loc", loc_dir.to_str().unwrap()])
         .assert()
-        .failure()
+        .success()
         .stdout(predicate::str::contains("CW268"))
         .stdout(predicate::str::contains("missing_quote"))
         .stdout(predicate::str::contains("1 issues"));
+}
+
+#[test]
+fn test_loc_information_only_succeeds() {
+    // CW234 (REPLACE_ME placeholder) is Information-severity; exit 0.
+    let loc_dir = fixtures_dir().join("loc_info_only");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW234"));
+}
+
+#[test]
+fn test_loc_error_severity_fails() {
+    // CW225 (undefined loc reference) is Error-severity; exit 1 unchanged.
+    let loc_dir = fixtures_dir().join("loc_error");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW225"));
 }
 
 #[test]

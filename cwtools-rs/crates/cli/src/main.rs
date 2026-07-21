@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand};
 use cwtools_driver::{index_game_dir, search_config_for};
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
+use cwtools_localization::Lang;
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
+use cwtools_validation::ErrorSeverity;
 use std::borrow::Cow;
 use std::path::PathBuf;
 
@@ -92,6 +94,17 @@ enum Commands {
         /// May be repeated. Examples: --ignore-dir "build" --ignore-dir "temp*"
         #[arg(long = "ignore-dir", value_name = "GLOB")]
         ignore_dirs: Vec<String>,
+        /// Restrict loc validation/lookup to this language (repeatable). Valid
+        /// values: english, french, german, spanish, russian, polish, braz_por,
+        /// simp_chinese, japanese, korean, turkish, default. Omit to use every
+        /// language with data (current behavior).
+        #[arg(long = "loc-language", value_name = "LANG", value_parser = parse_lang)]
+        loc_language: Vec<Lang>,
+        /// Only report diagnostics at or above this severity. Valid values:
+        /// error, warning, info, hint. Omit to report everything (current
+        /// behavior).
+        #[arg(long, value_name = "LEVEL", value_parser = parse_min_severity)]
+        min_severity: Option<ErrorSeverity>,
     },
     /// Pre-generate a vanilla type index from a base-game install, for use with
     /// `validate --vanilla-cache`. Parses and indexes the install once so later
@@ -196,6 +209,39 @@ fn print_ruleset_summary(ruleset: &cwtools_rules::rules_types::RuleSet) {
     println!("  Aliases:       {}", ruleset.aliases.len());
     println!("  SingleAliases: {}", ruleset.single_aliases.len());
     println!("  ComplexEnums:  {}", ruleset.complex_enums.len());
+}
+
+/// Parse a `--loc-language` value into a `Lang`, for clap's `value_parser`.
+fn parse_lang(s: &str) -> Result<Lang, String> {
+    Lang::from_name(s).ok_or_else(|| {
+        format!(
+            "invalid language '{s}': valid values are english, french, german, spanish, russian, \
+             polish, braz_por, simp_chinese, japanese, korean, turkish, default"
+        )
+    })
+}
+
+/// Parse a `--min-severity` value into an `ErrorSeverity`, for clap's `value_parser`.
+fn parse_min_severity(s: &str) -> Result<ErrorSeverity, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "error" => Ok(ErrorSeverity::Error),
+        "warning" => Ok(ErrorSeverity::Warning),
+        "info" => Ok(ErrorSeverity::Information),
+        "hint" => Ok(ErrorSeverity::Hint),
+        _ => Err(format!(
+            "invalid severity '{s}': valid values are error, warning, info, hint"
+        )),
+    }
+}
+
+/// Ordinal rank for `--min-severity` filtering: higher is more severe.
+fn severity_rank(s: ErrorSeverity) -> u8 {
+    match s {
+        ErrorSeverity::Error => 3,
+        ErrorSeverity::Warning => 2,
+        ErrorSeverity::Information => 1,
+        ErrorSeverity::Hint => 0,
+    }
 }
 
 /// Map a run's outcome to a process exit code. Operational failures (couldn't
@@ -345,6 +391,8 @@ fn main() {
             output_hashes,
             ignore_files,
             ignore_dirs,
+            loc_language,
+            min_severity,
         } => {
             use cwtools_driver::{RulesInput, Session, SessionConfig};
             use cwtools_game::constants::Game;
@@ -426,7 +474,11 @@ fn main() {
                 vanilla_cache: vanilla_cache_index,
                 ignore_files: &ignore_files,
                 ignore_dirs: &ignore_dirs,
-                loc_languages: None,
+                loc_languages: if loc_language.is_empty() {
+                    None
+                } else {
+                    Some(loc_language)
+                },
                 on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
             });
             let ruleset = session.ruleset();
@@ -550,6 +602,13 @@ fn main() {
                 });
             }
             tlog!("validate-loc");
+
+            // Same placement as the ignore_hashes filter above: strip diags
+            // before they reach the error/warning counts, the report, and the
+            // hash output. No-op unless --min-severity was passed.
+            if let Some(min_sev) = min_severity {
+                diags.retain(|d| severity_rank(d.severity) >= severity_rank(min_sev));
+            }
 
             let total_errors = diags
                 .iter()
@@ -773,8 +832,17 @@ fn main() {
                 "\nLoc validation complete: {} entries, {} issues",
                 total_entries, total_issues
             );
-            if total_issues > 0 {
-                std::process::exit(1);
+            // Severity-aware like `validate`: a parse failure is always an
+            // error; a lint diagnostic only counts if it's Error-severity, so
+            // e.g. Information-severity CW234 placeholders don't fail CI.
+            let total_errors = diags
+                .iter()
+                .filter(|d| d.severity == ErrorSeverity::Error)
+                .count()
+                + parse_errors.len();
+            let code = exit_code(total_errors, false, false);
+            if code != 0 {
+                std::process::exit(code);
             }
         }
     }
