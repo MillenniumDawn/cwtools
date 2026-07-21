@@ -479,7 +479,7 @@ fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<Val
         .iter()
         .map(|e| {
             let (line, col, msg) = match e {
-                ParseError::Pos(_, l, c, m) => (*l, *c, m.clone()),
+                ParseError::Pos(l, c, m) => (*l, *c, m.clone()),
                 ParseError::General(m) => (0, 0, m.clone()),
             };
             ValidationError {

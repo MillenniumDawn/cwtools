@@ -240,7 +240,7 @@ fn diagnostic_at(
 
 pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Diagnostic {
     let (line, col, msg) = match e {
-        ParseError::Pos(_f, line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
+        ParseError::Pos(line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
         ParseError::General(msg) => (0, 0, msg.clone()),
     };
     diagnostic_at(

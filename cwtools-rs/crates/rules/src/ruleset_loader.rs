@@ -115,7 +115,7 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
                 }
                 Err(e) => {
                     let (line, col, message) = match e {
-                        ParseError::Pos(_, l, c, m) => (l, c, m),
+                        ParseError::Pos(l, c, m) => (l, c, m),
                         ParseError::General(m) => (1, 0, m),
                     };
                     errors.push(RuleParseError {
