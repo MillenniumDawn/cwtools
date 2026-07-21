@@ -109,14 +109,17 @@ pub(crate) fn validate_scope_target(
         // NewScope-in-expected / VarFound / ValueFound / AnyScope -> lenient.
         _ => return,
     };
-    errors.push(ValidationError::from_code_with(
-        code,
-        code.severity,
-        file_path,
-        leaf.pos.start.line,
-        leaf.pos.start.col,
-        message,
-    ));
+    errors.push(
+        ValidationError::from_code_with(
+            code,
+            code.severity,
+            file_path,
+            leaf.pos.start.line,
+            leaf.pos.start.col,
+            message,
+        )
+        .with_end(leaf.pos.end),
+    );
 }
 
 /// Seed the scope context for a type instance's body. Precedence:

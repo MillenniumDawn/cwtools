@@ -512,6 +512,7 @@ fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<Val
                 file: file_path.to_string(),
                 code: None,
                 fix: None,
+                end: None,
             }
         })
         .collect()

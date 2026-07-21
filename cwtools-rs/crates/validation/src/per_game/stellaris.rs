@@ -148,7 +148,8 @@ fn walk_if_else(
                     col,
                     &[],
                 )
-                .with_fix(fix),
+                .with_fix(fix)
+                .with_end(block.range.end),
             );
         }
 
@@ -163,24 +164,30 @@ fn walk_if_else(
 
             // CW236 — old nested if/else style.
             if deprecated_else {
-                errors.push(ValidationError::from_code(
-                    &error_codes::CW236_DEPRECATED_ELSE,
-                    file_path,
-                    line,
-                    col,
-                    &[],
-                ));
+                errors.push(
+                    ValidationError::from_code(
+                        &error_codes::CW236_DEPRECATED_ELSE,
+                        file_path,
+                        line,
+                        col,
+                        &[],
+                    )
+                    .with_end(block.range.end),
+                );
             }
 
             // CW237 — ambiguous if = { if ... else }.
             if key == "if" && has_else && has_if {
-                errors.push(ValidationError::from_code(
-                    &error_codes::CW237_AMBIGUOUS_IF_ELSE,
-                    file_path,
-                    line,
-                    col,
-                    &[],
-                ));
+                errors.push(
+                    ValidationError::from_code(
+                        &error_codes::CW237_AMBIGUOUS_IF_ELSE,
+                        file_path,
+                        line,
+                        col,
+                        &[],
+                    )
+                    .with_end(block.range.end),
+                );
             }
 
             // CW238 — else/else_if missing a preceding if (skip the deprecated case).
@@ -196,13 +203,16 @@ fn walk_if_else(
                         prev_was_if = true;
                     } else {
                         // else / else_if with no preceding if.
-                        errors.push(ValidationError::from_code(
-                            &error_codes::CW238_IF_ELSE_ORDER,
-                            file_path,
-                            line,
-                            col,
-                            &[],
-                        ));
+                        errors.push(
+                            ValidationError::from_code(
+                                &error_codes::CW238_IF_ELSE_ORDER,
+                                file_path,
+                                line,
+                                col,
+                                &[],
+                            )
+                            .with_end(block.range.end),
+                        );
                         break;
                     }
                 }
@@ -305,13 +315,16 @@ fn flag_pretriggers(
         let leaf_key = table.get_string(leaf.key.lower).unwrap_or_default();
         if pretriggers.contains(&leaf_key) {
             let code = &error_codes::CW120_POSSIBLE_PRETRIGGER;
-            errors.push(ValidationError::from_code(
-                code,
-                file_path,
-                leaf.pos.start.line,
-                leaf.pos.start.col,
-                &[&leaf_key],
-            ));
+            errors.push(
+                ValidationError::from_code(
+                    code,
+                    file_path,
+                    leaf.pos.start.line,
+                    leaf.pos.start.col,
+                    &[&leaf_key],
+                )
+                .with_end(leaf.pos.end),
+            );
         }
     }
 }
@@ -410,13 +423,16 @@ fn validate_ship_designs(
             {
                 continue;
             }
-            errors.push(ValidationError::from_code(
-                code,
-                file_path,
-                gc_block.range.start.line,
-                gc_block.range.start.col,
-                &[&template],
-            ));
+            errors.push(
+                ValidationError::from_code(
+                    code,
+                    file_path,
+                    gc_block.range.start.line,
+                    gc_block.range.start.col,
+                    &[&template],
+                )
+                .with_end(gc_block.range.end),
+            );
         }
     }
 }
@@ -488,26 +504,32 @@ fn walk_research_leaders(
             match child_scalar(block.children, ast, table, "area") {
                 None => {
                     let code = &error_codes::CW108_RESEARCH_LEADER_AREA;
-                    errors.push(ValidationError::from_code(
-                        code,
-                        file_path,
-                        block.range.start.line,
-                        block.range.start.col,
-                        &[],
-                    ));
+                    errors.push(
+                        ValidationError::from_code(
+                            code,
+                            file_path,
+                            block.range.start.line,
+                            block.range.start.col,
+                            &[],
+                        )
+                        .with_end(block.range.end),
+                    );
                 }
                 Some(leader_area)
                     if !tech_area.is_empty() && !leader_area.eq_ignore_ascii_case(tech_area) =>
                 {
                     // F# swapped these args (tech first); ours is leader-then-tech.
                     let code = &error_codes::CW109_RESEARCH_LEADER_TECH;
-                    errors.push(ValidationError::from_code(
-                        code,
-                        file_path,
-                        block.range.start.line,
-                        block.range.start.col,
-                        &[&leader_area, tech_area],
-                    ));
+                    errors.push(
+                        ValidationError::from_code(
+                            code,
+                            file_path,
+                            block.range.start.line,
+                            block.range.start.col,
+                            &[&leader_area, tech_area],
+                        )
+                        .with_end(block.range.end),
+                    );
                 }
                 _ => {}
             }

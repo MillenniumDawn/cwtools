@@ -78,13 +78,16 @@ fn validate_wrapper_grandchildren(
                 if skip_tail.is_empty() {
                     let lv = &ast.arena.leaf_values[*idx as usize];
                     let value = leaf_value_to_string(&lv.value, table);
-                    errors.push(ValidationError::from_code(
-                        &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
-                        file_path,
-                        lv.pos.start.line,
-                        lv.pos.start.col,
-                        &[&format!("Unexpected bare value '{}'", value)],
-                    ));
+                    errors.push(
+                        ValidationError::from_code(
+                            &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
+                            file_path,
+                            lv.pos.start.line,
+                            lv.pos.start.col,
+                            &[&format!("Unexpected bare value '{}'", value)],
+                        )
+                        .with_end(lv.pos.end),
+                    );
                 }
                 continue;
             }

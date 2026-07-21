@@ -1165,12 +1165,13 @@ mod tests {
             file: "common/ideas/x.txt".to_string(),
             code: Some("CW282"),
             fix: None,
+            end: None,
         }
     }
 
-    // Inertness guard (Task 8, step 2): a fix payload must not change the report.
-    // The `Diag` mapping and every report row read no fix data — locked in here so
-    // populating the emit sites keeps validate output byte-identical.
+    // Inertness guard (Task 8/18, step 2): a fix payload AND an end position must
+    // not change the report. The `Diag` mapping and every report row read neither —
+    // locked in here so populating the emit sites keeps validate output byte-identical.
     #[test]
     fn fix_payload_is_inert_in_report() {
         let base = err_base();
@@ -1182,6 +1183,8 @@ mod tests {
                 end: SourcePos { line: 13, col: 0 },
             },
         ));
+        // Task 18: the end position is inert in the report too.
+        with_fix.end = Some((12, 30));
 
         let d0 = validation_to_diag(&base.file.clone(), base);
         let d1 = validation_to_diag(&with_fix.file.clone(), with_fix);

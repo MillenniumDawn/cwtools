@@ -59,6 +59,9 @@ pub(crate) fn loc_diag_to_validation_error(
         // Carry the loc fix (CW268 quote-wrap) so it reaches the code-action
         // path through the shared `validation_error_to_diagnostic` renderer.
         fix: d.fix.clone(),
+        // Loc diagnostics expose only a single (line, col) point, so they keep the
+        // whole-line squiggle (no cheap end to derive — see task-18 loc decision).
+        end: None,
     }
 }
 
@@ -139,6 +142,7 @@ pub(crate) fn truncate_validation_errors(
             file: uri.to_string(),
             code: None,
             fix: None,
+            end: None,
         });
     }
     total
@@ -308,6 +312,17 @@ pub(crate) fn validation_error_to_diagnostic(
         err.code.map(|c| NumberOrString::String(c.to_string())),
         err.message.clone(),
     );
+    // Precise span: when the emit site carried the node's end position, publish
+    // the real range instead of diagnostic_at's whole-line squiggle. The end uses
+    // the same 1-based-line / 0-based-char convention as the start (and as
+    // code_action's fix-edit conversion), so only the whole-line end is overridden.
+    // With `end` absent, the whole-line fallback stands byte-for-byte.
+    if let Some((end_line, end_col)) = err.end {
+        diag.range.end = Position {
+            line: end_line.saturating_sub(1),
+            character: end_col as u32,
+        };
+    }
     // Carry any machine-applicable fix into `data` so the code-action handler
     // can round-trip it back into a QUICKFIX WorkspaceEdit. Covers both the
     // validation and loc paths (loc diagnostics flow through here too).
@@ -1231,6 +1246,8 @@ mod whole_line_range_tests {
 
     #[test]
     fn diagnostic_spans_from_field_to_end_of_line() {
+        // Whole-line fallback: with `end: None` the squiggle still runs from the
+        // field to the line's content end (unchanged pre-Task-18 behavior).
         let text = "decision = {\n    custom_cost_text = a\n}\n";
         let ends = line_end_cols(text);
         let err = ValidationError {
@@ -1241,6 +1258,7 @@ mod whole_line_range_tests {
             file: "f".into(),
             code: Some("CW242"),
             fix: None,
+            end: None,
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.start.line, 1);
@@ -1248,6 +1266,56 @@ mod whole_line_range_tests {
         assert_eq!(diag.range.end.line, 1);
         // "    custom_cost_text = a" is 24 chars.
         assert_eq!(diag.range.end.character, 24);
+    }
+
+    #[test]
+    fn diagnostic_uses_precise_range_when_end_present() {
+        // Task 18: when the emit site carried the node's end position, the LSP
+        // publishes the exact token span instead of the whole-line squiggle. The
+        // end uses the same 1-based-line / 0-based-char convention as the start.
+        let text = "decision = {\n    custom_cost_text = a\n}\n";
+        let ends = line_end_cols(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW240"),
+            fix: None,
+            // The leaf's own SourceRange end (1-based line 2, exclusive char 24).
+            end: Some((2, 24)),
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.start.line, 1);
+        assert_eq!(diag.range.start.character, 4);
+        // Precise end from the carried range, not diag_end_col.
+        assert_eq!(diag.range.end.line, 1);
+        assert_eq!(diag.range.end.character, 24);
+    }
+
+    #[test]
+    fn diagnostic_precise_range_can_span_lines() {
+        // A block leaf's range end lands past the closing brace (SourceRange.end is
+        // exclusive and absorbs trailing whitespace), so a precise squiggle may
+        // legitimately span multiple lines — the whole unexpected block.
+        let text = "root = {\n    foo = {\n        a = 1\n    }\n}\n";
+        let ends = line_end_cols(text);
+        let err = ValidationError {
+            message: "Unexpected block 'foo'".into(),
+            severity: ErrorSeverity::Error,
+            line: 2, // `foo = {` line
+            col: 4,
+            file: "f".into(),
+            code: Some("CW262"),
+            fix: None,
+            end: Some((4, 5)), // just past the `}` on the closing line
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.start.line, 1);
+        assert_eq!(diag.range.start.character, 4);
+        assert_eq!(diag.range.end.line, 3);
+        assert_eq!(diag.range.end.character, 5);
     }
 
     #[test]
@@ -1260,6 +1328,7 @@ mod whole_line_range_tests {
             file: "f".into(),
             code: None,
             fix: None,
+            end: None,
         };
         let diag = validation_error_to_diagnostic(&err, &[]);
         assert_eq!(diag.range.start.character, 2);

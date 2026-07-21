@@ -54,17 +54,20 @@ fn validate_leaf_against_rule(
         // F# `ConfigRulesRuleWrongScope` (CW247): a trigger/effect/modifier rule
         // used in a scope it doesn't support. (Was the Rust-invented CW400.)
         let code = &error_codes::CW247_RULE_WRONG_SCOPE;
-        errors.push(ValidationError::from_code(
-            code,
-            ctx.file_path,
-            leaf.pos.start.line,
-            leaf.pos.start.col,
-            &[
-                key,
-                &sc.registry.name_of(current),
-                &opts.required_scopes.join(" or "),
-            ],
-        ));
+        errors.push(
+            ValidationError::from_code(
+                code,
+                ctx.file_path,
+                leaf.pos.start.line,
+                leaf.pos.start.col,
+                &[
+                    key,
+                    &sc.registry.name_of(current),
+                    &opts.required_scopes.join(" or "),
+                ],
+            )
+            .with_end(leaf.pos.end),
+        );
     }
     match rule_type {
         RuleType::LeafRule { left, .. } => {
@@ -113,7 +116,8 @@ fn validate_leaf_against_rule(
                                     leaf.pos.start.col,
                                     &[v],
                                 )
-                                .with_fix(fix),
+                                .with_fix(fix)
+                                .with_end(leaf.pos.end),
                             );
                         }
                     });
@@ -158,13 +162,16 @@ fn validate_leaf_against_rule(
             } else {
                 // NodeRule (block expected) but the value is a scalar — kind mismatch.
                 let val_str = leaf_value_to_string(&leaf.value, ctx.table);
-                errors.push(ValidationError::from_code(
-                    &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE,
-                    ctx.file_path,
-                    leaf.pos.start.line,
-                    leaf.pos.start.col,
-                    &[key, &val_str],
-                ));
+                errors.push(
+                    ValidationError::from_code(
+                        &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE,
+                        ctx.file_path,
+                        leaf.pos.start.line,
+                        leaf.pos.start.col,
+                        &[key, &val_str],
+                    )
+                    .with_end(leaf.pos.end),
+                );
             }
         }
         _ => {}
@@ -457,13 +464,16 @@ fn count_and_validate_children(
                     // (modifiers are additive). Only fires on confirmed modifiers.
                     if is_modifier && value_is_zero(&leaf.value) {
                         let code = &error_codes::CW235_ZERO_MODIFIER;
-                        errors.push(ValidationError::from_code(
-                            code,
-                            file_path,
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                            &[key],
-                        ));
+                        errors.push(
+                            ValidationError::from_code(
+                                code,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                &[key],
+                            )
+                            .with_end(leaf.pos.end),
+                        );
                     }
                     // A `@name = value` leaf is a Paradox read-time variable
                     // definition, valid anywhere in a block. F# skips these from the
@@ -486,14 +496,17 @@ fn count_and_validate_children(
                                 &error_codes::CW263_UNEXPECTED_PROPERTY_LEAF,
                             )
                         };
-                        errors.push(ValidationError::from_code_with(
-                            code,
-                            ErrorSeverity::Error,
-                            file_path,
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                            msg,
-                        ));
+                        errors.push(
+                            ValidationError::from_code_with(
+                                code,
+                                ErrorSeverity::Error,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                msg,
+                            )
+                            .with_end(leaf.pos.end),
+                        );
                     }
                 } else {
                     // An overloaded key (several rules with the same key, e.g. two
@@ -529,6 +542,7 @@ fn count_and_validate_children(
                                     leaf.pos.start.col,
                                     msg.clone(),
                                 )
+                                .with_end(leaf.pos.end)
                             })
                         },
                         errors,
@@ -582,13 +596,16 @@ fn count_and_validate_children(
                         }
                     }
                     if !matched {
-                        errors.push(ValidationError::from_code(
-                            &error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE,
-                            file_path,
-                            lv.pos.start.line,
-                            lv.pos.start.col,
-                            &["Unexpected value clause '{...}'"],
-                        ));
+                        errors.push(
+                            ValidationError::from_code(
+                                &error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE,
+                                file_path,
+                                lv.pos.start.line,
+                                lv.pos.start.col,
+                                &["Unexpected value clause '{...}'"],
+                            )
+                            .with_end(lv.pos.end),
+                        );
                     }
                 } else {
                     let mut matched = false;
@@ -606,6 +623,7 @@ fn count_and_validate_children(
                                     &raw,
                                     lv.pos.start.line,
                                     lv.pos.start.col,
+                                    lv.pos.end,
                                     errors,
                                 );
                             }
@@ -615,13 +633,16 @@ fn count_and_validate_children(
                     }
                     if !matched {
                         let val_str = leaf_value_to_string(&lv.value, table);
-                        errors.push(ValidationError::from_code(
-                            &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
-                            file_path,
-                            lv.pos.start.line,
-                            lv.pos.start.col,
-                            &[&format!("Unexpected bare value '{}'", val_str)],
-                        ));
+                        errors.push(
+                            ValidationError::from_code(
+                                &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
+                                file_path,
+                                lv.pos.start.line,
+                                lv.pos.start.col,
+                                &[&format!("Unexpected bare value '{}'", val_str)],
+                            )
+                            .with_end(lv.pos.end),
+                        );
                     }
                 }
             }

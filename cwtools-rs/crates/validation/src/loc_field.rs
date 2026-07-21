@@ -92,13 +92,16 @@ pub(crate) fn validate_localisation_field(
 
     let push_missing = |errors: &mut Vec<ValidationError>, lang: &str| {
         let code = &error_codes::CW100_MISSING_LOCALISATION;
-        errors.push(ValidationError::from_code(
-            code,
-            file_path,
-            leaf.pos.start.line,
-            leaf.pos.start.col,
-            &[key_raw, lang],
-        ));
+        errors.push(
+            ValidationError::from_code(
+                code,
+                file_path,
+                leaf.pos.start.line,
+                leaf.pos.start.col,
+                &[key_raw, lang],
+            )
+            .with_end(leaf.pos.end),
+        );
     };
 
     if is_inline {
@@ -112,13 +115,16 @@ pub(crate) fn validate_localisation_field(
                 // next line). The value's exact span can't be derived here without
                 // re-lexing, so we skip rather than approximate.
                 let code = &error_codes::CW122_LOC_KEY_IN_INLINE;
-                errors.push(ValidationError::from_code(
-                    code,
-                    file_path,
-                    leaf.pos.start.line,
-                    leaf.pos.start.col,
-                    &[key_raw],
-                ));
+                errors.push(
+                    ValidationError::from_code(
+                        code,
+                        file_path,
+                        leaf.pos.start.line,
+                        leaf.pos.start.col,
+                        &[key_raw],
+                    )
+                    .with_end(leaf.pos.end),
+                );
             }
             (true, false) => {} // quoted + missing → skip (lenient, matches F#)
             (false, true) => {} // unquoted + exists → ok
@@ -201,12 +207,15 @@ fn push_loc_command_diagnostic(
             (code, code.format(&[loc_key, command.as_str()]))
         }
     };
-    errors.push(ValidationError::from_code_with(
-        code,
-        code.severity,
-        file_path,
-        leaf.pos.start.line,
-        leaf.pos.start.col,
-        message,
-    ));
+    errors.push(
+        ValidationError::from_code_with(
+            code,
+            code.severity,
+            file_path,
+            leaf.pos.start.line,
+            leaf.pos.start.col,
+            message,
+        )
+        .with_end(leaf.pos.end),
+    );
 }

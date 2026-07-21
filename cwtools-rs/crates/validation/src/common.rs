@@ -2,7 +2,7 @@
 //! validation submodules.
 
 use cwtools_game::scope_engine::ScopeContext;
-use cwtools_parser::ast::{Child, ParsedFile, Value};
+use cwtools_parser::ast::{Child, ParsedFile, SourcePos, Value};
 use cwtools_parser::fix::SuggestedFix;
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
@@ -25,6 +25,14 @@ pub struct ValidationError {
     /// hashes and renders identically with or without one. The CLI `fix`
     /// subcommand and the LSP code-action provider consume it.
     pub fix: Option<SuggestedFix>,
+    /// Optional end position of the diagnostic's span (exclusive, matching the
+    /// `SourceRange` convention: 1-based line, 0-based col). Populated where the
+    /// emit site holds the node's range (`leaf.pos` / `block.range`); left `None`
+    /// where no clean range is in hand. Pure metadata like `fix`: the report/hash
+    /// path never reads it (see `error_hash` and the CLI `Diag`), so a diagnostic
+    /// hashes and renders identically with or without one. The LSP publishes a
+    /// precise squiggle when set, and falls back to the whole line when `None`.
+    pub end: Option<(u32, u16)>,
 }
 
 impl ValidationError {
@@ -46,6 +54,7 @@ impl ValidationError {
             file: file.to_string(),
             code: Some(code.id),
             fix: None,
+            end: None,
         }
     }
 
@@ -69,6 +78,7 @@ impl ValidationError {
             file: file.to_string(),
             code: Some(code.id),
             fix: None,
+            end: None,
         }
     }
 
@@ -77,6 +87,16 @@ impl ValidationError {
     /// existing constructor signatures stay unchanged.
     pub(crate) fn with_fix(mut self, fix: SuggestedFix) -> Self {
         self.fix = Some(fix);
+        self
+    }
+
+    /// Attach the diagnostic's end position (exclusive) from the emit site's node
+    /// range, so the LSP can publish a precise squiggle instead of the whole line.
+    /// Chains onto a `from_code` / `from_code_with` call; the convention matches
+    /// `SourceRange` (1-based line, 0-based col — pass `leaf.pos.end` / `range.end`).
+    /// Left unset (whole-line squiggle) where no clean range is in hand.
+    pub(crate) fn with_end(mut self, end: SourcePos) -> Self {
+        self.end = Some((end.line, end.col));
         self
     }
 }

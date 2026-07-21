@@ -69,11 +69,11 @@ pub fn validate_common(
     let mut type_counts: FxHashMap<String, usize> = FxHashMap::default();
 
     for child in &ast.root_children {
-        let (key, line, col) = match child {
+        let (key, line, col, end) = match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
                 let k = table.get_string(leaf.key.normal).unwrap_or_default();
-                (k, leaf.pos.start.line, leaf.pos.start.col)
+                (k, leaf.pos.start.line, leaf.pos.start.col, leaf.pos.end)
             }
             Child::LeafValue(_) | Child::Comment(_) => continue,
         };
@@ -94,13 +94,10 @@ pub fn validate_common(
                 // to the same token. F#'s check is project-wide and grouped
                 // by extracted instance id — a known refinement gap.
                 let code = &error_codes::CW261_DUPLICATE_TYPE_DEF;
-                errors.push(ValidationError::from_code(
-                    code,
-                    file_path,
-                    line,
-                    col,
-                    &[&key, &key],
-                ));
+                errors.push(
+                    ValidationError::from_code(code, file_path, line, col, &[&key, &key])
+                        .with_end(end),
+                );
             }
         }
     }

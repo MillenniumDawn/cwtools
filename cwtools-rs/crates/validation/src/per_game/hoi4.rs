@@ -74,7 +74,8 @@ pub fn validate_hoi4(
                     block.range.start.col,
                     &[&key],
                 )
-                .with_fix(fix),
+                .with_fix(fix)
+                .with_end(block.range.end),
             );
         }
     });

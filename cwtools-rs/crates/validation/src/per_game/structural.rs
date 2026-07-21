@@ -96,14 +96,10 @@ fn push(
     r: SourceRange,
     file: &str,
 ) {
-    errors.push(ValidationError::from_code_with(
-        code,
-        code.severity,
-        file,
-        r.start.line,
-        r.start.col,
-        msg,
-    ));
+    errors.push(
+        ValidationError::from_code_with(code, code.severity, file, r.start.line, r.start.col, msg)
+            .with_end(r.end),
+    );
 }
 
 /// As [`push`], but carries a fix. Used by the delete-the-empty-block hints
@@ -118,7 +114,8 @@ fn push_fix(
 ) {
     errors.push(
         ValidationError::from_code_with(code, code.severity, file, r.start.line, r.start.col, msg)
-            .with_fix(fix),
+            .with_fix(fix)
+            .with_end(r.end),
     );
 }
 
@@ -272,6 +269,38 @@ mod tests {
         assert!(
             !errors2.iter().any(|e| e.code == Some(code)),
             "{code} must be gone after applying the fix"
+        );
+    }
+
+    // Task 18: a real emit carries the offending block's own SourceRange end, so
+    // the LSP can publish a precise squiggle. Locks the population wiring: the end
+    // must equal the NOT block's `pos.end`, not a re-derived or absent position.
+    #[test]
+    fn diagnostic_carries_block_range_end() {
+        let src = "x = {\n    NOT = { a = 1 b = 2 }\n}\n";
+        let table = StringTable::new();
+        let ast = parse_string(src, &table).unwrap();
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW223"))
+            .expect("CW223 emitted");
+
+        // Recover the NOT block's range from the AST and compare.
+        let x_block = as_block(&ast.root_children[0], &ast).expect("x is a block");
+        let not_block = x_block
+            .children
+            .iter()
+            .find_map(|c| as_block(c, &ast))
+            .expect("NOT block present");
+        assert_eq!(err.line, not_block.range.start.line);
+        assert_eq!(err.col, not_block.range.start.col);
+        assert_eq!(
+            err.end,
+            Some((not_block.range.end.line, not_block.range.end.col)),
+            "CW223 must carry the NOT block's exclusive range end"
         );
     }
 

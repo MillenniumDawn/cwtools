@@ -2,7 +2,7 @@
 //! usage against every overload as a disjunction.
 
 use cwtools_game::scope_engine::ScopeContext;
-use cwtools_parser::ast::{Child, Value};
+use cwtools_parser::ast::{Child, SourcePos, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
 
@@ -219,13 +219,11 @@ pub(super) fn validate_alias_usage(
             let (line, col) = leaf
                 .map(|l| (l.pos.start.line, l.pos.start.col))
                 .unwrap_or(fallback_pos);
-            errors.push(ValidationError::from_code(
-                code,
-                file_path,
-                line,
-                col,
-                &[key],
-            ));
+            let mut err = ValidationError::from_code(code, file_path, line, col, &[key]);
+            if let Some(l) = leaf {
+                err = err.with_end(l.pos.end);
+            }
+            errors.push(err);
         }
     }
 
@@ -282,13 +280,17 @@ pub(super) fn validate_alias_usage(
             let (line, col) = leaf
                 .map(|l| (l.pos.start.line, l.pos.start.col))
                 .unwrap_or(fallback_pos);
-            errors.push(ValidationError::from_code(
+            let mut err = ValidationError::from_code(
                 code,
                 file_path,
                 line,
                 col,
                 &[key, &reg.name_of(current), &expected.join(" or ")],
-            ));
+            );
+            if let Some(l) = leaf {
+                err = err.with_end(l.pos.end);
+            }
+            errors.push(err);
         }
     }
 
@@ -321,9 +323,11 @@ pub(super) fn validate_alias_usage(
                     validate_leaf(ctx, leaf, rule_type, scope_context.as_ref(), &mut temp);
                 } else {
                     // Scalar-valued overload but the usage is a block — not a match.
+                    // No `leaf` here (this branch is the `leaf == None` case), so no
+                    // clean end range: fall back to the whole-line squiggle.
                     let (line, col) = fallback_pos;
                     temp.push(alias_mismatch_error(
-                        file_path, category, "{...}", line, col,
+                        file_path, category, "{...}", line, col, None,
                     ));
                 }
             }
@@ -374,7 +378,10 @@ pub(super) fn validate_alias_usage(
                             )
                         })
                         .unwrap_or_else(|| (String::new(), fallback_pos.0, fallback_pos.1));
-                    temp.push(alias_mismatch_error(file_path, category, &value, line, col));
+                    let end = leaf.map(|l| l.pos.end);
+                    temp.push(alias_mismatch_error(
+                        file_path, category, &value, line, col, end,
+                    ));
                 }
             }
             _ => continue,
@@ -394,14 +401,18 @@ pub(super) fn validate_alias_usage(
                     let (line, col) = leaf
                         .map(|l| (l.pos.start.line, l.pos.start.col))
                         .unwrap_or(fallback_pos);
-                    only_match = Some(ValidationError::from_code_with(
+                    let mut custom = ValidationError::from_code_with(
                         &error_codes::CW272_FROM_RULES_CUSTOM_ERROR,
                         sev,
                         file_path,
                         line,
                         col,
                         msg.clone(),
-                    ));
+                    );
+                    if let Some(l) = leaf {
+                        custom = custom.with_end(l.pos.end);
+                    }
+                    only_match = Some(custom);
                 }
                 continue;
             }
@@ -432,7 +443,12 @@ fn alias_mismatch_error(
     value: &str,
     line: u32,
     col: u16,
+    end: Option<SourcePos>,
 ) -> ValidationError {
     let code = &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE;
-    ValidationError::from_code(code, file_path, line, col, &[category, value])
+    let err = ValidationError::from_code(code, file_path, line, col, &[category, value]);
+    match end {
+        Some(end) => err.with_end(end),
+        None => err,
+    }
 }
