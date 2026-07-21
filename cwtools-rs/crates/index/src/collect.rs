@@ -1,15 +1,15 @@
 //! Collecting type instances from parsed files, and building a [`TypeIndex`]
 //! from discovered files.
 
-use cwtools_parser::ast::{Arena, Child, ParsedFile};
+use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
 use cwtools_rules::rules_types::{RuleSet, SkipRootKey, TypeDefinition};
 use cwtools_string_table::string_table::StringTable;
 use std::collections::{HashMap, HashSet};
 
 use crate::dynamic_values;
 use crate::{
-    NormalizedPath, SourceLocation, TypeIndex, TypeInstance, check_path_dir_norm,
-    collect_set_variable_names, leaf_value_string, unquote,
+    DefinedVariable, NormalizedPath, SourceLocation, TypeIndex, TypeInstance, check_path_dir_norm,
+    leaf_value_string, unquote,
 };
 
 /// Does this `skip_root_key` rule match `key`? Case-insensitive (matching the
@@ -170,13 +170,27 @@ fn walk_skip_root_child<V>(
     });
 }
 
-/// A function that derives a file's subtype-qualified instances
-/// (`"type.subtype" -> [instances]`) from its parsed AST. Implemented in the
-/// `validation` crate (it needs the subtype matcher) and injected into
+/// One type *instance node* as seen during the type-instance walk: the matched
+/// type, the resolved instance name, the node's own key, its clause children, and
+/// its source location. Passed to a [`SubtypeCollector`] so the injected subtype
+/// matcher can compute per-instance facts without re-navigating the file.
+pub struct InstanceNode<'a> {
+    pub td: &'a TypeDefinition,
+    pub name: &'a str,
+    pub node_key: &'a str,
+    pub children: &'a [Child],
+    pub location: SourceLocation,
+}
+
+/// A per-instance-node hook that appends a node's subtype-qualified membership
+/// (`"type.subtype" -> instances`) into `out`. Implemented in the `validation`
+/// crate (it needs the subtype matcher) and injected into
 /// [`index_discovered_files`] so the index crate stays free of a validation
-/// dependency.
+/// dependency. Called once per instance node of a subtype-declaring type during
+/// [`collect_type_instances`]' own walk, so type-instance and subtype-membership
+/// collection share a single navigation instead of two.
 pub type SubtypeCollector =
-    fn(&RuleSet, &ParsedFile, &str, &StringTable) -> HashMap<String, Vec<TypeInstance>>;
+    fn(&RuleSet, &ParsedFile, &InstanceNode, &StringTable, &mut HashMap<String, Vec<TypeInstance>>);
 
 /// Visit every type *instance node* in `file` whose type declares subtypes,
 /// invoking `f` with the matched type, the resolved instance name, the node's own
@@ -247,12 +261,30 @@ pub fn hash_instance_exports(per_type: &HashMap<String, Vec<TypeInstance>>) -> u
 /// Collect all type instances defined in `file` for the given `logical_path`,
 /// applying skip_root_key navigation. Returns a map from type name to the list
 /// of instances found in this file.
-#[tracing::instrument(skip_all)]
 pub fn collect_type_instances(
     ruleset: &RuleSet,
     file: &ParsedFile,
     logical_path: &str,
     table: &StringTable,
+) -> HashMap<String, Vec<TypeInstance>> {
+    collect_type_instances_inner(ruleset, file, logical_path, table, None)
+}
+
+/// [`collect_type_instances`], optionally fused with subtype-membership
+/// collection. When `subtype_hook` is `Some`, each instance node of a
+/// subtype-declaring type also runs the hook during the *same* skip_root walk,
+/// so `index_discovered_files` navigates those instances once instead of twice
+/// (the walk that [`for_each_instance_node`] would run separately). The subtype
+/// entries land under disjoint `"type.subtype"` keys, so per-key order — the
+/// only order [`TypeIndex::merge`] observes — is identical to running the two
+/// walks back-to-back.
+#[tracing::instrument(skip_all, name = "collect_type_instances")]
+fn collect_type_instances_inner(
+    ruleset: &RuleSet,
+    file: &ParsedFile,
+    logical_path: &str,
+    table: &StringTable,
+    subtype_hook: Option<SubtypeCollector>,
 ) -> HashMap<String, Vec<TypeInstance>> {
     let mut result: HashMap<String, Vec<TypeInstance>> = HashMap::new();
 
@@ -294,12 +326,21 @@ pub fn collect_type_instances(
                 // type_per_file types have no node body to read a field from.
                 primary_loc_key: None,
             });
+            // `type_per_file` types carry no node body, so they contribute no
+            // subtype membership (`for_each_instance_node` skips them too).
         } else {
-            // Walk the file's top-level keyed clauses.
+            // Walk the file's top-level keyed clauses. A subtype-declaring type
+            // additionally computes membership at each instance node via the
+            // injected hook, sharing this one navigation.
             let arena = &file.arena;
+            let node_hook = if td.subtypes.is_empty() {
+                None
+            } else {
+                subtype_hook
+            };
             let mut visit = |td: &TypeDefinition,
                              name: String,
-                             _key: &str,
+                             node_key: &str,
                              clause_children: &[Child],
                              location| {
                 // Capture the explicit-field primary loc key (e.g. an event's
@@ -307,6 +348,16 @@ pub fn collect_type_instances(
                 let primary_loc_key = primary_explicit_loc_field(td).and_then(|field| {
                     field_value_from_children(field, clause_children, arena, table)
                 });
+                if let Some(hook) = node_hook {
+                    let node = InstanceNode {
+                        td,
+                        name: &name,
+                        node_key,
+                        children: clause_children,
+                        location,
+                    };
+                    hook(ruleset, file, &node, table, &mut result);
+                }
                 instances.push(TypeInstance {
                     name,
                     location,
@@ -324,6 +375,114 @@ pub fn collect_type_instances(
     }
 
     result
+}
+
+/// Collect both set-variable names and `value_set[...]` members from one file in
+/// a single pre-order walk, replacing the two separate whole-tree traversals
+/// ([`crate::collect_set_variable_names`] +
+/// [`dynamic_values::collect_value_set_members`]) that `index_discovered_files`
+/// used to run back-to-back over the same arena.
+///
+/// The two collectors visit the identical set of nodes (every `Child::Leaf`,
+/// descending into every clause value) and key off different rule structures, so
+/// each node dispatches to both, writing to its own output. They differ in one
+/// descent rule: the value-set walk does not look inside a `variable`-namespace
+/// block (`set_variable = { .. }`), whose members are collected on the dedicated
+/// variable path, whereas the set-variable walk does descend there. The fused
+/// walk descends into every clause when the set-variable collector is active
+/// (suppressing the value-set logic for that subtree via `vs_active`), and
+/// otherwise descends exactly where the value-set walk would — reproducing both
+/// walks' output byte-for-byte.
+///
+/// `var_effects` mirrors `collect_set_variable_names`' gate: `Some(non_empty)`
+/// enables the set-variable collector, `None` disables it (the caller has already
+/// filtered out an empty set).
+fn collect_variables_and_value_sets(
+    file: &ParsedFile,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    var_effects: Option<&HashSet<String>>,
+    var_names_out: &mut Vec<String>,
+    value_sets_out: &mut HashMap<String, Vec<String>>,
+) {
+    let vs_active = !ruleset.value_set_effects.is_empty();
+    if var_effects.is_none() && !vs_active {
+        return;
+    }
+    let mut var_defs: Vec<DefinedVariable> = Vec::new();
+    walk_variables_and_value_sets(
+        &file.root_children,
+        file,
+        ruleset,
+        table,
+        var_effects,
+        vs_active,
+        &mut var_defs,
+        value_sets_out,
+    );
+    var_names_out.extend(var_defs.into_iter().map(|d| d.name));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_variables_and_value_sets(
+    children: &[Child],
+    file: &ParsedFile,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    var_effects: Option<&HashSet<String>>,
+    vs_active: bool,
+    var_defs: &mut Vec<DefinedVariable>,
+    value_sets: &mut HashMap<String, Vec<String>>,
+) {
+    let arena = &file.arena;
+    for child in children {
+        let Child::Leaf(li) = child else { continue };
+        let leaf = &arena.leaves[*li as usize];
+
+        // Set-variable collector: a clause whose key is a variable-defining effect
+        // defines names in its body (mirrors `collect_set_variable_defs`' walk).
+        if let Some(effects) = var_effects
+            && let Value::Clause(ch) = &leaf.value
+        {
+            let in_effects = table
+                .with_string(leaf.key.normal, |k| {
+                    effects.contains(k.to_ascii_lowercase().as_str())
+                })
+                .unwrap_or(false);
+            if in_effects {
+                crate::variables::extract_set_variable_defs_block(ch, arena, table, var_defs);
+            }
+        }
+
+        // Value-set collector: per-leaf member capture. A `variable`-namespace
+        // block returns `ns == "variable"`, marking a subtree the value-set walk
+        // must not descend into.
+        let ns = if vs_active {
+            dynamic_values::value_set_leaf(leaf, file, ruleset, table, value_sets)
+        } else {
+            None
+        };
+
+        if let Value::Clause(ch) = &leaf.value {
+            let is_var_ns = ns.as_deref() == Some("variable");
+            // The set-variable walk descends into every clause; the value-set walk
+            // descends into every clause but a `variable`-namespace block.
+            let descend = var_effects.is_some() || (vs_active && !is_var_ns);
+            let vs_child = vs_active && !is_var_ns;
+            if descend {
+                walk_variables_and_value_sets(
+                    ch,
+                    file,
+                    ruleset,
+                    table,
+                    var_effects,
+                    vs_child,
+                    var_defs,
+                    value_sets,
+                );
+            }
+        }
+    }
 }
 
 /// Build a [`TypeIndex`] from already-discovered+parsed files. Shared by the CLI
@@ -373,23 +532,34 @@ pub fn index_discovered_files(
                 root_children: file.root_children,
                 errors: vec![],
             };
-            let mut instances = collect_type_instances(ruleset, &pf, &file.logical_path, table);
-            if let Some(collect_subtypes) = subtype_collector {
-                for (k, v) in collect_subtypes(ruleset, &pf, &file.logical_path, table) {
-                    instances.entry(k).or_default().extend(v);
-                }
-            }
+            // Fused: type instances and subtype-qualified membership share one
+            // skip_root walk (the subtype hook runs at each instance node of a
+            // subtype-declaring type) instead of two separate navigations.
+            let instances = collect_type_instances_inner(
+                ruleset,
+                &pf,
+                &file.logical_path,
+                table,
+                subtype_collector,
+            );
+            // Fused: set-variable names and value-set members share one pre-order
+            // walk over the arena instead of two back-to-back traversals.
             let mut var_names: Vec<String> = Vec::new();
-            if let Some(effects) = var_effects {
-                collect_set_variable_names(&pf, table, effects, &mut var_names);
-            }
+            let mut value_sets: HashMap<String, Vec<String>> = HashMap::new();
+            collect_variables_and_value_sets(
+                &pf,
+                ruleset,
+                table,
+                var_effects,
+                &mut var_names,
+                &mut value_sets,
+            );
             let complex = dynamic_values::collect_complex_enum_values(
                 ruleset,
                 &pf,
                 &file.logical_path,
                 table,
             );
-            let value_sets = dynamic_values::collect_value_set_members(ruleset, &pf, table);
             (path, instances, var_names, complex, value_sets)
         })
         .collect();

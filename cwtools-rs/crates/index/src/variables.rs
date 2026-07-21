@@ -375,70 +375,6 @@ pub fn collect_set_variable_defs(
     effects: &HashSet<String>,
     out: &mut Vec<DefinedVariable>,
 ) {
-    fn def(name: String, value: Option<String>, pos: SourceRange) -> DefinedVariable {
-        DefinedVariable {
-            name,
-            namespace: Some("variable".to_string()),
-            location: SourceLocation {
-                line: pos.start.line,
-                col: pos.start.col,
-                end: (pos.end.line, pos.end.col),
-            },
-            value,
-        }
-    }
-
-    fn extract(
-        children: &[Child],
-        arena: &Arena,
-        table: &StringTable,
-        out: &mut Vec<DefinedVariable>,
-    ) {
-        // Explicit form: a `var`/`variable` child holds the name as its value;
-        // the assigned value (if any) is the sibling `value`/`amount`/`add` leaf.
-        let mut explicit = false;
-        let sibling_value = sibling_value_in_children(children, arena, table);
-        for child in children {
-            if let Child::Leaf(li) = child {
-                let leaf = &arena.leaves[*li as usize];
-                let is_var_key = table
-                    .with_string(leaf.key.normal, |k| {
-                        k.eq_ignore_ascii_case("var") || k.eq_ignore_ascii_case("variable")
-                    })
-                    .unwrap_or(false);
-                if is_var_key {
-                    let v = leaf_value_string(&leaf.value, table);
-                    if !v.is_empty() {
-                        out.push(def(v, sibling_value.clone(), leaf.pos));
-                    }
-                    explicit = true;
-                }
-            }
-        }
-        if explicit {
-            return;
-        }
-        // Shorthand form: the inner assignment key is the variable name and its
-        // RHS (if a leaf) is the assigned value.
-        for child in children {
-            let (key, value, pos) = match child {
-                Child::Leaf(li) => {
-                    let leaf = &arena.leaves[*li as usize];
-                    let k = get_string_or_empty(table, leaf.key.normal);
-                    let v = leaf_value_string(&leaf.value, table);
-                    (k, (!v.is_empty()).then_some(v), leaf.pos)
-                }
-                _ => continue,
-            };
-            const SKIP_KEYS: &[&str] = &["value", "tooltip", "var", "variable", "amount", "which"];
-            // Case-insensitive compare without allocating a lowercased copy of the
-            // key just to probe the skip-list (paradox keys are ASCII).
-            if !SKIP_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k)) {
-                out.push(def(key, value, pos));
-            }
-        }
-    }
-
     fn walk(
         children: &[Child],
         arena: &Arena,
@@ -456,7 +392,7 @@ pub fn collect_set_variable_defs(
                         })
                         .unwrap_or(false);
                     if in_effects {
-                        extract(ch, arena, table, out);
+                        extract_set_variable_defs_block(ch, arena, table, out);
                     }
                     walk(ch, arena, table, effects, out);
                 }
@@ -465,4 +401,75 @@ pub fn collect_set_variable_defs(
     }
 
     walk(&file.root_children, &file.arena, table, effects, out);
+}
+
+fn variable_def(name: String, value: Option<String>, pos: SourceRange) -> DefinedVariable {
+    DefinedVariable {
+        name,
+        namespace: Some("variable".to_string()),
+        location: SourceLocation {
+            line: pos.start.line,
+            col: pos.start.col,
+            end: (pos.end.line, pos.end.col),
+        },
+        value,
+    }
+}
+
+/// Extract variable definitions from the direct children of one variable-defining
+/// effect block (`set_variable = { ... }` and friends): the explicit
+/// `var`/`variable = NAME` form (value from a sibling `value`/`amount`/`add`), or
+/// the shorthand `{ my_var = 5 }` form. Non-recursive — this is one effect
+/// invocation's body. The per-node core shared by [`collect_set_variable_defs`]
+/// and the fused index walk (`crate::collect`); the walk that finds the effect
+/// blocks stays with the caller.
+pub(crate) fn extract_set_variable_defs_block(
+    children: &[Child],
+    arena: &Arena,
+    table: &StringTable,
+    out: &mut Vec<DefinedVariable>,
+) {
+    // Explicit form: a `var`/`variable` child holds the name as its value;
+    // the assigned value (if any) is the sibling `value`/`amount`/`add` leaf.
+    let mut explicit = false;
+    let sibling_value = sibling_value_in_children(children, arena, table);
+    for child in children {
+        if let Child::Leaf(li) = child {
+            let leaf = &arena.leaves[*li as usize];
+            let is_var_key = table
+                .with_string(leaf.key.normal, |k| {
+                    k.eq_ignore_ascii_case("var") || k.eq_ignore_ascii_case("variable")
+                })
+                .unwrap_or(false);
+            if is_var_key {
+                let v = leaf_value_string(&leaf.value, table);
+                if !v.is_empty() {
+                    out.push(variable_def(v, sibling_value.clone(), leaf.pos));
+                }
+                explicit = true;
+            }
+        }
+    }
+    if explicit {
+        return;
+    }
+    // Shorthand form: the inner assignment key is the variable name and its
+    // RHS (if a leaf) is the assigned value.
+    for child in children {
+        let (key, value, pos) = match child {
+            Child::Leaf(li) => {
+                let leaf = &arena.leaves[*li as usize];
+                let k = get_string_or_empty(table, leaf.key.normal);
+                let v = leaf_value_string(&leaf.value, table);
+                (k, (!v.is_empty()).then_some(v), leaf.pos)
+            }
+            _ => continue,
+        };
+        const SKIP_KEYS: &[&str] = &["value", "tooltip", "var", "variable", "amount", "which"];
+        // Case-insensitive compare without allocating a lowercased copy of the
+        // key just to probe the skip-list (paradox keys are ASCII).
+        if !SKIP_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k)) {
+            out.push(variable_def(key, value, pos));
+        }
+    }
 }

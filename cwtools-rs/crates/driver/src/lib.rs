@@ -564,7 +564,7 @@ pub fn index_game_dir(
         ruleset,
         table,
         Some(var_effects),
-        Some(cwtools_validation::collect_subtype_instances),
+        Some(cwtools_validation::subtype_membership_for_instance),
     )
 }
 
