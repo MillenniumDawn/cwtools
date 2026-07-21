@@ -4,9 +4,14 @@
 
 - Six diagnostics now carry a suggested fix: CW253 (deprecated `set_empire_name`/`set_planet_name` -> `set_name`), CW282 (redundant explicit default bool), CW280 (redundant `{ always = <default> }` field), CW121 (empty if/else_if), CW281 (empty `limit = { }`), and CW268 (unquoted loc value). New `cwtools fix` subcommand applies them: dry-run by default (prints a unified-diff preview), `--apply` writes the changes, and a repeatable `--code` filters to specific diagnostics (omit to fix everything fixable). Overlapping edits in the same file are skipped and reported rather than corrupting each other.
 - The LSP offers the same fixes as quick-fix code actions (`CodeActionKind::QUICKFIX`), built from a `fix` payload now carried in each diagnostic's `data` field.
-- `cwtools validate` gets `--loc-language` (repeatable, restricts loc validation/lookup to the given languages) and `--min-severity` (filters diagnostics below the given severity out of the report and hash).
+- An unexpected key (CW262/CW263) with exactly one plausible match among the sibling rule keys (bounded, case-insensitive edit distance) now carries a "Did you mean" suggested fix through the same mechanism, so `cwtools fix` and the LSP quick-fix can rename it. A tie between two equally-close candidates, or nothing within edit distance 2, leaves the diagnostic as before.
+- `validate --directory` pointing at a multi-mod workspace (a folder that is not itself a mod root but whose `mod`/`mods` folder holds `.mod` descriptors) now auto-detects and expands every referenced mod, layered by load order: mods resolve name-sorted and a later mod wins a logical path it shares with an earlier one, and a mod's `replace_path` suppresses lower-priority files under that prefix. A single-mod directory is validated exactly as before.
+- `cwtools validate` gets `--loc-language` (repeatable, restricts loc validation/lookup to the given languages) and `--min-severity` (filters diagnostics below the given severity out of the report and hash). `cwtools loc` gets `--report-type`, `--output-file`, and `--ignore-hashes`/`--output-hashes`, matching `validate`'s report and hash-baselining options.
 - A malformed `## cardinality` bound or an unrecognized `## severity` value in a `.cwt` rule file now produces a diagnostic at rules-load time instead of silently falling back to a default.
 - `type_key_prefix` on a `.cwt` type definition is now honored during instance collection: only keys matching the prefix (case-insensitive) are collected as instances of that type, with the prefix kept intact in the instance name.
+- A subtype's `## display_name` is now honored in completion detail and hover for a subtype-qualified reference (`<type.subtype>`), instead of showing the raw subtype name.
+- Diagnostics whose validator already knows where the underlying token or block ends now carry that end position through to the LSP, so the editor squiggle covers the actual token/block instead of the whole line.
+- The LSP offers inlay hints: a leaf whose value is a known type-instance id shows its localised title inline (`cwtools.inlayHints.locTitles`, on by default). A `cwtools.inlayHints.scopes` setting is scaffolded for a future resolved-scope hint but does not yet produce one.
 
 ## Bug Fixes
 
@@ -19,6 +24,8 @@
 ## Notes
 
 - **Behavioral:** `cwtools loc` now exits 1 only on an Error-severity diagnostic (or a real parse failure), matching `validate`. Previously it exited 1 on any diagnostic, so an Information- or Warning-only run (e.g. a lone CW234 placeholder, or a CW268 missing-quote warning) now exits 0.
+- **Behavioral:** `## error_if_only_match` in a `.cwt` rule (CW272) is now honored. An overload that matches only because of this directive surfaces its configured custom message instead of being silently accepted; a genuinely clean match from another overload still wins over it. This is new output wherever a ruleset declares the directive: on the Kaiserreich config it adds 104 Information-severity notices, mostly `create_country_leader` deprecation notices ("Use add_country_leader_role instead").
+- The vanilla cache format is bumped to v8 (a cached definition now carries its end position, matching live-scanned instances). A v7 or earlier cache rebuilds automatically; no user action needed.
 
 ## Developer
 
@@ -27,6 +34,10 @@
 - `instances_in_file` is now O(file) via a reverse map instead of scanning the whole index.
 - The two skip-root-key navigation walkers in the index (instance collection and the per-node callback) are unified behind one visitor.
 - The file-walk no longer allocates a path per directory entry.
+- Index instances (live and vanilla) carry an end position alongside their start, not just a start line/col.
+- Ruleset load no longer keeps every parsed `.cwt` AST alive at once for the post-merge structural reference check; each AST is converted and dropped as it's read, leaving only lightweight reference candidates behind.
+- `index_discovered_files` fuses two pairs of its five per-file collector walks that shared a traversal shape (type instances with subtype membership; set-variable names with `value_set[]` members), cutting it to three walks.
+- Open documents revalidated after a workspace scan (or a live config change) reuse their stored AST through the same prebuilt validation path the cross-file dependent sweep uses, skipping a redundant re-parse and re-index when the AST is still current.
 - Corpus output stayed byte-identical throughout, checked against the Kaiserreich guard corpus.
 
 # 1.26.0
