@@ -118,17 +118,6 @@ pub(crate) fn find_type_rule_opts<'a>(name: &str, ruleset: &'a RuleSet) -> Optio
     }
 }
 
-/// Find a type whose path_options match the given file path.
-/// Returns the MOST SPECIFIC match (longest path string) so that
-/// `common/ai_strategy_plans` wins over generic `common`.
-pub(crate) fn find_type_by_path<'a>(
-    file_path: &str,
-    ruleset: &'a RuleSet,
-) -> Option<&'a TypeDefinition> {
-    let lower = lookup_path(file_path);
-    find_type_by_path_and_key(&lower, None, ruleset)
-}
-
 /// A path-matched type with its base weight (path length + path_file bonus).
 /// The key-dependent bonuses (`skip_key_bonus`, `tkf_bonus`) are added later
 /// by [`find_type_from_candidates`] so that path filtering is done once per
@@ -239,10 +228,10 @@ pub(crate) fn find_type_from_candidates<'a>(
     best
 }
 
-/// Like `find_type_by_path` but also considers the root key of the child
-/// being validated. Types whose `skip_root_key` matches `root_key` are
-/// given a large bonus, so they beat a longer-path type that has no
-/// skip_root_key and would otherwise win on path length alone.
+/// Find a type whose path_options match the given file path, also considering
+/// the root key of the child being validated. Types whose `skip_root_key`
+/// matches `root_key` are given a large bonus, so they beat a longer-path type
+/// that has no skip_root_key and would otherwise win on path length alone.
 ///
 /// `file_path_lower` must already be lowercased (ASCII) by the caller so
 /// that per-child calls in a hot loop share a single allocation.
@@ -326,6 +315,51 @@ pub(crate) fn find_grandchild_type<'a>(
         }
     }
     generic
+}
+
+/// Refine a `skip_root_key` wrapper's resolved type for one grandchild, shared
+/// by the validator's `validate_wrapper_grandchildren` and the navigator's
+/// `descend_wrapper`. Prefers [`find_grandchild_type`]'s `## type_key_filter`
+/// match; when that finds nothing, falls back to the wrapper's already-resolved
+/// `type_def`/`inner_rules`, but only when `type_def`'s own `type_key_filter`
+/// (if any) actually applies to `gc_key`. `None` means the caller should skip
+/// this grandchild (continue the loop / stop descending) rather than validate
+/// or enter it.
+pub(crate) fn refine_grandchild_type<'a>(
+    file_path: &str,
+    wrapper_root_key: &str,
+    gc_key: &str,
+    type_def: &'a TypeDefinition,
+    inner_rules: &'a [(RuleType, Options)],
+    ruleset: &'a RuleSet,
+) -> Option<(&'a TypeDefinition, &'a [(RuleType, Options)])> {
+    match find_grandchild_type(file_path, wrapper_root_key, gc_key, ruleset) {
+        Some(t) => {
+            let r = find_rules_by_name(&t.name, ruleset);
+            // Resolved to an index-only type (no rule body): its fields
+            // are not content-validated, so don't flag them.
+            if !type_has_content(t, r) {
+                return None;
+            }
+            Some((t, r))
+        }
+        // No better match. Only fall back to the wrapper's resolved type
+        // when that type actually applies to THIS grandchild's key. A type
+        // with `## type_key_filter = containerWindowType` must not validate
+        // a sibling `scrollbarType`/`guiButtonType` (top-level widgets under
+        // `guiTypes`) against the containerWindowType schema — F# excludes
+        // them via the filter and leaves them unvalidated. Without this the
+        // widgets' own fields (slider/track/priority/...) flag as CW201.
+        None => {
+            if let Some((keys, negate)) = &type_def.type_key_filter {
+                let hit = keys.iter().any(|k| k.eq_ignore_ascii_case(gc_key));
+                if hit == *negate {
+                    return None;
+                }
+            }
+            Some((type_def, inner_rules))
+        }
+    }
 }
 
 /// Whether a type has its own validation rules, rather than being an index-only

@@ -17,8 +17,8 @@ use cwtools_rules::rules_types::*;
 use crate::common::{leaf_value_to_string, unquote_key};
 use crate::ctx::ValidationCtx;
 use crate::resolve::{
-    DispatchInput, ResolvedType, find_grandchild_type, find_rules_by_name, find_type_by_path,
-    path_candidates_for_file, resolve_root_child, type_has_content,
+    DispatchInput, ResolvedType, find_rules_by_name, find_type_from_candidates,
+    path_candidates_for_file, refine_grandchild_type, resolve_root_child, type_has_content,
 };
 use crate::rule_core::{
     alias_overloads, flatten_nested_subtype_rules, matching_candidates, merged_rules_for_type,
@@ -110,8 +110,14 @@ pub fn rules_at_pos(
         loop_vars: std::cell::RefCell::new(Vec::new()),
     };
 
+    // Path candidates depend only on the file path, so compute them once and
+    // reuse below for both the type_per_file check and the root-child dispatch,
+    // rather than rescanning `ruleset.types` twice.
+    let file_path_lower = file_path.to_lowercase();
+    let path_candidates = path_candidates_for_file(&file_path_lower, ruleset);
+
     // type_per_file: the whole file is one instance; root children are its body.
-    let path_type = find_type_by_path(file_path, ruleset);
+    let path_type = find_type_from_candidates(&path_candidates, None);
     if let Some(td) = path_type
         && td.type_per_file
     {
@@ -161,8 +167,6 @@ pub fn rules_at_pos(
     // Navigation opts into the content-bearing fallback (`allow_content_fallback`)
     // so the cursor can still descend through a rule-less skip wrapper whose body
     // lives in a sibling base type (e.g. `on_actions` -> `on_action`).
-    let file_path_lower = file_path.to_lowercase();
-    let path_candidates = path_candidates_for_file(&file_path_lower, ruleset);
     let dispatch = DispatchInput {
         ruleset,
         file_path,
@@ -258,25 +262,14 @@ fn descend_wrapper(
 
         // At the instance level: refine the type per grandchild key, as the
         // validator does.
-        let (gc_type_def, gc_rules) =
-            match find_grandchild_type(ctx.file_path, wrapper_root_key, &gc_key, ctx.ruleset) {
-                Some(t) => {
-                    let r = find_rules_by_name(&t.name, ctx.ruleset);
-                    if !type_has_content(t, r) {
-                        return None;
-                    }
-                    (t, r)
-                }
-                None => {
-                    if let Some((keys, negate)) = &type_def.type_key_filter {
-                        let hit = keys.iter().any(|k| k.eq_ignore_ascii_case(&gc_key));
-                        if hit == *negate {
-                            return None;
-                        }
-                    }
-                    (type_def, inner_rules)
-                }
-            };
+        let (gc_type_def, gc_rules) = refine_grandchild_type(
+            ctx.file_path,
+            wrapper_root_key,
+            &gc_key,
+            type_def,
+            inner_rules,
+            ctx.ruleset,
+        )?;
         return Some(enter_entity(
             ctx,
             gc_type_def,
