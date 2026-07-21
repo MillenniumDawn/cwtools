@@ -105,21 +105,32 @@ fn instance_name_from_children(
     }
 }
 
-/// Recurse through skip_root_key layers, then collect matching instances.
-/// `child` is a single top-level child (must be a keyed clause).
-fn collect_skip_root_child(
+/// Recurse through skip_root_key layers, then visit each matching instance node.
+/// `child` is a single top-level child (must be a keyed clause); at the instance
+/// node the key must pass the `type_key_filter` + `starts_with` gates and yield a
+/// name, then `visit` is invoked with the resolved name (owned), the node's own
+/// key, its clause children, and its location. The single skip-root-key navigator
+/// behind both [`collect_type_instances`] (builds `TypeInstance`s) and
+/// [`for_each_instance_node`] (invokes a caller callback); they differ only in
+/// what `visit` does at the leaf.
+fn walk_skip_root_child<V>(
     td: &TypeDefinition,
     skip_stack: &[SkipRootKey],
     child: &Child,
     arena: &Arena,
     table: &StringTable,
-    out: &mut Vec<TypeInstance>,
-) {
+    visit: &mut V,
+) where
+    V: FnMut(&TypeDefinition, String, &str, &[Child], SourceLocation),
+{
     let Some(kc) = arena.keyed_clause(child) else {
         return; // not a keyed clause — skip
     };
-    let (clause_children, start_line, start_col) =
-        (kc.children, kc.pos.start.line, kc.pos.start.col);
+    let clause_children = kc.children;
+    let location = SourceLocation {
+        line: kc.pos.start.line,
+        col: kc.pos.start.col,
+    };
 
     table.with_string(kc.key.normal, |key| match skip_stack {
         [] => {
@@ -129,26 +140,14 @@ fn collect_skip_root_child(
                 && let Some(name) =
                     instance_name_from_children(td, key, clause_children, arena, table)
             {
-                // Capture the explicit-field primary loc key (e.g. an event's
-                // `title`) so hover can resolve the localised title cross-file.
-                let primary_loc_key = primary_explicit_loc_field(td).and_then(|field| {
-                    field_value_from_children(field, clause_children, arena, table)
-                });
-                out.push(TypeInstance {
-                    name,
-                    location: SourceLocation {
-                        line: start_line,
-                        col: start_col,
-                    },
-                    primary_loc_key,
-                });
+                visit(td, name, key, clause_children, location);
             }
         }
         [head, tail @ ..] => {
             // Must match the skip-root layer; then descend into children.
             if skip_root_key_matches(head, key) {
                 for inner_child in clause_children {
-                    collect_skip_root_child(td, tail, inner_child, arena, table, out);
+                    walk_skip_root_child(td, tail, inner_child, arena, table, visit);
                 }
             }
         }
@@ -193,48 +192,14 @@ pub fn for_each_instance_node<F>(
         {
             continue;
         }
+        let mut visit =
+            |td: &TypeDefinition, name: String, key: &str, children: &[Child], location| {
+                f(td, &name, key, children, location);
+            };
         for child in &file.root_children {
-            walk_instance_node(td, &td.skip_root_key, child, &file.arena, table, f);
+            walk_skip_root_child(td, &td.skip_root_key, child, &file.arena, table, &mut visit);
         }
     }
-}
-
-fn walk_instance_node<F>(
-    td: &TypeDefinition,
-    skip_stack: &[SkipRootKey],
-    child: &Child,
-    arena: &Arena,
-    table: &StringTable,
-    f: &mut F,
-) where
-    F: FnMut(&TypeDefinition, &str, &str, &[Child], SourceLocation),
-{
-    let Some(kc) = arena.keyed_clause(child) else {
-        return;
-    };
-    let clause_children = kc.children;
-    let location = SourceLocation {
-        line: kc.pos.start.line,
-        col: kc.pos.start.col,
-    };
-    table.with_string(kc.key.normal, |key| match skip_stack {
-        [] => {
-            if type_key_filter_matches(td, key)
-                && starts_with_matches(td, key)
-                && let Some(name) =
-                    instance_name_from_children(td, key, clause_children, arena, table)
-            {
-                f(td, &name, key, clause_children, location);
-            }
-        }
-        [head, tail @ ..] => {
-            if skip_root_key_matches(head, key) {
-                for inner_child in clause_children {
-                    walk_instance_node(td, tail, inner_child, arena, table, f);
-                }
-            }
-        }
-    });
 }
 
 /// Hash one exported symbol's identity, with separators so distinct parts can't
@@ -307,15 +272,25 @@ pub fn collect_type_instances(
             });
         } else {
             // Walk the file's top-level keyed clauses.
+            let arena = &file.arena;
+            let mut visit = |td: &TypeDefinition,
+                             name: String,
+                             _key: &str,
+                             clause_children: &[Child],
+                             location| {
+                // Capture the explicit-field primary loc key (e.g. an event's
+                // `title`) so hover can resolve the localised title cross-file.
+                let primary_loc_key = primary_explicit_loc_field(td).and_then(|field| {
+                    field_value_from_children(field, clause_children, arena, table)
+                });
+                instances.push(TypeInstance {
+                    name,
+                    location,
+                    primary_loc_key,
+                });
+            };
             for child in &file.root_children {
-                collect_skip_root_child(
-                    td,
-                    &td.skip_root_key,
-                    child,
-                    &file.arena,
-                    table,
-                    &mut instances,
-                );
+                walk_skip_root_child(td, &td.skip_root_key, child, arena, table, &mut visit);
             }
         }
 
