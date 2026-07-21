@@ -40,7 +40,7 @@ fn resolve_item(
             .and_then(|rs| alias_documentation(rs, &cat, &name))
             .inspect(|desc| item.documentation = Some(Documentation::String(desc.clone())))
             .is_some(),
-        ResolveData::Type { t } => type_instance_detail(info, &t, &label)
+        ResolveData::Type { t } => type_instance_detail(ruleset, info, &t, &label)
             .inspect(|detail| item.detail = Some(detail.clone()))
             .is_some(),
         ResolveData::Enum { id } => ruleset
@@ -160,6 +160,67 @@ mod tests {
         let (resolved, hit) = resolve_item(item, None, &info);
         assert!(hit);
         assert_eq!(resolved.detail, Some("state instance".to_string()));
+    }
+
+    #[test]
+    fn resolve_type_prefers_subtype_display_name() {
+        use cwtools_rules::rules_types::{PathOptions, SubTypeDefinition, TypeDefinition};
+
+        let mut rs = RuleSet::new();
+        rs.types.push(TypeDefinition {
+            name: "event".to_string(),
+            name_field: None,
+            path_options: PathOptions::default(),
+            subtypes: vec![SubTypeDefinition {
+                name: "country".to_string(),
+                display_name: Some("Country Event".to_string()),
+                abbreviation: None,
+                rules: Vec::new(),
+                type_key_field: None,
+                starts_with: None,
+                push_scope: None,
+                localisation: Vec::new(),
+                only_if_not: Vec::new(),
+                modifiers: Vec::new(),
+                type_key_filter: Vec::new(),
+            }],
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: false,
+            localisation: Vec::new(),
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        });
+        rs.reindex();
+
+        let mut info = InfoService::new();
+        let mut per_type: std::collections::HashMap<String, Vec<TypeInstance>> =
+            std::collections::HashMap::new();
+        per_type.insert(
+            "event.country".to_string(),
+            vec![TypeInstance {
+                name: "my_event".to_string(),
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
+                primary_loc_key: None,
+            }],
+        );
+        info.type_index.merge("file:///events/e.txt", per_type);
+        let item = item_with_data("my_event", "type:event.country");
+        let (resolved, hit) = resolve_item(item, Some(&rs), &info);
+        assert!(hit);
+        assert_eq!(
+            resolved.detail,
+            Some("event.Country Event instance".to_string())
+        );
     }
 
     #[test]

@@ -469,6 +469,7 @@ pub struct TypeDefinition {
     pub unique: bool,
     pub should_be_referenced: bool,
     pub localisation: Vec<TypeLocalisation>,
+    /// `## graph_related_types = { ... }`: parsed for .cwt spec compatibility; not consumed.
     pub graph_related_types: Vec<String>,
     pub modifiers: Vec<TypeModifier>,
 }
@@ -700,6 +701,8 @@ pub struct Options {
     pub severity: Option<Severity>,
     pub required_scopes: Vec<String>,
     pub comparison: bool,
+    /// `## outgoingReferenceLabel`/`## incomingReferenceLabel`: parsed for .cwt
+    /// spec compatibility; not consumed.
     pub reference_details: Option<Box<ReferenceDetail>>,
     // key_required_quotes, value_required_quotes, type_hint removed:
     // always default-valued, no readers (quoted-key enforcement unimplemented).
