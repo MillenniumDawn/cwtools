@@ -54,7 +54,12 @@ enum Commands {
         /// Game identifier (hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom)
         #[arg(long, short)]
         game: String,
-        /// Directory containing game files
+        /// Directory containing game files. A single mod root is validated as-is.
+        /// A workspace of mods (a directory that is not itself a mod root but whose
+        /// `mod/`/`mods/` folder holds `.mod` descriptors) is auto-detected and
+        /// expanded: every referenced mod is validated together, layered by load
+        /// order (a later-resolved mod overrides a shared logical path; a mod's
+        /// `replace_path` suppresses lower-priority files under that prefix).
         #[arg(long, short)]
         directory: PathBuf,
         /// Path to a .cwt rules file OR a directory containing .cwt rule files

@@ -187,6 +187,38 @@ pub fn is_excluded_root_dir(name: &str) -> bool {
         .any(|d| name.eq_ignore_ascii_case(d))
 }
 
+/// True if `path` is a script file the discovery filters accept: a script
+/// extension, matching an include pattern, not on the exclude list, and within
+/// the size guard. Shared by single-root discovery ([`FileManager::collect_paths`])
+/// and the multi-mod path so both apply identical file-level rules.
+fn accept_script_file(cfg: &FileManagerConfig, path: &Path) -> bool {
+    if classify_extension(path) != FileKind::Script {
+        return false;
+    }
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !cfg
+        .file_patterns
+        .iter()
+        .any(|pat| glob_match(pat, file_name))
+    {
+        return false;
+    }
+    if cfg
+        .exclude_patterns
+        .iter()
+        .any(|pat| glob_match(pat, file_name))
+    {
+        return false;
+    }
+    if cfg.max_file_size > 0
+        && let Ok(meta) = path.metadata()
+        && meta.len() > cfg.max_file_size
+    {
+        return false;
+    }
+    true
+}
+
 #[derive(Debug, Error)]
 pub enum FileError {
     #[error("IO error: {0}")]
@@ -361,31 +393,10 @@ impl FileManager {
         let root_prefix = normalize_root_prefix(&self.config.root);
         let is_root_level = dir == self.config.root.as_path();
         let cfg = &self.config;
-        // Accept only script files that match the include patterns, aren't
-        // excluded, and pass the size guard; each yields (path, logical_path).
+        // Accept only script files that pass the shared file-level filter; each
+        // yields (path, logical_path).
         let mut accept = |path: &Path| -> Option<(PathBuf, String)> {
-            if classify_extension(path) != FileKind::Script {
-                return None;
-            }
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !cfg
-                .file_patterns
-                .iter()
-                .any(|pat| glob_match(pat, file_name))
-            {
-                return None;
-            }
-            if cfg
-                .exclude_patterns
-                .iter()
-                .any(|pat| glob_match(pat, file_name))
-            {
-                return None;
-            }
-            if cfg.max_file_size > 0
-                && let Ok(meta) = path.metadata()
-                && meta.len() > cfg.max_file_size
-            {
+            if !accept_script_file(cfg, path) {
                 return None;
             }
             let logical_path = compute_logical_path_with_root(path, &root_prefix);
@@ -396,6 +407,58 @@ impl FileManager {
         };
         walk_dir_generic(dir, is_root_level, cfg, &[], &mut accept, &mut on_err, out)
             .map_err(FileError::from)
+    }
+
+    /// Discover and parse the script files of a `MultipleMod` workspace: a
+    /// directory whose `mod/` (or `mods/`) folder holds `.mod` descriptors, each
+    /// pointing at a mod root ([`classify_directory`] returned `MultipleMod`).
+    ///
+    /// The mods are layered by [`discover_files_multi_mod`]'s load order — a
+    /// later-resolved mod (mods are name-sorted, so the alphabetically-greater
+    /// name) wins a shared logical path, and a mod's `replace_path` suppresses
+    /// lower-priority files under that prefix. The surviving script files are
+    /// then filtered and parsed exactly as [`Self::discover_and_parse`] does for a
+    /// single root. Vanilla is NOT folded in here — the driver indexes the base
+    /// game separately, for reference only.
+    pub fn discover_and_parse_multi_mod(&mut self) -> Result<Vec<ParsedFile>, FileError> {
+        use rayon::prelude::*;
+
+        let mods = expand_multiple_mods(&self.config.root);
+        let discovered = discover_files_multi_mod(None, &mods, &self.config.include_dirs);
+
+        // Apply the same file-level filter the single-root walk uses, to the
+        // already load-order-deduplicated set.
+        let cfg = &self.config;
+        let candidates: Vec<(PathBuf, String)> = discovered
+            .into_iter()
+            .filter(|(path, _)| accept_script_file(cfg, path))
+            .collect();
+
+        // Parse in parallel; `into_par_iter().collect()` preserves the input
+        // order, so output stays deterministic (candidates are sorted by
+        // logical path).
+        let table = &self.string_table;
+        let files = candidates
+            .into_par_iter()
+            .filter_map(|(path, logical_path)| {
+                let content = read_text(&path).ok()?;
+                match parse_string(&content, table) {
+                    Ok(parsed) => Some(ParsedFile {
+                        path,
+                        logical_path,
+                        arena: parsed.arena,
+                        root_children: parsed.root_children,
+                        errors: parsed.errors,
+                    }),
+                    Err(e) => {
+                        eprintln!("warn: skipping {}: {}", path.display(), e);
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        Ok(files)
     }
 
     pub fn parse_single_file(&mut self, path: &Path) -> Result<ParsedFile, FileError> {
@@ -675,6 +738,12 @@ fn collect_files_recursive(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            // Skip VCS/build/editor dirs, same as the single-root walk, so a
+            // mod's nested `.git`/`target`/… never contributes files.
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if is_excluded_dir(name) {
+                continue;
+            }
             collect_files_recursive(&path, root_prefix, priority, out);
         } else {
             let logical = compute_logical_path_with_root(&path, root_prefix);
@@ -1240,6 +1309,118 @@ mod tests {
             by_logical.contains_key("events/bar.txt"),
             "ModB events/bar.txt should be present"
         );
+    }
+
+    /// A workspace of two mods (a `mod/` folder with two `.mod` descriptors)
+    /// must classify as `MultipleMod`, expand to both resolved roots (name-sorted),
+    /// and discover the union of their script files with later-mod-wins override:
+    /// the alphabetically-greater mod name wins a shared logical path. Non-script
+    /// and default-excluded files are dropped, same as the single-root walk.
+    #[test]
+    fn multi_mod_workspace_expands_and_overrides() {
+        use std::collections::HashMap;
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let ws = tmp.path();
+
+        // Two mods, resolved via .mod descriptors in the workspace's mod/ folder.
+        fs::create_dir_all(ws.join("mod")).unwrap();
+        fs::write(
+            ws.join("mod/alpha.mod"),
+            "name = \"Alpha Mod\"\npath = \"alpha\"\n",
+        )
+        .unwrap();
+        fs::write(
+            ws.join("mod/bravo.mod"),
+            "name = \"Bravo Mod\"\npath = \"bravo\"\n",
+        )
+        .unwrap();
+
+        // Alpha: a shared file, an alpha-only file, plus files that must be filtered.
+        fs::create_dir_all(ws.join("alpha/common")).unwrap();
+        fs::create_dir_all(ws.join("alpha/localisation")).unwrap();
+        fs::write(ws.join("alpha/common/foo.txt"), "shared = alpha").unwrap();
+        fs::write(ws.join("alpha/common/only_a.txt"), "only = alpha").unwrap();
+        fs::write(ws.join("alpha/common/README.md"), "notes").unwrap();
+        fs::write(ws.join("alpha/localisation/x.yml"), "l_english:").unwrap();
+
+        // Bravo: overrides the shared file, adds an event file.
+        fs::create_dir_all(ws.join("bravo/common")).unwrap();
+        fs::create_dir_all(ws.join("bravo/events")).unwrap();
+        fs::write(ws.join("bravo/common/foo.txt"), "shared = bravo").unwrap();
+        fs::write(ws.join("bravo/events/e.txt"), "evt = bravo").unwrap();
+
+        assert_eq!(classify_directory(ws), DirectoryType::MultipleMod);
+
+        let mods = expand_multiple_mods(ws);
+        assert_eq!(
+            mods.iter()
+                .map(|m| m.descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha Mod", "Bravo Mod"],
+            "mods resolve name-sorted"
+        );
+
+        let mut fm = FileManager::new(FileManagerConfig {
+            root: ws.to_path_buf(),
+            include_dirs: vec!["common".into(), "events".into()],
+            ..Default::default()
+        });
+        let files = fm
+            .discover_and_parse_multi_mod()
+            .expect("multi-mod discover");
+
+        let by_logical: HashMap<String, PathBuf> = files
+            .iter()
+            .map(|f| (f.logical_path.clone(), f.path.clone()))
+            .collect();
+
+        // Shared file: Bravo wins (alphabetically-greater name = higher priority).
+        let foo = by_logical
+            .get("common/foo.txt")
+            .expect("common/foo.txt present");
+        assert_eq!(
+            fs::read_to_string(foo).unwrap(),
+            "shared = bravo",
+            "Bravo's common/foo.txt overrides Alpha's"
+        );
+        // Alpha-only and Bravo-only files both survive.
+        assert!(by_logical.contains_key("common/only_a.txt"));
+        assert!(by_logical.contains_key("events/e.txt"));
+        // Non-script and default-excluded files are dropped.
+        assert!(
+            !by_logical.keys().any(|k| k.ends_with("README.md")),
+            "*.md excluded: {by_logical:?}"
+        );
+        assert!(
+            !by_logical.keys().any(|k| k.ends_with(".yml")),
+            "loc files are not script-discovered: {by_logical:?}"
+        );
+    }
+
+    /// A plain single mod directory must classify as `Mod`, NOT `MultipleMod`, so
+    /// the driver keeps taking the existing single-root discovery path unchanged.
+    #[test]
+    fn single_mod_directory_classifies_as_mod() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join("common")).unwrap();
+        fs::create_dir_all(root.join("events")).unwrap();
+        fs::write(root.join("common/foo.txt"), "x = 1").unwrap();
+
+        assert_eq!(classify_directory(root), DirectoryType::Mod);
+
+        // The existing single-root walk still finds the file.
+        let fm = FileManager::new(FileManagerConfig {
+            root: root.to_path_buf(),
+            include_dirs: vec!["common".into()],
+            ..Default::default()
+        });
+        let mut paths = Vec::new();
+        fm.collect_paths(root, &mut paths).unwrap();
+        assert!(paths.iter().any(|(_, lp)| lp.ends_with("common/foo.txt")));
     }
 
     #[test]
