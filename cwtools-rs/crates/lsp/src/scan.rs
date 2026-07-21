@@ -516,15 +516,9 @@ impl Backend {
         };
         if !removed_uris.is_empty() {
             // Mirrors the DELETE branch of `did_change_watched_files_impl`:
-            // the symbol index and loc live-overlay are keyed per-file too and
-            // must forget the same URIs, or goto-def/loc checks keep serving
-            // stale entries for a file `info_service` just dropped.
-            {
-                let mut index = self.state.symbol_index.lock();
-                for uri in &removed_uris {
-                    index.clear_document(uri);
-                }
-            }
+            // the loc live-overlay is keyed per-file too and must forget the
+            // same URIs, or loc checks keep serving stale entries for a file
+            // `info_service` just dropped.
             {
                 let mut overlay = self.state.loc_live_overlay.write();
                 for uri in &removed_uris {
@@ -1376,17 +1370,10 @@ impl Backend {
     }
 
     /// Apply a coalesced batch of DELETE events off the message future: forget
-    /// each URI from the symbol index, the info service (one write scope), the
-    /// loc overlay, and the watched-signature record, bump the info revision
-    /// once for the whole batch, then publish empty diagnostics per URI outside
-    /// every lock.
+    /// each URI from the info service (one write scope), the loc overlay, and
+    /// the watched-signature record, bump the info revision once for the whole
+    /// batch, then publish empty diagnostics per URI outside every lock.
     async fn process_watched_deletes(&self, deletes: &[String]) {
-        {
-            let mut index = self.state.symbol_index.lock();
-            for uri in deletes {
-                index.clear_document(uri);
-            }
-        }
         {
             let mut info = self.state.info_service.write();
             for uri in deletes {

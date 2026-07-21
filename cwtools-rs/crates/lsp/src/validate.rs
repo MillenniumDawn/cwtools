@@ -360,11 +360,6 @@ impl Backend {
     /// from `index_document` so the workspace scan can index cache-hit ASTs
     /// without re-parsing.
     pub(crate) fn index_parsed_file(&self, uri: &str, parsed: &ParsedFile) {
-        {
-            let mut index = self.state.symbol_index.lock();
-            index.clear_document(uri);
-            index.index_document(uri, parsed, &self.state.string_table);
-        }
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = logical_path_from_uri(uri, &ws_prefix);
         // Lock order: rules -> info_service.
@@ -979,35 +974,11 @@ impl Backend {
                     diagnostics.push(parse_error_to_diagnostic(parse_err, &line_ends));
                 }
 
-                // Update symbol index
-                {
-                    let mut index = self.state.symbol_index.lock();
-                    index.clear_document(uri);
-                    index.index_document(uri, &parsed, &self.state.string_table);
-                }
-
-                // Derive logical path for type-instance indexing
-                let ws_prefix = self.state.config.read().workspace_prefix.clone();
-                let logical_path = logical_path_from_uri(uri, &ws_prefix);
-
-                // Update info service. Lock order: rules -> info_service.
-                {
-                    let rules_guard = self.state.rules.read();
-                    let mut info = self.state.info_service.write();
-                    info.clear_file(uri);
-                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
-                        info.index_file_with_path(
-                            uri,
-                            &parsed,
-                            &self.state.string_table,
-                            ruleset,
-                            &logical_path,
-                        );
-                    }
-                    drop(info);
-                    drop(rules_guard);
-                    self.bump_info_revision();
-                }
+                // Index this file the same way the workspace scan and did_close
+                // disk-restore do (previously an inlined, drifted subset that
+                // skipped the collect_subtype_instances merge — an open file
+                // could lose its `<type.subtype>` membership while being edited).
+                self.index_parsed_file(uri, &parsed);
 
                 // Validation. Lock order: rules -> info_service -> loc_index.
                 let (errors, log_msg) = {

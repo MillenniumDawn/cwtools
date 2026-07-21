@@ -4862,3 +4862,172 @@ fn test_did_close_restores_disk_definition() {
         "closing the live buffer should restore the disk definition, got: {result:?}"
     );
 }
+
+// ── did_open indexes its own subtype membership (architecture review L2) ─────
+
+/// Fixture adapted from `crates/validation/tests/subtype_membership.rs`: a
+/// `naval_equip` subtype is discriminated by `archetype = <equipment.naval_equip>`,
+/// which only resolves once the archetype's own subtype-qualified membership
+/// (`equipment.naval_equip`) is in the type index. Without that merge, the
+/// variant never activates `naval_equip` and `model` becomes an unrecognized
+/// field (CW263).
+const SUBTYPE_RULES: &str = r#"
+types = {
+    type[equipment] = {
+        skip_root_key = equipments
+        path = "game/common/units/equipment"
+        subtype[archetype_equip] = {
+            ## cardinality = 0..1
+            is_archetype = yes
+        }
+        subtype[naval_equip] = {
+            ## cardinality = 0..1
+            type = enum[ship_units]
+            ## cardinality = 0..1
+            archetype = <equipment.naval_equip>
+        }
+    }
+}
+
+equipment = {
+    ## cardinality = 0..1
+    is_archetype = bool
+    ## cardinality = 0..1
+    archetype = <equipment>
+    ## cardinality = 0..1
+    type = enum[ship_units]
+    alias_name[unit_stat] = alias_match_left[unit_stat]
+    subtype[naval_equip] = {
+        ## cardinality = 0..1
+        model = scalar
+    }
+}
+
+alias[unit_stat:build_cost_ic] = float
+
+enums = {
+    enum[ship_units] = {
+        submarine
+        destroyer
+    }
+}
+"#;
+
+const SUBTYPE_SCRIPT: &str = r#"
+equipments = {
+    ship_hull_submarine = {
+        is_archetype = yes
+        type = submarine
+        model = base_sub_model
+    }
+    ship_hull_cruiser_submarine = {
+        archetype = ship_hull_submarine
+        model = cruiser_sub_model
+    }
+}
+"#;
+
+#[test]
+fn did_open_indexes_own_subtype_membership() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    // An explicit empty `vanilla` dir, or `ensure_vanilla_index` auto-discovers
+    // a real game install on the host (e.g. a Steam copy of HOI4) and merges its
+    // equipment archetypes into `equipment.naval_equip`, masking the bug this
+    // test guards against.
+    let vanilla_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), SUBTYPE_RULES).unwrap();
+
+    let rel_path = "common/units/equipment/ships.txt";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    // Empty on disk: the initial workspace scan (which indexes correctly via
+    // `index_parsed_file`, unaffected by this bug) must never see the
+    // archetype. It's introduced only by the live edit below, so any
+    // `equipment.naval_equip` membership the variant resolves against can only
+    // have come from `parse_and_validate`'s own indexing of that edit.
+    std::fs::write(&file_path, "").unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // Diagnostics are gated (published as an empty set) until the initial scan
+    // finishes and flips `index_ready`; wait for it so the assertions below
+    // see the server's real validation output, not the gate's placeholder.
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": "",
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, rel_path);
+
+    // Edit in the archetype and its naval variant together: the variant's
+    // `archetype = <equipment.naval_equip>` discriminator only activates once
+    // this file's own archetype is merged into `equipment.naval_equip` by the
+    // same edit's indexing pass (did_change also runs through
+    // `parse_and_validate`).
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri, "version": 2 },
+                "contentChanges": [{ "text": SUBTYPE_SCRIPT }],
+            }),
+        ),
+    )
+    .unwrap();
+
+    let codes = diags_for(&mut reader, rel_path, 1).expect("diagnostics for ships.txt after edit");
+    child.kill().ok();
+
+    assert!(
+        !codes.contains(&"CW263".to_string()),
+        "an edit that adds both the archetype and its naval variant in one \
+         didChange must index the archetype's own subtype membership so the \
+         variant activates naval_equip and `model` is a recognized field, \
+         got: {:?}",
+        codes
+    );
+}

@@ -20,7 +20,6 @@ mod hover;
 mod navigation;
 mod paths;
 mod scan;
-mod symbols;
 mod validate;
 mod workspace_cache;
 
@@ -192,8 +191,6 @@ struct DocumentState {
     rules: parking_lot::RwLock<RuleData>,
     /// shared string table
     string_table: StringTable,
-    /// symbol index for goto-definition and references
-    symbol_index: Mutex<symbols::SymbolIndex>,
     /// computed info service for type/references/definitions. `RwLock` so the
     /// full-workspace pass-2 validation can share a single read guard across
     /// rayon threads, and the many read-only consumers (hover, completion,
@@ -446,7 +443,6 @@ impl DocumentState {
             config: parking_lot::RwLock::new(Config::new()),
             rules: parking_lot::RwLock::new(RuleData::new()),
             string_table: StringTable::new(),
-            symbol_index: Mutex::new(symbols::SymbolIndex::new()),
             info_service: parking_lot::RwLock::new(cwtools_info::InfoService::new()),
             vanilla_index: Mutex::new(None),
             vanilla_merged_uris: Mutex::new(HashSet::new()),
@@ -775,9 +771,14 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
     ) -> Option<CursorResolution> {
-        let (game, scope_checks, var_checks) = {
+        let (game, scope_checks, var_checks, position_encoding) = {
             let cfg = self.state.config.read();
-            (cfg.game(), cfg.scope_checks, cfg.var_checks)
+            (
+                cfg.game(),
+                cfg.scope_checks,
+                cfg.var_checks,
+                cfg.position_encoding.clone(),
+            )
         };
         let ast = self.ast_for(uri)?;
         let (ruleset, modifier_keys, scope_registry) = {
@@ -788,7 +789,6 @@ impl Backend {
                 rules_guard.scope_registry.clone(),
             )
         };
-        let position_encoding = self.state.config.read().position_encoding.clone();
         let document_text = {
             let docs = self.state.documents.lock();
             docs.get(uri).map(|doc| Arc::clone(&doc.text))
@@ -1226,7 +1226,6 @@ impl LanguageServer for Backend {
             if let Some(parsed) = disk_ast.as_ref() {
                 self.index_parsed_file(&uri, parsed);
             } else {
-                self.state.symbol_index.lock().clear_document(&uri);
                 self.state.info_service.write().clear_file(&uri);
                 self.bump_info_revision();
             }
