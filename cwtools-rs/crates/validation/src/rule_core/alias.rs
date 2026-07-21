@@ -308,6 +308,10 @@ pub(super) fn validate_alias_usage(
     }
 
     let mut best: Option<Vec<ValidationError>> = None;
+    // A `## error_if_only_match` overload that matched cleanly, held aside so a
+    // later directive-free clean match can still win. Surfaced only if no such
+    // match exists (F# `errorIfOnlyMatch` / CW272).
+    let mut only_match: Option<ValidationError> = None;
     let mut temp: Vec<ValidationError> = Vec::new();
     for (rule_type, opts) in overloads {
         temp.clear();
@@ -377,6 +381,30 @@ pub(super) fn validate_alias_usage(
         }
 
         if temp.is_empty() {
+            // Clean match. A `## error_if_only_match` overload is not an accept:
+            // keep its custom error aside and keep scanning for a directive-free
+            // clean match, which still wins.
+            if let Some(msg) = opts.error_if_only_match.as_ref() {
+                if only_match.is_none() {
+                    let sev = opts
+                        .severity
+                        .as_ref()
+                        .map(severity_to_error)
+                        .unwrap_or(ErrorSeverity::Error);
+                    let (line, col) = leaf
+                        .map(|l| (l.pos.start.line, l.pos.start.col))
+                        .unwrap_or(fallback_pos);
+                    only_match = Some(ValidationError::from_code_with(
+                        &error_codes::CW272_FROM_RULES_CUSTOM_ERROR,
+                        sev,
+                        file_path,
+                        line,
+                        col,
+                        msg.clone(),
+                    ));
+                }
+                continue;
+            }
             return; // clean match — accept with no errors
         }
         match &best {
@@ -386,7 +414,11 @@ pub(super) fn validate_alias_usage(
         }
     }
 
-    if let Some(b) = best {
+    // No directive-free clean match: surface the sole directive match's custom
+    // error, else the closest (fewest-errors) candidate.
+    if let Some(custom) = only_match {
+        errors.push(custom);
+    } else if let Some(b) = best {
         errors.extend(b);
     }
 }

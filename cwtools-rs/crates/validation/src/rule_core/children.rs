@@ -172,31 +172,54 @@ fn validate_leaf_against_rule(
 }
 
 /// Run several candidate rules for one overloaded key as a disjunction: accept on
-/// the first clean match, otherwise surface the fewest-errors candidate. With a
-/// single candidate this is just a direct validation.
-fn pick_best_candidate<F>(mut validate_one: F, errors: &mut Vec<ValidationError>, n: usize)
-where
+/// the first clean match, otherwise surface the fewest-errors candidate.
+///
+/// `only_match_error(i)` returns the `## error_if_only_match` (CW272) custom error
+/// for candidate `i` when that rule carries the directive, and `None` otherwise.
+/// A directive-carrying candidate whose value matches cleanly is NOT an accept: it
+/// is held aside and surfaced only if no directive-free candidate also matches
+/// cleanly (a later clean, directive-free match still wins). Mirrors F#
+/// `errorIfOnlyMatch`, gated by `lazyErrorMerge` on the absence of a clean match.
+fn pick_best_candidate<F, G>(
+    mut validate_one: F,
+    mut only_match_error: G,
+    errors: &mut Vec<ValidationError>,
+    n: usize,
+) where
     F: FnMut(usize, &mut Vec<ValidationError>),
+    G: FnMut(usize) -> Option<ValidationError>,
 {
-    if n == 1 {
-        validate_one(0, errors);
-        return;
-    }
     let mut best: Option<Vec<ValidationError>> = None;
+    let mut only_match: Option<ValidationError> = None;
     let mut temp: Vec<ValidationError> = Vec::new();
     for i in 0..n {
         temp.clear();
         validate_one(i, &mut temp);
         if temp.is_empty() {
-            return; // clean match
-        }
-        match &best {
-            Some(b) if b.len() <= temp.len() => {}
-            // New best — take `temp`'s contents, leaving a reusable empty buffer.
-            _ => best = Some(std::mem::take(&mut temp)),
+            match only_match_error(i) {
+                // Clean match, but the rule says "error if this is the only match":
+                // keep it aside and keep scanning for a directive-free clean match.
+                Some(custom) => {
+                    if only_match.is_none() {
+                        only_match = Some(custom);
+                    }
+                }
+                None => return, // directive-free clean match — accept
+            }
+        } else {
+            match &best {
+                Some(b) if b.len() <= temp.len() => {}
+                // New best — take `temp`'s contents, leaving a reusable empty buffer.
+                _ => best = Some(std::mem::take(&mut temp)),
+            }
         }
     }
-    if let Some(b) = best {
+    // No directive-free clean match. A directive-carrying candidate that matched
+    // cleanly is the sole match → surface its custom error; otherwise fall back to
+    // the closest (fewest-errors) candidate.
+    if let Some(custom) = only_match {
+        errors.push(custom);
+    } else if let Some(b) = best {
         errors.extend(b);
     }
 }
@@ -489,6 +512,24 @@ fn count_and_validate_children(
                                 scope_context,
                                 out,
                             );
+                        },
+                        |i| {
+                            let (_, opts) = candidates[i];
+                            opts.error_if_only_match.as_ref().map(|msg| {
+                                let sev = opts
+                                    .severity
+                                    .as_ref()
+                                    .map(severity_to_error)
+                                    .unwrap_or(ErrorSeverity::Error);
+                                ValidationError::from_code_with(
+                                    &error_codes::CW272_FROM_RULES_CUSTOM_ERROR,
+                                    sev,
+                                    file_path,
+                                    leaf.pos.start.line,
+                                    leaf.pos.start.col,
+                                    msg.clone(),
+                                )
+                            })
                         },
                         errors,
                         n,
