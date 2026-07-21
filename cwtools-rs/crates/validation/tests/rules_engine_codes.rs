@@ -133,3 +133,141 @@ foo = {
         "CW203/CW204 retired"
     );
 }
+
+// ── Did-you-mean suggested fixes (Task 19): fix metadata only ─────────────────
+// The suggestion lives in the fix title/edit; the diagnostic message, code, and
+// position are unchanged (corpus-inert).
+
+/// Full errors for a (cwt, script) pair, keeping ruleset+table alive so a fix can
+/// be applied and the corrected text revalidated against the same rules.
+fn validate_pair(
+    cwt: &str,
+    script: &str,
+) -> (
+    StringTable,
+    cwtools_rules::rules_types::RuleSet,
+    Vec<cwtools_validation::ValidationError>,
+) {
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let parsed = parse_string(script, &table).unwrap();
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
+    (table, ruleset, errors)
+}
+
+#[test]
+fn cw263_close_match_attaches_did_you_mean_fix() {
+    use cwtools_parser::fix::apply_edits;
+    let script = "foo = {\n    required_field = ok\n    cont = 3\n}\n";
+    let (table, ruleset, errors) = validate_pair(RULES, script);
+
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW263"))
+        .expect("CW263 emitted");
+    // Message is UNCHANGED — the suggestion is fix metadata, not diagnostic text.
+    assert_eq!(err.message, "Unexpected field 'cont'");
+    let fix = err.fix.as_ref().expect("CW263 carries a did-you-mean fix");
+    assert_eq!(fix.title, "Did you mean 'count'?");
+
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(
+        fixed,
+        "foo = {\n    required_field = ok\n    count = 3\n}\n"
+    );
+
+    // The corrected key matches `count = int`; CW263 is gone on revalidation.
+    let ast2 = parse_string(&fixed, &table).unwrap();
+    let errors2 = validate_ast(&ast2, &ruleset, &table, "test.txt", None, None, None);
+    assert!(
+        !errors2.iter().any(|e| e.code == Some("CW263")),
+        "CW263 must be gone after applying the fix"
+    );
+}
+
+const NODE_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    settings = { x = int }
+    name = scalar
+}
+"#;
+
+#[test]
+fn cw262_close_match_attaches_did_you_mean_fix() {
+    use cwtools_parser::fix::apply_edits;
+    let script = "foo = {\n    setings = { x = 1 }\n}\n";
+    let (table, ruleset, errors) = validate_pair(NODE_RULES, script);
+
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW262"))
+        .expect("CW262 emitted");
+    assert_eq!(err.message, "Unexpected block 'setings'");
+    let fix = err.fix.as_ref().expect("CW262 carries a did-you-mean fix");
+    assert_eq!(fix.title, "Did you mean 'settings'?");
+
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, "foo = {\n    settings = { x = 1 }\n}\n");
+
+    let ast2 = parse_string(&fixed, &table).unwrap();
+    let errors2 = validate_ast(&ast2, &ruleset, &table, "test.txt", None, None, None);
+    assert!(
+        !errors2.iter().any(|e| e.code == Some("CW262")),
+        "CW262 must be gone after applying the fix"
+    );
+}
+
+#[test]
+fn cw263_no_close_match_has_no_fix() {
+    let script = "foo = {\n    required_field = ok\n    xyzzy = 3\n}\n";
+    let (_t, _r, errors) = validate_pair(RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW263"))
+        .expect("CW263 emitted");
+    assert!(
+        err.fix.is_none(),
+        "no candidate within edit distance → no fix"
+    );
+}
+
+const TIE_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    cat = scalar
+    bat = scalar
+}
+"#;
+
+#[test]
+fn cw263_ambiguous_tie_has_no_fix() {
+    // "rat" is distance 1 from both "cat" and "bat": ambiguous → no fix.
+    let script = "foo = {\n    rat = 1\n}\n";
+    let (_t, _r, errors) = validate_pair(TIE_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW263"))
+        .expect("CW263 emitted");
+    assert!(err.fix.is_none(), "equal-distance tie → no fix");
+}
+
+const TINY_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    ab = scalar
+}
+"#;
+
+#[test]
+fn cw263_tiny_candidate_has_no_fix() {
+    // "ba" -> "ab" is distance 2, but the only candidate is 2 chars: too short.
+    let script = "foo = {\n    ba = 1\n}\n";
+    let (_t, _r, errors) = validate_pair(TINY_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW263"))
+        .expect("CW263 emitted");
+    assert!(err.fix.is_none(), "candidate shorter than 3 chars → no fix");
+}

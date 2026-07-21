@@ -6,6 +6,7 @@ mod children;
 mod leaf;
 mod matching;
 mod subtype_merge;
+mod suggest;
 
 pub(crate) use alias::alias_overloads;
 pub(crate) use children::{math_clause_rules, rule_right_is_math_expr};

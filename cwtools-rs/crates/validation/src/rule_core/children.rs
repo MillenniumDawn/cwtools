@@ -17,6 +17,7 @@ use super::alias::validate_alias_usage;
 use super::leaf::{check_variable_get, field_matches_value, validate_leaf};
 use super::matching::{get_rule_key, matching_candidates, rule_matches_leaf_key};
 use super::subtype_merge::flatten_nested_subtype_rules;
+use super::suggest::best_suggestion;
 
 /// True when a rule's left-hand field is `IgnoreField` (`key = ignore_field`),
 /// meaning the matched field/block is accepted without validating its contents.
@@ -496,17 +497,34 @@ fn count_and_validate_children(
                                 &error_codes::CW263_UNEXPECTED_PROPERTY_LEAF,
                             )
                         };
-                        errors.push(
-                            ValidationError::from_code_with(
-                                code,
-                                ErrorSeverity::Error,
-                                file_path,
-                                leaf.pos.start.line,
-                                leaf.pos.start.col,
-                                msg,
-                            )
-                            .with_end(leaf.pos.end),
-                        );
+                        let mut err = ValidationError::from_code_with(
+                            code,
+                            ErrorSeverity::Error,
+                            file_path,
+                            leaf.pos.start.line,
+                            leaf.pos.start.col,
+                            msg,
+                        )
+                        .with_end(leaf.pos.end);
+                        // Did-you-mean (fix metadata only, corpus-inert): on this
+                        // error path, scan the sibling SpecificField keys for a
+                        // single close match and offer a key-token rename. The span
+                        // covers the raw key token (quotes included, from the
+                        // interned source string) so a quoted key is replaced whole.
+                        if let Some(cand) = best_suggestion(
+                            key,
+                            rules.iter().filter_map(|(rt, _)| get_rule_key(rt)),
+                        ) {
+                            let raw_len = table
+                                .with_string(leaf.key.normal, |s| s.chars().count())
+                                .unwrap_or_else(|| key.chars().count());
+                            err = err.with_fix(cwtools_parser::fix::SuggestedFix::replace(
+                                format!("Did you mean '{}'?", cand),
+                                cwtools_parser::fix::key_token_range(leaf.pos.start, raw_len),
+                                cand,
+                            ));
+                        }
+                        errors.push(err);
                     }
                 } else {
                     // An overloaded key (several rules with the same key, e.g. two

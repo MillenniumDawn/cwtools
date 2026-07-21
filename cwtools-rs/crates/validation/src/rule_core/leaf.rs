@@ -433,6 +433,10 @@ pub(super) fn validate_leaf(
             let key = table
                 .with_string(leaf.key.normal, |s| s.to_string())
                 .unwrap_or_default();
+            // No did-you-mean fix here (unlike CW262/CW263): an enum-value rename
+            // would replace the value token, but `Leaf` records no value-start
+            // position and `leaf.pos.end` absorbs trailing whitespace, so the value
+            // span can't be derived cleanly. Skipped like Task 8's CW122.
             errors.push(
                 ValidationError::from_code(
                     &error_codes::CW240_UNEXPECTED_VALUE,
