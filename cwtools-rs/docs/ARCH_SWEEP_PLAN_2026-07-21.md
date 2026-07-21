@@ -223,7 +223,7 @@ Add `pub fix: Option<SuggestedFix>` to `ValidationError` (default `None`; keep a
 - [ ] **Step 2:** Apply `key_prefix` in the unified walker's instance gate (from T11) next to `type_key_filter_matches`/`starts_with_matches`. Add a collect test: a type with `type_key_prefix` only collects prefixed keys.
 - [ ] **Step 3:** Corpus guard byte-identical (0 HOI4 uses). `cargo test -p cwtools_index -p cwtools_rules`, fmt+clippy. Commit: `index: honor type_key_prefix when collecting instances`
 
-### Task T14 (stretch): children.rs hot-path fusion [opus]
+### Task 14 (stretch): children.rs hot-path fusion [opus]
 
 **Files:**
 - Modify: `crates/validation/src/rule_core/children.rs` (~221-236, ~650-653)
