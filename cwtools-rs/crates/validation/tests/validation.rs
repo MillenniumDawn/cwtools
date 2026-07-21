@@ -251,7 +251,11 @@ types = {
         "technology".to_string(),
         vec![TypeInstance {
             name: "my_tech_alpha".to_string(),
-            location: SourceLocation { line: 1, col: 0 },
+            location: SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
             primary_loc_key: None,
         }],
     );
@@ -455,7 +459,11 @@ event = {
         "technology".to_string(),
         vec![TypeInstance {
             name: "my_tech_alpha".to_string(),
-            location: SourceLocation { line: 1, col: 0 },
+            location: SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
             primary_loc_key: None,
         }],
     );
@@ -962,7 +970,11 @@ widget = {
         "spriteType".to_string(),
         vec![TypeInstance {
             name: "GFX_my_icon".to_string(),
-            location: SourceLocation { line: 1, col: 0 },
+            location: SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
             primary_loc_key: None,
         }],
     );
@@ -1127,7 +1139,11 @@ types = {
         "technology".to_string(),
         vec![TypeInstance {
             name: "my_tech_alpha".to_string(),
-            location: SourceLocation { line: 1, col: 0 },
+            location: SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
             primary_loc_key: None,
         }],
     );

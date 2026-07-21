@@ -1813,7 +1813,11 @@ mod resolve_data_tests {
             "state".to_string(),
             vec![cwtools_info::TypeInstance {
                 name: "STATE_1".to_string(),
-                location: cwtools_info::SourceLocation { line: 1, col: 0 },
+                location: cwtools_info::SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );

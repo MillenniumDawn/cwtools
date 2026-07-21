@@ -146,7 +146,11 @@ mod tests {
             "state".to_string(),
             vec![TypeInstance {
                 name: "STATE_123".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );

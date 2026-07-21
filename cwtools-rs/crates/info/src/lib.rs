@@ -341,6 +341,7 @@ fn collect_type_ref_uses(
                     SourceLocation {
                         line: leaf.pos.start.line,
                         col: leaf.pos.start.col,
+                        end: (leaf.pos.end.line, leaf.pos.end.col),
                     },
                 ));
             }
@@ -798,6 +799,7 @@ impl InfoService {
                 .push(SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
                 });
         }
     }
@@ -816,6 +818,7 @@ impl InfoService {
                 .push(SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
                 });
         }
     }
@@ -843,6 +846,7 @@ impl InfoService {
                 location: SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
                 },
                 is_global: key == "save_global_event_target_as",
             });
@@ -872,6 +876,7 @@ impl InfoService {
                                 SourceLocation {
                                     line: script_leaf.pos.start.line,
                                     col: script_leaf.pos.start.col,
+                                    end: (script_leaf.pos.end.line, script_leaf.pos.end.col),
                                 },
                             );
                         }
@@ -889,6 +894,7 @@ impl InfoService {
                 SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
                 },
             );
         }
@@ -1136,7 +1142,11 @@ mod tests {
             "event".to_string(),
             vec![TypeInstance {
                 name: "my_event".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -1156,7 +1166,11 @@ mod tests {
             "event".to_string(),
             vec![TypeInstance {
                 name: "ev1".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -1181,7 +1195,11 @@ mod tests {
             "character".to_string(),
             vec![TypeInstance {
                 name: "GER_some_char".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -1209,7 +1227,11 @@ mod tests {
             "ai_behavior".to_string(),
             vec![TypeInstance {
                 name: "LBA_ai_behavior".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -1436,7 +1458,11 @@ alias[effect:set_temp_variable] = {
         let mut file_info = FileInfo::default();
         file_info.defined_variables.insert(
             "my_var".to_string(),
-            cwtools_index::SourceLocation { line: 1, col: 0 },
+            cwtools_index::SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
         );
         // Populate defined_variables_ns so that clear_file's refcount path fires.
         file_info.defined_variables_ns.insert(
@@ -1444,7 +1470,11 @@ alias[effect:set_temp_variable] = {
             vec![cwtools_index::DefinedVariable {
                 name: "my_var".to_string(),
                 namespace: None,
-                location: cwtools_index::SourceLocation { line: 1, col: 0 },
+                location: cwtools_index::SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 value: None,
             }],
         );

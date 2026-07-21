@@ -47,7 +47,11 @@ const MAGIC: &[u8; 4] = b"CWV\x00";
 // into `per_type` so goto-definition / find-references into base-game content
 // land in the real vanilla file. The LSP's own writer (`save_per_type`) left
 // `f` blank in v6, so those caches must rebuild to gain the source paths.
-const CACHE_VERSION: u8 = 7;
+// v8 adds the definition's end position (`CachedInstance.el`/`ec`) so a cached
+// vanilla instance carries its full extent (`SourceLocation.end`), matching
+// live-scanned instances. v7 files lack the end fields, so the rkyv layout
+// differs and they must rebuild.
+const CACHE_VERSION: u8 = 8;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CachedInstance {
@@ -61,6 +65,10 @@ struct CachedInstance {
     l: u32,
     /// start column
     c: u16,
+    /// end line
+    el: u32,
+    /// end column
+    ec: u16,
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -280,6 +288,8 @@ pub fn save(
                 f: file_uri.to_string(),
                 l: inst.location.line,
                 c: inst.location.col,
+                el: inst.location.end.0,
+                ec: inst.location.end.1,
             })
         })
         .collect();
@@ -305,6 +315,8 @@ pub fn save_per_type(
                 f: file_uri.to_string(),
                 l: inst.location.line,
                 c: inst.location.col,
+                el: inst.location.end.0,
+                ec: inst.location.end.1,
             })
         })
         .collect();
@@ -342,6 +354,7 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
                 location: SourceLocation {
                     line: ci.l,
                     col: ci.c,
+                    end: (ci.el, ci.ec),
                 },
                 // The vanilla cache doesn't store primary loc keys; hover for
                 // vanilla instances falls back to name-derived keys.
@@ -389,12 +402,20 @@ mod tests {
             vec![
                 TypeInstance {
                     name: "GFX_a".into(),
-                    location: SourceLocation { line: 2, col: 1 },
+                    location: SourceLocation {
+                        line: 2,
+                        col: 1,
+                        end: (4, 1),
+                    },
                     primary_loc_key: None,
                 },
                 TypeInstance {
                     name: "GFX_b".into(),
-                    location: SourceLocation { line: 5, col: 3 },
+                    location: SourceLocation {
+                        line: 5,
+                        col: 3,
+                        end: (9, 4),
+                    },
                     primary_loc_key: None,
                 },
             ],
@@ -420,6 +441,19 @@ mod tests {
         for (uri, _) in loaded.per_type.get("spriteType").unwrap() {
             assert_eq!(uri.as_ref(), "vanilla/x.gfx");
         }
+        // Start AND end positions survive the round trip (v8 end plumbing).
+        let sprite = loaded.per_type.get("spriteType").unwrap();
+        let by_name = |n: &str| {
+            sprite
+                .iter()
+                .find(|(_, i)| i.name.as_str() == n)
+                .map(|(_, i)| i.location)
+                .unwrap()
+        };
+        let a = by_name("GFX_a");
+        assert_eq!((a.line, a.col, a.end), (2, 1, (4, 1)));
+        let b = by_name("GFX_b");
+        assert_eq!((b.line, b.col, b.end), (5, 3, (9, 4)));
         assert_eq!(loaded.loc_keys.len(), 1);
         assert_eq!(loaded.loc_keys[0].0, "english");
         assert_eq!(loaded.file_paths, vec!["gfx/interface/icon.dds"]);
@@ -446,7 +480,11 @@ mod tests {
                 Arc::from("/game/events/base.txt"),
                 TypeInstance {
                     name: "base.1".into(),
-                    location: SourceLocation { line: 7, col: 0 },
+                    location: SourceLocation {
+                        line: 7,
+                        col: 0,
+                        end: (12, 1),
+                    },
                     primary_loc_key: None,
                 },
             )],
@@ -464,6 +502,7 @@ mod tests {
             "source file must round-trip, not fall back to empty"
         );
         assert_eq!(insts[0].1.location.line, 7);
+        assert_eq!(insts[0].1.location.end, (12, 1));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -474,6 +513,21 @@ mod tests {
         std::fs::write(&path, r#"{"version":3,"game":"hoi4","instances":[]}"#).unwrap();
         let err = load(&path).unwrap_err();
         assert!(err.to_string().contains("not a vanilla cache file"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stale_version_cache_is_rejected() {
+        // A cache written with the current framing but a prior version byte must
+        // fail the version check (rebuilt), never be misread under the new layout.
+        let idx = TypeIndex::new();
+        let path = std::env::temp_dir().join("cwtools_vanilla_cache_stale_version.cwv");
+        save(&idx, "hoi4", "vfp", &path, VanillaCacheAux::default()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[MAGIC.len()] = CACHE_VERSION - 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let err = load(&path).unwrap_err();
+        assert!(err.to_string().contains("unsupported"));
         let _ = std::fs::remove_file(&path);
     }
 

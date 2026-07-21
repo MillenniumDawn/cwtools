@@ -832,6 +832,7 @@ fn scan_ast_for_type_ref(
                 cwtools_info::SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
                 },
             ));
         }

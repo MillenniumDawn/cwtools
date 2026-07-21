@@ -1,7 +1,7 @@
 //! Rule-driven variable / value_set collection: gathering defined variable names
 //! (and their values) from parsed files.
 
-use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
+use cwtools_parser::ast::{Arena, Child, ParsedFile, SourceRange, Value};
 use cwtools_rules::rules_types::{NewField, RuleSet, RuleType};
 use cwtools_string_table::string_table::StringTable;
 use std::collections::{HashMap, HashSet};
@@ -115,6 +115,7 @@ fn collect_at_vars(
                         location: SourceLocation {
                             line: leaf.pos.start.line,
                             col: leaf.pos.start.col,
+                            end: (leaf.pos.end.line, leaf.pos.end.col),
                         },
                         value: (!value.is_empty()).then_some(value),
                     });
@@ -192,6 +193,7 @@ fn scan_children_for_varset(
                             location: SourceLocation {
                                 line: kc.pos.start.line,
                                 col: kc.pos.start.col,
+                                end: (kc.pos.end.line, kc.pos.end.col),
                             },
                             value: None,
                         });
@@ -245,6 +247,7 @@ fn scan_children_for_varset(
                                 location: SourceLocation {
                                     line: leaf.pos.start.line,
                                     col: leaf.pos.start.col,
+                                    end: (leaf.pos.end.line, leaf.pos.end.col),
                                 },
                                 value: (!val.is_empty()).then(|| val.clone()),
                             });
@@ -267,6 +270,7 @@ fn scan_children_for_varset(
                                     location: SourceLocation {
                                         line: leaf.pos.start.line,
                                         col: leaf.pos.start.col,
+                                        end: (leaf.pos.end.line, leaf.pos.end.col),
                                     },
                                     value: sibling_value
                                         .get_or_init(|| {
@@ -297,6 +301,7 @@ fn scan_children_for_varset(
                                     location: SourceLocation {
                                         line: lv.pos.start.line,
                                         col: lv.pos.start.col,
+                                        end: (lv.pos.end.line, lv.pos.end.col),
                                     },
                                     value: None,
                                 });
@@ -370,11 +375,15 @@ pub fn collect_set_variable_defs(
     effects: &HashSet<String>,
     out: &mut Vec<DefinedVariable>,
 ) {
-    fn def(name: String, value: Option<String>, line: u32, col: u16) -> DefinedVariable {
+    fn def(name: String, value: Option<String>, pos: SourceRange) -> DefinedVariable {
         DefinedVariable {
             name,
             namespace: Some("variable".to_string()),
-            location: SourceLocation { line, col },
+            location: SourceLocation {
+                line: pos.start.line,
+                col: pos.start.col,
+                end: (pos.end.line, pos.end.col),
+            },
             value,
         }
     }
@@ -400,12 +409,7 @@ pub fn collect_set_variable_defs(
                 if is_var_key {
                     let v = leaf_value_string(&leaf.value, table);
                     if !v.is_empty() {
-                        out.push(def(
-                            v,
-                            sibling_value.clone(),
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                        ));
+                        out.push(def(v, sibling_value.clone(), leaf.pos));
                     }
                     explicit = true;
                 }
@@ -417,17 +421,12 @@ pub fn collect_set_variable_defs(
         // Shorthand form: the inner assignment key is the variable name and its
         // RHS (if a leaf) is the assigned value.
         for child in children {
-            let (key, value, line, col) = match child {
+            let (key, value, pos) = match child {
                 Child::Leaf(li) => {
                     let leaf = &arena.leaves[*li as usize];
                     let k = get_string_or_empty(table, leaf.key.normal);
                     let v = leaf_value_string(&leaf.value, table);
-                    (
-                        k,
-                        (!v.is_empty()).then_some(v),
-                        leaf.pos.start.line,
-                        leaf.pos.start.col,
-                    )
+                    (k, (!v.is_empty()).then_some(v), leaf.pos)
                 }
                 _ => continue,
             };
@@ -435,7 +434,7 @@ pub fn collect_set_variable_defs(
             // Case-insensitive compare without allocating a lowercased copy of the
             // key just to probe the skip-list (paradox keys are ASCII).
             if !SKIP_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k)) {
-                out.push(def(key, value, line, col));
+                out.push(def(key, value, pos));
             }
         }
     }

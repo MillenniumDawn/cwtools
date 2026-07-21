@@ -144,6 +144,7 @@ fn walk_skip_root_child<V>(
     let location = SourceLocation {
         line: kc.pos.start.line,
         col: kc.pos.start.col,
+        end: (kc.pos.end.line, kc.pos.end.col),
     };
 
     table.with_string(kc.key.normal, |key| match skip_stack {
@@ -281,7 +282,15 @@ pub fn collect_type_instances(
                 .to_string();
             instances.push(TypeInstance {
                 name,
-                location: SourceLocation { line: 1, col: 0 },
+                // The file itself is the instance: no single node span is the
+                // definition, so a deliberately degenerate span marks it rather
+                // than borrowing some root child's range (root_children IS in
+                // scope, but any node's range would be a fabrication here).
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 // type_per_file types have no node body to read a field from.
                 primary_loc_key: None,
             });
@@ -470,5 +479,34 @@ mod tests {
 
         let result = collect_type_instances(&rs, &parsed, "common/things/00_things.txt", &table);
         assert_eq!(names(&result, "thing"), vec!["MY_thing", "NOPE_thing"]);
+    }
+
+    // An instance's location spans its whole definition: the start is the key,
+    // the end is the spot just past the closing brace (the parser's
+    // `SourceRange.end`). Cleanup features (rename/delete a definition) need the
+    // full extent, so a multi-line clause must record an end on the brace's line.
+    #[test]
+    fn instance_location_end_is_closing_brace() {
+        // `}` is the last char, on line 3 col 0; the range end lands one past it.
+        let source = "thing_a = {\n    x = 1\n}";
+        let table = StringTable::new();
+        let parsed = parse_string(source, &table).unwrap();
+
+        let rs = ruleset_with(type_def("thing", "common/things"));
+        let result = collect_type_instances(&rs, &parsed, "common/things/00_things.txt", &table);
+
+        let inst = &result.get("thing").expect("thing instances")[0];
+        assert_eq!(inst.name, "thing_a");
+        assert_eq!((inst.location.line, inst.location.col), (1, 0));
+        assert_eq!(
+            inst.location.end,
+            (3, 1),
+            "end must point just past the closing brace on line 3"
+        );
+        assert_ne!(
+            (inst.location.line, inst.location.col),
+            inst.location.end,
+            "a multi-line definition has a non-degenerate span"
+        );
     }
 }

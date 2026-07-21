@@ -699,7 +699,11 @@ mod tests {
                 .or_default()
                 .push(TypeInstance {
                     name: (*name).to_string(),
-                    location: SourceLocation { line: 0, col: 0 },
+                    location: SourceLocation {
+                        line: 0,
+                        col: 0,
+                        end: (0, 0),
+                    },
                     primary_loc_key: None,
                 });
         }

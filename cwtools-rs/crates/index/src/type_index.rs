@@ -560,7 +560,11 @@ mod tests {
             "event".to_string(),
             vec![TypeInstance {
                 name: "GER_some.1".to_string(),
-                location: SourceLocation { line: 7, col: 4 },
+                location: SourceLocation {
+                    line: 7,
+                    col: 4,
+                    end: (7, 4),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -611,7 +615,11 @@ mod tests {
             "ln".to_string(),
             vec![TypeInstance {
                 name: "Education_Dynamic_Modifier".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -636,7 +644,11 @@ mod tests {
     fn inst(name: &str, line: u32) -> TypeInstance {
         TypeInstance {
             name: name.to_string(),
-            location: SourceLocation { line, col: 0 },
+            location: SourceLocation {
+                line,
+                col: 0,
+                end: (line, 0),
+            },
             primary_loc_key: None,
         }
     }
