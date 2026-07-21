@@ -260,7 +260,7 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
     if let Some(&existing_lower) = inner.lower_map.get(lower_key.as_str()) {
         debug_assert!(
             inner.next_id < u32::MAX,
-            "StringTable id space exhausted (would collide with StringId::NULL)"
+            "StringTable id space exhausted (u32::MAX is reserved)"
         );
         let normal_id = inner.next_id;
         inner.next_id += 1;
@@ -277,7 +277,7 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
     // Slow path: brand‑new lower key.
     debug_assert!(
         inner.next_id < u32::MAX - 1,
-        "StringTable id space exhausted (would collide with StringId::NULL)"
+        "StringTable id space exhausted (u32::MAX is reserved)"
     );
     let normal_id = inner.next_id;
     let lower_id = normal_id + 1;

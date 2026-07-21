@@ -387,7 +387,7 @@ impl Backend {
         // cache) and persisting the cache are pure functions over the
         // lock-guarded string-table interner, so they run in parallel across
         // files exactly as the driver parallelizes the same work. Indexing
-        // mutates the shared symbol/info indexes, so it stays serial and in the
+        // mutates the shared info index, so it stays serial and in the
         // original file order — the merge order is observable (goto-def "first
         // match", duplicate-name refcounts), and the cache-hit/miss tally must
         // match the sequential version.

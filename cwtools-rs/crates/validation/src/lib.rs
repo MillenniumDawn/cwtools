@@ -39,7 +39,7 @@ use scope::build_scope_registry;
 /// `skip_tail` is the remaining skip-stack after the level that led here was
 /// consumed.  When non-empty each grandchild that matches the next level is
 /// itself a skip wrapper and we recurse rather than validate directly (mirrors
-/// the indexer's `[head, tail..]` descent in `collect_skip_root_child`).
+/// the indexer's `[head, tail..]` descent in `walk_skip_root_child`).
 #[allow(clippy::too_many_arguments)]
 fn validate_wrapper_grandchildren(
     ctx: &ValidationCtx,

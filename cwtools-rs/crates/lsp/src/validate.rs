@@ -367,7 +367,7 @@ impl Backend {
         }
     }
 
-    /// Index an already-parsed AST into the symbol + info indexes. Extracted
+    /// Index an already-parsed AST into the info index. Extracted
     /// from `index_document` so the workspace scan can index cache-hit ASTs
     /// without re-parsing.
     pub(crate) fn index_parsed_file(&self, uri: &str, parsed: &ParsedFile) {
