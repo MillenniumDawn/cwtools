@@ -132,6 +132,20 @@ enum Commands {
     Loc {
         /// Directory containing localisation .yml files
         directory: PathBuf,
+        /// Report format: cli (default, grouped text), csv, or json.
+        #[arg(long, default_value = "cli")]
+        report_type: String,
+        /// Write the report to this file instead of stdout.
+        #[arg(long)]
+        output_file: Option<PathBuf>,
+        /// Suppress diagnostics whose hash is listed in this file (one hash per
+        /// line). Lets you baseline known/accepted diagnostics and see only new ones.
+        #[arg(long)]
+        ignore_hashes: Option<PathBuf>,
+        /// Write the surviving diagnostics' hashes (one per line) to this file, to
+        /// use later with --ignore-hashes.
+        #[arg(long)]
+        output_hashes: Option<PathBuf>,
     },
     /// Apply machine-applicable fixes for the curated fixable diagnostics.
     /// Dry-run by default (prints a unified-diff preview); pass `--apply` to write.
@@ -317,6 +331,38 @@ fn validation_to_diag(file: &str, err: ValidationError) -> Diag {
         code,
         message: err.message,
         line: err.line,
+        hash,
+    }
+}
+
+/// Map a `LocDiagnostic` to a report `Diag`, computing its hash. Consumes the
+/// diagnostic (moves file/message). The `fix` field is deliberately dropped,
+/// same as `validation_to_diag`.
+fn loc_diagnostic_to_diag(d: cwtools_localization::LocDiagnostic) -> Diag {
+    let line = d.line as u32;
+    let code = d.code.to_string();
+    let hash = diag_hash(&d.file, &code, &d.message, line);
+    Diag {
+        file: d.file,
+        severity: d.severity,
+        code,
+        message: d.message,
+        line,
+        hash,
+    }
+}
+
+/// Map a `LocService` fatal parse error (a file that couldn't even be
+/// lenient-parsed, so there's no line number) to a report `Diag`. Always
+/// Error-severity; `line` is 0 like other whole-file diagnostics.
+fn loc_parse_error_to_diag(file: String, message: String) -> Diag {
+    let hash = diag_hash(&file, "", &message, 0);
+    Diag {
+        file,
+        severity: ErrorSeverity::Error,
+        code: String::new(),
+        message,
+        line: 0,
         hash,
     }
 }
@@ -754,21 +800,11 @@ fn main() {
                 if !d.file.starts_with(&dir_prefix) {
                     continue;
                 }
-                let severity = d.severity;
-                let line = d.line as u32;
-                let code = d.code.to_string();
-                let hash = diag_hash(&d.file, &code, &d.message, line);
-                if ignored.contains(&hash) {
+                let d = loc_diagnostic_to_diag(d);
+                if ignored.contains(&d.hash) {
                     continue;
                 }
-                diags.push(Diag {
-                    file: d.file,
-                    severity,
-                    code,
-                    message: d.message,
-                    line,
-                    hash,
-                });
+                diags.push(d);
             }
             tlog!("validate-loc");
 
@@ -947,7 +983,13 @@ fn main() {
                 }
             }
         }
-        Commands::Loc { directory } => {
+        Commands::Loc {
+            directory,
+            report_type,
+            output_file,
+            ignore_hashes,
+            output_hashes,
+        } => {
             use cwtools_localization::{LocService, validate_loc_project};
 
             println!("Scanning localisation in {}", directory.display());
@@ -955,33 +997,39 @@ fn main() {
 
             let total_entries: usize = service.files().iter().map(|f| f.entries.len()).sum();
 
+            // Load the ignore-hash baseline, if given. Same placement as
+            // `validate`: diagnostics are dropped before the report is
+            // rendered and before they're counted for the exit code.
+            let ignored: std::collections::HashSet<String> = ignore_hashes
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| {
+                    s.lines()
+                        .map(|l| l.trim().to_string())
+                        .filter(|l| !l.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Standalone loc lint uses the scope-independent checks (CW225 etc.);
             // scope-aware command checks need the referencing config's scope.
-            let diags = validate_loc_project(&service);
+            let diags: Vec<Diag> = validate_loc_project(&service)
+                .into_iter()
+                .map(loc_diagnostic_to_diag)
+                .filter(|d| !ignored.contains(&d.hash))
+                .collect();
 
-            // Surface parse failures too.
-            let parse_errors = service.errors();
-
-            let mut by_file: std::collections::BTreeMap<String, Vec<_>> =
-                std::collections::BTreeMap::new();
-            for d in &diags {
-                by_file.entry(d.file.clone()).or_default().push(d);
-            }
-            for (file, ds) in &by_file {
-                println!("\n  {} — {} issues:", file, ds.len());
-                for d in ds {
-                    println!("    [line {}] {}: {}", d.line, d.code, d.message);
-                }
-            }
-            for (p, e) in parse_errors {
-                println!("\n  {} — PARSE ERROR: {}", p, e);
-            }
+            // Surface parse failures too (files that couldn't even be
+            // lenient-parsed), kept separate from `diags` since they carry no
+            // line/code and get their own text-report line below.
+            let parse_errors: Vec<Diag> = service
+                .errors()
+                .iter()
+                .map(|(file, message)| loc_parse_error_to_diag(file.clone(), message.clone()))
+                .filter(|d| !ignored.contains(&d.hash))
+                .collect();
 
             let total_issues = diags.len() + parse_errors.len();
-            println!(
-                "\nLoc validation complete: {} entries, {} issues",
-                total_entries, total_issues
-            );
             // Severity-aware like `validate`: a parse failure is always an
             // error; a lint diagnostic only counts if it's Error-severity, so
             // e.g. Information-severity CW234 placeholders don't fail CI.
@@ -990,7 +1038,93 @@ fn main() {
                 .filter(|d| d.severity == ErrorSeverity::Error)
                 .count()
                 + parse_errors.len();
-            let code = exit_code(total_errors, false, false);
+
+            // Render the report in the requested format. The `cli` default
+            // reproduces the original hand-rolled text report byte-for-byte;
+            // csv/json reuse the same row helpers `validate` uses.
+            let mut out = String::new();
+            match report_type.as_str() {
+                "csv" => {
+                    out.push_str("file,line,severity,code,message,hash\n");
+                    for d in diags.iter().chain(parse_errors.iter()) {
+                        out.push_str(&csv_row(d));
+                    }
+                }
+                "json" => {
+                    let all: Vec<&Diag> = diags.iter().chain(parse_errors.iter()).collect();
+                    out.push_str("[\n");
+                    for (i, d) in all.iter().enumerate() {
+                        out.push_str(&json_row(d, i + 1 >= all.len()));
+                    }
+                    out.push_str("]\n");
+                }
+                _ => {
+                    let mut by_file: std::collections::BTreeMap<String, Vec<&Diag>> =
+                        std::collections::BTreeMap::new();
+                    for d in &diags {
+                        by_file.entry(d.file.clone()).or_default().push(d);
+                    }
+                    for (file, ds) in &by_file {
+                        out.push_str(&format!("\n  {} — {} issues:\n", file, ds.len()));
+                        for d in ds {
+                            out.push_str(&format!(
+                                "    [line {}] {}: {}\n",
+                                d.line, d.code, d.message
+                            ));
+                        }
+                    }
+                    for d in &parse_errors {
+                        out.push_str(&format!("\n  {} — PARSE ERROR: {}\n", d.file, d.message));
+                    }
+                    out.push_str(&format!(
+                        "\nLoc validation complete: {} entries, {} issues\n",
+                        total_entries, total_issues
+                    ));
+                }
+            }
+
+            let write_failed = match &output_file {
+                Some(p) => {
+                    if let Err(e) = std::fs::write(p, &out) {
+                        eprintln!("Error writing report {}: {}", p.display(), e);
+                        true
+                    } else {
+                        println!(
+                            "Wrote {} report ({} issues) to {}",
+                            report_type,
+                            total_issues,
+                            p.display()
+                        );
+                        false
+                    }
+                }
+                None => {
+                    print!("{}", out);
+                    false
+                }
+            };
+
+            // Write the surviving hashes for use as a future baseline.
+            if let Some(p) = &output_hashes {
+                let mut hashes: Vec<&str> = diags
+                    .iter()
+                    .chain(parse_errors.iter())
+                    .map(|d| d.hash.as_str())
+                    .collect();
+                hashes.sort_unstable();
+                hashes.dedup();
+                if let Err(e) = std::fs::write(p, hashes.join("\n")) {
+                    eprintln!("Error writing hashes {}: {}", p.display(), e);
+                } else {
+                    println!(
+                        "Wrote {} diagnostic hashes to {}",
+                        hashes.len(),
+                        p.display()
+                    );
+                }
+            }
+
+            let code = exit_code(total_errors, false, write_failed);
             if code != 0 {
                 std::process::exit(code);
             }

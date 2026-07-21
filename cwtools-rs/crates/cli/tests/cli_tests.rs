@@ -399,6 +399,132 @@ fn test_loc_empty_directory() {
         .stdout(predicate::str::contains("0 entries"));
 }
 
+#[test]
+fn test_loc_default_report_type_matches_explicit_cli() {
+    // The default (no --report-type) must render exactly like --report-type
+    // cli, byte for byte — report/hash parity must not touch the default path.
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    let default_out = cwtools()
+        .args(["loc", loc_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let explicit_out = cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--report-type", "cli"])
+        .output()
+        .unwrap();
+    assert_eq!(default_out.stdout, explicit_out.stdout);
+    assert_eq!(default_out.status.code(), explicit_out.status.code());
+}
+
+#[test]
+fn test_loc_json_report() {
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--report-type", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"CW268\""))
+        .stdout(predicate::str::contains("\"hash\":"));
+}
+
+#[test]
+fn test_loc_csv_report() {
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--report-type", "csv"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "file,line,severity,code,message,hash",
+        ))
+        .stdout(predicate::str::contains("CW268"));
+}
+
+#[test]
+fn test_loc_output_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let report = tmp.path().join("report.txt");
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--output-file",
+            report.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let contents = std::fs::read_to_string(&report).unwrap();
+    assert!(contents.contains("CW268"));
+}
+
+#[test]
+fn test_loc_hash_write_and_ignore_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hashes = tmp.path().join("hashes.txt");
+    let loc_dir = fixtures_dir().join("loc_invalid");
+
+    // First run: exits 0 (CW268 is Warning-severity) and writes the baseline.
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--output-hashes",
+            hashes.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW268"));
+    let baseline = std::fs::read_to_string(&hashes).unwrap();
+    assert_eq!(baseline.lines().count(), 1, "one surviving diagnostic hash");
+
+    // Second run with that baseline as --ignore-hashes: the diagnostic is
+    // suppressed from the report entirely.
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--ignore-hashes",
+            hashes.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW268").not())
+        .stdout(predicate::str::contains("0 issues"));
+}
+
+#[test]
+fn test_loc_ignore_hashes_filters_error_before_exit_code() {
+    // CW225 (undefined loc reference) is Error-severity and normally fails
+    // the run. Baselining its hash must suppress it from BOTH the report and
+    // the exit-code count, same placement as `validate`.
+    let tmp = tempfile::tempdir().unwrap();
+    let hashes = tmp.path().join("hashes.txt");
+    let loc_dir = fixtures_dir().join("loc_error");
+
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--output-hashes",
+            hashes.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW225"));
+
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--ignore-hashes",
+            hashes.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW225").not());
+}
+
 // ── Fix ──────────────────────────────────────────────────────────────────────
 
 /// A temp mod with one `common/` file carrying an empty `if` (CW121, fixable).
