@@ -231,6 +231,93 @@ fn test_validate_csv_report() {
 }
 
 #[test]
+fn test_validate_loc_language_valid_accepted() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--loc-language",
+            "english",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Validation complete"));
+}
+
+#[test]
+fn test_validate_loc_language_unknown_fails() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--loc-language",
+            "klingon",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid language 'klingon'"))
+        .stderr(predicate::str::contains("english"));
+}
+
+#[test]
+fn test_validate_min_severity_filters_lower_severities() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    // mod_a's event triggers an Information-severity CW107; --min-severity
+    // error should drop it from the report.
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--min-severity",
+            "error",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW107").not());
+}
+
+#[test]
+fn test_validate_min_severity_unknown_fails() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--min-severity",
+            "bogus",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid severity 'bogus'"));
+}
+
+#[test]
 fn test_validate_output_file() {
     let tmp = tempfile::tempdir().unwrap();
     let report = tmp.path().join("report.txt");
@@ -268,14 +355,38 @@ fn test_loc_valid_directory() {
 
 #[test]
 fn test_loc_detects_unterminated_quote() {
+    // CW268 is Warning-severity, so this now exits 0 (severity-aware exit,
+    // like `validate`) even though the issue is still reported.
     let loc_dir = fixtures_dir().join("loc_invalid");
     cwtools()
         .args(["loc", loc_dir.to_str().unwrap()])
         .assert()
-        .failure()
+        .success()
         .stdout(predicate::str::contains("CW268"))
         .stdout(predicate::str::contains("missing_quote"))
         .stdout(predicate::str::contains("1 issues"));
+}
+
+#[test]
+fn test_loc_information_only_succeeds() {
+    // CW234 (REPLACE_ME placeholder) is Information-severity; exit 0.
+    let loc_dir = fixtures_dir().join("loc_info_only");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW234"));
+}
+
+#[test]
+fn test_loc_error_severity_fails() {
+    // CW225 (undefined loc reference) is Error-severity; exit 1 unchanged.
+    let loc_dir = fixtures_dir().join("loc_error");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW225"));
 }
 
 #[test]
@@ -286,6 +397,229 @@ fn test_loc_empty_directory() {
         .assert()
         .success()
         .stdout(predicate::str::contains("0 entries"));
+}
+
+#[test]
+fn test_loc_default_report_type_matches_explicit_cli() {
+    // The default (no --report-type) must render exactly like --report-type
+    // cli, byte for byte — report/hash parity must not touch the default path.
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    let default_out = cwtools()
+        .args(["loc", loc_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let explicit_out = cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--report-type", "cli"])
+        .output()
+        .unwrap();
+    assert_eq!(default_out.stdout, explicit_out.stdout);
+    assert_eq!(default_out.status.code(), explicit_out.status.code());
+}
+
+#[test]
+fn test_loc_json_report() {
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--report-type", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"code\":\"CW268\""))
+        .stdout(predicate::str::contains("\"hash\":"));
+}
+
+#[test]
+fn test_loc_csv_report() {
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--report-type", "csv"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "file,line,severity,code,message,hash",
+        ))
+        .stdout(predicate::str::contains("CW268"));
+}
+
+#[test]
+fn test_loc_output_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let report = tmp.path().join("report.txt");
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--output-file",
+            report.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let contents = std::fs::read_to_string(&report).unwrap();
+    assert!(contents.contains("CW268"));
+}
+
+#[test]
+fn test_loc_hash_write_and_ignore_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hashes = tmp.path().join("hashes.txt");
+    let loc_dir = fixtures_dir().join("loc_invalid");
+
+    // First run: exits 0 (CW268 is Warning-severity) and writes the baseline.
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--output-hashes",
+            hashes.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW268"));
+    let baseline = std::fs::read_to_string(&hashes).unwrap();
+    assert_eq!(baseline.lines().count(), 1, "one surviving diagnostic hash");
+
+    // Second run with that baseline as --ignore-hashes: the diagnostic is
+    // suppressed from the report entirely.
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--ignore-hashes",
+            hashes.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW268").not())
+        .stdout(predicate::str::contains("0 issues"));
+}
+
+#[test]
+fn test_loc_ignore_hashes_filters_error_before_exit_code() {
+    // CW225 (undefined loc reference) is Error-severity and normally fails
+    // the run. Baselining its hash must suppress it from BOTH the report and
+    // the exit-code count, same placement as `validate`.
+    let tmp = tempfile::tempdir().unwrap();
+    let hashes = tmp.path().join("hashes.txt");
+    let loc_dir = fixtures_dir().join("loc_error");
+
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--output-hashes",
+            hashes.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW225"));
+
+    cwtools()
+        .args([
+            "loc",
+            loc_dir.to_str().unwrap(),
+            "--ignore-hashes",
+            hashes.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW225").not());
+}
+
+// ── Fix ──────────────────────────────────────────────────────────────────────
+
+/// A temp mod with one `common/` file carrying an empty `if` (CW121, fixable).
+fn fix_mod() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let common = tmp.path().join("common");
+    std::fs::create_dir_all(&common).unwrap();
+    std::fs::write(common.join("hint.txt"), "x = { if = { } }\n").unwrap();
+    tmp
+}
+
+#[test]
+fn test_fix_dry_run_previews_without_writing() {
+    let tmp = fix_mod();
+    let rules_dir = fixtures_dir().join("rules");
+    let file = tmp.path().join("common").join("hint.txt");
+    cwtools()
+        .args([
+            "fix",
+            "--game",
+            "stellaris",
+            "--directory",
+            tmp.path().to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run"))
+        .stdout(predicate::str::contains("@@"));
+    // Dry run must not touch the file.
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "x = { if = { } }\n"
+    );
+}
+
+#[test]
+fn test_fix_apply_writes_and_is_idempotent() {
+    let tmp = fix_mod();
+    let rules_dir = fixtures_dir().join("rules");
+    let file = tmp.path().join("common").join("hint.txt");
+    cwtools()
+        .args([
+            "fix",
+            "--game",
+            "stellaris",
+            "--directory",
+            tmp.path().to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--apply",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Applied"));
+    // The empty if is gone.
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(after, "x = { }\n", "empty if should be removed");
+    // A second run finds nothing left to fix.
+    cwtools()
+        .args([
+            "fix",
+            "--game",
+            "stellaris",
+            "--directory",
+            tmp.path().to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 fix(es)"));
+}
+
+#[test]
+fn test_fix_code_filter_excludes_unmatched() {
+    let tmp = fix_mod();
+    let rules_dir = fixtures_dir().join("rules");
+    // Filtering to a code that isn't present leaves nothing to fix.
+    cwtools()
+        .args([
+            "fix",
+            "--game",
+            "stellaris",
+            "--directory",
+            tmp.path().to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--code",
+            "CW999",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 fix(es)"));
 }
 
 // ── Error handling ───────────────────────────────────────────────────────────

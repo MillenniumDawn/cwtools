@@ -2,6 +2,7 @@ use super::common::{as_block, walk_blocks};
 use crate::{ErrorSeverity, ValidationError, error_codes};
 use cwtools_index::TypeIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
+use cwtools_parser::fix::{SuggestedFix, key_token_range};
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 
@@ -132,13 +133,24 @@ fn walk_if_else(
 
         // CW253 — deprecated set_empire_name / set_planet_name.
         if key == "set_empire_name" || key == "set_planet_name" {
-            errors.push(ValidationError::from_code(
-                &error_codes::CW253_DEPRECATED_SET_NAME,
-                file_path,
-                line,
-                col,
-                &[],
-            ));
+            // Fix: rename just the key token to `set_name` (the block body is
+            // unchanged). Span covers the key on its start line.
+            let fix = SuggestedFix::replace(
+                "Rename to set_name",
+                key_token_range(block.range.start, key.chars().count()),
+                "set_name",
+            );
+            errors.push(
+                ValidationError::from_code(
+                    &error_codes::CW253_DEPRECATED_SET_NAME,
+                    file_path,
+                    line,
+                    col,
+                    &[],
+                )
+                .with_fix(fix)
+                .with_end(block.range.end),
+            );
         }
 
         if key != "limit" && key != "modifier" {
@@ -152,24 +164,30 @@ fn walk_if_else(
 
             // CW236 — old nested if/else style.
             if deprecated_else {
-                errors.push(ValidationError::from_code(
-                    &error_codes::CW236_DEPRECATED_ELSE,
-                    file_path,
-                    line,
-                    col,
-                    &[],
-                ));
+                errors.push(
+                    ValidationError::from_code(
+                        &error_codes::CW236_DEPRECATED_ELSE,
+                        file_path,
+                        line,
+                        col,
+                        &[],
+                    )
+                    .with_end(block.range.end),
+                );
             }
 
             // CW237 — ambiguous if = { if ... else }.
             if key == "if" && has_else && has_if {
-                errors.push(ValidationError::from_code(
-                    &error_codes::CW237_AMBIGUOUS_IF_ELSE,
-                    file_path,
-                    line,
-                    col,
-                    &[],
-                ));
+                errors.push(
+                    ValidationError::from_code(
+                        &error_codes::CW237_AMBIGUOUS_IF_ELSE,
+                        file_path,
+                        line,
+                        col,
+                        &[],
+                    )
+                    .with_end(block.range.end),
+                );
             }
 
             // CW238 — else/else_if missing a preceding if (skip the deprecated case).
@@ -185,13 +203,16 @@ fn walk_if_else(
                         prev_was_if = true;
                     } else {
                         // else / else_if with no preceding if.
-                        errors.push(ValidationError::from_code(
-                            &error_codes::CW238_IF_ELSE_ORDER,
-                            file_path,
-                            line,
-                            col,
-                            &[],
-                        ));
+                        errors.push(
+                            ValidationError::from_code(
+                                &error_codes::CW238_IF_ELSE_ORDER,
+                                file_path,
+                                line,
+                                col,
+                                &[],
+                            )
+                            .with_end(block.range.end),
+                        );
                         break;
                     }
                 }
@@ -294,13 +315,16 @@ fn flag_pretriggers(
         let leaf_key = table.get_string(leaf.key.lower).unwrap_or_default();
         if pretriggers.contains(&leaf_key) {
             let code = &error_codes::CW120_POSSIBLE_PRETRIGGER;
-            errors.push(ValidationError::from_code(
-                code,
-                file_path,
-                leaf.pos.start.line,
-                leaf.pos.start.col,
-                &[&leaf_key],
-            ));
+            errors.push(
+                ValidationError::from_code(
+                    code,
+                    file_path,
+                    leaf.pos.start.line,
+                    leaf.pos.start.col,
+                    &[&leaf_key],
+                )
+                .with_end(leaf.pos.end),
+            );
         }
     }
 }
@@ -399,13 +423,16 @@ fn validate_ship_designs(
             {
                 continue;
             }
-            errors.push(ValidationError::from_code(
-                code,
-                file_path,
-                gc_block.range.start.line,
-                gc_block.range.start.col,
-                &[&template],
-            ));
+            errors.push(
+                ValidationError::from_code(
+                    code,
+                    file_path,
+                    gc_block.range.start.line,
+                    gc_block.range.start.col,
+                    &[&template],
+                )
+                .with_end(gc_block.range.end),
+            );
         }
     }
 }
@@ -477,26 +504,32 @@ fn walk_research_leaders(
             match child_scalar(block.children, ast, table, "area") {
                 None => {
                     let code = &error_codes::CW108_RESEARCH_LEADER_AREA;
-                    errors.push(ValidationError::from_code(
-                        code,
-                        file_path,
-                        block.range.start.line,
-                        block.range.start.col,
-                        &[],
-                    ));
+                    errors.push(
+                        ValidationError::from_code(
+                            code,
+                            file_path,
+                            block.range.start.line,
+                            block.range.start.col,
+                            &[],
+                        )
+                        .with_end(block.range.end),
+                    );
                 }
                 Some(leader_area)
                     if !tech_area.is_empty() && !leader_area.eq_ignore_ascii_case(tech_area) =>
                 {
                     // F# swapped these args (tech first); ours is leader-then-tech.
                     let code = &error_codes::CW109_RESEARCH_LEADER_TECH;
-                    errors.push(ValidationError::from_code(
-                        code,
-                        file_path,
-                        block.range.start.line,
-                        block.range.start.col,
-                        &[&leader_area, tech_area],
-                    ));
+                    errors.push(
+                        ValidationError::from_code(
+                            code,
+                            file_path,
+                            block.range.start.line,
+                            block.range.start.col,
+                            &[&leader_area, tech_area],
+                        )
+                        .with_end(block.range.end),
+                    );
                 }
                 _ => {}
             }
@@ -666,7 +699,11 @@ mod tests {
                 .or_default()
                 .push(TypeInstance {
                     name: (*name).to_string(),
-                    location: SourceLocation { line: 0, col: 0 },
+                    location: SourceLocation {
+                        line: 0,
+                        col: 0,
+                        end: (0, 0),
+                    },
                     primary_loc_key: None,
                 });
         }
@@ -694,6 +731,41 @@ mod tests {
 
     fn has_code(codes: &[(String, u32, u16)], code: &str) -> bool {
         codes.iter().any(|(c, _, _)| c == code)
+    }
+
+    #[test]
+    fn cw253_fix_renames_key_to_set_name() {
+        use cwtools_parser::fix::apply_edits;
+        let src = "set_empire_name = { key = \"NAME\" }\n";
+        let table = StringTable::new();
+        let ast = parse_string(src, &table).unwrap();
+        let ruleset = RuleSet::new();
+        let mut errors = Vec::new();
+        validate_stellaris(&ast, &ruleset, &table, "events/test.txt", None, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW253"))
+            .expect("CW253 emitted");
+        let fix = err.fix.as_ref().expect("CW253 carries a fix");
+        let fixed = apply_edits(src, &fix.edits);
+        assert_eq!(fixed, "set_name = { key = \"NAME\" }\n");
+
+        // Revalidation of the fixed text no longer emits CW253.
+        let ast2 = parse_string(&fixed, &table).unwrap();
+        let mut errors2 = Vec::new();
+        validate_stellaris(
+            &ast2,
+            &ruleset,
+            &table,
+            "events/test.txt",
+            None,
+            &mut errors2,
+        );
+        assert!(
+            !errors2.iter().any(|e| e.code == Some("CW253")),
+            "CW253 must be gone after applying the fix"
+        );
     }
 
     fn count_code(codes: &[(String, u32, u16)], code: &str) -> usize {

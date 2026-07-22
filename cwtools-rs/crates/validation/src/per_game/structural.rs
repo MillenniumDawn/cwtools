@@ -14,6 +14,7 @@ use super::common::as_block;
 use crate::{ValidationError, error_codes};
 use cwtools_game::constants::Game;
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
+use cwtools_parser::fix::SuggestedFix;
 use cwtools_string_table::string_table::{StringId, StringTable};
 
 /// The implicit boolean context a node sits in, mirroring F#'s `BoolState`.
@@ -95,14 +96,27 @@ fn push(
     r: SourceRange,
     file: &str,
 ) {
-    errors.push(ValidationError::from_code_with(
-        code,
-        code.severity,
-        file,
-        r.start.line,
-        r.start.col,
-        msg,
-    ));
+    errors.push(
+        ValidationError::from_code_with(code, code.severity, file, r.start.line, r.start.col, msg)
+            .with_end(r.end),
+    );
+}
+
+/// As [`push`], but carries a fix. Used by the delete-the-empty-block hints
+/// (CW121/CW281) whose block range is the deletion span.
+fn push_fix(
+    errors: &mut Vec<ValidationError>,
+    code: &error_codes::ErrorCode,
+    msg: String,
+    r: SourceRange,
+    file: &str,
+    fix: SuggestedFix,
+) {
+    errors.push(
+        ValidationError::from_code_with(code, code.severity, file, r.start.line, r.start.col, msg)
+            .with_fix(fix)
+            .with_end(r.end),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -133,25 +147,27 @@ fn walk(
             );
         }
 
-        // CW121 — empty if/else_if.
+        // CW121 — empty if/else_if. Fix: delete the empty block.
         if (key == kw.if_ || key == kw.else_if) && is_empty_if(block.children, ast, kw) {
-            push(
+            push_fix(
                 errors,
                 &error_codes::CW121_EMPTY_IF,
                 error_codes::CW121_EMPTY_IF.message_template.to_string(),
                 block.range,
                 file_path,
+                SuggestedFix::delete("Remove empty if", block.range),
             );
         }
 
-        // CW281 — a `limit = { }` with no trigger conditions.
+        // CW281 — a `limit = { }` with no trigger conditions. Fix: delete it.
         if key == kw.limit && non_comment_count(block.children) == 0 {
-            push(
+            push_fix(
                 errors,
                 &error_codes::CW281_EMPTY_LIMIT,
                 error_codes::CW281_EMPTY_LIMIT.message_template.to_string(),
                 block.range,
                 file_path,
+                SuggestedFix::delete("Remove empty limit", block.range),
             );
         }
 
@@ -223,4 +239,78 @@ pub fn validate_structural(
         cw223_msg,
         errors,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cwtools_parser::fix::apply_edits;
+    use cwtools_parser::parser::parse_string;
+
+    /// Validate `src`, apply the fix on the first diagnostic with `code`, and
+    /// assert the result equals `expected` and no longer emits `code`.
+    fn assert_fix(code: &str, src: &str, expected: &str) {
+        let table = StringTable::new();
+        let ast = parse_string(src, &table).unwrap();
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some(code))
+            .unwrap_or_else(|| panic!("{code} emitted for {src:?}, got {errors:?}"));
+        let fix = err.fix.as_ref().expect("diagnostic carries a fix");
+        let fixed = apply_edits(src, &fix.edits);
+        assert_eq!(fixed, expected, "{code} fix output");
+
+        let ast2 = parse_string(&fixed, &table).unwrap();
+        let mut errors2 = Vec::new();
+        validate_structural(&ast2, &table, "test.txt", Game::Hoi4, &mut errors2);
+        assert!(
+            !errors2.iter().any(|e| e.code == Some(code)),
+            "{code} must be gone after applying the fix"
+        );
+    }
+
+    // Task 18: a real emit carries the offending block's own SourceRange end, so
+    // the LSP can publish a precise squiggle. Locks the population wiring: the end
+    // must equal the NOT block's `pos.end`, not a re-derived or absent position.
+    #[test]
+    fn diagnostic_carries_block_range_end() {
+        let src = "x = {\n    NOT = { a = 1 b = 2 }\n}\n";
+        let table = StringTable::new();
+        let ast = parse_string(src, &table).unwrap();
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW223"))
+            .expect("CW223 emitted");
+
+        // Recover the NOT block's range from the AST and compare.
+        let x_block = as_block(&ast.root_children[0], &ast).expect("x is a block");
+        let not_block = x_block
+            .children
+            .iter()
+            .find_map(|c| as_block(c, &ast))
+            .expect("NOT block present");
+        assert_eq!(err.line, not_block.range.start.line);
+        assert_eq!(err.col, not_block.range.start.col);
+        assert_eq!(
+            err.end,
+            Some((not_block.range.end.line, not_block.range.end.col)),
+            "CW223 must carry the NOT block's exclusive range end"
+        );
+    }
+
+    #[test]
+    fn cw121_fix_deletes_empty_if() {
+        assert_fix("CW121", "x = { if = { } }\n", "x = { }\n");
+    }
+
+    #[test]
+    fn cw281_fix_deletes_empty_limit() {
+        assert_fix("CW281", "x = { limit = { } }\n", "x = { }\n");
+    }
 }

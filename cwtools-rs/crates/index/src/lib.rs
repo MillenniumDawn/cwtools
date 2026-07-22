@@ -11,8 +11,8 @@ mod type_index;
 mod variables;
 
 pub use collect::{
-    SubtypeCollector, collect_type_instances, for_each_instance_node, hash_instance_exports,
-    index_discovered_files, mix_export_symbol, skip_root_key_matches,
+    InstanceNode, SubtypeCollector, collect_type_instances, for_each_instance_node,
+    hash_instance_exports, index_discovered_files, mix_export_symbol, skip_root_key_matches,
 };
 pub use path_match::{
     NormalizedPath, check_path_dir, check_path_dir_norm, dir_matches_pattern, path_contains_segment,
@@ -108,6 +108,13 @@ pub(crate) fn with_leaf_value_str<R>(
 pub struct SourceLocation {
     pub line: u32,
     pub col: u16,
+    /// End position `(line, col)` of the construct. For a keyed clause it is the
+    /// spot just past the closing brace (the parser's `SourceRange.end`), so a
+    /// definition's full extent is `(line, col)..end`. Cleanup features (rename a
+    /// definition, delete an unreferenced instance) need the whole span, not just
+    /// the start. Synthesized locations with no real range use `end == (line,
+    /// col)`. Non-optional because the range is always in hand at collection.
+    pub end: (u32, u16),
 }
 
 /// Whether an index key is a subtype-qualified membership key (`"type.subtype"`,

@@ -195,6 +195,19 @@ fn normalize_path_lower(p: &str) -> String {
     }
 }
 
+/// Fill in `paths_lower` / `path_file_lower` / `path_ext_lower` from `paths` /
+/// `path_file` / `path_extension`. Shared by `RuleSet::reindex()` for both
+/// `types` and `complex_enums`, which precompute the same lowercased lookup
+/// keys on `PathOptions`.
+fn normalize_path_options(opts: &mut PathOptions) {
+    opts.paths_lower = opts.paths.iter().map(|p| normalize_path_lower(p)).collect();
+    opts.path_file_lower = opts.path_file.as_deref().map(|s| s.to_lowercase());
+    opts.path_ext_lower = opts.path_extension.as_deref().map(|s| {
+        let s = s.to_lowercase();
+        s.strip_prefix('.').map(|t| t.to_string()).unwrap_or(s)
+    });
+}
+
 impl Default for RuleSet {
     fn default() -> Self {
         Self::new()
@@ -344,38 +357,10 @@ impl RuleSet {
             }
         }
         for td in &mut self.types {
-            td.path_options.paths_lower = td
-                .path_options
-                .paths
-                .iter()
-                .map(|p| normalize_path_lower(p))
-                .collect();
-            td.path_options.path_file_lower = td
-                .path_options
-                .path_file
-                .as_deref()
-                .map(|s| s.to_lowercase());
-            td.path_options.path_ext_lower = td.path_options.path_extension.as_deref().map(|s| {
-                let s = s.to_lowercase();
-                s.strip_prefix('.').map(|t| t.to_string()).unwrap_or(s)
-            });
+            normalize_path_options(&mut td.path_options);
         }
         for ce in &mut self.complex_enums {
-            ce.path_options.paths_lower = ce
-                .path_options
-                .paths
-                .iter()
-                .map(|p| normalize_path_lower(p))
-                .collect();
-            ce.path_options.path_file_lower = ce
-                .path_options
-                .path_file
-                .as_deref()
-                .map(|s| s.to_lowercase());
-            ce.path_options.path_ext_lower = ce.path_options.path_extension.as_deref().map(|s| {
-                let s = s.to_lowercase();
-                s.strip_prefix('.').map(|t| t.to_string()).unwrap_or(s)
-            });
+            normalize_path_options(&mut ce.path_options);
         }
         self.type_by_name.clear();
         for (i, td) in self.types.iter().enumerate() {
@@ -484,6 +469,7 @@ pub struct TypeDefinition {
     pub unique: bool,
     pub should_be_referenced: bool,
     pub localisation: Vec<TypeLocalisation>,
+    /// `## graph_related_types = { ... }`: parsed for .cwt spec compatibility; not consumed.
     pub graph_related_types: Vec<String>,
     pub modifiers: Vec<TypeModifier>,
 }
@@ -715,6 +701,8 @@ pub struct Options {
     pub severity: Option<Severity>,
     pub required_scopes: Vec<String>,
     pub comparison: bool,
+    /// `## outgoingReferenceLabel`/`## incomingReferenceLabel`: parsed for .cwt
+    /// spec compatibility; not consumed.
     pub reference_details: Option<Box<ReferenceDetail>>,
     // key_required_quotes, value_required_quotes, type_hint removed:
     // always default-valued, no readers (quoted-key enforcement unimplemented).

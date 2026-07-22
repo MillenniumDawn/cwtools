@@ -405,7 +405,11 @@ types = {
         "spriteType".to_string(),
         vec![TypeInstance {
             name: "GFX_idea_research_bonus".to_string(),
-            location: SourceLocation { line: 1, col: 1 },
+            location: SourceLocation {
+                line: 1,
+                col: 1,
+                end: (1, 1),
+            },
             primary_loc_key: None,
         }],
     );

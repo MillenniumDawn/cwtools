@@ -14,7 +14,7 @@ use crate::paths::{
     uri_to_path_str,
 };
 use crate::validate::{
-    loc_diag_to_validation_error, make_prepared, parse_error_to_diagnostic,
+    line_end_cols, loc_diag_to_validation_error, make_prepared, parse_error_to_diagnostic,
     validate_parsed_with_indexes, validation_error_to_diagnostic,
 };
 use crate::workspace_cache;
@@ -26,6 +26,17 @@ const WATCHED_DEBOUNCE_MS: u64 = 500;
 /// Above this many distinct files in one window, validate the whole workspace
 /// once (a rules re-clone / git checkout) instead of per file.
 const WATCHED_BULK_CAP: usize = 200;
+
+/// One open document captured for a post-scan / config-change revalidation: its
+/// uri, current text, version, and — when the cached AST still matches the
+/// version — that AST (a current AST routes the doc through the no-reparse
+/// prebuilt path; `None` falls back to a full re-parse).
+type OpenDocSnapshot = (
+    String,
+    Arc<str>,
+    i32,
+    Option<Arc<cwtools_parser::ast::ParsedFile>>,
+);
 
 /// Index a base-game ("vanilla") install into per-type instances, ready to merge
 /// into the workspace TypeIndex. Delegates to the shared driver's `index_game_dir`
@@ -387,7 +398,7 @@ impl Backend {
         // cache) and persisting the cache are pure functions over the
         // lock-guarded string-table interner, so they run in parallel across
         // files exactly as the driver parallelizes the same work. Indexing
-        // mutates the shared symbol/info indexes, so it stays serial and in the
+        // mutates the shared info index, so it stays serial and in the
         // original file order — the merge order is observable (goto-def "first
         // match", duplicate-name refcounts), and the cache-hit/miss tally must
         // match the sequential version.
@@ -516,15 +527,9 @@ impl Backend {
         };
         if !removed_uris.is_empty() {
             // Mirrors the DELETE branch of `did_change_watched_files_impl`:
-            // the symbol index and loc live-overlay are keyed per-file too and
-            // must forget the same URIs, or goto-def/loc checks keep serving
-            // stale entries for a file `info_service` just dropped.
-            {
-                let mut index = self.state.symbol_index.lock();
-                for uri in &removed_uris {
-                    index.clear_document(uri);
-                }
-            }
+            // the loc live-overlay is keyed per-file too and must forget the
+            // same URIs, or loc checks keep serving stale entries for a file
+            // `info_service` just dropped.
             {
                 let mut overlay = self.state.loc_live_overlay.write();
                 for uri in &removed_uris {
@@ -790,14 +795,88 @@ impl Backend {
     /// index don't keep stale cross-file diagnostics, and on a live
     /// `didChangeConfiguration` so a changed suppression list re-filters at once.
     pub(crate) async fn revalidate_all_open_docs(&self, trigger: crate::ValidateTrigger) {
-        let open_docs: Vec<(String, Arc<str>, i32)> = {
+        // Snapshot each open doc's uri/text/version, plus its cached AST *only
+        // when that AST matches the current version*. A current AST lets us
+        // re-validate against the now-complete index via the prebuilt path — no
+        // re-parse, no re-index — the same route the dependent sweep takes.
+        //
+        // Skipping the re-index is sound because the scan never touches open
+        // docs: pass 1 skips `open_uris`, and the on-disk prune excludes them
+        // too, so an open doc's index entry still reflects exactly the content
+        // its cached AST was parsed from (written by did_open / did_change via
+        // index_parsed_file, kept in lock-step with `ast_version`). Only the
+        // *global* index grew — the other workspace files the scan indexed —
+        // which is precisely what we want the open doc re-validated against.
+        //
+        // A stale AST (a mid-edit fatal parse, or an edit whose debounce hasn't
+        // run so `ast_version` < `version`) or none at all (loc/.cwt files, or a
+        // never-parsed doc) falls back to the full parse path, which re-parses
+        // the current text and re-indexes — so its parse-error diagnostics and
+        // loc/.cwt handling stay identical to the prior behavior.
+        let open_docs: Vec<OpenDocSnapshot> = {
             let docs = self.state.documents.lock();
             docs.iter()
-                .map(|(uri, doc)| (uri.clone(), doc.text.clone(), doc.version))
+                .map(|(uri, doc)| {
+                    let current_ast = match &doc.ast {
+                        Some(ast) if doc.ast_version == Some(doc.version) => Some(ast.clone()),
+                        _ => None,
+                    };
+                    (uri.clone(), doc.text.clone(), doc.version, current_ast)
+                })
                 .collect()
         };
-        for (uri, text, version) in open_docs {
-            let (diagnostics, _) = self.parse_and_validate(&uri, &text, trigger).await;
+        // Ruleset family snapshotted once for the whole pass (none of it changes
+        // while we run); mirrors the workspace scan's pass-2 snapshot so the
+        // prebuilt validations share one clone instead of re-locking per doc.
+        let game = self.state.config.read().game();
+        let (ruleset_snap, registry_snap, modifier_keys_snap) = {
+            let rules = self.state.rules.read();
+            (
+                rules.ruleset.clone(),
+                rules.scope_registry.clone(),
+                rules.modifier_keys.clone(),
+            )
+        };
+        for (uri, text, version, current_ast) in open_docs {
+            let diagnostics = match current_ast {
+                Some(ast) => {
+                    // Prebuilt path: validate the stored AST against the complete
+                    // index. `validate_parsed_prebuilt` prepends the AST's own
+                    // parse errors and applies the same MAX_FILE_ERRORS truncation
+                    // and loc-overlay handling the full path uses. Emit the
+                    // `[validate] (trigger)` profiling line the full path would
+                    // (so per-doc revalidation stays observable in the log),
+                    // tagged `prebuilt` to make the no-reparse route legible.
+                    let line_ends = line_end_cols(&text);
+                    let diags = match ruleset_snap.as_ref() {
+                        Some(ruleset) => self.validate_parsed_prebuilt(
+                            &uri,
+                            &ast,
+                            &modifier_keys_snap,
+                            ruleset,
+                            game,
+                            registry_snap.as_ref(),
+                            &line_ends,
+                        ),
+                        None => ast
+                            .errors
+                            .iter()
+                            .map(|e| parse_error_to_diagnostic(e, &line_ends))
+                            .collect(),
+                    };
+                    tracing::info!(
+                        target: "cwtools::profile",
+                        "[validate] ({}) {} diagnostics (prebuilt, no reparse)",
+                        trigger.as_str(),
+                        diags.len()
+                    );
+                    diags
+                }
+                // No current AST — re-parse + re-index via the full path,
+                // preserving prior behavior for loc/.cwt files and mid-edit
+                // fatal parses (which must re-parse to surface the live error).
+                None => self.parse_and_validate(&uri, &text, trigger).await.0,
+            };
             // Skip if the doc changed or closed while we were validating; its own
             // did_change/did_close handler owns the fresher result.
             let still_current = {
@@ -1376,17 +1455,10 @@ impl Backend {
     }
 
     /// Apply a coalesced batch of DELETE events off the message future: forget
-    /// each URI from the symbol index, the info service (one write scope), the
-    /// loc overlay, and the watched-signature record, bump the info revision
-    /// once for the whole batch, then publish empty diagnostics per URI outside
-    /// every lock.
+    /// each URI from the info service (one write scope), the loc overlay, and
+    /// the watched-signature record, bump the info revision once for the whole
+    /// batch, then publish empty diagnostics per URI outside every lock.
     async fn process_watched_deletes(&self, deletes: &[String]) {
-        {
-            let mut index = self.state.symbol_index.lock();
-            for uri in deletes {
-                index.clear_document(uri);
-            }
-        }
         {
             let mut info = self.state.info_service.write();
             for uri in deletes {

@@ -4416,6 +4416,12 @@ fn test_config_no_op_skips_revalidate_then_real_change_runs() {
         1,
         "first (changed) config should revalidate the open doc once"
     );
+    // The open doc's AST is current (opened, never edited), so the revalidate
+    // must reuse the stored AST via the prebuilt path — no fresh parse.
+    assert!(
+        log1.contains("(configChange)") && log1.contains("(prebuilt, no reparse)"),
+        "an unedited open doc should revalidate from its stored AST, not re-parse: {log1}"
+    );
 
     // Identical payload → no-op guard skips the revalidate (total stays 1).
     write_frame(&mut child, &cfg(&["CW999"])).unwrap();
@@ -4861,4 +4867,578 @@ fn test_did_close_restores_disk_definition() {
             || result["uri"] == definition_uri,
         "closing the live buffer should restore the disk definition, got: {result:?}"
     );
+}
+
+// ── did_open indexes its own subtype membership (architecture review L2) ─────
+
+/// Fixture adapted from `crates/validation/tests/subtype_membership.rs`: a
+/// `naval_equip` subtype is discriminated by `archetype = <equipment.naval_equip>`,
+/// which only resolves once the archetype's own subtype-qualified membership
+/// (`equipment.naval_equip`) is in the type index. Without that merge, the
+/// variant never activates `naval_equip` and `model` becomes an unrecognized
+/// field (CW263).
+const SUBTYPE_RULES: &str = r#"
+types = {
+    type[equipment] = {
+        skip_root_key = equipments
+        path = "game/common/units/equipment"
+        subtype[archetype_equip] = {
+            ## cardinality = 0..1
+            is_archetype = yes
+        }
+        subtype[naval_equip] = {
+            ## cardinality = 0..1
+            type = enum[ship_units]
+            ## cardinality = 0..1
+            archetype = <equipment.naval_equip>
+        }
+    }
+}
+
+equipment = {
+    ## cardinality = 0..1
+    is_archetype = bool
+    ## cardinality = 0..1
+    archetype = <equipment>
+    ## cardinality = 0..1
+    type = enum[ship_units]
+    alias_name[unit_stat] = alias_match_left[unit_stat]
+    subtype[naval_equip] = {
+        ## cardinality = 0..1
+        model = scalar
+    }
+}
+
+alias[unit_stat:build_cost_ic] = float
+
+enums = {
+    enum[ship_units] = {
+        submarine
+        destroyer
+    }
+}
+"#;
+
+const SUBTYPE_SCRIPT: &str = r#"
+equipments = {
+    ship_hull_submarine = {
+        is_archetype = yes
+        type = submarine
+        model = base_sub_model
+    }
+    ship_hull_cruiser_submarine = {
+        archetype = ship_hull_submarine
+        model = cruiser_sub_model
+    }
+}
+"#;
+
+#[test]
+fn did_open_indexes_own_subtype_membership() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    // An explicit empty `vanilla` dir, or `ensure_vanilla_index` auto-discovers
+    // a real game install on the host (e.g. a Steam copy of HOI4) and merges its
+    // equipment archetypes into `equipment.naval_equip`, masking the bug this
+    // test guards against.
+    let vanilla_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), SUBTYPE_RULES).unwrap();
+
+    let rel_path = "common/units/equipment/ships.txt";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    // Empty on disk: the initial workspace scan (which indexes correctly via
+    // `index_parsed_file`, unaffected by this bug) must never see the
+    // archetype. It's introduced only by the live edit below, so any
+    // `equipment.naval_equip` membership the variant resolves against can only
+    // have come from `parse_and_validate`'s own indexing of that edit.
+    std::fs::write(&file_path, "").unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // Diagnostics are gated (published as an empty set) until the initial scan
+    // finishes and flips `index_ready`; wait for it so the assertions below
+    // see the server's real validation output, not the gate's placeholder.
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": "",
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, rel_path);
+
+    // Edit in the archetype and its naval variant together: the variant's
+    // `archetype = <equipment.naval_equip>` discriminator only activates once
+    // this file's own archetype is merged into `equipment.naval_equip` by the
+    // same edit's indexing pass (did_change also runs through
+    // `parse_and_validate`).
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri, "version": 2 },
+                "contentChanges": [{ "text": SUBTYPE_SCRIPT }],
+            }),
+        ),
+    )
+    .unwrap();
+
+    let codes = diags_for(&mut reader, rel_path, 1).expect("diagnostics for ships.txt after edit");
+    child.kill().ok();
+
+    assert!(
+        !codes.contains(&"CW263".to_string()),
+        "an edit that adds both the archetype and its naval variant in one \
+         didChange must index the archetype's own subtype membership so the \
+         variant activates naval_equip and `model` is a recognized field, \
+         got: {:?}",
+        codes
+    );
+}
+
+// ── Keystroke path runs CW100 too (open-doc missing-loc flicker) ─────────────
+
+const MISSING_LOC_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        localisation = {
+            ## required
+            name = "$"
+            ## required
+            desc = "$_desc"
+        }
+    }
+}
+thing = { x = scalar }
+"#;
+
+#[test]
+fn test_keystroke_edit_reports_missing_loc_once_loc_index_is_built() {
+    // CW100 (missing localisation) is gated on the loc index being non-empty
+    // (`validate.rs::append_missing_loc_errors`). Before this fix the gate was
+    // applied only in the scan/dependent-sweep path
+    // (`validate_parsed_with_indexes`), not in the keystroke path
+    // (`parse_and_validate`) — so an open doc's CW100 would appear after a scan
+    // or dependent revalidation and then vanish on the very next edit, until the
+    // next scan. This is the flicker's kill test: once the loc index is built,
+    // a didChange (the keystroke path) must still report CW100, not clear it.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    // Explicit empty vanilla dir so a real host game install (if any) can't
+    // merge in loc data that would mask the missing `my_thing_desc` key.
+    let vanilla_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), MISSING_LOC_RULES).unwrap();
+
+    // Non-empty loc union (the CW100 gate), but missing `my_thing_desc`.
+    let loc_dir = ws.path().join("localisation");
+    std::fs::create_dir_all(&loc_dir).unwrap();
+    let mut loc_bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    loc_bytes.extend_from_slice(b"l_english:\n my_thing:0 \"My Thing\"\n");
+    std::fs::write(loc_dir.join("test_l_english.yml"), &loc_bytes).unwrap();
+
+    let rel_path = "common/things/test.txt";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    // Empty on disk: the initial scan must not see `my_thing`, so the CW100
+    // this test checks for can only have come from the didChange below (the
+    // keystroke path), not a diagnostic left over from the scan.
+    std::fs::write(&file_path, "").unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // The loc index (built from `localisation/` above) is complete by the time
+    // the scan flips `index_ready` and the loading bar closes.
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": doc_uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": "",
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, rel_path);
+
+    // The keystroke path: didChange runs through `parse_and_validate`, not the
+    // scan/dependent-sweep's `validate_parsed_with_indexes`.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri, "version": 2 },
+                "contentChanges": [{ "text": "my_thing = { x = 1 }\n" }],
+            }),
+        ),
+    )
+    .unwrap();
+
+    let codes = diags_for(&mut reader, rel_path, 1).expect("diagnostics after keystroke edit");
+    child.kill().ok();
+
+    assert!(
+        codes.contains(&"CW100".to_string()),
+        "a didChange (keystroke) edit must report CW100 for my_thing's missing \
+         required `my_thing_desc` loc key once the loc index is non-empty, \
+         got: {:?}",
+        codes
+    );
+}
+
+// ── Code actions (quick-fixes from SuggestedFix payloads) ────────────────────
+
+/// Read frames until a publishDiagnostics for `suffix` arrives carrying a
+/// diagnostic whose `code` matches, returning that full diagnostic JSON object
+/// (range + data included). None on timeout.
+fn wait_for_diag_object(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    suffix: &str,
+    code: &str,
+) -> Option<serde_json::Value> {
+    for _ in 0..2000 {
+        let raw = read_frame(reader).ok()?;
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(suffix))
+            && let Some(d) = v["params"]["diagnostics"]
+                .as_array()
+                .and_then(|a| a.iter().find(|d| d["code"] == code))
+        {
+            return Some(d.clone());
+        }
+    }
+    None
+}
+
+#[test]
+fn test_code_action_quickfix_from_diagnostic() {
+    // End-to-end: an empty `limit = { }` produces a CW281 diagnostic carrying a
+    // fix payload in `data`. Round-tripping that diagnostic back through
+    // textDocument/codeAction must yield one QUICKFIX whose edit, applied to the
+    // source, deletes the empty limit — the same result as the CLI `fix`.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/decisions/test.txt";
+    let text = "x = { limit = { } }\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", file_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let init_resp_str = read_response(&mut reader).expect("no init response");
+    let init_resp: serde_json::Value = serde_json::from_str(&init_resp_str).unwrap();
+    // Capability advertised: quickfix code actions, no resolve step.
+    let ca = &init_resp["result"]["capabilities"]["codeActionProvider"];
+    assert_eq!(ca["codeActionKinds"][0], "quickfix", "got: {ca}");
+    assert_eq!(ca["resolveProvider"], false, "got: {ca}");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW281")
+        .expect("CW281 diagnostic published for the empty limit");
+    assert!(
+        diag.get("data").is_some(),
+        "the diagnostic must carry a fix payload in `data`: {diag}"
+    );
+
+    let ca_req = jsonrpc_request(
+        2,
+        "textDocument/codeAction",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "range": diag["range"],
+            "context": { "diagnostics": [diag] },
+        }),
+    );
+    write_frame(&mut child, &ca_req).unwrap();
+    let resp_str = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(resp["id"], 2, "got: {resp_str}");
+    let actions = resp["result"].as_array().expect("array result");
+    assert_eq!(actions.len(), 1, "one quickfix expected: {resp_str}");
+    let action = &actions[0];
+    assert_eq!(action["kind"], "quickfix");
+    assert_eq!(action["title"], "Remove empty limit");
+
+    // The edit must reproduce the CLI `fix` output when applied.
+    let changes = action["edit"]["changes"]
+        .as_object()
+        .expect("edit carries a changes map");
+    let edits = changes
+        .values()
+        .next()
+        .and_then(|v| v.as_array())
+        .expect("edits for the document");
+    assert_eq!(edits.len(), 1, "one text edit: {resp_str}");
+    let e = &edits[0];
+    let sc = e["range"]["start"]["character"].as_u64().unwrap() as usize;
+    let ec = e["range"]["end"]["character"].as_u64().unwrap() as usize;
+    let new_text = e["newText"].as_str().unwrap();
+    // The fix is confined to line 0; splice the char range on that line.
+    let nl = text.find('\n').unwrap();
+    let chars: Vec<char> = text[..nl].chars().collect();
+    let mut fixed: String = chars[..sc].iter().collect();
+    fixed.push_str(new_text);
+    fixed.extend(chars[ec..].iter());
+    fixed.push_str(&text[nl..]);
+    assert_eq!(
+        fixed, "x = { }\n",
+        "applied edit must delete the empty limit"
+    );
+}
+
+// ── Inlay hints: loc titles ──────────────────────────────────────────────────
+
+#[test]
+fn test_inlay_hint_shows_loc_title_after_known_id() {
+    // End-to-end: the server advertises the inlayHint capability, and a request
+    // over a script that references a known decision id (with a localised title)
+    // returns one hint carrying that title, positioned just past the id.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    // The definition (indexed as a `decision` instance named `my_decision`).
+    let defs = ws.path().join("common/decisions/defs.txt");
+    std::fs::create_dir_all(defs.parent().unwrap()).unwrap();
+    std::fs::write(&defs, "my_decision = { cost = 1 }\n").unwrap();
+
+    // Its localised title.
+    let loc_dir = ws.path().join("localisation");
+    std::fs::create_dir_all(&loc_dir).unwrap();
+    let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice("l_english:\n my_decision:0 \"My Decision\"\n".as_bytes());
+    std::fs::write(loc_dir.join("test_l_english.yml"), &bytes).unwrap();
+
+    // The opened script referencing the id as a value on line 1.
+    let rel_path = "common/decisions/use.txt";
+    let text = "wrapper = {\n    ref = my_decision\n}\n";
+    let use_path = ws.path().join(rel_path);
+    std::fs::write(&use_path, text).unwrap();
+
+    let ws_uri = format!("file://{}", ws.path().display());
+    let doc_uri = format!("file://{}", use_path.display());
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let init_resp_str = read_response(&mut reader).expect("no init response");
+    let init_resp: serde_json::Value = serde_json::from_str(&init_resp_str).unwrap();
+    // Capability advertised.
+    assert_eq!(
+        init_resp["result"]["capabilities"]["inlayHintProvider"], true,
+        "inlayHint capability must be advertised: {init_resp_str}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    // Poll the inlay request until the loc map + type index are populated.
+    let mut hint = serde_json::Value::Null;
+    for attempt in 0..30 {
+        let req = jsonrpc_request(
+            2 + attempt,
+            "textDocument/inlayHint",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 100, "character": 0 },
+                },
+            }),
+        );
+        write_frame(&mut child, &req).unwrap();
+        let resp_str = read_response(&mut reader).expect("no inlayHint response");
+        let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+        if let Some(arr) = resp["result"].as_array()
+            && !arr.is_empty()
+        {
+            hint = arr[0].clone();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    child.kill().ok();
+
+    assert_eq!(hint["label"], "My Decision", "got: {hint}");
+    // Anchored just past `my_decision` on line 1: "    ref = my_decision" ends at col 21.
+    assert_eq!(hint["position"]["line"], 1, "got: {hint}");
+    assert_eq!(hint["position"]["character"], 21, "got: {hint}");
+    assert_eq!(hint["paddingLeft"], true, "got: {hint}");
 }

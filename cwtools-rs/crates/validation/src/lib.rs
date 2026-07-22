@@ -23,13 +23,13 @@ mod subtype;
 pub use common::{ErrorSeverity, ValidationError, error_hash};
 pub use loc_field::build_modifier_keys;
 pub use scope::scope_matches_required;
-pub use subtype::collect_subtype_instances;
+pub use subtype::{collect_subtype_instances, subtype_membership_for_instance};
 
 use common::{leaf_value_to_string, path_contains_segment};
 use ctx::ValidationCtx;
 use resolve::{
-    DispatchInput, ResolvedType, find_grandchild_type, find_rules_by_name, find_type_by_path,
-    path_candidates_for_file, resolve_root_child, type_has_content,
+    DispatchInput, ResolvedType, find_rules_by_name, find_type_from_candidates,
+    path_candidates_for_file, refine_grandchild_type, resolve_root_child, type_has_content,
 };
 use rule_core::validate_with_type;
 use scope::build_scope_registry;
@@ -39,7 +39,7 @@ use scope::build_scope_registry;
 /// `skip_tail` is the remaining skip-stack after the level that led here was
 /// consumed.  When non-empty each grandchild that matches the next level is
 /// itself a skip wrapper and we recurse rather than validate directly (mirrors
-/// the indexer's `[head, tail..]` descent in `collect_skip_root_child`).
+/// the indexer's `[head, tail..]` descent in `walk_skip_root_child`).
 #[allow(clippy::too_many_arguments)]
 fn validate_wrapper_grandchildren(
     ctx: &ValidationCtx,
@@ -78,13 +78,16 @@ fn validate_wrapper_grandchildren(
                 if skip_tail.is_empty() {
                     let lv = &ast.arena.leaf_values[*idx as usize];
                     let value = leaf_value_to_string(&lv.value, table);
-                    errors.push(ValidationError::from_code(
-                        &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
-                        file_path,
-                        lv.pos.start.line,
-                        lv.pos.start.col,
-                        &[&format!("Unexpected bare value '{}'", value)],
-                    ));
+                    errors.push(
+                        ValidationError::from_code(
+                            &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
+                            file_path,
+                            lv.pos.start.line,
+                            lv.pos.start.col,
+                            &[&format!("Unexpected bare value '{}'", value)],
+                        )
+                        .with_end(lv.pos.end),
+                    );
                 }
                 continue;
             }
@@ -118,34 +121,16 @@ fn validate_wrapper_grandchildren(
         // (pdxmesh, pdxparticle, entity, …) that share a path; pick the type that
         // `## type_key_filter` assigns to THIS grandchild's key rather than
         // validating every grandchild against whichever type won the path lookup.
-        let (gc_type_def, gc_rules) =
-            match find_grandchild_type(file_path, wrapper_root_key, &gc_key, ruleset) {
-                Some(t) => {
-                    let r = find_rules_by_name(&t.name, ruleset);
-                    // Resolved to an index-only type (no rule body): its fields
-                    // are not content-validated, so don't flag them.
-                    if !type_has_content(t, r) {
-                        continue;
-                    }
-                    (t, r)
-                }
-                // No better match. Only fall back to the wrapper's resolved type
-                // when that type actually applies to THIS grandchild's key. A type
-                // with `## type_key_filter = containerWindowType` must not validate
-                // a sibling `scrollbarType`/`guiButtonType` (top-level widgets under
-                // `guiTypes`) against the containerWindowType schema — F# excludes
-                // them via the filter and leaves them unvalidated. Without this the
-                // widgets' own fields (slider/track/priority/...) flag as CW201.
-                None => {
-                    if let Some((keys, negate)) = &type_def.type_key_filter {
-                        let hit = keys.iter().any(|k| k.eq_ignore_ascii_case(&gc_key));
-                        if hit == *negate {
-                            continue;
-                        }
-                    }
-                    (type_def, inner_rules)
-                }
-            };
+        let Some((gc_type_def, gc_rules)) = refine_grandchild_type(
+            file_path,
+            wrapper_root_key,
+            &gc_key,
+            type_def,
+            inner_rules,
+            ruleset,
+        ) else {
+            continue;
+        };
 
         validate_with_type(
             ctx,
@@ -349,7 +334,7 @@ pub fn validate_prepared(
     // set rather than scanning all types N_children times.
     let file_path_lower = file_path.to_lowercase();
     let path_candidates = path_candidates_for_file(&file_path_lower, ruleset);
-    let path_type = find_type_by_path(file_path, ruleset);
+    let path_type = find_type_from_candidates(&path_candidates, None);
 
     // type_per_file: the WHOLE file is a single instance of this type (e.g. an
     // OOB file). Its root children ARE the instance body — there is no per-entry

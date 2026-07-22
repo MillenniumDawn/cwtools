@@ -57,39 +57,11 @@ pub const CW001_PARSE_ERROR: ErrorCode = ErrorCode {
     message_template: "Localisation file parse error: {}",
 };
 
-/// Mixed key/values and values block (missing equals sign).
-pub const CW002_MIXED_BLOCK: ErrorCode = ErrorCode {
-    id: "CW002",
-    severity: ErrorSeverity::Error,
-    message_template: "This block has mixed key/values and values, it is probably a missing equals sign inside it.",
-};
-
 /// Missing localisation key.
 pub const CW100_MISSING_LOCALISATION: ErrorCode = ErrorCode {
     id: "CW100",
     severity: ErrorSeverity::Warning,
     message_template: "Localisation key {} is not defined for {}",
-};
-
-/// Undefined variable (@var).
-pub const CW101_UNDEFINED_VARIABLE: ErrorCode = ErrorCode {
-    id: "CW101",
-    severity: ErrorSeverity::Error,
-    message_template: "{} is not defined",
-};
-
-/// Unknown trigger used.
-pub const CW102_UNDEFINED_TRIGGER: ErrorCode = ErrorCode {
-    id: "CW102",
-    severity: ErrorSeverity::Error,
-    message_template: "unknown trigger {} used.",
-};
-
-/// Unknown effect used.
-pub const CW103_UNDEFINED_EFFECT: ErrorCode = ErrorCode {
-    id: "CW103",
-    severity: ErrorSeverity::Error,
-    message_template: "unknown effect {} used.",
 };
 
 /// Trigger used in wrong scope. F# `IncorrectTriggerScope`.
@@ -119,13 +91,6 @@ pub const CW122_LOC_KEY_IN_INLINE: ErrorCode = ErrorCode {
 /// F# `ConfigRulesUnexpectedValue`. Replaces the Rust-invented CW202/CW205.
 pub const CW240_UNEXPECTED_VALUE: ErrorCode = ErrorCode {
     id: "CW240",
-    severity: ErrorSeverity::Error,
-    message_template: "{}",
-};
-
-/// An unexpected property (generic). F# `ConfigRulesUnexpectedProperty`.
-pub const CW241_UNEXPECTED_PROPERTY: ErrorCode = ErrorCode {
-    id: "CW241",
     severity: ErrorSeverity::Error,
     message_template: "{}",
 };
@@ -181,13 +146,6 @@ pub const CW248_INVALID_SCOPE_COMMAND: ErrorCode = ErrorCode {
     id: "CW248",
     severity: ErrorSeverity::Error,
     message_template: "Invalid scope command {}",
-};
-
-/// A variable/number was expected. F# `ConfigRulesExpectedVariableValue`.
-pub const CW249_EXPECTED_VARIABLE_VALUE: ErrorCode = ErrorCode {
-    id: "CW249",
-    severity: ErrorSeverity::Warning,
-    message_template: "Expecting a variable or number",
 };
 
 /// An unexpected `key = { ... }` node. F# `ConfigRulesUnexpectedPropertyNode`.
@@ -259,20 +217,6 @@ pub const CW274_INLINE_SCRIPT_ERROR: ErrorCode = ErrorCode {
     id: "CW274",
     severity: ErrorSeverity::Error,
     message_template: "This usage of inline_script results in an error, see related",
-};
-
-/// An internal rules error. F# `RulesError`.
-pub const CW998_RULES_ERROR: ErrorCode = ErrorCode {
-    id: "CW998",
-    severity: ErrorSeverity::Error,
-    message_template: "{}",
-};
-
-/// A custom user error. F# `CustomError`.
-pub const CW999_CUSTOM_ERROR: ErrorCode = ErrorCode {
-    id: "CW999",
-    severity: ErrorSeverity::Error,
-    message_template: "{}",
 };
 
 /// Localisation string references another key that doesn't exist.

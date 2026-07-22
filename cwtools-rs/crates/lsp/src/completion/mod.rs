@@ -1792,7 +1792,11 @@ mod tests {
             "scripted_effect".to_string(),
             vec![cwtools_info::TypeInstance {
                 name: "my_special_effect".to_string(),
-                location: cwtools_info::SourceLocation { line: 1, col: 0 },
+                location: cwtools_info::SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -2408,7 +2412,11 @@ mod perf_bench {
         let mut info = cwtools_info::InfoService::new();
         let inst = |name: String| cwtools_info::TypeInstance {
             name,
-            location: cwtools_info::SourceLocation { line: 1, col: 0 },
+            location: cwtools_info::SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
             primary_loc_key: None,
         };
         let mut per_type: HashMap<String, Vec<cwtools_info::TypeInstance>> = HashMap::new();

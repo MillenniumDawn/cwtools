@@ -2,7 +2,7 @@
 //! right-hand field (types, filepaths, variables, localisation, scopes).
 
 use cwtools_game::scope_engine::ScopeContext;
-use cwtools_parser::ast::Value;
+use cwtools_parser::ast::{SourcePos, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
 
@@ -39,6 +39,7 @@ pub(super) fn check_variable_get(
     raw: &str,
     line: u32,
     col: u16,
+    end: SourcePos,
     errors: &mut Vec<ValidationError>,
 ) {
     if !ctx.var_checks {
@@ -65,13 +66,16 @@ pub(super) fn check_variable_get(
         && !idx.var_index.is_empty()
         && !idx.var_index.contains(core)
     {
-        errors.push(ValidationError::from_code(
-            &error_codes::CW246_UNSET_VARIABLE,
-            ctx.file_path,
-            line,
-            col,
-            &[core],
-        ));
+        errors.push(
+            ValidationError::from_code(
+                &error_codes::CW246_UNSET_VARIABLE,
+                ctx.file_path,
+                line,
+                col,
+                &[core],
+            )
+            .with_end(end),
+        );
     }
 }
 
@@ -213,14 +217,17 @@ pub(super) fn validate_leaf(
                                 ),
                             )
                         };
-                        errors.push(ValidationError::from_code_with(
-                            code,
-                            code.severity,
-                            file_path,
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                            message,
-                        ));
+                        errors.push(
+                            ValidationError::from_code_with(
+                                code,
+                                code.severity,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                message,
+                            )
+                            .with_end(leaf.pos.end),
+                        );
                     }
                 }
             });
@@ -274,13 +281,16 @@ pub(super) fn validate_leaf(
                             && !asset_relative
                         {
                             let code = &error_codes::CW113_MISSING_FILE;
-                            errors.push(ValidationError::from_code(
-                                code,
-                                file_path,
-                                leaf.pos.start.line,
-                                leaf.pos.start.col,
-                                &[&candidate],
-                            ));
+                            errors.push(
+                                ValidationError::from_code(
+                                    code,
+                                    file_path,
+                                    leaf.pos.start.line,
+                                    leaf.pos.start.col,
+                                    &[&candidate],
+                                )
+                                .with_end(leaf.pos.end),
+                            );
                         }
                     }
                 });
@@ -330,22 +340,28 @@ pub(super) fn validate_leaf(
                         // Numeric value: enforce int-ness / decimal precision.
                         if *is_int && f.fract() != 0.0 {
                             let code = &error_codes::CW271_VARIABLE_INT_ONLY;
-                            errors.push(ValidationError::from_code(
-                                code,
-                                file_path,
-                                leaf.pos.start.line,
-                                leaf.pos.start.col,
-                                &[],
-                            ));
+                            errors.push(
+                                ValidationError::from_code(
+                                    code,
+                                    file_path,
+                                    leaf.pos.start.line,
+                                    leaf.pos.start.col,
+                                    &[],
+                                )
+                                .with_end(leaf.pos.end),
+                            );
                         } else if *is_32bit && decimal_places(core) > 3 {
                             let code = &error_codes::CW270_VARIABLE_TOO_SMALL;
-                            errors.push(ValidationError::from_code(
-                                code,
-                                file_path,
-                                leaf.pos.start.line,
-                                leaf.pos.start.col,
-                                &[],
-                            ));
+                            errors.push(
+                                ValidationError::from_code(
+                                    code,
+                                    file_path,
+                                    leaf.pos.start.line,
+                                    leaf.pos.start.col,
+                                    &[],
+                                )
+                                .with_end(leaf.pos.end),
+                            );
                         }
                     } else if ctx.var_checks {
                         // Non-numeric value: it must name a defined variable. Stay
@@ -365,13 +381,16 @@ pub(super) fn validate_leaf(
                             && !idx.var_index.contains(core)
                         {
                             let code = &error_codes::CW246_UNSET_VARIABLE;
-                            errors.push(ValidationError::from_code(
-                                code,
-                                file_path,
-                                leaf.pos.start.line,
-                                leaf.pos.start.col,
-                                &[core],
-                            ));
+                            errors.push(
+                                ValidationError::from_code(
+                                    code,
+                                    file_path,
+                                    leaf.pos.start.line,
+                                    leaf.pos.start.col,
+                                    &[core],
+                                )
+                                .with_end(leaf.pos.end),
+                            );
                         }
                     }
                 }
@@ -385,7 +404,14 @@ pub(super) fn validate_leaf(
         // variable index) so empty-index setups don't false-positive.
         if let NewField::VariableGetField(_) = right {
             with_leaf_value_str(&leaf.value, table, |raw| {
-                check_variable_get(ctx, raw, leaf.pos.start.line, leaf.pos.start.col, errors);
+                check_variable_get(
+                    ctx,
+                    raw,
+                    leaf.pos.start.line,
+                    leaf.pos.start.col,
+                    leaf.pos.end,
+                    errors,
+                );
             });
             return;
         }
@@ -407,16 +433,23 @@ pub(super) fn validate_leaf(
             let key = table
                 .with_string(leaf.key.normal, |s| s.to_string())
                 .unwrap_or_default();
-            errors.push(ValidationError::from_code(
-                &error_codes::CW240_UNEXPECTED_VALUE,
-                file_path,
-                leaf.pos.start.line,
-                leaf.pos.start.col,
-                &[&format!(
-                    "Field '{}' has value '{}', expected {}",
-                    key, actual, expected
-                )],
-            ));
+            // No did-you-mean fix here (unlike CW262/CW263): an enum-value rename
+            // would replace the value token, but `Leaf` records no value-start
+            // position and `leaf.pos.end` absorbs trailing whitespace, so the value
+            // span can't be derived cleanly. Skipped like Task 8's CW122.
+            errors.push(
+                ValidationError::from_code(
+                    &error_codes::CW240_UNEXPECTED_VALUE,
+                    file_path,
+                    leaf.pos.start.line,
+                    leaf.pos.start.col,
+                    &[&format!(
+                        "Field '{}' has value '{}', expected {}",
+                        key, actual, expected
+                    )],
+                )
+                .with_end(leaf.pos.end),
+            );
         }
     }
 }

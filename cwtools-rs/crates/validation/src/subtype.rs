@@ -34,23 +34,53 @@ pub fn collect_subtype_instances(
         logical_path,
         table,
         &mut |td, name, node_key, children, location| {
-            // `for_each_instance_node` only visits types that declare subtypes.
-            for st in &td.subtypes {
-                if subtype_matches(st, children, file, table, ruleset, Some(node_key), None) {
-                    out.entry(format!("{}.{}", td.name, st.name))
-                        .or_default()
-                        .push(cwtools_index::TypeInstance {
-                            name: name.to_string(),
-                            location,
-                            // Hover resolves the primary loc key via the base-type
-                            // instances; subtype-qualified entries don't need it.
-                            primary_loc_key: None,
-                        });
-                }
-            }
+            let node = cwtools_index::InstanceNode {
+                td,
+                name,
+                node_key,
+                children,
+                location,
+            };
+            subtype_membership_for_instance(ruleset, file, &node, table, &mut out);
         },
     );
     out
+}
+
+/// Append one instance node's active subtypes to `out` under `"type.subtype"`
+/// keys. The per-node core of [`collect_subtype_instances`], and the
+/// [`cwtools_index::SubtypeCollector`] hook that `index_discovered_files` runs
+/// inside the type-instance walk so type and subtype collection share a single
+/// navigation.
+pub fn subtype_membership_for_instance(
+    ruleset: &RuleSet,
+    file: &ParsedFile,
+    node: &cwtools_index::InstanceNode,
+    table: &StringTable,
+    out: &mut std::collections::HashMap<String, Vec<cwtools_index::TypeInstance>>,
+) {
+    // Only reached for types that declare subtypes.
+    for st in &node.td.subtypes {
+        if subtype_matches(
+            st,
+            node.children,
+            file,
+            table,
+            ruleset,
+            Some(node.node_key),
+            None,
+        ) {
+            out.entry(format!("{}.{}", node.td.name, st.name))
+                .or_default()
+                .push(cwtools_index::TypeInstance {
+                    name: node.name.to_string(),
+                    location: node.location,
+                    // Hover resolves the primary loc key via the base-type
+                    // instances; subtype-qualified entries don't need it.
+                    primary_loc_key: None,
+                });
+        }
+    }
 }
 
 /// Test whether a subtype's rules are satisfied by an entity's children.

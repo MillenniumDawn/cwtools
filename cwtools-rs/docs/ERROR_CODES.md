@@ -21,9 +21,14 @@ Each diagnostic the validator emits carries a `CWxxx` code. The codes mirror the
 - **Defined, not wired** -- the const exists but nothing emits it yet. Either it's superseded by a more specific code, or a generic check would need a complete registry to stay false-positive-safe (the project never trades correctness for coverage).
 - **Emitted (escape hatch `CWTOOLS_...`)** -- runs by default; the env var disables it.
 
-Every F# code (71 after the experimental/dead cleanup) has a Rust definition.
-Codes with no emission site in either engine were removed from both; see
-[Removed](#removed-experimental--dead-deleted-from-both-engines).
+63 of F#'s 71 codes (after the experimental/dead cleanup) have a Rust
+definition. Codes with no emission site in either engine were removed from
+both; see [Removed](#removed-experimental--dead-deleted-from-both-engines).
+
+The other 8 F# codes were superseded placeholders, dropped rather than kept
+as unwired consts: CW002, CW249, CW998, CW999 had no path to emission;
+CW101/102/103 are covered by the rules-engine structural codes CW262/263,
+and CW241 by CW262-265.
 
 ---
 
@@ -35,22 +40,11 @@ Codes with no emission site in either engine were removed from both; see
 
 ---
 
-## CW002 -- Core parser
-
-| ID | Severity | Message | Meaning | Status |
-|---|---|---|---|---|
-| CW002 | Error | This block has mixed key/values and values, it is probably a missing equals sign inside it. | A block mixes bare values with key-value pairs, which usually means a missing `=`. | Defined, not wired (parser does not flag this yet) |
-
----
-
 ## CW100-CW122 -- Core: loc, variables, triggers/effects, scope, misc
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | CW100 | Warning | Localisation key {} is not defined for {} | A referenced localisation key has no entry for the named language. | Emitted |
-| CW101 | Error | {} is not defined | A `@variable` is used but never defined. | Defined, not wired (needs FP-safe @-var def/use tracking) |
-| CW102 | Error | unknown trigger {} used. | A trigger name is not in the known trigger list. | Defined, not wired (rules-engine structural codes CW262-265 cover this; a generic check needs a complete trigger registry to avoid false positives) |
-| CW103 | Error | unknown effect {} used. | An effect name is not in the known effect list. | Defined, not wired (as CW102, needs a complete effect registry) |
 | CW104 | Error | {} trigger used in incorrect scope. In {} but expected {} | A trigger is used in a scope it doesn't accept. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`). Scope tracking handles links/iterators/data-refs/root-scope; a DLC-scope long tail may still surface false positives |
 | CW105 | Error | {} effect used in incorrect scope. In {} but expected {} | An effect is used in the wrong scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
 | CW106 | Error | {} scope command used in incorrect scope. In {} but expected {} | A scope command is used outside its valid scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
@@ -115,14 +109,13 @@ Codes with no emission site in either engine were removed from both; see
 |---|---|---|---|---|
 | CW239 | Warning | {} of type {} is not used anywhere, but is expected to be | A `should_be_referenced` type instance is never referenced in any other file. | Defined, emission pending (cross-file reference-tracking subsystem) (reconciled from Rust CW502) |
 
-### CW240-CW249 -- Rules-engine dynamic codes
+### CW240-CW248 -- Rules-engine dynamic codes
 
 These are the core rules-engine codes. Severity and message text are computed per-rule (the rule's `## severity` option overrides the defaults here).
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | CW240 | Error | {} | A value didn't match its rule's field type (int/float/enum/bool/date, etc.). | Emitted |
-| CW241 | Error | {} | An unexpected property was found (generic). | Defined, not wired (superseded by the node-kind-specific CW262-CW265) |
 | CW242 | Warning | {} | A field appears too few or too many times (cardinality violation). | Emitted |
 | CW243 | Error | Target "{}" has incorrect scope. Is {} but expect {} | A scope target resolves to a scope the field doesn't expect. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
 | CW244 | Error | {} is not a target. Expected a target in scope(s) {} | A value is not a valid target in any of the expected scopes. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
@@ -130,7 +123,6 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW246 | Warning | The variable {} has not been set | A referenced variable hasn't been assigned anywhere the engine can see. | Wired, gated off (`CWTOOLS_VAR_CHECKS=1`; needs a complete mod+vanilla variable index) |
 | CW247 | Error | Trigger/Effect/Modifier {} used in wrong scope. In {} but expect {} | A trigger, effect, or modifier rule was used in the wrong scope. | Emitted |
 | CW248 | Error | Invalid scope command {} | A scope command is not valid here. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
-| CW249 | Warning | Expecting a variable or number | A field required a variable reference or numeric literal but got something else. | Defined, emission pending (rare F# `changeScope` NotFound edge; the common unknown-variable case is CW246) |
 
 ### CW250-CW253 -- Game-specific: planet_killer, boolean, flag, set_name
 
@@ -195,15 +187,6 @@ CW501 (duplicate type) and CW502 (unused type) were Rust-invented IDs that have 
 
 ---
 
-## CW998-CW999 -- Internal and custom rule errors
-
-| ID | Severity | Message | Meaning | Status |
-|---|---|---|---|---|
-| CW998 | Error | {} | An internal rules-engine error (malformed rule definition, etc.). | Defined, not wired (rules loader does not surface internal errors as diagnostics yet) |
-| CW999 | Error | {} | A custom user error from a `.cwt` rule file. | Defined, not wired (needs the custom-error rule option) |
-
----
-
 ## Reconciliations
 
 These are intentional ID renumberings documented in `error_codes.rs`. All converge Rust-invented codes onto their F# equivalents so downstream baselines key off a single consistent number.
@@ -219,12 +202,13 @@ These are intentional ID renumberings documented in `error_codes.rs`. All conver
 
 ## Currently not emitted (pending subsystems)
 
-Every one of F#'s 71 codes has a Rust definition (full ID parity). The codes
-below are defined but not yet emitted: each needs a subsystem Rust doesn't have
-yet, and wiring it without that machinery would false-positive on valid game
-config (which the project forbids). They are kept so only the emission site
-remains to be built. None are HOI4/Millennium Dawn blockers; most are
-Stellaris/other-game checks that need that game's corpus to validate.
+63 of F#'s 71 codes have a Rust definition (see the note near the top of this
+doc for the other 8). The codes below are defined but not yet emitted: each
+needs a subsystem Rust doesn't have yet, and wiring it without that machinery
+would false-positive on valid game config (which the project forbids). They
+are kept so only the emission site remains to be built. None are HOI4/Millennium
+Dawn blockers; most are Stellaris/other-game checks that need that game's
+corpus to validate.
 
 | Subsystem needed | Codes blocked |
 |---|---|
@@ -233,7 +217,6 @@ Stellaris/other-game checks that need that game's corpus to validate.
 | Cross-file reference tracking (unused type / tech) | CW231, CW239 |
 | List-merge optimisation hint | CW269 |
 | Modifier-type registry | CW273 |
-| Variable index edge (CW246 is wired + gated; CW249 is F#'s rare `changeScope` NotFound case) | CW249 |
 
 ### Wired, runs by default (with an escape hatch)
 

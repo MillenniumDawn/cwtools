@@ -268,21 +268,8 @@ impl Backend {
                     info.find_references(&symbol).unwrap_or_default(),
                 )
             };
-            let indexed_references = {
-                let index = self.state.symbol_index.lock();
-                index.find_references(&symbol).cloned().unwrap_or_default()
-            };
             let mut all_locs = locations_at(self, definitions, &symbol, fallback);
             all_locs.extend(locations_at(self, references, &symbol, fallback));
-            all_locs.extend(indexed_references.into_iter().map(|l| Location {
-                uri: parse_uri(&l.uri, fallback),
-                range: self.source_range_at(
-                    &l.uri,
-                    l.line.saturating_sub(1),
-                    l.col as u32,
-                    &symbol,
-                ),
-            }));
             if !all_locs.is_empty() {
                 return Ok(Some(all_locs));
             }
@@ -300,12 +287,8 @@ impl Backend {
         type_name: &str,
         instance_name: &str,
     ) -> Vec<(String, cwtools_info::SourceLocation)> {
-        let open_uris: HashSet<String> = {
-            let docs = self.state.documents.lock();
-            docs.keys().cloned().collect()
-        };
         let mut sites: Vec<(String, cwtools_info::SourceLocation)> = Vec::new();
-        {
+        let open_uris: HashSet<String> = {
             let docs = self.state.documents.lock();
             let rules_guard = self.state.rules.read();
             let ws_prefix = self.state.config.read().workspace_prefix.clone();
@@ -319,7 +302,8 @@ impl Backend {
                     &self.state.string_table,
                 ));
             }
-        }
+            docs.keys().cloned().collect()
+        };
         {
             let info = self.state.info_service.read();
             for (file_uri, loc) in info.reference_index.references(type_name, instance_name) {
@@ -381,7 +365,7 @@ impl Backend {
 
     /// The current text of `uri`: the open-doc buffer if open, else read from
     /// disk (encoding-aware). `None` when neither is available.
-    fn file_text_for(&self, uri: &str) -> Option<String> {
+    pub(crate) fn file_text_for(&self, uri: &str) -> Option<String> {
         {
             let docs = self.state.documents.lock();
             if let Some(doc) = docs.get(uri) {
@@ -468,9 +452,11 @@ impl Backend {
         };
         // The identifier under the cursor: prefer the rule-resolved type-ref
         // instance name, falling back to the raw token in the text.
-        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let (ws_prefix, position_encoding) = {
+            let cfg = self.state.config.read();
+            (cfg.workspace_prefix.clone(), cfg.position_encoding.clone())
+        };
         let logical_path = logical_path_from_uri(&uri, &ws_prefix);
-        let position_encoding = self.state.config.read().position_encoding.clone();
         let (_, source_col) = lsp_pos_to_source_in_text(&text, pos, &position_encoding);
         let symbol = self
             .type_ref_at_cursor(&uri, pos, &logical_path)
@@ -599,22 +585,20 @@ impl Backend {
         let indexed_symbols = {
             let info = self.state.info_service.read();
             let mut entries = Vec::new();
-            for (type_name, instances) in &info.type_index.map {
+            'scan: for (type_name, instances) in &info.type_index.map {
                 for (file_uri, inst) in instances {
-                    if query.is_empty() || inst.name.to_lowercase().contains(&query) {
-                        entries.push((
-                            type_name.clone(),
-                            file_uri.to_string(),
-                            inst.name.clone(),
-                            inst.location,
-                        ));
+                    if !query.is_empty() && !name_contains_ignore_case(&inst.name, &query) {
+                        continue;
                     }
+                    entries.push((
+                        type_name.clone(),
+                        file_uri.to_string(),
+                        inst.name.clone(),
+                        inst.location,
+                    ));
                     if entries.len() >= 500 {
-                        break;
+                        break 'scan;
                     }
-                }
-                if entries.len() >= 500 {
-                    break;
                 }
             }
             entries
@@ -848,6 +832,7 @@ fn scan_ast_for_type_ref(
                 cwtools_info::SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
                 },
             ));
         }
@@ -926,6 +911,24 @@ fn dedup_locations(locs: Vec<Location>) -> Vec<Location> {
         .collect()
 }
 
+/// Case-insensitive substring test for the `workspace/symbol` query, run over
+/// every instance in the type index. `query` must already be lowercased.
+/// Instance names are ASCII-dominant, so the common case is matched by
+/// ASCII-folding bytes with no allocation; a name containing non-ASCII bytes
+/// falls back to `to_lowercase().contains(..)` so multi-byte case folding
+/// still matches (results are identical to that for every input, just not
+/// allocation-free).
+fn name_contains_ignore_case(name: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    if !name.is_ascii() {
+        return name.to_lowercase().contains(query);
+    }
+    let (n, q) = (name.as_bytes(), query.as_bytes());
+    q.len() <= n.len() && n.windows(q.len()).any(|w| w.eq_ignore_ascii_case(q))
+}
+
 /// Whether `c` continues an identifier token (bare id charset plus `.` for
 /// dotted event ids). Used to word-bound the token searches below.
 fn is_ident_char(c: char) -> bool {
@@ -961,7 +964,7 @@ fn all_token_cols_in_line(line: &str, name: &str) -> Vec<u32> {
 /// (the operator of a `key = value` leaf; also the `=` in `>=`/`?=`/etc.). The
 /// value token scan starts here so nothing in the key can be mistaken for the
 /// value. `None` when no `=` follows the key.
-fn value_start_after_eq(line: &str, key_col: u32) -> Option<u32> {
+pub(crate) fn value_start_after_eq(line: &str, key_col: u32) -> Option<u32> {
     line.chars()
         .enumerate()
         .skip(key_col as usize)
@@ -975,7 +978,7 @@ fn value_start_after_eq(line: &str, key_col: u32) -> Option<u32> {
 /// trailing comment (`x = MY_FOCUS # keep MY_FOCUS`) or a second `key = value`
 /// pair later on the line can't be mistaken for the value. Quoted values
 /// (`"MY_FOCUS"`) match the inner token. `None` when `name` doesn't occur here.
-fn value_col_in_line(line: &str, name: &str, from: u32) -> Option<u32> {
+pub(crate) fn value_col_in_line(line: &str, name: &str, from: u32) -> Option<u32> {
     let chars: Vec<char> = line.chars().collect();
     let needle: Vec<char> = name.chars().collect();
     if needle.is_empty() {
@@ -1285,6 +1288,24 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn name_contains_ignore_case_matches_ascii_case_insensitively() {
+        assert!(name_contains_ignore_case("Ship_Hull_Submarine", "hull_sub"));
+        assert!(name_contains_ignore_case("Ship_Hull_Submarine", ""));
+        assert!(!name_contains_ignore_case("Ship_Hull_Submarine", "cruiser"));
+        assert!(!name_contains_ignore_case("abc", "abcd"));
+    }
+
+    #[test]
+    fn name_contains_ignore_case_falls_back_for_non_ascii_names() {
+        // Matches the old `to_lowercase().contains(..)` behavior exactly, just
+        // via the slow path (Turkish İ lowercases to "i̇", not ASCII "i").
+        let name = "İstanbul";
+        let query = name.to_lowercase();
+        assert!(name_contains_ignore_case(name, &query));
+        assert!(!name_contains_ignore_case(name, "nomatch"));
     }
 
     #[test]

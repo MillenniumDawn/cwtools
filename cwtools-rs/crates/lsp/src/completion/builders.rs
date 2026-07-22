@@ -7,7 +7,8 @@ use cwtools_game::scope_engine::{SCOPE_ANY, ScopeId};
 use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_info::InfoService;
 use cwtools_rules::rules_types::{
-    NewField, ParsedAliasPattern, PatternKind, RootRule, RuleSet, RuleType, TypeType, ValueType,
+    NewField, ParsedAliasPattern, PatternKind, RootRule, RuleSet, RuleType, SubTypeDefinition,
+    TypeType, ValueType,
 };
 use cwtools_validation::scope_matches_required;
 
@@ -542,6 +543,15 @@ enum TypeInstanceStyle {
     Reference,
 }
 
+/// Look up a subtype-qualified type reference (`t` = `"type.subtype"`, as built
+/// for `<type.subtype>` back-references — see `cwtools_validation::subtype`).
+/// `None` when `t` isn't dotted or doesn't resolve to a real type/subtype pair.
+fn find_subtype<'a>(ruleset: &'a RuleSet, t: &str) -> Option<&'a SubTypeDefinition> {
+    let (base, sub) = t.split_once('.')?;
+    let &i = ruleset.type_by_name.get(base)?;
+    ruleset.types[i].subtypes.iter().find(|st| st.name == sub)
+}
+
 /// Emit one completion item per known instance of `t`. Shared by the typed-key
 /// arms (which complete to `name = …` snippets) and the bare type-reference
 /// value arm (which offers the instance name directly).
@@ -587,13 +597,30 @@ fn push_type_instances(
 /// Recompute a `<type>` instance item's `detail` on `completionItem/resolve`.
 /// `None` when `name` is no longer a known instance of `t` (best-effort: the
 /// item is left untouched rather than showing detail for a vanished
-/// instance).
-pub(crate) fn type_instance_detail(info: &InfoService, t: &str, name: &str) -> Option<String> {
+/// instance). When `t` is subtype-qualified (`"type.subtype"`) and the subtype
+/// declares a `## display_name`, it replaces the raw subtype name in the text.
+pub(crate) fn type_instance_detail(
+    ruleset: Option<&RuleSet>,
+    info: &InfoService,
+    t: &str,
+    name: &str,
+) -> Option<String> {
     info.type_index
         .instances(t)
         .iter()
         .any(|(_, inst)| inst.name == name)
-        .then(|| format!("{} instance", t))
+        .then(|| {
+            let display_name = ruleset
+                .and_then(|rs| find_subtype(rs, t))
+                .and_then(|st| st.display_name.as_deref());
+            match display_name {
+                Some(d) => {
+                    let base = t.split_once('.').map_or(t, |(base, _)| base);
+                    format!("{}.{} instance", base, d)
+                }
+                None => format!("{} instance", t),
+            }
+        })
 }
 
 /// Emit the keys of all `alias:<cat>` entries, labelled with the category
@@ -1813,7 +1840,11 @@ mod resolve_data_tests {
             "state".to_string(),
             vec![cwtools_info::TypeInstance {
                 name: "STATE_1".to_string(),
-                location: cwtools_info::SourceLocation { line: 1, col: 0 },
+                location: cwtools_info::SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -1839,8 +1870,91 @@ mod resolve_data_tests {
         );
         // The OLD eager path built exactly `format!("{} instance", t)`.
         assert_eq!(
-            type_instance_detail(&info, "state", "STATE_1").as_deref(),
+            type_instance_detail(None, &info, "state", "STATE_1").as_deref(),
             Some("state instance")
+        );
+    }
+
+    /// A `RuleSet` with one type declaring one subtype, matching the shape a
+    /// `<type.subtype>` back-reference resolves against (see
+    /// `cwtools_validation::subtype::collect_subtype_instances`).
+    fn ruleset_with_subtype(
+        type_name: &str,
+        subtype_name: &str,
+        display_name: Option<&str>,
+    ) -> RuleSet {
+        let mut rs = RuleSet::new();
+        rs.types.push(cwtools_rules::rules_types::TypeDefinition {
+            name: type_name.to_string(),
+            name_field: None,
+            path_options: cwtools_rules::rules_types::PathOptions::default(),
+            subtypes: vec![SubTypeDefinition {
+                name: subtype_name.to_string(),
+                display_name: display_name.map(str::to_string),
+                abbreviation: None,
+                rules: Vec::new(),
+                type_key_field: None,
+                starts_with: None,
+                push_scope: None,
+                localisation: Vec::new(),
+                only_if_not: Vec::new(),
+                modifiers: Vec::new(),
+                type_key_filter: Vec::new(),
+            }],
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: false,
+            localisation: Vec::new(),
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        });
+        rs.reindex();
+        rs
+    }
+
+    fn merge_one_instance(info: &mut InfoService, key: &str, name: &str) {
+        let mut per_type: HashMap<String, Vec<cwtools_info::TypeInstance>> = HashMap::new();
+        per_type.insert(
+            key.to_string(),
+            vec![cwtools_info::TypeInstance {
+                name: name.to_string(),
+                location: cwtools_info::SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
+                primary_loc_key: None,
+            }],
+        );
+        info.type_index.merge("file:///x.txt", per_type);
+    }
+
+    #[test]
+    fn type_instance_detail_prefers_subtype_display_name() {
+        let rs = ruleset_with_subtype("event", "country", Some("Country Event"));
+        let mut info = InfoService::new();
+        merge_one_instance(&mut info, "event.country", "my_event");
+
+        assert_eq!(
+            type_instance_detail(Some(&rs), &info, "event.country", "my_event").as_deref(),
+            Some("event.Country Event instance")
+        );
+    }
+
+    #[test]
+    fn type_instance_detail_unchanged_without_display_name() {
+        let rs = ruleset_with_subtype("event", "country", None);
+        let mut info = InfoService::new();
+        merge_one_instance(&mut info, "event.country", "my_event");
+
+        assert_eq!(
+            type_instance_detail(Some(&rs), &info, "event.country", "my_event").as_deref(),
+            Some("event.country instance")
         );
     }
 

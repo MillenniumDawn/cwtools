@@ -25,7 +25,7 @@ nested = {
     // Reload via the archived path and convert back to an arena.
     let table2 = StringTable::new();
     let (arena2, root2) = io::with_archived_file(tmp.path(), |archived| {
-        convert::archived_to_arena(archived, &table2)
+        convert::archived_to_arena(archived, &table2).unwrap()
     })
     .unwrap();
 
@@ -52,7 +52,7 @@ fn roundtrip_real_file() {
 
     let table2 = StringTable::new();
     let (arena2, root2) = io::with_archived_file(tmp.path(), |archived| {
-        convert::archived_to_arena(archived, &table2)
+        convert::archived_to_arena(archived, &table2).unwrap()
     })
     .unwrap();
 
@@ -96,7 +96,7 @@ key_a key_b = { x = 1 }
     io::serialize_to_file(&cached, tmp.path()).unwrap();
     let arch_table = StringTable::new();
     let (arch_arena, _) = io::with_archived_file(tmp.path(), |archived| {
-        convert::archived_to_arena(archived, &arch_table)
+        convert::archived_to_arena(archived, &arch_table).unwrap()
     })
     .unwrap();
 
@@ -185,7 +185,7 @@ fn archived_to_arena_matches_reference_over_corpus() {
 
         let arch_table = StringTable::new();
         let (arch_arena, arch_root) = io::with_archived_file(tmp.path(), |archived| {
-            convert::archived_to_arena(archived, &arch_table)
+            convert::archived_to_arena(archived, &arch_table).unwrap()
         })
         .unwrap();
 
@@ -305,7 +305,7 @@ fn roundtrip_all_performancetest_files() {
 
         let table2 = StringTable::new();
         let (arena2, root2) = io::with_archived_file(tmp.path(), |archived| {
-            convert::archived_to_arena(archived, &table2)
+            convert::archived_to_arena(archived, &table2).unwrap()
         })
         .unwrap();
 
@@ -347,5 +347,37 @@ fn roundtrip_all_performancetest_files() {
         total_files >= 60,
         "Expected at least 60 files, got {}",
         total_files
+    );
+}
+
+/// A cache whose child index points past the arena vectors must be rejected at
+/// the load boundary. rkyv access still succeeds (the raw u32 is a valid
+/// archive), so without the bounds check the structurally-inconsistent arena
+/// leaks out and panics when a downstream consumer indexes it (e.g.
+/// `Arena::keyed_clause`), crashing the process instead of degrading to a
+/// cache-miss re-parse.
+#[test]
+fn out_of_bounds_child_index_is_rejected() {
+    use cwtools_cache::cache_format::{CachedChild, CachedFile};
+
+    // Root references leaf 0, but there are no leaves: index 0 is out of bounds.
+    let cached = CachedFile {
+        root_children: vec![CachedChild::Leaf(0)],
+        leaves: vec![],
+        leaf_values: vec![],
+        comments: vec![],
+    };
+    let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
+    io::serialize_to_file(&cached, tmp.path()).unwrap();
+
+    let table = StringTable::new();
+    let result = io::with_archived_file(tmp.path(), |archived| {
+        convert::archived_to_arena(archived, &table)
+    })
+    .expect("header and rkyv access should succeed");
+
+    assert!(
+        result.is_err(),
+        "out-of-bounds child index must be rejected at load, got Ok"
     );
 }

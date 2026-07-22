@@ -4,8 +4,6 @@ use cwtools_string_table::string_table::StringTable;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub mod inline_expansion;
-
 // The index half of this crate now lives in `cwtools_index`. Re-export it so
 // existing `cwtools_info::TypeIndex` / `cwtools_info::collect_type_instances`
 // (and the rest) keep resolving for the LSP/CLI callers.
@@ -127,17 +125,12 @@ pub struct FileInfo {
     pub defined_variables_ns: HashMap<String, Vec<DefinedVariable>>,
     /// Classic @-var lookup (kept for LSP compatibility).
     pub defined_variables: HashMap<String, SourceLocation>,
-    /// Effect blocks (heuristic).
-    pub effect_blocks: Vec<SourceLocation>,
-    pub trigger_blocks: Vec<SourceLocation>,
     /// Saved event targets with position.
     pub saved_event_targets_detailed: Vec<SavedEventTarget>,
     /// Saved event targets (heuristic set, kept for LSP compatibility).
     pub saved_event_targets: HashSet<String>,
     /// Inline scripts referenced.
     pub inline_scripts: HashMap<String, SourceLocation>,
-    /// All top-level keys.
-    pub top_level_keys: Vec<(String, SourceLocation)>,
     /// Order-independent hash of this file's exported type instances
     /// (`(type, name)` pairs), computed at index time from the per-file
     /// instance map so the cross-file "did exports change?" check doesn't have
@@ -348,6 +341,7 @@ fn collect_type_ref_uses(
                     SourceLocation {
                         line: leaf.pos.start.line,
                         col: leaf.pos.start.col,
+                        end: (leaf.pos.end.line, leaf.pos.end.col),
                     },
                 ));
             }
@@ -780,7 +774,6 @@ impl InfoService {
 
             Self::record_saved_event_target(leaf, &key, &value_str, info);
             Self::record_inline_script(leaf, arena, table, &key, info);
-            Self::record_effect_trigger_block(leaf, &key, info);
 
             // Owned consumer last so `key` moves in rather than clones. An
             // `@`-prefixed key never matches any of the borrow-only checks above,
@@ -789,32 +782,25 @@ impl InfoService {
         }
     }
 
-    /// Record a clause leaf as a top-level key, and as a type definition when
-    /// its key names a known type.
+    /// Record a clause leaf as a type definition when its key names a known
+    /// type.
     fn record_top_level_key<S: std::hash::BuildHasher>(
         leaf: &cwtools_parser::ast::Leaf,
         key: &str,
         type_names: &HashMap<String, usize, S>,
         info: &mut FileInfo,
     ) {
-        if let Value::Clause(_) = &leaf.value {
-            info.top_level_keys.push((
-                key.to_string(),
-                SourceLocation {
+        if let Value::Clause(_) = &leaf.value
+            && type_names.contains_key(key)
+        {
+            info.type_definitions
+                .entry(key.to_string())
+                .or_default()
+                .push(SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
-                },
-            ));
-
-            if type_names.contains_key(key) {
-                info.type_definitions
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(SourceLocation {
-                        line: leaf.pos.start.line,
-                        col: leaf.pos.start.col,
-                    });
-            }
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
+                });
         }
     }
 
@@ -832,6 +818,7 @@ impl InfoService {
                 .push(SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
                 });
         }
     }
@@ -859,6 +846,7 @@ impl InfoService {
                 location: SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
                 },
                 is_global: key == "save_global_event_target_as",
             });
@@ -888,32 +876,13 @@ impl InfoService {
                                 SourceLocation {
                                     line: script_leaf.pos.start.line,
                                     col: script_leaf.pos.start.col,
+                                    end: (script_leaf.pos.end.line, script_leaf.pos.end.col),
                                 },
                             );
                         }
                     }
                 }
             }
-        }
-    }
-
-    /// Record `effect`/`*_effect` and `trigger`/`*_trigger` block positions.
-    fn record_effect_trigger_block(
-        leaf: &cwtools_parser::ast::Leaf,
-        key: &str,
-        info: &mut FileInfo,
-    ) {
-        if key == "effect" || key.ends_with("_effect") {
-            info.effect_blocks.push(SourceLocation {
-                line: leaf.pos.start.line,
-                col: leaf.pos.start.col,
-            });
-        }
-        if key == "trigger" || key.ends_with("_trigger") {
-            info.trigger_blocks.push(SourceLocation {
-                line: leaf.pos.start.line,
-                col: leaf.pos.start.col,
-            });
         }
     }
 
@@ -925,6 +894,7 @@ impl InfoService {
                 SourceLocation {
                     line: leaf.pos.start.line,
                     col: leaf.pos.start.col,
+                    end: (leaf.pos.end.line, leaf.pos.end.col),
                 },
             );
         }
@@ -1172,7 +1142,11 @@ mod tests {
             "event".to_string(),
             vec![TypeInstance {
                 name: "my_event".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -1192,7 +1166,11 @@ mod tests {
             "event".to_string(),
             vec![TypeInstance {
                 name: "ev1".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -1217,7 +1195,11 @@ mod tests {
             "character".to_string(),
             vec![TypeInstance {
                 name: "GER_some_char".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -1245,7 +1227,11 @@ mod tests {
             "ai_behavior".to_string(),
             vec![TypeInstance {
                 name: "LBA_ai_behavior".to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             }],
         );
@@ -1472,7 +1458,11 @@ alias[effect:set_temp_variable] = {
         let mut file_info = FileInfo::default();
         file_info.defined_variables.insert(
             "my_var".to_string(),
-            cwtools_index::SourceLocation { line: 1, col: 0 },
+            cwtools_index::SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
         );
         // Populate defined_variables_ns so that clear_file's refcount path fires.
         file_info.defined_variables_ns.insert(
@@ -1480,7 +1470,11 @@ alias[effect:set_temp_variable] = {
             vec![cwtools_index::DefinedVariable {
                 name: "my_var".to_string(),
                 namespace: None,
-                location: cwtools_index::SourceLocation { line: 1, col: 0 },
+                location: cwtools_index::SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 value: None,
             }],
         );

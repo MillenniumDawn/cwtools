@@ -52,6 +52,8 @@ impl Backend {
                 .state
                 .hover_debug
                 .load(std::sync::atomic::Ordering::Relaxed);
+            // Lock order: rules -> info_service -> loc_text.
+            let rules_guard = self.state.rules.read();
             // `resolved_scope` is already `None` unless the resolved setting
             // is on (computed in rule_info_at_cursor).
             let mut md = build_hover_markdown(
@@ -68,6 +70,7 @@ impl Backend {
                     resolved: resolved_scope.as_deref(),
                 },
                 debug,
+                rules_guard.ruleset.as_deref(),
             );
             // For a variable read, append the known assigned value(s) so the
             // user sees what it resolves to without chasing the definition.
@@ -91,8 +94,6 @@ impl Backend {
             // …) shows the localised title, resolved from the captured
             // explicit-field key or a name-derived key. (#40)
             if let ReferenceHint::TypeRef { type_name, value } = &hint {
-                // Lock order: rules -> info_service -> loc_text.
-                let rules_guard = self.state.rules.read();
                 let info_guard = self.state.info_service.read();
                 let loc_text = self.state.loc_text.read();
                 if let Some(ruleset) = rules_guard.ruleset.as_ref() {
@@ -204,6 +205,33 @@ pub(crate) struct ScopeTable<'a> {
     pub resolved: Option<&'a str>,
 }
 
+/// If `type_name` is a subtype-qualified reference (`"type.subtype"`, from a
+/// `<type.subtype>` back-reference) and the ruleset's subtype declares a
+/// `## display_name`, swap it in for the raw subtype name. Otherwise returns
+/// `type_name` unchanged. Mirrors `completion::builders::find_subtype`, kept
+/// local since hover isn't a descendant of the completion module.
+fn display_type_name(
+    ruleset: Option<&cwtools_rules::rules_types::RuleSet>,
+    type_name: &str,
+) -> String {
+    let Some((base, sub)) = type_name.split_once('.') else {
+        return type_name.to_string();
+    };
+    let display = ruleset.and_then(|rs| {
+        let &i = rs.type_by_name.get(base)?;
+        rs.types[i]
+            .subtypes
+            .iter()
+            .find(|st| st.name == sub)?
+            .display_name
+            .as_deref()
+    });
+    match display {
+        Some(d) => format!("{}.{}", base, d),
+        None => type_name.to_string(),
+    }
+}
+
 /// Build a Markdown hover string from the classified element + the matched
 /// rule's category, description, and required scopes (from
 /// `rule_info_at_cursor`).
@@ -213,6 +241,7 @@ pub(crate) struct ScopeTable<'a> {
 /// scopes (plus localisation, appended by the caller). When `debug` is set the
 /// raw rule classification (`Type reference` / `Field` / `Scope` / …) is added —
 /// useful for extension developers, noise for everyone else.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_hover_markdown(
     element: &PositionElement,
     hint: &ReferenceHint,
@@ -221,6 +250,7 @@ pub(crate) fn build_hover_markdown(
     rule_scopes: &[String],
     scopes: ScopeTable<'_>,
     debug: bool,
+    ruleset: Option<&cwtools_rules::rules_types::RuleSet>,
 ) -> String {
     // Section 1 — identity + documentation ("what it is"): the alias-category
     // header (so a trigger reads as a trigger), the raw classification when
@@ -238,7 +268,11 @@ pub(crate) fn build_hover_markdown(
     if debug {
         let line = match hint {
             ReferenceHint::TypeRef { type_name, value } => {
-                format!("**Type reference** — `{}` (`{}`)", value, type_name)
+                format!(
+                    "**Type reference** — `{}` (`{}`)",
+                    value,
+                    display_type_name(ruleset, type_name)
+                )
             }
             ReferenceHint::EnumRef { enum_name, value } => {
                 format!("**Enum value** — `{}` (member of `{}`)", value, enum_name)
@@ -402,10 +436,97 @@ mod tests {
             &[],
             ScopeTable::default(),
             true,
+            None,
         );
         assert!(md.contains("Type reference"), "got: {}", md);
         assert!(md.contains("my_ethos"), "got: {}", md);
         assert!(md.contains("ethoses"), "got: {}", md);
+    }
+
+    /// A `RuleSet` with one type declaring one subtype, matching the
+    /// `"type.subtype"` shape a `<type.subtype>` back-reference resolves to.
+    fn ruleset_with_subtype(display_name: Option<&str>) -> cwtools_rules::rules_types::RuleSet {
+        use cwtools_rules::rules_types::{PathOptions, RuleSet, SubTypeDefinition, TypeDefinition};
+
+        let mut rs = RuleSet::new();
+        rs.types.push(TypeDefinition {
+            name: "event".to_string(),
+            name_field: None,
+            path_options: PathOptions::default(),
+            subtypes: vec![SubTypeDefinition {
+                name: "country".to_string(),
+                display_name: display_name.map(str::to_string),
+                abbreviation: None,
+                rules: Vec::new(),
+                type_key_field: None,
+                starts_with: None,
+                push_scope: None,
+                localisation: Vec::new(),
+                only_if_not: Vec::new(),
+                modifiers: Vec::new(),
+                type_key_filter: Vec::new(),
+            }],
+            type_key_filter: None,
+            skip_root_key: Vec::new(),
+            starts_with: None,
+            type_per_file: false,
+            key_prefix: None,
+            warning_only: false,
+            unique: false,
+            should_be_referenced: false,
+            localisation: Vec::new(),
+            graph_related_types: Vec::new(),
+            modifiers: Vec::new(),
+        });
+        rs.reindex();
+        rs
+    }
+
+    #[test]
+    fn test_hover_type_ref_prefers_subtype_display_name() {
+        let rs = ruleset_with_subtype(Some("Country Event"));
+        let md = build_hover_markdown(
+            &PositionElement::Leaf {
+                key: "add_ideas".to_string(),
+                value: "my_event".to_string(),
+            },
+            &ReferenceHint::TypeRef {
+                type_name: "event.country".to_string(),
+                value: "my_event".to_string(),
+            },
+            None,
+            None,
+            &[],
+            ScopeTable::default(),
+            true,
+            Some(&rs),
+        );
+        assert!(md.contains("event.Country Event"), "got: {}", md);
+        assert!(!md.contains("`event.country`"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_type_ref_unchanged_without_display_name() {
+        // No `## display_name` declared: the raw "type.subtype" string shows,
+        // same as before this field was wired in.
+        let rs = ruleset_with_subtype(None);
+        let md = build_hover_markdown(
+            &PositionElement::Leaf {
+                key: "add_ideas".to_string(),
+                value: "my_event".to_string(),
+            },
+            &ReferenceHint::TypeRef {
+                type_name: "event.country".to_string(),
+                value: "my_event".to_string(),
+            },
+            None,
+            None,
+            &[],
+            ScopeTable::default(),
+            true,
+            Some(&rs),
+        );
+        assert!(md.contains("`event.country`"), "got: {}", md);
     }
 
     #[test]
@@ -426,6 +547,7 @@ mod tests {
             &["country".to_string()],
             ScopeTable::default(),
             false,
+            None,
         );
         assert!(!md.contains("Type reference"), "should hide debug: {}", md);
         assert!(md.contains("Pick an ethos"), "got: {}", md);
@@ -448,6 +570,7 @@ mod tests {
             &[],
             ScopeTable::default(),
             true,
+            None,
         );
         assert!(md.contains("Enum value"), "got: {}", md);
         assert!(md.contains("alpha"), "got: {}", md);
@@ -467,6 +590,7 @@ mod tests {
             &[],
             ScopeTable::default(),
             true,
+            None,
         );
         assert!(md.contains("foo") && md.contains("bar"), "got: {}", md);
     }
@@ -487,6 +611,7 @@ mod tests {
             &["country".to_string()],
             ScopeTable::default(),
             false,
+            None,
         );
         assert!(md.contains("The kind of this thing"), "got: {}", md);
         assert!(md.contains("Required scopes"), "got: {}", md);
@@ -510,6 +635,7 @@ mod tests {
                 ..Default::default()
             },
             false,
+            None,
         );
         assert!(md.contains("**Scope**: country"), "got: {}", md);
     }
@@ -535,6 +661,7 @@ mod tests {
                 resolved: None,
             },
             false,
+            None,
         );
         assert!(md.contains("**Scope**: state"), "got: {}", md);
         assert!(md.contains("**Root**: country"), "got: {}", md);
@@ -564,6 +691,7 @@ mod tests {
                 resolved: None,
             },
             false,
+            None,
         );
         assert!(
             md.contains("---"),
@@ -593,6 +721,7 @@ mod tests {
                 resolved: Some("country"),
             },
             false,
+            None,
         );
         assert!(md.contains("**Resolves to**: country"), "got: {}", md);
     }
@@ -618,6 +747,7 @@ mod tests {
                 resolved: None,
             },
             false,
+            None,
         );
         assert!(md.contains("**Scope**: country"), "got: {}", md);
         assert!(!md.contains("**Root**"), "got: {}", md);

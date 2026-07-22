@@ -15,7 +15,7 @@ use crate::{dec_ref, unquote};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cwtools_parser::ast::{Child, ParsedFile, Value};
+use cwtools_parser::ast::{Child, Leaf, ParsedFile, Value};
 use cwtools_rules::rules_types::{ComplexEnumNameTree, ComplexEnumNameTreeEntry, RuleSet};
 use cwtools_string_table::string_table::{StringId, StringTable};
 
@@ -275,97 +275,122 @@ fn collect_value_sets_in(
     table: &StringTable,
     out: &mut HashMap<String, Vec<String>>,
 ) {
-    thread_local! {
-        static LOWER_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-    }
     for child in children {
         let Child::Leaf(idx) = child else { continue };
         let leaf = &ast.arena.leaves[*idx as usize];
-        let ns = table
-            .with_string(leaf.key.normal, |s| {
-                // Lowercase into a reused thread-local buffer instead of allocating
-                // a String per leaf just to probe the (lowercased-key) effect map.
-                LOWER_BUF.with(|buf| {
-                    let mut key = buf.borrow_mut();
-                    key.clear();
-                    key.extend(s.chars().map(|c| c.to_ascii_lowercase()));
-                    ruleset.value_set_effects.get(key.as_str()).cloned()
-                })
-            })
-            .flatten();
-        match (&leaf.value, ns) {
-            // Variables have their own collection path (CW246 + completion via
-            // all_variables); skip them here to avoid double-storing 100k names.
-            (_, Some(ns)) if ns == "variable" => {}
-            (Value::String(t) | Value::QString(t), Some(ns)) => {
-                table.with_string(t.normal, |v| push_member(out, ns, v));
-            }
-            (Value::Clause(sub), Some(ns)) => {
-                // Block form: the member is the value of the child bound to
-                // `value_set[ns]` in the rules (e.g. `flag`, `token_base`, `id`).
-                let bindings = table
-                    .with_string(leaf.key.normal, |s| {
-                        LOWER_BUF.with(|buf| {
-                            let mut key = buf.borrow_mut();
-                            key.clear();
-                            key.extend(s.chars().map(|c| c.to_ascii_lowercase()));
-                            ruleset.value_set_effect_fields.get(key.as_str()).cloned()
-                        })
-                    })
-                    .flatten();
-                if let Some(bindings) = bindings.filter(|b| !b.is_empty()) {
-                    // Capture every binding field's value into its declared set.
-                    // A single block can bind several sets (different keys → sets).
-                    for c in sub {
-                        let Child::Leaf(cidx) = c else { continue };
-                        let cl = &ast.arena.leaves[*cidx as usize];
-                        let (Value::String(t) | Value::QString(t)) = &cl.value else {
-                            continue;
-                        };
-                        let field_ns = table
-                            .with_string(cl.key.normal, |s| {
-                                bindings
-                                    .iter()
-                                    .find(|(fk, _)| s.eq_ignore_ascii_case(fk))
-                                    .map(|(_, n)| n.clone())
-                            })
-                            .flatten();
-                        if let Some(field_ns) = field_ns
-                            && field_ns != "variable"
-                        {
-                            table.with_string(t.normal, |v| push_member(out, field_ns, v));
-                        }
-                    }
-                } else {
-                    // No binding-field info — fall back to the fixed-key heuristic
-                    // for the common flag/name/token block shapes.
-                    const NAME_KEYS: &[&str] = &["flag", "name", "token", "var", "variable"];
-                    for c in sub {
-                        let Child::Leaf(cidx) = c else { continue };
-                        let cl = &ast.arena.leaves[*cidx as usize];
-                        let is_name_key = table
-                            .with_string(cl.key.normal, |s| {
-                                NAME_KEYS.iter().any(|k| s.eq_ignore_ascii_case(k))
-                            })
-                            .unwrap_or(false);
-                        if is_name_key
-                            && let Value::String(t) | Value::QString(t) = &cl.value
-                            && table
-                                .with_string(t.normal, |v| push_member(out, ns.clone(), v))
-                                .is_some()
-                        {
-                            break;
-                        }
-                    }
-                }
-                collect_value_sets_in(sub, ast, ruleset, table, out);
-            }
-            (Value::Clause(sub), None) => {
-                collect_value_sets_in(sub, ast, ruleset, table, out);
-            }
-            _ => {}
+        let ns = value_set_leaf(leaf, ast, ruleset, table, out);
+        // Descend into every clause EXCEPT a `variable`-namespace block, whose
+        // members are collected elsewhere (CW246 + `all_variables`).
+        if let Value::Clause(sub) = &leaf.value
+            && ns.as_deref() != Some("variable")
+        {
+            collect_value_sets_in(sub, ast, ruleset, table, out);
         }
     }
+}
+
+/// Non-recursive value-set work for one leaf child. Looks the leaf's key up in
+/// `value_set_effects`; if it names a set, captures the member from a scalar RHS
+/// or (block form) from the block's direct children — a binding-field match, or
+/// the fixed `flag`/`name`/`token`/… heuristic. Returns the namespace the key
+/// maps to so the caller can decide whether to descend (a `variable`-namespace
+/// block is skipped — variables have their own collection path). `None` when the
+/// key names no set.
+///
+/// The per-node core shared by [`collect_value_set_members`] and the fused index
+/// walk (`crate::collect`); the recursion into clause children stays with the
+/// caller so both walk shapes reuse it.
+pub(crate) fn value_set_leaf(
+    leaf: &Leaf,
+    ast: &ParsedFile,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    out: &mut HashMap<String, Vec<String>>,
+) -> Option<String> {
+    thread_local! {
+        static LOWER_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    let ns = table
+        .with_string(leaf.key.normal, |s| {
+            // Lowercase into a reused thread-local buffer instead of allocating
+            // a String per leaf just to probe the (lowercased-key) effect map.
+            LOWER_BUF.with(|buf| {
+                let mut key = buf.borrow_mut();
+                key.clear();
+                key.extend(s.chars().map(|c| c.to_ascii_lowercase()));
+                ruleset.value_set_effects.get(key.as_str()).cloned()
+            })
+        })
+        .flatten();
+    match (&leaf.value, ns.as_deref()) {
+        // Variables have their own collection path (CW246 + completion via
+        // all_variables); skip them here to avoid double-storing 100k names.
+        (_, Some("variable")) => {}
+        (Value::String(t) | Value::QString(t), Some(n)) => {
+            table.with_string(t.normal, |v| push_member(out, n.to_string(), v));
+        }
+        (Value::Clause(sub), Some(n)) => {
+            // Block form: the member is the value of the child bound to
+            // `value_set[ns]` in the rules (e.g. `flag`, `token_base`, `id`).
+            let bindings = table
+                .with_string(leaf.key.normal, |s| {
+                    LOWER_BUF.with(|buf| {
+                        let mut key = buf.borrow_mut();
+                        key.clear();
+                        key.extend(s.chars().map(|c| c.to_ascii_lowercase()));
+                        ruleset.value_set_effect_fields.get(key.as_str()).cloned()
+                    })
+                })
+                .flatten();
+            if let Some(bindings) = bindings.filter(|b| !b.is_empty()) {
+                // Capture every binding field's value into its declared set.
+                // A single block can bind several sets (different keys → sets).
+                for c in sub {
+                    let Child::Leaf(cidx) = c else { continue };
+                    let cl = &ast.arena.leaves[*cidx as usize];
+                    let (Value::String(t) | Value::QString(t)) = &cl.value else {
+                        continue;
+                    };
+                    let field_ns = table
+                        .with_string(cl.key.normal, |s| {
+                            bindings
+                                .iter()
+                                .find(|(fk, _)| s.eq_ignore_ascii_case(fk))
+                                .map(|(_, n)| n.clone())
+                        })
+                        .flatten();
+                    if let Some(field_ns) = field_ns
+                        && field_ns != "variable"
+                    {
+                        table.with_string(t.normal, |v| push_member(out, field_ns, v));
+                    }
+                }
+            } else {
+                // No binding-field info — fall back to the fixed-key heuristic
+                // for the common flag/name/token block shapes.
+                const NAME_KEYS: &[&str] = &["flag", "name", "token", "var", "variable"];
+                for c in sub {
+                    let Child::Leaf(cidx) = c else { continue };
+                    let cl = &ast.arena.leaves[*cidx as usize];
+                    let is_name_key = table
+                        .with_string(cl.key.normal, |s| {
+                            NAME_KEYS.iter().any(|k| s.eq_ignore_ascii_case(k))
+                        })
+                        .unwrap_or(false);
+                    if is_name_key
+                        && let Value::String(t) | Value::QString(t) = &cl.value
+                        && table
+                            .with_string(t.normal, |v| push_member(out, n.to_string(), v))
+                            .is_some()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    ns
 }
 
 #[cfg(test)]

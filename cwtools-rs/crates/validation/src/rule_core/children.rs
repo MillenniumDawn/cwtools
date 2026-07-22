@@ -4,7 +4,7 @@
 use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, Value};
 use cwtools_rules::rules_types::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::sync::LazyLock;
 
@@ -17,6 +17,7 @@ use super::alias::validate_alias_usage;
 use super::leaf::{check_variable_get, field_matches_value, validate_leaf};
 use super::matching::{get_rule_key, matching_candidates, rule_matches_leaf_key};
 use super::subtype_merge::flatten_nested_subtype_rules;
+use super::suggest::best_suggestion;
 
 /// True when a rule's left-hand field is `IgnoreField` (`key = ignore_field`),
 /// meaning the matched field/block is accepted without validating its contents.
@@ -54,17 +55,20 @@ fn validate_leaf_against_rule(
         // F# `ConfigRulesRuleWrongScope` (CW247): a trigger/effect/modifier rule
         // used in a scope it doesn't support. (Was the Rust-invented CW400.)
         let code = &error_codes::CW247_RULE_WRONG_SCOPE;
-        errors.push(ValidationError::from_code(
-            code,
-            ctx.file_path,
-            leaf.pos.start.line,
-            leaf.pos.start.col,
-            &[
-                key,
-                &sc.registry.name_of(current),
-                &opts.required_scopes.join(" or "),
-            ],
-        ));
+        errors.push(
+            ValidationError::from_code(
+                code,
+                ctx.file_path,
+                leaf.pos.start.line,
+                leaf.pos.start.col,
+                &[
+                    key,
+                    &sc.registry.name_of(current),
+                    &opts.required_scopes.join(" or "),
+                ],
+            )
+            .with_end(leaf.pos.end),
+        );
     }
     match rule_type {
         RuleType::LeafRule { left, .. } => {
@@ -98,13 +102,24 @@ fn validate_leaf_against_rule(
                         };
                         if is_default {
                             let code = &error_codes::CW282_REDUNDANT_DEFAULT_BOOL;
-                            errors.push(ValidationError::from_code(
-                                code,
-                                ctx.file_path,
-                                leaf.pos.start.line,
-                                leaf.pos.start.col,
-                                &[v],
-                            ));
+                            // Fix: delete the redundant `key = <default>` leaf.
+                            // `leaf.pos` spans key→value; its end lands at the next
+                            // token, taking the line and its newline with it.
+                            let fix = cwtools_parser::fix::SuggestedFix::delete(
+                                "Remove redundant default",
+                                leaf.pos,
+                            );
+                            errors.push(
+                                ValidationError::from_code(
+                                    code,
+                                    ctx.file_path,
+                                    leaf.pos.start.line,
+                                    leaf.pos.start.col,
+                                    &[v],
+                                )
+                                .with_fix(fix)
+                                .with_end(leaf.pos.end),
+                            );
                         }
                     });
                 }
@@ -148,13 +163,16 @@ fn validate_leaf_against_rule(
             } else {
                 // NodeRule (block expected) but the value is a scalar — kind mismatch.
                 let val_str = leaf_value_to_string(&leaf.value, ctx.table);
-                errors.push(ValidationError::from_code(
-                    &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE,
-                    ctx.file_path,
-                    leaf.pos.start.line,
-                    leaf.pos.start.col,
-                    &[key, &val_str],
-                ));
+                errors.push(
+                    ValidationError::from_code(
+                        &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE,
+                        ctx.file_path,
+                        leaf.pos.start.line,
+                        leaf.pos.start.col,
+                        &[key, &val_str],
+                    )
+                    .with_end(leaf.pos.end),
+                );
             }
         }
         _ => {}
@@ -162,31 +180,54 @@ fn validate_leaf_against_rule(
 }
 
 /// Run several candidate rules for one overloaded key as a disjunction: accept on
-/// the first clean match, otherwise surface the fewest-errors candidate. With a
-/// single candidate this is just a direct validation.
-fn pick_best_candidate<F>(mut validate_one: F, errors: &mut Vec<ValidationError>, n: usize)
-where
+/// the first clean match, otherwise surface the fewest-errors candidate.
+///
+/// `only_match_error(i)` returns the `## error_if_only_match` (CW272) custom error
+/// for candidate `i` when that rule carries the directive, and `None` otherwise.
+/// A directive-carrying candidate whose value matches cleanly is NOT an accept: it
+/// is held aside and surfaced only if no directive-free candidate also matches
+/// cleanly (a later clean, directive-free match still wins). Mirrors F#
+/// `errorIfOnlyMatch`, gated by `lazyErrorMerge` on the absence of a clean match.
+fn pick_best_candidate<F, G>(
+    mut validate_one: F,
+    mut only_match_error: G,
+    errors: &mut Vec<ValidationError>,
+    n: usize,
+) where
     F: FnMut(usize, &mut Vec<ValidationError>),
+    G: FnMut(usize) -> Option<ValidationError>,
 {
-    if n == 1 {
-        validate_one(0, errors);
-        return;
-    }
     let mut best: Option<Vec<ValidationError>> = None;
+    let mut only_match: Option<ValidationError> = None;
     let mut temp: Vec<ValidationError> = Vec::new();
     for i in 0..n {
         temp.clear();
         validate_one(i, &mut temp);
         if temp.is_empty() {
-            return; // clean match
-        }
-        match &best {
-            Some(b) if b.len() <= temp.len() => {}
-            // New best — take `temp`'s contents, leaving a reusable empty buffer.
-            _ => best = Some(std::mem::take(&mut temp)),
+            match only_match_error(i) {
+                // Clean match, but the rule says "error if this is the only match":
+                // keep it aside and keep scanning for a directive-free clean match.
+                Some(custom) => {
+                    if only_match.is_none() {
+                        only_match = Some(custom);
+                    }
+                }
+                None => return, // directive-free clean match — accept
+            }
+        } else {
+            match &best {
+                Some(b) if b.len() <= temp.len() => {}
+                // New best — take `temp`'s contents, leaving a reusable empty buffer.
+                _ => best = Some(std::mem::take(&mut temp)),
+            }
         }
     }
-    if let Some(b) = best {
+    // No directive-free clean match. A directive-carrying candidate that matched
+    // cleanly is the sole match → surface its custom error; otherwise fall back to
+    // the closest (fewest-errors) candidate.
+    if let Some(custom) = only_match {
+        errors.push(custom);
+    } else if let Some(b) = best {
         errors.extend(b);
     }
 }
@@ -217,11 +258,12 @@ pub(crate) fn validate_children(
         rules
     };
 
-    // Phase 1: count occurrences of all children kinds (for cardinality).
-    let (key_counts, leafvalue_counts, valueclause_counts) = count_children(ctx, children, rules);
-
-    // Phase 2: validate each child.
-    validate_each_child(ctx, children, rules, scope_context, errors);
+    // Phases 1+2 fused: one pass over `children` both tallies occurrences (for
+    // cardinality) and validates each child. Phase-2 validation never reads the
+    // phase-1 counts (only phase 3 does) and counting emits nothing, so the two
+    // passes collapse into one with identical output.
+    let (key_counts, leafvalue_counts, valueclause_counts) =
+        count_and_validate_children(ctx, children, rules, scope_context, errors);
 
     // Phase 3: cardinality enforcement against the phase-1 counts.
     enforce_cardinality(
@@ -234,113 +276,6 @@ pub(crate) fn validate_children(
         &valueclause_counts,
         errors,
     );
-}
-
-/// Phase 1 of [`validate_children`]: count occurrences of every child kind so
-/// the cardinality pass can check min/max. Returns the three count maps that
-/// phase 3 ([`enforce_cardinality`]) consumes:
-/// - `key_counts`: lowercased key string -> count (Leaf/Node children),
-/// - `leafvalue_counts`: per-rule count of matching `LeafValueRule`s,
-/// - `valueclause_counts`: per-rule count of anonymous `{ ... }` clauses.
-fn count_children(
-    ctx: &ValidationCtx,
-    children: &[Child],
-    rules: &[(RuleType, Options)],
-) -> (FxHashMap<String, usize>, Vec<usize>, Vec<usize>) {
-    let ast = ctx.ast;
-    let table = ctx.table;
-    let ruleset = ctx.ruleset;
-
-    // Only the rule kinds actually present in `rules` need a count structure.
-    // The dominant block kind (effect/trigger bodies whose sole rule is an
-    // `alias_name[...]` wildcard) has no keyed / LeafValue / ValueClause rule at
-    // all, so every structure below stays unallocated and the scan is skipped.
-    let any_keyed = rules.iter().any(|(rt, _)| get_rule_key(rt).is_some());
-    let any_leafvalue = rules
-        .iter()
-        .any(|(rt, _)| matches!(rt, RuleType::LeafValueRule { .. }));
-    let any_valueclause = rules
-        .iter()
-        .any(|(rt, _)| matches!(rt, RuleType::ValueClauseRule { .. }));
-
-    // Keyed children (Leaf/Node): key string -> count.
-    let mut key_counts: FxHashMap<String, usize> = if any_keyed {
-        FxHashMap::with_capacity_and_hasher(children.len(), Default::default())
-    } else {
-        FxHashMap::default()
-    };
-    // Item 5: LeafValues — count per LeafValueRule index.
-    let mut leafvalue_counts: Vec<usize> = if any_leafvalue {
-        vec![0usize; rules.len()]
-    } else {
-        Vec::new()
-    };
-    // Item 5: ValueClause — count per ValueClauseRule index.
-    let mut valueclause_counts: Vec<usize> = if any_valueclause {
-        vec![0usize; rules.len()]
-    } else {
-        Vec::new()
-    };
-
-    if !any_keyed && !any_leafvalue && !any_valueclause {
-        return (key_counts, leafvalue_counts, valueclause_counts);
-    }
-
-    let mut keybuf: SmallVec<[u8; 24]> = SmallVec::new();
-    for child in children {
-        match child {
-            Child::Leaf(idx) if any_keyed => {
-                let leaf = &ast.arena.leaves[*idx as usize];
-                // Paradox keys are case-insensitive; key the counts in lowercase so
-                // a field written `texturefile` satisfies a rule keyed `textureFile`.
-                // Lowercase into a reused stack buffer so the owned String is only
-                // allocated on the first occurrence of each distinct key.
-                keybuf.clear();
-                table.with_string(leaf.key.normal, |s| {
-                    keybuf.extend_from_slice(unquote_key(s).as_bytes())
-                });
-                keybuf.make_ascii_lowercase();
-                let key: &str = std::str::from_utf8(&keybuf).unwrap_or_default();
-                match key_counts.get_mut(key) {
-                    Some(c) => *c += 1,
-                    None => {
-                        key_counts.insert(key.to_owned(), 1);
-                    }
-                }
-            }
-            Child::LeafValue(lvidx) => {
-                let lv = &ast.arena.leaf_values[*lvidx as usize];
-                // An anonymous `{ ... }` block parses as a clause-valued LeafValue;
-                // count it toward a ValueClauseRule, not a LeafValueRule.
-                if matches!(lv.value, Value::Clause(_)) {
-                    if any_valueclause {
-                        for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
-                            if matches!(rule_type, RuleType::ValueClauseRule { .. }) {
-                                valueclause_counts[rule_idx] += 1;
-                            }
-                        }
-                    }
-                } else if any_leafvalue {
-                    // Count toward EVERY matching LeafValueRule, not just the
-                    // first. Alternative leafvalue rules in one block are counted
-                    // independently (checkCardinality is a per-rule sum). Breaking on the first match lets
-                    // a permissive earlier alternative (e.g. a `<type>` TypeField,
-                    // which accepts any token) starve a later `enum[...]` rule,
-                    // producing a spurious "appears 0 time(s)" cardinality error.
-                    for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
-                        if let RuleType::LeafValueRule { right } = rule_type
-                            && field_matches_value(right, &lv.value, table, ruleset)
-                        {
-                            leafvalue_counts[rule_idx] += 1;
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    (key_counts, leafvalue_counts, valueclause_counts)
 }
 
 /// Whether a rule's right-hand side is the `math_expr` value type.
@@ -414,22 +349,62 @@ pub(super) fn validate_math_clause(
     );
 }
 
-/// Phase 2 of [`validate_children`]: validate each child against the matching
+/// Phases 1+2 of [`validate_children`], fused into one pass: tally occurrences of
+/// every child kind (for cardinality) AND validate each child against the matching
 /// rules, emitting unexpected-property and per-rule diagnostics. Recurses into
-/// nested blocks via [`validate_children`].
-fn validate_each_child(
+/// nested blocks via [`validate_children`]. Returns the three count maps that
+/// phase 3 ([`enforce_cardinality`]) consumes:
+/// - `key_counts`: lowercased key string -> count (Leaf/Node children),
+/// - `leafvalue_counts`: per-rule count of matching `LeafValueRule`s,
+/// - `valueclause_counts`: per-rule count of anonymous `{ ... }` clauses.
+fn count_and_validate_children(
     ctx: &ValidationCtx,
     children: &[Child],
     rules: &[(RuleType, Options)],
     scope_context: &mut Option<ScopeContext>,
     errors: &mut Vec<ValidationError>,
-) {
+) -> (FxHashMap<String, usize>, Vec<usize>, Vec<usize>) {
     let ast = ctx.ast;
     let table = ctx.table;
     let file_path = ctx.file_path;
     let ruleset = ctx.ruleset;
     let type_index = ctx.type_index;
     let modifier_keys = ctx.modifier_keys;
+
+    // Only the rule kinds actually present in `rules` need a count structure.
+    // The dominant block kind (effect/trigger bodies whose sole rule is an
+    // `alias_name[...]` wildcard) has no keyed / LeafValue / ValueClause rule at
+    // all, so every count structure below stays unallocated and its tally is
+    // skipped — the block is still validated in the same pass.
+    let any_keyed = rules.iter().any(|(rt, _)| get_rule_key(rt).is_some());
+    let any_leafvalue = rules
+        .iter()
+        .any(|(rt, _)| matches!(rt, RuleType::LeafValueRule { .. }));
+    let any_valueclause = rules
+        .iter()
+        .any(|(rt, _)| matches!(rt, RuleType::ValueClauseRule { .. }));
+
+    // Keyed children (Leaf/Node): key string -> count.
+    let mut key_counts: FxHashMap<String, usize> = if any_keyed {
+        FxHashMap::with_capacity_and_hasher(children.len(), Default::default())
+    } else {
+        FxHashMap::default()
+    };
+    // Item 5: LeafValues — count per LeafValueRule index.
+    let mut leafvalue_counts: Vec<usize> = if any_leafvalue {
+        vec![0usize; rules.len()]
+    } else {
+        Vec::new()
+    };
+    // Item 5: ValueClause — count per ValueClauseRule index.
+    let mut valueclause_counts: Vec<usize> = if any_valueclause {
+        vec![0usize; rules.len()]
+    } else {
+        Vec::new()
+    };
+    // Reused lowercase buffer for the keyed tally (the phase-2 `key` below keeps
+    // its original case for value-sensitive candidate matching and messages).
+    let mut lowerbuf: SmallVec<[u8; 24]> = SmallVec::new();
 
     for child in children {
         match child {
@@ -444,6 +419,22 @@ fn validate_each_child(
                     keybuf.extend_from_slice(unquote_key(s).as_bytes())
                 });
                 let key: &str = std::str::from_utf8(&keybuf).unwrap_or_default();
+                // Phase-1 tally: keyed children counted in lowercase so a field
+                // written `texturefile` satisfies a rule keyed `textureFile`. The
+                // owned String is allocated only on the first occurrence of each
+                // distinct key.
+                if any_keyed {
+                    lowerbuf.clear();
+                    lowerbuf.extend_from_slice(&keybuf);
+                    lowerbuf.make_ascii_lowercase();
+                    let lkey: &str = std::str::from_utf8(&lowerbuf).unwrap_or_default();
+                    match key_counts.get_mut(lkey) {
+                        Some(c) => *c += 1,
+                        None => {
+                            key_counts.insert(lkey.to_owned(), 1);
+                        }
+                    }
+                }
                 let candidates =
                     matching_candidates(rules, key, ruleset, type_index, rule_matches_leaf_key);
                 // `math_expr` is authoritative: a `{block}` math expression is
@@ -474,13 +465,16 @@ fn validate_each_child(
                     // (modifiers are additive). Only fires on confirmed modifiers.
                     if is_modifier && value_is_zero(&leaf.value) {
                         let code = &error_codes::CW235_ZERO_MODIFIER;
-                        errors.push(ValidationError::from_code(
-                            code,
-                            file_path,
-                            leaf.pos.start.line,
-                            leaf.pos.start.col,
-                            &[key],
-                        ));
+                        errors.push(
+                            ValidationError::from_code(
+                                code,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                &[key],
+                            )
+                            .with_end(leaf.pos.end),
+                        );
                     }
                     // A `@name = value` leaf is a Paradox read-time variable
                     // definition, valid anywhere in a block. F# skips these from the
@@ -503,14 +497,34 @@ fn validate_each_child(
                                 &error_codes::CW263_UNEXPECTED_PROPERTY_LEAF,
                             )
                         };
-                        errors.push(ValidationError::from_code_with(
+                        let mut err = ValidationError::from_code_with(
                             code,
                             ErrorSeverity::Error,
                             file_path,
                             leaf.pos.start.line,
                             leaf.pos.start.col,
                             msg,
-                        ));
+                        )
+                        .with_end(leaf.pos.end);
+                        // Did-you-mean (fix metadata only, corpus-inert): on this
+                        // error path, scan the sibling SpecificField keys for a
+                        // single close match and offer a key-token rename. The span
+                        // covers the raw key token (quotes included, from the
+                        // interned source string) so a quoted key is replaced whole.
+                        if let Some(cand) = best_suggestion(
+                            key,
+                            rules.iter().filter_map(|(rt, _)| get_rule_key(rt)),
+                        ) {
+                            let raw_len = table
+                                .with_string(leaf.key.normal, |s| s.chars().count())
+                                .unwrap_or_else(|| key.chars().count());
+                            err = err.with_fix(cwtools_parser::fix::SuggestedFix::replace(
+                                format!("Did you mean '{}'?", cand),
+                                cwtools_parser::fix::key_token_range(leaf.pos.start, raw_len),
+                                cand,
+                            ));
+                        }
+                        errors.push(err);
                     }
                 } else {
                     // An overloaded key (several rules with the same key, e.g. two
@@ -530,6 +544,25 @@ fn validate_each_child(
                                 out,
                             );
                         },
+                        |i| {
+                            let (_, opts) = candidates[i];
+                            opts.error_if_only_match.as_ref().map(|msg| {
+                                let sev = opts
+                                    .severity
+                                    .as_ref()
+                                    .map(severity_to_error)
+                                    .unwrap_or(ErrorSeverity::Error);
+                                ValidationError::from_code_with(
+                                    &error_codes::CW272_FROM_RULES_CUSTOM_ERROR,
+                                    sev,
+                                    file_path,
+                                    leaf.pos.start.line,
+                                    leaf.pos.start.col,
+                                    msg.clone(),
+                                )
+                                .with_end(leaf.pos.end)
+                            })
+                        },
                         errors,
                         n,
                     );
@@ -538,6 +571,30 @@ fn validate_each_child(
             // Item 5: LeafValue validation
             Child::LeafValue(lvidx) => {
                 let lv = &ast.arena.leaf_values[*lvidx as usize];
+                // Phase-1 tally. An anonymous `{ ... }` block parses as a
+                // clause-valued LeafValue; count it toward a ValueClauseRule, not a
+                // LeafValueRule. Non-clause values count toward EVERY matching
+                // LeafValueRule (checkCardinality is a per-rule sum) — breaking on
+                // the first match lets a permissive earlier alternative (e.g. a
+                // `<type>` TypeField, which accepts any token) starve a later
+                // `enum[...]` rule, producing a spurious "appears 0 time(s)" error.
+                if matches!(lv.value, Value::Clause(_)) {
+                    if any_valueclause {
+                        for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
+                            if matches!(rule_type, RuleType::ValueClauseRule { .. }) {
+                                valueclause_counts[rule_idx] += 1;
+                            }
+                        }
+                    }
+                } else if any_leafvalue {
+                    for (rule_idx, (rule_type, _)) in rules.iter().enumerate() {
+                        if let RuleType::LeafValueRule { right } = rule_type
+                            && field_matches_value(right, &lv.value, table, ruleset)
+                        {
+                            leafvalue_counts[rule_idx] += 1;
+                        }
+                    }
+                }
                 // Anonymous `{ ... }` block: validate against a ValueClauseRule,
                 // recursing into the block's children (e.g. milestones entries).
                 if let Value::Clause(clause_children) = &lv.value {
@@ -557,13 +614,16 @@ fn validate_each_child(
                         }
                     }
                     if !matched {
-                        errors.push(ValidationError::from_code(
-                            &error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE,
-                            file_path,
-                            lv.pos.start.line,
-                            lv.pos.start.col,
-                            &["Unexpected value clause '{...}'"],
-                        ));
+                        errors.push(
+                            ValidationError::from_code(
+                                &error_codes::CW265_UNEXPECTED_PROPERTY_VALUE_CLAUSE,
+                                file_path,
+                                lv.pos.start.line,
+                                lv.pos.start.col,
+                                &["Unexpected value clause '{...}'"],
+                            )
+                            .with_end(lv.pos.end),
+                        );
                     }
                 } else {
                     let mut matched = false;
@@ -581,6 +641,7 @@ fn validate_each_child(
                                     &raw,
                                     lv.pos.start.line,
                                     lv.pos.start.col,
+                                    lv.pos.end,
                                     errors,
                                 );
                             }
@@ -590,23 +651,28 @@ fn validate_each_child(
                     }
                     if !matched {
                         let val_str = leaf_value_to_string(&lv.value, table);
-                        errors.push(ValidationError::from_code(
-                            &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
-                            file_path,
-                            lv.pos.start.line,
-                            lv.pos.start.col,
-                            &[&format!("Unexpected bare value '{}'", val_str)],
-                        ));
+                        errors.push(
+                            ValidationError::from_code(
+                                &error_codes::CW264_UNEXPECTED_PROPERTY_LEAF_VALUE,
+                                file_path,
+                                lv.pos.start.line,
+                                lv.pos.start.col,
+                                &[&format!("Unexpected bare value '{}'", val_str)],
+                            )
+                            .with_end(lv.pos.end),
+                        );
                     }
                 }
             }
             _ => {}
         }
     }
+
+    (key_counts, leafvalue_counts, valueclause_counts)
 }
 
 /// Phase 3 of [`validate_children`]: enforce cardinality (min/max occurrence)
-/// against the counts gathered by [`count_children`]. Reads `key_counts`,
+/// against the counts gathered by [`count_and_validate_children`]. Reads `key_counts`,
 /// `leafvalue_counts`, and `valueclause_counts`; emits CW242 diagnostics.
 #[allow(clippy::too_many_arguments)]
 fn enforce_cardinality(
@@ -644,28 +710,29 @@ fn enforce_cardinality(
     // times, or an absent optional alternative double-reports.
     // Third field tracks strictness: a `~` (soft) minimum on ANY overload of a
     // key makes the whole key's minimum soft, so an under-count is not flagged.
-    // Lowercase each keyed rule's key once and reuse it below (both the key_card
-    // aggregation and the per-rule report loop need it), instead of re-lowercasing
-    // per rule per phase. `None` for non-keyed rules.
-    let rule_keys_lower: Vec<Option<String>> = rules
-        .iter()
-        .map(|(rt, _)| get_rule_key(rt).map(|k| k.to_ascii_lowercase()))
-        .collect();
-
-    let mut key_card: FxHashMap<&str, (i32, i32, bool)> =
+    // Rule keys are ruleset-static; lowercase each into a reused buffer rather
+    // than materialising a per-block Vec of owned Strings. The 4th field is a
+    // "reported" flag that dedups the per-rule report loop (each key once).
+    let mut keybuf = String::new();
+    let mut key_card: FxHashMap<String, (i32, i32, bool, bool)> =
         FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
-    for (i, (_, opts)) in rules.iter().enumerate() {
-        if let Some(lkey) = &rule_keys_lower[i] {
-            let e = key_card
-                .entry(lkey.as_str())
-                .or_insert((opts.min, opts.max, opts.strict_min));
-            e.0 = e.0.min(opts.min);
-            e.1 = e.1.max(opts.max);
-            e.2 = e.2 && opts.strict_min;
+    for (rule_type, opts) in rules {
+        if let Some(k) = get_rule_key(rule_type) {
+            keybuf.clear();
+            keybuf.push_str(k);
+            keybuf.make_ascii_lowercase();
+            match key_card.get_mut(keybuf.as_str()) {
+                Some(e) => {
+                    e.0 = e.0.min(opts.min);
+                    e.1 = e.1.max(opts.max);
+                    e.2 = e.2 && opts.strict_min;
+                }
+                None => {
+                    key_card.insert(keybuf.clone(), (opts.min, opts.max, opts.strict_min, false));
+                }
+            }
         }
     }
-    let mut reported_keys: FxHashSet<&str> =
-        FxHashSet::with_capacity_and_hasher(key_card.len(), Default::default());
 
     for (rule_idx, (rule_type, opts)) in rules.iter().enumerate() {
         // Both under- and over-count default to a WARNING (config cardinalities are
@@ -681,16 +748,21 @@ fn enforce_cardinality(
 
         match rule_type {
             RuleType::LeafRule { .. } | RuleType::NodeRule { .. } => {
-                if let (Some(key), Some(lkey)) =
-                    (get_rule_key(rule_type), &rule_keys_lower[rule_idx])
-                {
-                    // Each distinct key is reported at most once (see key_card above).
-                    if reported_keys.insert(lkey.as_str()) {
-                        let (kmin, kmax, kstrict) = key_card
-                            .get(lkey.as_str())
-                            .copied()
-                            .unwrap_or((opts.min, opts.max, opts.strict_min));
-                        let count = key_counts.get(lkey.as_str()).copied().unwrap_or(0) as i32;
+                if let Some(key) = get_rule_key(rule_type) {
+                    keybuf.clear();
+                    keybuf.push_str(key);
+                    keybuf.make_ascii_lowercase();
+                    // Each distinct key is reported at most once, deduped via the
+                    // "reported" flag stored alongside the aggregated bounds.
+                    let bounds = match key_card.get_mut(keybuf.as_str()) {
+                        Some(e) if !e.3 => {
+                            e.3 = true;
+                            Some((e.0, e.1, e.2))
+                        }
+                        _ => None,
+                    };
+                    if let Some((kmin, kmax, kstrict)) = bounds {
+                        let count = key_counts.get(keybuf.as_str()).copied().unwrap_or(0) as i32;
                         if count < kmin && kstrict {
                             errors.push(ValidationError::from_code_with(
                                 &error_codes::CW242_WRONG_NUMBER,
@@ -713,7 +785,7 @@ fn enforce_cardinality(
                             // occurrence to point at, so it stays on the block.)
                             let (line, col) = children
                                 .iter()
-                                .find(|c| child_key_matches(c, ast, table, lkey))
+                                .find(|c| child_key_matches(c, ast, table, keybuf.as_str()))
                                 .and_then(|c| child_start_pos(c, ast))
                                 .unwrap_or((block_line, block_col));
                             errors.push(ValidationError::from_code_with(

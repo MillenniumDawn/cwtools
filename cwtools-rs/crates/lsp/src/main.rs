@@ -14,13 +14,14 @@ use cwtools_rules::rules_types::{NewField, RuleSet, RuleType, TypeType, ValueTyp
 use cwtools_string_table::string_table::{StringId, StringTable};
 use cwtools_validation::position::rules_at_pos;
 
+mod code_action;
 mod completion;
 mod config;
 mod hover;
+mod inlay;
 mod navigation;
 mod paths;
 mod scan;
-mod symbols;
 mod validate;
 mod workspace_cache;
 
@@ -192,8 +193,6 @@ struct DocumentState {
     rules: parking_lot::RwLock<RuleData>,
     /// shared string table
     string_table: StringTable,
-    /// symbol index for goto-definition and references
-    symbol_index: Mutex<symbols::SymbolIndex>,
     /// computed info service for type/references/definitions. `RwLock` so the
     /// full-workspace pass-2 validation can share a single read guard across
     /// rayon threads, and the many read-only consumers (hover, completion,
@@ -253,6 +252,15 @@ struct DocumentState {
     /// (run through `change_scope`), alongside the ambient current scope. Off by
     /// default — the ambient scope is shown alone. (#37)
     hover_resolved_scope: std::sync::atomic::AtomicBool,
+    /// Loc-title inlay hints (`cwtools.inlayHints.locTitles` init option, default
+    /// ON). When `true`, `textDocument/inlayHint` annotates a leaf whose value is
+    /// a known type-instance id with its localised title. Read on each request.
+    inlay_hints_loc_titles: std::sync::atomic::AtomicBool,
+    /// Resolved-scope inlay hints (`cwtools.inlayHints.scopes` init option,
+    /// default OFF). Scaffolded but not yet produced: the resolved scope needs a
+    /// per-position resolver invocation per leaf, too costly over a viewport
+    /// range. See `inlay.rs`.
+    inlay_hints_scopes: std::sync::atomic::AtomicBool,
     /// Whether the client advertised `hierarchicalDocumentSymbolSupport` at
     /// initialize. When `true`, documentSymbol returns a nested `DocumentSymbol`
     /// tree; otherwise it falls back to the flat `SymbolInformation` list.
@@ -446,7 +454,6 @@ impl DocumentState {
             config: parking_lot::RwLock::new(Config::new()),
             rules: parking_lot::RwLock::new(RuleData::new()),
             string_table: StringTable::new(),
-            symbol_index: Mutex::new(symbols::SymbolIndex::new()),
             info_service: parking_lot::RwLock::new(cwtools_info::InfoService::new()),
             vanilla_index: Mutex::new(None),
             vanilla_merged_uris: Mutex::new(HashSet::new()),
@@ -458,6 +465,8 @@ impl DocumentState {
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
             hover_resolved_scope: std::sync::atomic::AtomicBool::new(false),
+            inlay_hints_loc_titles: std::sync::atomic::AtomicBool::new(true),
+            inlay_hints_scopes: std::sync::atomic::AtomicBool::new(false),
             hierarchical_symbols: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             edit_generation: AtomicU64::new(0),
@@ -494,7 +503,8 @@ const DEBOUNCE_MS: u64 = 250;
 
 // ── Custom notification stubs ─────────────────────────────────────────────────
 
-// NOT PORTED — code-actions, pre-trigger refactor, techGraph / event-graph.
+// NOT PORTED — pre-trigger refactor, techGraph / event-graph.
+// (code-actions are handled in `code_action.rs`: QUICKFIX from SuggestedFix.)
 // See the F# LanguageFeatures.fs module if these are needed later.
 //   - getEmbeddedMetadata: per-file metadata bundle sent to the extension on
 //     open (F# LanguageFeatures.getEmbeddedMetadata).  Low priority until the
@@ -775,9 +785,14 @@ impl Backend {
         pos: tower_lsp::lsp_types::Position,
         logical_path: &str,
     ) -> Option<CursorResolution> {
-        let (game, scope_checks, var_checks) = {
+        let (game, scope_checks, var_checks, position_encoding) = {
             let cfg = self.state.config.read();
-            (cfg.game(), cfg.scope_checks, cfg.var_checks)
+            (
+                cfg.game(),
+                cfg.scope_checks,
+                cfg.var_checks,
+                cfg.position_encoding.clone(),
+            )
         };
         let ast = self.ast_for(uri)?;
         let (ruleset, modifier_keys, scope_registry) = {
@@ -788,7 +803,6 @@ impl Backend {
                 rules_guard.scope_registry.clone(),
             )
         };
-        let position_encoding = self.state.config.read().position_encoding.clone();
         let document_text = {
             let docs = self.state.documents.lock();
             docs.get(uri).map(|doc| Arc::clone(&doc.text))
@@ -1226,7 +1240,6 @@ impl LanguageServer for Backend {
             if let Some(parsed) = disk_ast.as_ref() {
                 self.index_parsed_file(&uri, parsed);
             } else {
-                self.state.symbol_index.lock().clear_document(&uri);
                 self.state.info_service.write().clear_file(&uri);
                 self.bump_info_revision();
             }
@@ -1328,6 +1341,15 @@ impl LanguageServer for Backend {
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         self.rename_impl(params).await
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        self.mark_activity();
+        self.code_action_impl(params).await
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        self.inlay_hint_impl(params).await
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {

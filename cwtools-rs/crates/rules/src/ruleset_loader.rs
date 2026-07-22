@@ -1,7 +1,7 @@
 use crate::post_process::post_process;
 #[cfg(test)]
 use crate::rules_converter::ast_to_ruleset;
-use crate::rules_converter::ast_to_ruleset_raw;
+use crate::rules_converter::{ast_to_ruleset_raw, validate_comment_directives};
 use crate::rules_types::RuleSet;
 use cwtools_parser::ast::ParseError;
 use cwtools_parser::parser::parse_string;
@@ -93,9 +93,11 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
 
     let mut combined = RuleSet::new();
     let mut errors = Vec::new();
-    // Retain each parsed AST so the structural reference check can re-walk them
-    // against the fully-merged RuleSet (cross-file definitions must all be in).
-    let mut asts: Vec<(std::path::PathBuf, cwtools_parser::ast::ParsedFile)> = Vec::new();
+    // Lightweight reference candidates collected from each AST while it is alive.
+    // The AST itself is dropped as soon as it is converted; only these positioned
+    // (kind, name) records are retained for the post-merge resolution pass, so we
+    // no longer pin every parsed `.cwt` file simultaneously.
+    let mut ref_candidates: Vec<crate::config_validation::RefCandidate> = Vec::new();
 
     for path in &cwt_files {
         match std::fs::read_to_string(path) {
@@ -108,13 +110,19 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
             }
             Ok(content) => match parse_string(&content, table) {
                 Ok(parsed) => {
+                    errors.extend(validate_comment_directives(&parsed, path));
                     let ruleset = ast_to_ruleset_raw(&parsed, table);
                     merge_ruleset(&mut combined, ruleset);
-                    asts.push((path.clone(), parsed));
+                    crate::config_validation::collect_reference_candidates(
+                        path,
+                        &parsed,
+                        table,
+                        &mut ref_candidates,
+                    );
                 }
                 Err(e) => {
                     let (line, col, message) = match e {
-                        ParseError::Pos(_, l, c, m) => (l, c, m),
+                        ParseError::Pos(l, c, m) => (l, c, m),
                         ParseError::General(m) => (1, 0, m),
                     };
                     errors.push(RuleParseError {
@@ -144,9 +152,11 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
     combined.reindex();
 
     // Structural validation: now that every definition is merged and indexed,
-    // flag references to undefined types/enums/aliases in the rule config.
-    errors.extend(crate::config_validation::validate_ruleset_references(
-        &asts, &combined, table,
+    // resolve the references collected during conversion against the merged set,
+    // flagging any pointing at an undefined type/enum/single_alias.
+    errors.extend(crate::config_validation::resolve_reference_candidates(
+        &ref_candidates,
+        &combined,
     ));
 
     (combined, errors)

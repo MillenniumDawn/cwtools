@@ -3,14 +3,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A unique identifier for an interned string.
-/// `NULL` (u32::MAX) is reserved and never assigned.
+/// `u32::MAX` is reserved and never assigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct StringId(pub u32);
-
-impl StringId {
-    pub const NULL: StringId = StringId(u32::MAX);
-}
 
 /// Mirrors the F# `StringTokens` struct.
 /// `lower`  → ID of the lower‑cased canonical form.
@@ -264,7 +260,7 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
     if let Some(&existing_lower) = inner.lower_map.get(lower_key.as_str()) {
         debug_assert!(
             inner.next_id < u32::MAX,
-            "StringTable id space exhausted (would collide with StringId::NULL)"
+            "StringTable id space exhausted (u32::MAX is reserved)"
         );
         let normal_id = inner.next_id;
         inner.next_id += 1;
@@ -281,7 +277,7 @@ fn intern_locked(inner: &mut Inner, s: &str) -> StringTokens {
     // Slow path: brand‑new lower key.
     debug_assert!(
         inner.next_id < u32::MAX - 1,
-        "StringTable id space exhausted (would collide with StringId::NULL)"
+        "StringTable id space exhausted (u32::MAX is reserved)"
     );
     let normal_id = inner.next_id;
     let lower_id = normal_id + 1;

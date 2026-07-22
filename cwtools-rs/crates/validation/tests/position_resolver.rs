@@ -33,7 +33,11 @@ fn type_index(entries: &[(&str, &str)]) -> TypeIndex {
             .or_default()
             .push(TypeInstance {
                 name: instance.to_string(),
-                location: SourceLocation { line: 1, col: 0 },
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
                 primary_loc_key: None,
             });
     }

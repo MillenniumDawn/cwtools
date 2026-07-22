@@ -56,6 +56,12 @@ pub(crate) fn loc_diag_to_validation_error(
         col: d.col.saturating_sub(1) as u16,
         file: d.file.clone(),
         code: Some(d.code),
+        // Carry the loc fix (CW268 quote-wrap) so it reaches the code-action
+        // path through the shared `validation_error_to_diagnostic` renderer.
+        fix: d.fix.clone(),
+        // Loc diagnostics expose only a single (line, col) point, so they keep the
+        // whole-line squiggle (no cheap end to derive — see task-18 loc decision).
+        end: None,
     }
 }
 
@@ -135,9 +141,38 @@ pub(crate) fn truncate_validation_errors(
             col: 0,
             file: uri.to_string(),
             code: None,
+            fix: None,
+            end: None,
         });
     }
     total
+}
+
+/// CW100: objects defined here whose `## required` localisation keys aren't
+/// provided by any loc file. Gated on the loc index being built — before the
+/// initial scan finishes it's empty and everything would falsely report
+/// missing. Shared by the batch/scan path and the single-file keystroke path
+/// so both apply the same gate (a prior drift left the keystroke path without
+/// this check, so CW100 would flicker off on every edit until the next scan).
+pub(crate) fn append_missing_loc_errors(
+    parsed: &ParsedFile,
+    uri: &str,
+    prepared: &Prepared,
+    errs: &mut Vec<cwtools_validation::ValidationError>,
+) {
+    if let Some(loc) = prepared.loc_index
+        && !loc.union().is_empty()
+    {
+        let overlay = prepared.extra_loc_keys;
+        errs.extend(cwtools_validation::missing_loc::check_missing_localisation(
+            parsed,
+            uri,
+            uri,
+            prepared.ruleset,
+            prepared.table,
+            |k| loc.exists_any(k) || overlay.is_some_and(|o| o.contains(k)),
+        ));
+    }
 }
 
 /// Validate one already-parsed file against a caller-supplied [`Prepared`],
@@ -156,23 +191,7 @@ pub(crate) fn validate_parsed_with_indexes(
         .map(|e| parse_error_to_diagnostic(e, line_ends))
         .collect();
     let mut errs = validate_prepared(parsed, uri, prepared);
-    // CW100: objects defined here whose `## required` localisation keys aren't
-    // provided by any loc file. Gated on the loc index being built — before the
-    // initial scan finishes it's empty and everything would falsely report
-    // missing.
-    if let Some(loc) = prepared.loc_index
-        && !loc.union().is_empty()
-    {
-        let overlay = prepared.extra_loc_keys;
-        errs.extend(cwtools_validation::missing_loc::check_missing_localisation(
-            parsed,
-            uri,
-            uri,
-            prepared.ruleset,
-            prepared.table,
-            |k| loc.exists_any(k) || overlay.is_some_and(|o| o.contains(k)),
-        ));
-    }
+    append_missing_loc_errors(parsed, uri, prepared, &mut errs);
     truncate_validation_errors(&mut errs, uri);
     for err in &errs {
         diagnostics.push(validation_error_to_diagnostic(err, line_ends));
@@ -238,7 +257,7 @@ fn diagnostic_at(
 
 pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Diagnostic {
     let (line, col, msg) = match e {
-        ParseError::Pos(_f, line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
+        ParseError::Pos(line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
         ParseError::General(msg) => (0, 0, msg.clone()),
     };
     diagnostic_at(
@@ -295,7 +314,7 @@ pub(crate) fn validation_error_to_diagnostic(
         cwtools_validation::ErrorSeverity::Information => DiagnosticSeverity::INFORMATION,
         cwtools_validation::ErrorSeverity::Hint => DiagnosticSeverity::HINT,
     };
-    diagnostic_at(
+    let mut diag = diagnostic_at(
         line,
         col,
         line_ends,
@@ -303,7 +322,25 @@ pub(crate) fn validation_error_to_diagnostic(
         "cwtools",
         err.code.map(|c| NumberOrString::String(c.to_string())),
         err.message.clone(),
-    )
+    );
+    // Precise span: when the emit site carried the node's end position, publish
+    // the real range instead of diagnostic_at's whole-line squiggle. The end uses
+    // the same 1-based-line / 0-based-char convention as the start (and as
+    // code_action's fix-edit conversion), so only the whole-line end is overridden.
+    // With `end` absent, the whole-line fallback stands byte-for-byte.
+    if let Some((end_line, end_col)) = err.end {
+        diag.range.end = Position {
+            line: end_line.saturating_sub(1),
+            character: end_col as u32,
+        };
+    }
+    // Carry any machine-applicable fix into `data` so the code-action handler
+    // can round-trip it back into a QUICKFIX WorkspaceEdit. Covers both the
+    // validation and loc paths (loc diagnostics flow through here too).
+    if let Some(fix) = &err.fix {
+        diag.data = Some(crate::code_action::fix_to_data(fix));
+    }
+    diag
 }
 
 /// Collect the identifier-like tokens a parsed file mentions — every key and
@@ -356,15 +393,10 @@ impl Backend {
         }
     }
 
-    /// Index an already-parsed AST into the symbol + info indexes. Extracted
+    /// Index an already-parsed AST into the info index. Extracted
     /// from `index_document` so the workspace scan can index cache-hit ASTs
     /// without re-parsing.
     pub(crate) fn index_parsed_file(&self, uri: &str, parsed: &ParsedFile) {
-        {
-            let mut index = self.state.symbol_index.lock();
-            index.clear_document(uri);
-            index.index_document(uri, parsed, &self.state.string_table);
-        }
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = logical_path_from_uri(uri, &ws_prefix);
         // Lock order: rules -> info_service.
@@ -979,35 +1011,11 @@ impl Backend {
                     diagnostics.push(parse_error_to_diagnostic(parse_err, &line_ends));
                 }
 
-                // Update symbol index
-                {
-                    let mut index = self.state.symbol_index.lock();
-                    index.clear_document(uri);
-                    index.index_document(uri, &parsed, &self.state.string_table);
-                }
-
-                // Derive logical path for type-instance indexing
-                let ws_prefix = self.state.config.read().workspace_prefix.clone();
-                let logical_path = logical_path_from_uri(uri, &ws_prefix);
-
-                // Update info service. Lock order: rules -> info_service.
-                {
-                    let rules_guard = self.state.rules.read();
-                    let mut info = self.state.info_service.write();
-                    info.clear_file(uri);
-                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
-                        info.index_file_with_path(
-                            uri,
-                            &parsed,
-                            &self.state.string_table,
-                            ruleset,
-                            &logical_path,
-                        );
-                    }
-                    drop(info);
-                    drop(rules_guard);
-                    self.bump_info_revision();
-                }
+                // Index this file the same way the workspace scan and did_close
+                // disk-restore do (previously an inlined, drifted subset that
+                // skipped the collect_subtype_instances merge — an open file
+                // could lose its `<type.subtype>` membership while being edited).
+                self.index_parsed_file(uri, &parsed);
 
                 // Validation. Lock order: rules -> info_service -> loc_index.
                 let (errors, log_msg) = {
@@ -1043,6 +1051,7 @@ impl Backend {
                             var_checks,
                         );
                         let mut errs = validate_prepared(&parsed, uri, &prepared);
+                        append_missing_loc_errors(&parsed, uri, &prepared, &mut errs);
                         drop(loc_guard);
                         drop(info_guard);
                         let elapsed = start.elapsed();
@@ -1249,6 +1258,8 @@ mod whole_line_range_tests {
 
     #[test]
     fn diagnostic_spans_from_field_to_end_of_line() {
+        // Whole-line fallback: with `end: None` the squiggle still runs from the
+        // field to the line's content end (unchanged pre-Task-18 behavior).
         let text = "decision = {\n    custom_cost_text = a\n}\n";
         let ends = line_end_cols(text);
         let err = ValidationError {
@@ -1258,6 +1269,8 @@ mod whole_line_range_tests {
             col: 4,  // start of the field, after the indentation
             file: "f".into(),
             code: Some("CW242"),
+            fix: None,
+            end: None,
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.start.line, 1);
@@ -1265,6 +1278,56 @@ mod whole_line_range_tests {
         assert_eq!(diag.range.end.line, 1);
         // "    custom_cost_text = a" is 24 chars.
         assert_eq!(diag.range.end.character, 24);
+    }
+
+    #[test]
+    fn diagnostic_uses_precise_range_when_end_present() {
+        // Task 18: when the emit site carried the node's end position, the LSP
+        // publishes the exact token span instead of the whole-line squiggle. The
+        // end uses the same 1-based-line / 0-based-char convention as the start.
+        let text = "decision = {\n    custom_cost_text = a\n}\n";
+        let ends = line_end_cols(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW240"),
+            fix: None,
+            // The leaf's own SourceRange end (1-based line 2, exclusive char 24).
+            end: Some((2, 24)),
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.start.line, 1);
+        assert_eq!(diag.range.start.character, 4);
+        // Precise end from the carried range, not diag_end_col.
+        assert_eq!(diag.range.end.line, 1);
+        assert_eq!(diag.range.end.character, 24);
+    }
+
+    #[test]
+    fn diagnostic_precise_range_can_span_lines() {
+        // A block leaf's range end lands past the closing brace (SourceRange.end is
+        // exclusive and absorbs trailing whitespace), so a precise squiggle may
+        // legitimately span multiple lines — the whole unexpected block.
+        let text = "root = {\n    foo = {\n        a = 1\n    }\n}\n";
+        let ends = line_end_cols(text);
+        let err = ValidationError {
+            message: "Unexpected block 'foo'".into(),
+            severity: ErrorSeverity::Error,
+            line: 2, // `foo = {` line
+            col: 4,
+            file: "f".into(),
+            code: Some("CW262"),
+            fix: None,
+            end: Some((4, 5)), // just past the `}` on the closing line
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.start.line, 1);
+        assert_eq!(diag.range.start.character, 4);
+        assert_eq!(diag.range.end.line, 3);
+        assert_eq!(diag.range.end.character, 5);
     }
 
     #[test]
@@ -1276,6 +1339,8 @@ mod whole_line_range_tests {
             col: 2,
             file: "f".into(),
             code: None,
+            fix: None,
+            end: None,
         };
         let diag = validation_error_to_diagnostic(&err, &[]);
         assert_eq!(diag.range.start.character, 2);

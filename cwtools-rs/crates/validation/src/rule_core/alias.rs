@@ -2,7 +2,7 @@
 //! usage against every overload as a disjunction.
 
 use cwtools_game::scope_engine::ScopeContext;
-use cwtools_parser::ast::{Child, Value};
+use cwtools_parser::ast::{Child, SourcePos, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
 
@@ -219,13 +219,11 @@ pub(super) fn validate_alias_usage(
             let (line, col) = leaf
                 .map(|l| (l.pos.start.line, l.pos.start.col))
                 .unwrap_or(fallback_pos);
-            errors.push(ValidationError::from_code(
-                code,
-                file_path,
-                line,
-                col,
-                &[key],
-            ));
+            let mut err = ValidationError::from_code(code, file_path, line, col, &[key]);
+            if let Some(l) = leaf {
+                err = err.with_end(l.pos.end);
+            }
+            errors.push(err);
         }
     }
 
@@ -282,13 +280,17 @@ pub(super) fn validate_alias_usage(
             let (line, col) = leaf
                 .map(|l| (l.pos.start.line, l.pos.start.col))
                 .unwrap_or(fallback_pos);
-            errors.push(ValidationError::from_code(
+            let mut err = ValidationError::from_code(
                 code,
                 file_path,
                 line,
                 col,
                 &[key, &reg.name_of(current), &expected.join(" or ")],
-            ));
+            );
+            if let Some(l) = leaf {
+                err = err.with_end(l.pos.end);
+            }
+            errors.push(err);
         }
     }
 
@@ -298,7 +300,7 @@ pub(super) fn validate_alias_usage(
     // permissive sibling overload — typically a pattern alias whose backing enum
     // is unpopulated, so it matches any key with a `variable_field` that accepts
     // the block cleanly — would win clean and discard the strict math
-    // diagnostic. Mirrors the same authoritative bypass in `validate_each_child`.
+    // diagnostic. Mirrors the same authoritative bypass in `count_and_validate_children`.
     if let Some(leaf) = leaf
         && matches!(&leaf.value, Value::Clause(_))
         && let Some((mrt, _)) = overloads.iter().find(|(rt, _)| rule_right_is_math_expr(rt))
@@ -308,6 +310,10 @@ pub(super) fn validate_alias_usage(
     }
 
     let mut best: Option<Vec<ValidationError>> = None;
+    // A `## error_if_only_match` overload that matched cleanly, held aside so a
+    // later directive-free clean match can still win. Surfaced only if no such
+    // match exists (F# `errorIfOnlyMatch` / CW272).
+    let mut only_match: Option<ValidationError> = None;
     let mut temp: Vec<ValidationError> = Vec::new();
     for (rule_type, opts) in overloads {
         temp.clear();
@@ -317,9 +323,11 @@ pub(super) fn validate_alias_usage(
                     validate_leaf(ctx, leaf, rule_type, scope_context.as_ref(), &mut temp);
                 } else {
                     // Scalar-valued overload but the usage is a block — not a match.
+                    // No `leaf` here (this branch is the `leaf == None` case), so no
+                    // clean end range: fall back to the whole-line squiggle.
                     let (line, col) = fallback_pos;
                     temp.push(alias_mismatch_error(
-                        file_path, category, "{...}", line, col,
+                        file_path, category, "{...}", line, col, None,
                     ));
                 }
             }
@@ -370,13 +378,44 @@ pub(super) fn validate_alias_usage(
                             )
                         })
                         .unwrap_or_else(|| (String::new(), fallback_pos.0, fallback_pos.1));
-                    temp.push(alias_mismatch_error(file_path, category, &value, line, col));
+                    let end = leaf.map(|l| l.pos.end);
+                    temp.push(alias_mismatch_error(
+                        file_path, category, &value, line, col, end,
+                    ));
                 }
             }
             _ => continue,
         }
 
         if temp.is_empty() {
+            // Clean match. A `## error_if_only_match` overload is not an accept:
+            // keep its custom error aside and keep scanning for a directive-free
+            // clean match, which still wins.
+            if let Some(msg) = opts.error_if_only_match.as_ref() {
+                if only_match.is_none() {
+                    let sev = opts
+                        .severity
+                        .as_ref()
+                        .map(severity_to_error)
+                        .unwrap_or(ErrorSeverity::Error);
+                    let (line, col) = leaf
+                        .map(|l| (l.pos.start.line, l.pos.start.col))
+                        .unwrap_or(fallback_pos);
+                    let mut custom = ValidationError::from_code_with(
+                        &error_codes::CW272_FROM_RULES_CUSTOM_ERROR,
+                        sev,
+                        file_path,
+                        line,
+                        col,
+                        msg.clone(),
+                    );
+                    if let Some(l) = leaf {
+                        custom = custom.with_end(l.pos.end);
+                    }
+                    only_match = Some(custom);
+                }
+                continue;
+            }
             return; // clean match — accept with no errors
         }
         match &best {
@@ -386,7 +425,11 @@ pub(super) fn validate_alias_usage(
         }
     }
 
-    if let Some(b) = best {
+    // No directive-free clean match: surface the sole directive match's custom
+    // error, else the closest (fewest-errors) candidate.
+    if let Some(custom) = only_match {
+        errors.push(custom);
+    } else if let Some(b) = best {
         errors.extend(b);
     }
 }
@@ -400,7 +443,12 @@ fn alias_mismatch_error(
     value: &str,
     line: u32,
     col: u16,
+    end: Option<SourcePos>,
 ) -> ValidationError {
     let code = &error_codes::CW267_UNEXPECTED_ALIAS_KEY_VALUE;
-    ValidationError::from_code(code, file_path, line, col, &[category, value])
+    let err = ValidationError::from_code(code, file_path, line, col, &[category, value]);
+    match end {
+        Some(end) => err.with_end(end),
+        None => err,
+    }
 }

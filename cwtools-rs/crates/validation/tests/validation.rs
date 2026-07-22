@@ -104,11 +104,51 @@ fn test_error_hash() {
         col: 10,
         file: "test.txt".to_string(),
         code: None,
+        fix: None,
+        end: None,
     };
     let hash = error_hash(&error);
     assert_eq!(
         hash,
         "error|test.txt|3|Field 'cost' has value 'not_a_number', expected Int"
+    );
+}
+
+// Inertness guard (Task 8/18, step 2): a `SuggestedFix` payload AND an `end`
+// position are pure metadata. `error_hash` must read only severity/file/line/
+// message, so a diagnostic with and without them hashes identically. This is the
+// corpus-safety net — it must pass both before the emit-site changes and after
+// they populate real fixes and end positions.
+#[test]
+fn fix_payload_does_not_change_error_hash() {
+    use cwtools_parser::ast::{SourcePos, SourceRange};
+    use cwtools_parser::fix::SuggestedFix;
+
+    let base = cwtools_validation::ValidationError {
+        message: "redundant default".to_string(),
+        severity: ErrorSeverity::Warning,
+        line: 7,
+        col: 4,
+        file: "common/ideas/x.txt".to_string(),
+        code: Some("CW282"),
+        fix: None,
+        end: None,
+    };
+    let mut with_fix = base.clone();
+    with_fix.fix = Some(SuggestedFix::delete(
+        "Remove redundant default",
+        SourceRange {
+            start: SourcePos { line: 7, col: 4 },
+            end: SourcePos { line: 8, col: 0 },
+        },
+    ));
+    // Task 18: the end position is inert too.
+    with_fix.end = Some((7, 24));
+
+    assert_eq!(
+        error_hash(&base),
+        error_hash(&with_fix),
+        "fix payload and end position must not affect the diagnostic hash"
     );
 }
 
@@ -211,7 +251,11 @@ types = {
         "technology".to_string(),
         vec![TypeInstance {
             name: "my_tech_alpha".to_string(),
-            location: SourceLocation { line: 1, col: 0 },
+            location: SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
             primary_loc_key: None,
         }],
     );
@@ -415,7 +459,11 @@ event = {
         "technology".to_string(),
         vec![TypeInstance {
             name: "my_tech_alpha".to_string(),
-            location: SourceLocation { line: 1, col: 0 },
+            location: SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
             primary_loc_key: None,
         }],
     );
@@ -922,7 +970,11 @@ widget = {
         "spriteType".to_string(),
         vec![TypeInstance {
             name: "GFX_my_icon".to_string(),
-            location: SourceLocation { line: 1, col: 0 },
+            location: SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
             primary_loc_key: None,
         }],
     );
@@ -1087,7 +1139,11 @@ types = {
         "technology".to_string(),
         vec![TypeInstance {
             name: "my_tech_alpha".to_string(),
-            location: SourceLocation { line: 1, col: 0 },
+            location: SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
             primary_loc_key: None,
         }],
     );

@@ -57,6 +57,33 @@ fn no_hint_when_set_to_non_default() {
 }
 
 #[test]
+fn cw282_fix_deletes_redundant_leaf() {
+    use cwtools_parser::fix::apply_edits;
+    let src = "foo = { name = x some_bool_field = yes }";
+    let table = StringTable::new();
+    let parsed_cwt = parse_string(RULES, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let parsed = parse_string(src, &table).unwrap();
+    let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
+
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW282"))
+        .expect("CW282 emitted");
+    let fix = err.fix.as_ref().expect("CW282 carries a fix");
+    let fixed = apply_edits(src, &fix.edits);
+    assert_eq!(fixed, "foo = { name = x }");
+
+    // Revalidation of the fixed text no longer emits CW282.
+    let parsed2 = parse_string(&fixed, &table).unwrap();
+    let errors2 = validate_ast(&parsed2, &ruleset, &table, "test.txt", None, None, None);
+    assert!(
+        !errors2.iter().any(|e| e.code == Some("CW282")),
+        "CW282 must be gone after applying the fix"
+    );
+}
+
+#[test]
 fn no_hint_without_directive() {
     // A bool field with no `## default_bool` annotation never emits CW282.
     const PLAIN: &str = r#"

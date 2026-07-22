@@ -15,8 +15,7 @@
 //! behind an `RwLock`, with no whole-workspace re-parse), which doesn't fit
 //! `Session`'s load-once/immutable ownership. Instead the LSP holds its own
 //! workspace state and builds a [`Prepared`] from the same shared primitives per
-//! validation. [`Session::validate_file`] offers the incremental shape for any
-//! caller whose index IS owned by the session.
+//! validation.
 //!
 //! Loc-file diagnostics (CW225 etc.) need the parsed `LocService`, so the session
 //! keeps it resident and serves both the loc-key index and the project lint from
@@ -26,7 +25,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
+use cwtools_file_manager::file_manager::{
+    DirectoryType, FileManager, FileManagerConfig, classify_directory,
+};
 use cwtools_game::constants::Game;
 use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_index::{
@@ -150,8 +151,28 @@ impl Session {
                 .exclude_dir_patterns
                 .extend(ignore_dirs.iter().cloned());
         }
+
+        // Auto-detect a workspace of mods: a directory that is not itself a mod
+        // root but whose `mod/`(or `mods/`) folder holds `.mod` descriptors. Such
+        // a target expands to every referenced mod, layered by load order
+        // (later-resolved mod wins a shared logical path; `replace_path`
+        // suppresses lower-priority files). A plain single mod root takes the
+        // exact single-root discovery path below, unchanged.
+        let is_multi_mod = classify_directory(&directory) == DirectoryType::MultipleMod;
+        if is_multi_mod && !ruleset.folders.is_empty() {
+            // The workspace root itself lacks the game folders (they live inside
+            // each mod), so `apply_config_folders`' root check never fires. Use the
+            // ruleset's folder layout for the per-mod discovery.
+            fm_config.include_dirs = ruleset.folders.clone();
+        }
+
         let mut manager = FileManager::with_string_table(fm_config, rules_table.clone());
-        let (files, discovery_failed) = match manager.discover_and_parse() {
+        let discovered = if is_multi_mod {
+            manager.discover_and_parse_multi_mod()
+        } else {
+            manager.discover_and_parse()
+        };
+        let (files, discovery_failed) = match discovered {
             Ok(f) => (f, false),
             Err(e) => {
                 eprintln!("error: discovery failed for {}: {}", directory.display(), e);
@@ -355,12 +376,6 @@ impl Session {
         }
     }
 
-    /// Validate one already-parsed file against this session's prebuilt indexes
-    /// and registry. The single-file (incremental) entry point.
-    pub fn validate_file(&self, file_path: &str, parsed: &ParsedFile) -> Vec<ValidationError> {
-        validate_prepared(parsed, file_path, &self.prepared())
-    }
-
     /// Loc-project diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace,
     /// scoped to this session's loc languages. Resolves references against the full
     /// mod+vanilla union; the caller filters to mod-path files.
@@ -486,7 +501,7 @@ fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<Val
         .iter()
         .map(|e| {
             let (line, col, msg) = match e {
-                ParseError::Pos(_, l, c, m) => (*l, *c, m.clone()),
+                ParseError::Pos(l, c, m) => (*l, *c, m.clone()),
                 ParseError::General(m) => (0, 0, m.clone()),
             };
             ValidationError {
@@ -496,6 +511,8 @@ fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<Val
                 col,
                 file: file_path.to_string(),
                 code: None,
+                fix: None,
+                end: None,
             }
         })
         .collect()
@@ -547,7 +564,7 @@ pub fn index_game_dir(
         ruleset,
         table,
         Some(var_effects),
-        Some(cwtools_validation::collect_subtype_instances),
+        Some(cwtools_validation::subtype_membership_for_instance),
     )
 }
 

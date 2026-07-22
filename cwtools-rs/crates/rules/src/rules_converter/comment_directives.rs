@@ -3,6 +3,8 @@
 //! scopes, and the documentation lines used for hover tooltips.
 
 use super::*;
+use crate::ruleset_loader::RuleParseError;
+use std::path::Path;
 
 /// Extract description from ### comments (## are options).
 pub(crate) fn extract_description_from_comments(comments: &[String]) -> Option<String> {
@@ -318,6 +320,69 @@ pub(crate) fn parse_required_scopes(comments: &[String]) -> Vec<String> {
     Vec::new()
 }
 
+/// Whether a `## cardinality = <spec>` RHS is one `options_from_comments`
+/// can't parse: it has a `min..max` shape, but `min` (after an optional `~`)
+/// or `max` (unless it's `inf`) isn't an integer. `options_from_comments`
+/// silently `unwrap_or(1)`s such a bound instead of erroring, so this is the
+/// only way malformed input is ever surfaced.
+fn cardinality_spec_is_malformed(spec: &str) -> bool {
+    let Some((min_s, max_s)) = spec.split_once("..") else {
+        // No `..` at all falls back to the documented 1..1 default rather
+        // than an unwrap_or, so it isn't flagged here.
+        return false;
+    };
+    let min_s = min_s.trim().strip_prefix('~').unwrap_or(min_s.trim());
+    let max_s = max_s.trim();
+    min_s.parse::<i32>().is_err() || (max_s != "inf" && max_s.parse::<i32>().is_err())
+}
+
+/// Whether a `## severity = <value>` RHS is not one of the values
+/// `options_from_comments` recognises (it otherwise silently falls to `None`).
+fn severity_value_is_unrecognized(value: &str) -> bool {
+    !matches!(value, "error" | "warning" | "info" | "information" | "hint")
+}
+
+/// Scan every `##` directive comment in `ast` for a `cardinality` or `severity`
+/// value `options_from_comments` can't parse, and report one `RuleParseError`
+/// per bad line. Purely diagnostic — doesn't change what `options_from_comments`
+/// resolves the directive to, so well-formed config is unaffected.
+pub(crate) fn validate_comment_directives(ast: &ParsedFile, path: &Path) -> Vec<RuleParseError> {
+    let mut errors = Vec::new();
+    for comment in &ast.arena.comments {
+        let text = comment.text.trim();
+        let Some(rest) = text.strip_prefix("##") else {
+            continue;
+        };
+        if rest.starts_with('#') {
+            continue; // ### documentation line
+        }
+        let rest = rest.trim_start();
+        let Some((key, rhs)) = rest.split_once('=') else {
+            continue;
+        };
+        let key = key.trim_end();
+        let rhs = rhs.trim();
+        let message = match key {
+            "cardinality" if cardinality_spec_is_malformed(rhs) => {
+                Some(format!("malformed `cardinality` bound `{rhs}`"))
+            }
+            "severity" if severity_value_is_unrecognized(rhs) => {
+                Some(format!("unrecognized `severity` value `{rhs}`"))
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            errors.push(RuleParseError {
+                file: path.to_path_buf(),
+                line: comment.pos.start.line,
+                col: comment.pos.start.col,
+                message,
+            });
+        }
+    }
+    errors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +517,60 @@ mod tests {
     fn default_bool_absent_is_none() {
         let opts = options_from_comments(&s(&["## cardinality = 0..1"]), false);
         assert_eq!(opts.default_bool, None);
+    }
+
+    // ── validate_comment_directives (R8) ──────────────────────────────────────
+
+    fn parse(src: &str) -> ParsedFile {
+        let table = cwtools_string_table::string_table::StringTable::new();
+        cwtools_parser::parser::parse_string(src, &table).unwrap()
+    }
+
+    #[test]
+    fn malformed_cardinality_bound_is_flagged() {
+        // "n" is neither an integer nor "inf" — options_from_comments would
+        // otherwise silently unwrap_or(1) this into max=1.
+        let ast = parse("## cardinality = 0..n\nfoo = bar\n");
+        let errors = validate_comment_directives(&ast, std::path::Path::new("t.cwt"));
+        assert_eq!(errors.len(), 1, "got: {:?}", errors);
+        assert!(errors[0].message.contains("cardinality"));
+        assert!(errors[0].message.contains("0..n"));
+    }
+
+    #[test]
+    fn invalid_severity_value_is_flagged() {
+        // "warn" is not a recognised severity — the correct spelling is "warning".
+        let ast = parse("## severity = warn\nfoo = bar\n");
+        let errors = validate_comment_directives(&ast, std::path::Path::new("t.cwt"));
+        assert_eq!(errors.len(), 1, "got: {:?}", errors);
+        assert!(errors[0].message.contains("severity"));
+        assert!(errors[0].message.contains("warn"));
+    }
+
+    #[test]
+    fn well_formed_cardinality_and_severity_are_not_flagged() {
+        let ast = parse(
+            "## cardinality = 0..inf\n## severity = warning\nfoo = bar\n\
+             ## cardinality = ~1..5\nbaz = qux\n",
+        );
+        let errors = validate_comment_directives(&ast, std::path::Path::new("t.cwt"));
+        assert!(errors.is_empty(), "got: {:?}", errors);
+    }
+
+    #[test]
+    fn malformed_cardinality_diagnostic_does_not_change_parsed_rule() {
+        // The diagnostic is additive: options_from_comments must still resolve
+        // the malformed bound exactly as it did before (min=0, max=1 via the
+        // existing unwrap_or(1) fallback, strict since there's no `~`).
+        let opts = options_from_comments(&s(&["## cardinality = 0..n"]), false);
+        assert_eq!((opts.min, opts.max, opts.strict_min), (0, 1, true));
+    }
+
+    #[test]
+    fn invalid_severity_diagnostic_does_not_change_parsed_rule() {
+        // options_from_comments must still fall through to None for an
+        // unrecognized severity, same as before the diagnostic was added.
+        let opts = options_from_comments(&s(&["## severity = warn"]), false);
+        assert_eq!(opts.severity, None);
     }
 }

@@ -66,7 +66,7 @@ impl<'a> Parser<'a> {
             self.col = 0;
         } else if c != '\r' {
             // '\r' is not counted toward column (CRLF line endings: \r\n is one newline).
-            self.col += 1;
+            self.col = self.col.saturating_add(1);
         }
         Some(c)
     }
@@ -169,38 +169,10 @@ impl<'a> Parser<'a> {
 
     fn parse_key(&mut self) -> Option<StringTokens> {
         if self.peek() == Some('"') {
-            // Quoted key — same escape rules as quoted values.
-            self.advance();
-            // Build with surrounding quotes directly to avoid a format!("\"{}\"", s) copy.
-            let mut s = String::from('"');
-            while let Some(c) = self.peek() {
-                if c == '\\' {
-                    self.advance(); // consume '\'
-                    match self.peek() {
-                        Some('"') => {
-                            self.advance();
-                            s.push('"');
-                        }
-                        Some('\\') => {
-                            self.advance();
-                            s.push('\\');
-                        }
-                        _ => {
-                            // Keep literal backslash; next char picked up naturally.
-                            s.push('\\');
-                        }
-                    }
-                    continue;
-                } else if c == '"' {
-                    self.advance();
-                    break;
-                }
-                s.push(c);
-                self.advance();
-            }
-            s.push('"');
-            self.skip_whitespace();
-            Some(self.table.intern(&s))
+            // Quoted key — same escape/termination rules as a quoted value: it
+            // never spans a line, and an unclosed one is an error (a quoted key
+            // is never a bare clause entry, so always report).
+            Some(self.scan_quoted(true))
         } else {
             let start = self.byte_pos();
             while let Some(c) = self.peek() {
@@ -329,18 +301,38 @@ impl<'a> Parser<'a> {
     /// closes strictly at the first unescaped `"` and never spans lines, in both
     /// modes (see [`Parser::parse_value`] for why).
     fn parse_quoted_value(&mut self, leafvalue: bool) -> Value {
+        // A bare clause entry suppresses the unclosed-string error; a key's RHS
+        // reports it.
+        Value::QString(self.scan_quoted(!leafvalue))
+    }
+
+    /// Scan a `"`-delimited string (cursor at the opening quote) and intern it
+    /// WITH its surrounding quotes. Shared by quoted keys and quoted values so
+    /// their escape/termination rules cannot drift apart.
+    ///
+    /// A quoted string never spans a line: a raw newline terminates it (quoted
+    /// keys and values are single-line in Clausewitz). It closes at the first
+    /// unescaped `"`; only `\"` and `\\` are unescaped, any other `\X` keeps the
+    /// backslash (matches F# behaviour). When the string is left unclosed and
+    /// `report_unclosed` is set, an "unclosed quoted string" error is pushed —
+    /// keys and key-RHS values report; bare clause entries (leafvalues) suppress
+    /// it.
+    ///
+    /// Closing at the first interior quote (rather than trying to keep an
+    /// embedded-quote name whole) is deliberate: `"X" Y` is ambiguous —
+    /// `"Granada" II` (one name, interior quote) is indistinguishable from
+    /// `"Sunshine" Demon` (two values). An older "keep interior quotes as one
+    /// value" heuristic consumed past the close and swallowed the clause's `}`,
+    /// dropping a whole HOI4 names file with a bogus "unclosed clause"
+    /// (cwtools-vscode#42).
+    fn scan_quoted(&mut self, report_unclosed: bool) -> StringTokens {
         let quote_start = self.pos();
-        self.advance();
+        self.advance(); // opening '"'
         // Build with surrounding quotes directly to avoid a format!("\"{}\"", s) copy.
         let mut s = String::from('"');
         let mut closed = false;
         while let Some(c) = self.peek() {
             if c == '\n' {
-                // Never span lines in a quoted string. For a key-RHS string
-                // (`a = “oops`) this is an unclosed quote; for a leafvalue
-                // the interior-quote heuristic stays single-line already
-                // (this matches the prior `leafvalue && c == '\n'` behavior
-                // and extends it to key-RHS, fixing spec item 3.5).
                 break;
             }
             if c == '\\' {
@@ -358,28 +350,12 @@ impl<'a> Parser<'a> {
                     }
                     _ => {
                         // Any other \X: keep the backslash and let the loop
-                        // pick up the next char naturally (matches F# behaviour).
+                        // pick up the next char naturally.
                         s.push('\\');
                     }
                 }
                 continue;
             } else if c == '"' {
-                // A quoted string closes at the first unescaped `"`, for both a
-                // key's RHS and a leafvalue (a namelist entry). This matches
-                // Clausewitz, which splits a name at its first interior quote.
-                //
-                // A previous leafvalue-only heuristic tried to keep namelist
-                // entries that embed quotes (`"Division "Castillejos""`) as one
-                // value by treating a `"` followed by bare content as an interior
-                // quote. But `"X" Y` is ambiguous — `"Granada" II` (one name with
-                // an interior quote) is indistinguishable from `"Sunshine" Demon`
-                // (two separate values) — and the heuristic kept consuming past
-                // the close, swallowing the rest of the line including the
-                // clause's `}` and corrupting everything after it. A real HOI4
-                // common/names file (`callsigns = { "Sunshine" Demon }`) tripped
-                // this and dropped the whole file with a bogus "unclosed clause"
-                // (cwtools-vscode#42). Escaped quotes (`\"`) are handled above and
-                // still join the string.
                 self.advance();
                 closed = true;
                 break;
@@ -387,9 +363,8 @@ impl<'a> Parser<'a> {
             s.push(c);
             self.advance();
         }
-        if !leafvalue && !closed {
+        if report_unclosed && !closed {
             self.errors.push(ParseError::Pos(
-                "".to_string(),
                 quote_start.line,
                 quote_start.col,
                 format!(
@@ -400,8 +375,7 @@ impl<'a> Parser<'a> {
         }
         s.push('"');
         self.skip_whitespace();
-        let tokens = self.table.intern(&s);
-        Value::QString(tokens)
+        self.table.intern(&s)
     }
 
     /// Recognize a standalone `yes`/`no` boolean keyword from the pre-peeked
@@ -547,7 +521,6 @@ impl<'a> Parser<'a> {
             if self.peek().is_none() {
                 // Unclosed brace — record error and break to avoid infinite loop
                 self.errors.push(ParseError::Pos(
-                    "".to_string(),
                     self.pos().line,
                     self.pos().col,
                     "unclosed clause: expected '}' before end of file".to_string(),
@@ -597,7 +570,6 @@ impl<'a> Parser<'a> {
                 let idx = self.arena.push_leaf(leaf);
                 out.push(Child::Leaf(idx));
                 self.errors.push(ParseError::Pos(
-                    "".to_string(),
                     saved.line,
                     saved.col,
                     format!(
@@ -699,7 +671,6 @@ impl<'a> Parser<'a> {
         }
         if !found_close {
             self.errors.push(ParseError::Pos(
-                "".to_string(),
                 self.pos().line,
                 self.pos().col,
                 "unclosed metaprogramming bracket: expected ']'".to_string(),
@@ -1117,6 +1088,25 @@ ENG = {
         }
     }
 
+    #[test]
+    fn well_formed_quoted_key_position_unchanged() {
+        // The newline-termination hardening must not shift a *well-formed*
+        // quoted key's recorded position: a single-line quoted key advances the
+        // cursor exactly as before (open quote, body, close quote), so its leaf
+        // start col is still the column of the opening quote and no error fires.
+        let table = StringTable::new();
+        let result = parse_string("  \"k\" = 5", &table).unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        match &result.root_children[0] {
+            Child::Leaf(i) => {
+                let leaf = &result.arena.leaves[*i as usize];
+                assert_eq!(leaf.pos.start.col, 2, "quoted key starts after 2 spaces");
+                assert_eq!(leaf.value, Value::Int(5));
+            }
+            other => panic!("expected a leaf, got {:?}", other),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Issue 4: CRLF column tracking — '\r' must not advance col.
     // -----------------------------------------------------------------------
@@ -1191,6 +1181,55 @@ ENG = {
         assert!(
             !result.errors.is_empty(),
             "expected a parse error for an unclosed string at EOF"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PP1: an unclosed *quoted key* must terminate at end-of-line and push an
+    // "unclosed quoted string" error, exactly like an unclosed key-RHS quoted
+    // value — instead of silently swallowing the following statement. The
+    // key-side was missed when parse_quoted_value was hardened for
+    // cwtools-vscode#42; both now share one escape-scanning helper.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unclosed_quoted_key_terminates_at_newline_with_error() {
+        let table = StringTable::new();
+        // `"foo\nbar = 1\n" = 5\n`: the unclosed quoted key used to span three
+        // lines, swallowing the well-formed `bar = 1`. It must now stop at the
+        // first newline, flag the unclosed string, and leave `bar = 1` intact.
+        let result = parse_string("\"foo\nbar = 1\n\" = 5\n", &table).unwrap();
+        // (b) an unclosed-quoted-string error is recorded.
+        assert!(
+            !result.errors.is_empty(),
+            "expected an unclosed quoted string error, got none"
+        );
+        // (a) the key terminated at the newline, so (c) `bar = 1` survives as
+        // its own leaf rather than being absorbed into a multi-line key.
+        let bar = result
+            .root_children
+            .iter()
+            .find_map(|c| match c {
+                Child::Leaf(i) => {
+                    let leaf = &result.arena.leaves[*i as usize];
+                    (table.get_string(leaf.key.normal).unwrap_or_default() == "bar")
+                        .then(|| leaf.value.clone())
+                }
+                _ => None,
+            })
+            .expect("`bar = 1` must parse as its own leaf, not be swallowed by the quoted key");
+        assert_eq!(bar, Value::Int(1));
+    }
+
+    #[test]
+    fn unclosed_quoted_key_at_eof_produces_error() {
+        let table = StringTable::new();
+        // A quoted key with no closing quote at EOF must error, not be accepted
+        // silently.
+        let result = parse_string("\"unterminated = 5", &table).unwrap();
+        assert!(
+            !result.errors.is_empty(),
+            "expected a parse error for an unclosed quoted key at EOF"
         );
     }
 
@@ -1298,5 +1337,16 @@ ENG = {
                 other => panic!("`{}`: expected a Leaf, got {:?}", src, other),
             }
         }
+    }
+
+    #[test]
+    fn single_line_over_u16_max_chars_does_not_panic() {
+        // col is a u16; a single line past 65,535 chars must saturate instead
+        // of overflowing (debug builds panic on overflow, release wraps and
+        // corrupts positions). Regression for the col += 1 add in advance().
+        let table = StringTable::new();
+        let src = format!("foo = {}", "a".repeat(70_000));
+        let result = parse_string(&src, &table);
+        assert!(result.is_ok(), "parse must complete without panicking");
     }
 }

@@ -159,6 +159,7 @@ fn parse_loc_file_entry(
                 path: path.clone(),
                 language_prefix: lang.to_string(),
                 lang: Some(lang),
+                is_csv: true,
                 entries,
                 file_diagnostics: Vec::new(),
                 parse_errors: Vec::new(),
