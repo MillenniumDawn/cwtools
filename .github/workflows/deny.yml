@@ -10,7 +10,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: deny-${{ github.ref }}
+  # event_name keeps a push to main from cancelling the weekly sweep.
+  group: deny-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
