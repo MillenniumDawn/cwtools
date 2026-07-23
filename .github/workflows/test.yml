@@ -20,8 +20,8 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
-  # Covers the Actions deps. Rust advisories are cargo-deny's job, in deny.yml,
-  # since cwtools-rs/Cargo.lock is gitignored and absent from the dep graph.
+  # Covers the Actions deps and, via the committed Cargo.lock, the Rust crates.
+  # cargo-deny in deny.yml remains the primary advisory + license gate for Rust.
   dependency-review:
     name: Dependency review
     if: github.event_name == 'pull_request'
