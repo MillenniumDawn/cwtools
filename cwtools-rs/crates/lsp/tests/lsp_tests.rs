@@ -1,6 +1,16 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
+/// Build a URI the way the server does. `format!("file://{path}")` is only
+/// valid where paths start with `/`; on Windows it yields `file://C:\a\b`,
+/// which never matches the server's `file:///C:/a/b`.
+fn path_uri(path: impl AsRef<std::path::Path>) -> String {
+    let path = path.as_ref();
+    tower_lsp::lsp_types::Url::from_file_path(path)
+        .map(|u| u.to_string())
+        .unwrap_or_else(|_| format!("file://{}", path.display()))
+}
+
 fn cwtools_server_cmd() -> Command {
     let bin = assert_cmd::cargo::cargo_bin("cwtools-server");
     let mut cmd = Command::new(bin);
@@ -105,7 +115,7 @@ fn jsonrpc_notification(method: &str, params: serde_json::Value) -> String {
 #[test]
 fn test_lsp_full_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
-    let uri = format!("file://{}", tmp.path().display());
+    let uri = path_uri(tmp.path());
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -149,7 +159,7 @@ fn test_lsp_full_lifecycle() {
 #[test]
 fn test_lsp_unknown_notification_does_not_crash() {
     let tmp = tempfile::tempdir().unwrap();
-    let uri = format!("file://{}", tmp.path().display());
+    let uri = path_uri(tmp.path());
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -271,8 +281,8 @@ fn completion_labels(rel_path: &str, text: &str, line0: u32, char0: u32) -> Vec<
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, text).unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
-    let doc_uri = format!("file://{}", file_path.display());
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -389,8 +399,8 @@ fn test_completion_resolve_fills_alias_documentation() {
     let file_path = ws.path().join(rel_path);
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, text).unwrap();
-    let ws_uri = format!("file://{}", ws.path().display());
-    let doc_uri = format!("file://{}", file_path.display());
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -536,8 +546,8 @@ fn test_completion_after_change_with_stale_ast_stays_incomplete() {
     let file_path = ws.path().join(rel_path);
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, initial_text).unwrap();
-    let ws_uri = format!("file://{}", ws.path().display());
-    let doc_uri = format!("file://{}", file_path.display());
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -735,8 +745,8 @@ fn completion_response(rel_path: &str, text: &str, line0: u32, char0: u32) -> se
     let file_path = ws.path().join(rel_path);
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, text).unwrap();
-    let ws_uri = format!("file://{}", ws.path().display());
-    let doc_uri = format!("file://{}", file_path.display());
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -969,7 +979,7 @@ fn completion_labels_with_files(
         std::fs::write(&p, content).unwrap();
     }
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -999,7 +1009,7 @@ fn completion_labels_with_files(
     // the next message so its index write (value_set members, enum values, type
     // instances) is queryable when the cross-file completion runs.
     for (rel, content) in extra_files.iter().chain([&(rel_path, text)]) {
-        let uri = format!("file://{}", ws.path().join(rel).display());
+        let uri = path_uri(ws.path().join(rel));
         let body = jsonrpc_notification(
             "textDocument/didOpen",
             serde_json::json!({
@@ -1015,7 +1025,7 @@ fn completion_labels_with_files(
         wait_for_diagnostics(&mut reader, rel);
     }
 
-    let doc_uri = format!("file://{}", ws.path().join(rel_path).display());
+    let doc_uri = path_uri(ws.path().join(rel_path));
     let body = jsonrpc_request(
         2,
         "textDocument/completion",
@@ -1370,7 +1380,7 @@ fn completion_labels_custom_rules(
         std::fs::write(&p, content).unwrap();
     }
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1396,7 +1406,7 @@ fn completion_labels_custom_rules(
     let _ = read_response(&mut reader).expect("no init response");
 
     for (rel, content) in extra_files.iter().chain([&(rel_path, text)]) {
-        let uri = format!("file://{}", ws.path().join(rel).display());
+        let uri = path_uri(ws.path().join(rel));
         let body = jsonrpc_notification(
             "textDocument/didOpen",
             serde_json::json!({
@@ -1412,7 +1422,7 @@ fn completion_labels_custom_rules(
         wait_for_diagnostics(&mut reader, rel);
     }
 
-    let doc_uri = format!("file://{}", ws.path().join(rel_path).display());
+    let doc_uri = path_uri(ws.path().join(rel_path));
     let body = jsonrpc_request(
         2,
         "textDocument/completion",
@@ -1458,7 +1468,7 @@ fn completion_items_custom_rules(
         std::fs::write(&p, content).unwrap();
     }
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1484,7 +1494,7 @@ fn completion_items_custom_rules(
     let _ = read_response(&mut reader).expect("no init response");
 
     for (rel, content) in extra_files.iter().chain([&(rel_path, text)]) {
-        let uri = format!("file://{}", ws.path().join(rel).display());
+        let uri = path_uri(ws.path().join(rel));
         let body = jsonrpc_notification(
             "textDocument/didOpen",
             serde_json::json!({
@@ -1500,7 +1510,7 @@ fn completion_items_custom_rules(
         wait_for_diagnostics(&mut reader, rel);
     }
 
-    let doc_uri = format!("file://{}", ws.path().join(rel_path).display());
+    let doc_uri = path_uri(ws.path().join(rel_path));
     let body = jsonrpc_request(
         2,
         "textDocument/completion",
@@ -1894,7 +1904,7 @@ fn completion_labels_after_change(
         std::fs::write(&p, content).unwrap();
     }
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1920,7 +1930,7 @@ fn completion_labels_after_change(
     let _ = read_response(&mut reader).expect("no init response");
 
     for (rel, content) in extra_files.iter().chain([&(rel_path, open_text)]) {
-        let uri = format!("file://{}", ws.path().join(rel).display());
+        let uri = path_uri(ws.path().join(rel));
         let body = jsonrpc_notification(
             "textDocument/didOpen",
             serde_json::json!({
@@ -1939,7 +1949,7 @@ fn completion_labels_after_change(
     // didChange to the new (backspaced) text. Bump the version so the LSP
     // accepts it. Full-sync: server ignores the range and replaces the whole
     // document text.
-    let doc_uri = format!("file://{}", ws.path().join(rel_path).display());
+    let doc_uri = path_uri(ws.path().join(rel_path));
     let body = jsonrpc_notification(
         "textDocument/didChange",
         serde_json::json!({
@@ -2074,7 +2084,7 @@ fn hover_markdown(
     std::fs::create_dir_all(trigger.parent().unwrap()).unwrap();
     std::fs::write(&trigger, "# scan trigger\n").unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2109,7 +2119,7 @@ fn hover_markdown(
     let body = jsonrpc_notification("initialized", serde_json::json!({}));
     write_frame(&mut child, &body).unwrap();
 
-    let doc_uri = format!("file://{}", p.display());
+    let doc_uri = path_uri(&p);
     let body = jsonrpc_notification(
         "textDocument/didOpen",
         serde_json::json!({
@@ -2405,7 +2415,7 @@ fn goto_def(
         std::fs::write(&p, content).unwrap();
     }
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2434,7 +2444,7 @@ fn goto_def(
     write_frame(&mut child, &body).unwrap();
 
     for (rel, content) in files {
-        let uri = format!("file://{}", ws.path().join(rel).display());
+        let uri = path_uri(ws.path().join(rel));
         let body = jsonrpc_notification(
             "textDocument/didOpen",
             serde_json::json!({
@@ -2447,7 +2457,7 @@ fn goto_def(
         wait_for_diagnostics(&mut reader, rel);
     }
 
-    let doc_uri = format!("file://{}", ws.path().join(doc_rel).display());
+    let doc_uri = path_uri(ws.path().join(doc_rel));
     let mut out: Vec<(String, u32)> = Vec::new();
     // Loc-key goto depends on the async workspace scan populating loc_locations;
     // under parallel test load that can lag, so poll generously.
@@ -2767,7 +2777,7 @@ fn test_goto_vanilla_definition_resolves_to_vanilla_file() {
     let decision_text = "my_dec = {\n    has_focus = VANILLA_FOCUS\n}\n";
     std::fs::write(&decision, decision_text).unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2799,7 +2809,7 @@ fn test_goto_vanilla_definition_resolves_to_vanilla_file() {
     )
     .unwrap();
 
-    let doc_uri = format!("file://{}", decision.display());
+    let doc_uri = path_uri(&decision);
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -2947,7 +2957,7 @@ fn test_did_open_definition_clears_open_caller_stale_error() {
     )
     .unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2981,7 +2991,7 @@ fn test_did_open_definition_clears_open_caller_stale_error() {
     wait_for_scan_done(&mut reader);
 
     // Open the caller; the definition is absent, so B shows CW263.
-    let b_uri = format!("file://{}", b_path.display());
+    let b_uri = path_uri(&b_path);
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -3003,7 +3013,7 @@ fn test_did_open_definition_clears_open_caller_stale_error() {
     let a_path = ws.path().join(a_rel);
     std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
     std::fs::write(&a_path, "my_se = { log = \"hi\" }\n").unwrap();
-    let a_uri = format!("file://{}", a_path.display());
+    let a_uri = path_uri(&a_path);
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -3049,7 +3059,7 @@ fn feature_request(
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, content).unwrap();
     }
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3087,7 +3097,7 @@ fn feature_request(
             .find(|(r, _)| *r == rel)
             .map(|(_, c)| *c)
             .unwrap();
-        let uri = format!("file://{}", ws.path().join(rel).display());
+        let uri = path_uri(ws.path().join(rel));
         write_frame(
             &mut child,
             &jsonrpc_notification(
@@ -3101,7 +3111,7 @@ fn feature_request(
         wait_for_diagnostics(&mut reader, rel);
     }
 
-    let doc_uri = format!("file://{}", ws.path().join(doc_rel).display());
+    let doc_uri = path_uri(ws.path().join(doc_rel));
     let mut result = serde_json::Value::Null;
     for attempt in 0..40 {
         let mut params = serde_json::json!({ "textDocument": { "uri": doc_uri } });
@@ -3464,7 +3474,7 @@ fn perf_completion_md() {
     let cache_dir = tempfile::tempdir().unwrap();
     init_opts["cacheDir"] = serde_json::json!(cache_dir.path().to_string_lossy());
 
-    let ws_uri = format!("file://{}", mod_path.display());
+    let ws_uri = path_uri(&mod_path);
 
     let mut cmd = cwtools_server_cmd();
     cmd.env("RUST_LOG", "cwtools_completion=info");
@@ -3574,7 +3584,7 @@ fn perf_completion_md() {
         }
         let text = std::fs::read_to_string(&file_path)
             .unwrap_or_else(|e| panic!("failed to read {}: {}", file_path.display(), e));
-        let doc_uri = format!("file://{}", file_path.display());
+        let doc_uri = path_uri(&file_path);
         write_frame(
             &mut child,
             &jsonrpc_notification(
@@ -3693,7 +3703,7 @@ fn test_rescan_prunes_deleted_file_from_index() {
     )
     .unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3828,7 +3838,7 @@ fn test_background_reindex_picks_up_new_file_quietly() {
     )
     .unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .env("CWTOOLS_REINDEX_INTERVAL_SECS", "1")
         .env("CWTOOLS_REINDEX_IDLE_SECS", "0")
@@ -3865,7 +3875,7 @@ fn test_background_reindex_picks_up_new_file_quietly() {
     wait_for_scan_done(&mut reader);
 
     // Open the caller; the definition is absent, so B shows CW263.
-    let b_uri = format!("file://{}", b_path.display());
+    let b_uri = path_uri(&b_path);
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -3919,7 +3929,7 @@ fn test_background_reindex_idle_window_from_init_option() {
     )
     .unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .env("CWTOOLS_REINDEX_INTERVAL_SECS", "1")
         .stdin(Stdio::piped())
@@ -3953,7 +3963,7 @@ fn test_background_reindex_idle_window_from_init_option() {
     .unwrap();
     wait_for_scan_done(&mut reader);
 
-    let b_uri = format!("file://{}", b_path.display());
+    let b_uri = path_uri(&b_path);
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -4025,7 +4035,7 @@ fn test_clear_all_caches_reports_reindexed_message() {
     std::fs::create_dir_all(seed_path.parent().unwrap()).unwrap();
     std::fs::write(&seed_path, "my_dec = {\n}\n").unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
+    let ws_uri = path_uri(ws.path());
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -4095,7 +4105,7 @@ fn storm_server(
     rules_dir: &std::path::Path,
     vanilla: &std::path::Path,
 ) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
-    let ws_uri = format!("file://{}", ws.display());
+    let ws_uri = path_uri(ws);
     let mut child = cwtools_server_cmd()
         // The `[validate]` line is a tracing event now, read back via
         // exportProfilingLog. env_remove so init_tracing installs the `info`
@@ -4241,7 +4251,7 @@ fn write_disk_file(ws: &std::path::Path, rel: &str, content: &str) -> String {
     let path = ws.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, content).unwrap();
-    format!("file://{}", path.display())
+    path_uri(&path)
 }
 
 #[test]
@@ -4382,7 +4392,7 @@ fn test_config_no_op_skips_revalidate_then_real_change_runs() {
     let path = ws.path().join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, STORM_FILE).unwrap();
-    let uri = format!("file://{}", path.display());
+    let uri = path_uri(&path);
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -4461,7 +4471,7 @@ fn test_config_idle_only_change_passes_noop_guard() {
     let path = ws.path().join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, STORM_FILE).unwrap();
-    let uri = format!("file://{}", path.display());
+    let uri = path_uri(&path);
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -4522,7 +4532,7 @@ fn test_config_partial_payload_keeps_ignore_lists() {
     let path = ws.path().join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, STORM_FILE).unwrap();
-    let uri = format!("file://{}", path.display());
+    let uri = path_uri(&path);
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -4714,7 +4724,7 @@ fn test_did_open_validates_deferred() {
     let rel = "common/decisions/o.txt";
     let path = ws.path().join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let uri = format!("file://{}", path.display());
+    let uri = path_uri(&path);
     let rx = spawn_frame_collector(reader);
 
     write_frame(
@@ -4760,7 +4770,7 @@ fn test_did_open_then_immediate_close_ends_empty() {
     let rel = "common/decisions/c.txt";
     let path = ws.path().join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let uri = format!("file://{}", path.display());
+    let uri = path_uri(&path);
     let rx = spawn_frame_collector(reader);
 
     write_frame(
@@ -4954,8 +4964,8 @@ fn did_open_indexes_own_subtype_membership() {
     // have come from `parse_and_validate`'s own indexing of that edit.
     std::fs::write(&file_path, "").unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
-    let doc_uri = format!("file://{}", file_path.display());
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -5087,8 +5097,8 @@ fn test_keystroke_edit_reports_missing_loc_once_loc_index_is_built() {
     // keystroke path), not a diagnostic left over from the scan.
     std::fs::write(&file_path, "").unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
-    let doc_uri = format!("file://{}", file_path.display());
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -5220,8 +5230,8 @@ types = {
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, text).unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
-    let doc_uri = format!("file://{}", file_path.display());
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -5359,8 +5369,8 @@ types = {
     let use_path = ws.path().join(rel_path);
     std::fs::write(&use_path, text).unwrap();
 
-    let ws_uri = format!("file://{}", ws.path().display());
-    let doc_uri = format!("file://{}", use_path.display());
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&use_path);
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
