@@ -10,11 +10,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: codeql-${{ github.ref }}
+  # event_name keeps a push to main from cancelling the weekly sweep.
+  group: codeql-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  # CodeQL needs read on contents, write on security-events to upload SARIF.
   contents: read
   security-events: write
 
@@ -25,7 +25,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Rust (cwtools-rs) and the GitHub Actions pack cover the workflow files.
         include:
           - language: actions
             paths: .github/workflows
@@ -35,16 +34,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # Full history is required for accurate security scanning.
           fetch-depth: 0
       - name: Initialize CodeQL
         uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a # v4
         with:
           languages: ${{ matrix.language }}
-          # Restrict scanning to the directories the language actually lives in.
           paths: ${{ matrix.paths }}
-          # Queries: use the security-and-quality query pack; tweak if you want
-          # a leaner scan (security-extended gives more coverage, slower).
+          # security-extended over security-and-quality: no maintainability noise.
           queries: security-extended
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a # v4
