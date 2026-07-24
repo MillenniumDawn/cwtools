@@ -62,9 +62,12 @@ impl Lang {
 
 /// Parse an `l_xxx` prefix into a Lang variant.
 ///
-/// Accepts all known language keys including `l_default`.
+/// Accepts all known language keys including `l_default`. Case-insensitive like
+/// `Lang::from_name` and `yaml_parser::lang_from_filename`: a file headed
+/// `L_English:` would otherwise resolve to no language and drop every one of its
+/// keys from the index.
 pub(crate) fn key_to_language(prefix: &str) -> Option<Lang> {
-    match prefix {
+    match prefix.to_ascii_lowercase().as_str() {
         "l_english" => Some(Lang::English),
         "l_french" => Some(Lang::French),
         "l_german" => Some(Lang::German),
@@ -146,9 +149,6 @@ pub struct LocFile {
     /// YAML-only lang-header check (CW255/256/257) must skip them.
     pub is_csv: bool,
     pub entries: Vec<LocEntry>,
-    /// File-level diagnostics (BOM, header/filename mismatches, etc.).
-    /// Empty when there are no issues.
-    pub file_diagnostics: Vec<String>,
     /// Line-level parse errors collected during lenient recovery (CW001).
     /// Empty for well-formed files.
     pub parse_errors: Vec<LocParseError>,
@@ -176,6 +176,16 @@ mod tests {
         assert_eq!(key_to_language("l_english"), Some(Lang::English));
         assert_eq!(key_to_language("l_turkish"), Some(Lang::Turkish));
         assert_eq!(key_to_language("l_unknown"), None);
+    }
+
+    #[test]
+    fn test_key_to_language_case_insensitive() {
+        // Real loc files ship `L_English:` headers; the siblings
+        // (`Lang::from_name`, `lang_from_filename`) already ignore case.
+        assert_eq!(key_to_language("L_English"), Some(Lang::English));
+        assert_eq!(key_to_language("L_SIMP_CHINESE"), Some(Lang::SimpChinese));
+        assert_eq!(key_to_language("L_Default"), Some(Lang::Default));
+        assert_eq!(key_to_language("L_Klingon"), None);
     }
 
     #[test]

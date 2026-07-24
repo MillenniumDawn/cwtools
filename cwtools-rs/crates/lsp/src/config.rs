@@ -368,6 +368,18 @@ impl Backend {
             .hierarchical_symbols
             .store(hierarchical, Ordering::Relaxed);
 
+        // `$/progress`: only usable when the client says it will answer
+        // `window/workDoneProgress/create`. See `scan::send_work_done_progress`.
+        let work_done_progress = params
+            .capabilities
+            .window
+            .as_ref()
+            .and_then(|w| w.work_done_progress)
+            .unwrap_or(false);
+        self.state
+            .client_work_done_progress
+            .store(work_done_progress, Ordering::Relaxed);
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 position_encoding,
@@ -411,6 +423,9 @@ impl Backend {
                         "reloadrulesconfig".to_string(),
                         "genlocall".to_string(),
                         "reindexWorkspace".to_string(),
+                        // The extension greys out its graph commands unless it
+                        // finds this name here (`graphAvailability.ts`).
+                        "getGraphData".to_string(),
                     ],
                     work_done_progress_options: Default::default(),
                 }),
@@ -427,7 +442,13 @@ impl Backend {
                 // step: the WorkspaceEdit is built up-front in the handler.
                 code_action_provider: Some(CodeActionProviderCapability::Options(
                     CodeActionOptions {
-                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        code_action_kinds: Some(vec![
+                            CodeActionKind::QUICKFIX,
+                            // `source.fixAll` is what `editor.codeActionsOnSave`
+                            // binds to; without it in this list no client ever
+                            // asks for it.
+                            CodeActionKind::SOURCE_FIX_ALL,
+                        ]),
                         resolve_provider: Some(false),
                         work_done_progress_options: Default::default(),
                     },
@@ -436,6 +457,33 @@ impl Backend {
                 // The handler gates each kind on its setting and returns nothing
                 // when both are off, so a client always-on capability is harmless.
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                // Semantic tokens: `full` only. `range` would need its own walk
+                // (the rule bootstrap is per top-level entity, not per line) for
+                // no real gain on files this size, and `full/delta` needs
+                // server-side result caching we have no invalidation story for.
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: crate::semantic::legend(),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: Some(false),
+                            work_done_progress_options: Default::default(),
+                        },
+                    ),
+                ),
+                // Document colours: `color = { … }` leaves get an inline swatch
+                // and the native picker. `colorPresentation` re-reads the source
+                // span so the picker writes back the convention it found.
+                color_provider: Some(ColorProviderCapability::Simple(true)),
+                // Multi-root: the server tracks one primary folder (the first),
+                // so a folder change re-points it and re-scans.
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    file_operations: None,
+                }),
                 // `position_encoding` (above): utf-32 when the client supports
                 // it, else the LSP default (utf-16). The parser counts chars,
                 // so on utf-16 clients column offsets are off by the number of
@@ -484,11 +532,14 @@ impl Backend {
                 .log_message(MessageType::ERROR, err.to_string())
                 .await;
             // Shared with the live per-file CWT lint (#43). No file text
-            // here to widen the squiggle, so pass empty line-ends.
+            // here to widen the squiggle, so pass no line info.
             diags_by_file
                 .entry(crate::paths::path_to_uri(&err.file))
                 .or_default()
-                .push(crate::validate::rule_parse_error_to_diagnostic(err, &[]));
+                .push(crate::validate::rule_parse_error_to_diagnostic(
+                    err,
+                    &crate::validate::DocLines::none(),
+                ));
         }
         for (uri, diags) in diags_by_file {
             if let Ok(url) = uri.parse() {
@@ -544,6 +595,96 @@ impl Backend {
                 .await;
         }
         loaded
+    }
+
+    /// React to a workspace folder being added or removed.
+    ///
+    /// The server tracks ONE primary folder (`config.workspace_uri`, the first
+    /// one at initialize) and derives the logical paths, the file scan root and
+    /// the type index from it. So the contained behaviour is: re-point that
+    /// folder at the first survivor and re-index. A workspace whose FIRST folder
+    /// is unchanged therefore only re-indexes; it does not gain the other
+    /// folders' content. Indexing several roots at once needs the scan and the
+    /// logical-path derivation to become multi-root, which is a bigger change
+    /// than this handler.
+    pub(crate) async fn did_change_workspace_folders_impl(
+        &self,
+        params: DidChangeWorkspaceFoldersParams,
+    ) {
+        let removed: Vec<String> = params
+            .event
+            .removed
+            .iter()
+            .map(|f| f.uri.to_string())
+            .collect();
+        let added: Vec<String> = params
+            .event
+            .added
+            .iter()
+            .map(|f| f.uri.to_string())
+            .collect();
+        let current = self.state.config.read().workspace_uri.clone();
+        let current = current.as_deref().map(str::to_string);
+
+        // Re-point only when the primary folder itself went away; otherwise the
+        // root the index was built from is still valid.
+        let next = match &current {
+            Some(uri) if removed.iter().any(|r| r == uri) => added.first().cloned(),
+            None => added.first().cloned(),
+            _ => current.clone(),
+        };
+        if next != current {
+            match &next {
+                Some(uri) => {
+                    let mut cfg = self.state.config.write();
+                    cfg.workspace_prefix = Some(crate::paths::workspace_prefix_of(uri));
+                    cfg.workspace_uri = Some(uri.as_str().into());
+                }
+                None => {
+                    let mut cfg = self.state.config.write();
+                    cfg.workspace_prefix = None;
+                    cfg.workspace_uri = None;
+                }
+            }
+        }
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "workspace folders changed (+{} / -{}); primary folder: {}",
+                    added.len(),
+                    removed.len(),
+                    next.as_deref().unwrap_or("<none>"),
+                ),
+            )
+            .await;
+        if next.is_none() {
+            return;
+        }
+        // A full rescan, the same path `reindexWorkspace` takes. The generation
+        // bump makes the quiet-pass fingerprint stale so the scan can't
+        // short-circuit on an unchanged file set from the OLD root.
+        self.state
+            .settings_generation
+            .fetch_add(1, Ordering::SeqCst);
+        // `validate_entire_workspace`'s CAS guard returns false when a scan is
+        // already running — including the startup scan this notification often
+        // races. That scan indexed the old root, so retry until we win the CAS,
+        // bounded so a perpetually-busy server reports instead of spinning.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut rescanned = self.validate_entire_workspace(false).await;
+        while !rescanned && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            rescanned = self.validate_entire_workspace(false).await;
+        }
+        if !rescanned {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "workspace folders changed but a scan stayed in progress; index still points at the previous folder",
+                )
+                .await;
+        }
     }
 
     /// Re-read ignore globs and the background-reindex interval/idle window
@@ -785,6 +926,9 @@ impl Backend {
                 };
                 Ok(Some(Value::String(msg.to_string())))
             }
+            // `getGraphData(entityType, depth)` — the entity graph the webview
+            // renders. See `graph.rs` for the wire format and the bounds.
+            "getGraphData" => self.get_graph_data(&params.arguments).await,
             // An error, not a silent `Ok(None)`: the VS Code client renders a
             // null result as success, masking client/engine version drift.
             other => Err(tower_lsp::jsonrpc::Error::invalid_params(format!(

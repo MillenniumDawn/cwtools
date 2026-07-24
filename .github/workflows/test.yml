@@ -117,8 +117,120 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-features --no-fail-fast
 
+  # A declared MSRV nobody builds at is a comment. Stable is 1.95; the floor is
+  # 1.88 (let-chains), so seven releases' worth of newer APIs compile fine on a
+  # developer machine and break the MSRV silently. This job is what makes
+  # `rust-version` in cwtools-rs/Cargo.toml mean something.
+  msrv-rs:
+    name: Rust MSRV build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cwtools-rs
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Read the version out of Cargo.toml rather than repeating it here, so
+      # bumping the MSRV is a one-line change and can't leave CI testing the
+      # old floor.
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(grep -m1 -oP '^rust-version\s*=\s*"\K[^"]+' Cargo.toml)
+          if [ -z "$msrv" ]; then
+            echo "::error::no rust-version found in cwtools-rs/Cargo.toml"
+            exit 1
+          fi
+          echo "Declared MSRV: $msrv"
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+      - name: Install Rust toolchain (MSRV)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cwtools-rs/Cargo.lock') }}
+      # Keyed on the MSRV: a different rustc invalidates every fingerprint, so
+      # sharing the stable job's target cache would just force two full rebuilds
+      # per run. The prefix is `msrv-target` rather than `cargo-target-msrv`
+      # because the other jobs restore-key on `cargo-target-`, which would
+      # otherwise match this cache and hand them a target dir built by 1.88.
+      - name: Cache cargo target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: cwtools-rs/target
+          key: ${{ runner.os }}-msrv-target-${{ steps.msrv.outputs.version }}-${{ hashFiles('cwtools-rs/Cargo.lock', 'cwtools-rs/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-target-${{ steps.msrv.outputs.version }}-
+          save-always: true
+      # The `+${{ ... }}` is load-bearing. rust-toolchain.toml pins the channel
+      # to stable, and a directory toolchain file outranks whatever rustup
+      # default the install step set, so a bare `cargo build` here would quietly
+      # build on stable and this job would pass no matter what the MSRV is.
+      - name: cargo build at MSRV
+        run: cargo +${{ steps.msrv.outputs.version }} build --workspace --all-targets
+
+  # Fuzzing in CI is a smoke run, not a fuzzing campaign: -runs=0 replays the
+  # committed seed corpus once and exits. Deterministic, ~seconds of target
+  # time, and it re-checks the two crashes the seeds encode (the reversed slice
+  # panic on a lone `'` in a Jomini param, and clause nesting past the depth
+  # cap). A real campaign is nondeterministic and belongs on a machine that can
+  # run for hours, not on the PR path where a fresh find would turn every
+  # unrelated PR red.
+  fuzz-smoke:
+    name: Fuzz seed-corpus smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cwtools-rs
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # cargo-fuzz needs nightly. Pinned to a date for the same reason every
+      # `uses:` here is pinned to a SHA: an unpinned nightly means a toolchain
+      # regression lands as a red build on an unrelated PR. Bump it deliberately
+      # when there's a reason to.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: nightly-2026-07-24
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cwtools-rs/Cargo.lock') }}
+      - name: Cache fuzz target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: cwtools-rs/fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-target-${{ hashFiles('cwtools-rs/fuzz/Cargo.toml', 'cwtools-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-target-
+          save-always: true
+      # Explicit +toolchain throughout: rust-toolchain.toml says stable, and
+      # letting it win would make rustup fetch a second toolchain to run
+      # cargo-fuzz on, which then can't build the nightly-only targets.
+      # Version-pinned, unlike the cargo-machete install above: `fuzz run`'s
+      # positional-corpus and `-- -runs=0` handling is the whole contract this
+      # job depends on, and a cargo-fuzz that changed it would break the job
+      # rather than the code.
+      - name: Install cargo-fuzz
+        run: cargo +nightly-2026-07-24 install cargo-fuzz --version 0.13.2 --locked
+      - name: parse_string over seed corpus
+        run: cargo +nightly-2026-07-24 fuzz run parse_string fuzz/seeds/parse_string -- -runs=0
+      - name: parse_loc_text over seed corpus
+        run: cargo +nightly-2026-07-24 fuzz run parse_loc_text fuzz/seeds/parse_loc_text -- -runs=0
+
+  # Release is the profile users actually get, and until this job ran tests it
+  # had no coverage at all. Debug panics on integer overflow, release wraps, so
+  # the arithmetic the shipped binary performs was never the arithmetic under
+  # test. 2.2.0 shipped exactly that (a u16 column overflow).
   build-rs-release:
-    name: Rust release build
+    name: Rust release build & test
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -144,6 +256,8 @@ jobs:
           save-always: true
       - name: cargo build --release
         run: cargo build --workspace --release
+      - name: cargo test --release
+        run: cargo test --workspace --all-features --release --no-fail-fast
       - name: Upload release binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -151,4 +265,6 @@ jobs:
           path: |
             cwtools-rs/target/release/cwtools
             cwtools-rs/target/release/cwtools-server
-          if-no-files-found: warn
+          # error, not warn: a job that builds no binaries and still goes green
+          # is the failure this upload exists to catch.
+          if-no-files-found: error

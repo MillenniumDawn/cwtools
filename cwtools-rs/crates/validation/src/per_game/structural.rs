@@ -28,10 +28,12 @@ enum BoolState {
     Neutral,
 }
 
-/// The reserved keywords' interned ids, resolved once per file so the walk
-/// compares token ids instead of doing string-table lookups per block. This
-/// walk visits every block of every file and the per-block lookups dominated
-/// its cost (~25% of the whole MD validate phase before; integer compares now).
+/// The reserved keywords' interned *lowercase* ids, resolved once per file so
+/// the walk compares token ids instead of doing string-table lookups per block.
+/// This walk visits every block of every file and the per-block lookups
+/// dominated its cost (~25% of the whole MD validate phase before; integer
+/// compares now). Paradox script keys are case-insensitive, so every comparison
+/// is against a block's `key_lower` — `NOT`/`not`/`Not` are one keyword.
 struct Keywords {
     not: StringId,
     if_: StringId,
@@ -41,21 +43,40 @@ struct Keywords {
     nor: StringId,
     limit: StringId,
     count_triggers: StringId,
+    value: StringId,
 }
 
 impl Keywords {
     fn new(table: &StringTable) -> Self {
         Self {
-            not: table.intern("NOT").normal,
-            if_: table.intern("if").normal,
-            else_if: table.intern("else_if").normal,
-            and: table.intern("AND").normal,
-            or: table.intern("OR").normal,
-            nor: table.intern("NOR").normal,
-            limit: table.intern("limit").normal,
-            count_triggers: table.intern("count_triggers").normal,
+            not: table.intern("not").lower,
+            if_: table.intern("if").lower,
+            else_if: table.intern("else_if").lower,
+            and: table.intern("and").lower,
+            or: table.intern("or").lower,
+            nor: table.intern("nor").lower,
+            limit: table.intern("limit").lower,
+            count_triggers: table.intern("count_triggers").lower,
+            value: table.intern("value").lower,
         }
     }
+}
+
+/// Whether a key is one of the boolean operators the checks below reason about.
+fn is_bool_operator(key: StringId, kw: &Keywords) -> bool {
+    key == kw.not || key == kw.and || key == kw.or || key == kw.nor
+}
+
+/// Whether an operator block is a dynamic-value (math) expression rather than a
+/// boolean one. HOI4 reuses `and`/`or`/`not` as *value* operators inside
+/// `check_expr`, `set_variable` and friends — `and = { value = x less_than = 3 }`
+/// combines two computed values and is not the `AND` trigger this walk reasons
+/// about. A direct `value = …` child tells the two apart without a rules lookup.
+fn is_math_expression(children: &[Child], ast: &ParsedFile, kw: &Keywords) -> bool {
+    children.iter().any(|c| match c {
+        Child::Leaf(idx) => ast.arena.leaves[*idx as usize].key.lower == kw.value,
+        _ => false,
+    })
 }
 
 /// Number of children that are not comments.
@@ -78,7 +99,7 @@ fn is_empty_if(children: &[Child], ast: &ParsedFile, kw: &Keywords) -> bool {
                     return false;
                 }
                 // A `key = { ... }` leaf-clause: only `limit` is allowed.
-                if l.key.normal != kw.limit {
+                if l.key.lower != kw.limit {
                     return false;
                 }
             }
@@ -133,7 +154,22 @@ fn walk(
         let Some(block) = as_block(child, ast) else {
             continue;
         };
-        let key = block.key;
+        let key = block.key_lower;
+
+        // Value arithmetic, not boolean logic: none of the checks below apply to
+        // it, and its children are operands, so descend with a neutral context.
+        if is_bool_operator(key, kw) && is_math_expression(block.children, ast, kw) {
+            walk(
+                block.children,
+                ast,
+                kw,
+                file_path,
+                BoolState::Neutral,
+                cw223_msg,
+                errors,
+            );
+            continue;
+        }
 
         // CW223 — NOT with more than one child. The remediation differs by game
         // (HOI4 has no NOR/NAND triggers), so the message is chosen by the caller.
@@ -247,6 +283,15 @@ mod tests {
     use cwtools_parser::fix::apply_edits;
     use cwtools_parser::parser::parse_string;
 
+    /// The codes emitted for `src`, in emit order.
+    fn codes(src: &str) -> Vec<&'static str> {
+        let table = StringTable::new();
+        let ast = parse_string(src, &table).unwrap();
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+        errors.iter().filter_map(|e| e.code).collect()
+    }
+
     /// Validate `src`, apply the fix on the first diagnostic with `code`, and
     /// assert the result equals `expected` and no longer emits `code`.
     fn assert_fix(code: &str, src: &str, expected: &str) {
@@ -312,5 +357,121 @@ mod tests {
     #[test]
     fn cw281_fix_deletes_empty_limit() {
         assert_fix("CW281", "x = { limit = { } }\n", "x = { }\n");
+    }
+
+    // Paradox script keys are case-insensitive, so every spelling of a reserved
+    // logic keyword must reach the same check.
+
+    #[test]
+    fn not_flagged_in_every_casing() {
+        for key in ["NOT", "not", "Not"] {
+            let src = format!("x = {{ {key} = {{ has_war = yes tag = GER }} }}\n");
+            assert_eq!(codes(&src), ["CW223"], "{key}");
+        }
+    }
+
+    #[test]
+    fn empty_if_flagged_in_every_casing() {
+        for key in ["if", "IF", "If", "else_if", "ELSE_IF", "Else_if"] {
+            let src = format!("x = {{ {key} = {{ }} }}\n");
+            assert_eq!(codes(&src), ["CW121"], "{key}");
+        }
+    }
+
+    #[test]
+    fn empty_limit_flagged_in_every_casing() {
+        for key in ["limit", "LIMIT", "Limit"] {
+            let src = format!("x = {{ {key} = {{ }} }}\n");
+            assert_eq!(codes(&src), ["CW281"], "{key}");
+        }
+    }
+
+    #[test]
+    fn if_with_only_a_limit_is_empty_in_every_casing() {
+        // The limit doesn't count as an effect, so the `if` is still empty.
+        let src = "x = { IF = { LIMIT = { tag = GER } } }\n";
+        assert_eq!(codes(src), ["CW121"]);
+    }
+
+    #[test]
+    fn redundant_and_flagged_in_every_casing() {
+        for key in ["AND", "and", "And"] {
+            // The root context is already AND, so a top-level AND is redundant.
+            let src = format!("{key} = {{ tag = GER }}\n");
+            assert_eq!(codes(&src), ["CW251"], "{key}");
+        }
+    }
+
+    #[test]
+    fn redundant_or_flagged_in_every_casing() {
+        for (outer, inner) in [("OR", "OR"), ("or", "OR"), ("OR", "or"), ("or", "or")] {
+            let src = format!("{outer} = {{ {inner} = {{ tag = GER }} }}\n");
+            assert_eq!(codes(&src), ["CW251"], "{outer} / {inner}");
+        }
+    }
+
+    #[test]
+    fn nor_opens_an_or_context_in_every_casing() {
+        for key in ["NOR", "nor"] {
+            // NOR is never redundant itself, but an OR directly inside it is.
+            let src = format!("{key} = {{ OR = {{ tag = GER }} }}\n");
+            assert_eq!(codes(&src), ["CW251"], "{key}");
+        }
+    }
+
+    // Regression: a lowercase `or` fell through to the default AND context, so
+    // the AND grouping inside it wrongly read as redundant (false CW251).
+    #[test]
+    fn and_inside_or_is_not_redundant_in_every_casing() {
+        for key in ["OR", "or"] {
+            let src = format!(
+                "{key} = {{ AND = {{ has_war = yes tag = GER }} has_capitulated = yes }}\n"
+            );
+            assert!(codes(&src).is_empty(), "{key}: {:?}", codes(&src));
+        }
+    }
+
+    #[test]
+    fn and_inside_not_is_not_redundant_in_every_casing() {
+        for key in ["NOT", "not"] {
+            let src = format!("{key} = {{ AND = {{ has_war = yes tag = GER }} }}\n");
+            assert!(codes(&src).is_empty(), "{key}: {:?}", codes(&src));
+        }
+    }
+
+    // HOI4's dynamic-value syntax reuses the operator names on values, where the
+    // boolean rules don't hold: `and = { value = … }` inside a `check_expr` is
+    // arithmetic, not a redundant AND.
+    #[test]
+    fn math_expression_operators_are_not_boolean() {
+        let src = "x = { check_expr = {\n\
+                   value = { value = global.num_days mod = 365 greater_than = 90 }\n\
+                   and = { value = global.num_days mod = 365 less_than = 300 }\n\
+                   } }\n";
+        assert!(codes(src).is_empty(), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn math_expression_not_is_not_a_trigger() {
+        let src = "x = { not = { value = current_level equals = 3 } }\n";
+        assert!(codes(src).is_empty(), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn triggers_below_a_math_block_are_still_checked() {
+        // The `limit` of a math `if` holds real triggers, so the walk must keep
+        // descending rather than write off the whole subtree.
+        let src = "x = { set_temp_variable = { v = { value = 0\n\
+                   if = { limit = { NOT = { has_war = yes tag = GER } } add = 1 }\n\
+                   } } }\n";
+        assert_eq!(codes(src), ["CW223"]);
+    }
+
+    #[test]
+    fn count_triggers_is_neutral_in_every_casing() {
+        for key in ["count_triggers", "COUNT_TRIGGERS"] {
+            let src = format!("{key} = {{ amount = 2 AND = {{ has_war = yes tag = GER }} }}\n");
+            assert!(codes(&src).is_empty(), "{key}: {:?}", codes(&src));
+        }
     }
 }

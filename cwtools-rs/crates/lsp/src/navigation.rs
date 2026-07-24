@@ -282,7 +282,7 @@ impl Backend {
     /// the workspace reverse index. Open docs are taken only from the live scan
     /// (their index entry can lag a keystroke), so the reverse-index half skips
     /// them.
-    fn collect_use_sites(
+    pub(crate) fn collect_use_sites(
         &self,
         type_name: &str,
         instance_name: &str,

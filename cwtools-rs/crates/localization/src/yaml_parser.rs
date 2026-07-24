@@ -221,43 +221,12 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
         }
     }
 
-    // Collect file-level diagnostics: header/filename lang validation
-    let mut file_diagnostics = Vec::new();
-    if let Some(diag) = check_loc_file_lang(name, language_key) {
-        let msg = match &diag {
-            LangHeaderDiagnostic::MissingLocFileLangHeader { file } => {
-                format!(
-                    "CW-MissingLocFileLangHeader: '{}' has no recognised language header",
-                    file
-                )
-            }
-            LangHeaderDiagnostic::MissingLocFileLang { file } => {
-                format!(
-                    "CW-MissingLocFileLang: '{}' filename carries no language tag",
-                    file
-                )
-            }
-            LangHeaderDiagnostic::LocFileLangMismatch {
-                file,
-                filename_lang,
-                header_lang,
-            } => {
-                format!(
-                    "CW-LocFileLangMismatch: '{}' filename says '{}' but header says '{}'",
-                    file, filename_lang, header_lang
-                )
-            }
-        };
-        file_diagnostics.push(msg);
-    }
-
     Ok(LocFile {
         path: name.to_string(),
         language_prefix: language_key.to_string(),
         lang,
         is_csv: false,
         entries,
-        file_diagnostics,
         parse_errors,
         // Unknown here; set by the disk-reading path (`LocService`) where the
         // raw bytes are available.
@@ -657,65 +626,11 @@ mod tests {
     // ---- lang-header / filename diagnostics tests --------------------------
 
     #[test]
-    fn test_lang_header_matching_filename() {
-        // events_l_english.yml with l_english: header — no diagnostic
-        let text = "l_english:\n key: \"value\"\n";
-        let file = parse_loc_text(text, "events_l_english.yml").unwrap();
-        assert!(
-            file.file_diagnostics.is_empty(),
-            "should have no diagnostics: {:?}",
-            file.file_diagnostics
-        );
-    }
-
-    #[test]
-    fn test_lang_header_mismatch() {
-        // events_l_english.yml but header says l_french:
-        let text = "l_french:\n key: \"value\"\n";
-        let file = parse_loc_text(text, "events_l_english.yml").unwrap();
-        assert_eq!(file.file_diagnostics.len(), 1);
-        assert!(
-            file.file_diagnostics[0].contains("LocFileLangMismatch"),
-            "{:?}",
-            file.file_diagnostics
-        );
-    }
-
-    #[test]
-    fn test_lang_header_missing_from_filename() {
-        // file with no lang tag in name, valid header
-        let text = "l_english:\n key: \"value\"\n";
-        let file = parse_loc_text(text, "events.yml").unwrap();
-        assert_eq!(file.file_diagnostics.len(), 1);
-        assert!(
-            file.file_diagnostics[0].contains("MissingLocFileLang"),
-            "{:?}",
-            file.file_diagnostics
-        );
-    }
-
-    #[test]
-    fn test_lang_header_unrecognised_header() {
-        // unrecognised header key
-        let text = "l_klingon:\n key: \"value\"\n";
-        let file = parse_loc_text(text, "events_l_english.yml").unwrap();
-        assert_eq!(file.file_diagnostics.len(), 1);
-        assert!(
-            file.file_diagnostics[0].contains("MissingLocFileLangHeader"),
-            "{:?}",
-            file.file_diagnostics
-        );
-    }
-
-    #[test]
     fn test_lang_header_default_is_ok() {
         // l_default header should always pass
-        let text = "l_default:\n key: \"value\"\n";
-        let file = parse_loc_text(text, "events_l_english.yml").unwrap();
-        assert!(
-            file.file_diagnostics.is_empty(),
-            "l_default should not produce diagnostics: {:?}",
-            file.file_diagnostics
+        assert_eq!(
+            check_loc_file_lang("events_l_english.yml", "l_default"),
+            None
         );
     }
 
@@ -741,10 +656,9 @@ mod tests {
         let file = parse_loc_text(text, "factions_l_english.yml").unwrap();
         assert_eq!(file.lang, Some(Lang::English));
         assert_eq!(file.language_prefix, "l_english");
-        assert!(
-            file.file_diagnostics.is_empty(),
-            "leading-space header should not flag: {:?}",
-            file.file_diagnostics
+        assert_eq!(
+            check_loc_file_lang("factions_l_english.yml", &file.language_prefix),
+            None
         );
     }
 
@@ -755,23 +669,16 @@ mod tests {
         let text = "\u{feff}\u{feff}l_french:\n KEY_A: \"value\"\n";
         let file = parse_loc_text(text, "lockeys_l_french.yml").unwrap();
         assert_eq!(file.lang, Some(Lang::French));
-        assert!(
-            file.file_diagnostics.is_empty(),
-            "double-BOM header should not flag: {:?}",
-            file.file_diagnostics
+        assert_eq!(
+            check_loc_file_lang("lockeys_l_french.yml", &file.language_prefix),
+            None
         );
     }
 
     #[test]
     fn test_languages_yml_exempt() {
-        // languages.yml is special-cased
-        let text = "l_english:\n key: \"value\"\n";
-        let file = parse_loc_text(text, "languages.yml").unwrap();
-        assert!(
-            file.file_diagnostics.is_empty(),
-            "languages.yml should be exempt: {:?}",
-            file.file_diagnostics
-        );
+        // languages.yml is special-cased: no lang tag in the name, still no flag.
+        assert_eq!(check_loc_file_lang("languages.yml", "l_english"), None);
     }
 
     #[test]
@@ -789,6 +696,32 @@ mod tests {
         let text = "l_english:\n key: \"[event_target:foo]\"\n";
         let file = parse_loc_text(text, "test.yml").unwrap();
         assert_eq!(file.entries[0].commands, vec!["event_target:foo"]);
+    }
+
+    #[test]
+    fn test_lone_quote_in_jomini_param_does_not_panic() {
+        // Exact repro of the `cwtools loc` crash (exit 101): a stray `'` inside a
+        // Jomini call panicked the parser, and with it the whole rayon run.
+        let text = "l_english:\n TEST_KEY:0 \"[GetName(')]\"\n";
+        let file = parse_loc_text(text, "test_l_english.yml").unwrap();
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(file.entries[0].key, "TEST_KEY");
+    }
+
+    #[test]
+    fn test_mixed_case_header_resolves_language() {
+        // `L_English:` — the header/filename checks already ignore case, so the
+        // lang lookup must too. Otherwise `lang` is None and `LocIndex::build`
+        // drops every key in the file (mass false CW100/CW122/CW225).
+        let text = "L_English:\n KEY_A: \"value\"\n";
+        let file = parse_loc_text(text, "events_l_english.yml").unwrap();
+        assert_eq!(file.lang, Some(Lang::English));
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(file.entries[0].key, "KEY_A");
+        assert_eq!(
+            check_loc_file_lang("events_l_english.yml", "L_English"),
+            None
+        );
     }
 
     #[test]

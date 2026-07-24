@@ -10,7 +10,9 @@ use cwtools_string_table::string_table::StringId;
 use cwtools_validation::{Prepared, ValidationError, validate_prepared};
 
 use crate::Backend;
-use crate::paths::{logical_path_from_uri, uri_to_path_str};
+use crate::paths::{
+    encoded_position_len, logical_path_from_uri, source_column_to_lsp, uri_to_path_str,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_prepared<'a>(
@@ -148,6 +150,22 @@ pub(crate) fn truncate_validation_errors(
     total
 }
 
+/// Names a loc `$ref$` may resolve to besides loc keys: modifier keys plus every
+/// loc-bindable index name (type instances, dynamic modifiers, ideas, and
+/// defined variables). Mirrors `cwtools_driver::Session::loc_extra_valid_refs`
+/// so CI, the workspace scan, and the per-edit path accept the same references —
+/// the keystroke path used to take idea instances alone, so a `$my_variable$`
+/// reference grew a CW225 the moment its file was opened and lost it again on
+/// the next rescan.
+pub(crate) fn loc_extra_valid_refs(
+    modifier_keys: &HashSet<String>,
+    type_index: &cwtools_info::TypeIndex,
+) -> HashSet<String> {
+    let mut extra = modifier_keys.clone();
+    extra.extend(type_index.loc_bindable_names());
+    extra
+}
+
 /// CW100: objects defined here whose `## required` localisation keys aren't
 /// provided by any loc file. Gated on the loc index being built — before the
 /// initial scan finishes it's empty and everything would falsely report
@@ -183,66 +201,96 @@ pub(crate) fn validate_parsed_with_indexes(
     uri: &str,
     parsed: &ParsedFile,
     prepared: &Prepared,
-    line_ends: &[u32],
+    lines: &DocLines,
 ) -> Vec<Diagnostic> {
     let mut diagnostics: Vec<Diagnostic> = parsed
         .errors
         .iter()
-        .map(|e| parse_error_to_diagnostic(e, line_ends))
+        .map(|e| parse_error_to_diagnostic(e, lines))
         .collect();
     let mut errs = validate_prepared(parsed, uri, prepared);
     append_missing_loc_errors(parsed, uri, prepared, &mut errs);
     truncate_validation_errors(&mut errs, uri);
     for err in &errs {
-        diagnostics.push(validation_error_to_diagnostic(err, line_ends));
+        diagnostics.push(validation_error_to_diagnostic(err, lines));
     }
     diagnostics
 }
 
-/// Trimmed char-length of each line in `text`, indexed by 0-based line number.
-/// Used to widen a 1-column diagnostic so the squiggle covers the whole
-/// statement instead of a single character at the start. Counts chars (not
-/// bytes) to match the parser's column unit.
-pub(crate) fn line_end_cols(text: &str) -> Vec<u32> {
-    text.lines()
-        .map(|l| l.trim_end().chars().count() as u32)
-        .collect()
+/// A document's lines plus the negotiated position encoding: everything the
+/// diagnostic builders need to place a squiggle. The parser reports 1-based
+/// lines and 0-based CHAR columns, but the client reads columns in the encoding
+/// negotiated at `initialize`, so every published position goes through
+/// [`source_column_to_lsp`] — the same conversion hover, rename, and the
+/// code-action fix edits use. Publishing the raw column instead put the
+/// diagnostic and its own quick fix on different spans of any line holding a
+/// non-BMP character.
+///
+/// Lines are resolved once per file: `source_position_to_lsp` re-scans the whole
+/// text per call, which the keystroke path can't afford at 100 diagnostics.
+pub(crate) struct DocLines<'a> {
+    lines: Vec<&'a str>,
+    encoding: PositionEncodingKind,
 }
 
-/// End column for a diagnostic starting at `col` on 0-based `line`: the end of
-/// that line's content, but always at least one past `col` so the range is
-/// never empty. With no line info (`line_ends` empty or line out of range),
-/// falls back to a single-character span.
-fn diag_end_col(line_ends: &[u32], line: u32, col: u32) -> u32 {
-    line_ends
-        .get(line as usize)
-        .copied()
-        .unwrap_or(0)
-        .max(col + 1)
+impl<'a> DocLines<'a> {
+    pub(crate) fn new(text: &'a str, encoding: PositionEncodingKind) -> Self {
+        Self {
+            lines: text.lines().collect(),
+            encoding,
+        }
+    }
+
+    /// No document text in hand (the workspace scan's non-open files, ruleset
+    /// load errors): positions keep the parser's raw char column and the
+    /// squiggle stays one character wide. The encoding is never consulted
+    /// without a line to convert against.
+    pub(crate) fn none() -> Self {
+        Self {
+            lines: Vec::new(),
+            encoding: PositionEncodingKind::UTF16,
+        }
+    }
+
+    /// LSP position for a parser position (0-based `line`, 0-based char `col`).
+    fn position(&self, line: u32, col: u32) -> Position {
+        let character = self
+            .lines
+            .get(line as usize)
+            .map_or(col, |l| source_column_to_lsp(l, col, &self.encoding));
+        Position { line, character }
+    }
+
+    /// End position for a diagnostic whose start is at encoded column `start`:
+    /// the end of that line's content, but always at least one past `start` so
+    /// the range is never empty. With no line info, a single-character span.
+    fn end_position(&self, line: u32, start: u32) -> Position {
+        let character = self
+            .lines
+            .get(line as usize)
+            .map_or(0, |l| encoded_position_len(l.trim_end(), &self.encoding))
+            .max(start + 1);
+        Position { line, character }
+    }
 }
 
-/// Build a whole-statement-line diagnostic at `(line, col)` (0-based). The
-/// squiggle spans from `col` to the line's end column via [`diag_end_col`].
-/// Shared skeleton behind the `*_to_diagnostic` builders.
+/// Build a whole-statement-line diagnostic at `(line, col)` — 0-based line,
+/// 0-based parser char column. The squiggle spans from `col` to the line's
+/// content end. Shared skeleton behind the `*_to_diagnostic` builders.
 fn diagnostic_at(
     line: u32,
     col: u32,
-    line_ends: &[u32],
+    lines: &DocLines,
     severity: DiagnosticSeverity,
     source: &str,
     code: Option<NumberOrString>,
     message: String,
 ) -> Diagnostic {
+    let start = lines.position(line, col);
     Diagnostic {
         range: Range {
-            start: Position {
-                line,
-                character: col,
-            },
-            end: Position {
-                line,
-                character: diag_end_col(line_ends, line, col),
-            },
+            end: lines.end_position(line, start.character),
+            start,
         },
         severity: Some(severity),
         code,
@@ -255,7 +303,7 @@ fn diagnostic_at(
     }
 }
 
-pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Diagnostic {
+pub(crate) fn parse_error_to_diagnostic(e: &ParseError, lines: &DocLines) -> Diagnostic {
     let (line, col, msg) = match e {
         ParseError::Pos(line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
         ParseError::General(msg) => (0, 0, msg.clone()),
@@ -263,7 +311,7 @@ pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Di
     diagnostic_at(
         line,
         col,
-        line_ends,
+        lines,
         DiagnosticSeverity::ERROR,
         "cwtools",
         None,
@@ -276,14 +324,14 @@ pub(crate) fn parse_error_to_diagnostic(e: &ParseError, line_ends: &[u32]) -> Di
 /// Shared by the load-time path (`config.rs`) and the live per-file CWT lint.
 pub(crate) fn rule_parse_error_to_diagnostic(
     err: &cwtools_rules::ruleset_loader::RuleParseError,
-    line_ends: &[u32],
+    lines: &DocLines,
 ) -> Diagnostic {
     let line = err.line.saturating_sub(1);
     let col = err.col as u32;
     diagnostic_at(
         line,
         col,
-        line_ends,
+        lines,
         DiagnosticSeverity::ERROR,
         "cwtools-rules",
         None,
@@ -304,7 +352,7 @@ pub(crate) fn code_is_suppressed(code: Option<&NumberOrString>, ignored: &[Strin
 
 pub(crate) fn validation_error_to_diagnostic(
     err: &ValidationError,
-    line_ends: &[u32],
+    lines: &DocLines,
 ) -> Diagnostic {
     let line = err.line.saturating_sub(1);
     let col = err.col as u32;
@@ -317,7 +365,7 @@ pub(crate) fn validation_error_to_diagnostic(
     let mut diag = diagnostic_at(
         line,
         col,
-        line_ends,
+        lines,
         severity,
         "cwtools",
         err.code.map(|c| NumberOrString::String(c.to_string())),
@@ -329,10 +377,7 @@ pub(crate) fn validation_error_to_diagnostic(
     // code_action's fix-edit conversion), so only the whole-line end is overridden.
     // With `end` absent, the whole-line fallback stands byte-for-byte.
     if let Some((end_line, end_col)) = err.end {
-        diag.range.end = Position {
-            line: end_line.saturating_sub(1),
-            character: end_col as u32,
-        };
+        diag.range.end = lines.position(end_line.saturating_sub(1), end_col as u32);
     }
     // Carry any machine-applicable fix into `data` so the code-action handler
     // can round-trip it back into a QUICKFIX WorkspaceEdit. Covers both the
@@ -396,14 +441,52 @@ impl Backend {
     /// Index an already-parsed AST into the info index. Extracted
     /// from `index_document` so the workspace scan can index cache-hit ASTs
     /// without re-parsing.
-    pub(crate) fn index_parsed_file(&self, uri: &str, parsed: &ParsedFile) {
+    ///
+    /// `parsed_version` is the document version `parsed` came from, when it came
+    /// from an open document. Callers indexing from disk (the workspace scan,
+    /// the did_close restore) pass `None`.
+    pub(crate) fn index_parsed_file(
+        &self,
+        uri: &str,
+        parsed: &ParsedFile,
+        parsed_version: Option<i32>,
+    ) {
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = logical_path_from_uri(uri, &ws_prefix);
-        // Lock order: rules -> info_service.
-        let rules_guard = self.state.rules.read();
+        // Snapshot the ruleset instead of holding `rules` across the write: the
+        // guard would otherwise outrank the `documents` check below, and the
+        // `Arc` makes the snapshot free.
+        let ruleset = self.state.rules.read().ruleset.clone();
+        // Subtype-qualified membership (`equipment.naval_equip` …) so
+        // `<type.subtype>` references resolve. Re-run on every (re)index so an
+        // edit to an archetype keeps its subtype tag fresh. Computed BEFORE the
+        // write guard: completion takes a read guard on the same lock, so every
+        // microsecond held here is a keystroke the UI path waits on.
+        let subtypes = ruleset.as_ref().map(|ruleset| {
+            cwtools_validation::collect_subtype_instances(
+                ruleset,
+                parsed,
+                &logical_path,
+                &self.state.string_table,
+            )
+        });
+        // Stale-write guard, the same version check debounced_validate publishes
+        // behind: a newer edit's validate may have raced ahead and indexed this
+        // file already, and installing the older parse would silently roll the
+        // index back to it until the next keystroke.
+        if let Some(version) = parsed_version
+            && self
+                .state
+                .documents
+                .lock()
+                .get(uri)
+                .is_some_and(|doc| doc.version != version)
+        {
+            return;
+        }
         let mut info = self.state.info_service.write();
         info.clear_file(uri);
-        if let Some(ruleset) = rules_guard.ruleset.as_ref() {
+        if let (Some(ruleset), Some(subtypes)) = (ruleset.as_ref(), subtypes) {
             info.index_file_with_path(
                 uri,
                 parsed,
@@ -411,21 +494,9 @@ impl Backend {
                 ruleset,
                 &logical_path,
             );
-            // Subtype-qualified membership (`equipment.naval_equip` …) so
-            // `<type.subtype>` references resolve. Re-run on every (re)index so an
-            // edit to an archetype keeps its subtype tag fresh.
-            info.type_index.merge(
-                uri,
-                cwtools_validation::collect_subtype_instances(
-                    ruleset,
-                    parsed,
-                    &logical_path,
-                    &self.state.string_table,
-                ),
-            );
+            info.type_index.merge(uri, subtypes);
         }
         drop(info);
-        drop(rules_guard);
         self.bump_info_revision();
     }
 
@@ -442,7 +513,7 @@ impl Backend {
         ruleset: &RuleSet,
         game: Option<cwtools_game::constants::Game>,
         registry: Option<&std::sync::Arc<cwtools_game::scope_registry::ScopeRegistry>>,
-        line_ends: &[u32],
+        lines: &DocLines,
     ) -> Vec<Diagnostic> {
         // Overlay computed before the other guards (its lock is independent and
         // never nested inside info/loc — see validate_loc_text).
@@ -465,7 +536,7 @@ impl Backend {
             scope_checks,
             var_checks,
         );
-        validate_parsed_with_indexes(uri, parsed, &prepared, line_ends)
+        validate_parsed_with_indexes(uri, parsed, &prepared, lines)
     }
 
     /// Publish diagnostics after dropping any whose code the user suppressed via
@@ -540,7 +611,9 @@ impl Backend {
             (info.export_fingerprint(&uri), info.export_names(&uri))
         };
 
-        let (diagnostics, parsed) = self.parse_and_validate(&uri, &text, trigger).await;
+        let (diagnostics, parsed) = self
+            .parse_and_validate(&uri, &text, trigger, Some(expected_version))
+            .await;
         {
             let ast = parsed.map(Arc::new);
             // Update tokens before taking documents lock (doc_tokens must be
@@ -665,10 +738,10 @@ impl Backend {
         // need re-parsing or re-indexing — only re-validation against the
         // now-updated global index. When `changed_names` is `Some`, skip docs
         // whose token set references none of the changed names.
-        // Capture each dependent's per-line end columns while the docs lock is
-        // held (cheaper than cloning the whole text) so the republished
-        // diagnostics get whole-line squiggles, same as the edited file.
-        let others: Vec<(String, i32, Arc<ParsedFile>, Vec<u32>)> = {
+        // Capture each dependent's text (an `Arc` bump) while the docs lock is
+        // held so the republished diagnostics get whole-line squiggles and
+        // encoded columns, same as the edited file.
+        let others: Vec<(String, i32, Arc<ParsedFile>, Arc<str>)> = {
             let tokens = self.state.doc_tokens.read();
             let docs = self.state.documents.lock();
             docs.iter()
@@ -685,7 +758,7 @@ impl Backend {
                 .filter_map(|(u, d)| {
                     d.ast
                         .clone()
-                        .map(|ast| (u.clone(), d.version, ast, line_end_cols(&d.text)))
+                        .map(|ast| (u.clone(), d.version, ast, d.text.clone()))
                 })
                 .collect()
         };
@@ -697,7 +770,10 @@ impl Backend {
             generation,
             "revalidate_open_dependents"
         );
-        let game = self.state.config.read().game();
+        let (game, encoding) = {
+            let cfg = self.state.config.read();
+            (cfg.game(), cfg.position_encoding.clone())
+        };
         // Validate every dependent synchronously, then publish. No await is held
         // across the rules lock. The single `rules` read guard covers the ruleset,
         // the cached scope registry, and the modifier-key set (none change during
@@ -707,7 +783,7 @@ impl Backend {
         let validated: Vec<(String, i32, Vec<Diagnostic>)> = {
             let rules_guard = self.state.rules.read();
             let mut out = Vec::with_capacity(others.len());
-            for (uri, snapshot_version, ast, line_ends) in others {
+            for (uri, snapshot_version, ast, text) in others {
                 // Preempt: a newer edit arrived. Save our changed_names into the
                 // shared pending set so the newer sweep drains and covers them;
                 // without this, dependents of the preempted edit stay stale.
@@ -723,6 +799,7 @@ impl Backend {
                     // pending_changed_names) covers the rest.
                     break;
                 }
+                let lines = DocLines::new(&text, encoding.clone());
                 let diagnostics = match rules_guard.ruleset.as_ref() {
                     Some(ruleset) => self.validate_parsed_prebuilt(
                         &uri,
@@ -731,12 +808,12 @@ impl Backend {
                         ruleset,
                         game,
                         rules_guard.scope_registry.as_ref(),
-                        &line_ends,
+                        &lines,
                     ),
                     None => ast
                         .errors
                         .iter()
-                        .map(|e| parse_error_to_diagnostic(e, &line_ends))
+                        .map(|e| parse_error_to_diagnostic(e, &lines))
                         .collect(),
                 };
                 out.push((uri, snapshot_version, diagnostics));
@@ -832,38 +909,40 @@ impl Backend {
         }
     }
 
-    /// Validate one loc file's text into diagnostics. Builds the set of names a
-    /// `$ref$` may resolve to — modifier keys, idea names, and the live loc
-    /// overlay (the current keys of every open `.yml`) — then checks against the
-    /// scanned union. Pure: it neither updates the overlay nor triggers any
-    /// cross-file work, so the cross-file sweep can call it safely (#36).
-    fn validate_loc_text(&self, path: &str, text: &str, line_ends: &[u32]) -> Vec<Diagnostic> {
-        // Lock order: rules -> info_service -> loc_index. The overlay lock is
-        // independent and taken between, never nested inside the others.
-        let mut extra: HashSet<String> = (*self.state.rules.read().modifier_keys).clone();
-        {
+    /// The names a `$ref$` in a loc file may resolve to: [`loc_extra_valid_refs`]
+    /// plus the live loc overlay (the current keys of every open `.yml`).
+    ///
+    /// This is a full copy of the modifier-key and index-name universe (~200K
+    /// Strings on Millennium Dawn), so it is built ONCE per edit and shared by
+    /// `Arc` with every file that edit revalidates — building it per file cost
+    /// the keystroke path one whole copy per open `.yml`.
+    fn loc_ref_names(&self) -> Arc<HashSet<String>> {
+        // Lock order: rules -> info_service. The overlay lock is independent and
+        // taken after, never nested inside the others.
+        let mut extra = {
+            let modifier_keys = self.state.rules.read().modifier_keys.clone();
             let info = self.state.info_service.read();
-            let ideas = info.type_index.instances("idea");
-            extra.reserve(ideas.len());
-            for (_uri, inst) in ideas {
-                // Idea names are ASCII identifiers; skip the lowercasing alloc
-                // when already lowercase ASCII (the common case).
-                let needs_fold = inst
-                    .name
-                    .bytes()
-                    .any(|b| b.is_ascii_uppercase() || !b.is_ascii());
-                if needs_fold {
-                    extra.insert(inst.name.to_lowercase());
-                } else {
-                    extra.insert(inst.name.clone());
-                }
-            }
-        }
-        // Live overlay: every open loc file's current keys. Lets a key just added
-        // to an open `.yml` resolve immediately, in this file and cross-file.
+            loc_extra_valid_refs(&modifier_keys, &info.type_index)
+        };
+        // Lets a key just added to an open `.yml` resolve immediately, in that
+        // file and cross-file.
         for keys in self.state.loc_live_overlay.read().values() {
             extra.extend(keys.iter().cloned());
         }
+        Arc::new(extra)
+    }
+
+    /// Validate one loc file's text into diagnostics against the scanned union
+    /// and the shared `extra` name set from [`loc_ref_names`]. Pure: it neither
+    /// updates the overlay nor triggers any cross-file work, so the cross-file
+    /// sweep can call it safely (#36).
+    fn validate_loc_text(
+        &self,
+        path: &str,
+        text: &str,
+        lines: &DocLines,
+        extra: &HashSet<String>,
+    ) -> Vec<Diagnostic> {
         // Hold the read guard across the validate call to avoid cloning the full
         // loc-key union (~2M Strings on Millennium Dawn).
         let loc_guard = self.state.loc_index.read();
@@ -872,9 +951,9 @@ impl Backend {
             .as_ref()
             .map(|idx| idx.union())
             .unwrap_or(&empty_union);
-        cwtools_localization::validate_loc_file_text(text, path, union, &extra)
+        cwtools_localization::validate_loc_file_text(text, path, union, extra)
             .iter()
-            .map(|d| validation_error_to_diagnostic(&loc_diag_to_validation_error(d), line_ends))
+            .map(|d| validation_error_to_diagnostic(&loc_diag_to_validation_error(d), lines))
             .collect()
     }
 
@@ -882,7 +961,7 @@ impl Backend {
     /// loc file's key set changed, so a `$ref$` to a key that was just added or
     /// removed updates in the other open `.yml` files without a reload (#36).
     /// Bounded by the number of open loc files.
-    async fn revalidate_other_open_loc_files(&self, except_uri: &str) {
+    async fn revalidate_other_open_loc_files(&self, except_uri: &str, extra: &HashSet<String>) {
         let targets: Vec<(String, Arc<str>)> = {
             let docs = self.state.documents.lock();
             docs.iter()
@@ -890,27 +969,32 @@ impl Backend {
                 .map(|(u, d)| (u.clone(), d.text.clone()))
                 .collect()
         };
+        let encoding = self.state.config.read().position_encoding.clone();
         for (u, text) in targets {
             let path = uri_to_path_str(&u);
-            let line_ends = line_end_cols(&text);
-            let diags = self.validate_loc_text(&path, &text, &line_ends);
+            let lines = DocLines::new(&text, encoding.clone());
+            let diags = self.validate_loc_text(&path, &text, &lines, extra);
             if let Ok(obj) = Url::parse(&u) {
                 self.publish_gated(obj, diags, None).await;
             }
         }
     }
 
+    /// `parsed_version` is the open-document version `text` was taken at, so the
+    /// index install can tell a newer edit's validate has overtaken this one.
+    /// `None` when the text came from disk (the scan's non-open pass).
     #[tracing::instrument(skip_all, fields(uri = %uri, bytes = text.len(), trigger = trigger.as_str()))]
     pub(crate) async fn parse_and_validate(
         &self,
         uri: &str,
         text: &str,
         trigger: crate::ValidateTrigger,
+        parsed_version: Option<i32>,
     ) -> (Vec<Diagnostic>, Option<ParsedFile>) {
         let mut diagnostics = Vec::new();
-        // Per-line end columns so every squiggle spans the whole statement line
-        // rather than a single character at its start.
-        let line_ends = line_end_cols(text);
+        // Per-line text + negotiated encoding, so every squiggle spans the whole
+        // statement line and lands on the columns the client reads.
+        let lines = DocLines::new(text, self.state.config.read().position_encoding.clone());
 
         // Localisation files are parsed and validated as loc, not config.
         if crate::paths::is_loc_file(uri) {
@@ -928,7 +1012,10 @@ impl Backend {
                 overlay.insert(uri.to_string(), new_keys);
                 diff
             };
-            let diagnostics = self.validate_loc_text(&path, text, &line_ends);
+            // Built once here and shared with the cross-file sweep below, which
+            // would otherwise rebuild the whole name set per open loc file.
+            let extra = self.loc_ref_names();
+            let diagnostics = self.validate_loc_text(&path, text, &lines, &extra);
             // Update the hover loc_text map so tooltips reflect the latest
             // edits without waiting for a full workspace rescan (#53).
             self.update_loc_text_for_file(uri, text, &path);
@@ -944,7 +1031,7 @@ impl Backend {
             // from, instead of every open game file.
             if !changed_keys.is_empty() {
                 self.bump_info_revision();
-                self.revalidate_other_open_loc_files(uri).await;
+                self.revalidate_other_open_loc_files(uri, &extra).await;
                 let generation = self
                     .state
                     .edit_generation
@@ -959,6 +1046,13 @@ impl Backend {
             return (diagnostics, None);
         }
 
+        // A loc-extension file outside any `localisation` dir (a CI workflow, an
+        // editor config) is neither loc nor game script: publish nothing rather
+        // than parsing YAML as Paradox script.
+        if crate::paths::has_loc_ext(uri) {
+            return (diagnostics, None);
+        }
+
         // `.cwt` rule-config files are the schema the engine is built from, not
         // game content. Lint them structurally — parse errors plus references to
         // undefined types/enums/single_aliases — against the loaded merged
@@ -968,7 +1062,7 @@ impl Backend {
             match parse_string(text, &self.state.string_table) {
                 Ok(parsed) => {
                     for parse_err in &parsed.errors {
-                        diagnostics.push(parse_error_to_diagnostic(parse_err, &line_ends));
+                        diagnostics.push(parse_error_to_diagnostic(parse_err, &lines));
                     }
                     // Structural reference check against the merged ruleset. Only
                     // runs once rules are loaded; before then there's nothing to
@@ -983,7 +1077,7 @@ impl Backend {
                             ruleset,
                             &self.state.string_table,
                         ) {
-                            diagnostics.push(rule_parse_error_to_diagnostic(&err, &line_ends));
+                            diagnostics.push(rule_parse_error_to_diagnostic(&err, &lines));
                         }
                     }
                 }
@@ -1008,14 +1102,14 @@ impl Backend {
         match parse_string(text, &self.state.string_table) {
             Ok(parsed) => {
                 for parse_err in &parsed.errors {
-                    diagnostics.push(parse_error_to_diagnostic(parse_err, &line_ends));
+                    diagnostics.push(parse_error_to_diagnostic(parse_err, &lines));
                 }
 
                 // Index this file the same way the workspace scan and did_close
                 // disk-restore do (previously an inlined, drifted subset that
                 // skipped the collect_subtype_instances merge — an open file
                 // could lose its `<type.subtype>` membership while being edited).
-                self.index_parsed_file(uri, &parsed);
+                self.index_parsed_file(uri, &parsed, parsed_version);
 
                 // Validation. Lock order: rules -> info_service -> loc_index.
                 let (errors, log_msg) = {
@@ -1079,7 +1173,7 @@ impl Backend {
                 }
 
                 for err in &errors {
-                    diagnostics.push(validation_error_to_diagnostic(err, &line_ends));
+                    diagnostics.push(validation_error_to_diagnostic(err, &lines));
                 }
                 (diagnostics, Some(parsed))
             }
@@ -1169,6 +1263,125 @@ mod perf_bench {
             total
         });
     }
+
+    /// The `$ref$` name set every loc-file edit builds ([`loc_ref_names`]), at
+    /// Millennium-Dawn scale. `validate_loc_text` used to build one of these per
+    /// call, so an edit with N loc files open paid it N+1 times; it is now built
+    /// once and shared, and this is what each avoided rebuild cost.
+    #[test]
+    #[ignore]
+    fn perf_loc_ref_names() {
+        const MODIFIER_KEYS: usize = 50_000;
+        const TYPE_INSTANCES: usize = 190_000;
+
+        let modifier_keys: HashSet<String> = (0..MODIFIER_KEYS)
+            .map(|i| format!("modifier_key_{:06}", i))
+            .collect();
+        let mut type_index = cwtools_info::TypeIndex::new();
+        let mut per_type: HashMap<String, Vec<cwtools_info::TypeInstance>> = HashMap::new();
+        for i in 0..TYPE_INSTANCES {
+            per_type
+                .entry(format!("type_{:02}", i % 40))
+                .or_default()
+                .push(cwtools_info::TypeInstance {
+                    name: format!("instance_name_{:06}", i),
+                    location: cwtools_info::SourceLocation {
+                        line: 1,
+                        col: 0,
+                        end: (1, 0),
+                    },
+                    primary_loc_key: None,
+                });
+        }
+        type_index.merge("file:///bench/defs.txt", per_type);
+        eprintln!(
+            "fixture: {} modifier keys, {} type instances",
+            modifier_keys.len(),
+            TYPE_INSTANCES
+        );
+
+        bench("loc_extra_valid_refs", 20, || {
+            loc_extra_valid_refs(&modifier_keys, &type_index).len()
+        });
+    }
+
+    /// Where the per-edit single-file index spends its time, split into the part
+    /// that now runs before `info_service.write()` is taken and the part that
+    /// still runs under it (completion blocks on that lock). Needs a real
+    /// ruleset and a real game file; skips when neither is on this machine.
+    #[test]
+    #[ignore]
+    fn perf_index_parsed_file() {
+        let expand = |p: &str| -> std::path::PathBuf {
+            match p.strip_prefix("~/") {
+                Some(rest) => std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(rest),
+                None => std::path::PathBuf::from(p),
+            }
+        };
+        let rules_dir = expand(
+            &std::env::var("CWTOOLS_PERF_RULES")
+                .unwrap_or_else(|_| "/mnt/Linux/github-projects/cwtools-hoi4-config".to_string()),
+        )
+        .join("Config");
+        let vanilla = expand(&std::env::var("CWTOOLS_PERF_VANILLA").unwrap_or_else(|_| {
+            "~/.local/share/Steam/steamapps/common/Hearts of Iron IV".to_string()
+        }));
+        if !rules_dir.is_dir() || !vanilla.is_dir() {
+            eprintln!(
+                "perf_index_parsed_file: skipping, need {} and {}",
+                rules_dir.display(),
+                vanilla.display()
+            );
+            return;
+        }
+
+        let table = cwtools_string_table::string_table::StringTable::new();
+        let (ruleset, _errors) =
+            cwtools_rules::ruleset_loader::load_ruleset_from_dir(&rules_dir, &table);
+        eprintln!(
+            "ruleset: {} types / {} aliases from {}",
+            ruleset.types.len(),
+            ruleset.aliases.len(),
+            rules_dir.display()
+        );
+
+        // A focus file (no subtypes), an events file, and an equipment file
+        // (`<type.subtype>` archetypes) — the three shapes of hot single-file
+        // reindex, so the split isn't read off one unrepresentative case.
+        for logical_path in [
+            "common/national_focus/germany.txt",
+            "events/WUW_Germany.txt",
+            "common/units/equipment/plane_airframes.txt",
+        ] {
+            let game_file = vanilla.join(logical_path);
+            let Ok(text) = std::fs::read_to_string(&game_file) else {
+                eprintln!("  skipping missing fixture {}", game_file.display());
+                continue;
+            };
+            let parsed = parse_string(&text, &table).expect("parse");
+            let uri = format!("file:///bench/{}", logical_path);
+            eprintln!("fixture: {} ({} bytes)", logical_path, text.len());
+
+            bench("collect_subtype_instances", 20, || {
+                cwtools_validation::collect_subtype_instances(
+                    &ruleset,
+                    &parsed,
+                    logical_path,
+                    &table,
+                )
+                .len()
+            });
+            // One InfoService across iterations, as in the server: `clear_file`
+            // then has real entries to drop, and the ruleset-derived
+            // `type_ref_keys` map is memoized instead of rebuilt per iteration.
+            let mut info = cwtools_info::InfoService::new();
+            bench("clear_file + index_file", 20, || {
+                info.clear_file(&uri);
+                info.index_file_with_path(&uri, &parsed, &table, &ruleset, logical_path);
+                info.export_fingerprint(&uri) as usize
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1246,14 +1459,89 @@ mod whole_line_range_tests {
     }
 
     #[test]
-    fn line_end_cols_reports_trimmed_char_lengths() {
+    fn loc_extra_valid_refs_covers_every_bindable_name() {
+        // The per-edit path used to collect `instances("idea")` alone, so a
+        // `$my_variable$` (or any non-idea definition) validated clean in CI and
+        // after a workspace scan, then grew a CW225 the moment the file was
+        // opened and lost it again on the next rescan. All three paths build the
+        // set from the same source now.
+        use cwtools_info::{SourceLocation, TypeIndex, TypeInstance};
+        let instance = |name: &str| TypeInstance {
+            name: name.to_string(),
+            location: SourceLocation {
+                line: 1,
+                col: 0,
+                end: (1, 0),
+            },
+            primary_loc_key: None,
+        };
+        let mut index = TypeIndex::new();
+        index.merge(
+            "file:///mod/common/ideas/x.txt",
+            HashMap::from([
+                ("idea".to_string(), vec![instance("my_idea")]),
+                (
+                    "dynamic_modifier".to_string(),
+                    vec![instance("My_Dynamic_Modifier")],
+                ),
+            ]),
+        );
+        index.var_index.add_name("my_variable");
+        let modifier_keys = HashSet::from(["stability_factor".to_string()]);
+
+        let refs = loc_extra_valid_refs(&modifier_keys, &index);
+        for name in [
+            "stability_factor",
+            "my_idea",
+            "my_dynamic_modifier",
+            "my_variable",
+        ] {
+            assert!(refs.contains(name), "{name} must resolve, got {refs:?}");
+        }
+    }
+
+    /// Line view in the LSP default encoding, as VS Code negotiates it.
+    fn utf16_lines(text: &str) -> DocLines<'_> {
+        DocLines::new(text, PositionEncodingKind::UTF16)
+    }
+
+    #[test]
+    fn diagnostic_end_stops_at_trimmed_line_content() {
         let text = "abc\n  hello world  \n";
-        let ends = line_end_cols(text);
-        assert_eq!(ends[0], 3, "\"abc\" has 3 chars");
+        let lines = utf16_lines(text);
+        assert_eq!(lines.end_position(0, 0).character, 3, "\"abc\" has 3 chars");
         assert_eq!(
-            ends[1], 13,
+            lines.end_position(1, 0).character,
+            13,
             "\"  hello world\" (trailing ws trimmed) has 13 chars"
         );
+    }
+
+    #[test]
+    fn diagnostic_range_uses_negotiated_encoding() {
+        // The published range must use the SAME conversion the code-action fix
+        // edits use, or a quick fix on a line holding a non-BMP character
+        // rewrites a different span than the one highlighted. `😀` is 1 char /
+        // 2 UTF-16 units, so the whole-line end moves with the encoding.
+        let text = "😀 custom_cost_text = a\n";
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 1,
+            col: 2, // parser char column of `custom_cost_text`
+            file: "f".into(),
+            code: Some("CW242"),
+            fix: None,
+            end: None,
+        };
+        let utf16 = validation_error_to_diagnostic(&err, &utf16_lines(text));
+        assert_eq!(utf16.range.start.character, 3);
+        assert_eq!(utf16.range.end.character, 23, "22 chars, 23 UTF-16 units");
+        // A client that negotiated utf-32 gets the parser's columns unchanged.
+        let utf32 =
+            validation_error_to_diagnostic(&err, &DocLines::new(text, PositionEncodingKind::UTF32));
+        assert_eq!(utf32.range.start.character, 2);
+        assert_eq!(utf32.range.end.character, 22);
     }
 
     #[test]
@@ -1261,7 +1549,7 @@ mod whole_line_range_tests {
         // Whole-line fallback: with `end: None` the squiggle still runs from the
         // field to the line's content end (unchanged pre-Task-18 behavior).
         let text = "decision = {\n    custom_cost_text = a\n}\n";
-        let ends = line_end_cols(text);
+        let ends = utf16_lines(text);
         let err = ValidationError {
             message: "x".into(),
             severity: ErrorSeverity::Warning,
@@ -1286,7 +1574,7 @@ mod whole_line_range_tests {
         // publishes the exact token span instead of the whole-line squiggle. The
         // end uses the same 1-based-line / 0-based-char convention as the start.
         let text = "decision = {\n    custom_cost_text = a\n}\n";
-        let ends = line_end_cols(text);
+        let ends = utf16_lines(text);
         let err = ValidationError {
             message: "x".into(),
             severity: ErrorSeverity::Warning,
@@ -1312,7 +1600,7 @@ mod whole_line_range_tests {
         // exclusive and absorbs trailing whitespace), so a precise squiggle may
         // legitimately span multiple lines — the whole unexpected block.
         let text = "root = {\n    foo = {\n        a = 1\n    }\n}\n";
-        let ends = line_end_cols(text);
+        let ends = utf16_lines(text);
         let err = ValidationError {
             message: "Unexpected block 'foo'".into(),
             severity: ErrorSeverity::Error,
@@ -1342,7 +1630,7 @@ mod whole_line_range_tests {
             fix: None,
             end: None,
         };
-        let diag = validation_error_to_diagnostic(&err, &[]);
+        let diag = validation_error_to_diagnostic(&err, &DocLines::none());
         assert_eq!(diag.range.start.character, 2);
         assert_eq!(diag.range.end.character, 3);
     }

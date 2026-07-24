@@ -95,11 +95,41 @@ pub fn pos_to_byte(text: &str, line_starts: &[usize], pos: SourcePos) -> usize {
     byte
 }
 
+/// Resolve one file's planned edits: drop any that overlap an already-kept edit,
+/// returning the survivors in file order plus the `tag`s of the ones dropped.
+/// Overlapping edits can't both be applied without one corrupting the other, so
+/// the later one is skipped and handed back for the caller to report — the CLI
+/// `fix` subcommand warns per file, the LSP `source.fixAll` action leaves the
+/// dropped diagnostic to its own quick fix.
+///
+/// `tag` is whatever identifies an edit's source to the caller (the diagnostic
+/// code, an index); it is only carried through to the skipped list.
+pub fn plan_file_edits<T>(text: &str, mut planned: Vec<(T, SpanEdit)>) -> (Vec<SpanEdit>, Vec<T>) {
+    let starts = line_start_bytes(text);
+    // Sort by start byte ascending so overlap detection is a single forward scan.
+    planned.sort_by_key(|(_, e)| pos_to_byte(text, &starts, e.range.start));
+    let mut kept: Vec<SpanEdit> = Vec::new();
+    let mut skipped: Vec<T> = Vec::new();
+    let mut last_end = 0usize;
+    let mut first = true;
+    for (tag, edit) in planned {
+        let s = pos_to_byte(text, &starts, edit.range.start);
+        let e = pos_to_byte(text, &starts, edit.range.end);
+        if !first && s < last_end {
+            skipped.push(tag);
+            continue;
+        }
+        last_end = e;
+        first = false;
+        kept.push(edit);
+    }
+    (kept, skipped)
+}
+
 /// Apply single-span edits to `text`, returning the new text. Edits are resolved
 /// to byte ranges, sorted by start descending, and applied later-first so earlier
 /// offsets stay valid. Overlaps are not checked here — the caller filters them
-/// (the CLI `fix` subcommand skips-and-warns per file); the single-edit fixtures
-/// never overlap.
+/// with [`plan_file_edits`]; the single-edit fixtures never overlap.
 pub fn apply_edits(text: &str, edits: &[SpanEdit]) -> String {
     let starts = line_start_bytes(text);
     let mut ranges: Vec<(usize, usize, &str)> = edits
@@ -173,5 +203,67 @@ mod tests {
         };
         assert_eq!(apply_edits(text, &[e1.clone(), e2.clone()]), "X Y\n");
         assert_eq!(apply_edits(text, &[e2, e1]), "X Y\n");
+    }
+
+    fn span(sl: u32, sc: u16, el: u32, ec: u16, repl: &str) -> SpanEdit {
+        SpanEdit {
+            range: SourceRange {
+                start: pos(sl, sc),
+                end: pos(el, ec),
+            },
+            replacement: repl.to_string(),
+        }
+    }
+
+    #[test]
+    fn plan_keeps_disjoint_edits_regardless_of_input_order() {
+        let text = "aaaa bbbb\n";
+        let forward = vec![("A", span(1, 0, 1, 4, "X")), ("B", span(1, 5, 1, 9, "Y"))];
+        let reversed = vec![("B", span(1, 5, 1, 9, "Y")), ("A", span(1, 0, 1, 4, "X"))];
+        for planned in [forward, reversed] {
+            let (kept, skipped) = plan_file_edits(text, planned);
+            assert!(skipped.is_empty());
+            assert_eq!(kept.len(), 2);
+            assert_eq!(apply_edits(text, &kept), "X Y\n");
+        }
+    }
+
+    #[test]
+    fn plan_skips_the_later_of_two_overlapping_edits() {
+        let text = "aaaa bbbb\n";
+        // "aaaa b" and "bbbb" share column 5.
+        let planned = vec![("A", span(1, 0, 1, 6, "X")), ("B", span(1, 5, 1, 9, "Y"))];
+        let (kept, skipped) = plan_file_edits(text, planned);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(skipped, vec!["B"], "the overlapping edit is reported back");
+        assert_eq!(apply_edits(text, &kept), "Xbbb\n");
+    }
+
+    #[test]
+    fn plan_keeps_edits_that_only_touch_at_a_boundary() {
+        // An edit starting exactly where the previous one ends is not an overlap.
+        let text = "aaaabbbb\n";
+        let planned = vec![("A", span(1, 0, 1, 4, "X")), ("B", span(1, 4, 1, 8, "Y"))];
+        let (kept, skipped) = plan_file_edits(text, planned);
+        assert!(skipped.is_empty());
+        assert_eq!(apply_edits(text, &kept), "XY\n");
+    }
+
+    #[test]
+    fn plan_orders_across_lines_by_byte_offset() {
+        // Sorting is by resolved byte offset, so a later line never sorts first.
+        let text = "one\ntwo\nthree\n";
+        let planned = vec![("C", span(3, 0, 3, 5, "3")), ("A", span(1, 0, 1, 3, "1"))];
+        let (kept, skipped) = plan_file_edits(text, planned);
+        assert!(skipped.is_empty());
+        assert_eq!(kept[0].replacement, "1");
+        assert_eq!(kept[1].replacement, "3");
+        assert_eq!(apply_edits(text, &kept), "1\ntwo\n3\n");
+    }
+
+    #[test]
+    fn plan_of_an_empty_list_is_empty() {
+        let (kept, skipped) = plan_file_edits::<&str>("x = y\n", Vec::new());
+        assert!(kept.is_empty() && skipped.is_empty());
     }
 }

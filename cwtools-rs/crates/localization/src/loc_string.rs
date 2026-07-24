@@ -270,7 +270,9 @@ fn parse_jomini_params(
 
 fn parse_jomini_param(s: &str) -> Result<JominiParam, String> {
     let trimmed = s.trim();
-    if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+    // A lone `'` satisfies both starts_with and ends_with; it takes two quotes to
+    // be a quoted literal, not one character playing both roles.
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
         Ok(JominiParam::Literal(
             trimmed[1..trimmed.len() - 1].to_string(),
         ))
@@ -352,6 +354,30 @@ mod tests {
         } else {
             panic!("expected JominiCommand");
         }
+    }
+
+    #[test]
+    fn test_jomini_lone_quote_param() {
+        // `[GetName(')]` — a single `'` satisfies both starts_with and ends_with,
+        // so stripping "the quotes" sliced [1..0] and panicked the process.
+        let elems = parse_loc_elements("[GetName(')]");
+        assert_eq!(elems.len(), 1, "{elems:?}");
+        let LocElement::JominiCommand(cmds) = &elems[0] else {
+            panic!("expected JominiCommand, got {elems:?}");
+        };
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].key, "GetName");
+        assert_eq!(cmds[0].params, vec![JominiParam::Literal("'".to_string())]);
+    }
+
+    #[test]
+    fn test_jomini_empty_quoted_param() {
+        // `''` is a well-formed empty literal: two quotes, not one doing both jobs.
+        let elems = parse_loc_elements("[GetName('')]");
+        let LocElement::JominiCommand(cmds) = &elems[0] else {
+            panic!("expected JominiCommand, got {elems:?}");
+        };
+        assert_eq!(cmds[0].params, vec![JominiParam::Literal(String::new())]);
     }
 
     #[test]

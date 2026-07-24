@@ -28,8 +28,10 @@ use std::sync::Arc;
 use cwtools_file_manager::file_manager::{
     DirectoryType, FileManager, FileManagerConfig, classify_directory,
 };
+use cwtools_file_manager::{FileEncoding, read_text_with_encoding};
 use cwtools_game::constants::Game;
 use cwtools_game::scope_registry::ScopeRegistry;
+use cwtools_index::vanilla_cache::{self, VanillaCacheData};
 use cwtools_index::{
     TypeIndex, collect_set_variable_names, collect_type_instances, index_discovered_files,
     variable_defining_effects,
@@ -70,6 +72,20 @@ impl RulesInput {
     }
 }
 
+/// Auto-managed on-disk cache of the base-game index, so a batch run doesn't
+/// re-parse the whole install every time. Only consulted when `vanilla` is a
+/// directory and no explicit `vanilla_cache` was supplied: a cache whose
+/// fingerprint matches the install short-circuits the walk, and a
+/// missing/stale/unreadable one is rebuilt and written after it.
+#[derive(Debug, Clone)]
+pub struct VanillaCacheAuto {
+    /// Directory holding one cache file per game + fingerprint. Same layout and
+    /// filename as the LSP's, so the CLI and the editor share warm caches.
+    pub dir: PathBuf,
+    /// Ignore any existing file: re-index the install and rewrite it.
+    pub refresh: bool,
+}
+
 /// Inputs to [`Session::load`].
 pub struct SessionConfig<'a> {
     /// Engine the rules/files are written for.
@@ -83,7 +99,10 @@ pub struct SessionConfig<'a> {
     /// Pre-generated vanilla data to merge (from a `--vanilla-cache`). When
     /// present the `vanilla` dir is NOT walked — type instances, loc keys, file
     /// paths, and variable names all come from the cache.
-    pub vanilla_cache: Option<cwtools_index::vanilla_cache::VanillaCacheData>,
+    pub vanilla_cache: Option<VanillaCacheData>,
+    /// Cache the base-game index on disk and reuse it on later runs. Ignored
+    /// when `vanilla_cache` is already supplied. See [`VanillaCacheAuto`].
+    pub vanilla_cache_auto: Option<VanillaCacheAuto>,
     /// Extra filename globs to skip during discovery (on top of engine defaults).
     pub ignore_files: &'a [String],
     /// Extra directory globs to skip during discovery.
@@ -123,7 +142,8 @@ impl Session {
             rules,
             directory,
             vanilla,
-            vanilla_cache,
+            mut vanilla_cache,
+            vanilla_cache_auto,
             ignore_files,
             ignore_dirs,
             loc_languages,
@@ -250,6 +270,23 @@ impl Session {
             type_index.value_set_values.merge_file(file_uri, value_sets);
         }
 
+        // Auto-managed cache: reuse a fresh one instead of walking the install,
+        // and remember where to write one when there's nothing to reuse.
+        let game_id = game.to_string();
+        let mut cache_write_target: Option<(PathBuf, String)> = None;
+        if let (None, Some(auto), Some(vanilla_dir)) =
+            (&vanilla_cache, &vanilla_cache_auto, &vanilla)
+        {
+            let fingerprint = vanilla_cache::combined_fingerprint(vanilla_dir, &ruleset);
+            let path = vanilla_cache_path(&auto.dir, &game_id, &fingerprint);
+            if !auto.refresh {
+                vanilla_cache = load_fresh_vanilla_cache(&path, &game_id, &fingerprint);
+            }
+            if vanilla_cache.is_none() {
+                cache_write_target = Some((path, fingerprint));
+            }
+        }
+
         // Vanilla data: from a pre-generated cache when given (skips walking the
         // install entirely — types, loc keys, file paths, and variables all come
         // from the cache), otherwise by indexing the install. Vanilla files
@@ -282,6 +319,24 @@ impl Session {
             cached_loc_keys = Some(cache.loc_keys);
         } else if let Some(vanilla_dir) = &vanilla {
             let vanilla_index = index_game_dir(vanilla_dir, &ruleset, &rules_table, &var_effects);
+            // Persist before the index is consumed below, so the next run can
+            // skip this walk entirely.
+            if let Some((path, fingerprint)) = &cache_write_target {
+                let aux = build_vanilla_cache_aux(vanilla_dir, &vanilla_index);
+                match write_vanilla_cache(&vanilla_index, &game_id, fingerprint, path, aux) {
+                    Ok(n) => eprintln!(
+                        "  Cached {} base-game instances to {} ({})",
+                        n,
+                        path.display(),
+                        fingerprint
+                    ),
+                    Err(e) => eprintln!(
+                        "  warn: could not write base-game cache {}: {}",
+                        path.display(),
+                        e
+                    ),
+                }
+            }
             type_index.var_index.merge(&vanilla_index.var_index);
             for (type_name, entries) in vanilla_index.map {
                 let per_type = HashMap::from([(
@@ -317,12 +372,15 @@ impl Session {
         {
             loc_dirs.push(v.as_path());
         }
-        let loc_service = LocService::from_folders(&loc_dirs);
+        let loc_service = load_loc_service(&loc_dirs, loc_languages.as_deref());
         let mut loc_index = LocIndex::build_scoped(&loc_service, loc_languages.as_deref());
         if let Some(keys) = cached_loc_keys {
+            // Scoped the same way as the walked files above, so a cache hit and a
+            // live walk answer `--loc-language` identically.
             let typed: Vec<(Lang, Vec<String>)> = keys
                 .into_iter()
                 .filter_map(|(name, ks)| Lang::from_name(&name).map(|l| (l, ks)))
+                .filter(|(lang, _)| loc_languages.as_ref().is_none_or(|ls| ls.contains(lang)))
                 .collect();
             loc_index.merge_cached_keys(typed, loc_languages.as_deref());
         }
@@ -472,8 +530,13 @@ impl SessionWithFiles {
                 let mut errors = parse_errors_to_validation(&src.parsed.errors, &file_str);
                 errors.extend(validate_prepared(&src.parsed, &file_str, &prepared));
                 // CW100: objects defined here whose `## required` localisation
-                // keys aren't provided by any loc file.
-                if let Some(loc) = prepared.loc_index {
+                // keys aren't provided by any loc file. Gated on the loc index
+                // being non-empty, same as the LSP's `append_missing_loc_errors`:
+                // a mod with no `localisation/` would otherwise report every key
+                // as missing.
+                if let Some(loc) = prepared.loc_index
+                    && !loc.union().is_empty()
+                {
                     errors.extend(cwtools_validation::missing_loc::check_missing_localisation(
                         &src.parsed,
                         &src.logical_path,
@@ -516,6 +579,171 @@ fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<Val
             }
         })
         .collect()
+}
+
+/// Load the loc files under `dirs`, materializing only the languages a scoped
+/// run will use. Without `langs` every file is parsed (the default). With it, a
+/// file whose header declares a language outside the set is dropped before its
+/// entries are built — the base game ships eleven of them, and a scoped run
+/// neither validates nor looks up the rest. A file whose header language can't
+/// be read is always kept, matching how `validate_loc_project_with_union`
+/// scopes its own per-file pass.
+fn load_loc_service(dirs: &[&Path], langs: Option<&[Lang]>) -> LocService {
+    let Some(langs) = langs else {
+        return LocService::from_folders(dirs);
+    };
+    use rayon::prelude::*;
+    let files: Vec<(String, String, Option<FileEncoding>)> = LocService::discover_files(dirs)
+        .into_par_iter()
+        .filter_map(|path| {
+            // CSV loc (CK2/VIC2) carries every language in one file, keyed by
+            // column, so there is no single header language to filter on.
+            let is_csv = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+            let path_str = path.to_string_lossy().into_owned();
+            let (text, encoding) = read_text_with_encoding(&path).ok()?;
+            if !is_csv
+                && let Some(lang) = loc_header_language(&text, &path_str)
+                && !langs.contains(&lang)
+            {
+                return None;
+            }
+            Some((path_str, text, Some(encoding)))
+        })
+        .collect();
+    LocService::from_files_with_encoding(files)
+}
+
+/// The language a loc file declares, without parsing its entries. The header
+/// line is handed to `parse_loc_text` on its own so the header semantics (BOM
+/// stripping, comment skipping, `l_*` lookup) stay defined in exactly one place.
+fn loc_header_language(text: &str, path: &str) -> Option<Lang> {
+    let mut end = 0;
+    for line in text.split_inclusive('\n') {
+        end += line.len();
+        let trimmed = line.trim_start_matches('\u{feff}').trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            break;
+        }
+    }
+    cwtools_localization::parse_loc_text(&text[..end], path)
+        .ok()
+        .and_then(|f| f.lang)
+}
+
+/// Cache file for `game` at `fingerprint` under `dir`. Filename layout matches
+/// the LSP's writer so a cache warmed by either side is reused by the other.
+fn vanilla_cache_path(dir: &Path, game: &str, fingerprint: &str) -> PathBuf {
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    dir.join(format!("vanilla-{}-{}.cwv", safe(game), safe(fingerprint)))
+}
+
+/// Serialize the base-game index to a sibling temp file and rename it into
+/// place. Two runs (or a run and the LSP) can share a cache dir, and a reader
+/// must never see a half-written file: the rename either happened or it didn't.
+fn write_vanilla_cache(
+    index: &TypeIndex,
+    game: &str,
+    fingerprint: &str,
+    path: &Path,
+    aux: cwtools_index::vanilla_cache::VanillaCacheAux,
+) -> std::io::Result<usize> {
+    let tmp = path.with_extension(format!("cwv.tmp{}", std::process::id()));
+    let written = vanilla_cache::save(index, game, fingerprint, &tmp, aux)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(written),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Read a cached base-game index, but only if it was built for this game from
+/// this exact install and ruleset. Anything else (missing, unreadable, written
+/// by an older format, stale fingerprint) reads as a miss so the caller
+/// re-indexes; a stale cache is never silently used.
+fn load_fresh_vanilla_cache(
+    path: &Path,
+    game: &str,
+    fingerprint: &str,
+) -> Option<VanillaCacheData> {
+    if !path.exists() {
+        return None;
+    }
+    match vanilla_cache::load(path) {
+        Ok((cache_game, cache_fp, data)) if cache_game == game && cache_fp == fingerprint => {
+            let total: usize = data.per_type.values().map(|v| v.len()).sum();
+            eprintln!(
+                "  Loaded {} base-game instances from cache {} ({})",
+                total,
+                path.display(),
+                fingerprint
+            );
+            Some(data)
+        }
+        Ok((cache_game, cache_fp, _)) => {
+            eprintln!(
+                "  Base-game cache {} is stale (cached {}/{}, install {}/{}); re-indexing",
+                path.display(),
+                cache_game,
+                cache_fp,
+                game,
+                fingerprint
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "  warn: could not read base-game cache {}: {}",
+                path.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+/// Where [`VanillaCacheAuto`] puts its cache when the caller has no preference:
+/// `XDG_CACHE_HOME`/`LOCALAPPDATA`, else `~/.cache` (Linux) or `~/Library/Caches`
+/// (macOS), else the temp dir — all under a `cwtools` subdirectory, the same
+/// location the LSP uses.
+pub fn default_cache_dir() -> Option<PathBuf> {
+    if let Ok(x) = std::env::var("XDG_CACHE_HOME")
+        && !x.is_empty()
+    {
+        return Some(PathBuf::from(x).join("cwtools"));
+    }
+    if let Ok(la) = std::env::var("LOCALAPPDATA")
+        && !la.is_empty()
+    {
+        return Some(PathBuf::from(la).join("cwtools"));
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        let home = PathBuf::from(home);
+        #[cfg(target_os = "macos")]
+        {
+            return Some(home.join("Library/Caches/cwtools"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Some(home.join(".cache/cwtools"));
+        }
+    }
+    Some(std::env::temp_dir().join("cwtools"))
 }
 
 /// Walk a vanilla install for the cache's aux payload: per-language loc keys
@@ -701,5 +929,50 @@ pub fn load_rules(
                 .map(|parsed| ast_to_ruleset(&parsed, table))
                 .map_err(|e| format!("could not parse rules {}: {}", file.display(), e))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The header-only read must agree with a full parse on every header shape
+    /// the loc parser accepts, or a scoped run would drop files it should keep.
+    #[test]
+    fn loc_header_language_matches_the_full_parse() {
+        let cases = [
+            "l_english:\n key:0 \"v\"\n",
+            "\u{feff}l_french:\n key:0 \"v\"\n",
+            "\u{feff}\u{feff}l_german:\n key:0 \"v\"\n",
+            " l_spanish:\n key:0 \"v\"\n",
+            "# a comment\n\nl_russian:\n key:0 \"v\"\n",
+            "\u{feff}# a comment\nl_polish:\n key:0 \"v\"\n",
+            "l_english:\n",
+            "l_klingon:\n key:0 \"v\"\n",
+            "no colon on this line\n key:0 \"v\"\n",
+            "# nothing but comments\n",
+            "",
+        ];
+        for text in cases {
+            let full = cwtools_localization::parse_loc_text(text, "f.yml")
+                .ok()
+                .and_then(|f| f.lang);
+            assert_eq!(
+                loc_header_language(text, "f.yml"),
+                full,
+                "header-only read diverged from the full parse on {text:?}"
+            );
+        }
+    }
+
+    /// The filename must survive both halves of the fingerprint verbatim where
+    /// it can, so a cache stays findable across runs (and shared with the LSP).
+    #[test]
+    fn vanilla_cache_path_is_sanitized_and_stable() {
+        let path = vanilla_cache_path(Path::new("/cache"), "hoi4", "v1.19.2.0|rs:493876ece638460f");
+        assert_eq!(
+            path,
+            Path::new("/cache/vanilla-hoi4-v1.19.2.0_rs_493876ece638460f.cwv")
+        );
     }
 }

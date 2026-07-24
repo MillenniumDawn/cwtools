@@ -162,7 +162,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW269 | Hint | Optimise by merging this with {} by using {} | Two lists could be merged for a minor script optimisation. | Defined, emission pending (vanilla data registries) |
 | CW270 | Warning | Value too small, only 3 decimal places are supported in this context | A numeric value has more decimal places than the engine supports here. | Emitted (32-bit `variable_field` with >3 decimal places) |
 | CW271 | Warning | Expected an integer | A field that requires an integer received a float or non-numeric value. | Emitted (`int_variable_field` given a fractional value) |
-| CW272 | Error | {} | A custom error attached to a rule via `## error = ...`. | Defined, not wired (rules loader does not parse the `## error` option yet) |
+| CW272 | Error | {} | A custom message attached to a rule via `## error_if_only_match = ...`, raised when that overload is the only one a key matches. `## severity` on the same rule overrides Error. | Emitted |
 | CW273 | Warning | Modifier type {} is not defined but is used | A modifier's type reference points to a modifier-type that isn't defined. | Defined, emission pending (modifier-type registry) |
 | CW274 | Error | This usage of inline_script results in an error, see related | An `inline_script` call resolves to content that itself fails validation. | Defined, not wired (inline-script expansion does not propagate child errors yet) |
 | CW275 | Warning | Localisation value for {} contains unexpected characters, and may not render correctly | A loc value contains characters outside the expected set for that game. | Emitted |

@@ -34,3 +34,117 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
+
+## Corpus guard
+
+The test suite says the code still compiles and behaves. The corpus guard says
+the *diagnostics* didn't move. Anything that touches the parser, the rule engine
+or a validator should run it, because a refactor that was supposed to change
+nothing is easy to believe and hard to prove.
+
+It validates a pinned real mod and diffs the report against a committed
+baseline (`scripts/corpus-baseline.csv`, 4036 diagnostics as of writing). Run it
+from the repo root, one level up from here:
+
+```sh
+./scripts/corpus-guard.sh
+```
+
+Exit 0 means the report matched. Exit 1 prints what moved: row counts, a
+per-code gone/new tally, and the first 40 lines of the diff, with the full diff
+written to a temp dir. Exit 2 means the run never happened (missing corpus,
+missing binary, validator crashed).
+
+Two inputs, both git checkouts, expected as siblings of this repo:
+
+- corpus: [Kaiserreich-4-Development](https://github.com/Kaiserreich/Kaiserreich-4-Development)
+- rules: [cwtools-hoi4-config](https://github.com/cwtools/cwtools-hoi4-config), the `Config` directory
+
+Override either with `--corpus` / `--rules` or `CWTOOLS_CORPUS` /
+`CWTOOLS_RULES`; `--help` lists the rest. The revisions the baseline was taken
+against are recorded in its `#` header, and the script prints the revisions it
+actually ran on, so an input that has moved on is visible before you go hunting
+through the diff.
+
+No `--vanilla`. It would need a Steam install of HOI4, which puts the guard out
+of reach of CI and of anyone else's machine, and the point here is a
+reproducible diff rather than vanilla coverage.
+
+When a change is *meant* to move diagnostics, re-bless the baseline in the same
+commit and say in the message which codes moved and why:
+
+```sh
+./scripts/corpus-guard.sh --bless
+git add scripts/corpus-baseline.csv
+```
+
+A re-bless that isn't explained in the commit message is indistinguishable from
+a regression someone papered over.
+
+The report's `hash` column is dropped on the way into the baseline. That digest
+is FNV over `file|code|message|source-line`, and `file` is the absolute path the
+validator was handed, so the same diagnostic hashes differently out of two
+checkouts. The columns it summarizes are all still in the baseline.
+
+## Fuzzing
+
+Both parsers eat files off the Steam Workshop, which means the input is whatever
+someone else's tooling produced. Two targets live in `fuzz/`:
+
+- `parse_string` over `cwtools_parser`, the script parser.
+- `parse_loc_text` over `cwtools_localization`. This one reaches further than
+  it looks: `parse_loc_text` calls `parse_entry`, which calls
+  `parse_loc_elements` on every value, so the `$ref$` and `[...]` Jomini
+  command parser is covered too.
+
+`cargo-fuzz` needs nightly. One-time setup:
+
+```sh
+rustup toolchain install nightly
+cargo +nightly install cargo-fuzz --locked
+```
+
+Then, from `cwtools-rs/`:
+
+```sh
+mkdir -p fuzz/corpus/parse_string fuzz/corpus/parse_loc_text
+cargo +nightly fuzz run parse_string   fuzz/corpus/parse_string   fuzz/seeds/parse_string
+cargo +nightly fuzz run parse_loc_text fuzz/corpus/parse_loc_text fuzz/seeds/parse_loc_text
+```
+
+The `mkdir` is once per clone. `fuzz/corpus/` is gitignored, so it isn't there
+after a fresh checkout, and libFuzzer refuses to start on a corpus directory
+that doesn't exist rather than creating one.
+
+The first directory is the working corpus libFuzzer grows, the second is the
+committed seeds. Order matters: new inputs are only written to the first one,
+which is what keeps them out of `seeds/`. Ctrl-C when you're bored, or bound it
+with `-- -max_total_time=300`.
+
+A crash writes the input to `fuzz/artifacts/<target>/` and prints the path.
+Replay it with `cargo +nightly fuzz run <target> <that-file>`.
+
+### Seeds
+
+`fuzz/seeds/` is committed and holds real `.txt`, `.cwt` and `.yml` files
+pulled from `testfiles/`, plus two regression seeds for crashes that already
+happened:
+
+- `parse_string/regression_deep_nesting_300.txt`: clause nesting 300 deep,
+  past the 256 `MAX_CLAUSE_DEPTH` cap. Unbounded recursion here used to blow
+  the stack, which aborts the process rather than returning an error.
+- `parse_loc_text/regression_jomini_lone_quote.yml`: `[GetName(')]`. A single
+  unpaired `'` in a Jomini param produced a reversed slice range and panicked.
+
+Both are fixed. The seeds are there so they stay fixed. Add a seed whenever a
+fuzz run finds something, in the same commit as the fix.
+
+### In CI
+
+The `fuzz-smoke` job replays the seed corpus on every PR with `-runs=0`, which
+executes each seed once and exits. It takes seconds and is deterministic.
+
+It is not a fuzzing campaign, deliberately. A long run finds new inputs, which
+means it fails on PRs that had nothing to do with the bug, and the failure isn't
+reproducible from the PR alone. Run the campaigns by hand, or on a schedule off
+the PR path, and commit what they find as seeds.

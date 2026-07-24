@@ -6,10 +6,9 @@ use rustc_hash::FxHashMap;
 
 /// A `key = { ... }` block (a `Leaf` whose value is a `Clause`), normalised so
 /// the per-game structural walkers share one `Value::Clause` extraction. The key
-/// is kept as a `StringId` so callers that only compare it avoid an owned
-/// `String`.
+/// is kept as a lowercased `StringId` so callers that only compare it avoid an
+/// owned `String`, and so comparisons are case-insensitive like the game.
 pub(crate) struct Block<'a> {
-    pub key: StringId,
     pub key_lower: StringId,
     pub children: &'a [Child],
     pub range: SourceRange,
@@ -31,7 +30,6 @@ pub(crate) fn as_block<'a>(child: &Child, ast: &'a ParsedFile) -> Option<Block<'
             let l = &ast.arena.leaves[*idx as usize];
             if let Value::Clause(children) = &l.value {
                 Some(Block {
-                    key: l.key.normal,
                     key_lower: l.key.lower,
                     children,
                     range: l.pos,

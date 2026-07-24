@@ -225,6 +225,10 @@ pub enum FileError {
     Io(#[from] std::io::Error),
     #[error("Parse error: {0}")]
     Parse(String),
+    /// The configured root isn't a directory. Distinct from an empty walk: a
+    /// path that doesn't resolve must not read as "this mod has no files".
+    #[error("directory does not exist: {0}")]
+    MissingRoot(PathBuf),
 }
 
 /// A discovered script file with its parsed AST.
@@ -348,6 +352,9 @@ impl FileManager {
         // preserves the input order, so discovery output is deterministic.
         let mut paths: Vec<(PathBuf, String)> = Vec::new();
         let root = &self.config.root;
+        if !root.is_dir() {
+            return Err(FileError::MissingRoot(root.clone()));
+        }
 
         for include_dir in &self.config.include_dirs {
             let dir = if include_dir == "." {
@@ -1444,5 +1451,36 @@ mod tests {
         let pos = |n: &str| names.iter().position(|x| x == n).expect("file present");
         assert!(pos("alpha.txt") < pos("middle.txt"), "got: {:?}", names);
         assert!(pos("middle.txt") < pos("zebra.txt"), "got: {:?}", names);
+    }
+
+    /// A root that isn't there is an error, not an empty result: a typo'd
+    /// `--directory` used to walk nothing and report a clean run.
+    #[test]
+    fn discover_and_parse_missing_root_is_an_error() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let missing = tmp.path().join("no_such_mod");
+        let mut fm = FileManager::new(FileManagerConfig {
+            root: missing.clone(),
+            ..Default::default()
+        });
+        let Err(err) = fm.discover_and_parse() else {
+            panic!("missing root must error");
+        };
+        assert!(
+            err.to_string().contains(&missing.display().to_string()),
+            "error must name the missing root, got: {err}"
+        );
+    }
+
+    /// An existing-but-empty root still succeeds with no files; "empty" is the
+    /// caller's policy call, only "not there" is an error here.
+    #[test]
+    fn discover_and_parse_empty_root_is_ok() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let mut fm = FileManager::new(FileManagerConfig {
+            root: tmp.path().to_path_buf(),
+            ..Default::default()
+        });
+        assert!(fm.discover_and_parse().expect("empty root").is_empty());
     }
 }

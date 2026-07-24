@@ -10,6 +10,8 @@ struct Parser<'a> {
     table: &'a StringTable,
     arena: Arena,
     errors: Vec<ParseError>,
+    /// Clauses currently open, bounded by [`MAX_CLAUSE_DEPTH`].
+    depth: u32,
 }
 
 /// Saved cursor for backtracking: the remaining-input iterator plus line/col.
@@ -30,6 +32,7 @@ impl<'a> Parser<'a> {
             table,
             arena: Arena::new(),
             errors: Vec::new(),
+            depth: 0,
         }
     }
 
@@ -107,19 +110,18 @@ impl<'a> Parser<'a> {
     fn consume_comment(&mut self) -> Option<Comment> {
         if self.peek() == Some('#') {
             let start = self.pos();
+            let start_byte = self.byte_pos();
             // Do NOT consume the '#'; keep it in the comment text so that
             // directive comments like '## cardinality = ...' remain intact.
-            let mut text = String::new();
             while let Some(c) = self.peek() {
                 if c == '\n' {
                     break;
                 }
-                text.push(c);
                 self.advance();
             }
             let end = self.pos();
             return Some(Comment {
-                text,
+                text: self.input[start_byte..self.byte_pos()].to_string(),
                 pos: SourceRange { start, end },
             });
         }
@@ -140,6 +142,25 @@ impl<'a> Parser<'a> {
             return true;
         }
         false
+    }
+
+    /// Consume a quoted string without materializing it, using the same
+    /// termination rules as [`Parser::scan_quoted`]: it ends at the first
+    /// unescaped `"` or at the end of the line.
+    fn skip_quoted(&mut self) {
+        self.advance(); // opening '"'
+        while let Some(c) = self.peek() {
+            if c == '\n' {
+                break;
+            }
+            self.advance();
+            if c == '"' {
+                break;
+            }
+            if c == '\\' && self.peek().is_some_and(|n| n == '"' || n == '\\') {
+                self.advance();
+            }
+        }
     }
 
     fn parse_operator(&mut self) -> Option<Operator> {
@@ -327,32 +348,29 @@ impl<'a> Parser<'a> {
     /// (cwtools-vscode#42).
     fn scan_quoted(&mut self, report_unclosed: bool) -> StringTokens {
         let quote_start = self.pos();
+        let start_byte = self.byte_pos();
         self.advance(); // opening '"'
-        // Build with surrounding quotes directly to avoid a format!("\"{}\"", s) copy.
-        let mut s = String::from('"');
+        // Stay on the borrowed input: only a *collapsed* escape forces an owned
+        // copy (already carrying the opening quote), and then only for the
+        // segments around it.
+        let mut owned: Option<String> = None;
+        let mut seg_start = self.byte_pos();
         let mut closed = false;
         while let Some(c) = self.peek() {
             if c == '\n' {
                 break;
             }
             if c == '\\' {
+                let esc_start = self.byte_pos();
                 self.advance(); // consume '\'
-                match self.peek() {
-                    Some('"') => {
-                        // \" -> " (unescape)
-                        self.advance();
-                        s.push('"');
-                    }
-                    Some('\\') => {
-                        // \\ -> \ (unescape)
-                        self.advance();
-                        s.push('\\');
-                    }
-                    _ => {
-                        // Any other \X: keep the backslash and let the loop
-                        // pick up the next char naturally.
-                        s.push('\\');
-                    }
+                // Only \" -> " and \\ -> \ unescape. Any other \X keeps the
+                // backslash and the loop picks up the next char naturally.
+                if let Some(e @ ('"' | '\\')) = self.peek() {
+                    let buf = owned.get_or_insert_with(|| String::from('"'));
+                    buf.push_str(&self.input[seg_start..esc_start]);
+                    buf.push(e);
+                    self.advance();
+                    seg_start = self.byte_pos();
                 }
                 continue;
             } else if c == '"' {
@@ -360,7 +378,6 @@ impl<'a> Parser<'a> {
                 closed = true;
                 break;
             }
-            s.push(c);
             self.advance();
         }
         if report_unclosed && !closed {
@@ -373,9 +390,25 @@ impl<'a> Parser<'a> {
                 ),
             ));
         }
-        s.push('"');
+        // An unclosed string still gets a synthesized closing quote.
+        let end_byte = self.byte_pos();
+        let body_end = if closed { end_byte - 1 } else { end_byte };
+        let tokens = match owned {
+            Some(mut buf) => {
+                buf.push_str(&self.input[seg_start..body_end]);
+                buf.push('"');
+                self.table.intern(&buf)
+            }
+            None if closed => self.table.intern(&self.input[start_byte..end_byte]),
+            None => {
+                let mut buf = String::with_capacity(body_end - start_byte + 1);
+                buf.push_str(&self.input[start_byte..body_end]);
+                buf.push('"');
+                self.table.intern(&buf)
+            }
+        };
         self.skip_whitespace();
-        self.table.intern(&s)
+        tokens
     }
 
     /// Recognize a standalone `yes`/`no` boolean keyword from the pre-peeked
@@ -438,29 +471,23 @@ impl<'a> Parser<'a> {
         // Leading '+' is accepted by F#'s pint64/pfloat (issue #2).
         let num_saved = self.save();
 
-        let mut num_str = String::new();
+        let num_start = self.byte_pos();
         let mut had_dot = false;
 
-        match self.peek() {
-            Some('-') | Some('+') => {
-                let sign = self.peek().unwrap();
-                num_str.push(sign);
-                self.advance();
-            }
-            _ => {}
+        if matches!(self.peek(), Some('-' | '+')) {
+            self.advance();
         }
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
-                num_str.push(c);
                 self.advance();
             } else if c == '.' && !had_dot {
                 had_dot = true;
-                num_str.push(c);
                 self.advance();
             } else {
                 break;
             }
         }
+        let num_str = &self.input[num_start..self.byte_pos()];
 
         // Only commit a numeric result when the token ends here (next char is not
         // a value-char).  Otherwise backtrack so the whole token becomes a String.
@@ -507,9 +534,22 @@ impl<'a> Parser<'a> {
         if self.peek() != Some('{') {
             return None;
         }
+        if self.depth >= MAX_CLAUSE_DEPTH {
+            let start = self.pos();
+            self.errors.push(ParseError::Pos(
+                start.line,
+                start.col,
+                format!(
+                    "clause nesting deeper than the limit of {MAX_CLAUSE_DEPTH}; this subtree was skipped"
+                ),
+            ));
+            self.skip_clause();
+            return Some(Value::Clause(Vec::new()));
+        }
         self.advance(); // '{'
         self.skip_whitespace();
 
+        self.depth += 1;
         let mut children = Vec::new();
         loop {
             self.skip_whitespace();
@@ -529,8 +569,46 @@ impl<'a> Parser<'a> {
             }
             self.parse_statement(&mut children);
         }
+        self.depth -= 1;
 
         Some(Value::Clause(children))
+    }
+
+    /// Consume a `{ ... }` that [`MAX_CLAUSE_DEPTH`] refused to descend into,
+    /// iteratively so the skip itself cannot overflow. Comments and quoted
+    /// strings are lexed rather than scanned for braces, so a `}` hidden in one
+    /// does not end the skip early and derail the rest of the file.
+    fn skip_clause(&mut self) {
+        self.advance(); // '{'
+        let mut open = 1u32;
+        while open > 0 {
+            match self.peek() {
+                None => {
+                    self.errors.push(ParseError::Pos(
+                        self.pos().line,
+                        self.pos().col,
+                        "unclosed clause: expected '}' before end of file".to_string(),
+                    ));
+                    return;
+                }
+                Some('#') => {
+                    self.skip_comment();
+                }
+                Some('"') => self.skip_quoted(),
+                Some('{') => {
+                    self.advance();
+                    open += 1;
+                }
+                Some('}') => {
+                    self.advance();
+                    open -= 1;
+                }
+                Some(_) => {
+                    self.advance();
+                }
+            }
+        }
+        self.skip_whitespace();
     }
 
     fn parse_statement(&mut self, out: &mut Vec<Child>) {
@@ -742,6 +820,18 @@ fn is_key_char(c: char) -> bool {
         c.is_alphanumeric()
     }
 }
+
+/// Maximum clause nesting the parser descends into. A deeper clause is consumed
+/// without recursing and a [`ParseError`] naming this limit is recorded.
+///
+/// A stack overflow aborts the process rather than unwinding, so an unbounded
+/// parser takes the whole language server down with it on a 48 KB file. The
+/// deepest nesting measured across HOI4 vanilla, the Kaiserreich mod and the
+/// .cwt ruleset is 24; a release `validate` — whose AST walks recurse far
+/// deeper per level than the parser — survives 704 on the 2 MB stack the LSP's
+/// worker threads get. 256 clears real content by an order of magnitude and
+/// leaves the downstream walkers most of the stack.
+pub const MAX_CLAUSE_DEPTH: u32 = 256;
 
 /// Strip UTF-8 BOM if present, then parse.
 #[tracing::instrument(skip_all)]
@@ -1337,6 +1427,103 @@ ENG = {
                 other => panic!("`{}`: expected a Leaf, got {:?}", src, other),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Clause nesting is bounded. A stack overflow aborts the process instead of
+    // unwinding, so an unbounded parser lets a 48 KB file kill the language
+    // server on every scan — and the file stays on disk, so it kills it again
+    // on every restart.
+    // -----------------------------------------------------------------------
+
+    /// `root = { a = { a = ... 1 ... } }` nested exactly `depth` clauses deep.
+    fn nested_clauses(depth: usize) -> String {
+        let mut s = String::with_capacity(depth * 8 + 16);
+        s.push_str("root = ");
+        for _ in 0..depth {
+            s.push_str("{ a = ");
+        }
+        s.push('1');
+        for _ in 0..depth {
+            s.push_str(" }");
+        }
+        s
+    }
+
+    fn depth_errors(result: &ParsedFile) -> Vec<String> {
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .filter(|m| m.contains("nesting"))
+            .collect()
+    }
+
+    #[test]
+    fn nesting_past_the_depth_cap_errors_instead_of_overflowing() {
+        // 30,000 levels is the reproducer that aborted with "fatal runtime
+        // error: stack overflow" on the default 8 MB main stack.
+        let table = StringTable::new();
+        let result = parse_string(&nested_clauses(30_000), &table).expect("parse must return");
+        let errs = depth_errors(&result);
+        assert_eq!(errs.len(), 1, "one depth error, got: {:?}", result.errors);
+        assert!(
+            errs[0].contains(&MAX_CLAUSE_DEPTH.to_string()),
+            "the error must name the limit, got: {}",
+            errs[0]
+        );
+        assert_eq!(result.root_children.len(), 1, "the root statement survives");
+    }
+
+    #[test]
+    fn nesting_at_the_depth_cap_is_unaffected() {
+        let table = StringTable::new();
+        // 24 is the deepest nesting in HOI4 vanilla / Kaiserreich / the ruleset.
+        for depth in [1, 24, MAX_CLAUSE_DEPTH as usize] {
+            let result = parse_string(&nested_clauses(depth), &table).unwrap();
+            assert!(
+                result.errors.is_empty(),
+                "depth {} must parse clean, got: {:?}",
+                depth,
+                result.errors
+            );
+            let mut value = value_of(&result, &table, 0);
+            for _ in 0..depth {
+                let Value::Clause(children) = value else {
+                    panic!("depth {}: expected a clause, got {:?}", depth, value);
+                };
+                match children.as_slice() {
+                    [Child::Leaf(i)] => value = result.arena.leaves[*i as usize].value.clone(),
+                    other => panic!("depth {}: expected one child, got {:?}", depth, other),
+                }
+            }
+            assert_eq!(value, Value::Int(1), "depth {} bottomed out wrong", depth);
+        }
+    }
+
+    #[test]
+    fn depth_cap_skips_only_the_over_deep_clause() {
+        // The skipped subtree must not cascade: braces hidden in a comment or a
+        // quoted string inside it are not counted, so the skip lands on the
+        // matching `}` and the next statement still parses.
+        let table = StringTable::new();
+        let deep = nested_clauses(MAX_CLAUSE_DEPTH as usize + 1);
+        let src = format!("{deep}\n# trailing }} brace\nafter = \"}}{{\"\nlast = 2\n");
+        let result = parse_string(&src, &table).unwrap();
+        assert_eq!(depth_errors(&result).len(), 1, "{:?}", result.errors);
+        let last = result
+            .root_children
+            .iter()
+            .find_map(|c| match c {
+                Child::Leaf(i) => {
+                    let leaf = &result.arena.leaves[*i as usize];
+                    (table.get_string(leaf.key.normal).unwrap_or_default() == "last")
+                        .then(|| leaf.value.clone())
+                }
+                _ => None,
+            })
+            .expect("`last = 2` must survive the skipped subtree");
+        assert_eq!(last, Value::Int(2));
     }
 
     #[test]

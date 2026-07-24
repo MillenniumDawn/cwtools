@@ -134,18 +134,27 @@ pub(crate) fn source_position_to_lsp(
     source_column: u32,
     encoding: &tower_lsp::lsp_types::PositionEncodingKind,
 ) -> tower_lsp::lsp_types::Position {
-    let character = text
-        .lines()
-        .nth(line as usize)
-        .map_or(source_column, |line| {
-            let chars = line.chars().take(source_column as usize);
-            if encoding == &tower_lsp::lsp_types::PositionEncodingKind::UTF32 {
-                chars.count() as u32
-            } else {
-                chars.map(|ch| ch.len_utf16() as u32).sum()
-            }
-        });
+    let character = text.lines().nth(line as usize).map_or(source_column, |l| {
+        source_column_to_lsp(l, source_column, encoding)
+    });
     tower_lsp::lsp_types::Position { line, character }
+}
+
+/// The column half of [`source_position_to_lsp`]: a parser column (0-based
+/// chars) rendered in the negotiated encoding, for callers that already hold the
+/// line. Diagnostics resolve their line once per file and convert from there, so
+/// they share this conversion instead of re-scanning the text per squiggle.
+pub(crate) fn source_column_to_lsp(
+    line: &str,
+    source_column: u32,
+    encoding: &tower_lsp::lsp_types::PositionEncodingKind,
+) -> u32 {
+    let chars = line.chars().take(source_column as usize);
+    if encoding == &tower_lsp::lsp_types::PositionEncodingKind::UTF32 {
+        chars.count() as u32
+    } else {
+        chars.map(|ch| ch.len_utf16() as u32).sum()
+    }
 }
 
 #[cfg(test)]
@@ -318,12 +327,38 @@ pub(crate) fn current_token_text_with_encoding(
     line.get(start..end).unwrap_or("").to_string()
 }
 
-/// Whether a URI is a localisation file (`.yml` / `.yaml` / `.csv`), where
-/// `$KEY$` references resolve to other loc entries rather than to game-script
-/// rules. One predicate so hover/goto, completion, and validate agree on what
-/// counts as loc (previously hover/goto only matched `.yml`, so loc resolution
-/// silently skipped `.yaml`/`.csv` files that completion and validate handled).
+/// Whether a URI is a localisation file, where `$KEY$` references resolve to
+/// other loc entries rather than to game-script rules. One predicate so
+/// hover/goto, completion, and validate agree on what counts as loc.
+///
+/// Both halves of the loc walker's rule apply: a loc extension AND a
+/// `localisation` / `localization` directory somewhere above the file, matching
+/// what `cwtools_localization`'s `walk_folder` actually loads (its own doc
+/// comment warns that extension alone pulls in CI workflows and editor caches —
+/// which is how `.github/workflows/ci.yml` earned CW255/CW256).
 pub(crate) fn is_loc_file(uri: &str) -> bool {
+    if !has_loc_ext(uri) {
+        return false;
+    }
+    // `path_contains_segment` is the shared whole-segment scan, so a file merely
+    // NAMED `localisation.yml` doesn't match. Lowercased and `/`-separated as it
+    // requires.
+    let path = normalize_separators(uri_to_path_str(uri)).to_ascii_lowercase();
+    LOC_DIR_NAMES
+        .iter()
+        .any(|dir| cwtools_info::path_contains_segment(&path, dir))
+}
+
+/// Directory names the game (and the loc walker) treat as localisation roots.
+/// Mirrors `cwtools_localization`'s private `is_loc_dir_name`, which isn't
+/// exported for the LSP to call.
+const LOC_DIR_NAMES: [&str; 2] = ["localisation", "localization"];
+
+/// Whether a URI has a localisation file extension (`.yml` / `.yaml` / `.csv`),
+/// wherever it lives. The wider test behind [`is_loc_file`]: a loc-extension
+/// file outside any `localisation` dir is neither loc nor game script, so the
+/// game-script paths skip it rather than parsing YAML as Paradox script.
+pub(crate) fn has_loc_ext(uri: &str) -> bool {
     std::path::Path::new(uri)
         .extension()
         .and_then(|e| e.to_str())
@@ -556,12 +591,33 @@ mod tests {
         assert!(is_loc_file("file:///mod/localisation/foo_l_english.yml"));
         assert!(is_loc_file("file:///mod/localisation/foo_l_english.yaml"));
         assert!(is_loc_file("file:///mod/localisation/names.csv"));
-        // case-insensitive (Windows)
-        assert!(is_loc_file("file:///MOD/FOO.YML"));
-        assert!(is_loc_file("file:///MOD/FOO.YAML"));
+        // case-insensitive (Windows), extension and directory alike
+        assert!(is_loc_file("file:///MOD/LOCALISATION/FOO.YML"));
+        assert!(is_loc_file("file:///MOD/Localisation/FOO.YAML"));
         // not loc
         assert!(!is_loc_file("file:///mod/common/ideas/foo.txt"));
         assert!(!is_loc_file("file:///mod/gfx/foo.gfx"));
+    }
+
+    #[test]
+    fn is_loc_file_requires_a_localisation_directory() {
+        // Extension alone routed CI workflows and editor configs into loc
+        // validation (false CW255/CW256). Only files the loc walker would load
+        // — those under a `localisation` / `localization` dir — count.
+        assert!(!is_loc_file("file:///repo/.github/workflows/ci.yml"));
+        assert!(!is_loc_file("file:///repo/docker-compose.yaml"));
+        assert!(!is_loc_file("file:///repo/data/export.csv"));
+        // American spelling and nested subdirectories still count.
+        assert!(is_loc_file("file:///mod/localization/foo_l_english.yml"));
+        assert!(is_loc_file(
+            "file:///mod/localisation/replace/foo_l_english.yml"
+        ));
+        // Percent-encoded workspace paths decode before the dir check.
+        assert!(is_loc_file(
+            "file:///home/user/My%20Mod/localisation/foo_l_english.yml"
+        ));
+        // A file merely NAMED like the directory isn't loc.
+        assert!(!is_loc_file("file:///mod/localisation.yml"));
     }
 
     #[test]

@@ -8,7 +8,11 @@ updates:
       day: "monday"
       time: "06:00"
     open-pull-requests-limit: 10
-    # Don't bump MSRV on a whim — surface as PRs but require human review.
+    # MSRV is 1.88.0, declared in cwtools-rs/Cargo.toml. This used to be a note
+    # asking for human review of MSRV bumps, guarding a value that didn't exist
+    # yet. It does now, and the "Rust MSRV build" job in test.yml fails any
+    # update whose own rust-version climbs past it, so a bump is a red check
+    # rather than something a reviewer has to spot.
     labels:
       - "dependencies"
       - "rust"

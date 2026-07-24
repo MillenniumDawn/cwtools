@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use cwtools_driver::{index_game_dir, search_config_for};
 use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
 use cwtools_localization::Lang;
@@ -8,13 +8,21 @@ use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{ErrorSeverity, ValidationError};
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cwtools_info::vanilla_cache;
+
+mod codes;
+mod config;
+mod report;
+
+use report::ReportType;
 
 #[derive(Parser)]
 #[command(name = "cwtools")]
 #[command(about = "CWTools CLI — Paradox mod tooling")]
+// From CARGO_PKG_VERSION, the same source `cwtools-server --version` prints.
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -51,9 +59,21 @@ enum Commands {
     },
     /// Validate a directory of game files against .cwt rules
     Validate {
+        /// Read settings from this cwtools.toml instead of searching for one.
+        ///
+        /// Without it, the first `cwtools.toml` at or above --directory (or the
+        /// working directory) is used. Flags override file values; the boolean
+        /// switches are the exception — they can only add to a `true` in the
+        /// file, never turn one off.
+        /// Recognised keys: game, directory, rules, vanilla, vanilla-cache,
+        /// no-vanilla-cache, refresh-vanilla-cache, report-type, min-severity,
+        /// ignore-files, ignore-dirs, loc-languages, ignore-codes, only-codes,
+        /// allow-empty. Relative paths resolve against the config file.
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
         /// Game identifier (hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom)
         #[arg(long, short)]
-        game: String,
+        game: Option<String>,
         /// Directory containing game files. A single mod root is validated as-is.
         /// A workspace of mods (a directory that is not itself a mod root but whose
         /// `mod/`/`mods/` folder holds `.mod` descriptors) is auto-detected and
@@ -61,14 +81,17 @@ enum Commands {
         /// order (a later-resolved mod overrides a shared logical path; a mod's
         /// `replace_path` suppresses lower-priority files under that prefix).
         #[arg(long, short)]
-        directory: PathBuf,
+        directory: Option<PathBuf>,
         /// Path to a .cwt rules file OR a directory containing .cwt rule files
         #[arg(long, short)]
-        rules: PathBuf,
+        rules: Option<PathBuf>,
         /// Optional path to the base game install (e.g. the vanilla HOI4 folder).
         /// Its files are indexed for reference resolution but not validated, so a
         /// mod can reference base-game content (operation_tokens, ship_names, …)
-        /// without false "not a known instance" errors.
+        /// without false "not a known instance" errors. The index is cached under
+        /// the OS cache dir (XDG_CACHE_HOME/cwtools, %LOCALAPPDATA%\cwtools,
+        /// ~/.cache/cwtools) and reused while the install and rules are unchanged;
+        /// see --no-vanilla-cache / --refresh-vanilla-cache.
         #[arg(long)]
         vanilla: Option<PathBuf>,
         /// Optional pre-generated vanilla index (see `cache-vanilla`). Loaded for
@@ -76,9 +99,19 @@ enum Commands {
         /// `--vanilla`; can be combined with it.
         #[arg(long)]
         vanilla_cache: Option<PathBuf>,
-        /// Report format: cli (default, grouped text), csv, or json.
-        #[arg(long, default_value = "cli")]
-        report_type: String,
+        /// Don't read or write the automatic base-game cache: re-parse the
+        /// `--vanilla` install on every run.
+        #[arg(long)]
+        no_vanilla_cache: bool,
+        /// Ignore any existing automatic base-game cache, re-parse the
+        /// `--vanilla` install, and overwrite the cache with the result.
+        #[arg(long)]
+        refresh_vanilla_cache: bool,
+        /// Report format: cli (default, grouped text), csv, json, github
+        /// (Actions workflow commands, annotating the PR diff), or sarif
+        /// (SARIF 2.1.0 for code-scanning upload).
+        #[arg(long, value_name = "FORMAT", value_parser = report::parse_report_type)]
+        report_type: Option<ReportType>,
         /// Write the report to this file instead of stdout.
         #[arg(long)]
         output_file: Option<PathBuf>,
@@ -110,6 +143,20 @@ enum Commands {
         /// behavior).
         #[arg(long, value_name = "LEVEL", value_parser = parse_min_severity)]
         min_severity: Option<ErrorSeverity>,
+        /// Drop every diagnostic with this CW code (repeatable). The same
+        /// suppression the editor applies via `cwtools.errors.ignore`, so one
+        /// policy can cover both. Example: --ignore-code CW100
+        #[arg(long = "ignore-code", value_name = "CWxxx", value_parser = codes::parse_code)]
+        ignore_codes: Vec<String>,
+        /// Report only diagnostics with this CW code (repeatable). Omit to
+        /// report every code. `--ignore-code` still applies on top.
+        #[arg(long = "only-code", value_name = "CWxxx", value_parser = codes::parse_code)]
+        only_codes: Vec<String>,
+        /// Accept a run with nothing to validate. Without this, a ruleset that
+        /// loads no types or a directory that yields no files is an error
+        /// (exit 4) instead of a silent "0 errors".
+        #[arg(long)]
+        allow_empty: bool,
     },
     /// Pre-generate a vanilla type index from a base-game install, for use with
     /// `validate --vanilla-cache`. Parses and indexes the install once so later
@@ -131,10 +178,16 @@ enum Commands {
     /// Parse and validate localisation files (.yml)
     Loc {
         /// Directory containing localisation .yml files
-        directory: PathBuf,
-        /// Report format: cli (default, grouped text), csv, or json.
-        #[arg(long, default_value = "cli")]
-        report_type: String,
+        directory: Option<PathBuf>,
+        /// Read settings from this cwtools.toml instead of searching for one.
+        /// `loc` reads directory, report-type, min-severity, ignore-codes,
+        /// only-codes and allow-empty; see `validate --help` for the schema.
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        /// Report format: cli (default, grouped text), csv, json, github
+        /// (Actions workflow commands), or sarif (SARIF 2.1.0).
+        #[arg(long, value_name = "FORMAT", value_parser = report::parse_report_type)]
+        report_type: Option<ReportType>,
         /// Write the report to this file instead of stdout.
         #[arg(long)]
         output_file: Option<PathBuf>,
@@ -146,19 +199,38 @@ enum Commands {
         /// use later with --ignore-hashes.
         #[arg(long)]
         output_hashes: Option<PathBuf>,
+        /// Only report diagnostics at or above this severity. Valid values:
+        /// error, warning, info, hint. Omit to report everything.
+        #[arg(long, value_name = "LEVEL", value_parser = parse_min_severity)]
+        min_severity: Option<ErrorSeverity>,
+        /// Drop every diagnostic with this CW code (repeatable).
+        #[arg(long = "ignore-code", value_name = "CWxxx", value_parser = codes::parse_code)]
+        ignore_codes: Vec<String>,
+        /// Report only diagnostics with this CW code (repeatable).
+        #[arg(long = "only-code", value_name = "CWxxx", value_parser = codes::parse_code)]
+        only_codes: Vec<String>,
+        /// Accept a run with nothing to check. Without this, a directory that
+        /// holds no localisation files is an error (exit 4).
+        #[arg(long)]
+        allow_empty: bool,
     },
     /// Apply machine-applicable fixes for the curated fixable diagnostics.
     /// Dry-run by default (prints a unified-diff preview); pass `--apply` to write.
     Fix {
+        /// Read settings from this cwtools.toml instead of searching for one.
+        /// `fix` reads every key `validate` does except report-type and
+        /// min-severity; see `validate --help` for the schema.
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
         /// Game identifier (hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom)
         #[arg(long, short)]
-        game: String,
+        game: Option<String>,
         /// Directory containing game files
         #[arg(long, short)]
-        directory: PathBuf,
+        directory: Option<PathBuf>,
         /// Path to a .cwt rules file OR a directory containing .cwt rule files
         #[arg(long, short)]
-        rules: PathBuf,
+        rules: Option<PathBuf>,
         /// Optional path to the base game install, indexed for reference
         /// resolution (see `validate --vanilla`).
         #[arg(long)]
@@ -166,6 +238,12 @@ enum Commands {
         /// Optional pre-generated vanilla index (see `cache-vanilla`).
         #[arg(long)]
         vanilla_cache: Option<PathBuf>,
+        /// Don't read or write the automatic base-game cache (see `validate`).
+        #[arg(long)]
+        no_vanilla_cache: bool,
+        /// Ignore any existing automatic base-game cache and overwrite it.
+        #[arg(long)]
+        refresh_vanilla_cache: bool,
         /// Extra filename glob patterns to skip. May be repeated.
         #[arg(long = "ignore-file", value_name = "GLOB")]
         ignore_files: Vec<String>,
@@ -183,44 +261,18 @@ enum Commands {
         /// prints a preview only.
         #[arg(long)]
         apply: bool,
+        /// Accept a run with nothing to fix. Without this, a ruleset that loads
+        /// no types or a directory that yields no files is an error (exit 4).
+        #[arg(long)]
+        allow_empty: bool,
     },
 }
 
-/// A fix to apply to one file: the underlying edit plus the diagnostic code /
-/// title for the preview. Grouped per file by the `fix` subcommand.
-struct PlannedFix {
-    code: String,
-    edit: cwtools_parser::fix::SpanEdit,
-}
-
-/// Resolve a planned file's edits: drop any that overlap an already-kept edit
-/// (skip-and-warn, so a later edit never corrupts an earlier one), returning the
-/// surviving edits in file order plus the codes of the skipped ones.
-fn plan_file_edits(
-    text: &str,
-    mut planned: Vec<PlannedFix>,
-) -> (Vec<cwtools_parser::fix::SpanEdit>, Vec<String>) {
-    use cwtools_parser::fix::{line_start_bytes, pos_to_byte};
-    let starts = line_start_bytes(text);
-    // Sort by start byte ascending so overlap detection is a single forward scan.
-    planned.sort_by_key(|p| pos_to_byte(text, &starts, p.edit.range.start));
-    let mut kept: Vec<cwtools_parser::fix::SpanEdit> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
-    let mut last_end = 0usize;
-    let mut first = true;
-    for p in planned {
-        let s = pos_to_byte(text, &starts, p.edit.range.start);
-        let e = pos_to_byte(text, &starts, p.edit.range.end);
-        if !first && s < last_end {
-            skipped.push(p.code);
-            continue;
-        }
-        last_end = e;
-        first = false;
-        kept.push(p.edit);
-    }
-    (kept, skipped)
-}
+/// A fix to apply to one file: the diagnostic code (for the skip warning) paired
+/// with the underlying edit. Grouped per file by the `fix` subcommand and handed
+/// to `cwtools_parser::fix::plan_file_edits`, which owns the overlap resolution
+/// the LSP `source.fixAll` action shares.
+type PlannedFix = (String, cwtools_parser::fix::SpanEdit);
 
 /// A unified-diff-style preview of applying `edits` to `old` under `path`. One
 /// hunk per edit (edits are already non-overlapping), showing the touched old
@@ -263,23 +315,65 @@ fn fix_preview(path: &str, old: &str, edits: &[cwtools_parser::fix::SpanEdit]) -
     out
 }
 
-/// Stable FNV-1a-64 hex digest of a diagnostic, for baseline/ignore matching.
-/// Stable across runs and machines (unlike std's DefaultHasher seed).
-fn diag_hash(file: &str, code: &str, message: &str, line: u32) -> String {
+/// FNV-1a-64 hex digest of `parts`, joined by `|`. FNV rather than std's
+/// `DefaultHasher` because the seed there is randomized per process: a baseline
+/// file has to mean the same thing on every run and every machine.
+fn fnv1a_digest(parts: [&str; 4]) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in file
-        .bytes()
-        .chain(b"|".iter().copied())
-        .chain(code.bytes())
-        .chain(b"|".iter().copied())
-        .chain(message.bytes())
-        .chain(b"|".iter().copied())
-        .chain(line.to_string().bytes())
-    {
+    let mut mix = |b: u8| {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
+    };
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            mix(b'|');
+        }
+        for b in part.bytes() {
+            mix(b);
+        }
     }
     format!("{:016x}", h)
+}
+
+/// Stable digest of a diagnostic, for baseline/ignore matching. Keyed on the
+/// trimmed text of the offending source line rather than its line number, so
+/// inserting a line above a baselined diagnostic doesn't resurface it as new.
+/// Two identical diagnostics on two identical lines of one file collapse to one
+/// digest, which is the intended trade: baselines track content, not position.
+fn diag_hash(file: &str, code: &str, message: &str, line_text: &str) -> String {
+    fnv1a_digest([file, code, message, line_text])
+}
+
+/// The previous digest, keyed on the line number. Still accepted when matching
+/// `--ignore-hashes` so existing baselines don't all invalidate at once; never
+/// emitted. Remove once the migration window closes.
+fn legacy_diag_hash(file: &str, code: &str, message: &str, line: u32) -> String {
+    fnv1a_digest([file, code, message, &line.to_string()])
+}
+
+/// One-slot memo of a file's trimmed lines, feeding [`diag_hash`]. Diagnostics
+/// arrive grouped by file from both the validation and loc passes, so a single
+/// slot keeps each file to one read and only one file resident.
+#[derive(Default)]
+struct SourceLines {
+    file: String,
+    lines: Vec<String>,
+}
+
+impl SourceLines {
+    /// Trimmed text of 1-based `line` in `file`; `""` when the file can't be
+    /// read or the line doesn't exist (whole-file diagnostics report line 0).
+    fn trimmed(&mut self, file: &str, line: u32) -> &str {
+        if self.file != file {
+            self.lines = std::fs::read_to_string(file)
+                .map(|text| text.lines().map(|l| l.trim().to_string()).collect())
+                .unwrap_or_default();
+            self.file = file.to_string();
+        }
+        line.checked_sub(1)
+            .and_then(|i| self.lines.get(i as usize))
+            .map_or("", String::as_str)
+    }
 }
 
 /// Escape a field for CSV output.
@@ -317,53 +411,80 @@ struct Diag {
     code: String,
     message: String,
     line: u32,
+    /// 1-based column, normalised from the emitting subsystem's convention.
+    /// Only the `github` and `sarif` reports read it, so it stays out of the
+    /// hash and the cli/csv/json rows.
+    col: u32,
     hash: String,
+    /// The previous line-number digest, for matching older baselines only.
+    legacy_hash: String,
 }
 
-/// Map a `ValidationError` to a report `Diag`, computing its hash. Consumes the
-/// error (moves the message). The `fix` field is deliberately dropped.
-fn validation_to_diag(file: &str, err: ValidationError) -> Diag {
+/// Whether a `--ignore-hashes` baseline suppresses `d`. Both digests are
+/// accepted for the migration window: baselines written before the digest
+/// became content-derived keep matching, while only the new one is ever
+/// emitted, so a rewritten baseline converts itself.
+fn is_ignored(ignored: &std::collections::HashSet<String>, d: &Diag) -> bool {
+    ignored.contains(&d.hash) || ignored.contains(&d.legacy_hash)
+}
+
+/// Map a `ValidationError` to a report `Diag`, computing its hash from the
+/// trimmed source line. Consumes the error (moves the message). The `fix` field
+/// is deliberately dropped.
+fn validation_to_diag(file: &str, err: ValidationError, line_text: &str) -> Diag {
     let code = err.code.unwrap_or_default().to_string();
-    let hash = diag_hash(file, &code, &err.message, err.line);
+    let hash = diag_hash(file, &code, &err.message, line_text);
+    let legacy_hash = legacy_diag_hash(file, &code, &err.message, err.line);
     Diag {
         file: file.to_string(),
         severity: err.severity,
         code,
         message: err.message,
         line: err.line,
+        // Parser columns are 0-based; both CI formats are 1-based.
+        col: err.col as u32 + 1,
         hash,
+        legacy_hash,
     }
 }
 
 /// Map a `LocDiagnostic` to a report `Diag`, computing its hash. Consumes the
 /// diagnostic (moves file/message). The `fix` field is deliberately dropped,
 /// same as `validation_to_diag`.
-fn loc_diagnostic_to_diag(d: cwtools_localization::LocDiagnostic) -> Diag {
+fn loc_diagnostic_to_diag(d: cwtools_localization::LocDiagnostic, line_text: &str) -> Diag {
     let line = d.line as u32;
     let code = d.code.to_string();
-    let hash = diag_hash(&d.file, &code, &d.message, line);
+    let hash = diag_hash(&d.file, &code, &d.message, line_text);
+    let legacy_hash = legacy_diag_hash(&d.file, &code, &d.message, line);
     Diag {
         file: d.file,
         severity: d.severity,
         code,
         message: d.message,
         line,
+        // Loc diagnostics already count columns from 1.
+        col: (d.col as u32).max(1),
         hash,
+        legacy_hash,
     }
 }
 
 /// Map a `LocService` fatal parse error (a file that couldn't even be
 /// lenient-parsed, so there's no line number) to a report `Diag`. Always
-/// Error-severity; `line` is 0 like other whole-file diagnostics.
+/// Error-severity; `line` is 0 like other whole-file diagnostics, so there's no
+/// source line to key the hash on.
 fn loc_parse_error_to_diag(file: String, message: String) -> Diag {
-    let hash = diag_hash(&file, "", &message, 0);
+    let hash = diag_hash(&file, "", &message, "");
+    let legacy_hash = legacy_diag_hash(&file, "", &message, 0);
     Diag {
         file,
         severity: ErrorSeverity::Error,
         code: String::new(),
         message,
         line: 0,
+        col: 1,
         hash,
+        legacy_hash,
     }
 }
 
@@ -476,19 +597,137 @@ fn severity_rank(s: ErrorSeverity) -> u8 {
     }
 }
 
+/// The file walk itself failed (the path doesn't resolve, a dir is unreadable).
+const EXIT_DISCOVERY_FAILED: i32 = 3;
+
+/// An input resolved to nothing: a ruleset with no types, or a target directory
+/// with no files. Distinct from [`EXIT_DISCOVERY_FAILED`] so CI can tell
+/// "nothing to check" from "the walk errored".
+const EXIT_EMPTY_INPUT: i32 = 4;
+
+/// A `cwtools.toml` that couldn't be read or understood. Shares clap's
+/// usage-error code: the run never started, so it is not a validation result.
+const EXIT_CONFIG_ERROR: i32 = 2;
+
+/// Resolve the run's config file, failing loudly on a broken one. `anchor` is
+/// the directory the upward search starts from when `--config` wasn't given.
+fn load_config(explicit: Option<&Path>, anchor: Option<&Path>) -> Option<config::FileConfig> {
+    config::resolve(explicit, anchor).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(EXIT_CONFIG_ERROR);
+    })
+}
+
+/// Whether stdout is carrying one of the CI report formats, in which case status
+/// lines have to go to stderr instead: `cwtools loc . --report-type sarif >
+/// out.sarif` must not have a progress banner in the middle of the JSON. Only
+/// the two new formats divert — cli, csv and json keep every line where it was.
+fn report_owns_stdout(report_type: ReportType, output_file: Option<&PathBuf>) -> bool {
+    output_file.is_none() && matches!(report_type, ReportType::Github | ReportType::Sarif)
+}
+
+/// A progress/status line, diverted to stderr when the report owns stdout.
+fn status(line: String, to_stderr: bool) {
+    if to_stderr {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+}
+
+/// Report which config file the run used and what it contributed, on stderr so
+/// a redirected report stays clean. `reads` is the running subcommand's key set:
+/// anything the file sets outside it is named, since a key that quietly does
+/// nothing is the failure mode a shared config invites.
+fn announce_config(
+    subcommand: &str,
+    cfg: Option<&config::FileConfig>,
+    applied: &[&'static str],
+    reads: &[&str],
+) {
+    let Some(cfg) = cfg else { return };
+    let what = if applied.is_empty() {
+        "no settings applied".to_string()
+    } else {
+        format!("applied: {}", applied.join(", "))
+    };
+    eprintln!("Using config {} ({})", cfg.path.display(), what);
+    let unread: Vec<&str> = cfg
+        .present
+        .iter()
+        .copied()
+        .filter(|k| !reads.contains(k))
+        .collect();
+    if !unread.is_empty() {
+        eprintln!(
+            "warn: {} sets {}, which `{subcommand}` does not read",
+            cfg.path.display(),
+            unread.join(", ")
+        );
+    }
+}
+
+/// Bail on a setting that neither a flag nor the config file supplied, through
+/// clap so the message, the usage line and the exit code match every other
+/// usage error.
+fn missing_required(subcommand: &str, arg: &str, key: &str, cfg: Option<&config::FileConfig>) -> ! {
+    let hint = match cfg {
+        Some(c) => format!("{} does not set `{key}`", c.path.display()),
+        None => format!(
+            "no {} was found; `{key}` could come from one",
+            config::FILE_NAME
+        ),
+    };
+    let kind = clap::error::ErrorKind::MissingRequiredArgument;
+    let message = format!("the following required argument was not provided: {arg}\n\n  {hint}");
+    let mut root = Cli::command();
+    if let Some(sub) = root.find_subcommand_mut(subcommand) {
+        sub.error(kind, message).exit()
+    }
+    root.error(kind, message).exit()
+}
+
 /// Map a run's outcome to a process exit code. Operational failures (couldn't
 /// discover the files, couldn't write the report) are distinct from validation
 /// finding errors, so CI can tell "the tool couldn't run" apart from "validation
 /// found problems". 0 = clean run, no errors.
 fn exit_code(total_errors: usize, discovery_failed: bool, write_failed: bool) -> i32 {
     if discovery_failed {
-        3
+        EXIT_DISCOVERY_FAILED
     } else if write_failed {
         2
     } else if total_errors > 0 {
         1
     } else {
         0
+    }
+}
+
+/// A path as the run resolved it: absolute where that can be computed, so an
+/// error names the location a relative CI path actually pointed at.
+fn resolved_path(path: &std::path::Path) -> String {
+    std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// Message for an input that resolved to nothing. `what` names the input and
+/// what came back empty; the path is what the run resolved it to.
+fn empty_input_error(what: &str, path: &std::path::Path) -> String {
+    format!(
+        "error: {what}: {} (nothing to check; pass --allow-empty if this is intended)",
+        resolved_path(path)
+    )
+}
+
+/// Fail loudly when an input resolved to nothing. Validating against an empty
+/// ruleset, or over an empty file set, reports "0 errors" and exits 0, which
+/// leaves a CI job with a typo'd path permanently green.
+fn exit_if_empty(count: usize, allow_empty: bool, what: &str, path: &std::path::Path) {
+    if count == 0 && !allow_empty {
+        eprintln!("{}", empty_input_error(what, path));
+        std::process::exit(EXIT_EMPTY_INPUT);
     }
 }
 
@@ -519,6 +758,20 @@ fn main() {
                         println!("  Values:        {}", parsed.arena.leaf_values.len());
                         println!("  Comments:      {}", parsed.arena.comments.len());
                         println!("  Root children: {}", parsed.root_children.len());
+                        // The parser recovers rather than bailing, so a malformed
+                        // file still returns Ok with a partial AST. Reporting only
+                        // the summary made `a = { b =` look clean.
+                        if !parsed.errors.is_empty() {
+                            eprintln!(
+                                "\n{} parse error(s) in {}:",
+                                parsed.errors.len(),
+                                file.display()
+                            );
+                            for e in &parsed.errors {
+                                eprintln!("  {}", e);
+                            }
+                            std::process::exit(1);
+                        }
                     }
                     Err(e) => {
                         eprintln!("Error parsing {}: {}", file.display(), e);
@@ -612,11 +865,14 @@ fn main() {
             print_ruleset_summary(&ruleset);
         }
         Commands::Validate {
+            config,
             game,
             directory,
             rules,
             vanilla,
             vanilla_cache,
+            no_vanilla_cache,
+            refresh_vanilla_cache,
             report_type,
             output_file,
             ignore_hashes,
@@ -625,9 +881,111 @@ fn main() {
             ignore_dirs,
             loc_language,
             min_severity,
+            ignore_codes,
+            only_codes,
+            allow_empty,
         } => {
-            use cwtools_driver::{RulesInput, Session, SessionConfig};
+            use cwtools_driver::{RulesInput, Session, SessionConfig, VanillaCacheAuto};
             use cwtools_game::constants::Game;
+
+            let file_cfg = load_config(config.as_deref(), directory.as_deref());
+            let mut applied: Vec<&'static str> = Vec::new();
+            let fc = file_cfg.as_ref();
+            let game = config::pick(game, fc.and_then(|c| c.game.clone()), "game", &mut applied);
+            let directory = config::pick(
+                directory,
+                fc.and_then(|c| c.directory.clone()),
+                "directory",
+                &mut applied,
+            );
+            let rules = config::pick(
+                rules,
+                fc.and_then(|c| c.rules.clone()),
+                "rules",
+                &mut applied,
+            );
+            let vanilla = config::pick(
+                vanilla,
+                fc.and_then(|c| c.vanilla.clone()),
+                "vanilla",
+                &mut applied,
+            );
+            let vanilla_cache = config::pick(
+                vanilla_cache,
+                fc.and_then(|c| c.vanilla_cache.clone()),
+                "vanilla-cache",
+                &mut applied,
+            );
+            let no_vanilla_cache = config::pick_flag(
+                no_vanilla_cache,
+                fc.is_some_and(|c| c.no_vanilla_cache),
+                "no-vanilla-cache",
+                &mut applied,
+            );
+            let refresh_vanilla_cache = config::pick_flag(
+                refresh_vanilla_cache,
+                fc.is_some_and(|c| c.refresh_vanilla_cache),
+                "refresh-vanilla-cache",
+                &mut applied,
+            );
+            let report_type = config::pick(
+                report_type,
+                fc.and_then(|c| c.report_type),
+                "report-type",
+                &mut applied,
+            )
+            .unwrap_or(ReportType::Cli);
+            let min_severity = config::pick(
+                min_severity,
+                fc.and_then(|c| c.min_severity),
+                "min-severity",
+                &mut applied,
+            );
+            let ignore_files = config::pick_list(
+                ignore_files,
+                fc.map(|c| c.ignore_files.clone()).unwrap_or_default(),
+                "ignore-files",
+                &mut applied,
+            );
+            let ignore_dirs = config::pick_list(
+                ignore_dirs,
+                fc.map(|c| c.ignore_dirs.clone()).unwrap_or_default(),
+                "ignore-dirs",
+                &mut applied,
+            );
+            let loc_language = config::pick_list(
+                loc_language,
+                fc.map(|c| c.loc_languages.clone()).unwrap_or_default(),
+                "loc-languages",
+                &mut applied,
+            );
+            let ignore_codes = config::pick_list(
+                ignore_codes,
+                fc.map(|c| c.ignore_codes.clone()).unwrap_or_default(),
+                "ignore-codes",
+                &mut applied,
+            );
+            let only_codes = config::pick_list(
+                only_codes,
+                fc.map(|c| c.only_codes.clone()).unwrap_or_default(),
+                "only-codes",
+                &mut applied,
+            );
+            let allow_empty = config::pick_flag(
+                allow_empty,
+                fc.is_some_and(|c| c.allow_empty),
+                "allow-empty",
+                &mut applied,
+            );
+            announce_config("validate", fc, &applied, config::VALIDATE_KEYS);
+
+            let game =
+                game.unwrap_or_else(|| missing_required("validate", "--game <GAME>", "game", fc));
+            let directory = directory.unwrap_or_else(|| {
+                missing_required("validate", "--directory <DIRECTORY>", "directory", fc)
+            });
+            let rules = rules
+                .unwrap_or_else(|| missing_required("validate", "--rules <RULES>", "rules", fc));
 
             let game_id = Game::from_str(&game).unwrap_or_else(|| {
                 eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
@@ -694,6 +1052,18 @@ fn main() {
             });
             let (cached_fingerprint, vanilla_cache_index) = vanilla_cache_index.unzip();
 
+            // Without an explicit --vanilla-cache, keep one under the OS cache dir
+            // so repeat runs don't re-parse the whole install. The driver keys it
+            // on game version + ruleset shape and rebuilds it when either moves.
+            let vanilla_cache_auto = if no_vanilla_cache || vanilla_cache.is_some() {
+                None
+            } else {
+                cwtools_driver::default_cache_dir().map(|dir| VanillaCacheAuto {
+                    dir,
+                    refresh: refresh_vanilla_cache,
+                })
+            };
+
             // Build the whole engine pipeline through the shared driver: parse
             // rules, discover/parse mod files, build the type/var/vanilla indexes,
             // expand modifier keys, build the loc index, prebuild the scope
@@ -704,6 +1074,7 @@ fn main() {
                 directory: directory.clone(),
                 vanilla: vanilla.clone(),
                 vanilla_cache: vanilla_cache_index,
+                vanilla_cache_auto,
                 ignore_files: &ignore_files,
                 ignore_dirs: &ignore_dirs,
                 loc_languages: if loc_language.is_empty() {
@@ -721,6 +1092,23 @@ fn main() {
                 ruleset.aliases.len()
             );
             eprintln!("  Discovered {} files", session.parsed_files().len());
+
+            // Nothing to validate is a failure, not a clean run. A failed walk
+            // already exits 3 below, so don't relabel it as an empty input.
+            if !session.discovery_failed {
+                exit_if_empty(
+                    ruleset.types.len(),
+                    allow_empty,
+                    "--rules loaded 0 types",
+                    &rules,
+                );
+                exit_if_empty(
+                    session.parsed_files().len(),
+                    allow_empty,
+                    "--directory contains no files to validate",
+                    &directory,
+                );
+            }
 
             // Vanilla-cache freshness check. If both --vanilla-cache and --vanilla
             // are given we can compute the combined fingerprint (game version +
@@ -767,21 +1155,24 @@ fn main() {
 
             // The driver validates files in parallel, in input order, so the
             // report is byte-for-byte identical to the sequential version.
-            let ignored_ref = &ignored;
-            let mut diags: Vec<Diag> = session
-                .validate_all()
-                .into_iter()
-                .flat_map(|(path, errors)| {
-                    let file_str = path.to_str().unwrap_or("").to_string();
-                    errors.into_iter().filter_map(move |err| {
-                        let d = validation_to_diag(&file_str, err);
-                        if ignored_ref.contains(&d.hash) {
-                            return None;
-                        }
-                        Some(d)
-                    })
-                })
-                .collect();
+            let mut sources = SourceLines::default();
+            let mut diags: Vec<Diag> = Vec::new();
+            for (path, errors) in session.validate_all() {
+                let file_str = path.to_str().unwrap_or("").to_string();
+                for err in errors {
+                    // Same placement as the hash baseline: a suppressed code
+                    // never reaches the counts, the report or --output-hashes.
+                    if !codes::wanted(err.code.unwrap_or_default(), &only_codes, &ignore_codes) {
+                        continue;
+                    }
+                    let line_text = sources.trimmed(&file_str, err.line);
+                    let d = validation_to_diag(&file_str, err, line_text);
+                    if is_ignored(&ignored, &d) {
+                        continue;
+                    }
+                    diags.push(d);
+                }
+            }
             tlog!("validate-config");
 
             // Loc-file checks (CW225/CW234/CW259/CW268/CW275). Resolve refs
@@ -797,11 +1188,14 @@ fn main() {
                 }
             };
             for d in session.loc_project_diagnostics() {
-                if !d.file.starts_with(&dir_prefix) {
+                if !d.file.starts_with(&dir_prefix)
+                    || !codes::wanted(d.code, &only_codes, &ignore_codes)
+                {
                     continue;
                 }
-                let d = loc_diagnostic_to_diag(d);
-                if ignored.contains(&d.hash) {
+                let line_text = sources.trimmed(&d.file, d.line as u32).to_string();
+                let d = loc_diagnostic_to_diag(d, &line_text);
+                if is_ignored(&ignored, &d) {
                     continue;
                 }
                 diags.push(d);
@@ -870,21 +1264,31 @@ fn main() {
 
             // Render the report in the requested format.
             let mut out = String::new();
-            match report_type.as_str() {
-                "csv" => {
+            match report_type {
+                ReportType::Csv => {
                     out.push_str("file,line,severity,code,message,hash\n");
                     for d in &diags {
                         out.push_str(&csv_row(d));
                     }
                 }
-                "json" => {
+                ReportType::Json => {
                     out.push_str("[\n");
                     for (i, d) in diags.iter().enumerate() {
                         out.push_str(&json_row(d, i + 1 >= diags.len()));
                     }
                     out.push_str("]\n");
                 }
-                _ => {
+                ReportType::Github => {
+                    let root = report::report_root();
+                    for d in &diags {
+                        out.push_str(&report::github_row(d, &root));
+                    }
+                }
+                ReportType::Sarif => {
+                    let refs: Vec<&Diag> = diags.iter().collect();
+                    out.push_str(&report::sarif_report(&refs, &report::report_root()));
+                }
+                ReportType::Cli => {
                     // cli: grouped by file
                     let mut current = "";
                     for d in &diags {
@@ -909,7 +1313,7 @@ fn main() {
                     } else {
                         println!(
                             "Wrote {} report ({} errors, {} warnings) to {}",
-                            report_type,
+                            report_type.as_str(),
                             total_errors,
                             total_warnings,
                             p.display()
@@ -931,10 +1335,13 @@ fn main() {
                 if let Err(e) = std::fs::write(p, hashes.join("\n")) {
                     eprintln!("Error writing hashes {}: {}", p.display(), e);
                 } else {
-                    println!(
-                        "Wrote {} diagnostic hashes to {}",
-                        hashes.len(),
-                        p.display()
+                    status(
+                        format!(
+                            "Wrote {} diagnostic hashes to {}",
+                            hashes.len(),
+                            p.display()
+                        ),
+                        report_owns_stdout(report_type, output_file.as_ref()),
                     );
                 }
             }
@@ -985,15 +1392,84 @@ fn main() {
         }
         Commands::Loc {
             directory,
+            config,
             report_type,
             output_file,
             ignore_hashes,
             output_hashes,
+            min_severity,
+            ignore_codes,
+            only_codes,
+            allow_empty,
         } => {
             use cwtools_localization::{LocService, validate_loc_project};
 
-            println!("Scanning localisation in {}", directory.display());
+            let file_cfg = load_config(config.as_deref(), directory.as_deref());
+            let mut applied: Vec<&'static str> = Vec::new();
+            let fc = file_cfg.as_ref();
+            let directory = config::pick(
+                directory,
+                fc.and_then(|c| c.directory.clone()),
+                "directory",
+                &mut applied,
+            );
+            let report_type = config::pick(
+                report_type,
+                fc.and_then(|c| c.report_type),
+                "report-type",
+                &mut applied,
+            )
+            .unwrap_or(ReportType::Cli);
+            let min_severity = config::pick(
+                min_severity,
+                fc.and_then(|c| c.min_severity),
+                "min-severity",
+                &mut applied,
+            );
+            let ignore_codes = config::pick_list(
+                ignore_codes,
+                fc.map(|c| c.ignore_codes.clone()).unwrap_or_default(),
+                "ignore-codes",
+                &mut applied,
+            );
+            let only_codes = config::pick_list(
+                only_codes,
+                fc.map(|c| c.only_codes.clone()).unwrap_or_default(),
+                "only-codes",
+                &mut applied,
+            );
+            let allow_empty = config::pick_flag(
+                allow_empty,
+                fc.is_some_and(|c| c.allow_empty),
+                "allow-empty",
+                &mut applied,
+            );
+            announce_config("loc", fc, &applied, config::LOC_KEYS);
+            let directory = directory
+                .unwrap_or_else(|| missing_required("loc", "<DIRECTORY>", "directory", fc));
+
+            // A path that doesn't resolve is never a clean run, and --allow-empty
+            // doesn't excuse it (that flag covers a deliberately empty scan).
+            if !directory.is_dir() {
+                eprintln!(
+                    "error: directory does not exist: {}",
+                    resolved_path(&directory)
+                );
+                std::process::exit(EXIT_DISCOVERY_FAILED);
+            }
+
+            let divert = report_owns_stdout(report_type, output_file.as_ref());
+            status(
+                format!("Scanning localisation in {}", directory.display()),
+                divert,
+            );
             let service = LocService::from_folder(&directory);
+            exit_if_empty(
+                service.files().len(),
+                allow_empty,
+                "no localisation files found under",
+                &directory,
+            );
 
             let total_entries: usize = service.files().iter().map(|f| f.entries.len()).sum();
 
@@ -1013,20 +1489,32 @@ fn main() {
 
             // Standalone loc lint uses the scope-independent checks (CW225 etc.);
             // scope-aware command checks need the referencing config's scope.
+            let mut sources = SourceLines::default();
+            let keep = |d: &Diag| {
+                !is_ignored(&ignored, d)
+                    && min_severity.is_none_or(|m| severity_rank(d.severity) >= severity_rank(m))
+            };
             let diags: Vec<Diag> = validate_loc_project(&service)
                 .into_iter()
-                .map(loc_diagnostic_to_diag)
-                .filter(|d| !ignored.contains(&d.hash))
+                .filter(|d| codes::wanted(d.code, &only_codes, &ignore_codes))
+                .map(|d| {
+                    let line_text = sources.trimmed(&d.file, d.line as u32).to_string();
+                    loc_diagnostic_to_diag(d, &line_text)
+                })
+                .filter(keep)
                 .collect();
 
             // Surface parse failures too (files that couldn't even be
             // lenient-parsed), kept separate from `diags` since they carry no
             // line/code and get their own text-report line below.
+            // Neither code filter touches these: they carry no code to name, and
+            // dropping a file the parser couldn't read at all would exit 0 on a
+            // broken mod. Suppression is per code; these have none.
             let parse_errors: Vec<Diag> = service
                 .errors()
                 .iter()
                 .map(|(file, message)| loc_parse_error_to_diag(file.clone(), message.clone()))
-                .filter(|d| !ignored.contains(&d.hash))
+                .filter(keep)
                 .collect();
 
             let total_issues = diags.len() + parse_errors.len();
@@ -1043,14 +1531,14 @@ fn main() {
             // reproduces the original hand-rolled text report byte-for-byte;
             // csv/json reuse the same row helpers `validate` uses.
             let mut out = String::new();
-            match report_type.as_str() {
-                "csv" => {
+            match report_type {
+                ReportType::Csv => {
                     out.push_str("file,line,severity,code,message,hash\n");
                     for d in diags.iter().chain(parse_errors.iter()) {
                         out.push_str(&csv_row(d));
                     }
                 }
-                "json" => {
+                ReportType::Json => {
                     let all: Vec<&Diag> = diags.iter().chain(parse_errors.iter()).collect();
                     out.push_str("[\n");
                     for (i, d) in all.iter().enumerate() {
@@ -1058,7 +1546,17 @@ fn main() {
                     }
                     out.push_str("]\n");
                 }
-                _ => {
+                ReportType::Github => {
+                    let root = report::report_root();
+                    for d in diags.iter().chain(parse_errors.iter()) {
+                        out.push_str(&report::github_row(d, &root));
+                    }
+                }
+                ReportType::Sarif => {
+                    let all: Vec<&Diag> = diags.iter().chain(parse_errors.iter()).collect();
+                    out.push_str(&report::sarif_report(&all, &report::report_root()));
+                }
+                ReportType::Cli => {
                     let mut by_file: std::collections::BTreeMap<String, Vec<&Diag>> =
                         std::collections::BTreeMap::new();
                     for d in &diags {
@@ -1091,7 +1589,7 @@ fn main() {
                     } else {
                         println!(
                             "Wrote {} report ({} issues) to {}",
-                            report_type,
+                            report_type.as_str(),
                             total_issues,
                             p.display()
                         );
@@ -1116,10 +1614,13 @@ fn main() {
                 if let Err(e) = std::fs::write(p, hashes.join("\n")) {
                     eprintln!("Error writing hashes {}: {}", p.display(), e);
                 } else {
-                    println!(
-                        "Wrote {} diagnostic hashes to {}",
-                        hashes.len(),
-                        p.display()
+                    status(
+                        format!(
+                            "Wrote {} diagnostic hashes to {}",
+                            hashes.len(),
+                            p.display()
+                        ),
+                        report_owns_stdout(report_type, output_file.as_ref()),
                     );
                 }
             }
@@ -1130,30 +1631,128 @@ fn main() {
             }
         }
         Commands::Fix {
+            config,
             game,
             directory,
             rules,
             vanilla,
             vanilla_cache,
+            no_vanilla_cache,
+            refresh_vanilla_cache,
             ignore_files,
             ignore_dirs,
             loc_language,
-            codes,
+            codes: only_flag,
             apply,
+            allow_empty,
         } => {
-            use cwtools_driver::{RulesInput, Session, SessionConfig};
+            use cwtools_driver::{RulesInput, Session, SessionConfig, VanillaCacheAuto};
             use cwtools_game::constants::Game;
             use std::collections::BTreeMap;
+
+            let file_cfg = load_config(config.as_deref(), directory.as_deref());
+            let mut applied: Vec<&'static str> = Vec::new();
+            let fc = file_cfg.as_ref();
+            let game = config::pick(game, fc.and_then(|c| c.game.clone()), "game", &mut applied);
+            let directory = config::pick(
+                directory,
+                fc.and_then(|c| c.directory.clone()),
+                "directory",
+                &mut applied,
+            );
+            let rules = config::pick(
+                rules,
+                fc.and_then(|c| c.rules.clone()),
+                "rules",
+                &mut applied,
+            );
+            let vanilla = config::pick(
+                vanilla,
+                fc.and_then(|c| c.vanilla.clone()),
+                "vanilla",
+                &mut applied,
+            );
+            let vanilla_cache = config::pick(
+                vanilla_cache,
+                fc.and_then(|c| c.vanilla_cache.clone()),
+                "vanilla-cache",
+                &mut applied,
+            );
+            let no_vanilla_cache = config::pick_flag(
+                no_vanilla_cache,
+                fc.is_some_and(|c| c.no_vanilla_cache),
+                "no-vanilla-cache",
+                &mut applied,
+            );
+            let refresh_vanilla_cache = config::pick_flag(
+                refresh_vanilla_cache,
+                fc.is_some_and(|c| c.refresh_vanilla_cache),
+                "refresh-vanilla-cache",
+                &mut applied,
+            );
+            let ignore_files = config::pick_list(
+                ignore_files,
+                fc.map(|c| c.ignore_files.clone()).unwrap_or_default(),
+                "ignore-files",
+                &mut applied,
+            );
+            let ignore_dirs = config::pick_list(
+                ignore_dirs,
+                fc.map(|c| c.ignore_dirs.clone()).unwrap_or_default(),
+                "ignore-dirs",
+                &mut applied,
+            );
+            let loc_language = config::pick_list(
+                loc_language,
+                fc.map(|c| c.loc_languages.clone()).unwrap_or_default(),
+                "loc-languages",
+                &mut applied,
+            );
+            // `--code` is `fix`'s own spelling of the config's `only-codes`. It
+            // predates the validated code flags and stays lenient: an unknown
+            // code warns rather than failing the run.
+            let only_flag: Vec<String> = only_flag
+                .iter()
+                .map(|c| c.to_ascii_uppercase())
+                .inspect(|c| {
+                    if codes::entry(c).is_none() {
+                        eprintln!("warn: --code {c} is not a code the validator emits");
+                    }
+                })
+                .collect();
+            let only_codes = config::pick_list(
+                only_flag,
+                fc.map(|c| c.only_codes.clone()).unwrap_or_default(),
+                "only-codes",
+                &mut applied,
+            );
+            let ignore_codes = config::pick_list(
+                Vec::new(),
+                fc.map(|c| c.ignore_codes.clone()).unwrap_or_default(),
+                "ignore-codes",
+                &mut applied,
+            );
+            let allow_empty = config::pick_flag(
+                allow_empty,
+                fc.is_some_and(|c| c.allow_empty),
+                "allow-empty",
+                &mut applied,
+            );
+            announce_config("fix", fc, &applied, config::FIX_KEYS);
+
+            let game = game.unwrap_or_else(|| missing_required("fix", "--game <GAME>", "game", fc));
+            let directory = directory.unwrap_or_else(|| {
+                missing_required("fix", "--directory <DIRECTORY>", "directory", fc)
+            });
+            let rules =
+                rules.unwrap_or_else(|| missing_required("fix", "--rules <RULES>", "rules", fc));
 
             let game_id = Game::from_str(&game).unwrap_or_else(|| {
                 eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
                 std::process::exit(1);
             });
 
-            // Uppercased code filter; empty means "every fixable diagnostic".
-            let code_filter: std::collections::HashSet<String> =
-                codes.iter().map(|c| c.to_ascii_uppercase()).collect();
-            let want = |code: &str| code_filter.is_empty() || code_filter.contains(code);
+            let want = |code: &str| codes::wanted(code, &only_codes, &ignore_codes);
 
             let vanilla_cache_index = vanilla_cache
                 .as_ref()
@@ -1161,12 +1760,24 @@ fn main() {
                 .map(|(_, fp, data)| (fp, data));
             let (_fp, vanilla_cache_index) = vanilla_cache_index.unzip();
 
+            // Same automatic base-game cache as `validate`, so both commands see
+            // the same base-game data (and share the warm cache).
+            let vanilla_cache_auto = if no_vanilla_cache || vanilla_cache.is_some() {
+                None
+            } else {
+                cwtools_driver::default_cache_dir().map(|dir| VanillaCacheAuto {
+                    dir,
+                    refresh: refresh_vanilla_cache,
+                })
+            };
+
             let session = Session::load(SessionConfig {
                 game: game_id,
                 rules: RulesInput::from_path(rules.clone()),
                 directory: directory.clone(),
                 vanilla: vanilla.clone(),
                 vanilla_cache: vanilla_cache_index,
+                vanilla_cache_auto,
                 ignore_files: &ignore_files,
                 ignore_dirs: &ignore_dirs,
                 loc_languages: if loc_language.is_empty() {
@@ -1176,6 +1787,24 @@ fn main() {
                 },
                 on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
             });
+
+            // Same guards as `validate`: a failed walk, an empty ruleset, or an
+            // empty file set must not read as "nothing needed fixing".
+            if session.discovery_failed {
+                std::process::exit(EXIT_DISCOVERY_FAILED);
+            }
+            exit_if_empty(
+                session.ruleset().types.len(),
+                allow_empty,
+                "--rules loaded 0 types",
+                &rules,
+            );
+            exit_if_empty(
+                session.parsed_files().len(),
+                allow_empty,
+                "--directory contains no files to fix",
+                &directory,
+            );
 
             // Gather fixable diagnostics, grouped per file in deterministic order.
             let mut by_file: BTreeMap<String, Vec<PlannedFix>> = BTreeMap::new();
@@ -1191,10 +1820,7 @@ fn main() {
                             by_file
                                 .entry(file_str.clone())
                                 .or_default()
-                                .push(PlannedFix {
-                                    code: code.to_string(),
-                                    edit,
-                                });
+                                .push((code.to_string(), edit));
                         }
                     }
                 }
@@ -1214,10 +1840,10 @@ fn main() {
                 }
                 if let Some(fix) = d.fix {
                     for edit in fix.edits {
-                        by_file.entry(d.file.clone()).or_default().push(PlannedFix {
-                            code: d.code.to_string(),
-                            edit,
-                        });
+                        by_file
+                            .entry(d.file.clone())
+                            .or_default()
+                            .push((d.code.to_string(), edit));
                     }
                 }
             }
@@ -1230,7 +1856,7 @@ fn main() {
                     eprintln!("warn: could not read {file}; skipping its fixes");
                     continue;
                 };
-                let (kept, skipped) = plan_file_edits(&text, planned);
+                let (kept, skipped) = cwtools_parser::fix::plan_file_edits(&text, planned);
                 for code in &skipped {
                     eprintln!("warn: {file}: skipped a {code} fix (overlaps another edit)");
                 }
@@ -1290,6 +1916,16 @@ mod tests {
         assert_eq!(exit_code(5, true, true), 3);
     }
 
+    #[test]
+    fn empty_input_error_names_the_input_and_resolved_path() {
+        let msg = empty_input_error("--rules loaded 0 types", std::path::Path::new("."));
+        assert!(msg.contains("--rules loaded 0 types"), "got: {msg}");
+        assert!(msg.contains("--allow-empty"), "got: {msg}");
+        // The path is absolutized, so a relative CI path is identifiable.
+        let here = std::path::absolute(".").unwrap().display().to_string();
+        assert!(msg.contains(&here), "got: {msg}");
+    }
+
     fn err_base() -> ValidationError {
         ValidationError {
             message: "redundant default, remove it".to_string(),
@@ -1301,6 +1937,102 @@ mod tests {
             fix: None,
             end: None,
         }
+    }
+
+    // ── Diagnostic hashes ────────────────────────────────────────────────────
+
+    /// Same diagnostic on the same source text, moved down two lines.
+    #[test]
+    fn hash_survives_line_motion() {
+        let mut moved = err_base();
+        moved.line += 2;
+        let before = validation_to_diag("common/ideas/x.txt", err_base(), "cost = 150");
+        let after = validation_to_diag("common/ideas/x.txt", moved, "cost = 150");
+        assert_eq!(
+            before.hash, after.hash,
+            "inserting a line above a diagnostic must not change its digest"
+        );
+        assert_ne!(
+            before.legacy_hash, after.legacy_hash,
+            "the legacy digest is the one that moved"
+        );
+    }
+
+    /// Editing the offending line is a real change: the baseline entry should
+    /// stop matching so the diagnostic is re-triaged.
+    #[test]
+    fn hash_changes_when_the_source_line_changes() {
+        let a = validation_to_diag("common/ideas/x.txt", err_base(), "cost = 150");
+        let b = validation_to_diag("common/ideas/x.txt", err_base(), "cost = 200");
+        assert_ne!(a.hash, b.hash);
+    }
+
+    /// Migration: a baseline written with the old line-number digest still
+    /// suppresses its diagnostic, and only the new digest is emitted.
+    #[test]
+    fn legacy_hashes_still_match_but_are_not_emitted() {
+        let d = validation_to_diag("common/ideas/x.txt", err_base(), "cost = 150");
+        let legacy = legacy_diag_hash(
+            "common/ideas/x.txt",
+            "CW282",
+            "redundant default, remove it",
+            12,
+        );
+        assert_eq!(d.legacy_hash, legacy);
+        assert_ne!(
+            d.hash, legacy,
+            "the emitted digest is the content-derived one"
+        );
+
+        let baseline: std::collections::HashSet<String> = [legacy].into_iter().collect();
+        assert!(
+            is_ignored(&baseline, &d),
+            "old baselines must keep matching"
+        );
+
+        let fresh: std::collections::HashSet<String> = [d.hash.clone()].into_iter().collect();
+        assert!(is_ignored(&fresh, &d), "new baselines match too");
+        // The report and --output-hashes only ever see the new digest.
+        assert!(csv_row(&d).contains(&d.hash));
+        assert!(!csv_row(&d).contains(&d.legacy_hash));
+    }
+
+    /// The legacy digest is a compatibility contract with baselines already on
+    /// disk, so its bytes are frozen, not just its shape. This value is FNV-1a-64
+    /// over `common/ideas/x.txt|CW282|redundant default|12`, exactly what the
+    /// old line-number `diag_hash` emitted.
+    #[test]
+    fn legacy_hash_digest_is_frozen() {
+        assert_eq!(
+            legacy_diag_hash("common/ideas/x.txt", "CW282", "redundant default", 12),
+            "8e7fd969bd9ea463"
+        );
+    }
+
+    /// Whole-file diagnostics (line 0) have no source line; the digest still
+    /// distinguishes them by file/code/message.
+    #[test]
+    fn parse_error_hashes_are_distinct_without_a_source_line() {
+        let a = loc_parse_error_to_diag("l_english.yml".into(), "bad yaml".into());
+        let b = loc_parse_error_to_diag("l_english.yml".into(), "worse yaml".into());
+        assert_ne!(a.hash, b.hash);
+    }
+
+    #[test]
+    fn source_lines_trims_and_handles_missing_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("x.txt");
+        std::fs::write(&file, "first\n    indented = yes\n").unwrap();
+        let path = file.to_str().unwrap();
+
+        let mut sources = SourceLines::default();
+        assert_eq!(sources.trimmed(path, 2), "indented = yes");
+        assert_eq!(sources.trimmed(path, 1), "first");
+        assert_eq!(sources.trimmed(path, 0), "", "line 0 has no source line");
+        assert_eq!(sources.trimmed(path, 99), "", "past the end of the file");
+        assert_eq!(sources.trimmed("/no/such/file.txt", 1), "");
+        // The slot re-fills when the file changes back.
+        assert_eq!(sources.trimmed(path, 1), "first");
     }
 
     // Inertness guard (Task 8/18, step 2): a fix payload AND an end position must
@@ -1320,8 +2052,8 @@ mod tests {
         // Task 18: the end position is inert in the report too.
         with_fix.end = Some((12, 30));
 
-        let d0 = validation_to_diag(&base.file.clone(), base);
-        let d1 = validation_to_diag(&with_fix.file.clone(), with_fix);
+        let d0 = validation_to_diag(&base.file.clone(), base, "cost = 150");
+        let d1 = validation_to_diag(&with_fix.file.clone(), with_fix, "cost = 150");
 
         assert_eq!(d0.hash, d1.hash, "hash must ignore the fix");
         assert_eq!(csv_row(&d0), csv_row(&d1), "csv row must ignore the fix");
@@ -1344,28 +2076,16 @@ mod tests {
     #[test]
     fn multiple_edits_per_file_apply_in_descending_order() {
         let text = "aaaa bbbb\n";
-        let forward = vec![
-            PlannedFix {
-                code: "CWA".into(),
-                edit: edit(1, 0, 1, 4, "X"),
-            },
-            PlannedFix {
-                code: "CWB".into(),
-                edit: edit(1, 5, 1, 9, "Y"),
-            },
+        let forward: Vec<PlannedFix> = vec![
+            ("CWA".into(), edit(1, 0, 1, 4, "X")),
+            ("CWB".into(), edit(1, 5, 1, 9, "Y")),
         ];
-        let reversed = vec![
-            PlannedFix {
-                code: "CWB".into(),
-                edit: edit(1, 5, 1, 9, "Y"),
-            },
-            PlannedFix {
-                code: "CWA".into(),
-                edit: edit(1, 0, 1, 4, "X"),
-            },
+        let reversed: Vec<PlannedFix> = vec![
+            ("CWB".into(), edit(1, 5, 1, 9, "Y")),
+            ("CWA".into(), edit(1, 0, 1, 4, "X")),
         ];
         for planned in [forward, reversed] {
-            let (kept, skipped) = plan_file_edits(text, planned);
+            let (kept, skipped) = cwtools_parser::fix::plan_file_edits(text, planned);
             assert!(skipped.is_empty(), "no overlap expected");
             assert_eq!(kept.len(), 2);
             assert_eq!(cwtools_parser::fix::apply_edits(text, &kept), "X Y\n");
@@ -1377,17 +2097,11 @@ mod tests {
     #[test]
     fn overlapping_edits_skip_and_warn() {
         let text = "aaaa bbbb\n";
-        let planned = vec![
-            PlannedFix {
-                code: "CWA".into(),
-                edit: edit(1, 0, 1, 6, "X"), // covers "aaaa b"
-            },
-            PlannedFix {
-                code: "CWB".into(),
-                edit: edit(1, 5, 1, 9, "Y"), // overlaps at col 5
-            },
+        let planned: Vec<PlannedFix> = vec![
+            ("CWA".into(), edit(1, 0, 1, 6, "X")), // covers "aaaa b"
+            ("CWB".into(), edit(1, 5, 1, 9, "Y")), // overlaps at col 5
         ];
-        let (kept, skipped) = plan_file_edits(text, planned);
+        let (kept, skipped) = cwtools_parser::fix::plan_file_edits(text, planned);
         assert_eq!(kept.len(), 1, "one edit kept");
         assert_eq!(skipped, vec!["CWB".to_string()], "overlapping edit skipped");
         assert_eq!(cwtools_parser::fix::apply_edits(text, &kept), "Xbbb\n");

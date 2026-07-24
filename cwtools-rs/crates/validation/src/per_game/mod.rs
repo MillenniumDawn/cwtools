@@ -3,7 +3,6 @@ use crate::ctx::ValidationCtx;
 use cwtools_game::constants::Game;
 
 pub mod common;
-pub mod eu4;
 pub mod hoi4;
 pub mod stellaris;
 pub mod structural;
@@ -38,9 +37,6 @@ pub(crate) fn run_game_validators(ctx: &ValidationCtx, game: Game) -> Vec<Valida
                 ctx.type_index,
                 &mut errors,
             );
-        }
-        Game::Eu4 => {
-            eu4::validate_eu4(ast, ruleset, table, file_path, &mut errors);
         }
         Game::Hoi4 => {
             hoi4::validate_hoi4(ast, ruleset, table, file_path, &mut errors);

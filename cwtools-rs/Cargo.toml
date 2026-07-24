@@ -16,11 +16,22 @@ members = [
   "crates/lsp",
   "crates/cli",
 ]
+# fuzz/ is its own workspace root. Excluding it here keeps `cargo build` and
+# `cargo test` from ever pulling in libfuzzer-sys, which needs nightly and a
+# sanitizer runtime. Running the targets: see CONTRIBUTING.md.
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
-version = "2.2.0"
+version = "2.3.0"
 edition = "2024"
+# Minimum supported Rust version, inherited by every member crate so cargo
+# enforces it per crate. 1.88 is the floor for let-chains (`if let ... && let
+# ...`), which the parser, the scope registry and ~20 other modules rely on;
+# 1.86 and 1.87 reject them as E0658. Dependencies want 1.86 independently.
+# CI's "Rust MSRV build" job in test.yml builds at exactly this version so it
+# cannot drift upward unnoticed.
+rust-version = "1.88.0"
 license = "MIT"
 repository = "https://github.com/MillenniumDawn/cwtools"
 

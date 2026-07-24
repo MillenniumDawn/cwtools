@@ -89,7 +89,8 @@ waiting on. The re-entrancy guard (`scan_in_progress`) means a background pass a
 foreground scan can't overlap; the loser skips.
 
 The cadence is the `backgroundReindexIntervalMinutes` initializationOption (default
-30, `0` disables). It is also live-updatable through `workspace/didChangeConfiguration`
+`0`, which disables the loop entirely: a client that never sends the option gets no
+background passes). It is also live-updatable through `workspace/didChangeConfiguration`
 (`config.rs`), so toggling the setting takes effect without a restart. The
 `reindexWorkspace` executeCommand forces an immediate foreground rescan on demand;
 it reports "already in progress" when it loses the guard instead of silently
@@ -104,7 +105,7 @@ Then `run_game_validators` (`validation/src/per_game/mod.rs`) adds:
 - `common` checks (unique types, `should_be_referenced`, warning-only downgrades),
 - cross-game `structural` hints (empty `if`/`limit`, `NOT` misuse, redundant booleans), then
 - a dispatch on `Game`: `stellaris` (full validators), `hoi4` (cleanup hints),
-  `eu4` (stub), and `_ =>` common-only for everything else.
+  and `_ =>` common-only for every other game, EU4 included.
 
 The `_ =>` fallback is intentional: a game with no per-game module still gets the
 common + structural checks. Scope and link behavior is config-driven, not hardcoded
@@ -127,8 +128,10 @@ A new `Game` variant touches these sites, in lockstep:
    dedicated validator module. Otherwise the `_ =>` default handles it.
 5. `validation/src/per_game/structural.rs`: add a CW223 message arm only if the
    game's boolean operators differ from the default (HOI4 already overrides it).
-6. `localization/src/commands.rs`: add the game's language list to
-   `languages_for_game` (else it falls to the accept-all default).
+6. `localization/src/commands.rs`: usually nothing. The `Lang` set is one global
+   list shared by every game, not a per-game one. Add a variant (and its arms in
+   `key_to_language`, `Lang::from_name`, `Display`) only if the new game ships a
+   language cwtools doesn't already recognize.
 7. `localization/src/scope_validation.rs`: add the variant to `game_to_engine`'s
    pass-through list (else loc scope checks fall back to lenient HOI4).
 8. `lsp/src/paths.rs`: add the Steam install-folder name to `discover_vanilla_dir`.
@@ -138,9 +141,9 @@ The compiler catches some of these for you. The `Game` matches in `constants.rs`
 (`Display`, `scope_defs`) and `scope_engine/links.rs` (`load_scope_links`) have no
 `_ =>`, so a new variant won't compile until you handle them. That is the safety
 net. Do not add a catch-all to silence it. The remaining sites (`from_str`,
-`languages_for_game`, `game_to_engine`, `discover_vanilla_dir`, the per-game
-dispatch, the CW223 message) have deliberate fallbacks, so a new variant compiles
-and behaves as the generic default until you add its arm.
+`game_to_engine`, `discover_vanilla_dir`, the per-game dispatch, the CW223
+message) have deliberate fallbacks, so a new variant compiles and behaves as the
+generic default until you add its arm.
 
 ## Adding an error code
 

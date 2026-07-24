@@ -7,13 +7,21 @@
 //! can see at a glance which objects lack localisation. Mirrors the old cwtools
 //! "object has no localisation" warning.
 
-use cwtools_index::collect_type_instances;
+use cwtools_index::{NormalizedPath, check_path_dir_norm, collect_type_instances};
 use cwtools_parser::ast::ParsedFile;
-use cwtools_rules::rules_types::RuleSet;
+use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 use cwtools_string_table::string_table::StringTable;
 
 use crate::ValidationError;
 use crate::error_codes;
+
+/// Whether a type declares a loc key this check can flag: `## required`, not
+/// `## optional`, and derived from the instance name rather than a child field.
+fn has_required_name_loc(td: &TypeDefinition) -> bool {
+    td.localisation
+        .iter()
+        .any(|loc| loc.required && !loc.optional && loc.explicit_field.is_none())
+}
 
 /// Flag instances in `ast` whose `## required` localisation keys are not provided
 /// by any loc file. `loc_exists(key_lower)` reports whether a (lowercased) loc key
@@ -28,13 +36,23 @@ pub fn check_missing_localisation(
     table: &StringTable,
     loc_exists: impl Fn(&str) -> bool,
 ) -> Vec<ValidationError> {
+    // Only a type whose path covers this file can contribute instances here, so
+    // unless one of those declares a `## required` name-derived loc key the whole
+    // instance walk is dead work — which is most files (events, gfx, history, …).
+    let np = NormalizedPath::new(logical_path);
+    let relevant: Vec<&TypeDefinition> = ruleset
+        .types
+        .iter()
+        .filter(|td| has_required_name_loc(td) && check_path_dir_norm(&td.path_options, &np))
+        .collect();
+    if relevant.is_empty() {
+        return Vec::new();
+    }
+
     let mut errors = Vec::new();
     let instances = collect_type_instances(ruleset, ast, logical_path, table);
 
-    for td in &ruleset.types {
-        if td.localisation.is_empty() {
-            continue;
-        }
+    for td in relevant {
         let Some(insts) = instances.get(&td.name) else {
             continue;
         };
@@ -82,21 +100,20 @@ types = {
 thing = { x = scalar }
 "#;
 
-    fn run(script: &str, has: &[&str]) -> Vec<ValidationError> {
+    fn run_at(logical_path: &str, script: &str, has: &[&str]) -> Vec<ValidationError> {
         let table = StringTable::new();
         let parsed_cwt = parse_string(RULES, &table).unwrap();
         let ruleset = ast_to_ruleset(&parsed_cwt, &table);
         let parsed = parse_string(script, &table).unwrap();
         let present: std::collections::HashSet<String> =
             has.iter().map(|s| s.to_ascii_lowercase()).collect();
-        check_missing_localisation(
-            &parsed,
-            "common/things/test.txt",
-            "common/things/test.txt",
-            &ruleset,
-            &table,
-            |k| present.contains(k),
-        )
+        check_missing_localisation(&parsed, logical_path, logical_path, &ruleset, &table, |k| {
+            present.contains(k)
+        })
+    }
+
+    fn run(script: &str, has: &[&str]) -> Vec<ValidationError> {
+        run_at("common/things/test.txt", script, has)
     }
 
     #[test]
@@ -112,6 +129,18 @@ thing = { x = scalar }
         );
         assert!(errs[0].message.contains("my_thing_desc"), "got: {:?}", msgs);
         assert_eq!(errs[0].code, Some("CW100"));
+    }
+
+    #[test]
+    fn clean_when_no_loc_bearing_type_owns_the_path() {
+        // No type declaring a required loc key covers `events/`, so the file is
+        // skipped whole — same instance name, nothing flagged.
+        let errs = run_at("events/test.txt", "my_thing = { x = yes }\n", &[]);
+        assert!(
+            errs.is_empty(),
+            "got: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -75,21 +75,31 @@ jobs:
       - name: cargo build --release
         run: cargo build --workspace --release
 
+      # Both binaries are expected. A missing one used to be skipped quietly,
+      # which left an archive holding just the CLI, and `if-no-files-found:
+      # error` on the upload below was still satisfied by that archive. The
+      # release shipped without the language server and nothing went red.
       - name: Strip + archive binaries
         shell: pwsh
         run: |
           $ext = if ('${{ matrix.os }}' -eq 'windows-latest') { '.exe' } else { '' }
           $extOut = if ('${{ matrix.os }}' -eq 'windows-latest') { '.zip' } else { '.tar.gz' }
+          $expected = @('cwtools', 'cwtools-server')
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          foreach ($bin in @('cwtools', 'cwtools-server')) {
+          foreach ($bin in $expected) {
             $src = "target/release/${bin}${ext}"
-            if (Test-Path $src) {
-              if ('${{ matrix.strip }}' -eq 'true') {
-                # strip on Linux/macOS
-                & strip $src
-              }
-              Copy-Item $src "dist/${bin}${ext}"
+            if (-not (Test-Path $src)) {
+              throw "release build produced no ${src}; refusing to ship a partial archive"
             }
+            if ('${{ matrix.strip }}' -eq 'true') {
+              # strip on Linux/macOS
+              & strip $src
+            }
+            Copy-Item $src "dist/${bin}${ext}"
+          }
+          $staged = @(Get-ChildItem dist -File)
+          if ($staged.Count -ne $expected.Count) {
+            throw "staged $($staged.Count) binaries, expected $($expected.Count): $($staged.Name -join ', ')"
           }
           if ($extOut -eq '.zip') {
             Compress-Archive -Path dist\* -DestinationPath "${{ matrix.artifact }}.zip" -Force

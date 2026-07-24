@@ -10,6 +10,10 @@
 
 ## Global Constraints
 
+> **Superseded:** the corpus guard described below is now `scripts/corpus-guard.sh`
+> with a committed baseline. See CONTRIBUTING.md. The ad-hoc command line here is
+> kept as the record of how this sweep was run.
+
 - **Corpus guard is mandatory.** Baseline: Kaiserreich at `/mnt/Linux/github-projects/Kaiserreich-4-Development` validates to 1605 errors / 45 warnings with the CSV saved at `$SCRATCH/kr_baseline.csv` (orchestrator holds the path). After each phase gate: `cargo build --release -p cwtools_cli && ./target/release/cwtools validate --game hoi4 --directory /mnt/Linux/github-projects/Kaiserreich-4-Development --rules /mnt/Linux/github-projects/cwtools-hoi4-config/Config --vanilla "/home/kmccormick/.steam/steam/steamapps/common/Hearts of Iron IV" --report-type csv --output-file /tmp/kr_after.csv`, then `LC_ALL=C sort` both CSVs and diff. Must be empty. Any task that would move it is marked behavioral below and must justify the exact diff.
 - **Test floor:** `cargo test --workspace` passes 780 at baseline. Never goes down; new tests are added where tasks say so.
 - **Lint gates:** `cargo fmt --all` and `cargo clippy --workspace --all-targets` produce zero warnings. Never silence a lint to pass.

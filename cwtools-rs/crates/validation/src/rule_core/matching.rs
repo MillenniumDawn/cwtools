@@ -30,10 +30,12 @@ where
     let has_specific = rules
         .iter()
         .any(|(rt, _)| is_specific(rt) && matcher(rt, key, ruleset, type_index));
+    // Cheap specificity test first: both operands are pure, so short-circuiting
+    // on it skips the matcher for every rule a specific one already outranks.
     rules
         .iter()
         .filter(|(rt, _)| {
-            matcher(rt, key, ruleset, type_index) && (!has_specific || is_specific(rt))
+            (!has_specific || is_specific(rt)) && matcher(rt, key, ruleset, type_index)
         })
         .collect()
 }

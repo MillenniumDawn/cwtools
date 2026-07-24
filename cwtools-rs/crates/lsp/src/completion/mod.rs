@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,7 @@ use crate::{AstSource, Backend, CompletionCacheEntry};
 
 mod builders;
 mod cwt;
+mod loc_keys;
 mod resolve;
 mod scope_names;
 mod snippets;
@@ -25,6 +26,7 @@ pub(crate) use builders::{
     ValueCompletionSets, completions_from_rules, expanded_modifier_scopes, root_type_snippets,
     value_completions, value_rules_need_loc_keys,
 };
+pub(crate) use loc_keys::LocKeyIndex;
 pub(crate) use scope_names::loc_completions;
 pub(crate) use snippets::generate_node_snippet;
 
@@ -97,9 +99,32 @@ fn subsequence_match(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
+    // Both sides plain ASCII (every identifier and loc key in practice): case
+    // folding is a byte op and the walk needs no char decoding. The haystack
+    // check has to stay — a non-ASCII char can still fold to an ASCII one
+    // (U+212A KELVIN SIGN lowercases to `k`), which the byte walk would miss.
+    if needle.is_ascii() && haystack.is_ascii() {
+        let needle = needle.as_bytes();
+        let mut want = 0;
+        for byte in haystack.as_bytes() {
+            if byte.eq_ignore_ascii_case(&needle[want]) {
+                want += 1;
+                if want == needle.len() {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
     let mut needle_it = needle.chars().flat_map(char::to_lowercase).peekable();
     for c in haystack.chars().flat_map(char::to_lowercase) {
-        if needle_it.peek() == Some(&c) {
+        // Stop as soon as the needle is exhausted: the rest of the haystack
+        // can't change the answer, and on a 400K-key sweep that tail is most
+        // of the work.
+        let Some(&want) = needle_it.peek() else {
+            return true;
+        };
+        if want == c {
             needle_it.next();
         }
     }
@@ -228,35 +253,37 @@ fn log_completion_summary(
 }
 
 impl Backend {
+    /// The best-ranked loc keys for the typed token, capped at [`CONTEXT_CAP`].
+    /// Served from the scan-built [`LocKeyIndex`] when there is one — a linear
+    /// sweep of the ~400K-key union per keystroke is the single biggest cost on
+    /// the loc completion path. Same result either way (see the equivalence
+    /// test in `loc_keys`).
     fn completion_loc_keys(&self, token: &str) -> HashSet<String> {
+        let index = self.state.loc_key_index.read().clone();
+        if let Some(index) = index {
+            // The overlay is read directly rather than snapshotted: it is only
+            // the open `.yml` files' keys, and cloning them per keystroke was
+            // itself thousands of allocations. No other lock is held here.
+            let overlay = self.state.loc_live_overlay.read();
+            return index.select(
+                token,
+                overlay
+                    .values()
+                    .flat_map(|keys| keys.iter().map(String::as_str)),
+                CONTEXT_CAP,
+            );
+        }
+        // Before the first scan builds the index (and in tests that never
+        // scan): sweep whatever the union holds.
         let overlay_keys = self.loc_overlay_keys();
         let index_guard = self.state.loc_index.read();
         let keys = index_guard
             .as_ref()
             .map(|index| index.union())
             .into_iter()
-            .flat_map(|keys| keys.iter())
-            .chain(overlay_keys.iter());
-        let mut selected = BTreeSet::new();
-        for key in keys.filter(|key| subsequence_match(key, token)) {
-            let key = key.as_str();
-            let ranked = (
-                !key.get(..token.len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(token)),
-                key,
-            );
-            if selected.len() < CONTEXT_CAP {
-                selected.insert(ranked);
-            } else if selected.last().is_some_and(|largest| ranked < *largest)
-                && selected.insert(ranked)
-            {
-                selected.pop_last();
-            }
-        }
-        selected
-            .into_iter()
-            .map(|(_, key)| key.to_owned())
-            .collect()
+            .flat_map(|keys| keys.iter().map(String::as_str))
+            .chain(overlay_keys.iter().map(String::as_str));
+        loc_keys::select_loc_keys(keys, token, CONTEXT_CAP)
     }
 
     #[tracing::instrument(
@@ -2610,5 +2637,191 @@ mod perf_bench {
             );
             items.len()
         });
+    }
+
+    /// The loc-key selection exactly as it stood before this pass: a linear
+    /// sweep of the whole union with a matcher that kept walking the haystack
+    /// after the needle was exhausted. Kept as the measurement baseline and as
+    /// the oracle the current implementation is checked against.
+    mod reference {
+        use std::collections::{BTreeSet, HashSet};
+
+        pub(super) fn subsequence_match(haystack: &str, needle: &str) -> bool {
+            if needle.is_empty() {
+                return true;
+            }
+            let mut needle_it = needle.chars().flat_map(char::to_lowercase).peekable();
+            for c in haystack.chars().flat_map(char::to_lowercase) {
+                if needle_it.peek() == Some(&c) {
+                    needle_it.next();
+                }
+            }
+            needle_it.peek().is_none()
+        }
+
+        pub(super) fn select<'a>(
+            keys: impl Iterator<Item = &'a str>,
+            token: &str,
+            cap: usize,
+        ) -> HashSet<String> {
+            let mut selected = BTreeSet::new();
+            for key in keys.filter(|key| subsequence_match(key, token)) {
+                let ranked = (
+                    !key.get(..token.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(token)),
+                    key,
+                );
+                if selected.len() < cap {
+                    selected.insert(ranked);
+                } else if selected.last().is_some_and(|largest| ranked < *largest)
+                    && selected.insert(ranked)
+                {
+                    selected.pop_last();
+                }
+            }
+            selected
+                .into_iter()
+                .map(|(_, key)| key.to_owned())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn subsequence_match_agrees_with_reference() {
+        let haystacks = [
+            "has_completed_focus",
+            "MDS_focus_title",
+            "",
+            "a",
+            "ünïcode_kéy",
+            "\u{212A}elvin",
+            "\u{130}stanbul",
+            "focus",
+        ];
+        let needles = [
+            "", "f", "hcf", "focus", "FOCUS", "xyz", "kelvin", "ü", "Ü", "istanbul", "a", "focuss",
+        ];
+        for hay in haystacks {
+            for needle in needles {
+                assert_eq!(
+                    subsequence_match(hay, needle),
+                    reference::subsequence_match(hay, needle),
+                    "diverged on haystack {:?} needle {:?}",
+                    hay,
+                    needle
+                );
+            }
+        }
+    }
+
+    /// Loc-key selection at Millennium-Dawn scale (mod + vanilla loc merged,
+    /// 399,781 unique keys). `reference` is the sweep every keystroke used to
+    /// pay, `linear` the same sweep with the early-exit matcher, `indexed` the
+    /// selection served from the scan-built [`LocKeyIndex`]. All three are
+    /// asserted to return identical key sets.
+    #[test]
+    #[ignore]
+    fn perf_loc_completion_keys() {
+        const LOC_KEYS: usize = 399_781;
+        const OWNERS: [&str; 14] = [
+            "mds",
+            "politics",
+            "focus",
+            "hol",
+            "eng",
+            "usa",
+            "ger",
+            "sov",
+            "generic",
+            "decision",
+            "idea",
+            "event",
+            "state",
+            "equipment",
+        ];
+        const STEMS: [&str; 8] = [
+            "title", "desc", "tooltip", "effect", "flavor", "name", "option", "log",
+        ];
+
+        let keys: HashSet<String> = (0..LOC_KEYS)
+            .map(|i| {
+                format!(
+                    "{}_{}_{:06}",
+                    OWNERS[i % OWNERS.len()],
+                    STEMS[(i / OWNERS.len()) % STEMS.len()],
+                    i
+                )
+            })
+            .collect();
+        let overlay: HashSet<String> = (0..400)
+            .map(|i| format!("unsaved_open_yml_key_{:04}", i))
+            .collect();
+        let bytes: usize = keys.iter().map(|k| k.len()).sum();
+        eprintln!(
+            "fixture: {} loc keys ({} KiB of key text), {} overlay keys, cap {}",
+            keys.len(),
+            bytes / 1024,
+            overlay.len(),
+            CONTEXT_CAP
+        );
+
+        let t = std::time::Instant::now();
+        let index = LocKeyIndex::build(keys.iter().map(String::as_str));
+        eprintln!(
+            "{:>28}: {:?} (once per workspace scan, {} keys)",
+            "LocKeyIndex::build",
+            t.elapsed(),
+            index.len()
+        );
+
+        // "f"/"" are the first-keystroke cases; "mdsfoc" is subsequence-only;
+        // "zqxv" matches nothing. "lltt" is the adversarial one: common enough
+        // characters to clear the index's per-key character filter, rare enough
+        // as a subsequence that the sweep can't fill the cap and stop early.
+        for token in ["", "f", "mds_f", "mdsfoc", "zqxv", "lltt"] {
+            let linear = loc_keys::select_loc_keys(
+                keys.iter()
+                    .map(String::as_str)
+                    .chain(overlay.iter().map(String::as_str)),
+                token,
+                CONTEXT_CAP,
+            );
+            let indexed = index.select(token, overlay.iter().map(String::as_str), CONTEXT_CAP);
+            let baseline = reference::select(
+                keys.iter()
+                    .map(String::as_str)
+                    .chain(overlay.iter().map(String::as_str)),
+                token,
+                CONTEXT_CAP,
+            );
+            assert_eq!(baseline, linear, "token {:?} diverged (linear)", token);
+            assert_eq!(baseline, indexed, "token {:?} diverged (indexed)", token);
+
+            bench(&format!("before  (token {:?})", token), || {
+                reference::select(
+                    keys.iter()
+                        .map(String::as_str)
+                        .chain(overlay.iter().map(String::as_str)),
+                    token,
+                    CONTEXT_CAP,
+                )
+                .len()
+            });
+            bench(&format!("linear  (token {:?})", token), || {
+                loc_keys::select_loc_keys(
+                    keys.iter()
+                        .map(String::as_str)
+                        .chain(overlay.iter().map(String::as_str)),
+                    token,
+                    CONTEXT_CAP,
+                )
+                .len()
+            });
+            bench(&format!("indexed (token {:?})", token), || {
+                index
+                    .select(token, overlay.iter().map(String::as_str), CONTEXT_CAP)
+                    .len()
+            });
+        }
     }
 }

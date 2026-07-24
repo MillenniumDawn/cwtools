@@ -14,7 +14,7 @@ use crate::paths::{
     uri_to_path_str,
 };
 use crate::validate::{
-    line_end_cols, loc_diag_to_validation_error, make_prepared, parse_error_to_diagnostic,
+    DocLines, loc_diag_to_validation_error, make_prepared, parse_error_to_diagnostic,
     validate_parsed_with_indexes, validation_error_to_diagnostic,
 };
 use crate::workspace_cache;
@@ -78,13 +78,83 @@ impl Drop for ScanGuard<'_> {
     }
 }
 
+/// Token for the scan's `$/progress` stream. A single fixed token is safe
+/// because full scans are serialized by `scan_in_progress` and
+/// `scan_progress_active` gates the `begin`/`end` pairing — reusing a token
+/// while its progress is live is a protocol violation.
+const SCAN_PROGRESS_TOKEN: &str = "cwtools/scan";
+
 impl Backend {
-    /// Send the `loadingBar` server→client notification so the VS Code extension
-    /// status bar reflects background indexing/validation work.
-    /// Payload: `{ "enable": bool, "value": string }`.
+    /// Report background indexing/validation progress.
+    ///
+    /// Two channels, deliberately: the custom `loadingBar` notification
+    /// (`{ "enable": bool, "value": string }`) that drives the bundled VS Code
+    /// extension's status bar, and the standard `$/progress` stream every other
+    /// client understands. `cwtools-server` is a standalone binary, so in
+    /// Neovim / Helix / Zed the custom notification is dropped on the floor and
+    /// the initial index looks like a hang.
+    ///
+    /// Both go out from the one place so the phase strings can't drift apart.
     pub(crate) async fn send_loading_bar(&self, enable: bool, value: &str) {
         let payload = serde_json::json!({ "enable": enable, "value": value });
         self.client.send_notification::<LoadingBar>(payload).await;
+        self.send_work_done_progress(enable, value).await;
+    }
+
+    /// The `$/progress` half of [`send_loading_bar`]. The first `enable` creates
+    /// the token and begins; later ones report a new phase; `enable = false`
+    /// ends it. Silent unless the client advertised `window.workDoneProgress` —
+    /// a server-initiated progress needs `window/workDoneProgress/create`, and a
+    /// client that didn't advertise support isn't required to answer it.
+    async fn send_work_done_progress(&self, enable: bool, value: &str) {
+        use tower_lsp::lsp_types::request::WorkDoneProgressCreate;
+        if !self.state.client_work_done_progress.load(Ordering::Relaxed) {
+            return;
+        }
+        let token = ProgressToken::String(SCAN_PROGRESS_TOKEN.to_string());
+        let was_active = self
+            .state
+            .scan_progress_active
+            .swap(enable, Ordering::SeqCst);
+        let progress = match (enable, was_active) {
+            (false, false) => return, // nothing live to end
+            (false, true) => WorkDoneProgress::End(WorkDoneProgressEnd { message: None }),
+            (true, true) => WorkDoneProgress::Report(WorkDoneProgressReport {
+                cancellable: Some(false),
+                message: Some(value.to_string()),
+                percentage: None,
+            }),
+            (true, false) => {
+                // The client may refuse the token; if it does, roll the flag back
+                // so a later phase tries to create it again instead of reporting
+                // against a token that was never registered.
+                if self
+                    .client
+                    .send_request::<WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                        token: token.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    self.state
+                        .scan_progress_active
+                        .store(false, Ordering::SeqCst);
+                    return;
+                }
+                WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                    title: "CWTools".to_string(),
+                    cancellable: Some(false),
+                    message: Some(value.to_string()),
+                    percentage: None,
+                })
+            }
+        };
+        self.client
+            .send_notification::<tower_lsp::lsp_types::notification::Progress>(ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(progress),
+            })
+            .await;
     }
 
     /// Send the `updateFileList` server→client notification so the VS Code
@@ -455,7 +525,7 @@ impl Backend {
             let parsed = match outcome {
                 Some((cache_hit, parsed)) => {
                     let uri = path_to_uri(file_path);
-                    self.index_parsed_file(&uri, &parsed);
+                    self.index_parsed_file(&uri, &parsed, None);
                     if cache_hit {
                         cache_hits += 1;
                     } else {
@@ -675,14 +745,18 @@ impl Backend {
                         return None;
                     }
                     // Workspace scan covers files not open in an editor (open
-                    // ones are skipped above), so there's no squiggle to widen —
-                    // pass no line info and keep the cheap single-char range.
+                    // ones are skipped above), so their text isn't held and
+                    // there's no squiggle to widen — pass no line info and keep
+                    // the cheap single-char range at the parser's own column.
+                    let no_lines = DocLines::none();
                     let diagnostics = match &prepared {
-                        Some(prepared) => validate_parsed_with_indexes(&uri, parsed, prepared, &[]),
+                        Some(prepared) => {
+                            validate_parsed_with_indexes(&uri, parsed, prepared, &no_lines)
+                        }
                         None => parsed
                             .errors
                             .iter()
-                            .map(|e| parse_error_to_diagnostic(e, &[]))
+                            .map(|e| parse_error_to_diagnostic(e, &no_lines))
                             .collect(),
                     };
                     Some((uri, diagnostics))
@@ -828,7 +902,10 @@ impl Backend {
         // Ruleset family snapshotted once for the whole pass (none of it changes
         // while we run); mirrors the workspace scan's pass-2 snapshot so the
         // prebuilt validations share one clone instead of re-locking per doc.
-        let game = self.state.config.read().game();
+        let (game, encoding) = {
+            let cfg = self.state.config.read();
+            (cfg.game(), cfg.position_encoding.clone())
+        };
         let (ruleset_snap, registry_snap, modifier_keys_snap) = {
             let rules = self.state.rules.read();
             (
@@ -847,7 +924,7 @@ impl Backend {
                     // `[validate] (trigger)` profiling line the full path would
                     // (so per-doc revalidation stays observable in the log),
                     // tagged `prebuilt` to make the no-reparse route legible.
-                    let line_ends = line_end_cols(&text);
+                    let lines = DocLines::new(&text, encoding.clone());
                     let diags = match ruleset_snap.as_ref() {
                         Some(ruleset) => self.validate_parsed_prebuilt(
                             &uri,
@@ -856,12 +933,12 @@ impl Backend {
                             ruleset,
                             game,
                             registry_snap.as_ref(),
-                            &line_ends,
+                            &lines,
                         ),
                         None => ast
                             .errors
                             .iter()
-                            .map(|e| parse_error_to_diagnostic(e, &line_ends))
+                            .map(|e| parse_error_to_diagnostic(e, &lines))
                             .collect(),
                     };
                     tracing::info!(
@@ -875,7 +952,11 @@ impl Backend {
                 // No current AST — re-parse + re-index via the full path,
                 // preserving prior behavior for loc/.cwt files and mid-edit
                 // fatal parses (which must re-parse to surface the live error).
-                None => self.parse_and_validate(&uri, &text, trigger).await.0,
+                None => {
+                    self.parse_and_validate(&uri, &text, trigger, Some(version))
+                        .await
+                        .0
+                }
             };
             // Skip if the doc changed or closed while we were validating; its own
             // did_change/did_close handler owns the fresher result.
@@ -960,12 +1041,9 @@ impl Backend {
         // `validate_loc_project_with_union`, so they aren't duplicated here.
         let extra_valid_refs: HashSet<String> = {
             // Lock order: rules -> info_service.
-            let mut extra = (*self.state.rules.read().modifier_keys).clone();
+            let modifier_keys = self.state.rules.read().modifier_keys.clone();
             let info = self.state.info_service.read();
-            // Dynamic modifiers, ideas, other game-object names + defined
-            // variables a `$ref$` can bind to (mirrors the CLI/driver path).
-            extra.extend(info.type_index.loc_bindable_names());
-            extra
+            crate::validate::loc_extra_valid_refs(&modifier_keys, &info.type_index)
         };
 
         // block_in_place: the loc service reads and parses hundreds of loc files
@@ -1000,11 +1078,12 @@ impl Backend {
                     }
                     let ve = loc_diag_to_validation_error(&d);
                     // Project-wide loc scan feeds the Problems panel; open files
-                    // get whole-line squiggles when re-validated on open.
+                    // get whole-line squiggles and encoded columns when
+                    // re-validated on open.
                     by_file
                         .entry(d.file.clone())
                         .or_default()
-                        .push(validation_error_to_diagnostic(&ve, &[]));
+                        .push(validation_error_to_diagnostic(&ve, &DocLines::none()));
                 }
                 // Extract per-key display text for hover and a representative
                 // definition site (for goto) before dropping the service.
@@ -1048,7 +1127,16 @@ impl Backend {
                 }
                 (idx, by_file, lt, ll)
             });
+        // Prefix-searchable companion for loc completion, built here so the
+        // per-keystroke path never pays for it. block_in_place: sorting ~400K
+        // keys is CPU-bound and must not sit on the async executor.
+        let loc_key_index = tokio::task::block_in_place(|| {
+            Arc::new(crate::completion::LocKeyIndex::build(
+                loc_index.union().iter().map(String::as_str),
+            ))
+        });
         *self.state.loc_index.write() = Some(loc_index);
+        *self.state.loc_key_index.write() = Some(loc_key_index);
         *self.state.loc_text.write() = loc_text_map;
         *self.state.loc_locations.write() = loc_loc_map;
 
@@ -1418,7 +1506,7 @@ impl Backend {
                 match read {
                     Ok(Ok(text)) => {
                         let (diagnostics, _) = self
-                            .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched)
+                            .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched, None)
                             .await;
                         // Record only after a successful validate, so a
                         // transient read failure doesn't poison the record.

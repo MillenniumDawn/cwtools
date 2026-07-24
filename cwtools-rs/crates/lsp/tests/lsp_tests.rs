@@ -19,10 +19,33 @@ fn cwtools_server_cmd() -> Command {
 }
 
 fn write_frame(child: &mut std::process::Child, body: &str) -> std::io::Result<()> {
-    let stdin = child.stdin.as_mut().unwrap();
+    write_frame_to(child.stdin.as_mut().unwrap(), body)
+}
+
+/// [`write_frame`] against a bare stdin handle, for the worker thread in
+/// [`run_with_deadline`] which owns the pipe rather than the `Child`.
+fn write_frame_to(stdin: &mut impl Write, body: &str) -> std::io::Result<()> {
     write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body)?;
-    stdin.flush()?;
-    Ok(())
+    stdin.flush()
+}
+
+/// Hand the server's pipes to a worker thread and wait at most `secs` for its
+/// result. `read_frame` blocks with no timeout, so a test that waits on a
+/// notification the server never sends would wedge the whole binary instead of
+/// failing on its own. `None` means the deadline passed.
+fn run_with_deadline<T: Send + 'static>(
+    mut stdin: std::process::ChildStdin,
+    mut reader: BufReader<std::process::ChildStdout>,
+    secs: u64,
+    f: impl FnOnce(&mut std::process::ChildStdin, &mut BufReader<std::process::ChildStdout>) -> T
+    + Send
+    + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f(&mut stdin, &mut reader));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
 }
 
 fn read_frame(reader: &mut BufReader<std::process::ChildStdout>) -> std::io::Result<String> {
@@ -5301,9 +5324,12 @@ types = {
 
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     assert_eq!(resp["id"], 2, "got: {resp_str}");
-    let actions = resp["result"].as_array().expect("array result");
+    let all = resp["result"].as_array().expect("array result");
+    // An unfiltered request also carries the `source.fixAll` action; this test
+    // is about the per-diagnostic quickfix.
+    let actions: Vec<&serde_json::Value> = all.iter().filter(|a| a["kind"] == "quickfix").collect();
     assert_eq!(actions.len(), 1, "one quickfix expected: {resp_str}");
-    let action = &actions[0];
+    let action = actions[0];
     assert_eq!(action["kind"], "quickfix");
     assert_eq!(action["title"], "Remove empty limit");
 
@@ -5331,6 +5357,219 @@ types = {
     assert_eq!(
         fixed, "x = { }\n",
         "applied edit must delete the empty limit"
+    );
+}
+
+#[test]
+fn test_code_action_and_diagnostic_agree_on_non_bmp_line() {
+    // The published diagnostic and the quick fix hanging off it must speak the
+    // same position encoding. A non-BMP char earlier on the line makes the
+    // parser's char column and the client's UTF-16 column differ, so publishing
+    // the raw column applied the fix one column short — corrupting the file.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/decisions/test.txt";
+    let text = "x = { name = \"😀\" limit = { } }\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    // No `general.positionEncodings` in the capabilities → UTF-16, as VS Code.
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW281")
+        .expect("CW281 diagnostic published for the empty limit");
+    // The squiggle starts at `limit` in UTF-16 units (18), not chars (17).
+    let limit_utf16 = text[..text.find("limit").unwrap()].encode_utf16().count() as u64;
+    assert_eq!(
+        diag["range"]["start"]["character"], limit_utf16,
+        "diagnostic must use the negotiated encoding: {diag}"
+    );
+
+    let ca_req = jsonrpc_request(
+        2,
+        "textDocument/codeAction",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "range": diag["range"],
+            "context": { "diagnostics": [diag] },
+        }),
+    );
+    write_frame(&mut child, &ca_req).unwrap();
+    let resp_str = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    let e = resp["result"][0]["edit"]["changes"]
+        .as_object()
+        .and_then(|c| c.values().next())
+        .and_then(|v| v.get(0))
+        .cloned()
+        .expect("one text edit");
+    assert_eq!(
+        e["range"]["start"], diag["range"]["start"],
+        "the fix must start where the squiggle does: {resp_str}"
+    );
+
+    // Apply the edit the way a UTF-16 client would: splice by code units.
+    let sc = e["range"]["start"]["character"].as_u64().unwrap() as usize;
+    let ec = e["range"]["end"]["character"].as_u64().unwrap() as usize;
+    let nl = text.find('\n').unwrap();
+    let units: Vec<u16> = text[..nl].encode_utf16().collect();
+    let mut fixed = String::from_utf16(&units[..sc]).expect("start is on a char boundary");
+    fixed.push_str(e["newText"].as_str().unwrap());
+    fixed.push_str(&String::from_utf16(&units[ec..]).expect("end is on a char boundary"));
+    fixed.push_str(&text[nl..]);
+    assert_eq!(
+        fixed, "x = { name = \"😀\" }\n",
+        "applied edit must delete exactly the empty limit"
+    );
+}
+
+#[test]
+fn test_yml_outside_localisation_dir_is_not_validated_as_loc() {
+    // `.yml` alone doesn't make a file localisation: the loc walker only loads
+    // what lives under a `localisation` dir. Opening a CI workflow used to route
+    // it into loc validation (CW255/CW256 on a GitHub Actions file), and must
+    // not fall through to the game-script validator either.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = ".github/workflows/ci.yml";
+    let text = "name: CI\non:\n  push:\n    branches: [main]\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"yaml","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    let codes = diags_for(&mut reader, "ci.yml", 1).expect("diagnostics published for the yml");
+    assert!(
+        codes.is_empty(),
+        "a yml outside any localisation dir must report nothing, got: {codes:?}"
+    );
+
+    // Nor may it fall through to the game-script validator: the same yaml
+    // sitting inside a rule-matched game dir must still report nothing rather
+    // than being parsed (and indexed) as Paradox script.
+    let in_tree_rel = "common/decisions/notes.yml";
+    let in_tree_path = ws.path().join(in_tree_rel);
+    std::fs::create_dir_all(in_tree_path.parent().unwrap()).unwrap();
+    std::fs::write(&in_tree_path, text).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":path_uri(&in_tree_path),"languageId":"yaml","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+    let in_tree_codes =
+        diags_for(&mut reader, in_tree_rel, 1).expect("diagnostics published for the in-tree yml");
+    child.kill().ok();
+    assert!(
+        in_tree_codes.is_empty(),
+        "a yml in a game dir is still not game script, got: {in_tree_codes:?}"
     );
 }
 
@@ -5451,4 +5690,1156 @@ types = {
     assert_eq!(hint["position"]["line"], 1, "got: {hint}");
     assert_eq!(hint["position"]["character"], 21, "got: {hint}");
     assert_eq!(hint["paddingLeft"], true, "got: {hint}");
+}
+
+// ── getGraphData ─────────────────────────────────────────────────────────────
+
+/// A focus type whose instances reference each other, plus a decision type that
+/// references a focus. Both reference keys sit at depth 1 of a type rule
+/// (`relative_position_id = <focus>` is copied from the real HOI4
+/// national_focus.cwt): that is the shape `is_type_ref_leaf` /
+/// `build_type_ref_keys` classify, so it is what the workspace reference index
+/// — and therefore the graph — can see.
+const GRAPH_RULES: &str = r#"
+types = {
+    type[focus] = {
+        path = "game/common/national_focus"
+        name_field = "id"
+    }
+    type[decision] = { path = "game/common/decisions" }
+}
+focus = {
+    id = scalar
+    ## cardinality = 0..1
+    cost = int
+    ## cardinality = 0..1
+    relative_position_id = <focus>
+}
+decision = {
+    ## cardinality = 0..1
+    has_focus = <focus>
+}
+"#;
+
+const GRAPH_FILES: &[(&str, &str)] = &[
+    (
+        "common/national_focus/tree.txt",
+        "focus = {\n\tid = FOCUS_A\n\tcost = 1\n}\n\
+         focus = {\n\tid = FOCUS_B\n\tcost = 1\n\trelative_position_id = FOCUS_A\n}\n\
+         focus = {\n\tid = FOCUS_C\n\tcost = 1\n\trelative_position_id = FOCUS_B\n}\n",
+    ),
+    (
+        "common/decisions/d.txt",
+        "my_decision = {\n\thas_focus = FOCUS_C\n}\n",
+    ),
+];
+
+/// Assert `value` is exactly the `GraphData` the client declares in
+/// cwtools-vscode `client/common/graphTypes.ts`: an array of `GraphNode`, every
+/// documented member typed as declared, every required member present, and no
+/// member the client's interfaces don't know about.
+fn assert_graph_data_shape(value: &serde_json::Value) {
+    let nodes = value.as_array().expect("GraphData must be an array");
+    assert!(!nodes.is_empty(), "expected at least one node");
+    for node in nodes {
+        let obj = node.as_object().expect("GraphNode must be an object");
+        for (key, member) in obj {
+            let ok = match key.as_str() {
+                "id" | "entityType" | "name" | "entityTypeDisplayName" | "abbreviation" => {
+                    member.is_string()
+                }
+                "isPrimary" => member.is_boolean(),
+                "references" => member
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().all(is_graph_reference)),
+                "location" => is_graph_location(member),
+                "details" => member
+                    .as_array()
+                    .is_some_and(|rows| rows.iter().all(is_graph_node_detail)),
+                _ => false,
+            };
+            assert!(
+                ok,
+                "GraphNode member `{key}` = {member} is not graphTypes.ts"
+            );
+        }
+        for required in ["id", "references", "isPrimary", "entityType"] {
+            assert!(
+                obj.contains_key(required),
+                "GraphNode is missing the required member `{required}`: {node}"
+            );
+        }
+    }
+}
+
+fn is_graph_reference(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    obj.contains_key("key")
+        && obj.contains_key("isOutgoing")
+        && obj.iter().all(|(k, v)| match k.as_str() {
+            "key" | "label" => v.is_string(),
+            "isOutgoing" => v.is_boolean(),
+            _ => false,
+        })
+}
+
+fn is_graph_location(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    obj.len() == 3
+        && obj
+            .get("filename")
+            .is_some_and(serde_json::Value::is_string)
+        && obj.get("line").is_some_and(serde_json::Value::is_u64)
+        && obj.get("column").is_some_and(serde_json::Value::is_u64)
+}
+
+fn is_graph_node_detail(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    obj.len() == 2
+        && obj.get("key").is_some_and(serde_json::Value::is_string)
+        && obj
+            .get("values")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|vs| vs.iter().all(serde_json::Value::is_string))
+}
+
+/// Every `(source, target)` edge the webview would build from the payload.
+fn graph_edges(nodes: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut edges = Vec::new();
+    for node in nodes {
+        let id = node["id"].as_str().unwrap().to_string();
+        for r in node["references"].as_array().unwrap() {
+            let key = r["key"].as_str().unwrap().to_string();
+            if r["isOutgoing"].as_bool().unwrap() {
+                edges.push((id.clone(), key));
+            } else {
+                edges.push((key, id.clone()));
+            }
+        }
+    }
+    edges.sort();
+    edges
+}
+
+/// Spawn a server over a workspace of `files`, then run `getGraphData` with
+/// `arguments`, polling until the workspace scan has populated the index.
+fn graph_data_response(files: &[(&str, &str)], arguments: serde_json::Value) -> serde_json::Value {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GRAPH_RULES).unwrap();
+    for (rel, content) in files {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let mut response = serde_json::Value::Null;
+    for attempt in 0..20 {
+        write_frame(
+            &mut child,
+            &jsonrpc_request(
+                600 + attempt,
+                "workspace/executeCommand",
+                serde_json::json!({ "command": "getGraphData", "arguments": arguments }),
+            ),
+        )
+        .unwrap();
+        let raw = read_response(&mut reader).expect("no getGraphData response");
+        response = serde_json::from_str(&raw).unwrap();
+        // The reference index lands with the async workspace scan; a graph that
+        // is still only seeds means the scan hasn't finished writing it.
+        let settled = response["result"].as_array().is_none_or(|nodes| {
+            nodes
+                .iter()
+                .any(|n| !n["references"].as_array().unwrap().is_empty())
+        });
+        if settled {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    child.kill().ok();
+    response
+}
+
+#[test]
+fn test_get_graph_data_is_advertised_in_capabilities() {
+    // graphAvailability.ts greys the whole graph feature out unless this exact
+    // name is in executeCommandProvider.commands.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(tmp.path()),
+                "capabilities": {}
+            }),
+        ),
+    )
+    .unwrap();
+    let resp_str = read_response(&mut reader).expect("no init response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    let commands = resp["result"]["capabilities"]["executeCommandProvider"]["commands"]
+        .as_array()
+        .expect("executeCommandProvider.commands");
+    assert!(
+        commands.contains(&serde_json::Value::String("getGraphData".to_string())),
+        "getGraphData not advertised: {commands:?}"
+    );
+}
+
+#[test]
+fn test_get_graph_data_returns_client_graph_shape() {
+    let response = graph_data_response(GRAPH_FILES, serde_json::json!(["focus", 3]));
+    assert!(
+        response["error"].is_null(),
+        "getGraphData failed: {}",
+        response["error"]
+    );
+    assert_graph_data_shape(&response["result"]);
+
+    let nodes = response["result"].as_array().unwrap();
+    let mut ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["FOCUS_A", "FOCUS_B", "FOCUS_C", "my_decision"],
+        "got: {}",
+        response["result"]
+    );
+
+    // The prerequisite chain, plus the decision that reaches it at depth 1.
+    assert_eq!(
+        graph_edges(nodes),
+        [
+            ("FOCUS_B".to_string(), "FOCUS_A".to_string()),
+            ("FOCUS_C".to_string(), "FOCUS_B".to_string()),
+            ("my_decision".to_string(), "FOCUS_C".to_string()),
+        ],
+        "got: {}",
+        response["result"]
+    );
+
+    let focus_b = nodes.iter().find(|n| n["id"] == "FOCUS_B").unwrap();
+    assert_eq!(focus_b["isPrimary"], true);
+    assert_eq!(focus_b["entityType"], "focus");
+    assert_eq!(focus_b["entityTypeDisplayName"], "Focus");
+    // 1-based line/column pointing at the `focus = {` that opens FOCUS_B.
+    assert_eq!(focus_b["location"]["line"], 5, "got: {focus_b}");
+    assert_eq!(focus_b["location"]["column"], 1, "got: {focus_b}");
+    assert!(
+        focus_b["location"]["filename"]
+            .as_str()
+            .unwrap()
+            .ends_with("common/national_focus/tree.txt"),
+        "got: {focus_b}"
+    );
+
+    // A related type joins the graph but is not primary, and its crossing edge
+    // is labelled with the type it points at.
+    let decision = nodes.iter().find(|n| n["id"] == "my_decision").unwrap();
+    assert_eq!(decision["isPrimary"], false);
+    assert_eq!(decision["entityType"], "decision");
+    assert_eq!(decision["references"][0]["label"], "focus");
+
+    // Nothing was dropped, so no node carries a truncation notice.
+    assert!(
+        nodes.iter().all(|n| n["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["key"] != "truncated")),
+        "unexpected truncation: {}",
+        response["result"]
+    );
+}
+
+#[test]
+fn test_get_graph_data_depth_bounds_the_walk() {
+    // Depth 1 reaches the decision that references FOCUS_C directly. The focus
+    // instances are all seeds, so what depth prunes here is the referring type.
+    let response = graph_data_response(GRAPH_FILES, serde_json::json!(["focus", 1]));
+    let nodes = response["result"].as_array().unwrap();
+    assert_eq!(nodes.len(), 4, "got: {}", response["result"]);
+
+    // A decision is only reachable through a focus, so seeding on `decision`
+    // with depth 1 never walks back out to the focuses.
+    let response = graph_data_response(GRAPH_FILES, serde_json::json!(["decision", 1]));
+    let nodes = response["result"].as_array().unwrap();
+    let ids: Vec<&str> = nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["my_decision"], "got: {}", response["result"]);
+}
+
+#[test]
+fn test_get_graph_data_rejects_bad_requests() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GRAPH_RULES).unwrap();
+    for (rel, content) in GRAPH_FILES {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+
+    // (arguments, a phrase the error message must name)
+    let cases: [(serde_json::Value, &str); 6] = [
+        (serde_json::json!([]), "entity type"),
+        (serde_json::json!([42, 3]), "entity type"),
+        (serde_json::json!(["focus"]), "missing depth"),
+        (serde_json::json!(["focus", 0]), "at least 1"),
+        (serde_json::json!(["focus", -2]), "at least 1"),
+        (serde_json::json!(["not_a_type", 3]), "unknown entity type"),
+    ];
+    for (i, (arguments, phrase)) in cases.iter().enumerate() {
+        write_frame(
+            &mut child,
+            &jsonrpc_request(
+                700 + i as i64,
+                "workspace/executeCommand",
+                serde_json::json!({ "command": "getGraphData", "arguments": arguments }),
+            ),
+        )
+        .unwrap();
+        let raw = read_response(&mut reader).expect("no getGraphData response");
+        let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            resp["result"].is_null(),
+            "{arguments} should not have produced a result: {resp}"
+        );
+        let message = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(phrase),
+            "{arguments}: error should name `{phrase}`, got {resp}"
+        );
+        assert_eq!(resp["error"]["code"], -32602, "{arguments}: got {resp}");
+    }
+    child.kill().ok();
+}
+
+#[test]
+fn test_get_graph_data_on_empty_workspace_reports_not_ready() {
+    // No script files at all: the command must name the problem rather than
+    // hand the webview an empty array.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GRAPH_RULES).unwrap();
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            720,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "getGraphData", "arguments": ["focus", 3] }),
+        ),
+    )
+    .unwrap();
+    let raw = read_response(&mut reader).expect("no getGraphData response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(resp["result"].is_null(), "got: {resp}");
+    let message = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("index is empty") || message.contains("no instances"),
+        "got: {resp}"
+    );
+}
+
+// ── Semantic tokens, document colours, source.fixAll, $/progress ─────────────
+
+/// Rules for the editor-capability round-trips below: an entity with a colour
+/// block in both conventions, a typed reference, an enum, a localisation field
+/// and a trigger alias.
+const EDITOR_RULES: &str = r#"
+types = {
+    type[focus] = {
+        path = "game/common/national_focus"
+    }
+    type[ideology] = {
+        path = "game/common/ideologies"
+    }
+}
+focus = {
+    id = scalar
+    cost = int
+    text = localisation
+    mood = enum[mood]
+    prerequisite = <focus>
+    available = {
+        alias_name[trigger] = alias_match_left[trigger]
+    }
+}
+ideology = {
+    color = {
+        ## cardinality = 3..3
+        int
+    }
+    color = {
+        ## cardinality = 3..3
+        float
+    }
+    dynamic_faction_names = {
+        ## cardinality = 3..3
+        int
+    }
+}
+alias[trigger:has_completed_focus] = <focus>
+alias[trigger:always] = bool
+enums = {
+    enum[mood] = {
+        calm
+        angry
+    }
+}
+"#;
+
+/// Boot a server on a temp workspace with `EDITOR_RULES`, open every file, and
+/// hand back the live child plus its reader so the caller can issue requests.
+fn editor_server(
+    files: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::process::Child,
+    BufReader<std::process::ChildStdout>,
+) {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("editor_rules.cwt"), EDITOR_RULES).unwrap();
+    for (rel, content) in files {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    for (rel, content) in files {
+        let body = jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": path_uri(ws.path().join(rel)),
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": content,
+                }
+            }),
+        );
+        write_frame(&mut child, &body).unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+    (ws, rules_dir, child, reader)
+}
+
+/// Drain frames until the `publishDiagnostics` for `rel_path` arrives, returning
+/// the whole diagnostics array (the code-action tests need the payloads, not
+/// just the readiness signal `wait_for_diagnostics` gives).
+fn wait_for_diags(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    rel_path: &str,
+) -> Option<Vec<serde_json::Value>> {
+    for _ in 0..2000 {
+        let raw = read_frame(reader).ok()?;
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(rel_path))
+        {
+            return v["params"]["diagnostics"].as_array().cloned();
+        }
+    }
+    None
+}
+
+/// Decode the delta-encoded `data` array back into absolute
+/// `(line, start, length, type, modifiers)` tuples — exactly what a client does.
+fn decode_semantic_tokens(data: &[serde_json::Value]) -> Vec<(u32, u32, u32, u32, u32)> {
+    let nums: Vec<u32> = data.iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    assert_eq!(nums.len() % 5, 0, "the stream must be quintuples");
+    let mut out = Vec::new();
+    let (mut line, mut start) = (0u32, 0u32);
+    for c in nums.chunks(5) {
+        line += c[0];
+        start = if c[0] == 0 { start + c[1] } else { c[1] };
+        out.push((line, start, c[2], c[3], c[4]));
+    }
+    out
+}
+
+#[test]
+fn test_semantic_tokens_full_returns_a_decodable_classified_stream() {
+    let text = "\
+# a focus tree
+my_focus = {
+    id = my_focus
+    cost = 10
+    mood = calm
+    text = focus_title_key
+    available = {
+        has_completed_focus = other_focus
+        always = yes
+    }
+}
+";
+    let rel = "common/national_focus/tree.txt";
+    let (ws, _rules, mut child, mut reader) = editor_server(&[(rel, text)]);
+
+    let body = jsonrpc_request(
+        2,
+        "textDocument/semanticTokens/full",
+        serde_json::json!({
+            "textDocument": { "uri": path_uri(ws.path().join(rel)) },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let raw = read_response(&mut reader).expect("no semanticTokens response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(resp["id"], 2, "got: {raw}");
+    let data = resp["result"]["data"].as_array().expect("token data");
+    let tokens = decode_semantic_tokens(data);
+    println!("semanticTokens/full data = {}", resp["result"]["data"]);
+    println!("decoded (line, start, len, type, mods) = {tokens:#?}");
+
+    // Legend indices, from `semantic::TOKEN_TYPES`.
+    const COMMENT: u32 = 0;
+    const PROPERTY: u32 = 1;
+    const OPERATOR: u32 = 2;
+    const NUMBER: u32 = 3;
+    const STRING: u32 = 4;
+    const KEYWORD: u32 = 5;
+    const TYPE: u32 = 6;
+    const ENUM_MEMBER: u32 = 7;
+    const FUNCTION: u32 = 10;
+
+    let find = |line: u32, start: u32| {
+        tokens
+            .iter()
+            .find(|t| t.0 == line && t.1 == start)
+            .copied()
+            .unwrap_or_else(|| panic!("no token at {line}:{start} in {tokens:#?}"))
+    };
+
+    // Every token must be within its line and non-empty — the drift symptom.
+    let lines: Vec<&str> = text.lines().collect();
+    for (line, start, length, ..) in &tokens {
+        let width = lines[*line as usize].chars().count() as u32;
+        assert!(
+            *length > 0 && start + length <= width,
+            "token ({line},{start},{length}) runs past line {line} ({width} chars)"
+        );
+    }
+
+    assert_eq!(find(0, 0).3, COMMENT, "the leading comment");
+    assert_eq!(find(0, 0).2, 14, "comment length");
+    assert_eq!(find(1, 0).3, PROPERTY, "the root key");
+    assert_eq!(find(1, 9).3, OPERATOR);
+    assert_eq!(find(3, 11).3, NUMBER, "cost = 10");
+    assert_eq!(find(4, 11).3, ENUM_MEMBER, "mood = calm resolves the enum");
+    assert_eq!(
+        find(5, 11).3,
+        STRING,
+        "text = <localisation> stays a string"
+    );
+    assert_eq!(
+        find(7, 8).3,
+        FUNCTION,
+        "has_completed_focus resolves through alias[trigger:…]"
+    );
+    assert_eq!(
+        find(7, 30).3,
+        TYPE,
+        "its value resolves to a <focus> instance"
+    );
+    assert_eq!(find(8, 17).3, KEYWORD, "always = yes");
+}
+
+#[test]
+fn test_semantic_tokens_skip_loc_and_cwt_files() {
+    let files = [
+        (
+            "localisation/english/x_l_english.yml",
+            "l_english:\n key:0 \"v\"\n",
+        ),
+        (
+            "common/national_focus/tree.txt",
+            "my_focus = {\n    id = my_focus\n}\n",
+        ),
+    ];
+    let (ws, _rules, mut child, mut reader) = editor_server(&files);
+    for (i, rel) in ["localisation/english/x_l_english.yml"].iter().enumerate() {
+        let body = jsonrpc_request(
+            30 + i as i64,
+            "textDocument/semanticTokens/full",
+            serde_json::json!({ "textDocument": { "uri": path_uri(ws.path().join(rel)) } }),
+        );
+        write_frame(&mut child, &body).unwrap();
+        let raw = read_response(&mut reader).expect("no response");
+        let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            resp["result"].is_null(),
+            "{rel} should get no tokens: {raw}"
+        );
+    }
+    child.kill().ok();
+}
+
+#[test]
+fn test_document_color_and_presentation_round_trip_both_conventions() {
+    let text = "\
+communism = {
+    color = { 51 102 153 }
+    dynamic_faction_names = { 0.2 0.4 0.6 }
+}
+";
+    let rel = "common/ideologies/00_ideologies.txt";
+    let (ws, _rules, mut child, mut reader) = editor_server(&[(rel, text)]);
+    let doc_uri = path_uri(ws.path().join(rel));
+
+    let body = jsonrpc_request(
+        2,
+        "textDocument/documentColor",
+        serde_json::json!({ "textDocument": { "uri": doc_uri } }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let raw = read_response(&mut reader).expect("no documentColor response");
+    let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(resp["id"], 2, "got: {raw}");
+    println!("documentColor result = {}", resp["result"]);
+    let colours = resp["result"].as_array().expect("colour array").clone();
+    assert_eq!(colours.len(), 2, "two colour leaves: {}", resp["result"]);
+
+    // Swatches agree: `{ 51 102 153 }` and `{ 0.2 0.4 0.6 }` are the same colour.
+    for c in &colours {
+        let (r, g, b) = (
+            c["color"]["red"].as_f64().unwrap(),
+            c["color"]["green"].as_f64().unwrap(),
+            c["color"]["blue"].as_f64().unwrap(),
+        );
+        assert!((r - 0.2).abs() < 0.01, "red {r} in {c}");
+        assert!((g - 0.4).abs() < 0.01, "green {g} in {c}");
+        assert!((b - 0.6).abs() < 0.01, "blue {b} in {c}");
+        assert_eq!(c["color"]["alpha"], 1.0);
+    }
+
+    // The ranges must cover exactly the literal, not the key.
+    let lines: Vec<&str> = text.lines().collect();
+    let slice = |c: &serde_json::Value| {
+        let line = c["range"]["start"]["line"].as_u64().unwrap() as usize;
+        let s = c["range"]["start"]["character"].as_u64().unwrap() as usize;
+        let e = c["range"]["end"]["character"].as_u64().unwrap() as usize;
+        lines[line].chars().skip(s).take(e - s).collect::<String>()
+    };
+    let mut spans: Vec<String> = colours.iter().map(slice).collect();
+    spans.sort();
+    assert_eq!(spans, vec!["{ 0.2 0.4 0.6 }", "{ 51 102 153 }"]);
+
+    // colorPresentation must write back the convention it read. Ask each range
+    // for the SAME colour it already holds and check the spelling survives.
+    for (i, c) in colours.iter().enumerate() {
+        let body = jsonrpc_request(
+            10 + i as i64,
+            "textDocument/colorPresentation",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "color": c["color"],
+                "range": c["range"],
+            }),
+        );
+        write_frame(&mut child, &body).unwrap();
+        let raw = read_response(&mut reader).expect("no colorPresentation response");
+        let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        println!("colorPresentation for {} = {}", slice(c), resp["result"]);
+        let label = resp["result"][0]["label"].as_str().expect("a presentation");
+        let edit = resp["result"][0]["textEdit"]["newText"]
+            .as_str()
+            .expect("a text edit");
+        assert_eq!(label, edit);
+        assert_eq!(resp["result"][0]["textEdit"]["range"], c["range"]);
+        if slice(c).contains('.') {
+            assert_eq!(edit, "{ 0.200 0.400 0.600 }", "floats stay floats");
+        } else {
+            assert_eq!(edit, "{ 51 102 153 }", "bytes stay bytes");
+        }
+    }
+    child.kill().ok();
+}
+
+#[test]
+fn test_color_presentation_writes_a_new_pick_in_the_source_convention() {
+    let text = "communism = {\n    color = { 51 102 153 }\n}\n";
+    let rel = "common/ideologies/00_ideologies.txt";
+    let (ws, _rules, mut child, mut reader) = editor_server(&[(rel, text)]);
+    let doc_uri = path_uri(ws.path().join(rel));
+
+    // Pure orange picked in the editor over an int-convention literal.
+    let body = jsonrpc_request(
+        5,
+        "textDocument/colorPresentation",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "color": { "red": 1.0, "green": 0.5, "blue": 0.0, "alpha": 1.0 },
+            "range": {
+                "start": { "line": 1, "character": 12 },
+                "end": { "line": 1, "character": 26 },
+            },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let raw = read_response(&mut reader).expect("no colorPresentation response");
+    child.kill().ok();
+    let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    println!("colorPresentation (new pick) = {}", resp["result"]);
+    assert_eq!(
+        resp["result"][0]["textEdit"]["newText"], "{ 255 128 0 }",
+        "an int-convention literal must not be rewritten as floats: {raw}"
+    );
+}
+
+#[test]
+fn test_initialize_advertises_the_new_capabilities() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(tmp.path()),
+                "capabilities": { "window": { "workDoneProgress": true } },
+            }),
+        ),
+    )
+    .unwrap();
+    let raw = read_response(&mut reader).expect("no init response");
+    child.kill().ok();
+    let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let caps = &resp["result"]["capabilities"];
+    println!(
+        "semanticTokensProvider = {}",
+        caps["semanticTokensProvider"]
+    );
+    println!("colorProvider = {}", caps["colorProvider"]);
+    println!("codeActionProvider = {}", caps["codeActionProvider"]);
+    println!("workspace = {}", caps["workspace"]);
+
+    assert_eq!(caps["semanticTokensProvider"]["full"], true);
+    let types = caps["semanticTokensProvider"]["legend"]["tokenTypes"]
+        .as_array()
+        .expect("a token legend");
+    assert_eq!(
+        types[0], "comment",
+        "legend order is the wire encoding; index 0 must stay `comment`"
+    );
+    assert_eq!(types.len(), 11);
+    assert_eq!(
+        caps["semanticTokensProvider"]["legend"]["tokenModifiers"][0],
+        "declaration"
+    );
+    assert_eq!(caps["colorProvider"], true);
+    let kinds = caps["codeActionProvider"]["codeActionKinds"]
+        .as_array()
+        .expect("code action kinds");
+    assert!(
+        kinds.iter().any(|k| k == "source.fixAll"),
+        "editor.codeActionsOnSave needs source.fixAll advertised: {kinds:?}"
+    );
+    assert_eq!(caps["workspace"]["workspaceFolders"]["supported"], true);
+    assert_eq!(
+        caps["workspace"]["workspaceFolders"]["changeNotifications"],
+        true
+    );
+}
+
+#[test]
+fn test_source_fix_all_applies_every_fixable_diagnostic_at_once() {
+    // Two empty `limit = { }` blocks -> two CW281 diagnostics, each carrying a
+    // fix. `source.fixAll` must return ONE action holding both edits, and
+    // applying them must give the same file the CLI `fix --apply` would.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel = "common/decisions/test.txt";
+    let text = "a = { limit = { } }\nb = { limit = { } }\n";
+    let p = ws.path().join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, text).unwrap();
+    let doc_uri = path_uri(&p);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    // Capture the published diagnostics: the client round-trips them back on the
+    // codeAction request, and the fix payloads ride along in `data`.
+    let diagnostics = wait_for_diags(&mut reader, rel).expect("diagnostics for the document");
+    let fixable: Vec<&serde_json::Value> = diagnostics
+        .iter()
+        .filter(|d| d["data"].is_object())
+        .collect();
+    println!("fixable diagnostics = {}", fixable.len());
+    assert_eq!(
+        fixable.len(),
+        2,
+        "two empty limits -> two fixable diagnostics: {diagnostics:#?}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 2, "character": 0 },
+                },
+                "context": { "diagnostics": diagnostics, "only": ["source.fixAll"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let raw = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+    let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    println!("source.fixAll action = {}", resp["result"]);
+    let actions = resp["result"].as_array().expect("actions");
+    assert_eq!(actions.len(), 1, "only source.fixAll was requested: {raw}");
+    assert_eq!(actions[0]["kind"], "source.fixAll");
+    assert_eq!(actions[0]["title"], "Fix all (2 auto-fixable)");
+    assert_eq!(
+        actions[0]["diagnostics"].as_array().map(Vec::len),
+        Some(2),
+        "the action claims both diagnostics"
+    );
+    let edits = actions[0]["edit"]["changes"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(edits.len(), 2, "one edit per fixable diagnostic");
+
+    // Apply the edits (line-descending, so earlier columns stay valid) and check
+    // the result: both empty limits removed.
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut resolved: Vec<(usize, usize, usize, String)> = edits
+        .iter()
+        .map(|e| {
+            (
+                e["range"]["start"]["line"].as_u64().unwrap() as usize,
+                e["range"]["start"]["character"].as_u64().unwrap() as usize,
+                e["range"]["end"]["character"].as_u64().unwrap() as usize,
+                e["newText"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    resolved.sort_by(|a, b| b.cmp(a));
+    for (line, sc, ec, new_text) in resolved {
+        let chars: Vec<char> = lines[line].chars().collect();
+        let mut out: String = chars[..sc].iter().collect();
+        out.push_str(&new_text);
+        out.extend(chars[ec..].iter());
+        lines[line] = out;
+    }
+    let fixed = format!("{}\n", lines.join("\n"));
+    println!("fixed source = {fixed:?}");
+    assert_eq!(fixed, "a = { }\nb = { }\n");
+}
+
+#[test]
+fn test_scan_reports_standard_work_done_progress() {
+    // A client that advertises window.workDoneProgress must see the standard
+    // $/progress stream, not only the custom `loadingBar` notification.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("editor_rules.cwt"), EDITOR_RULES).unwrap();
+    let p = ws.path().join("common/national_focus/tree.txt");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "my_focus = {\n    id = my_focus\n}\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": { "window": { "workDoneProgress": true } },
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    let stdin = child.stdin.take().unwrap();
+    let collected = run_with_deadline(stdin, reader, 90, |stdin, reader| {
+        let mut created = false;
+        let mut kinds: Vec<String> = Vec::new();
+        let mut saw_loading_bar = false;
+        for _ in 0..2000 {
+            let Ok(raw) = read_frame(reader) else { break };
+            if raw.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            match v["method"].as_str() {
+                Some("window/workDoneProgress/create") => {
+                    println!("window/workDoneProgress/create = {}", v["params"]);
+                    assert_eq!(v["params"]["token"], "cwtools/scan");
+                    created = true;
+                    // The server waits for this response before it begins.
+                    write_frame_to(
+                        stdin,
+                        &serde_json::json!({ "jsonrpc": "2.0", "id": v["id"], "result": null })
+                            .to_string(),
+                    )
+                    .unwrap();
+                }
+                Some("$/progress") => {
+                    println!("$/progress = {}", v["params"]);
+                    assert_eq!(v["params"]["token"], "cwtools/scan");
+                    let kind = v["params"]["value"]["kind"].as_str().unwrap().to_string();
+                    let done = kind == "end";
+                    kinds.push(kind);
+                    if done {
+                        break;
+                    }
+                }
+                Some("loadingBar") => saw_loading_bar = true,
+                _ => {}
+            }
+        }
+        (created, kinds, saw_loading_bar)
+    });
+    child.kill().ok();
+
+    let (created, kinds, saw_loading_bar) =
+        collected.expect("timed out waiting for the progress stream");
+    assert!(created, "no window/workDoneProgress/create");
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("begin"),
+        "progress must open with begin: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some("end"),
+        "progress must be closed: {kinds:?}"
+    );
+    assert!(
+        saw_loading_bar,
+        "the custom loadingBar notification must still fire for the VS Code client"
+    );
+}
+
+#[test]
+fn test_did_change_workspace_folders_repoints_and_rescans() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("editor_rules.cwt"), EDITOR_RULES).unwrap();
+    let p = second.path().join("common/national_focus/tree.txt");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "moved_focus = {\n    id = moved_focus\n}\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(first.path()),
+                "workspaceFolders": [{ "uri": path_uri(first.path()), "name": "first" }],
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    // Swap the primary folder for one that holds a focus file.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeWorkspaceFolders",
+            serde_json::json!({
+                "event": {
+                    "added": [{ "uri": path_uri(second.path()), "name": "second" }],
+                    "removed": [{ "uri": path_uri(first.path()), "name": "first" }],
+                }
+            }),
+        ),
+    )
+    .unwrap();
+
+    // The re-scan must index the new root: its file gets diagnostics published.
+    let stdin = child.stdin.take().unwrap();
+    let saw = run_with_deadline(stdin, reader, 90, |_stdin, reader| {
+        for _ in 0..2000 {
+            let Ok(raw) = read_frame(reader) else { break };
+            if raw.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("common/national_focus/tree.txt"))
+            {
+                println!("rescan published diagnostics for {}", v["params"]["uri"]);
+                return true;
+            }
+        }
+        false
+    });
+    child.kill().ok();
+    assert_eq!(
+        saw,
+        Some(true),
+        "the new workspace folder was never scanned"
+    );
 }

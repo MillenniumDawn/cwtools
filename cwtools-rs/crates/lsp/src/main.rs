@@ -15,13 +15,16 @@ use cwtools_string_table::string_table::{StringId, StringTable};
 use cwtools_validation::position::rules_at_pos;
 
 mod code_action;
+mod color;
 mod completion;
 mod config;
+mod graph;
 mod hover;
 mod inlay;
 mod navigation;
 mod paths;
 mod scan;
+mod semantic;
 mod validate;
 mod workspace_cache;
 
@@ -218,6 +221,12 @@ struct DocumentState {
     /// loc-key index (workspace + vanilla) for CW100/CW122 on config files and
     /// for scope-aware loc-command checks. Rebuilt on each full workspace scan.
     loc_index: parking_lot::RwLock<Option<cwtools_localization::LocIndex>>,
+    /// Sorted, prefix-searchable mirror of `loc_index`'s key union, built beside
+    /// it on each scan so loc completion can binary-search for the typed token
+    /// instead of sweeping all ~400K keys per keystroke. `None` until the first
+    /// scan; completion falls back to the sweep until then. Held behind its own
+    /// lock and only ever cloned out (an `Arc` bump), so it nests with nothing.
+    loc_key_index: parking_lot::RwLock<Option<Arc<completion::LocKeyIndex>>>,
     /// Display text per loc key (lowercased) → list of (language, display text).
     /// Built from the LocService during workspace scan so hover can show
     /// localisation without re-reading loc files. Outer quotes are stripped
@@ -265,6 +274,15 @@ struct DocumentState {
     /// initialize. When `true`, documentSymbol returns a nested `DocumentSymbol`
     /// tree; otherwise it falls back to the flat `SymbolInformation` list.
     hierarchical_symbols: std::sync::atomic::AtomicBool,
+    /// Whether the client advertised `window.workDoneProgress` at initialize.
+    /// A server-initiated `$/progress` has to register its token with
+    /// `window/workDoneProgress/create` first, which a client that didn't
+    /// advertise support isn't obliged to answer — so the whole stream is gated
+    /// on this. The custom `loadingBar` notification is sent regardless.
+    client_work_done_progress: std::sync::atomic::AtomicBool,
+    /// Whether the scan's `$/progress` token is currently live, so the phase
+    /// updates pair one `begin` with one `end` on a token that exists.
+    scan_progress_active: std::sync::atomic::AtomicBool,
     /// `false` until the first full workspace scan has finished building the
     /// index. While `false`, per-file validation still parses and indexes, but
     /// suppresses published diagnostics (clears instead) so the user never sees
@@ -459,6 +477,7 @@ impl DocumentState {
             vanilla_merged_uris: Mutex::new(HashSet::new()),
             vanilla_loc_keys: Mutex::new(None),
             loc_index: parking_lot::RwLock::new(None),
+            loc_key_index: parking_lot::RwLock::new(None),
             loc_text: parking_lot::RwLock::new(HashMap::new()),
             loc_locations: parking_lot::RwLock::new(HashMap::new()),
             loc_live_overlay: parking_lot::RwLock::new(HashMap::new()),
@@ -468,6 +487,8 @@ impl DocumentState {
             inlay_hints_loc_titles: std::sync::atomic::AtomicBool::new(true),
             inlay_hints_scopes: std::sync::atomic::AtomicBool::new(false),
             hierarchical_symbols: std::sync::atomic::AtomicBool::new(false),
+            client_work_done_progress: std::sync::atomic::AtomicBool::new(false),
+            scan_progress_active: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
@@ -503,8 +524,9 @@ const DEBOUNCE_MS: u64 = 250;
 
 // ── Custom notification stubs ─────────────────────────────────────────────────
 
-// NOT PORTED — pre-trigger refactor, techGraph / event-graph.
-// (code-actions are handled in `code_action.rs`: QUICKFIX from SuggestedFix.)
+// NOT PORTED — pre-trigger refactor.
+// (code-actions are handled in `code_action.rs`: QUICKFIX from SuggestedFix;
+// the techGraph / event-graph data is in `graph.rs` behind `getGraphData`.)
 // See the F# LanguageFeatures.fs module if these are needed later.
 //   - getEmbeddedMetadata: per-file metadata bundle sent to the extension on
 //     open (F# LanguageFeatures.getEmbeddedMetadata).  Low priority until the
@@ -886,7 +908,11 @@ pub(crate) struct RuleCursorInfo {
 /// Map a matched leaf rule's right-hand field to a [`ReferenceHint`] for the
 /// leaf's value (the same classification `info_at_position` used to do at
 /// depth 0-1, now fed by the full position resolver).
-fn hint_from_rule_right(rule_type: &RuleType, value: &str, ruleset: &RuleSet) -> ReferenceHint {
+pub(crate) fn hint_from_rule_right(
+    rule_type: &RuleType,
+    value: &str,
+    ruleset: &RuleSet,
+) -> ReferenceHint {
     let right = match rule_type {
         RuleType::LeafRule { right, .. } => right,
         RuleType::LeafValueRule { right } => right,
@@ -1214,7 +1240,7 @@ impl LanguageServer for Backend {
             let info = self.state.info_service.read();
             (info.export_fingerprint(&uri), info.export_names(&uri))
         };
-        let disk_ast = if !crate::paths::is_loc_file(&uri) && !crate::paths::is_cwt_file(&uri) {
+        let disk_ast = if !crate::paths::has_loc_ext(&uri) && !crate::paths::is_cwt_file(&uri) {
             let path = crate::paths::uri_to_path_str(&uri);
             let table = self.state.string_table.clone();
             tokio::task::spawn_blocking(move || {
@@ -1238,7 +1264,7 @@ impl LanguageServer for Backend {
             }
 
             if let Some(parsed) = disk_ast.as_ref() {
-                self.index_parsed_file(&uri, parsed);
+                self.index_parsed_file(&uri, parsed, None);
             } else {
                 self.state.info_service.write().clear_file(&uri);
                 self.bump_info_revision();
@@ -1352,12 +1378,34 @@ impl LanguageServer for Backend {
         self.inlay_hint_impl(params).await
     }
 
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        self.semantic_tokens_full_impl(params).await
+    }
+
+    async fn document_color(&self, params: DocumentColorParams) -> Result<Vec<ColorInformation>> {
+        self.document_color_impl(params).await
+    }
+
+    async fn color_presentation(
+        &self,
+        params: ColorPresentationParams,
+    ) -> Result<Vec<ColorPresentation>> {
+        self.color_presentation_impl(params).await
+    }
+
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
         self.execute_command_impl(params).await
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         self.did_change_watched_files_impl(params).await;
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        self.did_change_workspace_folders_impl(params).await;
     }
 }
 

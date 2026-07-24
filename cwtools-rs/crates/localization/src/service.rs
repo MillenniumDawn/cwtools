@@ -161,7 +161,6 @@ fn parse_loc_file_entry(
                 lang: Some(lang),
                 is_csv: true,
                 entries,
-                file_diagnostics: Vec::new(),
                 parse_errors: Vec::new(),
                 encoding,
             })

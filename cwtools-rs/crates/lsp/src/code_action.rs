@@ -12,6 +12,12 @@
 //! The payload stores ranges in the parser convention (1-based line, 0-based
 //! char column) verbatim; the LSP conversion is deferred to the handler, the one
 //! place with both the text and the negotiated encoding.
+//!
+//! Two kinds are offered: one QUICKFIX per fixable diagnostic, and one
+//! `source.fixAll` that applies all of them at once — the kind
+//! `editor.codeActionsOnSave` binds to. `source.fixAll` resolves overlaps with
+//! `cwtools_parser::fix::plan_file_edits`, the same code the CLI `fix`
+//! subcommand runs, so the two agree on what a fixed file looks like.
 
 use std::collections::HashMap;
 
@@ -19,7 +25,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
 use cwtools_parser::ast::{SourcePos, SourceRange};
-use cwtools_parser::fix::SuggestedFix;
+use cwtools_parser::fix::{SpanEdit, SuggestedFix, plan_file_edits};
 
 use crate::Backend;
 use crate::paths::source_position_to_lsp;
@@ -96,8 +102,9 @@ fn fix_from_data(data: &serde_json::Value) -> Option<FixPayload> {
 
 /// Convert a parser [`SourceRange`] (1-based line, 0-based char col) into an LSP
 /// `Range`, using `text` and the negotiated `encoding` — the same
-/// `source_position_to_lsp` conversion hover/rename/navigation use, so the edit
-/// lands on exactly the same columns the client sees.
+/// `source_position_to_lsp` conversion hover/rename/navigation use, and the one
+/// the diagnostic this fix hangs off went through (`validate::DocLines`), so the
+/// edit lands on exactly the columns the squiggle covers.
 fn source_range_to_lsp(range: SourceRange, text: &str, encoding: &PositionEncodingKind) -> Range {
     Range {
         start: source_position_to_lsp(
@@ -155,6 +162,90 @@ fn code_actions_from_diagnostics(
     actions
 }
 
+/// Build the single `source.fixAll` action: every fixable diagnostic in the
+/// document, applied at once. `None` when fewer than one edit survives.
+///
+/// Overlap resolution is [`cwtools_parser::fix::plan_file_edits`] — the same
+/// function the CLI `fix` subcommand uses, so "fix all" in the editor and
+/// `cwtools fix --apply` produce the same file. An edit dropped for overlapping
+/// keeps its own quick fix, which is the right outcome: applying it needs the
+/// first edit to land and the document to be re-validated.
+///
+/// The diagnostics come from `context.diagnostics`, which the client scopes to
+/// the requested range. `editor.codeActionsOnSave` requests the whole document,
+/// so that is what "all" means here.
+fn fix_all_action(
+    uri: &Url,
+    diagnostics: &[Diagnostic],
+    text: &str,
+    encoding: &PositionEncodingKind,
+) -> Option<CodeActionOrCommand> {
+    let planned: Vec<(usize, SpanEdit)> = diagnostics
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| Some((i, d.data.as_ref().and_then(fix_from_data)?)))
+        .flat_map(|(i, payload)| {
+            payload.edits.into_iter().map(move |e| {
+                (
+                    i,
+                    SpanEdit {
+                        range: e.range,
+                        replacement: e.replacement,
+                    },
+                )
+            })
+        })
+        .collect();
+    if planned.is_empty() {
+        return None;
+    }
+    let (kept, skipped) = plan_file_edits(text, planned);
+    if kept.is_empty() {
+        return None;
+    }
+    // Attribute the action to the diagnostics it actually resolves, so the
+    // client can clear them optimistically.
+    let resolved: Vec<Diagnostic> = diagnostics
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| {
+            d.data.as_ref().is_some_and(|v| fix_from_data(v).is_some()) && !skipped.contains(i)
+        })
+        .map(|(_, d)| d.clone())
+        .collect();
+    let text_edits: Vec<TextEdit> = kept
+        .iter()
+        .map(|e| TextEdit {
+            range: source_range_to_lsp(e.range, text, encoding),
+            new_text: e.replacement.clone(),
+        })
+        .collect();
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), text_edits);
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Fix all ({} auto-fixable)", kept.len()),
+        kind: Some(CodeActionKind::SOURCE_FIX_ALL),
+        diagnostics: Some(resolved),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        ..Default::default()
+    }))
+}
+
+/// Whether the request asks for `kind`. An absent `only` means "everything";
+/// LSP kinds are hierarchical, so `source` selects `source.fixAll`.
+fn wants(only: Option<&Vec<CodeActionKind>>, kind: &CodeActionKind) -> bool {
+    match only {
+        None => true,
+        Some(only) => only.iter().any(|k| {
+            kind.as_str() == k.as_str() || kind.as_str().starts_with(&format!("{}.", k.as_str()))
+        }),
+    }
+}
+
 impl Backend {
     pub(crate) async fn code_action_impl(
         &self,
@@ -168,8 +259,22 @@ impl Backend {
             return Ok(None);
         };
         let encoding = self.state.config.read().position_encoding.clone();
-        let actions =
-            code_actions_from_diagnostics(&uri, &params.context.diagnostics, &text, &encoding);
+        let only = params.context.only.as_ref();
+        let mut actions = Vec::new();
+        if wants(only, &CodeActionKind::QUICKFIX) {
+            actions.extend(code_actions_from_diagnostics(
+                &uri,
+                &params.context.diagnostics,
+                &text,
+                &encoding,
+            ));
+        }
+        if wants(only, &CodeActionKind::SOURCE_FIX_ALL)
+            && let Some(action) =
+                fix_all_action(&uri, &params.context.diagnostics, &text, &encoding)
+        {
+            actions.push(action);
+        }
         if actions.is_empty() {
             Ok(None)
         } else {
@@ -268,6 +373,60 @@ mod tests {
             replacement: "set_name".into(),
         };
         assert_eq!(apply_edits(text, &[span]), "set_name = { }\n");
+    }
+
+    #[test]
+    fn diagnostic_range_and_fix_edit_agree_on_non_bmp_line() {
+        // A non-BMP char before the token makes the parser's char column (2) and
+        // the client's UTF-16 column (3) differ. The published diagnostic and the
+        // quick fix it carries must land on the same range, or applying the fix
+        // rewrites a different span than the one highlighted.
+        let text = "😀 set_empire_name = { }\n";
+        let fix = SuggestedFix::replace("Rename to set_name", range(1, 2, 1, 17), "set_name");
+        let err = cwtools_validation::ValidationError {
+            message: "renamed effect".into(),
+            severity: cwtools_validation::ErrorSeverity::Warning,
+            line: 1,
+            col: 2,
+            file: "f".into(),
+            code: Some("CW253"),
+            fix: Some(fix),
+            end: Some((1, 17)),
+        };
+        let lines = crate::validate::DocLines::new(text, PositionEncodingKind::UTF16);
+        let diag = crate::validate::validation_error_to_diagnostic(&err, &lines);
+        assert_eq!(
+            diag.range,
+            Range::new(Position::new(0, 3), Position::new(0, 18)),
+            "diagnostic range must use UTF-16 columns"
+        );
+
+        let uri: Url = "file:///mod/common/x.txt".parse().unwrap();
+        let actions = code_actions_from_diagnostics(
+            &uri,
+            std::slice::from_ref(&diag),
+            text,
+            &PositionEncodingKind::UTF16,
+        );
+        let edits = match &actions[0] {
+            CodeActionOrCommand::CodeAction(a) => a
+                .edit
+                .as_ref()
+                .and_then(|e| e.changes.as_ref())
+                .and_then(|c| c.get(&uri))
+                .expect("edit targets the document"),
+            _ => panic!("expected a CodeAction"),
+        };
+        assert_eq!(
+            edits[0].range, diag.range,
+            "quick fix must edit exactly the highlighted span"
+        );
+        // The parser-space span the payload carries is the right one.
+        let span = SpanEdit {
+            range: range(1, 2, 1, 17),
+            replacement: "set_name".into(),
+        };
+        assert_eq!(apply_edits(text, &[span]), "😀 set_name = { }\n");
     }
 
     #[test]

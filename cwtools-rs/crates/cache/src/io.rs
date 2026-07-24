@@ -26,7 +26,8 @@ pub enum CacheError {
 
 /// zstd compression level for cache bodies. Shared by the `.cwb` parse cache
 /// (here) and the vanilla index cache (`cwtools_index::vanilla_cache`) so both
-/// caches compress identically.
+/// caches compress at the same ratio. Only the `.cwb` writer adds a frame
+/// checksum on top; see `serialize_to_file`.
 pub const ZSTD_LEVEL: i32 = 3;
 
 /// Magic bytes at the start of every `.cwb` file. Lets `read_archive_bytes`
@@ -50,7 +51,21 @@ const FORMAT_VERSION: u8 = 3;
 pub fn serialize_to_file(cached: &CachedFile, path: &Path) -> Result<(), CacheError> {
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(cached).map_err(CacheError::Serialize)?;
 
-    let compressed = zstd::encode_all(&bytes[..], ZSTD_LEVEL).map_err(CacheError::Compression)?;
+    // Frame checksum on. rkyv's checked `access` validates structure, not
+    // content, so a flipped byte can decompress into a different-but-valid
+    // archive and get served as a cache hit. The checksum turns that into a
+    // decode error, which callers already degrade to a re-parse. Readers need
+    // no change: a frame without one still decodes, so old `.cwb` files stay
+    // loadable and the format version doesn't move.
+    let compressed = {
+        let mut encoder =
+            zstd::stream::Encoder::new(Vec::new(), ZSTD_LEVEL).map_err(CacheError::Compression)?;
+        encoder
+            .include_checksum(true)
+            .map_err(CacheError::Compression)?;
+        encoder.write_all(&bytes).map_err(CacheError::Compression)?;
+        encoder.finish().map_err(CacheError::Compression)?
+    };
 
     let mut file = File::create(path)?;
     file.write_all(MAGIC)?;

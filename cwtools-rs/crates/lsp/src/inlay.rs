@@ -60,7 +60,7 @@ impl Backend {
         }
         let uri = params.text_document.uri.to_string();
         // Loc / rule files aren't game ASTs — no id references to annotate.
-        if crate::paths::is_loc_file(&uri) || crate::paths::is_cwt_file(&uri) {
+        if crate::paths::has_loc_ext(&uri) || crate::paths::is_cwt_file(&uri) {
             return Ok(None);
         }
         // Snapshot document AST + text first (locks `documents` briefly, then

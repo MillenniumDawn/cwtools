@@ -3,13 +3,35 @@
 ## Prerequisites
 
 - **Rust toolchain** — stable, installed via [rustup](https://rustup.rs/).
-  The workspace pins a minimum version in `rust-toolchain.toml`.
-- **Windows**: the `rust-lld` component (LLVM linker) is recommended for
-  faster LTO linking. Install it after rustup:
+  `rust-toolchain.toml` pins the channel (`stable`) and pulls in rustfmt and
+  clippy, so rustup sets itself up on the first `cargo` command in the tree.
 
-  ```plaintext
-  rustup component add rust-lld
-  ```
+No other prerequisites, on any platform. See [Platform notes](#platform-notes).
+
+## MSRV
+
+**1.88.0**, declared as `rust-version` in `[workspace.package]` and inherited by
+every crate, so `cargo` refuses the build per crate rather than failing halfway
+through with a confusing error.
+
+1.88 is where let-chains (`if let Some(x) = a && let Some(y) = b`) stabilized
+for edition 2024. There are about 60 of them across the workspace, so 1.87 and
+1.86 both reject the parser and the scope registry outright with E0658. The
+dependency tree wants 1.86 on its own account (criterion, the `icu_*` crates via
+`url`), which is the lower bound you'd get from `cargo` alone.
+
+Develop on stable. The MSRV is a floor for downstream consumers, not the
+version you're expected to use, and the `msrv-rs` CI job builds at exactly it
+so it can't creep upward unnoticed. To check locally:
+
+```plaintext
+rustup toolchain install 1.88.0
+cargo +1.88.0 build --workspace --all-targets
+```
+
+The `+1.88.0` matters. `rust-toolchain.toml` selects stable and a toolchain
+file outranks `rustup default`, so without the explicit override you will build
+on stable and learn nothing.
 
 ## Build
 
@@ -37,6 +59,7 @@ Produces two binaries in `target/release/`:
 - `deserialize`: read a `.cwb` cache file back and verify it.
 - `rules`: parse a `.cwt` rules file or directory and print a summary.
 - `loc`: parse and validate localisation `.yml` files.
+- `fix`: apply the machine-applicable fixes for diagnostics that carry one. Dry-run by default; `--apply` writes.
 
 ## Build all targets (debug + tests)
 
@@ -47,31 +70,32 @@ cargo test --workspace --all-features --no-fail-fast
 
 ## Release profile
 
-The workspace uses `lto = "thin"` (not fat) and the default 16 codegen units.
-Thin LTO parallelizes well and links much faster than fat LTO, especially on
-Windows where MSVC `link.exe` is the bottleneck. The binary is ~5-10% larger
-than fat LTO + `codegen-units = 1`, but `strip = true` keeps it small enough
-that antivirus false positives are not a concern.
+The workspace uses `lto = "thin"` (not fat), `codegen-units = 1`, and
+`strip = true`. Thin LTO parallelizes well and links much faster than fat LTO,
+especially on Windows where MSVC `link.exe` is the bottleneck.
 
 See `PROFILING.md` for build profiling and runtime tracing.
 
 ## Platform notes
 
+`.cargo/config.toml` sets no linker overrides. Every platform builds with its
+default linker and needs no extra install.
+
 ### Windows
 
-- The `.cargo/config.toml` sets `rust-lld.exe` as the linker for
-  `x86_64-pc-windows-msvc`. This replaces MSVC `link.exe` with LLVM's
-  linker, which is much faster at LTO linking.
-- Without `rust-lld`, the build falls back to MSVC `link.exe` and is
-  significantly slower. Install it with `rustup component add rust-lld`.
+- MSVC `link.exe`, the rustup default. It is the slow part of a release build.
+- `rust-lld` would link LTO faster, but on stable Windows MSVC it ships as a
+  self-contained binary rather than an installable rustup component
+  (`rustup component add rust-lld` does not work), so nothing here selects it.
+  See the comment at the top of `.cargo/config.toml`.
 
 ### macOS
 
-- The system linker (`ld64`) is used. No special setup needed.
+- The system linker (`ld64`). No special setup needed.
 
 ### Linux
 
-- The system linker (`lld` or `gold`) is used. No special setup needed.
+- The system linker (GNU `ld` on most distros). No special setup needed.
 
 ## CI
 
@@ -79,5 +103,7 @@ The `build-bench` workflow (`.github/workflows/build-bench.yml`) measures clean
 release-build time across all three platforms. Run it manually from the Actions
 tab or push to the `perf/build-time-improvements` branch.
 
-The `release` workflow (`.github/workflows/release.yml`) builds and archives
-binaries for all three platforms on `workflow_dispatch`.
+The `release` workflow (`.github/workflows/release.yml`) builds, archives, and
+publishes binaries for all three platforms when a `v*` tag is pushed.
+`workflow_dispatch` is a manual re-run: off a tag ref it builds the archives but
+skips the publish step.

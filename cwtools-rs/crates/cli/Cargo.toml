@@ -2,6 +2,7 @@
 name = "cwtools_cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
@@ -10,6 +11,7 @@ name = "cwtools"
 path = "src/main.rs"
 
 [dependencies]
+cwtools_error_codes = { workspace = true }
 cwtools_parser = { workspace = true }
 cwtools_file_manager = { workspace = true }
 cwtools_string_table = { workspace = true }
@@ -22,6 +24,7 @@ cwtools_game = { workspace = true }
 cwtools_localization = { workspace = true }
 cwtools_profiling = { workspace = true }
 clap = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
