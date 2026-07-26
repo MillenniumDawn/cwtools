@@ -1,3 +1,18 @@
+# 2.4.0
+
+## Bug Fixes
+
+- The "Remove empty if" quick fix deleted valid script. `if = { limit = { tag = GXC } }` followed by an `else_if` was fixed by deleting the `if`, which left the `else_if` with no antecedent for the game to reject. On Kaiserreich, 9 of the 10 places the fix was offered were chain-breaking. It also reached `source.fixAll`, so anyone binding that through `editor.codeActionsOnSave` had files corrupted on save. The fix is now withheld when an `else_if` or `else` follows the block. The diagnostic still reports.
+- Diagnostic squiggles ran one line long, and for a block ran to the line past its closing brace. The parser records a node's end as the cursor after the node and the whitespace behind it, which is the start of the next token, and that position was published as-is. It affected all 43 codes that carry a precise range, including the scope errors and type-reference errors modders see most. The published end is now walked back to the last content character. Quick-fix edits are unaffected: they are built from the fix's own range, which still needs to absorb the trailing newline to delete a line cleanly.
+- The CW223 hint on `NOT` with multiple children underlined the whole block instead of the keyword, burying however many lines the block spanned under one squiggle. It now marks the `NOT` itself. This is old behavior that only became visible in the last release, when the server started publishing the ranges it had been recording all along.
+- Nothing under `localisation_synced/` got any language features, and none of the keys defined there were indexed, so script referencing them read as missing. HOI4 ships synced localisation in that directory and the client has always treated it as localisation. The loc walker and the server's own check now agree with it.
+- The "N rules-config error(s)" popup pointed at an output channel that never had the errors in it. The details were written to the language client's channel ("Paradox Language Server"), not the extension's ("CWTools"), and the per-file diagnostics meant as the fallback were published during `initialize`, where notifications are dropped before the handshake completes. The popup now names the first error inline, and the diagnostics are held until `initialized`.
+
+## Notes
+
+- **Behavioral:** CW223's range covers the `NOT` keyword rather than the block. Anything matching on diagnostic ranges rather than the start position will see the change.
+- **Behavioral:** `localisation_synced/` is now walked for localisation. Keys defined there join the index, which clears missing-key errors against them and can surface duplicate-key errors that were previously hidden by the directory being skipped.
+
 # 2.3.0
 
 ## Features

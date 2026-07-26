@@ -261,6 +261,50 @@ impl<'a> DocLines<'a> {
         Position { line, character }
     }
 
+    /// LSP position for a parser range end (0-based `line`, 0-based char `col`),
+    /// walked back over whitespace to the last content character.
+    ///
+    /// The parser records a node's end as the cursor after the node *and* the
+    /// whitespace behind it, so a raw end sits on the start of the next token and
+    /// published verbatim bleeds onto the following line (#107). Floors at
+    /// `start`, so the range cannot invert.
+    fn clamped_end_position(&self, line: u32, col: u32, start: Position) -> Position {
+        // No document text (workspace scan, ruleset load): nothing to walk back
+        // over, so the parser's raw position is the best available.
+        if self.lines.is_empty() {
+            return Position {
+                line,
+                character: col,
+            };
+        }
+
+        let (mut line, mut col) = (line, col);
+        loop {
+            let text = self.lines.get(line as usize).copied().unwrap_or("");
+            let consumed: String = text.chars().take(col as usize).collect();
+            if !consumed.trim().is_empty() {
+                col = consumed.trim_end().chars().count() as u32;
+                break;
+            }
+            let Some(prev) = line.checked_sub(1) else {
+                col = 0;
+                break;
+            };
+            line = prev;
+            col = self
+                .lines
+                .get(line as usize)
+                .map_or(0, |l| l.chars().count() as u32);
+        }
+
+        let end = self.position(line, col);
+        if (end.line, end.character) < (start.line, start.character) {
+            start
+        } else {
+            end
+        }
+    }
+
     /// End position for a diagnostic whose start is at encoded column `start`:
     /// the end of that line's content, but always at least one past `start` so
     /// the range is never empty. With no line info, a single-character span.
@@ -375,9 +419,15 @@ pub(crate) fn validation_error_to_diagnostic(
     // the real range instead of diagnostic_at's whole-line squiggle. The end uses
     // the same 1-based-line / 0-based-char convention as the start (and as
     // code_action's fix-edit conversion), so only the whole-line end is overridden.
+    // Fix edits are unaffected: they read `SuggestedFix.range`, which still needs
+    // the untrimmed span to delete a line cleanly.
     // With `end` absent, the whole-line fallback stands byte-for-byte.
     if let Some((end_line, end_col)) = err.end {
-        diag.range.end = lines.position(end_line.saturating_sub(1), end_col as u32);
+        diag.range.end = lines.clamped_end_position(
+            end_line.saturating_sub(1),
+            end_col as u32,
+            diag.range.start,
+        );
     }
     // Carry any machine-applicable fix into `data` so the code-action handler
     // can round-trip it back into a QUICKFIX WorkspaceEdit. Covers both the
@@ -1596,9 +1646,8 @@ mod whole_line_range_tests {
 
     #[test]
     fn diagnostic_precise_range_can_span_lines() {
-        // A block leaf's range end lands past the closing brace (SourceRange.end is
-        // exclusive and absorbs trailing whitespace), so a precise squiggle may
-        // legitimately span multiple lines — the whole unexpected block.
+        // A block's range legitimately spans lines; only the trailing whitespace
+        // the parser folded into the end has to come back off.
         let text = "root = {\n    foo = {\n        a = 1\n    }\n}\n";
         let ends = utf16_lines(text);
         let err = ValidationError {
@@ -1609,13 +1658,103 @@ mod whole_line_range_tests {
             file: "f".into(),
             code: Some("CW262"),
             fix: None,
-            end: Some((4, 5)), // just past the `}` on the closing line
+            end: Some((5, 0)), // what the parser actually emits: start of `}`
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.start.line, 1);
         assert_eq!(diag.range.start.character, 4);
-        assert_eq!(diag.range.end.line, 3);
+        assert_eq!(
+            diag.range.end.line, 3,
+            "end stays on the closing-brace line"
+        );
         assert_eq!(diag.range.end.character, 5);
+    }
+
+    // Issue #107. Each `end` below is what the parser actually emits.
+
+    #[test]
+    fn diagnostic_end_does_not_bleed_onto_the_next_line() {
+        let text = "decision = {\n    custom_cost_text = a\n}\n";
+        let ends = utf16_lines(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW240"),
+            fix: None,
+            end: Some((3, 0)), // start of the `}` line
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.end.line, 1, "must stay on the statement's line");
+        assert_eq!(diag.range.end.character, 24);
+    }
+
+    #[test]
+    fn diagnostic_end_does_not_bleed_onto_the_next_indent() {
+        // The CW500 shape: an indented next line puts the raw end mid-whitespace
+        // rather than at column 0.
+        let text = "c = {\n    picture = generic_economy\n    allowed = {\n    }\n}\n";
+        let ends = utf16_lines(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Error,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW500"),
+            fix: None,
+            end: Some((3, 4)), // start of `allowed` on the next line
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.end.line, 1);
+        assert_eq!(diag.range.end.character, 29);
+    }
+
+    #[test]
+    fn diagnostic_end_never_precedes_its_start() {
+        // A whitespace-only statement line: the walk-back would run past the start.
+        let text = "a = {\n    \n}\n";
+        let ends = utf16_lines(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Error,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW262"),
+            fix: None,
+            end: Some((3, 0)),
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert!(
+            (diag.range.end.line, diag.range.end.character)
+                >= (diag.range.start.line, diag.range.start.character),
+            "range must not invert: {:?}",
+            diag.range
+        );
+    }
+
+    #[test]
+    fn diagnostic_end_clamps_before_utf16_conversion() {
+        // Clamping after the conversion instead would land inside the surrogate pair.
+        let text = "a = {\n    x = \"\u{1F600}\"\n}\n";
+        let ends = utf16_lines(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Error,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW500"),
+            fix: None,
+            end: Some((3, 0)),
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.end.line, 1);
+        // 11 source chars, 12 UTF-16 units — the emoji counts twice.
+        assert_eq!(diag.range.end.character, 12);
     }
 
     #[test]

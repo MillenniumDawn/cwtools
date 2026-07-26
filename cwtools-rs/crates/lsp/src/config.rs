@@ -519,12 +519,8 @@ impl Backend {
         let (combined_ruleset, parse_errors) =
             load_ruleset_from_dir(cache_path, &self.state.string_table);
 
-        // Rules-config parse/read errors mean the .cwt rules are broken,
-        // which silently degrades every downstream check. Emit at ERROR so
-        // the client reveals its output channel (it auto-reveals on Error),
-        // surface a one-line popup so it's noticed even when the panel is
-        // closed, and publish a diagnostic on each offending .cwt file so
-        // the Problems panel points at the exact line.
+        // Broken .cwt rules silently degrade every downstream check, so they are
+        // reported three ways: the log, a popup, and a diagnostic per file.
         let mut diags_by_file: std::collections::HashMap<String, Vec<Diagnostic>> =
             std::collections::HashMap::new();
         for err in &parse_errors {
@@ -541,17 +537,32 @@ impl Backend {
                     &crate::validate::DocLines::none(),
                 ));
         }
-        for (uri, diags) in diags_by_file {
-            if let Ok(url) = uri.parse() {
-                self.client.publish_diagnostics(url, diags, None).await;
+        // Dropped on the floor before `initialized`, so park them for the
+        // handshake to flush (#98).
+        if self
+            .state
+            .handshake_complete
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for (uri, diags) in diags_by_file {
+                if let Ok(url) = uri.parse() {
+                    self.client.publish_diagnostics(url, diags, None).await;
+                }
             }
+        } else {
+            self.state
+                .deferred_rule_diagnostics
+                .lock()
+                .extend(diags_by_file);
         }
-        if !parse_errors.is_empty() {
+        if let Some(first) = parse_errors.first() {
+            // Inline the first error: the popup is the only part a user is
+            // guaranteed to see, whatever their client names its output channel.
             self.client
                 .show_message(
                     MessageType::ERROR,
                     format!(
-                        "CWTools: {} rules-config error(s). See Output → CWTools for details.",
+                        "CWTools: {} rules-config error(s), first: {first}",
                         parse_errors.len()
                     ),
                 )

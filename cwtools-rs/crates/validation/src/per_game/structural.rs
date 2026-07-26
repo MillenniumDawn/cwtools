@@ -14,7 +14,7 @@ use super::common::as_block;
 use crate::{ValidationError, error_codes};
 use cwtools_game::constants::Game;
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
-use cwtools_parser::fix::SuggestedFix;
+use cwtools_parser::fix::{SuggestedFix, key_token_range};
 use cwtools_string_table::string_table::{StringId, StringTable};
 
 /// The implicit boolean context a node sits in, mirroring F#'s `BoolState`.
@@ -38,6 +38,7 @@ struct Keywords {
     not: StringId,
     if_: StringId,
     else_if: StringId,
+    else_: StringId,
     and: StringId,
     or: StringId,
     nor: StringId,
@@ -52,6 +53,7 @@ impl Keywords {
             not: table.intern("not").lower,
             if_: table.intern("if").lower,
             else_if: table.intern("else_if").lower,
+            else_: table.intern("else").lower,
             and: table.intern("and").lower,
             or: table.intern("or").lower,
             nor: table.intern("nor").lower,
@@ -110,6 +112,22 @@ fn is_empty_if(children: &[Child], ast: &ParsedFile, kw: &Keywords) -> bool {
     true
 }
 
+/// Deleting a block an `else_if`/`else` hangs off leaves the follower with no
+/// antecedent, which the game rejects.
+fn chain_follows(children: &[Child], idx: usize, ast: &ParsedFile, kw: &Keywords) -> bool {
+    for child in &children[idx + 1..] {
+        match child {
+            Child::Comment(_) => {}
+            Child::Leaf(i) => {
+                let key = ast.arena.leaves[*i as usize].key.lower;
+                return key == kw.else_if || key == kw.else_;
+            }
+            Child::LeafValue(_) => return false,
+        }
+    }
+    false
+}
+
 fn push(
     errors: &mut Vec<ValidationError>,
     code: &error_codes::ErrorCode,
@@ -150,7 +168,7 @@ fn walk(
     cw223_msg: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    for child in children {
+    for (idx, child) in children.iter().enumerate() {
         let Some(block) = as_block(child, ast) else {
             continue;
         };
@@ -173,26 +191,39 @@ fn walk(
 
         // CW223 — NOT with more than one child. The remediation differs by game
         // (HOI4 has no NOR/NAND triggers), so the message is chosen by the caller.
+        // A quoted key interns with its quotes and can never match `kw.not`, so
+        // the source token is always exactly `NOT`, 3 chars.
         if key == kw.not && non_comment_count(block.children) > 1 {
             push(
                 errors,
                 &error_codes::CW223_INCORRECT_NOT_USAGE,
                 cw223_msg.to_string(),
-                block.range,
+                key_token_range(block.range.start, 3),
                 file_path,
             );
         }
 
         // CW121 — empty if/else_if. Fix: delete the empty block.
         if (key == kw.if_ || key == kw.else_if) && is_empty_if(block.children, ast, kw) {
-            push_fix(
-                errors,
-                &error_codes::CW121_EMPTY_IF,
-                error_codes::CW121_EMPTY_IF.message_template.to_string(),
-                block.range,
-                file_path,
-                SuggestedFix::delete("Remove empty if", block.range),
-            );
+            let msg = error_codes::CW121_EMPTY_IF.message_template.to_string();
+            if chain_follows(children, idx, ast, kw) {
+                push(
+                    errors,
+                    &error_codes::CW121_EMPTY_IF,
+                    msg,
+                    block.range,
+                    file_path,
+                );
+            } else {
+                push_fix(
+                    errors,
+                    &error_codes::CW121_EMPTY_IF,
+                    msg,
+                    block.range,
+                    file_path,
+                    SuggestedFix::delete("Remove empty if", block.range),
+                );
+            }
         }
 
         // CW281 — a `limit = { }` with no trigger conditions. Fix: delete it.
@@ -317,12 +348,11 @@ mod tests {
         );
     }
 
-    // Task 18: a real emit carries the offending block's own SourceRange end, so
-    // the LSP can publish a precise squiggle. Locks the population wiring: the end
-    // must equal the NOT block's `pos.end`, not a re-derived or absent position.
+    // Issue #107: carrying the block's own range buried every line of the body
+    // under one squiggle.
     #[test]
-    fn diagnostic_carries_block_range_end() {
-        let src = "x = {\n    NOT = { a = 1 b = 2 }\n}\n";
+    fn cw223_underlines_only_the_not_key() {
+        let src = "x = {\n    NOT = {\n        a = 1\n        b = 2\n    }\n}\n";
         let table = StringTable::new();
         let ast = parse_string(src, &table).unwrap();
         let mut errors = Vec::new();
@@ -342,16 +372,59 @@ mod tests {
             .expect("NOT block present");
         assert_eq!(err.line, not_block.range.start.line);
         assert_eq!(err.col, not_block.range.start.col);
+
+        let (end_line, end_col) = err.end.expect("CW223 carries an end");
         assert_eq!(
-            err.end,
-            Some((not_block.range.end.line, not_block.range.end.col)),
-            "CW223 must carry the NOT block's exclusive range end"
+            end_line, not_block.range.start.line,
+            "stays on the NOT line"
+        );
+        assert_eq!(
+            end_col,
+            not_block.range.start.col + 3,
+            "spans `NOT` and nothing else"
+        );
+        assert!(
+            end_line < not_block.range.end.line,
+            "must not reach the block body"
         );
     }
 
     #[test]
     fn cw121_fix_deletes_empty_if() {
         assert_fix("CW121", "x = { if = { } }\n", "x = { }\n");
+    }
+
+    // The diagnostic still reports; only the chain-breaking edit is withheld.
+    #[test]
+    fn cw121_offers_no_fix_when_a_chain_follows() {
+        for src in [
+            "x = { if = { } else_if = { a = 1 } }\n",
+            "x = { if = { } else = { a = 1 } }\n",
+            "x = { if = { a = 1 } else_if = { } else = { b = 2 } }\n",
+        ] {
+            let table = StringTable::new();
+            let ast = parse_string(src, &table).unwrap();
+            let mut errors = Vec::new();
+            validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+
+            let err = errors
+                .iter()
+                .find(|e| e.code == Some("CW121"))
+                .unwrap_or_else(|| panic!("CW121 emitted for {src:?}, got {errors:?}"));
+            assert!(
+                err.fix.is_none(),
+                "CW121 must not offer a chain-breaking delete for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cw121_still_fixes_a_trailing_empty_else_if() {
+        assert_fix(
+            "CW121",
+            "x = { if = { a = 1 } else_if = { } }\n",
+            "x = { if = { a = 1 } }\n",
+        );
     }
 
     #[test]

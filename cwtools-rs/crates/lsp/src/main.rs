@@ -290,6 +290,12 @@ struct DocumentState {
     /// isn't indexed yet. The scan publishes the real diagnostics once the index
     /// is complete. Set `true` with no workspace folder (nothing to index).
     index_ready: std::sync::atomic::AtomicBool,
+    /// `false` until `initialized`. tower-lsp drops outgoing notifications until
+    /// then, so anything published during `initialize` never reaches the client.
+    handshake_complete: std::sync::atomic::AtomicBool,
+    /// Broken-`.cwt` diagnostics, parked because the rules load runs inside
+    /// `initialize` where the gate above would swallow them (#98).
+    deferred_rule_diagnostics: parking_lot::Mutex<Vec<(String, Vec<Diagnostic>)>>,
     /// Monotonic edit counter, bumped on every `did_change`. A debounced
     /// validation captures the value at spawn time; the cross-file dependent
     /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
@@ -490,6 +496,8 @@ impl DocumentState {
             client_work_done_progress: std::sync::atomic::AtomicBool::new(false),
             scan_progress_active: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
+            handshake_complete: std::sync::atomic::AtomicBool::new(false),
+            deferred_rule_diagnostics: parking_lot::Mutex::new(Vec::new()),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
             pending_changed_names: Mutex::new(HashSet::new()),
@@ -1059,6 +1067,17 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "CWTools server initialized!")
             .await;
+
+        // Notifications are only forwarded from here on.
+        self.state
+            .handshake_complete
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deferred = std::mem::take(&mut *self.state.deferred_rule_diagnostics.lock());
+        for (uri, diags) in deferred {
+            if let Ok(url) = uri.parse() {
+                self.client.publish_diagnostics(url, diags, None).await;
+            }
+        }
 
         // Workspace-wide initial validation spawned in background so the LSP
         // handshake returns promptly.
