@@ -239,13 +239,15 @@ fn walk(
         }
 
         // CW251 — redundant boolean nesting; also compute the child context.
+        // Advice about the operator keyword, so the range covers it alone; see
+        // the CW223 note above on why the source token length is known.
         let state = if key == kw.and {
             if parent == BoolState::And {
                 push(
                     errors,
                     &error_codes::CW251_UNNECESSARY_BOOLEAN,
                     error_codes::CW251_UNNECESSARY_BOOLEAN.format(&["AND"]),
-                    block.range,
+                    key_token_range(block.range.start, 3),
                     file_path,
                 );
             }
@@ -256,7 +258,7 @@ fn walk(
                     errors,
                     &error_codes::CW251_UNNECESSARY_BOOLEAN,
                     error_codes::CW251_UNNECESSARY_BOOLEAN.format(&["OR"]),
-                    block.range,
+                    key_token_range(block.range.start, 2),
                     file_path,
                 );
             }
@@ -387,6 +389,34 @@ mod tests {
             end_line < not_block.range.end.line,
             "must not reach the block body"
         );
+    }
+
+    // Same shape as CW223: advice about the operator keyword, so spanning the
+    // block buried the body under a squiggle.
+    #[test]
+    fn cw251_underlines_only_the_operator_key() {
+        // The root context is already AND, so the outer AND is the redundant one.
+        let and_src = "AND = {\n    tag = GER\n    has_war = no\n}\n";
+        // Inside an OR, the nested OR is the redundant one.
+        let or_src = "OR = {\n    OR = {\n        tag = GER\n        tag = FRA\n    }\n}\n";
+
+        for (src, line, col, len) in [(and_src, 1, 0, 3), (or_src, 2, 4, 2)] {
+            let table = StringTable::new();
+            let ast = parse_string(src, &table).unwrap();
+            let mut errors = Vec::new();
+            validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+
+            let err = errors
+                .iter()
+                .find(|e| e.code == Some("CW251"))
+                .unwrap_or_else(|| panic!("CW251 emitted for {src:?}, got {errors:?}"));
+            assert_eq!((err.line, err.col), (line, col), "{src:?}");
+            assert_eq!(
+                err.end,
+                Some((line, col + len)),
+                "CW251 must span only the operator key in {src:?}"
+            );
+        }
     }
 
     #[test]
