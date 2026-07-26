@@ -1380,18 +1380,30 @@ fn test_only_the_new_formats_divert_status_lines() {
         .stdout(predicate::str::starts_with("Scanning localisation in "));
 }
 
-/// Diagnostic hashes key on the file string, so `directory = "."` in a config
-/// must produce the same paths — and therefore the same baseline — as passing
-/// the directory on the command line.
+/// Diagnostic hashes are relative to the mod root, so `directory = "."` in a
+/// config must resolve to the same root — and therefore the same baseline —
+/// as passing the directory on the command line. The config lives inside the
+/// mod dir itself (as a real mod's `cwtools.toml` would, next to `common/`,
+/// `events/`, etc.), not `config_mod`'s layout one level up: `directory = "."`
+/// there names the mod's *parent*, a different root that happens to contain
+/// the same one file, which isn't the scenario this test is about.
 #[test]
 fn test_config_directory_dot_keeps_baseline_hashes_stable() {
-    let tmp = config_mod("directory = \".\"\n");
+    let tmp = tempfile::tempdir().unwrap();
     let mod_dir = tmp.path().join("mod");
+    let events = mod_dir.join("events");
+    std::fs::create_dir_all(&events).unwrap();
+    std::fs::copy(
+        fixtures_dir().join("discover/mod_a/events/test.txt"),
+        events.join("test.txt"),
+    )
+    .unwrap();
+    std::fs::write(mod_dir.join("cwtools.toml"), "directory = \".\"\n").unwrap();
     let rules_dir = fixtures_dir().join("rules");
     let hashes = |args: &[&str], cwd: &std::path::Path| {
         let out = tmp.path().join("h.txt");
-        let mut cmd = cwtools();
-        cmd.arg("validate")
+        cwtools()
+            .arg("validate")
             .args([
                 "--game",
                 "stellaris",
