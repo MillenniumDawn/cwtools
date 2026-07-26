@@ -745,9 +745,9 @@ impl Backend {
                         return None;
                     }
                     // Workspace scan covers files not open in an editor (open
-                    // ones are skipped above), so their text isn't held and
-                    // there's no squiggle to widen — pass no line info and keep
-                    // the cheap single-char range at the parser's own column.
+                    // ones are skipped above), so their text isn't held: no line
+                    // info, and the cheap single-char range at the parser's own
+                    // column. did_open republishes the precise range.
                     let no_lines = DocLines::none();
                     let diagnostics = match &prepared {
                         Some(prepared) => {

@@ -894,7 +894,15 @@ fn walk_dir_generic<T>(
 /// - `Unknown` otherwise
 pub fn classify_directory(dir: &Path) -> DirectoryType {
     let looks_like_game_folder = |d: &Path| -> bool {
-        for sub in &["common", "events", "interface", "gfx", "localisation"] {
+        for sub in &[
+            "common",
+            "events",
+            "interface",
+            "gfx",
+            "localisation",
+            "localisation_synced",
+            "localization",
+        ] {
             if d.join(sub).is_dir() {
                 return true;
             }

@@ -296,6 +296,10 @@ struct DocumentState {
     /// Broken-`.cwt` diagnostics, parked because the rules load runs inside
     /// `initialize` where the gate above would swallow them (#98).
     deferred_rule_diagnostics: parking_lot::Mutex<Vec<(String, Vec<Diagnostic>)>>,
+    /// URIs the last rules load published diagnostics for. A load only publishes
+    /// files that still have errors, so a repaired one needs an explicit clear or
+    /// its squiggle outlives the problem.
+    published_rule_uris: parking_lot::Mutex<HashSet<String>>,
     /// Monotonic edit counter, bumped on every `did_change`. A debounced
     /// validation captures the value at spawn time; the cross-file dependent
     /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
@@ -498,6 +502,7 @@ impl DocumentState {
             index_ready: std::sync::atomic::AtomicBool::new(false),
             handshake_complete: std::sync::atomic::AtomicBool::new(false),
             deferred_rule_diagnostics: parking_lot::Mutex::new(Vec::new()),
+            published_rule_uris: parking_lot::Mutex::new(HashSet::new()),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
             pending_changed_names: Mutex::new(HashSet::new()),

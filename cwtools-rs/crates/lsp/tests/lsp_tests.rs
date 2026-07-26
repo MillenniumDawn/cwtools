@@ -7017,3 +7017,95 @@ fn test_published_diagnostic_range_stays_on_its_own_line() {
     );
     assert_eq!(range["end"]["character"], 7, "range: {range}");
 }
+
+/// A `.cwt` that parsed badly and then parses cleanly has to have its squiggle
+/// taken back. Only files *with* errors are published, so without an explicit
+/// clear the stale diagnostic sits in the Problems panel forever.
+#[test]
+fn test_rules_config_diagnostics_clear_after_a_clean_reload() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let broken = rules_dir.path().join("broken.cwt");
+    std::fs::write(
+        &broken,
+        "types = {\n  type[foo] = { path = \"common/foo\" }\n}\nr = {\n  a = <undefined_thing>\n}\n",
+    )
+    .unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    // Repair the rules on disk, then ask the server to re-read them.
+    std::fs::write(
+        &broken,
+        "types = {\n  type[foo] = { path = \"common/foo\" }\n}\n",
+    )
+    .unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({"command": "reloadrulesconfig", "arguments": []}),
+        ),
+    )
+    .unwrap();
+
+    let stdin = child.stdin.take().unwrap();
+    let cleared = run_with_deadline(stdin, reader, 30, |_stdin, reader| {
+        for _ in 0..400 {
+            let Ok(raw) = read_frame(reader) else {
+                return false;
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("broken.cwt"))
+                && v["params"]["diagnostics"]
+                    .as_array()
+                    .is_some_and(|d| d.is_empty())
+            {
+                return true;
+            }
+        }
+        false
+    });
+    child.kill().ok();
+    assert_eq!(
+        cleared,
+        Some(true),
+        "the recovered .cwt never had its diagnostics cleared"
+    );
+}

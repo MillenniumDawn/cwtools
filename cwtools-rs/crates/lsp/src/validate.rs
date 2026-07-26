@@ -261,6 +261,12 @@ impl<'a> DocLines<'a> {
         Position { line, character }
     }
 
+    /// Whether any document text is held, i.e. whether positions can be resolved
+    /// against real lines. False for the workspace scan and the ruleset load.
+    fn has_text(&self) -> bool {
+        !self.lines.is_empty()
+    }
+
     /// LSP position for a parser range end (0-based `line`, 0-based char `col`),
     /// walked back over whitespace to the last content character.
     ///
@@ -269,15 +275,6 @@ impl<'a> DocLines<'a> {
     /// published verbatim bleeds onto the following line (#107). Floors at
     /// `start`, so the range cannot invert.
     fn clamped_end_position(&self, line: u32, col: u32, start: Position) -> Position {
-        // No document text (workspace scan, ruleset load): nothing to walk back
-        // over, so the parser's raw position is the best available.
-        if self.lines.is_empty() {
-            return Position {
-                line,
-                character: col,
-            };
-        }
-
         let (mut line, mut col) = (line, col);
         loop {
             let text = self.lines.get(line as usize).copied().unwrap_or("");
@@ -422,7 +419,12 @@ pub(crate) fn validation_error_to_diagnostic(
     // Fix edits are unaffected: they read `SuggestedFix.range`, which still needs
     // the untrimmed span to delete a line cleanly.
     // With `end` absent, the whole-line fallback stands byte-for-byte.
-    if let Some((end_line, end_col)) = err.end {
+    // Without text the end cannot be walked back off the following token, and
+    // publishing it raw bleeds onto the next line, so the whole-line fallback
+    // stands instead.
+    if let Some((end_line, end_col)) = err.end
+        && lines.has_text()
+    {
         diag.range.end = lines.clamped_end_position(
             end_line.saturating_sub(1),
             end_col as u32,
@@ -1771,6 +1773,30 @@ mod whole_line_range_tests {
         };
         let diag = validation_error_to_diagnostic(&err, &DocLines::none());
         assert_eq!(diag.range.start.character, 2);
+        assert_eq!(diag.range.end.character, 3);
+    }
+
+    // The workspace scan holds no file text, so there is nothing to walk the
+    // parser's end back over. Publishing it raw would bleed onto the next line
+    // for every file that is not open, which is most of the Problems panel.
+    #[test]
+    fn diagnostic_without_line_info_ignores_a_carried_end() {
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 5,
+            col: 2,
+            file: "f".into(),
+            code: Some("CW500"),
+            fix: None,
+            end: Some((6, 0)),
+        };
+        let diag = validation_error_to_diagnostic(&err, &DocLines::none());
+        assert_eq!(diag.range.start.line, 4);
+        assert_eq!(
+            diag.range.end.line, 4,
+            "must not spill onto a later line without text to clamp against"
+        );
         assert_eq!(diag.range.end.character, 3);
     }
 

@@ -537,6 +537,21 @@ impl Backend {
                     &crate::validate::DocLines::none(),
                 ));
         }
+        let mut to_publish: Vec<(String, Vec<Diagnostic>)> = diags_by_file.into_iter().collect();
+        // A load only reports files that still have errors, so anything reported
+        // last time and absent now has been repaired and needs an explicit clear.
+        {
+            let current: std::collections::HashSet<String> =
+                to_publish.iter().map(|(uri, _)| uri.clone()).collect();
+            let mut previous = self.state.published_rule_uris.lock();
+            to_publish.extend(
+                previous
+                    .difference(&current)
+                    .map(|uri| (uri.clone(), Vec::new())),
+            );
+            *previous = current;
+        }
+
         // Dropped on the floor before `initialized`, so park them for the
         // handshake to flush (#98).
         if self
@@ -544,7 +559,7 @@ impl Backend {
             .handshake_complete
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            for (uri, diags) in diags_by_file {
+            for (uri, diags) in to_publish {
                 if let Ok(url) = uri.parse() {
                     self.client.publish_diagnostics(url, diags, None).await;
                 }
@@ -553,7 +568,7 @@ impl Backend {
             self.state
                 .deferred_rule_diagnostics
                 .lock()
-                .extend(diags_by_file);
+                .extend(to_publish);
         }
         if let Some(first) = parse_errors.first() {
             // Inline the first error: the popup is the only part a user is
