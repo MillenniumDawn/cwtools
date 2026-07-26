@@ -3456,13 +3456,15 @@ fn perf_parse_summary(line: &str) -> Option<std::collections::HashMap<String, St
 #[test]
 #[ignore]
 fn perf_completion_md() {
-    let mod_dir = std::env::var("CWTOOLS_PERF_MOD")
-        .unwrap_or_else(|_| "/mnt/Linux/Millennium-Dawn".to_string());
-    let mod_path = std::path::PathBuf::from(&mod_dir);
+    let mod_dir = perf_expand_tilde(
+        &std::env::var("CWTOOLS_PERF_MOD")
+            .unwrap_or_else(|_| "~/Documents/github-projects/Millennium-Dawn".to_string()),
+    );
+    let mod_path = mod_dir.clone();
     if !mod_path.is_dir() {
         eprintln!(
             "perf_completion_md: skipping, mod dir not found: {}",
-            mod_dir
+            mod_dir.display()
         );
         return;
     }
@@ -3471,8 +3473,10 @@ fn perf_completion_md() {
         perf_expand_tilde(&std::env::var("CWTOOLS_PERF_VANILLA").unwrap_or_else(|_| {
             "~/.local/share/Steam/steamapps/common/Hearts of Iron IV".to_string()
         }));
-    let rules_repo = std::env::var("CWTOOLS_PERF_RULES")
-        .unwrap_or_else(|_| "/mnt/Linux/github-projects/cwtools-hoi4-config".to_string());
+    let rules_repo = perf_expand_tilde(
+        &std::env::var("CWTOOLS_PERF_RULES")
+            .unwrap_or_else(|_| "~/Documents/github-projects/cwtools-hoi4-config".to_string()),
+    );
     // The repo stores the raw `.cwt` files under `Config/`, not at the repo
     // root — matches how `rulesCache` is consumed in config.rs.
     let rules_dir = std::path::PathBuf::from(&rules_repo).join("Config");

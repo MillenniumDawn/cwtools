@@ -1372,7 +1372,7 @@ mod perf_bench {
         };
         let rules_dir = expand(
             &std::env::var("CWTOOLS_PERF_RULES")
-                .unwrap_or_else(|_| "/mnt/Linux/github-projects/cwtools-hoi4-config".to_string()),
+                .unwrap_or_else(|_| "~/Documents/github-projects/cwtools-hoi4-config".to_string()),
         )
         .join("Config");
         let vanilla = expand(&std::env::var("CWTOOLS_PERF_VANILLA").unwrap_or_else(|_| {
