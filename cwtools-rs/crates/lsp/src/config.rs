@@ -544,9 +544,14 @@ impl Backend {
             let current: std::collections::HashSet<String> =
                 to_publish.iter().map(|(uri, _)| uri.clone()).collect();
             let mut previous = self.state.published_rule_uris.lock();
+            let open = self.state.documents.lock();
             to_publish.extend(
                 previous
                     .difference(&current)
+                    // An open editor buffer owns its diagnostics: the live `.cwt`
+                    // lint republishes it, and clearing here would blank a dirty
+                    // buffer's squiggles until the next keystroke.
+                    .filter(|uri| !open.contains_key(*uri))
                     .map(|uri| (uri.clone(), Vec::new())),
             );
             *previous = current;
