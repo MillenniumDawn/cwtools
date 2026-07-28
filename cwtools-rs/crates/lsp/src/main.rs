@@ -308,6 +308,15 @@ struct DocumentState {
     /// Broken-`.cwt` diagnostics, parked because the rules load runs inside
     /// `initialize` where the gate above would swallow them (#98).
     deferred_rule_diagnostics: parking_lot::Mutex<Vec<(String, Vec<Diagnostic>)>>,
+    /// The rules load's user-visible messages (per-error log lines, the error
+    /// toast), parked the same way as the diagnostics above (#98).
+    deferred_rules_messages: parking_lot::Mutex<Vec<DeferredRulesMessage>>,
+    /// Order-independent key (sorted error strings) of the last rules-error
+    /// set toasted this session. The client fires `reloadrulesconfig` at boot
+    /// right after `initialize` already loaded the rules, so an unchanged
+    /// error set must not toast twice; a different set (a real reload) still
+    /// does.
+    last_rules_toast: parking_lot::Mutex<Option<String>>,
     /// URIs the last rules load published diagnostics for. A load only publishes
     /// files that still have errors, so a repaired one needs an explicit clear or
     /// its squiggle outlives the problem.
@@ -461,6 +470,13 @@ pub(crate) struct AstSnapshot {
     pub(crate) source: AstSource,
 }
 
+/// A user-visible rules-load message parked until `initialized` (#98): `Log`
+/// lines go to the client's output channel, `Toast` to a popup.
+pub(crate) enum DeferredRulesMessage {
+    Log(String),
+    Toast(String),
+}
+
 /// What kicked off a `parse_and_validate` call. Threaded through so the
 /// `[validate]` log names its trigger, which makes a validate storm's source
 /// legible in the server log (issue #90) instead of a wall of identical lines.
@@ -515,6 +531,8 @@ impl DocumentState {
             index_ready: std::sync::atomic::AtomicBool::new(false),
             handshake_complete: std::sync::atomic::AtomicBool::new(false),
             deferred_rule_diagnostics: parking_lot::Mutex::new(Vec::new()),
+            deferred_rules_messages: parking_lot::Mutex::new(Vec::new()),
+            last_rules_toast: parking_lot::Mutex::new(None),
             published_rule_uris: parking_lot::Mutex::new(HashSet::new()),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
@@ -1094,6 +1112,17 @@ impl LanguageServer for Backend {
         for (uri, diags) in deferred {
             if let Ok(url) = uri.parse() {
                 self.client.publish_diagnostics(url, diags, None).await;
+            }
+        }
+        let deferred_msgs = std::mem::take(&mut *self.state.deferred_rules_messages.lock());
+        for msg in deferred_msgs {
+            match msg {
+                DeferredRulesMessage::Log(text) => {
+                    self.client.log_message(MessageType::ERROR, text).await;
+                }
+                DeferredRulesMessage::Toast(text) => {
+                    self.client.show_message(MessageType::ERROR, text).await;
+                }
             }
         }
 

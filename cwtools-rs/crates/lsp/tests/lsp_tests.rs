@@ -7575,3 +7575,143 @@ fn test_rules_config_diagnostics_clear_after_a_clean_reload() {
         "the recovered .cwt never had its diagnostics cleared"
     );
 }
+
+/// #98: the rules-error toast fired inside `initialize`, where tower-lsp drops
+/// notifications, and again from the boot-time `reloadrulesconfig` the client
+/// sends after its rules clone. It must arrive exactly once, after the
+/// handshake; an unchanged error set must not toast again; a changed one must —
+/// even one that keeps the same count and the same first error, which the
+/// displayed summary alone cannot distinguish.
+#[test]
+fn test_rules_config_toast_defers_to_initialized_and_dedupes() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let broken = rules_dir.path().join("broken.cwt");
+    std::fs::write(
+        &broken,
+        "types = {\n  type[foo] = { path = \"common/foo\" }\n}\nr = {\n  a = <undefined_thing>\n  b = <also_missing>\n}\n",
+    )
+    .unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    let broken_path = broken.clone();
+    let stdin = child.stdin.take().unwrap();
+    let phases = run_with_deadline(stdin, reader, 60, move |stdin, reader| {
+        let is_toast = |v: &serde_json::Value| v["method"] == "window/showMessage";
+        // Toasts seen until a response with `id` arrives; None = frame cap hit.
+        let toasts_until_response =
+            |reader: &mut BufReader<std::process::ChildStdout>, id: i64| -> Option<usize> {
+                let mut n = 0usize;
+                for _ in 0..400 {
+                    let raw = read_frame(reader).ok()?;
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                        continue;
+                    };
+                    if is_toast(&v) {
+                        n += 1;
+                    }
+                    if v["id"] == id {
+                        return Some(n);
+                    }
+                }
+                None
+            };
+
+        // Phase 1: the deferred boot toast arrives with no further prompting.
+        let mut boot_toast = false;
+        for _ in 0..400 {
+            let Ok(raw) = read_frame(reader) else {
+                return None;
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+                && is_toast(&v)
+            {
+                boot_toast = true;
+                break;
+            }
+        }
+
+        // Phase 2: reloading the same broken rules must not toast again.
+        write_frame_to(
+            stdin,
+            &jsonrpc_request(
+                2,
+                "workspace/executeCommand",
+                serde_json::json!({"command": "reloadrulesconfig", "arguments": []}),
+            ),
+        )
+        .ok()?;
+        let same_reload = toasts_until_response(reader, 2)?;
+
+        // Phase 3: a different error set toasts again — here one that keeps
+        // the count (2) and the first error, so a summary-keyed dedupe would
+        // wrongly swallow it.
+        std::fs::write(
+            &broken_path,
+            "types = {\n  type[foo] = { path = \"common/foo\" }\n}\nr = {\n  a = <undefined_thing>\n  b = <other_thing>\n}\n",
+        )
+        .ok()?;
+        write_frame_to(
+            stdin,
+            &jsonrpc_request(
+                3,
+                "workspace/executeCommand",
+                serde_json::json!({"command": "reloadrulesconfig", "arguments": []}),
+            ),
+        )
+        .ok()?;
+        let changed_reload = toasts_until_response(reader, 3)?;
+
+        Some((boot_toast, same_reload, changed_reload))
+    });
+    child.kill().ok();
+
+    let (boot_toast, same_reload, changed_reload) =
+        phases.flatten().expect("server went quiet mid-test");
+    assert!(
+        boot_toast,
+        "the boot rules-error toast must arrive after `initialized`, not be dropped"
+    );
+    assert_eq!(
+        same_reload, 0,
+        "reloading an unchanged error set must not toast again"
+    );
+    assert_eq!(
+        changed_reload, 1,
+        "a changed error set must toast exactly once"
+    );
+}

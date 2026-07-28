@@ -520,13 +520,33 @@ impl Backend {
             load_ruleset_from_dir(cache_path, &self.state.string_table);
 
         // Broken .cwt rules silently degrade every downstream check, so they are
-        // reported three ways: the log, a popup, and a diagnostic per file.
+        // reported three ways: the log, a popup, and a diagnostic per file. All
+        // three are user-visible and all can run inside `initialize`, where
+        // tower-lsp drops outgoing notifications — so each defers through the
+        // handshake gate below (#98). Snapshotting once is sound only while the
+        // park sites run await-free from here: an `.await` between a stale
+        // `false` and a park would let the `initialized` flush slip past and
+        // strand the parked message forever.
+        let handshake_complete = self
+            .state
+            .handshake_complete
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if handshake_complete {
+            for err in &parse_errors {
+                self.client
+                    .log_message(MessageType::ERROR, err.to_string())
+                    .await;
+            }
+        } else {
+            self.state.deferred_rules_messages.lock().extend(
+                parse_errors
+                    .iter()
+                    .map(|err| crate::DeferredRulesMessage::Log(err.to_string())),
+            );
+        }
         let mut diags_by_file: std::collections::HashMap<String, Vec<Diagnostic>> =
             std::collections::HashMap::new();
         for err in &parse_errors {
-            self.client
-                .log_message(MessageType::ERROR, err.to_string())
-                .await;
             // Shared with the live per-file CWT lint (#43). No file text
             // here to widen the squiggle, so pass no line info.
             diags_by_file
@@ -559,11 +579,7 @@ impl Backend {
 
         // Dropped on the floor before `initialized`, so park them for the
         // handshake to flush (#98).
-        if self
-            .state
-            .handshake_complete
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if handshake_complete {
             for (uri, diags) in to_publish {
                 if let Ok(url) = uri.parse() {
                     self.client.publish_diagnostics(url, diags, None).await;
@@ -576,17 +592,51 @@ impl Backend {
                 .extend(to_publish);
         }
         if let Some(first) = parse_errors.first() {
-            // Inline the first error: the popup is the only part a user is
-            // guaranteed to see, whatever their client names its output channel.
-            self.client
-                .show_message(
-                    MessageType::ERROR,
-                    format!(
-                        "CWTools: {} rules-config error(s), first: {first}",
-                        parse_errors.len()
-                    ),
-                )
-                .await;
+            // Inline the first error: the client never auto-reveals its output
+            // channel (RevealOutputChannelOn.Never), so the popup is the only
+            // part a user is guaranteed to see.
+            let summary = format!(
+                "CWTools: {} rules-config error(s), first: {first}",
+                parse_errors.len()
+            );
+            // Dedupe on the full error set, order-independent: `first` follows
+            // read_dir traversal order, so the same set could summarize
+            // differently across the boot double-load, and two different sets
+            // can share a count and a first error.
+            let dedupe_key = {
+                let mut errs: Vec<String> = parse_errors.iter().map(|e| e.to_string()).collect();
+                errs.sort_unstable();
+                errs.join("\n")
+            };
+            let is_new = {
+                let mut last = self.state.last_rules_toast.lock();
+                if last.as_deref() == Some(dedupe_key.as_str()) {
+                    false
+                } else {
+                    *last = Some(dedupe_key);
+                    true
+                }
+            };
+            if is_new {
+                // Re-read the gate: a toast parked after the flush ran would sit
+                // forever while the dedupe key above already claimed it.
+                if self
+                    .state
+                    .handshake_complete
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.client.show_message(MessageType::ERROR, summary).await;
+                } else {
+                    self.state
+                        .deferred_rules_messages
+                        .lock()
+                        .push(crate::DeferredRulesMessage::Toast(summary));
+                }
+            }
+        } else {
+            // A clean load forgets the last toast, so the same errors coming
+            // back later in the session toast again.
+            *self.state.last_rules_toast.lock() = None;
         }
 
         let loaded = !combined_ruleset.types.is_empty()
