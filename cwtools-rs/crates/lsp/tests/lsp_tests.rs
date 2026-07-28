@@ -3456,13 +3456,15 @@ fn perf_parse_summary(line: &str) -> Option<std::collections::HashMap<String, St
 #[test]
 #[ignore]
 fn perf_completion_md() {
-    let mod_dir = std::env::var("CWTOOLS_PERF_MOD")
-        .unwrap_or_else(|_| "/mnt/Linux/Millennium-Dawn".to_string());
-    let mod_path = std::path::PathBuf::from(&mod_dir);
+    let mod_dir = perf_expand_tilde(
+        &std::env::var("CWTOOLS_PERF_MOD")
+            .unwrap_or_else(|_| "~/Documents/github-projects/Millennium-Dawn".to_string()),
+    );
+    let mod_path = mod_dir.clone();
     if !mod_path.is_dir() {
         eprintln!(
             "perf_completion_md: skipping, mod dir not found: {}",
-            mod_dir
+            mod_dir.display()
         );
         return;
     }
@@ -3471,8 +3473,10 @@ fn perf_completion_md() {
         perf_expand_tilde(&std::env::var("CWTOOLS_PERF_VANILLA").unwrap_or_else(|_| {
             "~/.local/share/Steam/steamapps/common/Hearts of Iron IV".to_string()
         }));
-    let rules_repo = std::env::var("CWTOOLS_PERF_RULES")
-        .unwrap_or_else(|_| "/mnt/Linux/github-projects/cwtools-hoi4-config".to_string());
+    let rules_repo = perf_expand_tilde(
+        &std::env::var("CWTOOLS_PERF_RULES")
+            .unwrap_or_else(|_| "~/Documents/github-projects/cwtools-hoi4-config".to_string()),
+    );
     // The repo stores the raw `.cwt` files under `Config/`, not at the repo
     // root — matches how `rulesCache` is consumed in config.rs.
     let rules_dir = std::path::PathBuf::from(&rules_repo).join("Config");
@@ -6841,5 +6845,271 @@ fn test_did_change_workspace_folders_repoints_and_rescans() {
         saw,
         Some(true),
         "the new workspace folder was never scanned"
+    );
+}
+
+// ── #98: rules-config errors reach the Problems panel ────────────────────────
+
+/// The rules load runs inside `initialize`, where tower-lsp drops notifications,
+/// so the diagnostics behind the "N rules-config error(s)" popup went nowhere.
+#[test]
+fn test_rules_config_errors_publish_after_initialized() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        rules_dir.path().join("broken.cwt"),
+        "types = {\n  type[foo] = { path = \"common/foo\" }\n}\nr = {\n  a = <undefined_thing>\n  b = <also_missing>\n}\n",
+    )
+    .unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+
+    let body = jsonrpc_notification("initialized", serde_json::json!({}));
+    write_frame(&mut child, &body).unwrap();
+
+    let stdin = child.stdin.take().unwrap();
+    let saw = run_with_deadline(stdin, reader, 30, |_stdin, reader| {
+        for _ in 0..400 {
+            let Ok(raw) = read_frame(reader) else {
+                return false;
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("broken.cwt"))
+                && v["params"]["diagnostics"]
+                    .as_array()
+                    .is_some_and(|d| !d.is_empty())
+            {
+                return true;
+            }
+        }
+        false
+    });
+    child.kill().ok();
+    assert_eq!(
+        saw,
+        Some(true),
+        "no diagnostics published for the broken .cwt file"
+    );
+}
+
+// ── #107: published diagnostic ranges do not bleed past the statement ─────────
+
+/// Nothing asserted a published diagnostic's range end, which is how the parser's
+/// whitespace-absorbing `SourceRange.end` reached users as a squiggle running a
+/// line long. CW223 needs no rules to fire, so this is a pure range check.
+#[test]
+fn test_published_diagnostic_range_stays_on_its_own_line() {
+    let ws = tempfile::tempdir().unwrap();
+    let rel = "common/scripted_effects/e.txt";
+    let text = "my_effect = {\n    NOT = { a = 1 b = 2 }\n    x = yes\n}\n";
+    let p = ws.path().join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, text).unwrap();
+
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        rules_dir.path().join("types.cwt"),
+        "types = {\n    type[scripted_effect] = {\n        path = \"game/common/scripted_effects\"\n    }\n}\n",
+    )
+    .unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    let doc_uri = path_uri(&p);
+    let body = jsonrpc_notification(
+        "textDocument/didOpen",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri, "languageId": "hoi4", "version": 1, "text": text }
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+
+    let stdin = child.stdin.take().unwrap();
+    let found = run_with_deadline(stdin, reader, 30, |_stdin, reader| {
+        for _ in 0..400 {
+            let Ok(raw) = read_frame(reader) else {
+                return None;
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if v["method"] != "textDocument/publishDiagnostics"
+                || !v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("e.txt"))
+            {
+                continue;
+            }
+            if let Some(d) = v["params"]["diagnostics"]
+                .as_array()
+                .and_then(|ds| ds.iter().find(|d| d["code"] == "CW223"))
+            {
+                return Some(d["range"].clone());
+            }
+        }
+        None
+    });
+    child.kill().ok();
+
+    let range = found.flatten().expect("no CW223 diagnostic published");
+    // `NOT` sits at line index 1, columns 4..7.
+    assert_eq!(range["start"]["line"], 1, "range: {range}");
+    assert_eq!(range["start"]["character"], 4, "range: {range}");
+    assert_eq!(
+        range["end"]["line"], 1,
+        "must not spill onto a later line: {range}"
+    );
+    assert_eq!(range["end"]["character"], 7, "range: {range}");
+}
+
+/// A `.cwt` that parsed badly and then parses cleanly has to have its squiggle
+/// taken back. Only files *with* errors are published, so without an explicit
+/// clear the stale diagnostic sits in the Problems panel forever.
+#[test]
+fn test_rules_config_diagnostics_clear_after_a_clean_reload() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let broken = rules_dir.path().join("broken.cwt");
+    std::fs::write(
+        &broken,
+        "types = {\n  type[foo] = { path = \"common/foo\" }\n}\nr = {\n  a = <undefined_thing>\n}\n",
+    )
+    .unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    // Repair the rules on disk, then ask the server to re-read them.
+    std::fs::write(
+        &broken,
+        "types = {\n  type[foo] = { path = \"common/foo\" }\n}\n",
+    )
+    .unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({"command": "reloadrulesconfig", "arguments": []}),
+        ),
+    )
+    .unwrap();
+
+    let stdin = child.stdin.take().unwrap();
+    let cleared = run_with_deadline(stdin, reader, 30, |_stdin, reader| {
+        for _ in 0..400 {
+            let Ok(raw) = read_frame(reader) else {
+                return false;
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("broken.cwt"))
+                && v["params"]["diagnostics"]
+                    .as_array()
+                    .is_some_and(|d| d.is_empty())
+            {
+                return true;
+            }
+        }
+        false
+    });
+    child.kill().ok();
+    assert_eq!(
+        cleared,
+        Some(true),
+        "the recovered .cwt never had its diagnostics cleared"
     );
 }

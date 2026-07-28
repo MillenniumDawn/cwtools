@@ -134,12 +134,10 @@ fn walk_if_else(
         // CW253 — deprecated set_empire_name / set_planet_name.
         if key == "set_empire_name" || key == "set_planet_name" {
             // Fix: rename just the key token to `set_name` (the block body is
-            // unchanged). Span covers the key on its start line.
-            let fix = SuggestedFix::replace(
-                "Rename to set_name",
-                key_token_range(block.range.start, key.chars().count()),
-                "set_name",
-            );
+            // unchanged). The squiggle covers the same span, since the body is
+            // not what's deprecated.
+            let key_range = key_token_range(block.range.start, key.chars().count());
+            let fix = SuggestedFix::replace("Rename to set_name", key_range, "set_name");
             errors.push(
                 ValidationError::from_code(
                     &error_codes::CW253_DEPRECATED_SET_NAME,
@@ -149,7 +147,7 @@ fn walk_if_else(
                     &[],
                 )
                 .with_fix(fix)
-                .with_end(block.range.end),
+                .with_end(key_range.end),
             );
         }
 

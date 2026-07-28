@@ -351,8 +351,9 @@ pub(crate) fn is_loc_file(uri: &str) -> bool {
 
 /// Directory names the game (and the loc walker) treat as localisation roots.
 /// Mirrors `cwtools_localization`'s private `is_loc_dir_name`, which isn't
-/// exported for the LSP to call.
-const LOC_DIR_NAMES: [&str; 2] = ["localisation", "localization"];
+/// exported for the LSP to call, and the client's own list in
+/// `release/package.json` (activation event and file-watcher glob).
+const LOC_DIR_NAMES: [&str; 3] = ["localisation", "localisation_synced", "localization"];
 
 /// Whether a URI has a localisation file extension (`.yml` / `.yaml` / `.csv`),
 /// wherever it lives. The wider test behind [`is_loc_file`]: a loc-extension
@@ -618,6 +619,21 @@ mod tests {
         ));
         // A file merely NAMED like the directory isn't loc.
         assert!(!is_loc_file("file:///mod/localisation.yml"));
+    }
+
+    // The client treats this as loc in three places (activation event, watcher
+    // glob, language detection); disagreeing here stripped the files of features.
+    #[test]
+    fn is_loc_file_accepts_the_synced_localisation_directory() {
+        assert!(is_loc_file(
+            "file:///mod/localisation_synced/foo_l_english.yml"
+        ));
+        assert!(is_loc_file(
+            "file:///mod/localisation_synced/replace/foo_l_english.yml"
+        ));
+        assert!(is_loc_file(
+            "file:///MOD/Localisation_Synced/FOO_l_english.YML"
+        ));
     }
 
     #[test]

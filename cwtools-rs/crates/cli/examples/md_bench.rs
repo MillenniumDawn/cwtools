@@ -2,14 +2,22 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() {
-    let dirs = vec![
-        "/mnt/Linux/Millennium-Dawn/common/countries",
-        "/mnt/Linux/Millennium-Dawn/common/ideas",
-        "/mnt/Linux/Millennium-Dawn/common/national_focus",
-        "/mnt/Linux/Millennium-Dawn/common/decisions",
-        "/mnt/Linux/Millennium-Dawn/events",
-        "/mnt/Linux/Millennium-Dawn/history",
-    ];
+    // Sibling checkout of this repo; override with CWTOOLS_MD_DIR.
+    let md = std::env::var("CWTOOLS_MD_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/Documents/github-projects/Millennium-Dawn")
+    });
+    let dirs: Vec<String> = [
+        "common/countries",
+        "common/ideas",
+        "common/national_focus",
+        "common/decisions",
+        "events",
+        "history",
+    ]
+    .iter()
+    .map(|sub| format!("{md}/{sub}"))
+    .collect();
 
     let mut total_files = 0usize;
     let mut total_leaves = 0usize;

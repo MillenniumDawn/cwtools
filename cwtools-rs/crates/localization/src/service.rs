@@ -180,7 +180,7 @@ fn parse_loc_file_entry(
 /// True for a directory name the game treats as a localisation root.
 fn is_loc_dir_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower == "localisation" || lower == "localization"
+    lower == "localisation" || lower == "localisation_synced" || lower == "localization"
 }
 
 /// Tooling / VCS / build directories that never hold game loc. Skipped during the
@@ -390,6 +390,32 @@ mod tests {
                 .path
                 .replace('\\', "/")
                 .ends_with("localisation/good_l_english.yml")
+        );
+    }
+
+    // Skipping this directory left every key defined there out of the index, so
+    // script referencing them read as missing.
+    #[test]
+    fn from_folder_loads_the_synced_localisation_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("localisation_synced")).unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("localisation_synced")
+                .join("good_l_english.yml"),
+            r#"l_english:
+ key:0 "v"
+"#,
+        )
+        .unwrap();
+
+        let svc = LocService::from_folder(tmp.path());
+        assert_eq!(svc.files().len(), 1);
+        assert!(
+            svc.files()[0]
+                .path
+                .replace('\\', "/")
+                .ends_with("localisation_synced/good_l_english.yml")
         );
     }
 
