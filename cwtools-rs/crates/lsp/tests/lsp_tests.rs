@@ -4132,13 +4132,27 @@ fn storm_server(
     rules_dir: &std::path::Path,
     vanilla: &std::path::Path,
 ) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
+    storm_server_env(ws, rules_dir, vanilla, &[])
+}
+
+/// [`storm_server`] with extra environment variables (test-only server knobs
+/// like `CWTOOLS_SCAN_HOLD_MS`).
+fn storm_server_env(
+    ws: &std::path::Path,
+    rules_dir: &std::path::Path,
+    vanilla: &std::path::Path,
+    extra_env: &[(&str, &str)],
+) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
     let ws_uri = path_uri(ws);
-    let mut child = cwtools_server_cmd()
-        // The `[validate]` line is a tracing event now, read back via
-        // exportProfilingLog. env_remove so init_tracing installs the `info`
-        // filter instead of an empty RUST_LOG="" that would capture nothing.
-        .env_remove("RUST_LOG")
-        .env("CWTOOLS_PROFILE", "1")
+    let mut cmd = cwtools_server_cmd();
+    // The `[validate]` line is a tracing event now, read back via
+    // exportProfilingLog. env_remove so init_tracing installs the `info`
+    // filter instead of an empty RUST_LOG="" that would capture nothing.
+    cmd.env_remove("RUST_LOG").env("CWTOOLS_PROFILE", "1");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -4281,6 +4295,16 @@ fn write_disk_file(ws: &std::path::Path, rel: &str, content: &str) -> String {
     path_uri(&path)
 }
 
+/// Write a BOM + `l_english:`-headed loc file on disk and return its URI.
+fn write_loc_file(ws: &std::path::Path, rel: &str, body: &str) -> String {
+    let path = ws.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(format!("l_english:\n{body}").as_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    path_uri(&path)
+}
+
 #[test]
 fn test_watched_repeated_change_coalesces_to_one_validate() {
     // Ten CHANGED events for the same non-open file, each in its own
@@ -4398,6 +4422,218 @@ fn test_watched_bulk_flood_uses_rescan_not_per_file() {
     assert!(
         publishes > 0,
         "the bulk rescan should still republish workspace diagnostics"
+    );
+}
+
+#[test]
+fn test_watched_overcap_batch_does_not_spin_against_running_scan() {
+    // An over-cap batch that loses the rescan CAS to an in-flight scan used to
+    // requeue and immediately re-arm, retrying (and logging "over cap") every
+    // 500ms window for the scan's whole duration (#90 residual). It must park
+    // the requeue for the scan winner to drain once: one over-cap line for the
+    // losing drain, one for the winner-armed drain that runs the real rescan.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    // Hold every scan open for 4s so the watched drain reliably lands mid-scan.
+    let (mut child, reader) = storm_server_env(
+        ws.path(),
+        rules_dir.path(),
+        vanilla.path(),
+        &[("CWTOOLS_SCAN_HOLD_MS", "4000")],
+    );
+    let n = 205usize;
+    let uris: Vec<String> = (0..n)
+        .map(|i| write_disk_file(ws.path(), &format!("common/decisions/s{i}.txt"), STORM_FILE))
+        .collect();
+    let rx = spawn_frame_collector(reader);
+
+    // Start a scan, then flood while it holds the CAS.
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            900,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    write_frame(&mut child, &watched_changes(&uris)).unwrap();
+
+    // Quiet must outlast the held rescan so the whole story is observed.
+    let _ = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(5500),
+        std::time::Duration::from_secs(30),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1004);
+    child.kill().ok();
+
+    assert_eq!(
+        log.matches("watched batch over cap").count(),
+        2,
+        "a lost-CAS over-cap batch must be drained exactly once after the scan \
+         (loser + winner-armed retry), not retried every window"
+    );
+    assert_eq!(
+        count_validate_log(&log, "watched"),
+        0,
+        "the requeued flood must still collapse into a rescan, not per-file validations"
+    );
+}
+
+#[test]
+fn test_watched_loc_value_change_does_not_sweep_open_loc_files() {
+    // A watched change to a NON-open loc file must stay out of the live overlay
+    // (that map is open-doc state): before this fix its first sight treated the
+    // whole file as changed and swept every other open loc file. Same keys, new
+    // value — the open loc file must not be republished.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    let watched_uri = write_loc_file(
+        ws.path(),
+        "localisation/watched_l_english.yml",
+        " W_KEY:0 \"one\"\n",
+    );
+    let open_text = "\u{FEFF}l_english:\n OPEN_KEY:0 \"hi\"\n";
+    let open_uri = write_loc_file(
+        ws.path(),
+        "localisation/open_l_english.yml",
+        " OPEN_KEY:0 \"hi\"\n",
+    );
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":open_uri,"languageId":"paradox","version":1,"text":open_text}}),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, "open_l_english.yml", 1).expect("didOpen publish");
+    let rx = spawn_frame_collector(reader);
+
+    write_loc_file(
+        ws.path(),
+        "localisation/watched_l_english.yml",
+        " W_KEY:0 \"two\"\n",
+    );
+    write_frame(
+        &mut child,
+        &watched_changes(std::slice::from_ref(&watched_uri)),
+    )
+    .unwrap();
+
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    child.kill().ok();
+
+    assert_eq!(
+        count_publishes(&frames, "watched_l_english.yml"),
+        1,
+        "the watched loc file itself should be validated and published once"
+    );
+    assert_eq!(
+        count_publishes(&frames, "open_l_english.yml"),
+        0,
+        "a watched loc change with unchanged keys must not sweep open loc files"
+    );
+}
+
+#[test]
+fn test_watched_loc_new_keys_resolve_cross_file_with_one_sweep() {
+    // New keys in watched (non-open) loc files must still reach cross-file
+    // validation (the loc index, not the overlay), and a batch of loc files
+    // must produce ONE coalesced sweep of the open loc files, not one per file.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    let b_uri = write_loc_file(
+        ws.path(),
+        "localisation/b_l_english.yml",
+        " B_KEY:0 \"b\"\n",
+    );
+    let c_uri = write_loc_file(
+        ws.path(),
+        "localisation/c_l_english.yml",
+        " C_KEY:0 \"c\"\n",
+    );
+    // CW225 only fires for refs with lowercase letters (uppercase may be a
+    // game variable), so the refs are spelled lowercase.
+    let open_text = "\u{FEFF}l_english:\n OPEN_KEY:0 \"see $new_key$ and $new_key2$\"\n";
+    let open_uri = write_loc_file(
+        ws.path(),
+        "localisation/open_l_english.yml",
+        " OPEN_KEY:0 \"see $new_key$ and $new_key2$\"\n",
+    );
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":open_uri,"languageId":"paradox","version":1,"text":open_text}}),
+        ),
+    )
+    .unwrap();
+    let codes = diags_for(&mut reader, "open_l_english.yml", 1).expect("didOpen publish");
+    assert!(
+        codes.contains(&"CW225".to_string()),
+        "the open file's refs must be unresolved before the watched batch, got: {codes:?}"
+    );
+    let rx = spawn_frame_collector(reader);
+
+    write_loc_file(
+        ws.path(),
+        "localisation/b_l_english.yml",
+        " B_KEY:0 \"b\"\n NEW_KEY:0 \"n1\"\n",
+    );
+    write_loc_file(
+        ws.path(),
+        "localisation/c_l_english.yml",
+        " C_KEY:0 \"c\"\n NEW_KEY2:0 \"n2\"\n",
+    );
+    write_frame(&mut child, &watched_changes(&[b_uri, c_uri])).unwrap();
+
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    child.kill().ok();
+
+    let open_publishes: Vec<&serde_json::Value> = frames
+        .iter()
+        .filter(|v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("open_l_english.yml"))
+        })
+        .collect();
+    assert_eq!(
+        open_publishes.len(),
+        1,
+        "a batch of watched loc files must sweep the open loc files once, not per file"
+    );
+    let codes: Vec<String> = open_publishes[0]["params"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["code"].as_str().map(String::from))
+        .collect();
+    assert!(
+        !codes.contains(&"CW225".to_string()),
+        "keys added by watched loc files must resolve cross-file, got: {codes:?}"
     );
 }
 

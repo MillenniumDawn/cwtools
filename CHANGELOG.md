@@ -1,3 +1,10 @@
+# 2.5.0
+
+## Bug Fixes
+
+- A bulk file change landing while a workspace scan was already running made the server retry every half second for the scan's whole duration. An over-cap watched batch collapses into one rescan, but when that rescan lost the in-progress race it requeued its events and immediately re-armed its own window, so at Millennium Dawn scale the log filled with "watched batch over cap" lines for tens of seconds (#90 residual). The losing batch now parks its events and the winning scan drains them once when it finishes, with the loser re-arming itself only when the winner finished in between and its drain came up empty.
+- Watched file changes polluted the live localisation overlay, which holds the unsaved keys of open `.yml` files. The first watched event for each loc file treated the whole file as changed and ran the cross-file sweep meant for open-editor edits, up to 200 times per drain window, and the overlay kept an entry per watched file until a delete or a window reload (#90 residual). Watched loc files now fold their new keys straight into the scanned localisation index, so cross-file references still resolve them, and a batch runs one coalesced sweep of the open files instead of one per file. Open documents keep the overlay behavior they had.
+
 # 2.4.0
 
 ## Bug Fixes

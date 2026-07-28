@@ -303,10 +303,20 @@ impl Backend {
             tracing::debug!("workspace scan already in progress; skipping");
             return false;
         }
-        let _guard = ScanGuard(&self.state.scan_in_progress);
-        self.validate_entire_workspace_inner(quiet).await;
-        if !quiet {
-            self.send_loading_bar(false, "").await;
+        {
+            let _guard = ScanGuard(&self.state.scan_in_progress);
+            self.validate_entire_workspace_inner(quiet).await;
+            if !quiet {
+                self.send_loading_bar(false, "").await;
+            }
+        }
+        // Drain any watched events an over-cap batch requeued after losing the
+        // CAS to this scan — the loser suppresses its own re-arm so it doesn't
+        // retry against the flag every window for the scan's whole duration.
+        let requeued = !self.state.watched_pending.lock().is_empty()
+            || !self.state.watched_deleted.lock().is_empty();
+        if requeued {
+            self.arm_watched_batch();
         }
         true
     }
@@ -314,6 +324,14 @@ impl Backend {
     /// Scan the entire workspace for relevant game files and validate them all.
     #[tracing::instrument(skip_all)]
     async fn validate_entire_workspace_inner(&self, quiet: bool) {
+        // `CWTOOLS_SCAN_HOLD_MS` test override: hold the scan open so the tests
+        // can overlap it with watched-file batches deterministically.
+        if let Some(ms) = std::env::var("CWTOOLS_SCAN_HOLD_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         cwtools_profiling::log_rss("workspace_scan_start");
         if !quiet {
             self.send_loading_bar(true, "Indexing workspace…").await;
@@ -1459,6 +1477,7 @@ impl Backend {
         if changes.is_empty() && deletes.is_empty() {
             return;
         }
+        let mut lost_scan_cas = false;
         if watched_batch_over_cap(changes.len(), deletes.len()) {
             tracing::info!(
                 changes = changes.len(),
@@ -1466,9 +1485,12 @@ impl Backend {
                 "watched batch over cap; full rescan"
             );
             if !self.validate_entire_workspace(true).await {
-                // Lost the CAS to a running scan — requeue both sides.
+                // Lost the CAS to a running scan — requeue both sides for the
+                // winner to drain when it finishes. Re-arming here would retry
+                // (and re-log) every window for the winner's whole duration.
                 self.state.watched_pending.lock().extend(changes);
                 self.state.watched_deleted.lock().extend(deletes);
+                lost_scan_cas = true;
             }
         } else {
             // Deletions first, so a re-created file's later change validates
@@ -1476,6 +1498,10 @@ impl Backend {
             if !deletes.is_empty() {
                 self.process_watched_deletes(&deletes).await;
             }
+            // Loc keys new to the batch's loc files, folded into the scanned
+            // index per file and swept ONCE after the loop — the per-file
+            // cross-file sweep is the open-doc edit path's job (#90).
+            let mut new_loc_keys: HashSet<String> = HashSet::new();
             for uri in changes {
                 // An open editor buffer owns its diagnostics; skip files that
                 // are open now, regardless of open state when queued.
@@ -1505,6 +1531,11 @@ impl Backend {
                 };
                 match read {
                     Ok(Ok(text)) => {
+                        // Merge before validating so the file's own diagnostics
+                        // resolve keys it just defined.
+                        if crate::paths::is_loc_file(&uri) {
+                            new_loc_keys.extend(self.merge_watched_loc_keys(&path, &text));
+                        }
                         let (diagnostics, _) = self
                             .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched, None)
                             .await;
@@ -1528,11 +1559,23 @@ impl Backend {
                     }
                 }
             }
+            if !new_loc_keys.is_empty() {
+                self.refresh_after_watched_loc_changes(&new_loc_keys).await;
+            }
         }
         // Clear our slot before the final check so a producer that queued an
         // event while we ran can arm the next window (or we do it here). Setting
         // the slot to `None` only detaches this finished task, it doesn't abort.
         *self.state.watched_debounce.lock() = None;
+        if lost_scan_cas {
+            // The scan winner drains the requeue at its end; only if it already
+            // finished (between the CAS failure and the requeue, so its drain
+            // saw empty queues) do we arm on its behalf.
+            if !self.state.scan_in_progress.load(Ordering::SeqCst) {
+                self.arm_watched_batch();
+            }
+            return;
+        }
         // Each guard scoped to its own `let` so the two queue locks are never
         // held at once.
         let pending_more = !self.state.watched_pending.lock().is_empty();

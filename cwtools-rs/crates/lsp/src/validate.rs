@@ -1032,6 +1032,64 @@ impl Backend {
         }
     }
 
+    /// Fold a watched (non-open) loc file's keys into the scanned loc index so
+    /// cross-file `$ref$` and missing-loc checks resolve them without waiting
+    /// for a rescan. Additive, like the live overlay: a key removed on disk
+    /// keeps resolving against the baseline until the next scan. Returns the
+    /// keys that were new to the union, for the batch's coalesced sweep.
+    pub(crate) fn merge_watched_loc_keys(&self, path: &str, text: &str) -> HashSet<String> {
+        let svc = cwtools_localization::LocService::from_files(vec![(
+            path.to_string(),
+            text.to_string(),
+        )]);
+        let per_language: Vec<(cwtools_localization::Lang, Vec<String>)> = svc
+            .files()
+            .iter()
+            .filter_map(|f| {
+                f.lang.map(|lang| {
+                    (
+                        lang,
+                        f.entries.iter().map(|e| e.key.to_lowercase()).collect(),
+                    )
+                })
+            })
+            .collect();
+        if per_language.is_empty() {
+            return HashSet::new();
+        }
+        let loc_languages = self.state.config.read().loc_languages.clone();
+        let mut guard = self.state.loc_index.write();
+        let Some(idx) = guard.as_mut() else {
+            return HashSet::new();
+        };
+        let new_keys: HashSet<String> = per_language
+            .iter()
+            .flat_map(|(_, keys)| keys.iter())
+            .filter(|k| !idx.union().contains(*k))
+            .cloned()
+            .collect();
+        idx.merge_cached_keys(per_language, loc_languages.as_deref());
+        new_keys
+    }
+
+    /// The cross-file refresh an open loc edit runs per file, done ONCE for a
+    /// whole watched batch that added loc keys (#90).
+    pub(crate) async fn refresh_after_watched_loc_changes(&self, new_keys: &HashSet<String>) {
+        self.bump_info_revision();
+        let extra = self.loc_ref_names();
+        self.revalidate_other_open_loc_files("", &extra).await;
+        let generation = self
+            .state
+            .edit_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let scope = {
+            let rules_guard = self.state.rules.read();
+            loc_change_candidate_names(rules_guard.ruleset.as_deref(), new_keys)
+        };
+        self.revalidate_open_dependents("", generation, Some(&scope))
+            .await;
+    }
+
     /// `parsed_version` is the open-document version `text` was taken at, so the
     /// index install can tell a newer edit's validate has overtaken this one.
     /// `None` when the text came from disk (the scan's non-open pass).
@@ -1054,7 +1112,15 @@ impl Backend {
             // Keep the live overlay current so this file's own keys (and any just
             // added) resolve immediately in `$ref$` checks, without waiting for a
             // full rescan. Record which keys were added or removed. (#36)
-            let changed_keys: HashSet<String> = {
+            //
+            // Open docs only: the overlay is "unsaved keys in open .yml files".
+            // The watched path reaches here for files that are NOT open; letting
+            // them in grew the map a stale entry per watched file and made every
+            // first sight fire the whole-file cross-file sweep (#90). Watched
+            // files fold into the scanned index instead (`merge_watched_loc_keys`)
+            // with one coalesced sweep per batch.
+            let is_open = self.state.documents.lock().contains_key(uri);
+            let changed_keys: HashSet<String> = if is_open {
                 let new_keys = loc_keys_of(text, &path);
                 let mut overlay = self.state.loc_live_overlay.write();
                 let diff = match overlay.get(uri) {
@@ -1063,6 +1129,8 @@ impl Backend {
                 };
                 overlay.insert(uri.to_string(), new_keys);
                 diff
+            } else {
+                HashSet::new()
             };
             // Built once here and shared with the cross-file sweep below, which
             // would otherwise rebuild the whole name set per open loc file.
