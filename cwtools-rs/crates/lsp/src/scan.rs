@@ -313,9 +313,11 @@ impl Backend {
         // Drain any watched events an over-cap batch requeued after losing the
         // CAS to this scan — the loser suppresses its own re-arm so it doesn't
         // retry against the flag every window for the scan's whole duration.
-        let requeued = !self.state.watched_pending.lock().is_empty()
-            || !self.state.watched_deleted.lock().is_empty();
-        if requeued {
+        // Each guard scoped to its own `let` so the two queue locks are never
+        // held at once.
+        let requeued_pending = !self.state.watched_pending.lock().is_empty();
+        let requeued_deleted = !self.state.watched_deleted.lock().is_empty();
+        if requeued_pending || requeued_deleted {
             self.arm_watched_batch();
         }
         true
@@ -324,17 +326,18 @@ impl Backend {
     /// Scan the entire workspace for relevant game files and validate them all.
     #[tracing::instrument(skip_all)]
     async fn validate_entire_workspace_inner(&self, quiet: bool) {
-        // `CWTOOLS_SCAN_HOLD_MS` test override: hold the scan open so the tests
+        cwtools_profiling::log_rss("workspace_scan_start");
+        if !quiet {
+            self.send_loading_bar(true, "Indexing workspace…").await;
+        }
+        // `CWTOOLS_SCAN_HOLD_MS` test override: hold the scan open (after the
+        // loading bar, which doubles as the scan-started signal) so the tests
         // can overlap it with watched-file batches deterministically.
         if let Some(ms) = std::env::var("CWTOOLS_SCAN_HOLD_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
         {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
-        cwtools_profiling::log_rss("workspace_scan_start");
-        if !quiet {
-            self.send_loading_bar(true, "Indexing workspace…").await;
         }
 
         let workspace_uri = self.state.config.read().workspace_uri.clone();
@@ -615,13 +618,19 @@ impl Backend {
         };
         if !removed_uris.is_empty() {
             // Mirrors the DELETE branch of `did_change_watched_files_impl`:
-            // the loc live-overlay is keyed per-file too and must forget the
+            // both loc overlays are keyed per-file too and must forget the
             // same URIs, or loc checks keep serving stale entries for a file
             // `info_service` just dropped.
             {
                 let mut overlay = self.state.loc_live_overlay.write();
                 for uri in &removed_uris {
                     overlay.remove(uri);
+                }
+            }
+            {
+                let mut watched = self.state.loc_watched_overlay.write();
+                for uri in &removed_uris {
+                    watched.remove(uri);
                 }
             }
             self.bump_info_revision();
@@ -1498,10 +1507,11 @@ impl Backend {
             if !deletes.is_empty() {
                 self.process_watched_deletes(&deletes).await;
             }
-            // Loc keys new to the batch's loc files, folded into the scanned
-            // index per file and swept ONCE after the loop — the per-file
-            // cross-file sweep is the open-doc edit path's job (#90).
-            let mut new_loc_keys: HashSet<String> = HashSet::new();
+            // Loc keys added or removed across the batch's loc files, recorded
+            // per file in the watched overlay and swept ONCE after the loop —
+            // the per-file cross-file sweep is the open-doc edit path's job
+            // (#90).
+            let mut changed_loc_keys: HashSet<String> = HashSet::new();
             for uri in changes {
                 // An open editor buffer owns its diagnostics; skip files that
                 // are open now, regardless of open state when queued.
@@ -1531,10 +1541,11 @@ impl Backend {
                 };
                 match read {
                     Ok(Ok(text)) => {
-                        // Merge before validating so the file's own diagnostics
+                        // Record before validating so the file's own diagnostics
                         // resolve keys it just defined.
                         if crate::paths::is_loc_file(&uri) {
-                            new_loc_keys.extend(self.merge_watched_loc_keys(&path, &text));
+                            changed_loc_keys
+                                .extend(self.record_watched_loc_keys(&uri, &path, &text));
                         }
                         let (diagnostics, _) = self
                             .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched, None)
@@ -1559,8 +1570,9 @@ impl Backend {
                     }
                 }
             }
-            if !new_loc_keys.is_empty() {
-                self.refresh_after_watched_loc_changes(&new_loc_keys).await;
+            if !changed_loc_keys.is_empty() {
+                self.refresh_after_watched_loc_changes(&changed_loc_keys)
+                    .await;
             }
         }
         // Clear our slot before the final check so a producer that queued an
@@ -1586,7 +1598,7 @@ impl Backend {
     }
 
     /// Apply a coalesced batch of DELETE events off the message future: forget
-    /// each URI from the info service (one write scope), the loc overlay, and
+    /// each URI from the info service (one write scope), both loc overlays, and
     /// the watched-signature record, bump the info revision once for the whole
     /// batch, then publish empty diagnostics per URI outside every lock.
     async fn process_watched_deletes(&self, deletes: &[String]) {
@@ -1600,6 +1612,12 @@ impl Backend {
             let mut overlay = self.state.loc_live_overlay.write();
             for uri in deletes {
                 overlay.remove(uri);
+            }
+        }
+        {
+            let mut watched = self.state.loc_watched_overlay.write();
+            for uri in deletes {
+                watched.remove(uri);
             }
         }
         {

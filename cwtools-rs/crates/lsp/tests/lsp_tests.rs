@@ -4460,6 +4460,21 @@ fn test_watched_overcap_batch_does_not_spin_against_running_scan() {
         ),
     )
     .unwrap();
+    // Wait for the scan-started signal (the hold begins after the bar-on), so
+    // the flood's debounce window can't slip past the scan and win the CAS.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no loadingBar(true) after reindexWorkspace"
+        );
+        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
+            && v["method"] == "loadingBar"
+            && v["params"]["enable"] == serde_json::Value::Bool(true)
+        {
+            break;
+        }
+    }
     write_frame(&mut child, &watched_changes(&uris)).unwrap();
 
     // Quiet must outlast the held rescan so the whole story is observed.
@@ -4488,8 +4503,9 @@ fn test_watched_overcap_batch_does_not_spin_against_running_scan() {
 fn test_watched_loc_value_change_does_not_sweep_open_loc_files() {
     // A watched change to a NON-open loc file must stay out of the live overlay
     // (that map is open-doc state): before this fix its first sight treated the
-    // whole file as changed and swept every other open loc file. Same keys, new
-    // value — the open loc file must not be republished.
+    // whole file as changed and swept every other open loc file on EVERY event.
+    // First sight seeds the watched overlay and may sweep once; a repeat change
+    // that leaves the key set unchanged must not sweep at all.
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     let vanilla = tempfile::tempdir().unwrap();
@@ -4518,6 +4534,7 @@ fn test_watched_loc_value_change_does_not_sweep_open_loc_files() {
     let _ = diags_for(&mut reader, "open_l_english.yml", 1).expect("didOpen publish");
     let rx = spawn_frame_collector(reader);
 
+    // Round 1: first sight seeds the watched overlay (one batch sweep allowed).
     write_loc_file(
         ws.path(),
         "localisation/watched_l_english.yml",
@@ -4528,7 +4545,28 @@ fn test_watched_loc_value_change_does_not_sweep_open_loc_files() {
         &watched_changes(std::slice::from_ref(&watched_uri)),
     )
     .unwrap();
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    assert_eq!(
+        count_publishes(&frames, "watched_l_english.yml"),
+        1,
+        "the watched loc file itself should be validated and published once"
+    );
 
+    // Round 2: same keys again, new value — no sweep, no open-file republish.
+    write_loc_file(
+        ws.path(),
+        "localisation/watched_l_english.yml",
+        " W_KEY:0 \"three\"\n",
+    );
+    write_frame(
+        &mut child,
+        &watched_changes(std::slice::from_ref(&watched_uri)),
+    )
+    .unwrap();
     let frames = drain_until_quiet(
         &rx,
         std::time::Duration::from_millis(1200),
@@ -4551,7 +4589,7 @@ fn test_watched_loc_value_change_does_not_sweep_open_loc_files() {
 #[test]
 fn test_watched_loc_new_keys_resolve_cross_file_with_one_sweep() {
     // New keys in watched (non-open) loc files must still reach cross-file
-    // validation (the loc index, not the overlay), and a batch of loc files
+    // validation (via the watched-files overlay), and a batch of loc files
     // must produce ONE coalesced sweep of the open loc files, not one per file.
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
@@ -4634,6 +4672,194 @@ fn test_watched_loc_new_keys_resolve_cross_file_with_one_sweep() {
     assert!(
         !codes.contains(&"CW225".to_string()),
         "keys added by watched loc files must resolve cross-file, got: {codes:?}"
+    );
+}
+
+/// Codes of every publish for `suffix` in `frames`, in arrival order.
+fn publish_codes_for(frames: &[serde_json::Value], suffix: &str) -> Vec<Vec<String>> {
+    frames
+        .iter()
+        .filter(|v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with(suffix))
+        })
+        .map(|v| {
+            v["params"]["diagnostics"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|d| d["code"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[test]
+fn test_watched_loc_keys_survive_scan_index_install() {
+    // A workspace scan REPLACES the loc index wholesale from its own disk
+    // reads, which can predate a watched change (the read raced the write), so
+    // keys held only by the scanned index would silently vanish. The watched
+    // overlay must survive the install. Deterministic proxy for the race:
+    // revert the watched file on disk with NO watched event, so the rescan
+    // reads the OLD content while the overlay still holds the recorded key.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    let b_uri = write_loc_file(
+        ws.path(),
+        "localisation/b_l_english.yml",
+        " B_KEY:0 \"b\"\n",
+    );
+    let open_text = "\u{FEFF}l_english:\n OPEN_KEY:0 \"see $new_key$\"\n";
+    let open_uri = write_loc_file(
+        ws.path(),
+        "localisation/open_l_english.yml",
+        " OPEN_KEY:0 \"see $new_key$\"\n",
+    );
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":open_uri,"languageId":"paradox","version":1,"text":open_text}}),
+        ),
+    )
+    .unwrap();
+    let codes = diags_for(&mut reader, "open_l_english.yml", 1).expect("didOpen publish");
+    assert!(codes.contains(&"CW225".to_string()), "got: {codes:?}");
+    let rx = spawn_frame_collector(reader);
+
+    // The watched change adds the key; the batch records it and sweeps.
+    write_loc_file(
+        ws.path(),
+        "localisation/b_l_english.yml",
+        " B_KEY:0 \"b\"\n NEW_KEY:0 \"n1\"\n",
+    );
+    write_frame(&mut child, &watched_changes(std::slice::from_ref(&b_uri))).unwrap();
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    let opens = publish_codes_for(&frames, "open_l_english.yml");
+    assert!(
+        opens
+            .last()
+            .is_some_and(|c| !c.contains(&"CW225".to_string())),
+        "the recorded key must resolve before the rescan, got: {opens:?}"
+    );
+
+    // Revert on disk with no event, then rescan: the scan's loc walk reads the
+    // pre-change content, standing in for a read that predated the change.
+    write_loc_file(
+        ws.path(),
+        "localisation/b_l_english.yml",
+        " B_KEY:0 \"b\"\n",
+    );
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            700,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1500),
+        std::time::Duration::from_secs(15),
+    );
+    child.kill().ok();
+
+    let opens = publish_codes_for(&frames, "open_l_english.yml");
+    assert!(
+        opens
+            .last()
+            .is_some_and(|c| !c.contains(&"CW225".to_string())),
+        "a recorded watched key must survive the scan's index install, got: {opens:?}"
+    );
+}
+
+#[test]
+fn test_watched_loc_removed_key_stops_resolving() {
+    // The watched overlay has per-file REPLACE semantics: a key added by one
+    // watched change and removed by the next stops resolving, and the removal
+    // triggers the batch sweep so a referencing open file gets its CW225 back.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    let b_uri = write_loc_file(
+        ws.path(),
+        "localisation/b_l_english.yml",
+        " B_KEY:0 \"b\"\n",
+    );
+    let open_text = "\u{FEFF}l_english:\n OPEN_KEY:0 \"see $new_key$\"\n";
+    let open_uri = write_loc_file(
+        ws.path(),
+        "localisation/open_l_english.yml",
+        " OPEN_KEY:0 \"see $new_key$\"\n",
+    );
+
+    let (mut child, mut reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":open_uri,"languageId":"paradox","version":1,"text":open_text}}),
+        ),
+    )
+    .unwrap();
+    let codes = diags_for(&mut reader, "open_l_english.yml", 1).expect("didOpen publish");
+    assert!(codes.contains(&"CW225".to_string()), "got: {codes:?}");
+    let rx = spawn_frame_collector(reader);
+
+    // Round 1: the key appears; the open file's ref resolves.
+    write_loc_file(
+        ws.path(),
+        "localisation/b_l_english.yml",
+        " B_KEY:0 \"b\"\n NEW_KEY:0 \"n1\"\n",
+    );
+    write_frame(&mut child, &watched_changes(std::slice::from_ref(&b_uri))).unwrap();
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    let opens = publish_codes_for(&frames, "open_l_english.yml");
+    assert!(
+        opens
+            .last()
+            .is_some_and(|c| !c.contains(&"CW225".to_string())),
+        "the added key must resolve after round 1, got: {opens:?}"
+    );
+
+    // Round 2: the key is removed again; the ref must go back to unresolved.
+    write_loc_file(
+        ws.path(),
+        "localisation/b_l_english.yml",
+        " B_KEY:0 \"b\"\n",
+    );
+    write_frame(&mut child, &watched_changes(std::slice::from_ref(&b_uri))).unwrap();
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    child.kill().ok();
+
+    let opens = publish_codes_for(&frames, "open_l_english.yml");
+    assert_eq!(opens.len(), 1, "the removal must trigger one sweep");
+    assert!(
+        opens[0].contains(&"CW225".to_string()),
+        "a key removed from a watched loc file must stop resolving, got: {opens:?}"
     );
 }
 

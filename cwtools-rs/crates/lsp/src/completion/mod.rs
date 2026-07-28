@@ -261,14 +261,18 @@ impl Backend {
     fn completion_loc_keys(&self, token: &str) -> HashSet<String> {
         let index = self.state.loc_key_index.read().clone();
         if let Some(index) = index {
-            // The overlay is read directly rather than snapshotted: it is only
-            // the open `.yml` files' keys, and cloning them per keystroke was
-            // itself thousands of allocations. No other lock is held here.
+            // The overlays are read directly rather than snapshotted: they are
+            // only the open `.yml` files' keys plus the watched files' keys, and
+            // cloning them per keystroke was itself thousands of allocations.
+            // No other lock is held here; live before watched, matching the
+            // documented order.
             let overlay = self.state.loc_live_overlay.read();
+            let watched = self.state.loc_watched_overlay.read();
             return index.select(
                 token,
                 overlay
                     .values()
+                    .chain(watched.values())
                     .flat_map(|keys| keys.iter().map(String::as_str)),
                 CONTEXT_CAP,
             );

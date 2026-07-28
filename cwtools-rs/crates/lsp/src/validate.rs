@@ -893,13 +893,17 @@ impl Backend {
         }
     }
 
-    /// Flatten the live loc overlay (per-open-`.yml` key sets) into one set of
-    /// lowercased keys, for the game-file loc-existence checks (CW100/CW122) so a
-    /// key just typed into an open `.yml` resolves without a full rescan (#36).
-    /// Bounded by the number of open loc files; returns empty when none are open.
+    /// Flatten both loc overlays (per-open-`.yml` key sets plus the watched-file
+    /// sets) into one set of lowercased keys, for the game-file loc-existence
+    /// checks (CW100/CW122) so a key just typed into an open `.yml` — or saved
+    /// to a watched one — resolves without a full rescan (#36). Bounded by the
+    /// open loc files plus the distinct watched ones.
     pub(crate) fn loc_overlay_keys(&self) -> HashSet<String> {
         let mut keys = HashSet::new();
         for set in self.state.loc_live_overlay.read().values() {
+            keys.extend(set.iter().cloned());
+        }
+        for set in self.state.loc_watched_overlay.read().values() {
             keys.extend(set.iter().cloned());
         }
         keys
@@ -962,23 +966,27 @@ impl Backend {
     }
 
     /// The names a `$ref$` in a loc file may resolve to: [`loc_extra_valid_refs`]
-    /// plus the live loc overlay (the current keys of every open `.yml`).
+    /// plus both loc overlays (the current keys of every open `.yml` and of the
+    /// watched files changed since the last scan).
     ///
     /// This is a full copy of the modifier-key and index-name universe (~200K
     /// Strings on Millennium Dawn), so it is built ONCE per edit and shared by
     /// `Arc` with every file that edit revalidates — building it per file cost
     /// the keystroke path one whole copy per open `.yml`.
     fn loc_ref_names(&self) -> Arc<HashSet<String>> {
-        // Lock order: rules -> info_service. The overlay lock is independent and
-        // taken after, never nested inside the others.
+        // Lock order: rules -> info_service. The overlay locks are independent
+        // and taken after, never nested inside the others.
         let mut extra = {
             let modifier_keys = self.state.rules.read().modifier_keys.clone();
             let info = self.state.info_service.read();
             loc_extra_valid_refs(&modifier_keys, &info.type_index)
         };
-        // Lets a key just added to an open `.yml` resolve immediately, in that
-        // file and cross-file.
+        // Lets a key just added to an open `.yml` (or saved to a watched one)
+        // resolve immediately, in that file and cross-file.
         for keys in self.state.loc_live_overlay.read().values() {
+            extra.extend(keys.iter().cloned());
+        }
+        for keys in self.state.loc_watched_overlay.read().values() {
             extra.extend(keys.iter().cloned());
         }
         Arc::new(extra)
@@ -1032,49 +1040,33 @@ impl Backend {
         }
     }
 
-    /// Fold a watched (non-open) loc file's keys into the scanned loc index so
-    /// cross-file `$ref$` and missing-loc checks resolve them without waiting
-    /// for a rescan. Additive, like the live overlay: a key removed on disk
-    /// keeps resolving against the baseline until the next scan. Returns the
-    /// keys that were new to the union, for the batch's coalesced sweep.
-    pub(crate) fn merge_watched_loc_keys(&self, path: &str, text: &str) -> HashSet<String> {
-        let svc = cwtools_localization::LocService::from_files(vec![(
-            path.to_string(),
-            text.to_string(),
-        )]);
-        let per_language: Vec<(cwtools_localization::Lang, Vec<String>)> = svc
-            .files()
-            .iter()
-            .filter_map(|f| {
-                f.lang.map(|lang| {
-                    (
-                        lang,
-                        f.entries.iter().map(|e| e.key.to_lowercase()).collect(),
-                    )
-                })
-            })
-            .collect();
-        if per_language.is_empty() {
-            return HashSet::new();
-        }
-        let loc_languages = self.state.config.read().loc_languages.clone();
-        let mut guard = self.state.loc_index.write();
-        let Some(idx) = guard.as_mut() else {
-            return HashSet::new();
+    /// Record a watched (non-open) loc file's keys in the watched-files overlay
+    /// (per-file replace, like the open-doc overlay) so cross-file `$ref$` and
+    /// missing-loc checks resolve them without a rescan — and keep resolving
+    /// them across scans, whose index installs are built from disk reads that
+    /// may predate this change. Returns the keys added or removed relative to
+    /// the previous entry (first sight is every key), for the batch's coalesced
+    /// sweep.
+    pub(crate) fn record_watched_loc_keys(
+        &self,
+        uri: &str,
+        path: &str,
+        text: &str,
+    ) -> HashSet<String> {
+        let new_keys = loc_keys_of(text, path);
+        let mut overlay = self.state.loc_watched_overlay.write();
+        let changed = match overlay.get(uri) {
+            Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
+            None => new_keys.clone(),
         };
-        let new_keys: HashSet<String> = per_language
-            .iter()
-            .flat_map(|(_, keys)| keys.iter())
-            .filter(|k| !idx.union().contains(*k))
-            .cloned()
-            .collect();
-        idx.merge_cached_keys(per_language, loc_languages.as_deref());
-        new_keys
+        overlay.insert(uri.to_string(), new_keys);
+        changed
     }
 
     /// The cross-file refresh an open loc edit runs per file, done ONCE for a
-    /// whole watched batch that added loc keys (#90).
-    pub(crate) async fn refresh_after_watched_loc_changes(&self, new_keys: &HashSet<String>) {
+    /// whole watched batch whose loc key sets changed (#90). `changed_keys` is
+    /// the batch-wide union of additions and removals.
+    pub(crate) async fn refresh_after_watched_loc_changes(&self, changed_keys: &HashSet<String>) {
         self.bump_info_revision();
         let extra = self.loc_ref_names();
         self.revalidate_other_open_loc_files("", &extra).await;
@@ -1084,7 +1076,7 @@ impl Backend {
             .load(std::sync::atomic::Ordering::SeqCst);
         let scope = {
             let rules_guard = self.state.rules.read();
-            loc_change_candidate_names(rules_guard.ruleset.as_deref(), new_keys)
+            loc_change_candidate_names(rules_guard.ruleset.as_deref(), changed_keys)
         };
         self.revalidate_open_dependents("", generation, Some(&scope))
             .await;
@@ -1117,8 +1109,8 @@ impl Backend {
             // The watched path reaches here for files that are NOT open; letting
             // them in grew the map a stale entry per watched file and made every
             // first sight fire the whole-file cross-file sweep (#90). Watched
-            // files fold into the scanned index instead (`merge_watched_loc_keys`)
-            // with one coalesced sweep per batch.
+            // files record into `loc_watched_overlay` instead
+            // (`record_watched_loc_keys`) with one coalesced sweep per batch.
             let is_open = self.state.documents.lock().contains_key(uri);
             let changed_keys: HashSet<String> = if is_open {
                 let new_keys = loc_keys_of(text, &path);

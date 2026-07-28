@@ -246,6 +246,18 @@ struct DocumentState {
     /// against the baseline `loc_index` until the next scan — the overlay only
     /// adds keys, it can't subtract from the baseline union.
     loc_live_overlay: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
+    /// Per-file loc keys (lowercased) for NON-open loc files changed on disk
+    /// (watched events), keyed by URI — the watched-files counterpart of
+    /// `loc_live_overlay`, with the same per-file replace semantics, unioned at
+    /// the same query sites. Deliberately NOT cleared by a scan: the scan's
+    /// index install is built from disk reads that may predate a watched
+    /// change, so surviving the install is the point. Entries can go stale
+    /// (still correct, just redundant with the index) and are bounded by the
+    /// distinct watched files, like `watched_signatures`. Pruned per URI on a
+    /// watched DELETE, the scan's on-disk prune, and when the doc opens (the
+    /// open overlay owns it from then on). Taken after `loc_live_overlay` when
+    /// both are held.
+    loc_watched_overlay: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
     /// When `false` (the default), hover shows localisation for the primary
     /// language only (the first of `config.loc_languages`, else English) and the
     /// `loc_text` map only stores that language. Set via the
@@ -491,6 +503,7 @@ impl DocumentState {
             loc_text: parking_lot::RwLock::new(HashMap::new()),
             loc_locations: parking_lot::RwLock::new(HashMap::new()),
             loc_live_overlay: parking_lot::RwLock::new(HashMap::new()),
+            loc_watched_overlay: parking_lot::RwLock::new(HashMap::new()),
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
             hover_resolved_scope: std::sync::atomic::AtomicBool::new(false),
@@ -1159,6 +1172,11 @@ impl LanguageServer for Backend {
                     ast_version: None,
                 },
             );
+        }
+        // The open overlay owns this file's keys from here; a stale watched
+        // entry left behind could resurrect keys the buffer removed.
+        if crate::paths::is_loc_file(&uri) {
+            self.state.loc_watched_overlay.write().remove(&uri);
         }
 
         // Offload validation off the message future so a burst of opens can't
