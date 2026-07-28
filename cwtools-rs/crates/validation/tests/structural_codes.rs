@@ -323,3 +323,34 @@ foo = {
     );
     assert!(c.contains(&"CW253".to_string()), "got: {:?}", c);
 }
+
+// The complaint is the key name, not the block, and the fix already renames only
+// the key token. The squiggle should agree with it.
+#[test]
+fn cw253_underlines_only_the_deprecated_key() {
+    let table = StringTable::new();
+    let parsed_cwt = parse_string("", &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let script = "foo = {\n    set_empire_name = {\n        key = \"X\"\n    }\n}\n";
+    let parsed = parse_string(script, &table).unwrap();
+
+    let err = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "test.txt",
+        Some(Game::Stellaris),
+        None,
+        None,
+    )
+    .into_iter()
+    .find(|e| e.code == Some("CW253"))
+    .expect("CW253 emitted");
+
+    assert_eq!((err.line, err.col), (2, 4));
+    assert_eq!(
+        err.end,
+        Some((2, 4 + "set_empire_name".len() as u16)),
+        "CW253 must span only the key"
+    );
+}

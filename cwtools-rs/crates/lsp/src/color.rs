@@ -113,10 +113,11 @@ pub(crate) struct ColourLiteral {
 /// 4. Otherwise ints 0-255.
 pub(crate) fn parse_literal(text: &str) -> Option<ColourLiteral> {
     let trimmed = text.trim();
-    let (prefix, rest) = match trimmed.find('{') {
-        Some(i) => (trimmed[..i].trim().to_ascii_lowercase(), &trimmed[i..]),
-        None => return None,
-    };
+    let brace = trimmed.find('{')?;
+    let (prefix, rest) = (
+        trimmed[..brace].trim().to_ascii_lowercase(),
+        &trimmed[brace..],
+    );
     let body = rest.strip_prefix('{')?.strip_suffix('}')?;
     // Strip comments so `{ 1 2 3 # note }` doesn't parse the note.
     let body: String = body

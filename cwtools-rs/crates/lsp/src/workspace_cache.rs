@@ -433,7 +433,11 @@ mod tests {
     fn bench_parse_cache_vs_parse() {
         use std::time::Instant;
 
-        let root = Path::new("/mnt/Linux/Millennium-Dawn");
+        let root = std::path::PathBuf::from(std::env::var("CWTOOLS_MD_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{home}/Documents/github-projects/Millennium-Dawn")
+        }));
+        let root = root.as_path();
         if !root.exists() {
             eprintln!("SKIP: {} not present", root.display());
             return;
