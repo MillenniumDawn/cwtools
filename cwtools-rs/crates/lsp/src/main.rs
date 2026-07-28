@@ -311,10 +311,11 @@ struct DocumentState {
     /// The rules load's user-visible messages (per-error log lines, the error
     /// toast), parked the same way as the diagnostics above (#98).
     deferred_rules_messages: parking_lot::Mutex<Vec<DeferredRulesMessage>>,
-    /// The last rules-error toast summary shown this session. The client fires
-    /// `reloadrulesconfig` at boot right after `initialize` already loaded the
-    /// rules, so an unchanged error set must not toast twice; a different set
-    /// (a real reload) still does.
+    /// Order-independent key (sorted error strings) of the last rules-error
+    /// set toasted this session. The client fires `reloadrulesconfig` at boot
+    /// right after `initialize` already loaded the rules, so an unchanged
+    /// error set must not toast twice; a different set (a real reload) still
+    /// does.
     last_rules_toast: parking_lot::Mutex<Option<String>>,
     /// URIs the last rules load published diagnostics for. A load only publishes
     /// files that still have errors, so a repaired one needs an explicit clear or

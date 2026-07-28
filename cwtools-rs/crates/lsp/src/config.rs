@@ -523,7 +523,10 @@ impl Backend {
         // reported three ways: the log, a popup, and a diagnostic per file. All
         // three are user-visible and all can run inside `initialize`, where
         // tower-lsp drops outgoing notifications — so each defers through the
-        // handshake gate below (#98).
+        // handshake gate below (#98). Snapshotting once is sound only while the
+        // park sites run await-free from here: an `.await` between a stale
+        // `false` and a park would let the `initialized` flush slip past and
+        // strand the parked message forever.
         let handshake_complete = self
             .state
             .handshake_complete
@@ -596,17 +599,32 @@ impl Backend {
                 "CWTools: {} rules-config error(s), first: {first}",
                 parse_errors.len()
             );
+            // Dedupe on the full error set, order-independent: `first` follows
+            // read_dir traversal order, so the same set could summarize
+            // differently across the boot double-load, and two different sets
+            // can share a count and a first error.
+            let dedupe_key = {
+                let mut errs: Vec<String> = parse_errors.iter().map(|e| e.to_string()).collect();
+                errs.sort_unstable();
+                errs.join("\n")
+            };
             let is_new = {
                 let mut last = self.state.last_rules_toast.lock();
-                if last.as_deref() == Some(summary.as_str()) {
+                if last.as_deref() == Some(dedupe_key.as_str()) {
                     false
                 } else {
-                    *last = Some(summary.clone());
+                    *last = Some(dedupe_key);
                     true
                 }
             };
             if is_new {
-                if handshake_complete {
+                // Re-read the gate: a toast parked after the flush ran would sit
+                // forever while the dedupe key above already claimed it.
+                if self
+                    .state
+                    .handshake_complete
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     self.client.show_message(MessageType::ERROR, summary).await;
                 } else {
                     self.state

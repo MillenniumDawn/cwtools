@@ -7579,7 +7579,9 @@ fn test_rules_config_diagnostics_clear_after_a_clean_reload() {
 /// #98: the rules-error toast fired inside `initialize`, where tower-lsp drops
 /// notifications, and again from the boot-time `reloadrulesconfig` the client
 /// sends after its rules clone. It must arrive exactly once, after the
-/// handshake; an unchanged error set must not toast again; a changed one must.
+/// handshake; an unchanged error set must not toast again; a changed one must —
+/// even one that keeps the same count and the same first error, which the
+/// displayed summary alone cannot distinguish.
 #[test]
 fn test_rules_config_toast_defers_to_initialized_and_dedupes() {
     let ws = tempfile::tempdir().unwrap();
@@ -7587,7 +7589,7 @@ fn test_rules_config_toast_defers_to_initialized_and_dedupes() {
     let broken = rules_dir.path().join("broken.cwt");
     std::fs::write(
         &broken,
-        "types = {\n  type[foo] = { path = \"common/foo\" }\n}\nr = {\n  a = <undefined_thing>\n}\n",
+        "types = {\n  type[foo] = { path = \"common/foo\" }\n}\nr = {\n  a = <undefined_thing>\n  b = <also_missing>\n}\n",
     )
     .unwrap();
 
@@ -7675,10 +7677,12 @@ fn test_rules_config_toast_defers_to_initialized_and_dedupes() {
         .ok()?;
         let same_reload = toasts_until_response(reader, 2)?;
 
-        // Phase 3: a different error set toasts again.
+        // Phase 3: a different error set toasts again — here one that keeps
+        // the count (2) and the first error, so a summary-keyed dedupe would
+        // wrongly swallow it.
         std::fs::write(
             &broken_path,
-            "types = {\n  type[foo] = { path = \"common/foo\" }\n}\nr = {\n  a = <other_thing>\n}\n",
+            "types = {\n  type[foo] = { path = \"common/foo\" }\n}\nr = {\n  a = <undefined_thing>\n  b = <other_thing>\n}\n",
         )
         .ok()?;
         write_frame_to(

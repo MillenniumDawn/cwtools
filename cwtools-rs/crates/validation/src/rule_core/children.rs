@@ -524,12 +524,12 @@ fn count_and_validate_children(
                             key,
                             rules.iter().filter_map(|(rt, _)| get_rule_key(rt)),
                         ) {
-                            let raw_len = table
-                                .with_string(leaf.key.normal, |s| s.chars().count())
-                                .unwrap_or_else(|| key.chars().count());
                             err = err.with_fix(cwtools_parser::fix::SuggestedFix::replace(
                                 format!("Did you mean '{}'?", cand),
-                                cwtools_parser::fix::key_token_range(leaf.pos.start, raw_len),
+                                cwtools_parser::ast::SourceRange {
+                                    start: leaf.pos.start,
+                                    end: key_token_end(leaf, key, table),
+                                },
                                 cand,
                             ));
                         }
