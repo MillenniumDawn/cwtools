@@ -219,6 +219,25 @@ fn cw262_close_match_attaches_did_you_mean_fix() {
     );
 }
 
+// The complaint is the key, and the did-you-mean edit renames only the key
+// token. The squiggle must agree with it instead of covering the whole block
+// the unexpected key opens.
+#[test]
+fn cw262_underlines_only_the_unexpected_key() {
+    let script = "foo = {\n    setings = {\n        x = 1\n    }\n}\n";
+    let (_t, _r, errors) = validate_pair(NODE_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW262"))
+        .expect("CW262 emitted");
+    assert_eq!((err.line, err.col), (2, 4));
+    assert_eq!(
+        err.end,
+        Some((2, 4 + "setings".len() as u16)),
+        "CW262 must span only the key"
+    );
+}
+
 #[test]
 fn cw263_no_close_match_has_no_fix() {
     let script = "foo = {\n    required_field = ok\n    xyzzy = 3\n}\n";

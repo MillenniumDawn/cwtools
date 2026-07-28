@@ -1,5 +1,6 @@
 use crate::{ValidationError, error_codes};
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
+use cwtools_parser::fix::key_token_range;
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 use cwtools_string_table::string_table::{StringId, StringTable};
 use rustc_hash::FxHashMap;
@@ -71,7 +72,10 @@ pub fn validate_common(
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
                 let k = table.get_string(leaf.key.normal).unwrap_or_default();
-                (k, leaf.pos.start.line, leaf.pos.start.col, leaf.pos.end)
+                // The complaint is the duplicated key, so the squiggle covers
+                // the key token, not the whole entity definition.
+                let key_end = key_token_range(leaf.pos.start, k.chars().count()).end;
+                (k, leaf.pos.start.line, leaf.pos.start.col, key_end)
             }
             Child::LeafValue(_) | Child::Comment(_) => continue,
         };

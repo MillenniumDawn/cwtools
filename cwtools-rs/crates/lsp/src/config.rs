@@ -520,13 +520,30 @@ impl Backend {
             load_ruleset_from_dir(cache_path, &self.state.string_table);
 
         // Broken .cwt rules silently degrade every downstream check, so they are
-        // reported three ways: the log, a popup, and a diagnostic per file.
+        // reported three ways: the log, a popup, and a diagnostic per file. All
+        // three are user-visible and all can run inside `initialize`, where
+        // tower-lsp drops outgoing notifications — so each defers through the
+        // handshake gate below (#98).
+        let handshake_complete = self
+            .state
+            .handshake_complete
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if handshake_complete {
+            for err in &parse_errors {
+                self.client
+                    .log_message(MessageType::ERROR, err.to_string())
+                    .await;
+            }
+        } else {
+            self.state.deferred_rules_messages.lock().extend(
+                parse_errors
+                    .iter()
+                    .map(|err| crate::DeferredRulesMessage::Log(err.to_string())),
+            );
+        }
         let mut diags_by_file: std::collections::HashMap<String, Vec<Diagnostic>> =
             std::collections::HashMap::new();
         for err in &parse_errors {
-            self.client
-                .log_message(MessageType::ERROR, err.to_string())
-                .await;
             // Shared with the live per-file CWT lint (#43). No file text
             // here to widen the squiggle, so pass no line info.
             diags_by_file
@@ -559,11 +576,7 @@ impl Backend {
 
         // Dropped on the floor before `initialized`, so park them for the
         // handshake to flush (#98).
-        if self
-            .state
-            .handshake_complete
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if handshake_complete {
             for (uri, diags) in to_publish {
                 if let Ok(url) = uri.parse() {
                     self.client.publish_diagnostics(url, diags, None).await;
@@ -576,17 +589,36 @@ impl Backend {
                 .extend(to_publish);
         }
         if let Some(first) = parse_errors.first() {
-            // Inline the first error: the popup is the only part a user is
-            // guaranteed to see, whatever their client names its output channel.
-            self.client
-                .show_message(
-                    MessageType::ERROR,
-                    format!(
-                        "CWTools: {} rules-config error(s), first: {first}",
-                        parse_errors.len()
-                    ),
-                )
-                .await;
+            // Inline the first error: the client never auto-reveals its output
+            // channel (RevealOutputChannelOn.Never), so the popup is the only
+            // part a user is guaranteed to see.
+            let summary = format!(
+                "CWTools: {} rules-config error(s), first: {first}",
+                parse_errors.len()
+            );
+            let is_new = {
+                let mut last = self.state.last_rules_toast.lock();
+                if last.as_deref() == Some(summary.as_str()) {
+                    false
+                } else {
+                    *last = Some(summary.clone());
+                    true
+                }
+            };
+            if is_new {
+                if handshake_complete {
+                    self.client.show_message(MessageType::ERROR, summary).await;
+                } else {
+                    self.state
+                        .deferred_rules_messages
+                        .lock()
+                        .push(crate::DeferredRulesMessage::Toast(summary));
+                }
+            }
+        } else {
+            // A clean load forgets the last toast, so the same errors coming
+            // back later in the session toast again.
+            *self.state.last_rules_toast.lock() = None;
         }
 
         let loaded = !combined_ruleset.types.is_empty()

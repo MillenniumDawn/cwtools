@@ -200,6 +200,10 @@ pub(super) fn validate_alias_usage(
     }
     let overloads: Vec<&(RuleType, Options)> =
         overloads_conf.iter().map(|(rule, _)| *rule).collect();
+    // Advice-about-the-key diagnostics below (scope, shape mismatch, custom
+    // error) squiggle the key token, not the whole usage. Node-form usages
+    // have no leaf and keep the whole-line fallback.
+    let key_end = leaf.map(|l| key_token_end(l, key, table));
 
     // CW248: an invalid scope command in a chain. Restricted to dotted lower-case
     // chains (`owner.capital`): a bare command that's missing from this config's
@@ -220,8 +224,8 @@ pub(super) fn validate_alias_usage(
                 .map(|l| (l.pos.start.line, l.pos.start.col))
                 .unwrap_or(fallback_pos);
             let mut err = ValidationError::from_code(code, file_path, line, col, &[key]);
-            if let Some(l) = leaf {
-                err = err.with_end(l.pos.end);
+            if let Some(end) = key_end {
+                err = err.with_end(end);
             }
             errors.push(err);
         }
@@ -287,8 +291,8 @@ pub(super) fn validate_alias_usage(
                 col,
                 &[key, &reg.name_of(current), &expected.join(" or ")],
             );
-            if let Some(l) = leaf {
-                err = err.with_end(l.pos.end);
+            if let Some(end) = key_end {
+                err = err.with_end(end);
             }
             errors.push(err);
         }
@@ -378,9 +382,8 @@ pub(super) fn validate_alias_usage(
                             )
                         })
                         .unwrap_or_else(|| (String::new(), fallback_pos.0, fallback_pos.1));
-                    let end = leaf.map(|l| l.pos.end);
                     temp.push(alias_mismatch_error(
-                        file_path, category, &value, line, col, end,
+                        file_path, category, &value, line, col, key_end,
                     ));
                 }
             }
@@ -409,8 +412,8 @@ pub(super) fn validate_alias_usage(
                         col,
                         msg.clone(),
                     );
-                    if let Some(l) = leaf {
-                        custom = custom.with_end(l.pos.end);
+                    if let Some(end) = key_end {
+                        custom = custom.with_end(end);
                     }
                     only_match = Some(custom);
                 }

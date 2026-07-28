@@ -67,7 +67,7 @@ fn validate_leaf_against_rule(
                     &opts.required_scopes.join(" or "),
                 ],
             )
-            .with_end(leaf.pos.end),
+            .with_end(key_token_end(leaf, key, ctx.table)),
         );
     }
     match rule_type {
@@ -171,7 +171,7 @@ fn validate_leaf_against_rule(
                         leaf.pos.start.col,
                         &[key, &val_str],
                     )
-                    .with_end(leaf.pos.end),
+                    .with_end(key_token_end(leaf, key, ctx.table)),
                 );
             }
         }
@@ -486,7 +486,8 @@ fn count_and_validate_children(
                         // Clause value, so split the F# way: a clause value is an
                         // unexpected property NODE (CW262), a scalar value an
                         // unexpected property LEAF (CW263).
-                        let (msg, code) = if matches!(leaf.value, Value::Clause(_)) {
+                        let is_block = matches!(leaf.value, Value::Clause(_));
+                        let (msg, code) = if is_block {
                             (
                                 format!("Unexpected block '{}'", key),
                                 &error_codes::CW262_UNEXPECTED_PROPERTY_NODE,
@@ -497,6 +498,14 @@ fn count_and_validate_children(
                                 &error_codes::CW263_UNEXPECTED_PROPERTY_LEAF,
                             )
                         };
+                        // CW262 complains about the key, so its squiggle covers
+                        // the key token (the same span the did-you-mean fix
+                        // edits), not the whole block it opens.
+                        let end = if is_block {
+                            key_token_end(leaf, key, table)
+                        } else {
+                            leaf.pos.end
+                        };
                         let mut err = ValidationError::from_code_with(
                             code,
                             ErrorSeverity::Error,
@@ -505,7 +514,7 @@ fn count_and_validate_children(
                             leaf.pos.start.col,
                             msg,
                         )
-                        .with_end(leaf.pos.end);
+                        .with_end(end);
                         // Did-you-mean (fix metadata only, corpus-inert): on this
                         // error path, scan the sibling SpecificField keys for a
                         // single close match and offer a key-token rename. The span
@@ -560,7 +569,7 @@ fn count_and_validate_children(
                                     leaf.pos.start.col,
                                     msg.clone(),
                                 )
-                                .with_end(leaf.pos.end)
+                                .with_end(key_token_end(leaf, key, table))
                             })
                         },
                         errors,
