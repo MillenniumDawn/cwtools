@@ -252,33 +252,19 @@ pub(crate) fn find_type_by_path_and_key<'a>(
     find_type_from_candidates(&candidates, root_key)
 }
 
-/// True if `t`'s `path_options` select `file_path`. Mirrors the per-path test in
-/// [`find_type_by_path_and_key`] without the scoring, for use when several types
-/// share a path.
-pub(crate) fn type_path_matches(file_path: &str, t: &TypeDefinition) -> bool {
-    let path_lower = lookup_path(file_path);
-    let basename = path_lower.rsplit('/').next().unwrap_or(&path_lower);
-    let dir = path_lower
-        .strip_suffix(basename)
-        .unwrap_or(&path_lower)
-        .trim_end_matches('/');
-    if let Some(pf) = &t.path_options.path_file_lower
-        && basename != pf.as_str()
-    {
-        return false;
-    }
-    if let Some(ext) = &t.path_options.path_ext_lower
-        && basename
-            .rsplit('.')
-            .next()
-            .is_none_or(|e| e != ext.as_str())
-    {
-        return false;
-    }
-    t.path_options
-        .paths_lower
+/// Path-matched types whose first skip-root level selects `wrapper_root_key`.
+/// Compute this once for a wrapper, then reuse it for every grandchild instead of
+/// rechecking every ruleset type and normalizing the same path per grandchild.
+pub(crate) fn grandchild_candidates_for_wrapper<'a>(
+    path_candidates: &[PathCandidate<'a>],
+    wrapper_root_key: &str,
+) -> Vec<&'a TypeDefinition> {
+    path_candidates
         .iter()
-        .any(|p_lower| dir_matches_pattern(dir, p_lower, t.path_options.path_strict))
+        .filter_map(|candidate| {
+            should_skip_root_key(wrapper_root_key, candidate.type_def).then_some(candidate.type_def)
+        })
+        .collect()
 }
 
 /// Resolve which type a `skip_root_key` wrapper's grandchild belongs to, by the
@@ -289,16 +275,11 @@ pub(crate) fn type_path_matches(file_path: &str, t: &TypeDefinition) -> bool {
 /// no filter. Returns `None` when nothing fits, in which case the caller keeps
 /// the type that won the path lookup (so single-type wrappers are unaffected).
 pub(crate) fn find_grandchild_type<'a>(
-    file_path: &str,
-    wrapper_root_key: &str,
+    candidates: &[&'a TypeDefinition],
     gc_key: &str,
-    ruleset: &'a RuleSet,
 ) -> Option<&'a TypeDefinition> {
     let mut generic: Option<&TypeDefinition> = None;
-    for t in &ruleset.types {
-        if !should_skip_root_key(wrapper_root_key, t) || !type_path_matches(file_path, t) {
-            continue;
-        }
+    for &t in candidates {
         match &t.type_key_filter {
             Some((keys, negative)) => {
                 let in_list = keys.iter().any(|k| k.eq_ignore_ascii_case(gc_key));
@@ -326,14 +307,13 @@ pub(crate) fn find_grandchild_type<'a>(
 /// this grandchild (continue the loop / stop descending) rather than validate
 /// or enter it.
 pub(crate) fn refine_grandchild_type<'a>(
-    file_path: &str,
-    wrapper_root_key: &str,
+    candidates: &[&'a TypeDefinition],
     gc_key: &str,
     type_def: &'a TypeDefinition,
     inner_rules: &'a [(RuleType, Options)],
     ruleset: &'a RuleSet,
 ) -> Option<(&'a TypeDefinition, &'a [(RuleType, Options)])> {
-    match find_grandchild_type(file_path, wrapper_root_key, gc_key, ruleset) {
+    match find_grandchild_type(candidates, gc_key) {
         Some(t) => {
             let r = find_rules_by_name(&t.name, ruleset);
             // Resolved to an index-only type (no rule body): its fields
@@ -532,19 +512,19 @@ mod tests {
     }
 
     #[test]
-    fn type_path_matches_handles_backslash_paths() {
+    fn grandchild_candidates_handle_backslash_paths() {
         let table = StringTable::new();
-        let cwt = "types = { type[foo] = { path = \"common/foo\" } }";
+        let cwt = "types = { type[foo] = { path = \"common/foo\" skip_root_key = wrapper } }";
         let parsed = parse_string(cwt, &table).unwrap();
         let rs = ast_to_ruleset(&parsed, &table);
-        let t = &rs.types[0];
-        assert!(
-            type_path_matches("common/foo/x.txt", t),
-            "forward-slash path should match"
-        );
-        assert!(
-            type_path_matches("common\\foo\\x.txt", t),
-            "backslash path should match too"
-        );
+        for path in ["common/foo/x.txt", "common\\foo\\x.txt"] {
+            let candidates = path_candidates_for_file(path, &rs);
+            let grandchild_candidates = grandchild_candidates_for_wrapper(&candidates, "wrapper");
+            assert_eq!(
+                grandchild_candidates.len(),
+                1,
+                "{path} should resolve the wrapper type"
+            );
+        }
     }
 }

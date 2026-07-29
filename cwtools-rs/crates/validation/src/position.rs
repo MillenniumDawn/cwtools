@@ -17,8 +17,9 @@ use cwtools_rules::rules_types::*;
 use crate::common::{leaf_value_to_string, unquote_key};
 use crate::ctx::ValidationCtx;
 use crate::resolve::{
-    DispatchInput, ResolvedType, find_rules_by_name, find_type_from_candidates,
-    path_candidates_for_file, refine_grandchild_type, resolve_root_child, type_has_content,
+    DispatchInput, PathCandidate, ResolvedType, find_rules_by_name, find_type_from_candidates,
+    grandchild_candidates_for_wrapper, path_candidates_for_file, refine_grandchild_type,
+    resolve_root_child, type_has_content,
 };
 use crate::rule_core::{
     alias_overloads, flatten_nested_subtype_rules, matching_candidates, merged_rules_for_type,
@@ -195,6 +196,7 @@ pub fn rules_at_pos(
         } => descend_wrapper(
             &ctx,
             children,
+            &path_candidates,
             type_def,
             &root_key,
             inner_rules,
@@ -214,6 +216,7 @@ pub fn rules_at_pos(
 fn descend_wrapper(
     ctx: &ValidationCtx,
     grandchildren: &[Child],
+    path_candidates: &[PathCandidate],
     type_def: &TypeDefinition,
     wrapper_root_key: &str,
     inner_rules: &[(RuleType, Options)],
@@ -223,6 +226,7 @@ fn descend_wrapper(
     col: u16,
     for_completion: bool,
 ) -> Option<RuleContext> {
+    let candidates = grandchild_candidates_for_wrapper(path_candidates, wrapper_root_key);
     for grandchild in grandchildren {
         let Child::Leaf(gc_idx) = grandchild else {
             continue;
@@ -247,6 +251,7 @@ fn descend_wrapper(
                 return descend_wrapper(
                     ctx,
                     gc_children,
+                    path_candidates,
                     type_def,
                     &gc_key,
                     inner_rules,
@@ -262,14 +267,8 @@ fn descend_wrapper(
 
         // At the instance level: refine the type per grandchild key, as the
         // validator does.
-        let (gc_type_def, gc_rules) = refine_grandchild_type(
-            ctx.file_path,
-            wrapper_root_key,
-            &gc_key,
-            type_def,
-            inner_rules,
-            ctx.ruleset,
-        )?;
+        let (gc_type_def, gc_rules) =
+            refine_grandchild_type(&candidates, &gc_key, type_def, inner_rules, ctx.ruleset)?;
         return Some(enter_entity(
             ctx,
             gc_type_def,

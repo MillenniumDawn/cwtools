@@ -8,11 +8,13 @@
 //! `equipment.naval_equip` key, so the variant never activated `naval_equip` and
 //! its `model =` field fell through to the catch-all alias (CW267).
 
-use cwtools_index::TypeIndex;
+use cwtools_index::{TypeIndex, TypeInstance};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::{collect_subtype_instances, validate_ast};
+use cwtools_validation::{
+    collect_subtype_instances, subtype_membership_for_instance, validate_ast,
+};
 
 const CWT: &str = r#"
 types = {
@@ -73,16 +75,72 @@ equipments = {
 fn build_index(ruleset: &cwtools_rules::rules_types::RuleSet, table: &StringTable) -> TypeIndex {
     let parsed = parse_string(SCRIPT, table).unwrap();
     let logical = "common/units/equipment/ships.txt";
+    let collected = cwtools_index::collect_type_instances_with_subtypes(
+        ruleset,
+        &parsed,
+        logical,
+        table,
+        subtype_membership_for_instance,
+    );
     let mut idx = TypeIndex::new();
-    idx.merge(
-        "file://ships.txt",
-        cwtools_index::collect_type_instances(ruleset, &parsed, logical, table),
-    );
-    idx.merge(
-        "file://ships.txt",
-        collect_subtype_instances(ruleset, &parsed, logical, table),
-    );
+    idx.merge("file://ships.txt", collected.instances);
+    idx.merge("file://ships.txt", collected.subtype_instances);
     idx
+}
+
+type InstanceProjection = (String, u32, u16, (u32, u16), Option<String>);
+type TypeInstanceProjection = std::collections::BTreeMap<String, Vec<InstanceProjection>>;
+
+fn instance_projection(
+    per_type: &std::collections::HashMap<String, Vec<TypeInstance>>,
+) -> TypeInstanceProjection {
+    per_type
+        .iter()
+        .map(|(type_name, instances)| {
+            let mut values: Vec<_> = instances
+                .iter()
+                .map(|instance| {
+                    (
+                        instance.name.clone(),
+                        instance.location.line,
+                        instance.location.col,
+                        instance.location.end,
+                        instance.primary_loc_key.clone(),
+                    )
+                })
+                .collect();
+            values.sort();
+            (type_name.clone(), values)
+        })
+        .collect()
+}
+
+#[test]
+fn fused_collection_matches_the_separate_walks() {
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(CWT, &table).unwrap(), &table);
+    let parsed = parse_string(SCRIPT, &table).unwrap();
+    let logical = "common/units/equipment/ships.txt";
+
+    let separate_instances =
+        cwtools_index::collect_type_instances(&ruleset, &parsed, logical, &table);
+    let separate_subtypes = collect_subtype_instances(&ruleset, &parsed, logical, &table);
+    let fused = cwtools_index::collect_type_instances_with_subtypes(
+        &ruleset,
+        &parsed,
+        logical,
+        &table,
+        subtype_membership_for_instance,
+    );
+
+    assert_eq!(
+        instance_projection(&fused.instances),
+        instance_projection(&separate_instances)
+    );
+    assert_eq!(
+        instance_projection(&fused.subtype_instances),
+        instance_projection(&separate_subtypes)
+    );
 }
 
 #[test]

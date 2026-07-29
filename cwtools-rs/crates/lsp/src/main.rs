@@ -1819,6 +1819,7 @@ mod tests {
                 Options::default(),
             ),
         ));
+        rs.reindex();
 
         // "base" field referencing "my_type" should be recognized
         assert!(is_type_ref_leaf(&rs, "base", "my_type", "events/test.txt"));
@@ -1865,6 +1866,7 @@ mod tests {
                 Options::default(),
             ),
         ));
+        rs.reindex();
 
         let mut docs = HashMap::new();
         docs.insert(

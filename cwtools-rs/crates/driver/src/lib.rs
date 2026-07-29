@@ -33,8 +33,8 @@ use cwtools_game::constants::Game;
 use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_index::vanilla_cache::{self, VanillaCacheData};
 use cwtools_index::{
-    TypeIndex, collect_set_variable_names, collect_type_instances, index_discovered_files,
-    variable_defining_effects,
+    TypeIndex, collect_set_variable_names, collect_type_instances_with_subtypes,
+    index_discovered_files, variable_defining_effects,
 };
 use cwtools_localization::{Lang, LocDiagnostic, LocIndex, LocService};
 use cwtools_parser::ast::{ParseError, ParsedFile};
@@ -223,6 +223,7 @@ impl Session {
         use rayon::prelude::*;
         type PerFileResult = (
             HashMap<String, Vec<cwtools_index::TypeInstance>>,
+            HashMap<String, Vec<cwtools_index::TypeInstance>>,
             Vec<String>,
             HashMap<String, Vec<String>>,
         );
@@ -230,20 +231,16 @@ impl Session {
         let per_file: Vec<PerFileResult> = parsed
             .par_iter()
             .map(|src| {
-                let mut instances =
-                    collect_type_instances(&ruleset, &src.parsed, &src.logical_path, &rules_table);
-                // Subtype-qualified membership (`equipment.naval_equip` …) so
-                // `<type.subtype>` references resolve. Archetypes self-determine
-                // from direct discriminators; referencing variants resolve through
-                // them at validation time.
-                for (k, v) in cwtools_validation::collect_subtype_instances(
+                // Base instances and subtype-qualified membership share one
+                // skip-root walk. Keep the maps separate so TypeIndex preserves
+                // the base-instance refcount and export semantics.
+                let collected = collect_type_instances_with_subtypes(
                     &ruleset,
                     &src.parsed,
                     &src.logical_path,
                     &rules_table,
-                ) {
-                    instances.entry(k).or_default().extend(v);
-                }
+                    cwtools_validation::subtype_membership_for_instance,
+                );
                 let mut var_names: Vec<String> = Vec::new();
                 collect_set_variable_names(&src.parsed, &rules_table, &var_effects, &mut var_names);
                 // Value-set members defined in mod files (flags, character tokens,
@@ -256,14 +253,24 @@ impl Session {
                     &src.parsed,
                     &rules_table,
                 );
-                (instances, var_names, value_sets)
+                (
+                    collected.instances,
+                    collected.subtype_instances,
+                    var_names,
+                    value_sets,
+                )
             })
             .collect();
 
         let mut type_index = TypeIndex::new();
-        for (src, (instances, var_names, value_sets)) in parsed.iter().zip(per_file) {
+        for (src, (instances, subtype_instances, var_names, value_sets)) in
+            parsed.iter().zip(per_file)
+        {
             let file_uri = src.path.to_str().unwrap_or("");
             type_index.merge(file_uri, instances);
+            if !subtype_instances.is_empty() {
+                type_index.merge(file_uri, subtype_instances);
+            }
             for n in &var_names {
                 type_index.var_index.add_name(n);
             }
@@ -534,15 +541,15 @@ impl SessionWithFiles {
                 // being non-empty, same as the LSP's `append_missing_loc_errors`:
                 // a mod with no `localisation/` would otherwise report every key
                 // as missing.
-                if let Some(loc) = prepared.loc_index
+                if let (Some(loc), Some(type_index)) = (prepared.loc_index, prepared.type_index)
                     && !loc.union().is_empty()
                 {
+                    let instances = type_index.instances_in_file(&file_str);
                     errors.extend(cwtools_validation::missing_loc::check_missing_localisation(
-                        &src.parsed,
+                        &instances,
                         &src.logical_path,
                         &file_str,
                         prepared.ruleset,
-                        prepared.table,
                         |k| loc.exists_any(k),
                     ));
                 }
