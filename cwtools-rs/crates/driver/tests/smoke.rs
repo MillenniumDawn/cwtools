@@ -245,6 +245,36 @@ fn cw100_still_fires_when_loc_data_exists() {
     );
 }
 
+#[test]
+fn changed_source_is_not_validated_against_a_stale_index() {
+    let tmp = loc_gate_workspace(None);
+    let session = Session::load(SessionConfig {
+        game: Game::Hoi4,
+        rules: RulesInput::Dir(tmp.path().join("rules")),
+        directory: tmp.path().join("mod"),
+        vanilla: None,
+        vanilla_cache: None,
+        vanilla_cache_auto: None,
+        ignore_files: &[],
+        ignore_dirs: &[],
+        loc_languages: None,
+        on_rules_warning: None,
+    });
+    std::fs::write(
+        tmp.path().join("mod/common/things/x.txt"),
+        "changed_thing = { different_value = yes }\n",
+    )
+    .unwrap();
+
+    assert!(
+        session
+            .validate_all()
+            .into_iter()
+            .flat_map(|(_, errors)| errors)
+            .any(|error| error.message.contains("changed after indexing"))
+    );
+}
+
 // ── auto-managed vanilla cache ───────────────────────────────────────────────
 
 const THING_RULES: &str = r#"

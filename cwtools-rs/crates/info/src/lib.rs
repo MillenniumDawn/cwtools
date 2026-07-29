@@ -244,6 +244,24 @@ struct TypeRefRule {
 /// leaf key (rule keys match case-insensitively).
 fn build_type_ref_keys(ruleset: &RuleSet) -> HashMap<String, Vec<TypeRefRule>> {
     let mut map: HashMap<String, Vec<TypeRefRule>> = HashMap::new();
+    if !ruleset.type_reference_rules.is_empty() {
+        for (key, entries) in &ruleset.type_reference_rules {
+            map.insert(
+                key.clone(),
+                entries
+                    .iter()
+                    .map(|entry| TypeRefRule {
+                        ref_type: Arc::from(entry.ref_type.as_str()),
+                        root_type: entry.root_type.as_deref().map(Arc::from),
+                    })
+                    .collect(),
+            );
+        }
+        return map;
+    }
+
+    // Tests and embedders can construct a RuleSet without calling reindex().
+    // Preserve the old scan as a compatibility fallback for that shape.
     for root_rule in &ruleset.root_rules {
         let (root_name, is_type_rule, rule) = match root_rule {
             RootRule::TypeRule(n, r) => (n.as_str(), true, r),
@@ -442,6 +460,32 @@ impl InfoService {
         ruleset: &RuleSet,
         logical_path: &str,
     ) {
+        let instances = collect_type_instances(ruleset, ast, logical_path, table);
+        self.index_file_with_precomputed_instances(
+            uri,
+            ast,
+            table,
+            ruleset,
+            logical_path,
+            instances,
+            HashMap::new(),
+        );
+    }
+
+    /// Like [`Self::index_file_with_path`], but consumes type instances collected
+    /// before the caller takes the info-service write lock. Subtype membership is
+    /// separate so it stays out of a file's export fingerprint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_file_with_precomputed_instances(
+        &mut self,
+        uri: &str,
+        ast: &ParsedFile,
+        table: &StringTable,
+        ruleset: &RuleSet,
+        logical_path: &str,
+        instances: HashMap<String, Vec<TypeInstance>>,
+        subtype_instances: HashMap<String, Vec<TypeInstance>>,
+    ) {
         let mut info = FileInfo::default();
 
         // ── Heuristic type-name set (kept for back-compat) ────────────────────
@@ -471,7 +515,6 @@ impl InfoService {
         // Move the instances straight into the cross-file index. We don't keep a
         // second per-file copy on `FileInfo` (that doubled ~190K instances on
         // MD); document-symbol derives a file's instances from the index instead.
-        let instances = collect_type_instances(ruleset, ast, logical_path, table);
         // Hash this file's exported instances now, while we still hold the local
         // per-type map, so the cross-file export check never has to scan the
         // global index. Order-independent (wrapping_add) and stable for a given
@@ -483,6 +526,9 @@ impl InfoService {
             .map(|inst| inst.name.to_ascii_lowercase())
             .collect();
         self.type_index.merge(uri, instances);
+        if !subtype_instances.is_empty() {
+            self.type_index.merge(uri, subtype_instances);
+        }
 
         // ── Rule-driven: defined variables ────────────────────────────────────
         // Convert the @-vars already collected by index_child_heuristic into

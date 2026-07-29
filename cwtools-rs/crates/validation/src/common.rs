@@ -2,7 +2,7 @@
 //! validation submodules.
 
 use cwtools_game::scope_engine::ScopeContext;
-use cwtools_parser::ast::{Child, ParsedFile, SourcePos, Value};
+use cwtools_parser::ast::{Child, Leaf, ParsedFile, SourcePos, Value};
 use cwtools_parser::fix::SuggestedFix;
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
@@ -99,6 +99,17 @@ impl ValidationError {
         self.end = Some((end.line, end.col));
         self
     }
+}
+
+/// End of `leaf`'s raw key token (quotes included, from the interned source
+/// string), for diagnostics that advise about the key: the squiggle covers the
+/// key instead of the whole leaf/block span. Falls back to the caller's `key`
+/// when the interned string is unavailable.
+pub(crate) fn key_token_end(leaf: &Leaf, key: &str, table: &StringTable) -> SourcePos {
+    let raw_len = table
+        .with_string(leaf.key.normal, |s| s.chars().count())
+        .unwrap_or_else(|| key.chars().count());
+    cwtools_parser::fix::key_token_range(leaf.pos.start, raw_len).end
 }
 
 /// Number of significant decimal places in a numeric string; trailing zeros do

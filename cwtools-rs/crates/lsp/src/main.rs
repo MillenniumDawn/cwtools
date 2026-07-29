@@ -1,4 +1,5 @@
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,6 +28,9 @@ mod scan;
 mod semantic;
 mod validate;
 mod workspace_cache;
+
+pub(crate) type LocTextMap = FxHashMap<Arc<str>, Vec<(cwtools_localization::Lang, String)>>;
+pub(crate) type LocLocationMap = FxHashMap<Arc<str>, (Arc<str>, u32)>;
 
 // ── Custom LSP notification types ─────────────────────────────────────────────
 
@@ -232,12 +236,12 @@ struct DocumentState {
     /// localisation without re-reading loc files. Outer quotes are stripped
     /// from the desc for cleaner display.
     #[allow(clippy::type_complexity)]
-    loc_text: parking_lot::RwLock<HashMap<String, Vec<(cwtools_localization::Lang, String)>>>,
+    loc_text: parking_lot::RwLock<LocTextMap>,
     /// Definition site per loc key (lowercased) → (file URI, 0-based line). Built
     /// from the LocService during workspace scan so goto-definition on a
     /// `localisation` reference jumps to the `.yml` entry. One representative
     /// (primary-language) location per key is enough for navigation.
-    loc_locations: parking_lot::RwLock<HashMap<String, (String, u32)>>,
+    loc_locations: parking_lot::RwLock<LocLocationMap>,
     /// Live per-file loc keys (lowercased) for currently-open loc files, keyed by
     /// URI. Overlays the scanned `loc_index` so a key added to (or present in) an
     /// open `.yml` resolves immediately in `$ref$` checks without waiting for a
@@ -246,6 +250,18 @@ struct DocumentState {
     /// against the baseline `loc_index` until the next scan — the overlay only
     /// adds keys, it can't subtract from the baseline union.
     loc_live_overlay: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
+    /// Per-file loc keys (lowercased) for NON-open loc files changed on disk
+    /// (watched events), keyed by URI — the watched-files counterpart of
+    /// `loc_live_overlay`, with the same per-file replace semantics, unioned at
+    /// the same query sites. Deliberately NOT cleared by a scan: the scan's
+    /// index install is built from disk reads that may predate a watched
+    /// change, so surviving the install is the point. Entries can go stale
+    /// (still correct, just redundant with the index) and are bounded by the
+    /// distinct watched files, like `watched_signatures`. Pruned per URI on a
+    /// watched DELETE, the scan's on-disk prune, and when the doc opens (the
+    /// open overlay owns it from then on). Taken after `loc_live_overlay` when
+    /// both are held.
+    loc_watched_overlay: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
     /// When `false` (the default), hover shows localisation for the primary
     /// language only (the first of `config.loc_languages`, else English) and the
     /// `loc_text` map only stores that language. Set via the
@@ -296,6 +312,15 @@ struct DocumentState {
     /// Broken-`.cwt` diagnostics, parked because the rules load runs inside
     /// `initialize` where the gate above would swallow them (#98).
     deferred_rule_diagnostics: parking_lot::Mutex<Vec<(String, Vec<Diagnostic>)>>,
+    /// The rules load's user-visible messages (per-error log lines, the error
+    /// toast), parked the same way as the diagnostics above (#98).
+    deferred_rules_messages: parking_lot::Mutex<Vec<DeferredRulesMessage>>,
+    /// Order-independent key (sorted error strings) of the last rules-error
+    /// set toasted this session. The client fires `reloadrulesconfig` at boot
+    /// right after `initialize` already loaded the rules, so an unchanged
+    /// error set must not toast twice; a different set (a real reload) still
+    /// does.
+    last_rules_toast: parking_lot::Mutex<Option<String>>,
     /// URIs the last rules load published diagnostics for. A load only publishes
     /// files that still have errors, so a repaired one needs an explicit clear or
     /// its squiggle outlives the problem.
@@ -449,6 +474,13 @@ pub(crate) struct AstSnapshot {
     pub(crate) source: AstSource,
 }
 
+/// A user-visible rules-load message parked until `initialized` (#98): `Log`
+/// lines go to the client's output channel, `Toast` to a popup.
+pub(crate) enum DeferredRulesMessage {
+    Log(String),
+    Toast(String),
+}
+
 /// What kicked off a `parse_and_validate` call. Threaded through so the
 /// `[validate]` log names its trigger, which makes a validate storm's source
 /// legible in the server log (issue #90) instead of a wall of identical lines.
@@ -488,9 +520,10 @@ impl DocumentState {
             vanilla_loc_keys: Mutex::new(None),
             loc_index: parking_lot::RwLock::new(None),
             loc_key_index: parking_lot::RwLock::new(None),
-            loc_text: parking_lot::RwLock::new(HashMap::new()),
-            loc_locations: parking_lot::RwLock::new(HashMap::new()),
+            loc_text: parking_lot::RwLock::new(LocTextMap::default()),
+            loc_locations: parking_lot::RwLock::new(LocLocationMap::default()),
             loc_live_overlay: parking_lot::RwLock::new(HashMap::new()),
+            loc_watched_overlay: parking_lot::RwLock::new(HashMap::new()),
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
             hover_resolved_scope: std::sync::atomic::AtomicBool::new(false),
@@ -502,6 +535,8 @@ impl DocumentState {
             index_ready: std::sync::atomic::AtomicBool::new(false),
             handshake_complete: std::sync::atomic::AtomicBool::new(false),
             deferred_rule_diagnostics: parking_lot::Mutex::new(Vec::new()),
+            deferred_rules_messages: parking_lot::Mutex::new(Vec::new()),
+            last_rules_toast: parking_lot::Mutex::new(None),
             published_rule_uris: parking_lot::Mutex::new(HashSet::new()),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
@@ -1083,6 +1118,17 @@ impl LanguageServer for Backend {
                 self.client.publish_diagnostics(url, diags, None).await;
             }
         }
+        let deferred_msgs = std::mem::take(&mut *self.state.deferred_rules_messages.lock());
+        for msg in deferred_msgs {
+            match msg {
+                DeferredRulesMessage::Log(text) => {
+                    self.client.log_message(MessageType::ERROR, text).await;
+                }
+                DeferredRulesMessage::Toast(text) => {
+                    self.client.show_message(MessageType::ERROR, text).await;
+                }
+            }
+        }
 
         // Workspace-wide initial validation spawned in background so the LSP
         // handshake returns promptly.
@@ -1159,6 +1205,11 @@ impl LanguageServer for Backend {
                     ast_version: None,
                 },
             );
+        }
+        // The open overlay owns this file's keys from here; a stale watched
+        // entry left behind could resurrect keys the buffer removed.
+        if crate::paths::is_loc_file(&uri) {
+            self.state.loc_watched_overlay.write().remove(&uri);
         }
 
         // Offload validation off the message future so a burst of opens can't
@@ -1772,6 +1823,7 @@ mod tests {
                 Options::default(),
             ),
         ));
+        rs.reindex();
 
         // "base" field referencing "my_type" should be recognized
         assert!(is_type_ref_leaf(&rs, "base", "my_type", "events/test.txt"));
@@ -1818,6 +1870,7 @@ mod tests {
                 Options::default(),
             ),
         ));
+        rs.reindex();
 
         let mut docs = HashMap::new();
         docs.insert(

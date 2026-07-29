@@ -159,6 +159,9 @@ fn walk_if_else(
                 .iter()
                 .any(|c| child_key_eq(c, ast, table, "if"));
             let deprecated_else = (key == "if" || key == "else_if") && has_else && !has_if;
+            // Advice about the keyword, so the squiggle covers the key, not the
+            // whole block it opens (same treatment CW253 got above).
+            let key_end = key_token_range(block.range.start, key.chars().count()).end;
 
             // CW236 — old nested if/else style.
             if deprecated_else {
@@ -170,7 +173,7 @@ fn walk_if_else(
                         col,
                         &[],
                     )
-                    .with_end(block.range.end),
+                    .with_end(key_end),
                 );
             }
 
@@ -184,7 +187,7 @@ fn walk_if_else(
                         col,
                         &[],
                     )
-                    .with_end(block.range.end),
+                    .with_end(key_end),
                 );
             }
 
@@ -209,7 +212,7 @@ fn walk_if_else(
                                 col,
                                 &[],
                             )
-                            .with_end(block.range.end),
+                            .with_end(key_end),
                         );
                         break;
                     }
@@ -395,7 +398,8 @@ fn validate_ship_designs(
             let Some(gc_block) = as_block(grandchild, ast) else {
                 continue;
             };
-            let (type_name, code) = match gc_block.key_string_lower(table).as_str() {
+            let gc_key = gc_block.key_string_lower(table);
+            let (type_name, code) = match gc_key.as_str() {
                 "section" => (
                     "section_template",
                     &error_codes::CW227_UNKNOWN_SECTION_TEMPLATE,
@@ -429,7 +433,7 @@ fn validate_ship_designs(
                     gc_block.range.start.col,
                     &[&template],
                 )
-                .with_end(gc_block.range.end),
+                .with_end(key_token_range(gc_block.range.start, gc_key.chars().count()).end),
             );
         }
     }
@@ -498,7 +502,9 @@ fn walk_research_leaders(
     errors: &mut Vec<ValidationError>,
 ) {
     walk_blocks(children, ast, &mut |block| {
-        if block.key_string_lower(table) == "research_leader" {
+        let key = block.key_string_lower(table);
+        if key == "research_leader" {
+            let key_end = key_token_range(block.range.start, key.chars().count()).end;
             match child_scalar(block.children, ast, table, "area") {
                 None => {
                     let code = &error_codes::CW108_RESEARCH_LEADER_AREA;
@@ -510,7 +516,7 @@ fn walk_research_leaders(
                             block.range.start.col,
                             &[],
                         )
-                        .with_end(block.range.end),
+                        .with_end(key_end),
                     );
                 }
                 Some(leader_area)
@@ -526,7 +532,7 @@ fn walk_research_leaders(
                             block.range.start.col,
                             &[&leader_area, tech_area],
                         )
-                        .with_end(block.range.end),
+                        .with_end(key_end),
                     );
                 }
                 _ => {}

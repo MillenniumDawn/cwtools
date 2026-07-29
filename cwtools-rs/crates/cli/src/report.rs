@@ -350,6 +350,24 @@ mod tests {
         }
     }
 
+    /// An absolute path spelled the host's way. On Windows a leading `/` names
+    /// the current drive's root, so a base and a file that both start with one
+    /// still relate to each other, but neither renders without the drive.
+    fn abs(tail: &str) -> String {
+        if cfg!(windows) {
+            format!("C:/{tail}")
+        } else {
+            format!("/{tail}")
+        }
+    }
+
+    /// `file_uri` of an `abs` path, up to and including the first slash.
+    const URI: &str = if cfg!(windows) {
+        "file:///C:/"
+    } else {
+        "file:///"
+    };
+
     #[test]
     fn report_type_round_trips_its_spelling() {
         for name in ["cli", "csv", "json", "github", "sarif"] {
@@ -365,10 +383,16 @@ mod tests {
 
     #[test]
     fn github_row_renders_the_workflow_command() {
-        let base = Path::new("/repo");
-        let d = diag("/repo/common/x.txt", 12, 5, "CW282", "redundant default");
+        let base = PathBuf::from(abs("repo"));
+        let d = diag(
+            &abs("repo/common/x.txt"),
+            12,
+            5,
+            "CW282",
+            "redundant default",
+        );
         assert_eq!(
-            github_row(&d, base),
+            github_row(&d, &base),
             "::error file=common/x.txt,line=12,col=5,title=CW282::redundant default\n"
         );
     }
@@ -400,9 +424,9 @@ mod tests {
 
     #[test]
     fn github_row_encodes_separators_in_the_file_property() {
-        let base = Path::new("/repo");
-        let d = diag("/repo/od,d:name.txt", 1, 1, "", "m");
-        let row = github_row(&d, base);
+        let base = PathBuf::from(abs("repo"));
+        let d = diag(&abs("repo/od,d:name.txt"), 1, 1, "", "m");
+        let row = github_row(&d, &base);
         assert!(row.contains("file=od%2Cd%3Aname.txt,line=1"), "got: {row}");
         assert!(!row.contains("title="), "no code, no title: {row}");
     }
@@ -417,9 +441,14 @@ mod tests {
 
     #[test]
     fn paths_outside_the_root_stay_absolute() {
-        let base = Path::new("/repo");
-        let d = diag("/elsewhere/x.txt", 1, 1, "CW100", "m");
-        assert!(github_row(&d, base).contains("file=/elsewhere/x.txt"));
+        let base = PathBuf::from(abs("repo"));
+        let file = abs("elsewhere/x.txt");
+        let d = diag(&file, 1, 1, "CW100", "m");
+        let row = github_row(&d, &base);
+        assert!(
+            row.contains(&format!("file={},line=", escape_property(&file))),
+            "got: {row}"
+        );
     }
 
     #[test]
@@ -469,14 +498,14 @@ mod tests {
 
     #[test]
     fn sarif_locations_are_relative_to_the_source_root() {
-        let d = diag("/repo/common/x.txt", 7, 3, "CW100", "m");
-        let out = sarif_report(&[&d], Path::new("/repo"));
+        let d = diag(&abs("repo/common/x.txt"), 7, 3, "CW100", "m");
+        let out = sarif_report(&[&d], Path::new(&abs("repo")));
         assert!(
             out.contains("\"uri\": \"common/x.txt\", \"uriBaseId\": \"SRCROOT\""),
             "got: {out}"
         );
         assert!(
-            out.contains("\"SRCROOT\": { \"uri\": \"file:///repo/\" }"),
+            out.contains(&format!("\"SRCROOT\": {{ \"uri\": \"{URI}repo/\" }}")),
             "got: {out}"
         );
         assert!(
@@ -510,10 +539,12 @@ mod tests {
 
     #[test]
     fn sarif_encodes_spaces_in_uris() {
-        let d = diag("/games/Hearts of Iron IV/x.txt", 1, 1, "CW100", "m");
-        let out = sarif_report(&[&d], Path::new("/repo"));
+        let d = diag(&abs("games/Hearts of Iron IV/x.txt"), 1, 1, "CW100", "m");
+        let out = sarif_report(&[&d], Path::new(&abs("repo")));
         assert!(
-            out.contains("\"uri\": \"file:///games/Hearts%20of%20Iron%20IV/x.txt\""),
+            out.contains(&format!(
+                "\"uri\": \"{URI}games/Hearts%20of%20Iron%20IV/x.txt\""
+            )),
             "got: {out}"
         );
         assert!(!out.contains("uriBaseId"), "outside the root: {out}");

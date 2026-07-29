@@ -1,3 +1,24 @@
+# 2.5.0
+
+## Bug Fixes
+
+- A bulk file change landing while a workspace scan was already running made the server retry every half second for the scan's whole duration. An over-cap watched batch collapses into one rescan, but when that rescan lost the in-progress race it requeued its events and immediately re-armed its own window, so at Millennium Dawn scale the log filled with "watched batch over cap" lines for tens of seconds (#90 residual). The losing batch now parks its events and the winning scan drains them once when it finishes, with the loser re-arming itself only when the winner finished in between and its drain came up empty.
+- Watched file changes polluted the live localisation overlay, which holds the unsaved keys of open `.yml` files. Every watched event for a loc file treated the whole file as changed and ran the cross-file sweep meant for open-editor edits, up to 200 times per drain window, and the overlay kept an entry per watched file until a delete or a window reload (#90 residual). Watched loc files now get their own overlay, replaced per file on each event and consulted everywhere the open-doc one is, so cross-file references resolve keys added on disk and stop resolving keys removed there. It survives workspace scans on purpose: a scan's index install is built from disk reads that can predate a watched change, and merging into the index instead would lose the keys on the next install. A batch runs one coalesced sweep of the open files instead of one per file, and open documents keep the overlay behavior they had.
+- The rules-config error popup could show twice per session, and the details behind it never arrived at boot (#98). The rules load runs once inside `initialize`, where notifications are dropped before the handshake completes, and again when the client fires its boot-time `reloadrulesconfig` after cloning the rules, so the per-error log lines were lost and the popup repeated for the same errors. The popup and the log lines now defer to `initialized` the same way the per-file rule diagnostics already did, and an unchanged error set no longer re-toasts. A genuinely different set, such as after a real rules reload, still does.
+- Sixteen more "advice about a key" diagnostics underlined the whole block or statement they sat on instead of the key they complain about, burying however many lines the block spanned under one squiggle (#107 follow-up): CW104/CW105/CW106, CW108/CW109, CW227/CW229, CW236/CW237/CW238, CW247, CW248, CW261 (which underlined an entire entity definition), CW262 (whose did-you-mean fix already edited only the key, so squiggle and edit disagreed), CW267 and CW272. They now mark the key token, the same treatment CW223/CW251/CW253 got in 2.4.0. CW121/CW281/CW280 keep their full-block spans on purpose: their attached fixes delete the whole block.
+
+## Improvements
+
+- **In progress, engine v2.4.0:** remove redundant indexing and path normalization
+  work (#86).
+  Fuse type/subtype collection, reuse indexed instances for CW100, cache
+  ruleset lookups, and carry scan URIs across passes. Diagnostics must remain
+  byte-identical.
+
+## Notes
+
+- **Behavioral:** the sixteen codes above span their key token rather than the block or statement they open. Anything matching on diagnostic ranges rather than the start position will see the change.
+
 # 2.4.0
 
 ## Bug Fixes

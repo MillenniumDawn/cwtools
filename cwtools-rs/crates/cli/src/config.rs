@@ -683,17 +683,29 @@ mod tests {
         p
     }
 
+    /// An absolute path spelled the host's way: on Windows a leading `/` names
+    /// the current drive's root, so it is still resolved against the config.
+    fn abs(tail: &str) -> String {
+        if cfg!(windows) {
+            format!("C:/{tail}")
+        } else {
+            format!("/{tail}")
+        }
+    }
+
     #[test]
     fn loads_every_key() {
         let tmp = tempfile::tempdir().unwrap();
+        let vanilla = abs("games/hoi4");
         let p = write(
             tmp.path(),
-            r#"
+            &format!(
+                r#"
 # a cwtools.toml
 game = "hoi4"
 directory = "mod"
 rules = "../config/Config"
-vanilla = "/games/hoi4"
+vanilla = "{vanilla}"
 vanilla-cache = "ci/vanilla.cwb"
 no-vanilla-cache = true
 refresh-vanilla-cache = false
@@ -708,12 +720,13 @@ loc-languages = ["english"]
 ignore-codes = ["cw100"]
 only-codes = []
 allow-empty = true
-"#,
+"#
+            ),
         );
         let cfg = load(&p).unwrap();
         assert_eq!(cfg.game.as_deref(), Some("hoi4"));
         assert_eq!(cfg.directory, Some(tmp.path().join("mod")));
-        assert_eq!(cfg.vanilla, Some(PathBuf::from("/games/hoi4")));
+        assert_eq!(cfg.vanilla, Some(PathBuf::from(&vanilla)));
         assert!(cfg.no_vanilla_cache);
         assert!(!cfg.refresh_vanilla_cache);
         assert!(cfg.allow_empty);
@@ -760,8 +773,9 @@ allow-empty = true
     #[test]
     fn absolute_paths_are_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
-        let p = write(tmp.path(), "vanilla = \"/opt/hoi4\"\n");
-        assert_eq!(load(&p).unwrap().vanilla, Some(PathBuf::from("/opt/hoi4")));
+        let vanilla = abs("opt/hoi4");
+        let p = write(tmp.path(), &format!("vanilla = \"{vanilla}\"\n"));
+        assert_eq!(load(&p).unwrap().vanilla, Some(PathBuf::from(&vanilla)));
     }
 
     /// Literal strings take every byte as-is; basic strings unescape. A Windows

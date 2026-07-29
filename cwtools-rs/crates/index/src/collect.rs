@@ -192,6 +192,15 @@ pub struct InstanceNode<'a> {
 pub type SubtypeCollector =
     fn(&RuleSet, &ParsedFile, &InstanceNode, &StringTable, &mut HashMap<String, Vec<TypeInstance>>);
 
+/// Per-file type instances collected from one AST navigation. Base instances
+/// and subtype-qualified membership stay separate so callers that track exports
+/// do not treat subtype membership as an additional exported symbol.
+#[derive(Default)]
+pub struct CollectedTypeInstances {
+    pub instances: HashMap<String, Vec<TypeInstance>>,
+    pub subtype_instances: HashMap<String, Vec<TypeInstance>>,
+}
+
 /// Visit every type *instance node* in `file` whose type declares subtypes,
 /// invoking `f` with the matched type, the resolved instance name, the node's own
 /// key, and the node's clause children. Mirrors [`collect_type_instances`]'s
@@ -267,17 +276,38 @@ pub fn collect_type_instances(
     logical_path: &str,
     table: &StringTable,
 ) -> HashMap<String, Vec<TypeInstance>> {
-    collect_type_instances_inner(ruleset, file, logical_path, table, None)
+    collect_type_instances_inner(ruleset, file, logical_path, table, None, None)
 }
 
-/// [`collect_type_instances`], optionally fused with subtype-membership
-/// collection. When `subtype_hook` is `Some`, each instance node of a
-/// subtype-declaring type also runs the hook during the *same* skip_root walk,
-/// so `index_discovered_files` navigates those instances once instead of twice
-/// (the walk that [`for_each_instance_node`] would run separately). The subtype
-/// entries land under disjoint `"type.subtype"` keys, so per-key order — the
-/// only order [`TypeIndex::merge`] observes — is identical to running the two
-/// walks back-to-back.
+/// Collect base type instances and subtype-qualified membership in one walk.
+/// The maps stay separate because subtype entries are not additional exported
+/// symbols, even though both are merged into [`TypeIndex`] for reference lookup.
+pub fn collect_type_instances_with_subtypes(
+    ruleset: &RuleSet,
+    file: &ParsedFile,
+    logical_path: &str,
+    table: &StringTable,
+    subtype_hook: SubtypeCollector,
+) -> CollectedTypeInstances {
+    let mut subtype_instances = HashMap::new();
+    let instances = collect_type_instances_inner(
+        ruleset,
+        file,
+        logical_path,
+        table,
+        Some(subtype_hook),
+        Some(&mut subtype_instances),
+    );
+    CollectedTypeInstances {
+        instances,
+        subtype_instances,
+    }
+}
+
+/// Shared implementation for base collection and the fused subtype path.
+/// When `subtype_hook` is present, each instance node of a subtype-declaring
+/// type invokes it during the same skip-root navigation. Per-key instance order
+/// remains identical to the separate walks.
 #[tracing::instrument(skip_all, name = "collect_type_instances")]
 fn collect_type_instances_inner(
     ruleset: &RuleSet,
@@ -285,6 +315,7 @@ fn collect_type_instances_inner(
     logical_path: &str,
     table: &StringTable,
     subtype_hook: Option<SubtypeCollector>,
+    mut subtype_instances: Option<&mut HashMap<String, Vec<TypeInstance>>>,
 ) -> HashMap<String, Vec<TypeInstance>> {
     let mut result: HashMap<String, Vec<TypeInstance>> = HashMap::new();
 
@@ -348,7 +379,7 @@ fn collect_type_instances_inner(
                 let primary_loc_key = primary_explicit_loc_field(td).and_then(|field| {
                     field_value_from_children(field, clause_children, arena, table)
                 });
-                if let Some(hook) = node_hook {
+                if let (Some(hook), Some(out)) = (node_hook, subtype_instances.as_deref_mut()) {
                     let node = InstanceNode {
                         td,
                         name: &name,
@@ -356,7 +387,7 @@ fn collect_type_instances_inner(
                         children: clause_children,
                         location,
                     };
-                    hook(ruleset, file, &node, table, &mut result);
+                    hook(ruleset, file, &node, table, out);
                 }
                 instances.push(TypeInstance {
                     name,
@@ -518,7 +549,8 @@ pub fn index_discovered_files(
     // on a Vec preserves input order in the output Vec after collect().
     type PerFileData = (
         String,                             // path
-        HashMap<String, Vec<TypeInstance>>, // type instances
+        HashMap<String, Vec<TypeInstance>>, // base type instances
+        HashMap<String, Vec<TypeInstance>>, // subtype membership
         Vec<String>,                        // variable names
         HashMap<String, Vec<String>>,       // complex enum values
         HashMap<String, Vec<String>>,       // value set members
@@ -533,15 +565,24 @@ pub fn index_discovered_files(
                 errors: vec![],
             };
             // Fused: type instances and subtype-qualified membership share one
-            // skip_root walk (the subtype hook runs at each instance node of a
-            // subtype-declaring type) instead of two separate navigations.
-            let instances = collect_type_instances_inner(
-                ruleset,
-                &pf,
-                &file.logical_path,
-                table,
-                subtype_collector,
-            );
+            // skip-root walk. Keep the maps separate until merge so subtype
+            // membership never affects base-instance bookkeeping.
+            let (instances, subtype_instances) = match subtype_collector {
+                Some(hook) => {
+                    let collected = collect_type_instances_with_subtypes(
+                        ruleset,
+                        &pf,
+                        &file.logical_path,
+                        table,
+                        hook,
+                    );
+                    (collected.instances, collected.subtype_instances)
+                }
+                None => (
+                    collect_type_instances(ruleset, &pf, &file.logical_path, table),
+                    HashMap::new(),
+                ),
+            };
             // Fused: set-variable names and value-set members share one pre-order
             // walk over the arena instead of two back-to-back traversals.
             let mut var_names: Vec<String> = Vec::new();
@@ -560,15 +601,25 @@ pub fn index_discovered_files(
                 &file.logical_path,
                 table,
             );
-            (path, instances, var_names, complex, value_sets)
+            (
+                path,
+                instances,
+                subtype_instances,
+                var_names,
+                complex,
+                value_sets,
+            )
         })
         .collect();
 
     // Sequential merge in original file order — preserves TypeIndex.merge call
     // order so goto-def "first match" and refcount semantics are unchanged.
     let mut index = TypeIndex::new();
-    for (path, instances, var_names, complex, value_sets) in per_file {
+    for (path, instances, subtype_instances, var_names, complex, value_sets) in per_file {
         index.merge(&path, instances);
+        if !subtype_instances.is_empty() {
+            index.merge(&path, subtype_instances);
+        }
         for n in &var_names {
             index.var_index.add_name(n);
         }

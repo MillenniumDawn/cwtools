@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tower_lsp::lsp_types::*;
 
-use cwtools_parser::parser::parse_string;
+use cwtools_parser::parser::parse_string_without_comments;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::build_modifier_keys;
 
@@ -18,7 +18,7 @@ use crate::validate::{
     validate_parsed_with_indexes, validation_error_to_diagnostic,
 };
 use crate::workspace_cache;
-use crate::{Backend, LoadingBar, UpdateFileList};
+use crate::{Backend, LoadingBar, LocLocationMap, LocTextMap, UpdateFileList};
 
 /// Trailing window for coalescing `didChangeWatchedFiles` create/modify events.
 /// Fixed (not a sliding reset) so a continuous churn stream still drains.
@@ -37,6 +37,12 @@ type OpenDocSnapshot = (
     i32,
     Option<Arc<cwtools_parser::ast::ParsedFile>>,
 );
+
+/// One discovered workspace file, with its URI built once for every scan pass.
+struct ScannedFile {
+    path: std::path::PathBuf,
+    uri: String,
+}
 
 /// Index a base-game ("vanilla") install into per-type instances, ready to merge
 /// into the workspace TypeIndex. Delegates to the shared driver's `index_game_dir`
@@ -303,10 +309,22 @@ impl Backend {
             tracing::debug!("workspace scan already in progress; skipping");
             return false;
         }
-        let _guard = ScanGuard(&self.state.scan_in_progress);
-        self.validate_entire_workspace_inner(quiet).await;
-        if !quiet {
-            self.send_loading_bar(false, "").await;
+        {
+            let _guard = ScanGuard(&self.state.scan_in_progress);
+            self.validate_entire_workspace_inner(quiet).await;
+            if !quiet {
+                self.send_loading_bar(false, "").await;
+            }
+        }
+        // Drain any watched events an over-cap batch requeued after losing the
+        // CAS to this scan — the loser suppresses its own re-arm so it doesn't
+        // retry against the flag every window for the scan's whole duration.
+        // Each guard scoped to its own `let` so the two queue locks are never
+        // held at once.
+        let requeued_pending = !self.state.watched_pending.lock().is_empty();
+        let requeued_deleted = !self.state.watched_deleted.lock().is_empty();
+        if requeued_pending || requeued_deleted {
+            self.arm_watched_batch();
         }
         true
     }
@@ -317,6 +335,15 @@ impl Backend {
         cwtools_profiling::log_rss("workspace_scan_start");
         if !quiet {
             self.send_loading_bar(true, "Indexing workspace…").await;
+        }
+        // `CWTOOLS_SCAN_HOLD_MS` test override: hold the scan open (after the
+        // loading bar, which doubles as the scan-started signal) so the tests
+        // can overlap it with watched-file batches deterministically.
+        if let Some(ms) = std::env::var("CWTOOLS_SCAN_HOLD_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
 
         let workspace_uri = self.state.config.read().workspace_uri.clone();
@@ -387,12 +414,20 @@ impl Backend {
             return;
         }
 
+        let scan_files: Vec<ScannedFile> = files_to_validate
+            .into_iter()
+            .map(|path| ScannedFile {
+                uri: path_to_uri(&path),
+                path,
+            })
+            .collect();
+
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
                     "Validating {} workspace files under {:?} ...",
-                    files_to_validate.len(),
+                    scan_files.len(),
                     root_path
                 ),
             )
@@ -474,7 +509,7 @@ impl Backend {
         // match the sequential version.
         //
         // `par_iter().collect()` preserves file order, so `outcomes[i]`
-        // corresponds to `files_to_validate[i]`.
+        // corresponds to `scan_files[i]`.
         use rayon::prelude::*;
         // (cache_hit, parsed) per file; None = open doc, parse failure, or read error.
         type ParseOutcome = (bool, cwtools_parser::ast::ParsedFile);
@@ -482,22 +517,21 @@ impl Backend {
         // blocking I/O; the runtime shifts its remaining tasks to other workers
         // so the LSP request loop is not starved while rayon parses.
         let outcomes: Vec<Option<ParseOutcome>> = tokio::task::block_in_place(|| {
-            files_to_validate
+            scan_files
                 .par_iter()
-                .map(|file_path| {
-                    let uri = path_to_uri(file_path);
+                .map(|file| {
                     // Open docs are already indexed from their in-memory text;
                     // skip so we don't re-index stale disk content on top of the
                     // live version.
-                    if open_uris.contains(&uri) {
+                    if open_uris.contains(&file.uri) {
                         return None;
                     }
                     // Read via the file manager so cp1252-encoded script files
                     // (pre-Jomini mods) are indexed instead of silently dropped.
-                    let text = match cwtools_file_manager::file_manager::read_text(file_path) {
+                    let text = match cwtools_file_manager::file_manager::read_text(&file.path) {
                         Ok(t) => t,
                         Err(e) => {
-                            tracing::warn!(path = %file_path.display(), error = %e, "scan: skipping unreadable file");
+                            tracing::warn!(path = %file.path.display(), error = %e, "scan: skipping unreadable file");
                             return None;
                         }
                     };
@@ -509,7 +543,8 @@ impl Backend {
                         return Some((true, parsed));
                     }
                     // Cache miss — parse, then persist for the next scan.
-                    let parsed = parse_string(&text, &self.state.string_table).ok()?;
+                    let parsed =
+                        parse_string_without_comments(&text, &self.state.string_table).ok()?;
                     if let Some((ref cd, fp)) = cache_info {
                         workspace_cache::store(cd, fp, &text, &parsed, &self.state.string_table);
                     }
@@ -520,12 +555,11 @@ impl Backend {
 
         // Serial index phase, in file order.
         let mut parsed_files: Vec<Option<cwtools_parser::ast::ParsedFile>> =
-            Vec::with_capacity(files_to_validate.len());
-        for (i, (file_path, outcome)) in files_to_validate.iter().zip(outcomes).enumerate() {
+            Vec::with_capacity(scan_files.len());
+        for (i, (file, outcome)) in scan_files.iter().zip(outcomes).enumerate() {
             let parsed = match outcome {
                 Some((cache_hit, parsed)) => {
-                    let uri = path_to_uri(file_path);
-                    self.index_parsed_file(&uri, &parsed, None);
+                    self.index_parsed_file(&file.uri, &parsed, None);
                     if cache_hit {
                         cache_hits += 1;
                     } else {
@@ -566,13 +600,13 @@ impl Backend {
         // syntax error is still there and keeps its last-good index entry, so
         // cross-file goto/references don't drop out while it's mid-edit.
         let discovered_uris: HashSet<String> =
-            files_to_validate.iter().map(|p| path_to_uri(p)).collect();
+            scan_files.iter().map(|file| file.uri.clone()).collect();
         // An empty walk almost always means the root was transiently
         // unreadable — walk_workspace_files swallows I/O errors and returns an
         // empty Vec — not that the user deleted every file. Pruning against an
         // empty set would wipe the whole index on a hiccup, so skip it; real
         // deletions still arrive as per-file DELETE watched events.
-        let removed_uris: Vec<String> = if files_to_validate.is_empty() {
+        let removed_uris: Vec<String> = if scan_files.is_empty() {
             Vec::new()
         } else {
             let mut info = self.state.info_service.write();
@@ -597,13 +631,19 @@ impl Backend {
         };
         if !removed_uris.is_empty() {
             // Mirrors the DELETE branch of `did_change_watched_files_impl`:
-            // the loc live-overlay is keyed per-file too and must forget the
+            // both loc overlays are keyed per-file too and must forget the
             // same URIs, or loc checks keep serving stale entries for a file
             // `info_service` just dropped.
             {
                 let mut overlay = self.state.loc_live_overlay.write();
                 for uri in &removed_uris {
                     overlay.remove(uri);
+                }
+            }
+            {
+                let mut watched = self.state.loc_watched_overlay.write();
+                for uri in &removed_uris {
+                    watched.remove(uri);
                 }
             }
             self.bump_info_revision();
@@ -674,7 +714,7 @@ impl Backend {
             self.send_loading_bar(true, "Validating workspace…").await;
         }
         let mut total_errors = 0usize;
-        let total_files = files_to_validate.len();
+        let total_files = scan_files.len();
         // Build the scope registry + enum_map ONCE for the whole scan instead of
         // once per file: they depend only on (ruleset, game) and are the
         // expensive part of per-file setup (many inserts + lowercasing +
@@ -733,15 +773,14 @@ impl Backend {
                 )
             });
 
-            files_to_validate
+            scan_files
                 .par_iter()
                 .zip(parsed_files.par_iter())
-                .filter_map(|(file_path, parsed_opt)| {
+                .filter_map(|(file, parsed_opt)| {
                     // Skip files that failed to parse in pass 1, and open docs
                     // whose fresher in-memory diagnostics must not be overwritten.
                     let parsed = parsed_opt.as_ref()?;
-                    let uri = path_to_uri(file_path);
-                    if open_uris.contains(&uri) {
+                    if open_uris.contains(&file.uri) {
                         return None;
                     }
                     // Workspace scan covers files not open in an editor (open
@@ -751,7 +790,7 @@ impl Backend {
                     let no_lines = DocLines::none();
                     let diagnostics = match &prepared {
                         Some(prepared) => {
-                            validate_parsed_with_indexes(&uri, parsed, prepared, &no_lines)
+                            validate_parsed_with_indexes(&file.uri, parsed, prepared, &no_lines)
                         }
                         None => parsed
                             .errors
@@ -759,7 +798,7 @@ impl Backend {
                             .map(|e| parse_error_to_diagnostic(e, &no_lines))
                             .collect(),
                     };
-                    Some((uri, diagnostics))
+                    Some((file.uri.clone(), diagnostics))
                 })
                 .collect()
             // info_guard / loc_guard dropped here, before any await.
@@ -796,11 +835,10 @@ impl Backend {
 
         // Build and send the file list for the extension's file explorer.
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
-        let file_list: Vec<serde_json::Value> = files_to_validate
+        let file_list: Vec<serde_json::Value> = scan_files
             .iter()
-            .map(|file_path| {
-                let uri = path_to_uri(file_path);
-                let logical_path = logical_path_from_uri(&uri, &ws_prefix);
+            .map(|file| {
+                let logical_path = logical_path_from_uri(&file.uri, &ws_prefix);
                 let scope = logical_path
                     .split('/')
                     .next()
@@ -808,7 +846,7 @@ impl Backend {
                     .to_string();
                 serde_json::json!({
                     "scope": scope,
-                    "uri": uri,
+                    "uri": file.uri.clone(),
                     "logicalpath": logical_path
                 })
             })
@@ -817,7 +855,7 @@ impl Backend {
 
         // Never record for an empty walk: a transiently-unreadable root would
         // otherwise pin a bogus fingerprint and suppress the recovery pass.
-        if !files_to_validate.is_empty() {
+        if !scan_files.is_empty() {
             *self.state.last_scan_fingerprint.lock() = Some((scan_fingerprint, scan_generation));
         }
 
@@ -1087,9 +1125,8 @@ impl Backend {
                 }
                 // Extract per-key display text for hover and a representative
                 // definition site (for goto) before dropping the service.
-                let mut lt: HashMap<String, Vec<(cwtools_localization::Lang, String)>> =
-                    HashMap::new();
-                let mut ll: HashMap<String, (String, u32)> = HashMap::new();
+                let mut lt = LocTextMap::default();
+                let mut ll = LocLocationMap::default();
                 for file in service.files() {
                     if std::path::Path::new(&file.path).starts_with(root_path) {
                         by_file.entry(file.path.clone()).or_default();
@@ -1097,9 +1134,11 @@ impl Backend {
                     let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
                     let lang_included = hover_all || lang == primary_lang;
                     // Every entry in a file shares the same source path.
-                    let file_uri = path_to_uri(std::path::Path::new(&file.path));
+                    let file_uri: Arc<str> = path_to_uri(std::path::Path::new(&file.path)).into();
                     for entry in &file.entries {
-                        let key_lower = entry.key.to_lowercase();
+                        let key_lower = idx
+                            .key(&entry.key)
+                            .expect("loc index must contain every service key");
                         // goto: prefer the primary language's location (English by
                         // default) so Ctrl+Click lands on the canonical entry, not
                         // whichever language happened to be scanned first.
@@ -1132,7 +1171,7 @@ impl Backend {
         // keys is CPU-bound and must not sit on the async executor.
         let loc_key_index = tokio::task::block_in_place(|| {
             Arc::new(crate::completion::LocKeyIndex::build(
-                loc_index.union().iter().map(String::as_str),
+                loc_index.union().iter().map(AsRef::as_ref),
             ))
         });
         *self.state.loc_index.write() = Some(loc_index);
@@ -1459,6 +1498,7 @@ impl Backend {
         if changes.is_empty() && deletes.is_empty() {
             return;
         }
+        let mut lost_scan_cas = false;
         if watched_batch_over_cap(changes.len(), deletes.len()) {
             tracing::info!(
                 changes = changes.len(),
@@ -1466,9 +1506,12 @@ impl Backend {
                 "watched batch over cap; full rescan"
             );
             if !self.validate_entire_workspace(true).await {
-                // Lost the CAS to a running scan — requeue both sides.
+                // Lost the CAS to a running scan — requeue both sides for the
+                // winner to drain when it finishes. Re-arming here would retry
+                // (and re-log) every window for the winner's whole duration.
                 self.state.watched_pending.lock().extend(changes);
                 self.state.watched_deleted.lock().extend(deletes);
+                lost_scan_cas = true;
             }
         } else {
             // Deletions first, so a re-created file's later change validates
@@ -1476,6 +1519,11 @@ impl Backend {
             if !deletes.is_empty() {
                 self.process_watched_deletes(&deletes).await;
             }
+            // Loc keys added or removed across the batch's loc files, recorded
+            // per file in the watched overlay and swept ONCE after the loop —
+            // the per-file cross-file sweep is the open-doc edit path's job
+            // (#90).
+            let mut changed_loc_keys: HashSet<String> = HashSet::new();
             for uri in changes {
                 // An open editor buffer owns its diagnostics; skip files that
                 // are open now, regardless of open state when queued.
@@ -1505,6 +1553,12 @@ impl Backend {
                 };
                 match read {
                     Ok(Ok(text)) => {
+                        // Record before validating so the file's own diagnostics
+                        // resolve keys it just defined.
+                        if crate::paths::is_loc_file(&uri) {
+                            changed_loc_keys
+                                .extend(self.record_watched_loc_keys(&uri, &path, &text));
+                        }
                         let (diagnostics, _) = self
                             .parse_and_validate(&uri, &text, crate::ValidateTrigger::Watched, None)
                             .await;
@@ -1528,11 +1582,24 @@ impl Backend {
                     }
                 }
             }
+            if !changed_loc_keys.is_empty() {
+                self.refresh_after_watched_loc_changes(&changed_loc_keys)
+                    .await;
+            }
         }
         // Clear our slot before the final check so a producer that queued an
         // event while we ran can arm the next window (or we do it here). Setting
         // the slot to `None` only detaches this finished task, it doesn't abort.
         *self.state.watched_debounce.lock() = None;
+        if lost_scan_cas {
+            // The scan winner drains the requeue at its end; only if it already
+            // finished (between the CAS failure and the requeue, so its drain
+            // saw empty queues) do we arm on its behalf.
+            if !self.state.scan_in_progress.load(Ordering::SeqCst) {
+                self.arm_watched_batch();
+            }
+            return;
+        }
         // Each guard scoped to its own `let` so the two queue locks are never
         // held at once.
         let pending_more = !self.state.watched_pending.lock().is_empty();
@@ -1543,7 +1610,7 @@ impl Backend {
     }
 
     /// Apply a coalesced batch of DELETE events off the message future: forget
-    /// each URI from the info service (one write scope), the loc overlay, and
+    /// each URI from the info service (one write scope), both loc overlays, and
     /// the watched-signature record, bump the info revision once for the whole
     /// batch, then publish empty diagnostics per URI outside every lock.
     async fn process_watched_deletes(&self, deletes: &[String]) {
@@ -1557,6 +1624,12 @@ impl Backend {
             let mut overlay = self.state.loc_live_overlay.write();
             for uri in deletes {
                 overlay.remove(uri);
+            }
+        }
+        {
+            let mut watched = self.state.loc_watched_overlay.write();
+            for uri in deletes {
+                watched.remove(uri);
             }
         }
         {

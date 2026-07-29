@@ -2,6 +2,13 @@ use crate::ast::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
 use std::str::Chars;
 
+/// Whether parsed comments are retained in the AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentMode {
+    Preserve,
+    Discard,
+}
+
 struct Parser<'a> {
     input: &'a str,
     chars: Chars<'a>,
@@ -10,6 +17,7 @@ struct Parser<'a> {
     table: &'a StringTable,
     arena: Arena,
     errors: Vec<ParseError>,
+    comment_mode: CommentMode,
     /// Clauses currently open, bounded by [`MAX_CLAUSE_DEPTH`].
     depth: u32,
 }
@@ -23,7 +31,7 @@ struct Cursor<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(input: &'a str, table: &'a StringTable) -> Self {
+    fn new(input: &'a str, table: &'a StringTable, comment_mode: CommentMode) -> Self {
         Self {
             input,
             chars: input.chars(),
@@ -32,6 +40,7 @@ impl<'a> Parser<'a> {
             table,
             arena: Arena::new(),
             errors: Vec::new(),
+            comment_mode,
             depth: 0,
         }
     }
@@ -614,9 +623,15 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self, out: &mut Vec<Child>) {
         self.skip_whitespace();
 
-        if let Some(comment) = self.consume_comment() {
-            let idx = self.arena.push_comment(comment);
-            out.push(Child::Comment(idx));
+        if self.peek() == Some('#') {
+            if self.comment_mode == CommentMode::Preserve {
+                if let Some(comment) = self.consume_comment() {
+                    let idx = self.arena.push_comment(comment);
+                    out.push(Child::Comment(idx));
+                }
+            } else {
+                self.skip_comment();
+            }
             return;
         }
 
@@ -833,12 +848,28 @@ fn is_key_char(c: char) -> bool {
 /// leaves the downstream walkers most of the stack.
 pub const MAX_CLAUSE_DEPTH: u32 = 256;
 
-/// Strip UTF-8 BOM if present, then parse.
+/// Strip UTF-8 BOM if present, then parse with comments preserved.
 #[tracing::instrument(skip_all)]
 pub fn parse_string(input: &str, table: &StringTable) -> Result<ParsedFile, ParseError> {
+    parse_string_with_comment_mode(input, table, CommentMode::Preserve)
+}
+
+/// Strip UTF-8 BOM if present, then parse without retaining comment text.
+#[tracing::instrument(skip_all)]
+pub fn parse_string_without_comments(
+    input: &str,
+    table: &StringTable,
+) -> Result<ParsedFile, ParseError> {
+    parse_string_with_comment_mode(input, table, CommentMode::Discard)
+}
+
+fn parse_string_with_comment_mode(
+    input: &str,
+    table: &StringTable,
+    comment_mode: CommentMode,
+) -> Result<ParsedFile, ParseError> {
     let stripped = input.strip_prefix('\u{FEFF}').unwrap_or(input);
-    let parser = Parser::new(stripped, table);
-    parser.parse()
+    Parser::new(stripped, table, comment_mode).parse()
 }
 
 #[cfg(test)]
@@ -850,6 +881,18 @@ mod tests {
         let table = StringTable::new();
         let result = parse_string("foo = bar", &table).unwrap();
         assert_eq!(result.root_children.len(), 1);
+    }
+
+    #[test]
+    fn discarding_comments_preserves_statements() {
+        let table = StringTable::new();
+        let parsed = parse_string_without_comments(
+            "# ignored\nfirst = 1\n# also ignored\nsecond = 2",
+            &table,
+        )
+        .unwrap();
+        assert!(parsed.arena.comments.is_empty());
+        assert_eq!(parsed.root_children.len(), 2);
     }
 
     #[test]
