@@ -844,14 +844,41 @@ fn scan_ast_for_type_ref(
 }
 
 /// Check if a leaf with key `leaf_key` is a TypeField reference to `type_name`.
-/// Walks root_rules shallowly (depth 1) looking for a LeafRule whose left
-/// is SpecificField(leaf_key) and right is TypeField(Simple(type_name)).
+/// Uses the ruleset's depth-one leaf-key lookup when available. Hand-built
+/// rulesets that have not been reindexed retain the direct root-rule scan.
 pub(crate) fn is_type_ref_leaf(
     ruleset: &RuleSet,
     leaf_key: &str,
     type_name: &str,
     logical_path: &str,
 ) -> bool {
+    if !ruleset.type_reference_rules.is_empty() {
+        return ruleset
+            .type_reference_rules_for_key(leaf_key)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    if entry.ref_type != type_name {
+                        return false;
+                    }
+                    match &entry.root_type {
+                        None => true,
+                        Some(root_type) => ruleset
+                            .type_by_name
+                            .get(root_type)
+                            .map(|&idx| {
+                                cwtools_info::check_path_dir(
+                                    &ruleset.types[idx].path_options,
+                                    logical_path,
+                                )
+                            })
+                            // Preserve the legacy scan: a TypeRule without a
+                            // matching TypeDefinition has no path gate.
+                            .unwrap_or(true),
+                    }
+                })
+            });
+    }
+
     for root_rule in &ruleset.root_rules {
         let (rule_type_name, (rule_type, _)) = match root_rule {
             RootRule::TypeRule(n, r) => (Some(n.as_str()), r),

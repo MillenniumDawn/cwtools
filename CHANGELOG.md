@@ -7,6 +7,14 @@
 - The rules-config error popup could show twice per session, and the details behind it never arrived at boot (#98). The rules load runs once inside `initialize`, where notifications are dropped before the handshake completes, and again when the client fires its boot-time `reloadrulesconfig` after cloning the rules, so the per-error log lines were lost and the popup repeated for the same errors. The popup and the log lines now defer to `initialized` the same way the per-file rule diagnostics already did, and an unchanged error set no longer re-toasts. A genuinely different set, such as after a real rules reload, still does.
 - Sixteen more "advice about a key" diagnostics underlined the whole block or statement they sat on instead of the key they complain about, burying however many lines the block spanned under one squiggle (#107 follow-up): CW104/CW105/CW106, CW108/CW109, CW227/CW229, CW236/CW237/CW238, CW247, CW248, CW261 (which underlined an entire entity definition), CW262 (whose did-you-mean fix already edited only the key, so squiggle and edit disagreed), CW267 and CW272. They now mark the key token, the same treatment CW223/CW251/CW253 got in 2.4.0. CW121/CW281/CW280 keep their full-block spans on purpose: their attached fixes delete the whole block.
 
+## Improvements
+
+- **In progress, engine v2.4.0:** remove redundant indexing and path normalization
+  work (#86).
+  Fuse type/subtype collection, reuse indexed instances for CW100, cache
+  ruleset lookups, and carry scan URIs across passes. Diagnostics must remain
+  byte-identical.
+
 ## Notes
 
 - **Behavioral:** the sixteen codes above span their key token rather than the block or statement they open. Anything matching on diagnostic ranges rather than the start position will see the change.

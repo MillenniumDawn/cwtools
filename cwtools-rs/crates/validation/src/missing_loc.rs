@@ -7,10 +7,8 @@
 //! can see at a glance which objects lack localisation. Mirrors the old cwtools
 //! "object has no localisation" warning.
 
-use cwtools_index::{NormalizedPath, check_path_dir_norm, collect_type_instances};
-use cwtools_parser::ast::ParsedFile;
+use cwtools_index::{NormalizedPath, TypeInstance, check_path_dir_norm};
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
-use cwtools_string_table::string_table::StringTable;
 
 use crate::ValidationError;
 use crate::error_codes;
@@ -23,17 +21,16 @@ fn has_required_name_loc(td: &TypeDefinition) -> bool {
         .any(|loc| loc.required && !loc.optional && loc.explicit_field.is_none())
 }
 
-/// Flag instances in `ast` whose `## required` localisation keys are not provided
-/// by any loc file. `loc_exists(key_lower)` reports whether a (lowercased) loc key
-/// exists across the indexed languages. Only keys built from the instance name
-/// (`prefix$suffix`) are checked; `explicit_field` forms (loc key taken from a
-/// child field's value) are skipped for now.
+/// Flag indexed instances whose `## required` localisation keys are not
+/// provided by any loc file. `loc_exists(key_lower)` reports whether a
+/// (lowercased) loc key exists across the indexed languages. Only keys built
+/// from the instance name (`prefix$suffix`) are checked; `explicit_field` forms
+/// (loc key taken from a child field's value) are skipped for now.
 pub fn check_missing_localisation(
-    ast: &ParsedFile,
+    instances: &[(&str, &TypeInstance)],
     logical_path: &str,
     file_path: &str,
     ruleset: &RuleSet,
-    table: &StringTable,
     loc_exists: impl Fn(&str) -> bool,
 ) -> Vec<ValidationError> {
     // Only a type whose path covers this file can contribute instances here, so
@@ -50,13 +47,12 @@ pub fn check_missing_localisation(
     }
 
     let mut errors = Vec::new();
-    let instances = collect_type_instances(ruleset, ast, logical_path, table);
 
     for td in relevant {
-        let Some(insts) = instances.get(&td.name) else {
-            continue;
-        };
-        for inst in insts {
+        for &(type_name, inst) in instances {
+            if type_name != td.name.as_str() {
+                continue;
+            }
             for loc in &td.localisation {
                 // Only required, name-derived keys (`prefix$suffix`). `optional`
                 // and field-derived (`explicit_field`) forms are not flagged.
@@ -82,8 +78,10 @@ pub fn check_missing_localisation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cwtools_index::collect_type_instances;
     use cwtools_parser::parser::parse_string;
     use cwtools_rules::rules_converter::ast_to_ruleset;
+    use cwtools_string_table::string_table::StringTable;
 
     const RULES: &str = r#"
 types = {
@@ -107,7 +105,16 @@ thing = { x = scalar }
         let parsed = parse_string(script, &table).unwrap();
         let present: std::collections::HashSet<String> =
             has.iter().map(|s| s.to_ascii_lowercase()).collect();
-        check_missing_localisation(&parsed, logical_path, logical_path, &ruleset, &table, |k| {
+        let per_type = collect_type_instances(&ruleset, &parsed, logical_path, &table);
+        let instances: Vec<(&str, &TypeInstance)> = per_type
+            .iter()
+            .flat_map(|(type_name, values)| {
+                values
+                    .iter()
+                    .map(move |instance| (type_name.as_str(), instance))
+            })
+            .collect();
+        check_missing_localisation(&instances, logical_path, logical_path, &ruleset, |k| {
             present.contains(k)
         })
     }

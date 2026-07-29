@@ -38,6 +38,12 @@ type OpenDocSnapshot = (
     Option<Arc<cwtools_parser::ast::ParsedFile>>,
 );
 
+/// One discovered workspace file, with its URI built once for every scan pass.
+struct ScannedFile {
+    path: std::path::PathBuf,
+    uri: String,
+}
+
 /// Index a base-game ("vanilla") install into per-type instances, ready to merge
 /// into the workspace TypeIndex. Delegates to the shared driver's `index_game_dir`
 /// so the LSP and CLI discover and index vanilla the SAME way (the driver's
@@ -408,12 +414,20 @@ impl Backend {
             return;
         }
 
+        let scan_files: Vec<ScannedFile> = files_to_validate
+            .into_iter()
+            .map(|path| ScannedFile {
+                uri: path_to_uri(&path),
+                path,
+            })
+            .collect();
+
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
                     "Validating {} workspace files under {:?} ...",
-                    files_to_validate.len(),
+                    scan_files.len(),
                     root_path
                 ),
             )
@@ -495,7 +509,7 @@ impl Backend {
         // match the sequential version.
         //
         // `par_iter().collect()` preserves file order, so `outcomes[i]`
-        // corresponds to `files_to_validate[i]`.
+        // corresponds to `scan_files[i]`.
         use rayon::prelude::*;
         // (cache_hit, parsed) per file; None = open doc, parse failure, or read error.
         type ParseOutcome = (bool, cwtools_parser::ast::ParsedFile);
@@ -503,22 +517,21 @@ impl Backend {
         // blocking I/O; the runtime shifts its remaining tasks to other workers
         // so the LSP request loop is not starved while rayon parses.
         let outcomes: Vec<Option<ParseOutcome>> = tokio::task::block_in_place(|| {
-            files_to_validate
+            scan_files
                 .par_iter()
-                .map(|file_path| {
-                    let uri = path_to_uri(file_path);
+                .map(|file| {
                     // Open docs are already indexed from their in-memory text;
                     // skip so we don't re-index stale disk content on top of the
                     // live version.
-                    if open_uris.contains(&uri) {
+                    if open_uris.contains(&file.uri) {
                         return None;
                     }
                     // Read via the file manager so cp1252-encoded script files
                     // (pre-Jomini mods) are indexed instead of silently dropped.
-                    let text = match cwtools_file_manager::file_manager::read_text(file_path) {
+                    let text = match cwtools_file_manager::file_manager::read_text(&file.path) {
                         Ok(t) => t,
                         Err(e) => {
-                            tracing::warn!(path = %file_path.display(), error = %e, "scan: skipping unreadable file");
+                            tracing::warn!(path = %file.path.display(), error = %e, "scan: skipping unreadable file");
                             return None;
                         }
                     };
@@ -541,12 +554,11 @@ impl Backend {
 
         // Serial index phase, in file order.
         let mut parsed_files: Vec<Option<cwtools_parser::ast::ParsedFile>> =
-            Vec::with_capacity(files_to_validate.len());
-        for (i, (file_path, outcome)) in files_to_validate.iter().zip(outcomes).enumerate() {
+            Vec::with_capacity(scan_files.len());
+        for (i, (file, outcome)) in scan_files.iter().zip(outcomes).enumerate() {
             let parsed = match outcome {
                 Some((cache_hit, parsed)) => {
-                    let uri = path_to_uri(file_path);
-                    self.index_parsed_file(&uri, &parsed, None);
+                    self.index_parsed_file(&file.uri, &parsed, None);
                     if cache_hit {
                         cache_hits += 1;
                     } else {
@@ -587,13 +599,13 @@ impl Backend {
         // syntax error is still there and keeps its last-good index entry, so
         // cross-file goto/references don't drop out while it's mid-edit.
         let discovered_uris: HashSet<String> =
-            files_to_validate.iter().map(|p| path_to_uri(p)).collect();
+            scan_files.iter().map(|file| file.uri.clone()).collect();
         // An empty walk almost always means the root was transiently
         // unreadable — walk_workspace_files swallows I/O errors and returns an
         // empty Vec — not that the user deleted every file. Pruning against an
         // empty set would wipe the whole index on a hiccup, so skip it; real
         // deletions still arrive as per-file DELETE watched events.
-        let removed_uris: Vec<String> = if files_to_validate.is_empty() {
+        let removed_uris: Vec<String> = if scan_files.is_empty() {
             Vec::new()
         } else {
             let mut info = self.state.info_service.write();
@@ -701,7 +713,7 @@ impl Backend {
             self.send_loading_bar(true, "Validating workspace…").await;
         }
         let mut total_errors = 0usize;
-        let total_files = files_to_validate.len();
+        let total_files = scan_files.len();
         // Build the scope registry + enum_map ONCE for the whole scan instead of
         // once per file: they depend only on (ruleset, game) and are the
         // expensive part of per-file setup (many inserts + lowercasing +
@@ -760,15 +772,14 @@ impl Backend {
                 )
             });
 
-            files_to_validate
+            scan_files
                 .par_iter()
                 .zip(parsed_files.par_iter())
-                .filter_map(|(file_path, parsed_opt)| {
+                .filter_map(|(file, parsed_opt)| {
                     // Skip files that failed to parse in pass 1, and open docs
                     // whose fresher in-memory diagnostics must not be overwritten.
                     let parsed = parsed_opt.as_ref()?;
-                    let uri = path_to_uri(file_path);
-                    if open_uris.contains(&uri) {
+                    if open_uris.contains(&file.uri) {
                         return None;
                     }
                     // Workspace scan covers files not open in an editor (open
@@ -778,7 +789,7 @@ impl Backend {
                     let no_lines = DocLines::none();
                     let diagnostics = match &prepared {
                         Some(prepared) => {
-                            validate_parsed_with_indexes(&uri, parsed, prepared, &no_lines)
+                            validate_parsed_with_indexes(&file.uri, parsed, prepared, &no_lines)
                         }
                         None => parsed
                             .errors
@@ -786,7 +797,7 @@ impl Backend {
                             .map(|e| parse_error_to_diagnostic(e, &no_lines))
                             .collect(),
                     };
-                    Some((uri, diagnostics))
+                    Some((file.uri.clone(), diagnostics))
                 })
                 .collect()
             // info_guard / loc_guard dropped here, before any await.
@@ -823,11 +834,10 @@ impl Backend {
 
         // Build and send the file list for the extension's file explorer.
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
-        let file_list: Vec<serde_json::Value> = files_to_validate
+        let file_list: Vec<serde_json::Value> = scan_files
             .iter()
-            .map(|file_path| {
-                let uri = path_to_uri(file_path);
-                let logical_path = logical_path_from_uri(&uri, &ws_prefix);
+            .map(|file| {
+                let logical_path = logical_path_from_uri(&file.uri, &ws_prefix);
                 let scope = logical_path
                     .split('/')
                     .next()
@@ -835,7 +845,7 @@ impl Backend {
                     .to_string();
                 serde_json::json!({
                     "scope": scope,
-                    "uri": uri,
+                    "uri": file.uri.clone(),
                     "logicalpath": logical_path
                 })
             })
@@ -844,7 +854,7 @@ impl Backend {
 
         // Never record for an empty walk: a transiently-unreadable root would
         // otherwise pin a bogus fingerprint and suppress the recovery pass.
-        if !files_to_validate.is_empty() {
+        if !scan_files.is_empty() {
             *self.state.last_scan_fingerprint.lock() = Some((scan_fingerprint, scan_generation));
         }
 

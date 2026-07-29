@@ -1,3 +1,13 @@
+/// A depth-one `key = <type>` rule from a root rule. Built into a lookup map at
+/// ruleset reindex time for reference indexing and navigation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeReferenceRule {
+    pub ref_type: String,
+    /// `Some` for a `TypeRule`, whose path filter must apply. Alias roots apply
+    /// regardless of the current file path.
+    pub root_type: Option<String>,
+}
+
 /// Parsed result from a .cwt file or set of files.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleSet {
@@ -55,6 +65,10 @@ pub struct RuleSet {
     /// name to its index in `root_rules`, so `find_rules_by_name` is O(1)
     /// instead of a linear scan per root child.
     pub type_rules_idx: rustc_hash::FxHashMap<String, usize>,
+    /// Built by `reindex()`: lowercased leaf key -> each depth-one `<type>`
+    /// reference rule. Shared by workspace reference indexing and open-document
+    /// reference scans so neither rescans every root rule per candidate leaf.
+    pub type_reference_rules: rustc_hash::FxHashMap<String, Vec<TypeReferenceRule>>,
     /// Built by `reindex()`: lowercased effect/trigger alias key -> the
     /// `value_set[...]` namespace its body declares (e.g. `set_country_flag` ->
     /// `country_flag`). Used to collect dynamically-defined set members (flags,
@@ -235,6 +249,7 @@ impl RuleSet {
             type_by_name: rustc_hash::FxHashMap::default(),
             enum_by_name: rustc_hash::FxHashMap::default(),
             type_rules_idx: rustc_hash::FxHashMap::default(),
+            type_reference_rules: rustc_hash::FxHashMap::default(),
             value_set_effects: rustc_hash::FxHashMap::default(),
             value_set_effect_fields: rustc_hash::FxHashMap::default(),
             enum_values_lower: Vec::new(),
@@ -386,13 +401,48 @@ impl RuleSet {
             .map(|(k, vs)| (k.clone(), vs.iter().cloned().collect()))
             .collect();
         self.type_rules_idx.clear();
-        for (i, rr) in self.root_rules.iter().enumerate() {
-            if let RootRule::TypeRule(name, _) = rr {
-                // First writer wins — mirrors find_rules_by_name returning the
-                // first TypeRule with a given name.
-                self.type_rules_idx.entry(name.clone()).or_insert(i);
+        self.type_reference_rules.clear();
+        for (i, root_rule) in self.root_rules.iter().enumerate() {
+            let (root_type, rule) = match root_rule {
+                RootRule::TypeRule(name, rule) => {
+                    // First writer wins — mirrors find_rules_by_name returning the
+                    // first TypeRule with a given name.
+                    self.type_rules_idx.entry(name.clone()).or_insert(i);
+                    (Some(name.as_str()), rule)
+                }
+                RootRule::AliasRule(_, rule) | RootRule::SingleAliasRule(_, rule) => (None, rule),
+            };
+            let (rule_type, _) = rule;
+            let RuleType::NodeRule { rules, .. } = rule_type else {
+                continue;
+            };
+            for (inner, _) in rules {
+                if let RuleType::LeafRule {
+                    left: NewField::SpecificField(key),
+                    right: NewField::TypeField(TypeType::Simple(ref_type)),
+                } = inner
+                {
+                    self.type_reference_rules
+                        .entry(key.to_ascii_lowercase())
+                        .or_default()
+                        .push(TypeReferenceRule {
+                            ref_type: ref_type.clone(),
+                            root_type: root_type.map(str::to_string),
+                        });
+                }
             }
         }
+    }
+
+    /// The cached depth-one type-reference rules for `key`, using the same
+    /// case-insensitive lookup as script keys. Empty until [`Self::reindex`].
+    pub fn type_reference_rules_for_key(&self, key: &str) -> Option<&[TypeReferenceRule]> {
+        let rules = if key.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.type_reference_rules.get(&key.to_ascii_lowercase())
+        } else {
+            self.type_reference_rules.get(key)
+        }?;
+        Some(rules.as_slice())
     }
 
     /// Case-insensitive membership in enum `idx`'s values. Uses the precomputed

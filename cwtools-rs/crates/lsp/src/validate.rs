@@ -173,21 +173,20 @@ pub(crate) fn loc_extra_valid_refs(
 /// so both apply the same gate (a prior drift left the keystroke path without
 /// this check, so CW100 would flicker off on every edit until the next scan).
 pub(crate) fn append_missing_loc_errors(
-    parsed: &ParsedFile,
     uri: &str,
     prepared: &Prepared,
     errs: &mut Vec<cwtools_validation::ValidationError>,
 ) {
-    if let Some(loc) = prepared.loc_index
+    if let (Some(loc), Some(type_index)) = (prepared.loc_index, prepared.type_index)
         && !loc.union().is_empty()
     {
         let overlay = prepared.extra_loc_keys;
+        let instances = type_index.instances_in_file(uri);
         errs.extend(cwtools_validation::missing_loc::check_missing_localisation(
-            parsed,
+            &instances,
             uri,
             uri,
             prepared.ruleset,
-            prepared.table,
             |k| loc.exists_any(k) || overlay.is_some_and(|o| o.contains(k)),
         ));
     }
@@ -209,7 +208,7 @@ pub(crate) fn validate_parsed_with_indexes(
         .map(|e| parse_error_to_diagnostic(e, lines))
         .collect();
     let mut errs = validate_prepared(parsed, uri, prepared);
-    append_missing_loc_errors(parsed, uri, prepared, &mut errs);
+    append_missing_loc_errors(uri, prepared, &mut errs);
     truncate_validation_errors(&mut errs, uri);
     for err in &errs {
         diagnostics.push(validation_error_to_diagnostic(err, lines));
@@ -509,17 +508,16 @@ impl Backend {
         // guard would otherwise outrank the `documents` check below, and the
         // `Arc` makes the snapshot free.
         let ruleset = self.state.rules.read().ruleset.clone();
-        // Subtype-qualified membership (`equipment.naval_equip` …) so
-        // `<type.subtype>` references resolve. Re-run on every (re)index so an
-        // edit to an archetype keeps its subtype tag fresh. Computed BEFORE the
-        // write guard: completion takes a read guard on the same lock, so every
-        // microsecond held here is a keystroke the UI path waits on.
-        let subtypes = ruleset.as_ref().map(|ruleset| {
-            cwtools_validation::collect_subtype_instances(
+        // Base instances and subtype-qualified membership share one walk before
+        // the write guard. Completion takes a read guard on the same lock, so
+        // every microsecond kept outside it is a keystroke the UI path avoids.
+        let collected = ruleset.as_ref().map(|ruleset| {
+            cwtools_info::collect_type_instances_with_subtypes(
                 ruleset,
                 parsed,
                 &logical_path,
                 &self.state.string_table,
+                cwtools_validation::subtype_membership_for_instance,
             )
         });
         // Stale-write guard, the same version check debounced_validate publishes
@@ -538,15 +536,16 @@ impl Backend {
         }
         let mut info = self.state.info_service.write();
         info.clear_file(uri);
-        if let (Some(ruleset), Some(subtypes)) = (ruleset.as_ref(), subtypes) {
-            info.index_file_with_path(
+        if let (Some(ruleset), Some(collected)) = (ruleset.as_ref(), collected) {
+            info.index_file_with_precomputed_instances(
                 uri,
                 parsed,
                 &self.state.string_table,
                 ruleset,
                 &logical_path,
+                collected.instances,
+                collected.subtype_instances,
             );
-            info.type_index.merge(uri, subtypes);
         }
         drop(info);
         self.bump_info_revision();
@@ -1219,8 +1218,8 @@ impl Backend {
 
                 // Index this file the same way the workspace scan and did_close
                 // disk-restore do (previously an inlined, drifted subset that
-                // skipped the collect_subtype_instances merge — an open file
-                // could lose its `<type.subtype>` membership while being edited).
+                // skipped subtype-membership indexing — an open file could lose
+                // its `<type.subtype>` membership while being edited).
                 self.index_parsed_file(uri, &parsed, parsed_version);
 
                 // Validation. Lock order: rules -> info_service -> loc_index.
@@ -1257,7 +1256,7 @@ impl Backend {
                             var_checks,
                         );
                         let mut errs = validate_prepared(&parsed, uri, &prepared);
-                        append_missing_loc_errors(&parsed, uri, &prepared, &mut errs);
+                        append_missing_loc_errors(uri, &prepared, &mut errs);
                         drop(loc_guard);
                         drop(info_guard);
                         let elapsed = start.elapsed();
@@ -1474,23 +1473,76 @@ mod perf_bench {
             let uri = format!("file:///bench/{}", logical_path);
             eprintln!("fixture: {} ({} bytes)", logical_path, text.len());
 
-            bench("collect_subtype_instances", 20, || {
-                cwtools_validation::collect_subtype_instances(
+            bench("collect_type_instances_with_subtypes", 20, || {
+                let collected = cwtools_info::collect_type_instances_with_subtypes(
                     &ruleset,
                     &parsed,
                     logical_path,
                     &table,
+                    cwtools_validation::subtype_membership_for_instance,
+                );
+                collected.instances.len() + collected.subtype_instances.len()
+            });
+            // One InfoService across iterations, as in the server: `clear_file`
+            // then has real entries to drop, and the ruleset-derived reference
+            // map is reused instead of rebuilt per iteration.
+            let mut info = cwtools_info::InfoService::new();
+            bench("collect + clear_file + index_file", 20, || {
+                let collected = cwtools_info::collect_type_instances_with_subtypes(
+                    &ruleset,
+                    &parsed,
+                    logical_path,
+                    &table,
+                    cwtools_validation::subtype_membership_for_instance,
+                );
+                info.clear_file(&uri);
+                info.index_file_with_precomputed_instances(
+                    &uri,
+                    &parsed,
+                    &table,
+                    &ruleset,
+                    logical_path,
+                    collected.instances,
+                    collected.subtype_instances,
+                );
+                info.export_fingerprint(&uri) as usize
+            });
+
+            let mut type_index = cwtools_info::TypeIndex::new();
+            type_index.merge(
+                &uri,
+                cwtools_info::collect_type_instances(&ruleset, &parsed, logical_path, &table),
+            );
+            bench("CW100 recollect + check", 20, || {
+                let per_type =
+                    cwtools_info::collect_type_instances(&ruleset, &parsed, logical_path, &table);
+                let instances: Vec<_> = per_type
+                    .iter()
+                    .flat_map(|(type_name, values)| {
+                        values
+                            .iter()
+                            .map(move |instance| (type_name.as_str(), instance))
+                    })
+                    .collect();
+                cwtools_validation::missing_loc::check_missing_localisation(
+                    &instances,
+                    logical_path,
+                    logical_path,
+                    &ruleset,
+                    |_| true,
                 )
                 .len()
             });
-            // One InfoService across iterations, as in the server: `clear_file`
-            // then has real entries to drop, and the ruleset-derived
-            // `type_ref_keys` map is memoized instead of rebuilt per iteration.
-            let mut info = cwtools_info::InfoService::new();
-            bench("clear_file + index_file", 20, || {
-                info.clear_file(&uri);
-                info.index_file_with_path(&uri, &parsed, &table, &ruleset, logical_path);
-                info.export_fingerprint(&uri) as usize
+            bench("CW100 indexed check", 20, || {
+                let instances = type_index.instances_in_file(&uri);
+                cwtools_validation::missing_loc::check_missing_localisation(
+                    &instances,
+                    logical_path,
+                    logical_path,
+                    &ruleset,
+                    |_| true,
+                )
+                .len()
             });
         }
     }

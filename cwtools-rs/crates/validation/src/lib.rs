@@ -28,8 +28,9 @@ pub use subtype::{collect_subtype_instances, subtype_membership_for_instance};
 use common::{leaf_value_to_string, path_contains_segment};
 use ctx::ValidationCtx;
 use resolve::{
-    DispatchInput, ResolvedType, find_rules_by_name, find_type_from_candidates,
-    path_candidates_for_file, refine_grandchild_type, resolve_root_child, type_has_content,
+    DispatchInput, PathCandidate, ResolvedType, find_rules_by_name, find_type_from_candidates,
+    grandchild_candidates_for_wrapper, path_candidates_for_file, refine_grandchild_type,
+    resolve_root_child, type_has_content,
 };
 use rule_core::validate_with_type;
 use scope::build_scope_registry;
@@ -44,6 +45,7 @@ use scope::build_scope_registry;
 fn validate_wrapper_grandchildren(
     ctx: &ValidationCtx,
     grandchildren: &[Child],
+    path_candidates: &[PathCandidate],
     type_def: &TypeDefinition,
     wrapper_root_key: &str,
     inner_rules: &[(RuleType, Options)],
@@ -55,6 +57,7 @@ fn validate_wrapper_grandchildren(
     let table = ctx.table;
     let file_path = ctx.file_path;
     let ruleset = ctx.ruleset;
+    let candidates = grandchild_candidates_for_wrapper(path_candidates, wrapper_root_key);
     for grandchild in grandchildren {
         let (gc_key, gc_children, gc_pos): (String, &[Child], (u32, u16)) = match grandchild {
             Child::Leaf(gc_idx) => {
@@ -101,6 +104,7 @@ fn validate_wrapper_grandchildren(
                 validate_wrapper_grandchildren(
                     ctx,
                     gc_children,
+                    path_candidates,
                     type_def,
                     &gc_key,
                     inner_rules,
@@ -121,14 +125,9 @@ fn validate_wrapper_grandchildren(
         // (pdxmesh, pdxparticle, entity, …) that share a path; pick the type that
         // `## type_key_filter` assigns to THIS grandchild's key rather than
         // validating every grandchild against whichever type won the path lookup.
-        let Some((gc_type_def, gc_rules)) = refine_grandchild_type(
-            file_path,
-            wrapper_root_key,
-            &gc_key,
-            type_def,
-            inner_rules,
-            ruleset,
-        ) else {
+        let Some((gc_type_def, gc_rules)) =
+            refine_grandchild_type(&candidates, &gc_key, type_def, inner_rules, ruleset)
+        else {
             continue;
         };
 
@@ -402,6 +401,7 @@ pub fn validate_prepared(
             } => validate_wrapper_grandchildren(
                 &ctx,
                 children.as_slice(),
+                &path_candidates,
                 type_def,
                 &root_key,
                 inner_rules,
