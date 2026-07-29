@@ -335,20 +335,42 @@ fn fnv1a_digest(parts: [&str; 4]) -> String {
     format!("{:016x}", h)
 }
 
+/// `file` relative to `root` and `/`-separated, for hashing: a baseline must
+/// mean the same thing whether `file` came out absolute or mod-relative.
+/// Falls back to `file` (still `/`-separated) when it isn't under `root` — a
+/// vanilla install path reported alongside mod files, say — rather than
+/// panicking. Lexical only, no filesystem access, so a file that was never
+/// written to disk (as in tests) still hashes.
+fn relative_file(file: &str, root: &Path) -> String {
+    let file = file.replace('\\', "/");
+    let root = root.to_string_lossy().replace('\\', "/");
+    match Path::new(&file).strip_prefix(Path::new(&root)) {
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => file,
+    }
+}
+
 /// Stable digest of a diagnostic, for baseline/ignore matching. Keyed on the
 /// trimmed text of the offending source line rather than its line number, so
 /// inserting a line above a baselined diagnostic doesn't resurface it as new.
 /// Two identical diagnostics on two identical lines of one file collapse to one
 /// digest, which is the intended trade: baselines track content, not position.
-fn diag_hash(file: &str, code: &str, message: &str, line_text: &str) -> String {
-    fnv1a_digest([file, code, message, line_text])
+/// `file` is relativized against `root` first, so the digest doesn't depend on
+/// whether this invocation happened to see an absolute or relative path.
+fn diag_hash(root: &Path, file: &str, code: &str, message: &str, line_text: &str) -> String {
+    fnv1a_digest([relative_file(file, root).as_str(), code, message, line_text])
 }
 
 /// The previous digest, keyed on the line number. Still accepted when matching
 /// `--ignore-hashes` so existing baselines don't all invalidate at once; never
 /// emitted. Remove once the migration window closes.
-fn legacy_diag_hash(file: &str, code: &str, message: &str, line: u32) -> String {
-    fnv1a_digest([file, code, message, &line.to_string()])
+fn legacy_diag_hash(root: &Path, file: &str, code: &str, message: &str, line: u32) -> String {
+    fnv1a_digest([
+        relative_file(file, root).as_str(),
+        code,
+        message,
+        &line.to_string(),
+    ])
 }
 
 /// One-slot memo of a file's trimmed lines, feeding [`diag_hash`]. Diagnostics
@@ -430,11 +452,12 @@ fn is_ignored(ignored: &std::collections::HashSet<String>, d: &Diag) -> bool {
 
 /// Map a `ValidationError` to a report `Diag`, computing its hash from the
 /// trimmed source line. Consumes the error (moves the message). The `fix` field
-/// is deliberately dropped.
-fn validation_to_diag(file: &str, err: ValidationError, line_text: &str) -> Diag {
+/// is deliberately dropped. `root` is the mod root the hash is relativized
+/// against; the emitted `file` column is untouched.
+fn validation_to_diag(root: &Path, file: &str, err: ValidationError, line_text: &str) -> Diag {
     let code = err.code.unwrap_or_default().to_string();
-    let hash = diag_hash(file, &code, &err.message, line_text);
-    let legacy_hash = legacy_diag_hash(file, &code, &err.message, err.line);
+    let hash = diag_hash(root, file, &code, &err.message, line_text);
+    let legacy_hash = legacy_diag_hash(root, file, &code, &err.message, err.line);
     Diag {
         file: file.to_string(),
         severity: err.severity,
@@ -450,12 +473,17 @@ fn validation_to_diag(file: &str, err: ValidationError, line_text: &str) -> Diag
 
 /// Map a `LocDiagnostic` to a report `Diag`, computing its hash. Consumes the
 /// diagnostic (moves file/message). The `fix` field is deliberately dropped,
-/// same as `validation_to_diag`.
-fn loc_diagnostic_to_diag(d: cwtools_localization::LocDiagnostic, line_text: &str) -> Diag {
+/// same as `validation_to_diag`. `root` is the mod root the hash is
+/// relativized against.
+fn loc_diagnostic_to_diag(
+    root: &Path,
+    d: cwtools_localization::LocDiagnostic,
+    line_text: &str,
+) -> Diag {
     let line = d.line as u32;
     let code = d.code.to_string();
-    let hash = diag_hash(&d.file, &code, &d.message, line_text);
-    let legacy_hash = legacy_diag_hash(&d.file, &code, &d.message, line);
+    let hash = diag_hash(root, &d.file, &code, &d.message, line_text);
+    let legacy_hash = legacy_diag_hash(root, &d.file, &code, &d.message, line);
     Diag {
         file: d.file,
         severity: d.severity,
@@ -472,10 +500,11 @@ fn loc_diagnostic_to_diag(d: cwtools_localization::LocDiagnostic, line_text: &st
 /// Map a `LocService` fatal parse error (a file that couldn't even be
 /// lenient-parsed, so there's no line number) to a report `Diag`. Always
 /// Error-severity; `line` is 0 like other whole-file diagnostics, so there's no
-/// source line to key the hash on.
-fn loc_parse_error_to_diag(file: String, message: String) -> Diag {
-    let hash = diag_hash(&file, "", &message, "");
-    let legacy_hash = legacy_diag_hash(&file, "", &message, 0);
+/// source line to key the hash on. `root` is the mod root the hash is
+/// relativized against.
+fn loc_parse_error_to_diag(root: &Path, file: String, message: String) -> Diag {
+    let hash = diag_hash(root, &file, "", &message, "");
+    let legacy_hash = legacy_diag_hash(root, &file, "", &message, 0);
     Diag {
         file,
         severity: ErrorSeverity::Error,
@@ -1166,7 +1195,7 @@ fn main() {
                         continue;
                     }
                     let line_text = sources.trimmed(&file_str, err.line);
-                    let d = validation_to_diag(&file_str, err, line_text);
+                    let d = validation_to_diag(&directory, &file_str, err, line_text);
                     if is_ignored(&ignored, &d) {
                         continue;
                     }
@@ -1194,7 +1223,7 @@ fn main() {
                     continue;
                 }
                 let line_text = sources.trimmed(&d.file, d.line as u32).to_string();
-                let d = loc_diagnostic_to_diag(d, &line_text);
+                let d = loc_diagnostic_to_diag(&directory, d, &line_text);
                 if is_ignored(&ignored, &d) {
                     continue;
                 }
@@ -1242,16 +1271,9 @@ fn main() {
                     mib(st.id_to_string_bytes),
                     mib(st.map_key_bytes),
                 );
-                let (mut leaves, mut values) = (0usize, 0);
-                for src in parsed {
-                    leaves += src.parsed.arena.leaves.len();
-                    values += src.parsed.arena.leaf_values.len();
-                }
                 let type_instances: usize = type_index.map.values().map(|v| v.len()).sum();
                 eprintln!(
-                    "  [profile]   arenas: {} leaves, {} values across {} files",
-                    leaves,
-                    values,
+                    "  [profile]   parsed ASTs released after indexing ({} files)",
                     parsed.len()
                 );
                 eprintln!(
@@ -1499,7 +1521,7 @@ fn main() {
                 .filter(|d| codes::wanted(d.code, &only_codes, &ignore_codes))
                 .map(|d| {
                     let line_text = sources.trimmed(&d.file, d.line as u32).to_string();
-                    loc_diagnostic_to_diag(d, &line_text)
+                    loc_diagnostic_to_diag(&directory, d, &line_text)
                 })
                 .filter(keep)
                 .collect();
@@ -1513,7 +1535,9 @@ fn main() {
             let parse_errors: Vec<Diag> = service
                 .errors()
                 .iter()
-                .map(|(file, message)| loc_parse_error_to_diag(file.clone(), message.clone()))
+                .map(|(file, message)| {
+                    loc_parse_error_to_diag(&directory, file.clone(), message.clone())
+                })
                 .filter(keep)
                 .collect();
 
@@ -1941,13 +1965,91 @@ mod tests {
 
     // ── Diagnostic hashes ────────────────────────────────────────────────────
 
+    /// Bug: the digest used to be keyed on whatever path string an invocation
+    /// happened to produce. The same file under the mod root, spelled
+    /// absolute in one run, relative in another, `./`-prefixed in a third and
+    /// backslash-separated in a fourth (as a Windows run would spell it),
+    /// must all collapse to one digest.
+    #[test]
+    fn diag_hash_is_stable_across_path_spellings_of_the_same_file() {
+        let root = Path::new("/repo/mod");
+        let spellings = [
+            "/repo/mod/common/x.txt",
+            "common/x.txt",
+            "/repo/mod/./common/x.txt",
+            r"\repo\mod\common\x.txt",
+        ];
+        let hashes: Vec<String> = spellings
+            .iter()
+            .map(|f| diag_hash(root, f, "CW282", "m", "cost = 150"))
+            .collect();
+        for (spelling, hash) in spellings.iter().zip(&hashes) {
+            assert_eq!(
+                *hash, hashes[0],
+                "{spelling:?} must hash the same as {:?}",
+                spellings[0]
+            );
+        }
+    }
+
+    /// A file outside the root (e.g. a vanilla install path reported
+    /// alongside mod files) still produces a stable digest, not a panic.
+    #[test]
+    fn diag_hash_is_stable_for_a_file_outside_the_root() {
+        let root = Path::new("/repo/mod");
+        let a = diag_hash(root, "/vanilla/common/x.txt", "CW282", "m", "cost = 150");
+        let b = diag_hash(root, "/vanilla/common/x.txt", "CW282", "m", "cost = 150");
+        assert_eq!(a, b);
+    }
+
+    /// `diag_hash` strips the mod root, regardless of how the file spelling
+    /// and the root spelling disagree.
+    #[test]
+    fn relative_file_strips_the_root_regardless_of_spelling() {
+        let root = Path::new("/repo/mod");
+        let want = "common/x.txt";
+        assert_eq!(relative_file("/repo/mod/common/x.txt", root), want);
+        assert_eq!(
+            relative_file("common/x.txt", root),
+            want,
+            "already relative"
+        );
+        assert_eq!(
+            relative_file("/repo/mod/./common/x.txt", root),
+            want,
+            "a `./` component"
+        );
+        assert_eq!(
+            relative_file("/repo/mod/common/x.txt", Path::new("/repo/mod/")),
+            want,
+            "trailing separator on the root"
+        );
+        assert_eq!(
+            relative_file(r"\repo\mod\common\x.txt", root),
+            want,
+            "backslash-separated spelling"
+        );
+    }
+
+    /// A file genuinely outside the root (e.g. a vanilla install path reported
+    /// alongside mod files) falls back to the file string rather than panicking,
+    /// and does so the same way every time.
+    #[test]
+    fn relative_file_falls_back_and_does_not_panic_when_outside_the_root() {
+        let root = Path::new("/repo/mod");
+        let outside = "/vanilla/common/x.txt";
+        assert_eq!(relative_file(outside, root), outside);
+        assert_eq!(relative_file(outside, root), relative_file(outside, root));
+    }
+
     /// Same diagnostic on the same source text, moved down two lines.
     #[test]
     fn hash_survives_line_motion() {
         let mut moved = err_base();
         moved.line += 2;
-        let before = validation_to_diag("common/ideas/x.txt", err_base(), "cost = 150");
-        let after = validation_to_diag("common/ideas/x.txt", moved, "cost = 150");
+        let root = Path::new(".");
+        let before = validation_to_diag(root, "common/ideas/x.txt", err_base(), "cost = 150");
+        let after = validation_to_diag(root, "common/ideas/x.txt", moved, "cost = 150");
         assert_eq!(
             before.hash, after.hash,
             "inserting a line above a diagnostic must not change its digest"
@@ -1962,8 +2064,9 @@ mod tests {
     /// stop matching so the diagnostic is re-triaged.
     #[test]
     fn hash_changes_when_the_source_line_changes() {
-        let a = validation_to_diag("common/ideas/x.txt", err_base(), "cost = 150");
-        let b = validation_to_diag("common/ideas/x.txt", err_base(), "cost = 200");
+        let root = Path::new(".");
+        let a = validation_to_diag(root, "common/ideas/x.txt", err_base(), "cost = 150");
+        let b = validation_to_diag(root, "common/ideas/x.txt", err_base(), "cost = 200");
         assert_ne!(a.hash, b.hash);
     }
 
@@ -1971,8 +2074,10 @@ mod tests {
     /// suppresses its diagnostic, and only the new digest is emitted.
     #[test]
     fn legacy_hashes_still_match_but_are_not_emitted() {
-        let d = validation_to_diag("common/ideas/x.txt", err_base(), "cost = 150");
+        let root = Path::new(".");
+        let d = validation_to_diag(root, "common/ideas/x.txt", err_base(), "cost = 150");
         let legacy = legacy_diag_hash(
+            root,
             "common/ideas/x.txt",
             "CW282",
             "redundant default, remove it",
@@ -2004,7 +2109,13 @@ mod tests {
     #[test]
     fn legacy_hash_digest_is_frozen() {
         assert_eq!(
-            legacy_diag_hash("common/ideas/x.txt", "CW282", "redundant default", 12),
+            legacy_diag_hash(
+                Path::new("."),
+                "common/ideas/x.txt",
+                "CW282",
+                "redundant default",
+                12
+            ),
             "8e7fd969bd9ea463"
         );
     }
@@ -2013,8 +2124,9 @@ mod tests {
     /// distinguishes them by file/code/message.
     #[test]
     fn parse_error_hashes_are_distinct_without_a_source_line() {
-        let a = loc_parse_error_to_diag("l_english.yml".into(), "bad yaml".into());
-        let b = loc_parse_error_to_diag("l_english.yml".into(), "worse yaml".into());
+        let root = Path::new(".");
+        let a = loc_parse_error_to_diag(root, "l_english.yml".into(), "bad yaml".into());
+        let b = loc_parse_error_to_diag(root, "l_english.yml".into(), "worse yaml".into());
         assert_ne!(a.hash, b.hash);
     }
 
@@ -2052,8 +2164,9 @@ mod tests {
         // Task 18: the end position is inert in the report too.
         with_fix.end = Some((12, 30));
 
-        let d0 = validation_to_diag(&base.file.clone(), base, "cost = 150");
-        let d1 = validation_to_diag(&with_fix.file.clone(), with_fix, "cost = 150");
+        let root = Path::new(".");
+        let d0 = validation_to_diag(root, &base.file.clone(), base, "cost = 150");
+        let d1 = validation_to_diag(root, &with_fix.file.clone(), with_fix, "cost = 150");
 
         assert_eq!(d0.hash, d1.hash, "hash must ignore the fix");
         assert_eq!(csv_row(&d0), csv_row(&d1), "csv row must ignore the fix");

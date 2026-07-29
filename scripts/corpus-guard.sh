@@ -29,8 +29,10 @@ export LC_ALL=C
 script_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(dirname -- "$script_dir")
 
-corpus=${CWTOOLS_CORPUS:-/mnt/Linux/github-projects/Kaiserreich-4-Development}
-rules=${CWTOOLS_RULES:-/mnt/Linux/github-projects/cwtools-hoi4-config/Config}
+# Sibling checkouts of this repo. Override either with the env var.
+projects=${CWTOOLS_PROJECTS:-$HOME/Documents/github-projects}
+corpus=${CWTOOLS_CORPUS:-$projects/Kaiserreich-4-Development}
+rules=${CWTOOLS_RULES:-$projects/cwtools-hoi4-config/Config}
 baseline=${CWTOOLS_BASELINE:-$script_dir/corpus-baseline.csv}
 bin=${CWTOOLS_BIN:-$repo_root/cwtools-rs/target/release/cwtools}
 game=${CWTOOLS_GAME:-hoi4}

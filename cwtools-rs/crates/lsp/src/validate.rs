@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::*;
@@ -9,10 +9,10 @@ use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringId;
 use cwtools_validation::{Prepared, ValidationError, validate_prepared};
 
-use crate::Backend;
 use crate::paths::{
     encoded_position_len, logical_path_from_uri, source_column_to_lsp, uri_to_path_str,
 };
+use crate::{Backend, LocTextMap};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_prepared<'a>(
@@ -173,21 +173,20 @@ pub(crate) fn loc_extra_valid_refs(
 /// so both apply the same gate (a prior drift left the keystroke path without
 /// this check, so CW100 would flicker off on every edit until the next scan).
 pub(crate) fn append_missing_loc_errors(
-    parsed: &ParsedFile,
     uri: &str,
     prepared: &Prepared,
     errs: &mut Vec<cwtools_validation::ValidationError>,
 ) {
-    if let Some(loc) = prepared.loc_index
+    if let (Some(loc), Some(type_index)) = (prepared.loc_index, prepared.type_index)
         && !loc.union().is_empty()
     {
         let overlay = prepared.extra_loc_keys;
+        let instances = type_index.instances_in_file(uri);
         errs.extend(cwtools_validation::missing_loc::check_missing_localisation(
-            parsed,
+            &instances,
             uri,
             uri,
             prepared.ruleset,
-            prepared.table,
             |k| loc.exists_any(k) || overlay.is_some_and(|o| o.contains(k)),
         ));
     }
@@ -209,7 +208,7 @@ pub(crate) fn validate_parsed_with_indexes(
         .map(|e| parse_error_to_diagnostic(e, lines))
         .collect();
     let mut errs = validate_prepared(parsed, uri, prepared);
-    append_missing_loc_errors(parsed, uri, prepared, &mut errs);
+    append_missing_loc_errors(uri, prepared, &mut errs);
     truncate_validation_errors(&mut errs, uri);
     for err in &errs {
         diagnostics.push(validation_error_to_diagnostic(err, lines));
@@ -259,6 +258,47 @@ impl<'a> DocLines<'a> {
             .get(line as usize)
             .map_or(col, |l| source_column_to_lsp(l, col, &self.encoding));
         Position { line, character }
+    }
+
+    /// Whether any document text is held, i.e. whether positions can be resolved
+    /// against real lines. False for the workspace scan and the ruleset load.
+    fn has_text(&self) -> bool {
+        !self.lines.is_empty()
+    }
+
+    /// LSP position for a parser range end (0-based `line`, 0-based char `col`),
+    /// walked back over whitespace to the last content character.
+    ///
+    /// The parser records a node's end as the cursor after the node *and* the
+    /// whitespace behind it, so a raw end sits on the start of the next token and
+    /// published verbatim bleeds onto the following line (#107). Floors at
+    /// `start`, so the range cannot invert.
+    fn clamped_end_position(&self, line: u32, col: u32, start: Position) -> Position {
+        let (mut line, mut col) = (line, col);
+        loop {
+            let text = self.lines.get(line as usize).copied().unwrap_or("");
+            let consumed: String = text.chars().take(col as usize).collect();
+            if !consumed.trim().is_empty() {
+                col = consumed.trim_end().chars().count() as u32;
+                break;
+            }
+            let Some(prev) = line.checked_sub(1) else {
+                col = 0;
+                break;
+            };
+            line = prev;
+            col = self
+                .lines
+                .get(line as usize)
+                .map_or(0, |l| l.chars().count() as u32);
+        }
+
+        let end = self.position(line, col);
+        if (end.line, end.character) < (start.line, start.character) {
+            start
+        } else {
+            end
+        }
     }
 
     /// End position for a diagnostic whose start is at encoded column `start`:
@@ -375,9 +415,20 @@ pub(crate) fn validation_error_to_diagnostic(
     // the real range instead of diagnostic_at's whole-line squiggle. The end uses
     // the same 1-based-line / 0-based-char convention as the start (and as
     // code_action's fix-edit conversion), so only the whole-line end is overridden.
+    // Fix edits are unaffected: they read `SuggestedFix.range`, which still needs
+    // the untrimmed span to delete a line cleanly.
     // With `end` absent, the whole-line fallback stands byte-for-byte.
-    if let Some((end_line, end_col)) = err.end {
-        diag.range.end = lines.position(end_line.saturating_sub(1), end_col as u32);
+    // Without text the end cannot be walked back off the following token, and
+    // publishing it raw bleeds onto the next line, so the whole-line fallback
+    // stands instead.
+    if let Some((end_line, end_col)) = err.end
+        && lines.has_text()
+    {
+        diag.range.end = lines.clamped_end_position(
+            end_line.saturating_sub(1),
+            end_col as u32,
+            diag.range.start,
+        );
     }
     // Carry any machine-applicable fix into `data` so the code-action handler
     // can round-trip it back into a QUICKFIX WorkspaceEdit. Covers both the
@@ -457,17 +508,16 @@ impl Backend {
         // guard would otherwise outrank the `documents` check below, and the
         // `Arc` makes the snapshot free.
         let ruleset = self.state.rules.read().ruleset.clone();
-        // Subtype-qualified membership (`equipment.naval_equip` …) so
-        // `<type.subtype>` references resolve. Re-run on every (re)index so an
-        // edit to an archetype keeps its subtype tag fresh. Computed BEFORE the
-        // write guard: completion takes a read guard on the same lock, so every
-        // microsecond held here is a keystroke the UI path waits on.
-        let subtypes = ruleset.as_ref().map(|ruleset| {
-            cwtools_validation::collect_subtype_instances(
+        // Base instances and subtype-qualified membership share one walk before
+        // the write guard. Completion takes a read guard on the same lock, so
+        // every microsecond kept outside it is a keystroke the UI path avoids.
+        let collected = ruleset.as_ref().map(|ruleset| {
+            cwtools_info::collect_type_instances_with_subtypes(
                 ruleset,
                 parsed,
                 &logical_path,
                 &self.state.string_table,
+                cwtools_validation::subtype_membership_for_instance,
             )
         });
         // Stale-write guard, the same version check debounced_validate publishes
@@ -486,15 +536,16 @@ impl Backend {
         }
         let mut info = self.state.info_service.write();
         info.clear_file(uri);
-        if let (Some(ruleset), Some(subtypes)) = (ruleset.as_ref(), subtypes) {
-            info.index_file_with_path(
+        if let (Some(ruleset), Some(collected)) = (ruleset.as_ref(), collected) {
+            info.index_file_with_precomputed_instances(
                 uri,
                 parsed,
                 &self.state.string_table,
                 ruleset,
                 &logical_path,
+                collected.instances,
+                collected.subtype_instances,
             );
-            info.type_index.merge(uri, subtypes);
         }
         drop(info);
         self.bump_info_revision();
@@ -841,13 +892,17 @@ impl Backend {
         }
     }
 
-    /// Flatten the live loc overlay (per-open-`.yml` key sets) into one set of
-    /// lowercased keys, for the game-file loc-existence checks (CW100/CW122) so a
-    /// key just typed into an open `.yml` resolves without a full rescan (#36).
-    /// Bounded by the number of open loc files; returns empty when none are open.
+    /// Flatten both loc overlays (per-open-`.yml` key sets plus the watched-file
+    /// sets) into one set of lowercased keys, for the game-file loc-existence
+    /// checks (CW100/CW122) so a key just typed into an open `.yml` — or saved
+    /// to a watched one — resolves without a full rescan (#36). Bounded by the
+    /// open loc files plus the distinct watched ones.
     pub(crate) fn loc_overlay_keys(&self) -> HashSet<String> {
         let mut keys = HashSet::new();
         for set in self.state.loc_live_overlay.read().values() {
+            keys.extend(set.iter().cloned());
+        }
+        for set in self.state.loc_watched_overlay.read().values() {
             keys.extend(set.iter().cloned());
         }
         keys
@@ -873,24 +928,31 @@ impl Backend {
             .unwrap_or(cwtools_localization::Lang::English);
 
         // Collect the new entries for this file.
-        let mut new_entries: HashMap<String, Vec<(cwtools_localization::Lang, String)>> =
-            HashMap::new();
-        for file in svc.files() {
-            let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
-            let lang_included = hover_all || lang == primary_lang;
-            if !lang_included {
-                continue;
-            }
-            for entry in &file.entries {
-                let display = crate::paths::loc_display_text(&entry.desc);
-                if !display.is_empty() {
-                    new_entries
-                        .entry(entry.key.to_lowercase())
-                        .or_default()
-                        .push((lang, display.to_string()));
+        let new_entries = {
+            let loc_index = self.state.loc_index.read();
+            let mut new_entries = LocTextMap::default();
+            for file in svc.files() {
+                let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
+                let lang_included = hover_all || lang == primary_lang;
+                if !lang_included {
+                    continue;
+                }
+                for entry in &file.entries {
+                    let display = crate::paths::loc_display_text(&entry.desc);
+                    if !display.is_empty() {
+                        let key = loc_index
+                            .as_ref()
+                            .and_then(|index| index.key(&entry.key))
+                            .unwrap_or_else(|| Arc::from(entry.key.to_lowercase()));
+                        new_entries
+                            .entry(key)
+                            .or_default()
+                            .push((lang, display.to_string()));
+                    }
                 }
             }
-        }
+            new_entries
+        };
 
         // Merge into the global loc_text map: remove old entries for this
         // file's keys, then insert the new ones. A simple remove-and-replace
@@ -910,23 +972,27 @@ impl Backend {
     }
 
     /// The names a `$ref$` in a loc file may resolve to: [`loc_extra_valid_refs`]
-    /// plus the live loc overlay (the current keys of every open `.yml`).
+    /// plus both loc overlays (the current keys of every open `.yml` and of the
+    /// watched files changed since the last scan).
     ///
     /// This is a full copy of the modifier-key and index-name universe (~200K
     /// Strings on Millennium Dawn), so it is built ONCE per edit and shared by
     /// `Arc` with every file that edit revalidates — building it per file cost
     /// the keystroke path one whole copy per open `.yml`.
     fn loc_ref_names(&self) -> Arc<HashSet<String>> {
-        // Lock order: rules -> info_service. The overlay lock is independent and
-        // taken after, never nested inside the others.
+        // Lock order: rules -> info_service. The overlay locks are independent
+        // and taken after, never nested inside the others.
         let mut extra = {
             let modifier_keys = self.state.rules.read().modifier_keys.clone();
             let info = self.state.info_service.read();
             loc_extra_valid_refs(&modifier_keys, &info.type_index)
         };
-        // Lets a key just added to an open `.yml` resolve immediately, in that
-        // file and cross-file.
+        // Lets a key just added to an open `.yml` (or saved to a watched one)
+        // resolve immediately, in that file and cross-file.
         for keys in self.state.loc_live_overlay.read().values() {
+            extra.extend(keys.iter().cloned());
+        }
+        for keys in self.state.loc_watched_overlay.read().values() {
             extra.extend(keys.iter().cloned());
         }
         Arc::new(extra)
@@ -946,8 +1012,8 @@ impl Backend {
         // Hold the read guard across the validate call to avoid cloning the full
         // loc-key union (~2M Strings on Millennium Dawn).
         let loc_guard = self.state.loc_index.read();
-        let empty_union: HashSet<String> = HashSet::new();
-        let union: &HashSet<String> = loc_guard
+        let empty_union = cwtools_localization::LocKeySet::default();
+        let union: &cwtools_localization::LocKeySet = loc_guard
             .as_ref()
             .map(|idx| idx.union())
             .unwrap_or(&empty_union);
@@ -980,6 +1046,48 @@ impl Backend {
         }
     }
 
+    /// Record a watched (non-open) loc file's keys in the watched-files overlay
+    /// (per-file replace, like the open-doc overlay) so cross-file `$ref$` and
+    /// missing-loc checks resolve them without a rescan — and keep resolving
+    /// them across scans, whose index installs are built from disk reads that
+    /// may predate this change. Returns the keys added or removed relative to
+    /// the previous entry (first sight is every key), for the batch's coalesced
+    /// sweep.
+    pub(crate) fn record_watched_loc_keys(
+        &self,
+        uri: &str,
+        path: &str,
+        text: &str,
+    ) -> HashSet<String> {
+        let new_keys = loc_keys_of(text, path);
+        let mut overlay = self.state.loc_watched_overlay.write();
+        let changed = match overlay.get(uri) {
+            Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
+            None => new_keys.clone(),
+        };
+        overlay.insert(uri.to_string(), new_keys);
+        changed
+    }
+
+    /// The cross-file refresh an open loc edit runs per file, done ONCE for a
+    /// whole watched batch whose loc key sets changed (#90). `changed_keys` is
+    /// the batch-wide union of additions and removals.
+    pub(crate) async fn refresh_after_watched_loc_changes(&self, changed_keys: &HashSet<String>) {
+        self.bump_info_revision();
+        let extra = self.loc_ref_names();
+        self.revalidate_other_open_loc_files("", &extra).await;
+        let generation = self
+            .state
+            .edit_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let scope = {
+            let rules_guard = self.state.rules.read();
+            loc_change_candidate_names(rules_guard.ruleset.as_deref(), changed_keys)
+        };
+        self.revalidate_open_dependents("", generation, Some(&scope))
+            .await;
+    }
+
     /// `parsed_version` is the open-document version `text` was taken at, so the
     /// index install can tell a newer edit's validate has overtaken this one.
     /// `None` when the text came from disk (the scan's non-open pass).
@@ -1002,7 +1110,15 @@ impl Backend {
             // Keep the live overlay current so this file's own keys (and any just
             // added) resolve immediately in `$ref$` checks, without waiting for a
             // full rescan. Record which keys were added or removed. (#36)
-            let changed_keys: HashSet<String> = {
+            //
+            // Open docs only: the overlay is "unsaved keys in open .yml files".
+            // The watched path reaches here for files that are NOT open; letting
+            // them in grew the map a stale entry per watched file and made every
+            // first sight fire the whole-file cross-file sweep (#90). Watched
+            // files record into `loc_watched_overlay` instead
+            // (`record_watched_loc_keys`) with one coalesced sweep per batch.
+            let is_open = self.state.documents.lock().contains_key(uri);
+            let changed_keys: HashSet<String> = if is_open {
                 let new_keys = loc_keys_of(text, &path);
                 let mut overlay = self.state.loc_live_overlay.write();
                 let diff = match overlay.get(uri) {
@@ -1011,6 +1127,8 @@ impl Backend {
                 };
                 overlay.insert(uri.to_string(), new_keys);
                 diff
+            } else {
+                HashSet::new()
             };
             // Built once here and shared with the cross-file sweep below, which
             // would otherwise rebuild the whole name set per open loc file.
@@ -1107,8 +1225,8 @@ impl Backend {
 
                 // Index this file the same way the workspace scan and did_close
                 // disk-restore do (previously an inlined, drifted subset that
-                // skipped the collect_subtype_instances merge — an open file
-                // could lose its `<type.subtype>` membership while being edited).
+                // skipped subtype-membership indexing — an open file could lose
+                // its `<type.subtype>` membership while being edited).
                 self.index_parsed_file(uri, &parsed, parsed_version);
 
                 // Validation. Lock order: rules -> info_service -> loc_index.
@@ -1145,7 +1263,7 @@ impl Backend {
                             var_checks,
                         );
                         let mut errs = validate_prepared(&parsed, uri, &prepared);
-                        append_missing_loc_errors(&parsed, uri, &prepared, &mut errs);
+                        append_missing_loc_errors(uri, &prepared, &mut errs);
                         drop(loc_guard);
                         drop(info_guard);
                         let elapsed = start.elapsed();
@@ -1210,6 +1328,7 @@ impl Backend {
 #[cfg(test)]
 mod perf_bench {
     use super::*;
+    use std::collections::HashMap;
 
     fn bench<F: FnMut() -> usize>(label: &str, iters: usize, mut f: F) {
         for _ in 0..3 {
@@ -1320,7 +1439,7 @@ mod perf_bench {
         };
         let rules_dir = expand(
             &std::env::var("CWTOOLS_PERF_RULES")
-                .unwrap_or_else(|_| "/mnt/Linux/github-projects/cwtools-hoi4-config".to_string()),
+                .unwrap_or_else(|_| "~/Documents/github-projects/cwtools-hoi4-config".to_string()),
         )
         .join("Config");
         let vanilla = expand(&std::env::var("CWTOOLS_PERF_VANILLA").unwrap_or_else(|_| {
@@ -1362,23 +1481,76 @@ mod perf_bench {
             let uri = format!("file:///bench/{}", logical_path);
             eprintln!("fixture: {} ({} bytes)", logical_path, text.len());
 
-            bench("collect_subtype_instances", 20, || {
-                cwtools_validation::collect_subtype_instances(
+            bench("collect_type_instances_with_subtypes", 20, || {
+                let collected = cwtools_info::collect_type_instances_with_subtypes(
                     &ruleset,
                     &parsed,
                     logical_path,
                     &table,
+                    cwtools_validation::subtype_membership_for_instance,
+                );
+                collected.instances.len() + collected.subtype_instances.len()
+            });
+            // One InfoService across iterations, as in the server: `clear_file`
+            // then has real entries to drop, and the ruleset-derived reference
+            // map is reused instead of rebuilt per iteration.
+            let mut info = cwtools_info::InfoService::new();
+            bench("collect + clear_file + index_file", 20, || {
+                let collected = cwtools_info::collect_type_instances_with_subtypes(
+                    &ruleset,
+                    &parsed,
+                    logical_path,
+                    &table,
+                    cwtools_validation::subtype_membership_for_instance,
+                );
+                info.clear_file(&uri);
+                info.index_file_with_precomputed_instances(
+                    &uri,
+                    &parsed,
+                    &table,
+                    &ruleset,
+                    logical_path,
+                    collected.instances,
+                    collected.subtype_instances,
+                );
+                info.export_fingerprint(&uri) as usize
+            });
+
+            let mut type_index = cwtools_info::TypeIndex::new();
+            type_index.merge(
+                &uri,
+                cwtools_info::collect_type_instances(&ruleset, &parsed, logical_path, &table),
+            );
+            bench("CW100 recollect + check", 20, || {
+                let per_type =
+                    cwtools_info::collect_type_instances(&ruleset, &parsed, logical_path, &table);
+                let instances: Vec<_> = per_type
+                    .iter()
+                    .flat_map(|(type_name, values)| {
+                        values
+                            .iter()
+                            .map(move |instance| (type_name.as_str(), instance))
+                    })
+                    .collect();
+                cwtools_validation::missing_loc::check_missing_localisation(
+                    &instances,
+                    logical_path,
+                    logical_path,
+                    &ruleset,
+                    |_| true,
                 )
                 .len()
             });
-            // One InfoService across iterations, as in the server: `clear_file`
-            // then has real entries to drop, and the ruleset-derived
-            // `type_ref_keys` map is memoized instead of rebuilt per iteration.
-            let mut info = cwtools_info::InfoService::new();
-            bench("clear_file + index_file", 20, || {
-                info.clear_file(&uri);
-                info.index_file_with_path(&uri, &parsed, &table, &ruleset, logical_path);
-                info.export_fingerprint(&uri) as usize
+            bench("CW100 indexed check", 20, || {
+                let instances = type_index.instances_in_file(&uri);
+                cwtools_validation::missing_loc::check_missing_localisation(
+                    &instances,
+                    logical_path,
+                    logical_path,
+                    &ruleset,
+                    |_| true,
+                )
+                .len()
             });
         }
     }
@@ -1388,6 +1560,7 @@ mod perf_bench {
 mod whole_line_range_tests {
     use super::*;
     use cwtools_validation::ErrorSeverity;
+    use std::collections::HashMap;
 
     #[test]
     fn loc_keys_of_extracts_lowercased_keys() {
@@ -1596,9 +1769,8 @@ mod whole_line_range_tests {
 
     #[test]
     fn diagnostic_precise_range_can_span_lines() {
-        // A block leaf's range end lands past the closing brace (SourceRange.end is
-        // exclusive and absorbs trailing whitespace), so a precise squiggle may
-        // legitimately span multiple lines — the whole unexpected block.
+        // A block's range legitimately spans lines; only the trailing whitespace
+        // the parser folded into the end has to come back off.
         let text = "root = {\n    foo = {\n        a = 1\n    }\n}\n";
         let ends = utf16_lines(text);
         let err = ValidationError {
@@ -1609,13 +1781,103 @@ mod whole_line_range_tests {
             file: "f".into(),
             code: Some("CW262"),
             fix: None,
-            end: Some((4, 5)), // just past the `}` on the closing line
+            end: Some((5, 0)), // what the parser actually emits: start of `}`
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.start.line, 1);
         assert_eq!(diag.range.start.character, 4);
-        assert_eq!(diag.range.end.line, 3);
+        assert_eq!(
+            diag.range.end.line, 3,
+            "end stays on the closing-brace line"
+        );
         assert_eq!(diag.range.end.character, 5);
+    }
+
+    // Issue #107. Each `end` below is what the parser actually emits.
+
+    #[test]
+    fn diagnostic_end_does_not_bleed_onto_the_next_line() {
+        let text = "decision = {\n    custom_cost_text = a\n}\n";
+        let ends = utf16_lines(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW240"),
+            fix: None,
+            end: Some((3, 0)), // start of the `}` line
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.end.line, 1, "must stay on the statement's line");
+        assert_eq!(diag.range.end.character, 24);
+    }
+
+    #[test]
+    fn diagnostic_end_does_not_bleed_onto_the_next_indent() {
+        // The CW500 shape: an indented next line puts the raw end mid-whitespace
+        // rather than at column 0.
+        let text = "c = {\n    picture = generic_economy\n    allowed = {\n    }\n}\n";
+        let ends = utf16_lines(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Error,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW500"),
+            fix: None,
+            end: Some((3, 4)), // start of `allowed` on the next line
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.end.line, 1);
+        assert_eq!(diag.range.end.character, 29);
+    }
+
+    #[test]
+    fn diagnostic_end_never_precedes_its_start() {
+        // A whitespace-only statement line: the walk-back would run past the start.
+        let text = "a = {\n    \n}\n";
+        let ends = utf16_lines(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Error,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW262"),
+            fix: None,
+            end: Some((3, 0)),
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert!(
+            (diag.range.end.line, diag.range.end.character)
+                >= (diag.range.start.line, diag.range.start.character),
+            "range must not invert: {:?}",
+            diag.range
+        );
+    }
+
+    #[test]
+    fn diagnostic_end_clamps_before_utf16_conversion() {
+        // Clamping after the conversion instead would land inside the surrogate pair.
+        let text = "a = {\n    x = \"\u{1F600}\"\n}\n";
+        let ends = utf16_lines(text);
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Error,
+            line: 2,
+            col: 4,
+            file: "f".into(),
+            code: Some("CW500"),
+            fix: None,
+            end: Some((3, 0)),
+        };
+        let diag = validation_error_to_diagnostic(&err, &ends);
+        assert_eq!(diag.range.end.line, 1);
+        // 11 source chars, 12 UTF-16 units — the emoji counts twice.
+        assert_eq!(diag.range.end.character, 12);
     }
 
     #[test]
@@ -1632,6 +1894,30 @@ mod whole_line_range_tests {
         };
         let diag = validation_error_to_diagnostic(&err, &DocLines::none());
         assert_eq!(diag.range.start.character, 2);
+        assert_eq!(diag.range.end.character, 3);
+    }
+
+    // The workspace scan holds no file text, so there is nothing to walk the
+    // parser's end back over. Publishing it raw would bleed onto the next line
+    // for every file that is not open, which is most of the Problems panel.
+    #[test]
+    fn diagnostic_without_line_info_ignores_a_carried_end() {
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 5,
+            col: 2,
+            file: "f".into(),
+            code: Some("CW500"),
+            fix: None,
+            end: Some((6, 0)),
+        };
+        let diag = validation_error_to_diagnostic(&err, &DocLines::none());
+        assert_eq!(diag.range.start.line, 4);
+        assert_eq!(
+            diag.range.end.line, 4,
+            "must not spill onto a later line without text to clamp against"
+        );
         assert_eq!(diag.range.end.character, 3);
     }
 

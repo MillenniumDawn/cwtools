@@ -1,5 +1,5 @@
 use cwtools_parser::ast::{Arena, Child, ParseError};
-use cwtools_parser::parser::parse_string;
+use cwtools_parser::parser::{parse_string, parse_string_without_comments};
 use cwtools_string_table::string_table::StringTable;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -373,7 +373,7 @@ impl FileManager {
             .into_par_iter()
             .filter_map(|(path, logical_path)| {
                 let content = read_text(&path).ok()?;
-                match parse_string(&content, table) {
+                match parse_string_without_comments(&content, table) {
                     Ok(parsed) => Some(ParsedFile {
                         path,
                         logical_path,
@@ -449,7 +449,7 @@ impl FileManager {
             .into_par_iter()
             .filter_map(|(path, logical_path)| {
                 let content = read_text(&path).ok()?;
-                match parse_string(&content, table) {
+                match parse_string_without_comments(&content, table) {
                     Ok(parsed) => Some(ParsedFile {
                         path,
                         logical_path,
@@ -894,6 +894,8 @@ fn walk_dir_generic<T>(
 /// - `Unknown` otherwise
 pub fn classify_directory(dir: &Path) -> DirectoryType {
     let looks_like_game_folder = |d: &Path| -> bool {
+        // Deliberately narrow: the Mod check below short-circuits MultipleMod, so
+        // every name added here can hide a multi-mod workspace root.
         for sub in &["common", "events", "interface", "gfx", "localisation"] {
             if d.join(sub).is_dir() {
                 return true;

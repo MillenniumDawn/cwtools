@@ -1,3 +1,41 @@
+# 2.5.0
+
+## Bug Fixes
+
+- A bulk file change landing while a workspace scan was already running made the server retry every half second for the scan's whole duration. An over-cap watched batch collapses into one rescan, but when that rescan lost the in-progress race it requeued its events and immediately re-armed its own window, so at Millennium Dawn scale the log filled with "watched batch over cap" lines for tens of seconds (#90 residual). The losing batch now parks its events and the winning scan drains them once when it finishes, with the loser re-arming itself only when the winner finished in between and its drain came up empty.
+- Watched file changes polluted the live localisation overlay, which holds the unsaved keys of open `.yml` files. Every watched event for a loc file treated the whole file as changed and ran the cross-file sweep meant for open-editor edits, up to 200 times per drain window, and the overlay kept an entry per watched file until a delete or a window reload (#90 residual). Watched loc files now get their own overlay, replaced per file on each event and consulted everywhere the open-doc one is, so cross-file references resolve keys added on disk and stop resolving keys removed there. It survives workspace scans on purpose: a scan's index install is built from disk reads that can predate a watched change, and merging into the index instead would lose the keys on the next install. A batch runs one coalesced sweep of the open files instead of one per file, and open documents keep the overlay behavior they had.
+- The rules-config error popup could show twice per session, and the details behind it never arrived at boot (#98). The rules load runs once inside `initialize`, where notifications are dropped before the handshake completes, and again when the client fires its boot-time `reloadrulesconfig` after cloning the rules, so the per-error log lines were lost and the popup repeated for the same errors. The popup and the log lines now defer to `initialized` the same way the per-file rule diagnostics already did, and an unchanged error set no longer re-toasts. A genuinely different set, such as after a real rules reload, still does.
+- Sixteen more "advice about a key" diagnostics underlined the whole block or statement they sat on instead of the key they complain about, burying however many lines the block spanned under one squiggle (#107 follow-up): CW104/CW105/CW106, CW108/CW109, CW227/CW229, CW236/CW237/CW238, CW247, CW248, CW261 (which underlined an entire entity definition), CW262 (whose did-you-mean fix already edited only the key, so squiggle and edit disagreed), CW267 and CW272. They now mark the key token, the same treatment CW223/CW251/CW253 got in 2.4.0. CW121/CW281/CW280 keep their full-block spans on purpose: their attached fixes delete the whole block.
+
+## Improvements
+
+- **In progress, engine v2.4.0:** remove redundant indexing and path normalization
+  work (#86).
+  Fuse type/subtype collection, reuse indexed instances for CW100, cache
+  ruleset lookups, and carry scan URIs across passes. Diagnostics must remain
+  byte-identical.
+
+## Notes
+
+- **Behavioral:** the sixteen codes above span their key token rather than the block or statement they open. Anything matching on diagnostic ranges rather than the start position will see the change.
+
+# 2.4.0
+
+## Bug Fixes
+
+- The "Remove empty if" quick fix deleted valid script. `if = { limit = { tag = GXC } }` followed by an `else_if` was fixed by deleting the `if`, which left the `else_if` with no antecedent for the game to reject. On Kaiserreich, 9 of the 10 places the fix was offered were chain-breaking. It also reached `source.fixAll`, so anyone binding that through `editor.codeActionsOnSave` had files corrupted on save. The fix is now withheld when an `else_if` or `else` follows the block. The diagnostic still reports.
+- Diagnostic squiggles ran one line long, and for a block ran to the line past its closing brace. The parser records a node's end as the cursor after the node and the whitespace behind it, which is the start of the next token, and that position was published as-is. It affected all 43 codes that carry a precise range, including the scope errors and type-reference errors modders see most. The published end is now walked back to the last content character. Quick-fix edits are unaffected: they are built from the fix's own range, which still needs to absorb the trailing newline to delete a line cleanly.
+- Hints about a single keyword underlined the entire block that keyword opened, burying however many lines the block spanned under one squiggle. CW223 (`NOT` with multiple children) now marks the `NOT`, CW251 (unnecessary `AND`/`OR`) marks the operator, and CW253 (deprecated `set_empire_name`) marks the key, which is the same span its rename fix already edited. This is old behavior that only became visible in the last release, when the server started publishing the ranges it had been recording all along.
+- Nothing under `localisation_synced/` got any language features, and none of the keys defined there were indexed, so script referencing them read as missing. HOI4 ships synced localisation in that directory and the client has always treated it as localisation. The loc walker and the server's own check now agree with it.
+- The "N rules-config error(s)" popup pointed at an output channel that never had the errors in it. The details were written to the language client's channel ("Paradox Language Server"), not the extension's ("CWTools"), and the per-file diagnostics meant as the fallback were published during `initialize`, where notifications are dropped before the handshake completes. The popup now names the first error inline, and the diagnostics are held until `initialized`.
+- Diagnostic hashes were keyed on whatever path string an invocation happened to produce. Both `--directory` and a `cwtools.toml` yield an absolute path, but they build it differently: the flag is taken verbatim, while a config anchors on the process's current directory, which the OS reports with symlinks already resolved. On macOS that turns a temp path into `/private/var/...` on one route and leaves it `/var/...` on the other. The same mod validated two equivalent ways could produce two different baselines, which is why `validate --output-hashes` was unstable across macOS and Windows CI runs even though the same mod and rules were in play. The hash is now computed from the file path relative to the resolved mod root, `/`-separated regardless of host, falling back to the old path string for a file that genuinely sits outside the root (a vanilla install path, say) rather than panicking.
+
+## Notes
+
+- **Behavioral:** CW223, CW251 and CW253 cover their keyword rather than the block they open. Anything matching on diagnostic ranges rather than the start position will see the change.
+- **Behavioral:** `localisation_synced/` is now walked for localisation. Keys defined there join the index, which clears missing-key errors against them and can surface duplicate-key errors that were previously hidden by the directory being skipped.
+- **Behavioral:** diagnostic hashes are now relative to the mod root instead of the raw path string that produced them, so every existing `--ignore-hashes` baseline needs re-blessing (rerun with `--output-hashes` and commit the result). `legacy_diag_hash` still matches baselines written before this release during the migration window; only the new digest is ever emitted.
+
 # 2.3.0
 
 ## Features

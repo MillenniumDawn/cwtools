@@ -519,18 +519,34 @@ impl Backend {
         let (combined_ruleset, parse_errors) =
             load_ruleset_from_dir(cache_path, &self.state.string_table);
 
-        // Rules-config parse/read errors mean the .cwt rules are broken,
-        // which silently degrades every downstream check. Emit at ERROR so
-        // the client reveals its output channel (it auto-reveals on Error),
-        // surface a one-line popup so it's noticed even when the panel is
-        // closed, and publish a diagnostic on each offending .cwt file so
-        // the Problems panel points at the exact line.
+        // Broken .cwt rules silently degrade every downstream check, so they are
+        // reported three ways: the log, a popup, and a diagnostic per file. All
+        // three are user-visible and all can run inside `initialize`, where
+        // tower-lsp drops outgoing notifications — so each defers through the
+        // handshake gate below (#98). Snapshotting once is sound only while the
+        // park sites run await-free from here: an `.await` between a stale
+        // `false` and a park would let the `initialized` flush slip past and
+        // strand the parked message forever.
+        let handshake_complete = self
+            .state
+            .handshake_complete
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if handshake_complete {
+            for err in &parse_errors {
+                self.client
+                    .log_message(MessageType::ERROR, err.to_string())
+                    .await;
+            }
+        } else {
+            self.state.deferred_rules_messages.lock().extend(
+                parse_errors
+                    .iter()
+                    .map(|err| crate::DeferredRulesMessage::Log(err.to_string())),
+            );
+        }
         let mut diags_by_file: std::collections::HashMap<String, Vec<Diagnostic>> =
             std::collections::HashMap::new();
         for err in &parse_errors {
-            self.client
-                .log_message(MessageType::ERROR, err.to_string())
-                .await;
             // Shared with the live per-file CWT lint (#43). No file text
             // here to widen the squiggle, so pass no line info.
             diags_by_file
@@ -541,21 +557,86 @@ impl Backend {
                     &crate::validate::DocLines::none(),
                 ));
         }
-        for (uri, diags) in diags_by_file {
-            if let Ok(url) = uri.parse() {
-                self.client.publish_diagnostics(url, diags, None).await;
-            }
+        let mut to_publish: Vec<(String, Vec<Diagnostic>)> = diags_by_file.into_iter().collect();
+        // A load only reports files that still have errors, so anything reported
+        // last time and absent now has been repaired and needs an explicit clear.
+        {
+            let current: std::collections::HashSet<String> =
+                to_publish.iter().map(|(uri, _)| uri.clone()).collect();
+            let mut previous = self.state.published_rule_uris.lock();
+            let open = self.state.documents.lock();
+            to_publish.extend(
+                previous
+                    .difference(&current)
+                    // An open editor buffer owns its diagnostics: the live `.cwt`
+                    // lint republishes it, and clearing here would blank a dirty
+                    // buffer's squiggles until the next keystroke.
+                    .filter(|uri| !open.contains_key(*uri))
+                    .map(|uri| (uri.clone(), Vec::new())),
+            );
+            *previous = current;
         }
-        if !parse_errors.is_empty() {
-            self.client
-                .show_message(
-                    MessageType::ERROR,
-                    format!(
-                        "CWTools: {} rules-config error(s). See Output → CWTools for details.",
-                        parse_errors.len()
-                    ),
-                )
-                .await;
+
+        // Dropped on the floor before `initialized`, so park them for the
+        // handshake to flush (#98).
+        if handshake_complete {
+            for (uri, diags) in to_publish {
+                if let Ok(url) = uri.parse() {
+                    self.client.publish_diagnostics(url, diags, None).await;
+                }
+            }
+        } else {
+            self.state
+                .deferred_rule_diagnostics
+                .lock()
+                .extend(to_publish);
+        }
+        if let Some(first) = parse_errors.first() {
+            // Inline the first error: the client never auto-reveals its output
+            // channel (RevealOutputChannelOn.Never), so the popup is the only
+            // part a user is guaranteed to see.
+            let summary = format!(
+                "CWTools: {} rules-config error(s), first: {first}",
+                parse_errors.len()
+            );
+            // Dedupe on the full error set, order-independent: `first` follows
+            // read_dir traversal order, so the same set could summarize
+            // differently across the boot double-load, and two different sets
+            // can share a count and a first error.
+            let dedupe_key = {
+                let mut errs: Vec<String> = parse_errors.iter().map(|e| e.to_string()).collect();
+                errs.sort_unstable();
+                errs.join("\n")
+            };
+            let is_new = {
+                let mut last = self.state.last_rules_toast.lock();
+                if last.as_deref() == Some(dedupe_key.as_str()) {
+                    false
+                } else {
+                    *last = Some(dedupe_key);
+                    true
+                }
+            };
+            if is_new {
+                // Re-read the gate: a toast parked after the flush ran would sit
+                // forever while the dedupe key above already claimed it.
+                if self
+                    .state
+                    .handshake_complete
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.client.show_message(MessageType::ERROR, summary).await;
+                } else {
+                    self.state
+                        .deferred_rules_messages
+                        .lock()
+                        .push(crate::DeferredRulesMessage::Toast(summary));
+                }
+            }
+        } else {
+            // A clean load forgets the last toast, so the same errors coming
+            // back later in the session toast again.
+            *self.state.last_rules_toast.lock() = None;
         }
 
         let loaded = !combined_ruleset.types.is_empty()

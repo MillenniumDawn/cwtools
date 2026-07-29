@@ -345,10 +345,13 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
     let cache: VanillaCacheFile = rkyv::from_bytes::<VanillaCacheFile, rkyv::rancor::Error>(&bytes)
         .map_err(std::io::Error::other)?;
     let mut per_type: HashMap<String, Vec<(Arc<str>, TypeInstance)>> = HashMap::new();
+    let mut file_uris: HashMap<String, Arc<str>> = HashMap::new();
     for ci in cache.instances {
-        let file_uri: Arc<str> = Arc::from(ci.f.as_str());
+        let file_uri = file_uris
+            .entry(ci.f)
+            .or_insert_with_key(|path| Arc::from(path.as_str()));
         per_type.entry(ci.t).or_default().push((
-            file_uri,
+            Arc::clone(file_uri),
             TypeInstance {
                 name: ci.n,
                 location: SourceLocation {
@@ -441,8 +444,9 @@ mod tests {
         for (uri, _) in loaded.per_type.get("spriteType").unwrap() {
             assert_eq!(uri.as_ref(), "vanilla/x.gfx");
         }
-        // Start AND end positions survive the round trip (v8 end plumbing).
         let sprite = loaded.per_type.get("spriteType").unwrap();
+        assert!(Arc::ptr_eq(&sprite[0].0, &sprite[1].0));
+        // Start AND end positions survive the round trip (v8 end plumbing).
         let by_name = |n: &str| {
             sprite
                 .iter()

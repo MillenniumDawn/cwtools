@@ -29,7 +29,7 @@ pub struct TypeInstance {
 /// and forward-slashed, relative to their root, so lookups are case-insensitive.
 #[derive(Debug, Default)]
 pub struct FileIndex {
-    files: HashSet<String>,
+    files: FxHashSet<String>,
 }
 
 impl FileIndex {
@@ -42,7 +42,7 @@ impl FileIndex {
         Self::walk(root, root, &mut self.files);
     }
 
-    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut HashSet<String>) {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut FxHashSet<String>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -237,13 +237,13 @@ pub struct TypeIndex {
     /// instance. A refcount so `remove_file` can drop a name only when its last
     /// definition goes. Keyed lowercase because Paradox identifiers are
     /// case-insensitive (same normalization as `contains`/`instance_sets`).
-    name_counts: FxHashMap<String, usize>,
+    name_counts: FxHashMap<Arc<str>, usize>,
     /// type_name → (lowercased instance name → refcount). Makes `contains` an O(1)
     /// hash lookup instead of a linear scan over every instance of the type, which
     /// was quadratic over the corpus for high-cardinality types (state, character,
     /// country_event). The refcount lets `remove_file` drop a name only when its
     /// last definition in that type goes.
-    instance_sets: FxHashMap<String, FxHashMap<String, usize>>,
+    instance_sets: FxHashMap<String, FxHashMap<Arc<str>, usize>>,
     /// file_uri → the set of `map` bucket keys (type names) that file contributes
     /// instances to. Lets [`remove_file`](Self::remove_file) visit only the
     /// buckets the file actually touched (O(the file's own entries)) instead of
@@ -287,7 +287,8 @@ impl TypeIndex {
         // Borrow the key directly when it's already lowercase (the common case),
         // only allocating a lowercase copy when it actually has uppercase bytes.
         if instance.bytes().any(|b| b.is_ascii_uppercase()) {
-            names.contains_key(&instance.to_ascii_lowercase())
+            let lower = instance.to_ascii_lowercase();
+            names.contains_key(lower.as_str())
         } else {
             names.contains_key(instance)
         }
@@ -299,7 +300,8 @@ impl TypeIndex {
     /// e.g. `LBA_some_character = { ... }`.
     pub fn is_any_instance(&self, name: &str) -> bool {
         if name.bytes().any(|b| b.is_ascii_uppercase()) {
-            self.name_counts.contains_key(&name.to_ascii_lowercase())
+            let lower = name.to_ascii_lowercase();
+            self.name_counts.contains_key(lower.as_str())
         } else {
             self.name_counts.contains_key(name)
         }
@@ -352,7 +354,7 @@ impl TypeIndex {
     pub(crate) fn loc_bindable_names_iter(&self) -> impl Iterator<Item = &str> + '_ {
         self.name_counts
             .keys()
-            .map(String::as_str)
+            .map(AsRef::as_ref)
             .chain(self.var_index.names().map(String::as_str))
     }
 
@@ -415,10 +417,22 @@ impl TypeIndex {
             let set = self.instance_sets.entry(type_name.clone()).or_default();
             let entry = self.map.entry(type_name).or_default();
             for inst in instances {
-                let lower = inst.name.to_ascii_lowercase();
-                if !subtype_key {
-                    *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
-                }
+                let lower = Arc::<str>::from(inst.name.to_ascii_lowercase());
+                let lower = if subtype_key {
+                    lower
+                } else {
+                    match self.name_counts.entry(lower) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            *entry.get_mut() += 1;
+                            Arc::clone(entry.key())
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let lower = Arc::clone(entry.key());
+                            entry.insert(1);
+                            lower
+                        }
+                    }
+                };
                 *set.entry(lower).or_insert(0) += 1;
                 entry.push((Arc::clone(&uri), inst));
             }
@@ -439,10 +453,22 @@ impl TypeIndex {
             let set = self.instance_sets.entry(type_name.clone()).or_default();
             let entry = self.map.entry(type_name.clone()).or_default();
             for (uri, inst) in instances {
-                let lower = inst.name.to_ascii_lowercase();
-                if !subtype_key {
-                    *self.name_counts.entry(lower.clone()).or_insert(0) += 1;
-                }
+                let lower = Arc::<str>::from(inst.name.to_ascii_lowercase());
+                let lower = if subtype_key {
+                    lower
+                } else {
+                    match self.name_counts.entry(lower) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            *entry.get_mut() += 1;
+                            Arc::clone(entry.key())
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            let lower = Arc::clone(entry.key());
+                            entry.insert(1);
+                            lower
+                        }
+                    }
+                };
                 *set.entry(lower).or_insert(0) += 1;
                 // Each instance can come from a different file, so key on its own
                 // uri; clone the type name only the first time it's seen per uri.
@@ -653,6 +679,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lowercase_name_keys_share_one_allocation() {
+        let mut idx = TypeIndex::new();
+        idx.merge(
+            "file://event.txt",
+            HashMap::from([("event".to_string(), vec![inst("Shared_Event", 1)])]),
+        );
+
+        let name = idx.name_counts.keys().next().unwrap();
+        let set_name = idx
+            .instance_sets
+            .get("event")
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap();
+        assert!(Arc::ptr_eq(name, set_name));
+    }
+
     /// Comparable projection of every observable index structure. Sorted so the
     /// comparison is order-independent (removal preserves order, a from-scratch
     /// rebuild reproduces it, but sorting keeps the assertion robust either way).
@@ -676,7 +721,7 @@ mod tests {
         let name_counts: BTreeMap<String, usize> = idx
             .name_counts
             .iter()
-            .map(|(k, v)| (k.clone(), *v))
+            .map(|(k, v)| (k.to_string(), *v))
             .collect();
         let instance_sets: BTreeMap<String, BTreeMap<String, usize>> = idx
             .instance_sets
@@ -684,7 +729,7 @@ mod tests {
             .map(|(k, m)| {
                 (
                     k.clone(),
-                    m.iter().map(|(kk, vv)| (kk.clone(), *vv)).collect(),
+                    m.iter().map(|(kk, vv)| (kk.to_string(), *vv)).collect(),
                 )
             })
             .collect();

@@ -11,8 +11,9 @@ mod type_index;
 mod variables;
 
 pub use collect::{
-    InstanceNode, SubtypeCollector, collect_type_instances, for_each_instance_node,
-    hash_instance_exports, index_discovered_files, mix_export_symbol, skip_root_key_matches,
+    CollectedTypeInstances, InstanceNode, SubtypeCollector, collect_type_instances,
+    collect_type_instances_with_subtypes, for_each_instance_node, hash_instance_exports,
+    index_discovered_files, mix_export_symbol, skip_root_key_matches,
 };
 pub use path_match::{
     NormalizedPath, check_path_dir, check_path_dir_norm, dir_matches_pattern, path_contains_segment,

@@ -11,13 +11,13 @@ use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
 use std::collections::HashSet;
 
-fn codes_hoi4(cwt: &str, script: &str) -> Vec<String> {
+fn errors_hoi4(cwt: &str, script: &str) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
     let parsed_cwt = parse_string(cwt, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let parsed = parse_string(script, &table).unwrap();
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
-    let errors = validate_prepared(
+    validate_prepared(
         &parsed,
         "game/common/foo/test.txt",
         &Prepared {
@@ -32,8 +32,11 @@ fn codes_hoi4(cwt: &str, script: &str) -> Vec<String> {
             scope_checks: true,
             var_checks: false,
         },
-    );
-    errors
+    )
+}
+
+fn codes_hoi4(cwt: &str, script: &str) -> Vec<String> {
+    errors_hoi4(cwt, script)
         .into_iter()
         .filter_map(|e| e.code.map(String::from))
         .collect()
@@ -66,6 +69,41 @@ fn state_trigger_in_country_scope_is_cw104() {
 fn country_trigger_in_country_scope_is_clean() {
     let c = codes_hoi4(SCOPE_RULES, "foo = { country_only = yes }");
     assert!(!c.contains(&"CW104".to_string()), "got: {:?}", c);
+}
+
+/// A block-form trigger in the wrong scope: the complaint names the trigger
+/// key, so the squiggle covers the key token, not the whole block it opens.
+const SCOPE_BLOCK_RULES: &str = r#"
+scopes = {
+    Country = { aliases = { country } }
+    State = { aliases = { state } }
+}
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    alias_name[trigger] = alias_match_left[trigger]
+}
+## scope = state
+alias[trigger:state_block] = {
+    x = bool
+}
+"#;
+
+#[test]
+fn cw104_underlines_only_the_trigger_key() {
+    let errs = errors_hoi4(
+        SCOPE_BLOCK_RULES,
+        "foo = {\n    state_block = {\n        x = yes\n    }\n}\n",
+    );
+    let err = errs
+        .iter()
+        .find(|e| e.code == Some("CW104"))
+        .expect("CW104 emitted");
+    assert_eq!((err.line, err.col), (2, 4));
+    assert_eq!(
+        err.end,
+        Some((2, 4 + "state_block".len() as u16)),
+        "CW104 must span only the key"
+    );
 }
 
 /// A type whose root rule seeds state scope via `## replace_scope` should make a

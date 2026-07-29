@@ -323,3 +323,128 @@ foo = {
     );
     assert!(c.contains(&"CW253".to_string()), "got: {:?}", c);
 }
+
+// CW236/238 advise about the if/else keyword, not the block it opens: the
+// squiggle must cover only the key token.
+#[test]
+fn cw236_underlines_only_the_if_key() {
+    let table = StringTable::new();
+    let parsed_cwt = parse_string("", &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let script =
+        "foo = {\n    if = {\n        limit = { x = 1 }\n        else = { b = 2 }\n    }\n}\n";
+    let parsed = parse_string(script, &table).unwrap();
+
+    let err = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "test.txt",
+        Some(Game::Stellaris),
+        None,
+        None,
+    )
+    .into_iter()
+    .find(|e| e.code == Some("CW236"))
+    .expect("CW236 emitted");
+
+    assert_eq!((err.line, err.col), (2, 4));
+    assert_eq!(
+        err.end,
+        Some((2, 4 + "if".len() as u16)),
+        "CW236 must span only the key"
+    );
+}
+
+#[test]
+fn cw238_underlines_only_the_containing_key() {
+    let table = StringTable::new();
+    let parsed_cwt = parse_string("", &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let script = "foo = {\n    else = { a = 1 }\n}\n";
+    let parsed = parse_string(script, &table).unwrap();
+
+    let err = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "test.txt",
+        Some(Game::Stellaris),
+        None,
+        None,
+    )
+    .into_iter()
+    .find(|e| e.code == Some("CW238"))
+    .expect("CW238 emitted");
+
+    assert_eq!((err.line, err.col), (1, 0));
+    assert_eq!(
+        err.end,
+        Some((1, "foo".len() as u16)),
+        "CW238 must span only the key"
+    );
+}
+
+// CW261 fires at the second occurrence of a `unique = yes` type key. The
+// complaint is the duplicated key, so it spans the key, not the whole second
+// definition.
+#[test]
+fn cw261_underlines_only_the_duplicated_key() {
+    let table = StringTable::new();
+    let cwt = "types = {\n    type[thing] = {\n        path = \"game/common/things\"\n        unique = yes\n    }\n}\n";
+    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let script = "thing = {\n    a = 1\n}\nthing = {\n    b = 2\n}\n";
+    let parsed = parse_string(script, &table).unwrap();
+
+    let err = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "test.txt",
+        Some(Game::Hoi4),
+        None,
+        None,
+    )
+    .into_iter()
+    .find(|e| e.code == Some("CW261"))
+    .expect("CW261 emitted");
+
+    assert_eq!((err.line, err.col), (4, 0));
+    assert_eq!(
+        err.end,
+        Some((4, "thing".len() as u16)),
+        "CW261 must span only the key"
+    );
+}
+
+// The complaint is the key name, not the block, and the fix already renames only
+// the key token. The squiggle should agree with it.
+#[test]
+fn cw253_underlines_only_the_deprecated_key() {
+    let table = StringTable::new();
+    let parsed_cwt = parse_string("", &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_cwt, &table);
+    let script = "foo = {\n    set_empire_name = {\n        key = \"X\"\n    }\n}\n";
+    let parsed = parse_string(script, &table).unwrap();
+
+    let err = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "test.txt",
+        Some(Game::Stellaris),
+        None,
+        None,
+    )
+    .into_iter()
+    .find(|e| e.code == Some("CW253"))
+    .expect("CW253 emitted");
+
+    assert_eq!((err.line, err.col), (2, 4));
+    assert_eq!(
+        err.end,
+        Some((2, 4 + "set_empire_name".len() as u16)),
+        "CW253 must span only the key"
+    );
+}
