@@ -732,7 +732,7 @@ impl Backend {
             }
             node.name = keys
                 .iter()
-                .find_map(|k| loc_text.get(k))
+                .find_map(|key| loc_text.get(key.as_str()))
                 .and_then(|translations| translations.first())
                 .map(|(_, text)| truncate_label(text));
         }

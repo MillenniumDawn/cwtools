@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, Position, Range,
@@ -7,9 +5,9 @@ use tower_lsp::lsp_types::{
 
 use cwtools_info::{PositionElement, ReferenceHint};
 
-use crate::Backend;
 use crate::RuleCursorInfo;
 use crate::paths::{lang_display_name, logical_path_from_uri};
+use crate::{Backend, LocTextMap};
 
 impl Backend {
     pub(crate) async fn hover_impl(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -160,7 +158,8 @@ impl Backend {
         // The map is keyed by ASCII-lowercased loc keys. Avoid the temp String
         // when the key is already lowercase (the common case).
         let translations = if key.bytes().any(|b| b.is_ascii_uppercase()) {
-            loc_text.get(&key.to_lowercase())?
+            let lower = key.to_lowercase();
+            loc_text.get(lower.as_str())?
         } else {
             loc_text.get(key.as_str())?
         };
@@ -350,7 +349,7 @@ pub(crate) fn build_hover_markdown(
 pub(crate) fn append_localisation(
     md: &mut String,
     element: &PositionElement,
-    loc_text: &HashMap<String, Vec<(cwtools_localization::Lang, String)>>,
+    loc_text: &LocTextMap,
 ) {
     let (name_key, desc_key): (Option<String>, Option<String>) = match element {
         PositionElement::Leaf { key, value } if value.is_empty() => {
@@ -389,7 +388,7 @@ pub(crate) fn append_type_localisation(
     value: &str,
     type_index: &cwtools_info::TypeIndex,
     ruleset: &cwtools_rules::rules_types::RuleSet,
-    loc_text: &HashMap<String, Vec<(cwtools_localization::Lang, String)>>,
+    loc_text: &LocTextMap,
 ) {
     let value = value.trim_matches('"');
     let mut keys: Vec<String> = Vec::new();
@@ -406,7 +405,7 @@ pub(crate) fn append_type_localisation(
         }
     }
     for key in keys {
-        if let Some(translations) = loc_text.get(&key) {
+        if let Some(translations) = loc_text.get(key.as_str()) {
             md.push_str("\n\n---\n\n**Localisation**:");
             for (lang, text) in translations {
                 md.push_str(&format!("\n- {}: {}", lang_display_name(*lang), text));

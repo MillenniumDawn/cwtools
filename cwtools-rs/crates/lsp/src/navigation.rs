@@ -45,10 +45,11 @@ impl Backend {
         let (key, _, _) = self.loc_ref_at_cursor_doc(uri, pos)?;
         let target = {
             let map = self.state.loc_locations.read();
-            map.get(&key.to_lowercase()).cloned()
+            let key = key.to_lowercase();
+            map.get(key.as_str()).cloned()
         }?;
         Some(GotoDefinitionResponse::Array(vec![
-            self.source_location_at(&target.0, target.1, 0, &key, fallback),
+            self.source_location_at(target.0.as_ref(), target.1, 0, &key, fallback),
         ]))
     }
 
@@ -105,11 +106,12 @@ impl Backend {
                 ReferenceHint::LocRef { key } => {
                     let target = {
                         let map = self.state.loc_locations.read();
-                        map.get(&key.to_lowercase()).cloned()
+                        let key = key.to_lowercase();
+                        map.get(key.as_str()).cloned()
                     };
                     target
                         .map(|(file_uri, line)| {
-                            vec![self.source_location_at(&file_uri, line, 0, key, fallback)]
+                            vec![self.source_location_at(file_uri.as_ref(), line, 0, key, fallback)]
                         })
                         .unwrap_or_default()
                 }

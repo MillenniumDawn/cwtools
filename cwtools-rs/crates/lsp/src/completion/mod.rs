@@ -285,7 +285,7 @@ impl Backend {
             .as_ref()
             .map(|index| index.union())
             .into_iter()
-            .flat_map(|keys| keys.iter().map(String::as_str))
+            .flat_map(|keys| keys.iter().map(AsRef::as_ref))
             .chain(overlay_keys.iter().map(String::as_str));
         loc_keys::select_loc_keys(keys, token, CONTEXT_CAP)
     }

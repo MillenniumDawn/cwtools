@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::*;
@@ -9,10 +9,10 @@ use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringId;
 use cwtools_validation::{Prepared, ValidationError, validate_prepared};
 
-use crate::Backend;
 use crate::paths::{
     encoded_position_len, logical_path_from_uri, source_column_to_lsp, uri_to_path_str,
 };
+use crate::{Backend, LocTextMap};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_prepared<'a>(
@@ -928,24 +928,31 @@ impl Backend {
             .unwrap_or(cwtools_localization::Lang::English);
 
         // Collect the new entries for this file.
-        let mut new_entries: HashMap<String, Vec<(cwtools_localization::Lang, String)>> =
-            HashMap::new();
-        for file in svc.files() {
-            let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
-            let lang_included = hover_all || lang == primary_lang;
-            if !lang_included {
-                continue;
-            }
-            for entry in &file.entries {
-                let display = crate::paths::loc_display_text(&entry.desc);
-                if !display.is_empty() {
-                    new_entries
-                        .entry(entry.key.to_lowercase())
-                        .or_default()
-                        .push((lang, display.to_string()));
+        let new_entries = {
+            let loc_index = self.state.loc_index.read();
+            let mut new_entries = LocTextMap::default();
+            for file in svc.files() {
+                let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
+                let lang_included = hover_all || lang == primary_lang;
+                if !lang_included {
+                    continue;
+                }
+                for entry in &file.entries {
+                    let display = crate::paths::loc_display_text(&entry.desc);
+                    if !display.is_empty() {
+                        let key = loc_index
+                            .as_ref()
+                            .and_then(|index| index.key(&entry.key))
+                            .unwrap_or_else(|| Arc::from(entry.key.to_lowercase()));
+                        new_entries
+                            .entry(key)
+                            .or_default()
+                            .push((lang, display.to_string()));
+                    }
                 }
             }
-        }
+            new_entries
+        };
 
         // Merge into the global loc_text map: remove old entries for this
         // file's keys, then insert the new ones. A simple remove-and-replace
@@ -1005,8 +1012,8 @@ impl Backend {
         // Hold the read guard across the validate call to avoid cloning the full
         // loc-key union (~2M Strings on Millennium Dawn).
         let loc_guard = self.state.loc_index.read();
-        let empty_union: HashSet<String> = HashSet::new();
-        let union: &HashSet<String> = loc_guard
+        let empty_union = cwtools_localization::LocKeySet::default();
+        let union: &cwtools_localization::LocKeySet = loc_guard
             .as_ref()
             .map(|idx| idx.union())
             .unwrap_or(&empty_union);
@@ -1321,6 +1328,7 @@ impl Backend {
 #[cfg(test)]
 mod perf_bench {
     use super::*;
+    use std::collections::HashMap;
 
     fn bench<F: FnMut() -> usize>(label: &str, iters: usize, mut f: F) {
         for _ in 0..3 {
@@ -1552,6 +1560,7 @@ mod perf_bench {
 mod whole_line_range_tests {
     use super::*;
     use cwtools_validation::ErrorSeverity;
+    use std::collections::HashMap;
 
     #[test]
     fn loc_keys_of_extracts_lowercased_keys() {

@@ -1,5 +1,5 @@
 use cwtools_parser::ast::{Arena, Child, ParseError};
-use cwtools_parser::parser::parse_string;
+use cwtools_parser::parser::{parse_string, parse_string_without_comments};
 use cwtools_string_table::string_table::StringTable;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -373,7 +373,7 @@ impl FileManager {
             .into_par_iter()
             .filter_map(|(path, logical_path)| {
                 let content = read_text(&path).ok()?;
-                match parse_string(&content, table) {
+                match parse_string_without_comments(&content, table) {
                     Ok(parsed) => Some(ParsedFile {
                         path,
                         logical_path,
@@ -449,7 +449,7 @@ impl FileManager {
             .into_par_iter()
             .filter_map(|(path, logical_path)| {
                 let content = read_text(&path).ok()?;
-                match parse_string(&content, table) {
+                match parse_string_without_comments(&content, table) {
                     Ok(parsed) => Some(ParsedFile {
                         path,
                         logical_path,

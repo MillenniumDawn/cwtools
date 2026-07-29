@@ -28,7 +28,7 @@ use std::sync::Arc;
 use cwtools_file_manager::file_manager::{
     DirectoryType, FileManager, FileManagerConfig, classify_directory,
 };
-use cwtools_file_manager::{FileEncoding, read_text_with_encoding};
+use cwtools_file_manager::{FileEncoding, read_text, read_text_with_encoding};
 use cwtools_game::constants::Game;
 use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_index::vanilla_cache::{self, VanillaCacheData};
@@ -38,7 +38,7 @@ use cwtools_index::{
 };
 use cwtools_localization::{Lang, LocDiagnostic, LocIndex, LocService};
 use cwtools_parser::ast::{ParseError, ParsedFile};
-use cwtools_parser::parser::parse_string;
+use cwtools_parser::parser::{parse_string, parse_string_without_comments};
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
@@ -48,11 +48,31 @@ use cwtools_validation::{
     checks_from_env, validate_prepared,
 };
 
-/// A parsed workspace/mod file: its on-disk path, mod-relative logical path, and AST.
-pub struct ParsedSource {
+/// A discovered workspace/mod file, retained between indexing and validation.
+pub struct SourceFile {
     pub path: PathBuf,
     pub logical_path: String,
-    pub parsed: ParsedFile,
+    fingerprint: Option<SourceFingerprint>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SourceFingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn source_fingerprint(path: &Path) -> Option<SourceFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(SourceFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+struct ParsedFileSource {
+    path: PathBuf,
+    logical_path: String,
+    parsed: ParsedFile,
 }
 
 /// How to load the rules: a single `.cwt` file or a directory of them.
@@ -200,11 +220,11 @@ impl Session {
             }
         };
 
-        // Take ownership of each parsed AST once. The TypeIndex build and the
-        // validation pass both borrow this set, so nothing is parsed twice.
-        let parsed: Vec<ParsedSource> = files
+        // Take ownership of each parsed AST once for indexing. They are dropped
+        // before localisation is built; validation reparses each source later.
+        let parsed: Vec<ParsedFileSource> = files
             .into_iter()
-            .map(|f| ParsedSource {
+            .map(|f| ParsedFileSource {
                 path: f.path,
                 logical_path: f.logical_path,
                 parsed: ParsedFile {
@@ -276,6 +296,15 @@ impl Session {
             }
             type_index.value_set_values.merge_file(file_uri, value_sets);
         }
+        let source_files = parsed
+            .iter()
+            .map(|src| SourceFile {
+                path: src.path.clone(),
+                logical_path: src.logical_path.clone(),
+                fingerprint: source_fingerprint(&src.path),
+            })
+            .collect();
+        drop(parsed);
 
         // Auto-managed cache: reuse a fresh one instead of walking the install,
         // and remember where to write one when there's nothing to reuse.
@@ -407,18 +436,14 @@ impl Session {
             registry,
             directory,
         }
-        .with_parsed_cache(parsed, discovery_failed)
+        .with_source_files(source_files, discovery_failed)
     }
 
-    /// Attach the parsed mod-file set the batch path validates over.
-    fn with_parsed_cache(
-        self,
-        parsed: Vec<ParsedSource>,
-        discovery_failed: bool,
-    ) -> SessionWithFiles {
+    /// Attach the discovered mod-file set the batch path validates over.
+    fn with_source_files(self, files: Vec<SourceFile>, discovery_failed: bool) -> SessionWithFiles {
         SessionWithFiles {
             session: self,
-            parsed,
+            files,
             discovery_failed,
         }
     }
@@ -504,12 +529,12 @@ impl Session {
     }
 }
 
-/// A [`Session`] plus the parsed mod-file set, returned by [`Session::load`]. The
-/// batch path ([`Self::validate_all`]) needs the files resident; the LSP, which
-/// supplies its own ASTs per file, derefs to the inner [`Session`].
+/// A [`Session`] plus the discovered mod-file set, returned by [`Session::load`].
+/// The batch path reparses each file after the shared indexes are ready; the LSP,
+/// which supplies its own ASTs per file, derefs to the inner [`Session`].
 pub struct SessionWithFiles {
     session: Session,
-    parsed: Vec<ParsedSource>,
+    files: Vec<SourceFile>,
     /// True when the initial `discover_and_parse` failed; callers should treat
     /// this as a hard error (log already printed) and exit nonzero.
     pub discovery_failed: bool,
@@ -530,12 +555,51 @@ impl SessionWithFiles {
         use rayon::prelude::*;
 
         let prepared = self.session.prepared();
-        self.parsed
+        self.files
             .par_iter()
             .map(|src| {
                 let file_str = src.path.to_str().unwrap_or("").to_string();
-                let mut errors = parse_errors_to_validation(&src.parsed.errors, &file_str);
-                errors.extend(validate_prepared(&src.parsed, &file_str, &prepared));
+                if source_fingerprint(&src.path) != src.fingerprint {
+                    return (
+                        src.path.clone(),
+                        vec![ValidationError {
+                            message: format!(
+                                "file changed after indexing: {file_str}; rerun validation"
+                            ),
+                            severity: ErrorSeverity::Error,
+                            line: 0,
+                            col: 0,
+                            file: file_str,
+                            code: None,
+                            fix: None,
+                            end: None,
+                        }],
+                    );
+                }
+                let parsed = match read_text(&src.path).and_then(|text| {
+                    parse_string_without_comments(&text, &self.session.rules_table).map_err(|e| {
+                        cwtools_file_manager::file_manager::FileError::Parse(e.to_string())
+                    })
+                }) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        return (
+                            src.path.clone(),
+                            vec![ValidationError {
+                                message: format!("could not parse {file_str}: {error}"),
+                                severity: ErrorSeverity::Error,
+                                line: 0,
+                                col: 0,
+                                file: file_str,
+                                code: None,
+                                fix: None,
+                                end: None,
+                            }],
+                        );
+                    }
+                };
+                let mut errors = parse_errors_to_validation(&parsed.errors, &file_str);
+                errors.extend(validate_prepared(&parsed, &file_str, &prepared));
                 // CW100: objects defined here whose `## required` localisation
                 // keys aren't provided by any loc file. Gated on the loc index
                 // being non-empty, same as the LSP's `append_missing_loc_errors`:
@@ -558,9 +622,9 @@ impl SessionWithFiles {
             .collect()
     }
 
-    /// The parsed mod-file set (for profiling/inspection by the caller).
-    pub fn parsed_files(&self) -> &[ParsedSource] {
-        &self.parsed
+    /// The discovered mod-file set (for profiling/inspection by the caller).
+    pub fn parsed_files(&self) -> &[SourceFile] {
+        &self.files
     }
 }
 

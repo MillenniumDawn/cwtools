@@ -19,21 +19,18 @@
 //! The capability is declared statically (loc titles default on); the handler
 //! gates each kind on its setting and returns nothing when both are off.
 
-use std::collections::HashMap;
-
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
     InlayHint, InlayHintLabel, InlayHintParams, PositionEncodingKind, Range,
 };
 
 use cwtools_info::TypeIndex;
-use cwtools_localization::Lang;
 use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
 use cwtools_string_table::string_table::StringTable;
 
-use crate::Backend;
 use crate::navigation::{value_col_in_line, value_start_after_eq};
 use crate::paths::source_position_to_lsp;
+use crate::{Backend, LocTextMap};
 
 /// Upper bound on hints returned for one request, so a huge visible range (or a
 /// file that is one giant list of ids) can't produce an unbounded response.
@@ -107,7 +104,7 @@ pub(crate) fn loc_title_hints(
     text: &str,
     range: Range,
     type_index: &TypeIndex,
-    loc_text: &HashMap<String, Vec<(Lang, String)>>,
+    loc_text: &LocTextMap,
     encoding: &PositionEncodingKind,
 ) -> Vec<InlayHint> {
     let mut hints = Vec::new();
@@ -138,7 +135,7 @@ struct Ctx<'a> {
     lines: &'a [&'a str],
     range: Range,
     type_index: &'a TypeIndex,
-    loc_text: &'a HashMap<String, Vec<(Lang, String)>>,
+    loc_text: &'a LocTextMap,
     encoding: &'a PositionEncodingKind,
 }
 
@@ -240,7 +237,7 @@ fn hint_for_value(value: &Value, cx: &Ctx<'_>, line0: u32, anchor: Anchor) -> Op
             }
             // Past the gate: now allocate the lowercased lookup key + the title.
             let name_lc = name.to_ascii_lowercase();
-            let title = truncate_title(cx.loc_text.get(&name_lc)?.first()?.1.as_str());
+            let title = truncate_title(cx.loc_text.get(name_lc.as_str())?.first()?.1.as_str());
 
             let line = cx.line(line0);
             let from = match anchor {
@@ -280,6 +277,9 @@ fn truncate_title(title: &str) -> String {
 mod tests {
     use super::*;
     use cwtools_info::{SourceLocation, TypeInstance};
+    use cwtools_localization::Lang;
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use tower_lsp::lsp_types::Position;
 
     fn idx_with(type_name: &str, names: &[&str]) -> TypeIndex {
@@ -304,18 +304,14 @@ mod tests {
         idx
     }
 
-    fn loc(pairs: &[(&str, &str)]) -> HashMap<String, Vec<(Lang, String)>> {
+    fn loc(pairs: &[(&str, &str)]) -> LocTextMap {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), vec![(Lang::English, v.to_string())]))
+            .map(|(k, v)| (Arc::from(*k), vec![(Lang::English, v.to_string())]))
             .collect()
     }
 
-    fn hints_for(
-        text: &str,
-        idx: &TypeIndex,
-        loc: &HashMap<String, Vec<(Lang, String)>>,
-    ) -> Vec<InlayHint> {
+    fn hints_for(text: &str, idx: &TypeIndex, loc: &LocTextMap) -> Vec<InlayHint> {
         let table = StringTable::new();
         let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
         let range = Range::new(Position::new(0, 0), Position::new(1000, 0));

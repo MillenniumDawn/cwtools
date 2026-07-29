@@ -1271,16 +1271,9 @@ fn main() {
                     mib(st.id_to_string_bytes),
                     mib(st.map_key_bytes),
                 );
-                let (mut leaves, mut values) = (0usize, 0);
-                for src in parsed {
-                    leaves += src.parsed.arena.leaves.len();
-                    values += src.parsed.arena.leaf_values.len();
-                }
                 let type_instances: usize = type_index.map.values().map(|v| v.len()).sum();
                 eprintln!(
-                    "  [profile]   arenas: {} leaves, {} values across {} files",
-                    leaves,
-                    values,
+                    "  [profile]   parsed ASTs released after indexing ({} files)",
                     parsed.len()
                 );
                 eprintln!(

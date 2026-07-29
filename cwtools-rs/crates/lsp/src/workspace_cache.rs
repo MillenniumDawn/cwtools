@@ -23,7 +23,9 @@ use cwtools_string_table::string_table::StringTable;
 /// SipHash-keyed cache directories no longer match and are treated as a miss
 /// (one-time cold rebuild).
 /// v3: dropped `CachedNode`/`CachedChild::Node` from the `CachedFile` layout.
-const CACHE_VERSION: u32 = 3;
+/// v4: workspace scans discard comments before caching because only open-document
+/// semantic-token parsing needs them.
+const CACHE_VERSION: u32 = 4;
 
 // ── Fingerprinting ──────────────────────────────────────────────────────────
 

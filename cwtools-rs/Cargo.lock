@@ -460,6 +460,7 @@ dependencies = [
  "cwtools_game",
  "cwtools_parser",
  "rayon",
+ "rustc-hash",
  "tempfile",
  "tracing",
 ]
@@ -482,6 +483,7 @@ dependencies = [
  "cwtools_validation",
  "parking_lot",
  "rayon",
+ "rustc-hash",
  "serde_json",
  "tempfile",
  "tokio",
