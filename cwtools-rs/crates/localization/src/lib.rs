@@ -11,7 +11,7 @@ pub mod yaml_parser;
 pub use commands::*;
 pub use csv_parser::*;
 pub use cwtools_error_codes::ErrorSeverity;
-pub use loc_index::LocIndex;
+pub use loc_index::{LocIndex, LocKey, LocKeySet};
 pub use loc_string::{JominiCommand, JominiParam, LocElement, parse_loc_elements};
 pub use pipeline::{
     LocDiagnostic, loc_error_code, loc_error_severity, validate_loc_file_text,

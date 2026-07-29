@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tower_lsp::lsp_types::*;
 
-use cwtools_parser::parser::parse_string;
+use cwtools_parser::parser::parse_string_without_comments;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::build_modifier_keys;
 
@@ -18,7 +18,7 @@ use crate::validate::{
     validate_parsed_with_indexes, validation_error_to_diagnostic,
 };
 use crate::workspace_cache;
-use crate::{Backend, LoadingBar, UpdateFileList};
+use crate::{Backend, LoadingBar, LocLocationMap, LocTextMap, UpdateFileList};
 
 /// Trailing window for coalescing `didChangeWatchedFiles` create/modify events.
 /// Fixed (not a sliding reset) so a continuous churn stream still drains.
@@ -543,7 +543,8 @@ impl Backend {
                         return Some((true, parsed));
                     }
                     // Cache miss — parse, then persist for the next scan.
-                    let parsed = parse_string(&text, &self.state.string_table).ok()?;
+                    let parsed =
+                        parse_string_without_comments(&text, &self.state.string_table).ok()?;
                     if let Some((ref cd, fp)) = cache_info {
                         workspace_cache::store(cd, fp, &text, &parsed, &self.state.string_table);
                     }
@@ -1124,9 +1125,8 @@ impl Backend {
                 }
                 // Extract per-key display text for hover and a representative
                 // definition site (for goto) before dropping the service.
-                let mut lt: HashMap<String, Vec<(cwtools_localization::Lang, String)>> =
-                    HashMap::new();
-                let mut ll: HashMap<String, (String, u32)> = HashMap::new();
+                let mut lt = LocTextMap::default();
+                let mut ll = LocLocationMap::default();
                 for file in service.files() {
                     if std::path::Path::new(&file.path).starts_with(root_path) {
                         by_file.entry(file.path.clone()).or_default();
@@ -1134,9 +1134,11 @@ impl Backend {
                     let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
                     let lang_included = hover_all || lang == primary_lang;
                     // Every entry in a file shares the same source path.
-                    let file_uri = path_to_uri(std::path::Path::new(&file.path));
+                    let file_uri: Arc<str> = path_to_uri(std::path::Path::new(&file.path)).into();
                     for entry in &file.entries {
-                        let key_lower = entry.key.to_lowercase();
+                        let key_lower = idx
+                            .key(&entry.key)
+                            .expect("loc index must contain every service key");
                         // goto: prefer the primary language's location (English by
                         // default) so Ctrl+Click lands on the canonical entry, not
                         // whichever language happened to be scanned first.
@@ -1169,7 +1171,7 @@ impl Backend {
         // keys is CPU-bound and must not sit on the async executor.
         let loc_key_index = tokio::task::block_in_place(|| {
             Arc::new(crate::completion::LocKeyIndex::build(
-                loc_index.union().iter().map(String::as_str),
+                loc_index.union().iter().map(AsRef::as_ref),
             ))
         });
         *self.state.loc_index.write() = Some(loc_index);

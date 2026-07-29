@@ -10,22 +10,26 @@
 
 use crate::commands::{Lang, LocEntry};
 use crate::service::LocService;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Arc;
+
+pub type LocKey = Arc<str>;
+pub type LocKeySet = FxHashSet<LocKey>;
 
 /// Per-language loc-key index plus a representative parsed entry per key.
 #[derive(Debug, Clone, Default)]
 pub struct LocIndex {
     /// language -> lowercased key set
-    per_language: HashMap<Lang, HashSet<String>>,
+    per_language: FxHashMap<Lang, LocKeySet>,
     /// union of all keys across every language
-    union: HashSet<String>,
+    union: LocKeySet,
     /// languages the project actually ships loc data for
     languages_with_data: Vec<Lang>,
     /// lowercased key -> a representative parsed entry (English preferred), kept
     /// ONLY for keys whose representative actually has `[command]` chains — the
     /// sole consumer is the scope-aware command check. Keeping a full entry per
     /// key would re-clone all ~2M loc entries; almost none carry commands.
-    entries: HashMap<String, LocEntry>,
+    entries: FxHashMap<LocKey, LocEntry>,
 }
 
 impl LocIndex {
@@ -41,21 +45,16 @@ impl LocIndex {
     /// data (the previous behavior). The key `union` (existence resolution) is
     /// never restricted, so config `$ref$` checks still resolve any loaded key.
     pub fn build_scoped(service: &LocService, langs: Option<&[Lang]>) -> Self {
-        let mut per_language: HashMap<Lang, HashSet<String>> = HashMap::new();
-        let mut union: HashSet<String> = HashSet::new();
-        let mut entries: HashMap<String, LocEntry> = HashMap::new();
+        let mut per_language: FxHashMap<Lang, LocKeySet> = FxHashMap::default();
+        let mut union = LocKeySet::default();
+        let mut entries: FxHashMap<LocKey, LocEntry> = FxHashMap::default();
 
         for file in service.files() {
             let Some(lang) = file.lang else { continue };
             let set = per_language.entry(lang).or_default();
             for entry in &file.entries {
-                let lower = entry.key.to_lowercase();
-                set.insert(lower.clone());
-                // Duplicate keys across files/languages are common (~2M entries,
-                // far fewer unique); only clone into the union when it's new.
-                if !union.contains(&lower) {
-                    union.insert(lower.clone());
-                }
+                let lower = Self::intern_key(&mut union, entry.key.to_lowercase());
+                set.insert(Arc::clone(&lower));
 
                 // Representative entry for command validation only — skip keys
                 // with no commands so the map stays tiny.
@@ -84,6 +83,16 @@ impl LocIndex {
         }
     }
 
+    fn intern_key(union: &mut LocKeySet, key: String) -> LocKey {
+        if let Some(existing) = union.get(key.as_str()) {
+            Arc::clone(existing)
+        } else {
+            let key: LocKey = Arc::from(key);
+            union.insert(Arc::clone(&key));
+            key
+        }
+    }
+
     /// Merge cached per-language key sets (the vanilla-cache restore path):
     /// keys join the union + per-language sets, and languages new to the index
     /// join `languages_with_data` subject to the same `langs` scoping as
@@ -96,9 +105,9 @@ impl LocIndex {
     ) {
         for (lang, keys) in per_language {
             let set = self.per_language.entry(lang).or_default();
-            for k in keys {
-                self.union.insert(k.clone());
-                set.insert(k);
+            for key in keys {
+                let key = Self::intern_key(&mut self.union, key);
+                set.insert(key);
             }
             let allowed = langs.map(|ls| ls.contains(&lang)).unwrap_or(true);
             if allowed && !self.languages_with_data.contains(&lang) {
@@ -140,24 +149,34 @@ impl LocIndex {
     }
 
     /// The union of all loc keys (lowercased), for single-file `$ref$` checks.
-    pub fn union(&self) -> &HashSet<String> {
+    pub fn union(&self) -> &LocKeySet {
         &self.union
+    }
+
+    /// Return the shared lowercased key for `key`, if it is indexed.
+    pub fn key(&self, key: &str) -> Option<LocKey> {
+        self.union.get(key.to_lowercase().as_str()).cloned()
     }
 }
 
 /// Extract per-language lowercased key sets from a loaded [`LocService`] —
 /// the shape the vanilla cache stores (language display name -> keys).
 pub fn per_language_keys(service: &LocService) -> Vec<(String, Vec<String>)> {
-    let mut per: HashMap<Lang, HashSet<String>> = HashMap::new();
+    let mut per: FxHashMap<Lang, LocKeySet> = FxHashMap::default();
     for file in service.files() {
         let Some(lang) = file.lang else { continue };
         let set = per.entry(lang).or_default();
         for entry in &file.entries {
-            set.insert(entry.key.to_lowercase());
+            set.insert(entry.key.to_lowercase().into());
         }
     }
     per.into_iter()
-        .map(|(lang, keys)| (lang.to_string(), keys.into_iter().collect()))
+        .map(|(lang, keys)| {
+            (
+                lang.to_string(),
+                keys.into_iter().map(|key| key.to_string()).collect(),
+            )
+        })
         .collect()
 }
 
@@ -181,6 +200,30 @@ mod tests {
         let idx = LocIndex::build(&svc);
         assert!(idx.exists_any("my_key"));
         assert!(!idx.exists_any("absent"));
+    }
+
+    #[test]
+    fn indexed_keys_share_one_allocation() {
+        let svc = service_from(&[
+            ("a_l_english.yml", "l_english:\n shared_key: \"a\"\n"),
+            ("a_l_german.yml", "l_german:\n shared_key: \"b\"\n"),
+        ]);
+        let idx = LocIndex::build(&svc);
+        let union = idx.union.get("shared_key").unwrap();
+        let english = idx
+            .per_language
+            .get(&Lang::English)
+            .unwrap()
+            .get("shared_key")
+            .unwrap();
+        let german = idx
+            .per_language
+            .get(&Lang::German)
+            .unwrap()
+            .get("shared_key")
+            .unwrap();
+        assert!(Arc::ptr_eq(union, english));
+        assert!(Arc::ptr_eq(union, german));
     }
 
     #[test]

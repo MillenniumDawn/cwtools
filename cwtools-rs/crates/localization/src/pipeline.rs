@@ -8,6 +8,7 @@
 //! need the scope of the referencing field.
 
 use crate::commands::{Lang, LocFile};
+use crate::loc_index::LocKeySet;
 use crate::service::LocService;
 use crate::validation::{LocErrorKind, hardcoded_loc_set, validate_loc_file_with_hardcoded};
 use crate::yaml_parser::{LangHeaderDiagnostic, check_loc_file_lang, parse_loc_text};
@@ -184,7 +185,7 @@ fn lang_header_diagnostic(file: &LocFile) -> Option<LocDiagnostic> {
 fn build_diagnostics(
     file: &LocFile,
     file_path: &str,
-    union: &HashSet<String>,
+    union: &LocKeySet,
     extra_valid_refs: &HashSet<String>,
     hardcoded: &HashSet<String>,
     emit_cw254: bool,
@@ -279,10 +280,10 @@ pub fn validate_loc_project_scoped(
     // Built in parallel: on large projects (~2M entries) the sequential
     // lowercase+insert dominated. Same case-folding (`to_lowercase`) as before;
     // the resulting set is identical regardless of insert order.
-    let union: HashSet<String> = service
+    let union: LocKeySet = service
         .files()
         .par_iter()
-        .flat_map_iter(|file| file.entries.iter().map(|e| e.key.to_lowercase()))
+        .flat_map_iter(|file| file.entries.iter().map(|e| e.key.to_lowercase().into()))
         .collect();
     validate_loc_project_with_union(service, langs, &union, extra_valid_refs)
 }
@@ -297,7 +298,7 @@ pub fn validate_loc_project_scoped(
 pub fn validate_loc_project_with_union(
     service: &LocService,
     langs: Option<&[Lang]>,
-    union: &HashSet<String>,
+    union: &LocKeySet,
     extra_valid_refs: &HashSet<String>,
 ) -> Vec<LocDiagnostic> {
     use rayon::prelude::*;
@@ -338,7 +339,7 @@ pub fn validate_loc_project_with_union(
 pub fn validate_loc_file_text(
     text: &str,
     path: &str,
-    union: &HashSet<String>,
+    union: &LocKeySet,
     extra_valid_refs: &HashSet<String>,
 ) -> Vec<LocDiagnostic> {
     let Ok(file) = parse_loc_text(text, path) else {
