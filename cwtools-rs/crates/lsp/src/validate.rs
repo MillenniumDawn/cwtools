@@ -1507,6 +1507,43 @@ mod perf_bench {
                 );
                 info.export_fingerprint(&uri) as usize
             });
+
+            let mut type_index = cwtools_info::TypeIndex::new();
+            type_index.merge(
+                &uri,
+                cwtools_info::collect_type_instances(&ruleset, &parsed, logical_path, &table),
+            );
+            bench("CW100 recollect + check", 20, || {
+                let per_type =
+                    cwtools_info::collect_type_instances(&ruleset, &parsed, logical_path, &table);
+                let instances: Vec<_> = per_type
+                    .iter()
+                    .flat_map(|(type_name, values)| {
+                        values
+                            .iter()
+                            .map(move |instance| (type_name.as_str(), instance))
+                    })
+                    .collect();
+                cwtools_validation::missing_loc::check_missing_localisation(
+                    &instances,
+                    logical_path,
+                    logical_path,
+                    &ruleset,
+                    |_| true,
+                )
+                .len()
+            });
+            bench("CW100 indexed check", 20, || {
+                let instances = type_index.instances_in_file(&uri);
+                cwtools_validation::missing_loc::check_missing_localisation(
+                    &instances,
+                    logical_path,
+                    logical_path,
+                    &ruleset,
+                    |_| true,
+                )
+                .len()
+            });
         }
     }
 }
