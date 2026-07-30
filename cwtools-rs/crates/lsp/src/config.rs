@@ -368,6 +368,19 @@ impl Backend {
             .hierarchical_symbols
             .store(hierarchical, Ordering::Relaxed);
 
+        // rename: versioned documentChanges only when the client advertises
+        // support; otherwise the legacy `changes` map is served.
+        let document_changes = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.workspace_edit.as_ref())
+            .and_then(|we| we.document_changes)
+            .unwrap_or(false);
+        self.state
+            .workspace_edit_document_changes
+            .store(document_changes, Ordering::Relaxed);
+
         // `$/progress`: only usable when the client says it will answer
         // `window/workDoneProgress/create`. See `scan::send_work_done_progress`.
         let work_done_progress = params

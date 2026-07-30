@@ -3505,6 +3505,126 @@ fn test_rename_edits_closed_file() {
 }
 
 #[test]
+fn test_rename_emits_versioned_document_changes_when_supported() {
+    // A client that advertises workspace.workspaceEdit.documentChanges gets
+    // TextDocumentEdits with versions: the open doc carries its version, the
+    // closed file null.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/a.txt",
+            "adec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+        (
+            "common/decisions/b.txt",
+            "bdec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+    ];
+    let caps = serde_json::json!({
+        "workspace": { "workspaceEdit": { "documentChanges": true } }
+    });
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/a.txt"],
+        caps,
+        "common/decisions/a.txt",
+        "textDocument/rename",
+        serde_json::json!({ "position": { "line": 1, "character": 16 }, "newName": "NEW_FOCUS" }),
+    );
+    assert!(
+        result["changes"].is_null(),
+        "legacy changes must be absent, got: {}",
+        result
+    );
+    let doc_changes = result["documentChanges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("documentChanges must be present, got: {}", result));
+    let entry_for = |suffix: &str| {
+        doc_changes
+            .iter()
+            .find(|e| {
+                e["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap_or("")
+                    .ends_with(suffix)
+            })
+            .unwrap_or_else(|| panic!("no documentChanges entry for {}, got: {}", suffix, result))
+    };
+    assert_eq!(
+        entry_for("decisions/a.txt")["textDocument"]["version"],
+        1,
+        "open doc carries its version, got: {}",
+        result
+    );
+    assert!(
+        entry_for("decisions/b.txt")["textDocument"]["version"].is_null(),
+        "closed file version is null, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_rename_at_constant_renames_file_locally() {
+    // `@` script constants are file-local: renaming from the definition
+    // rewrites the definition and the read, but never the occurrence in a
+    // trailing comment.
+    let doc = "@my_const = 5\nadec = {\n    x = @my_const # @my_const stays\n}\n";
+    let files = &[("common/decisions/d.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/rename",
+        serde_json::json!({ "position": { "line": 0, "character": 2 }, "newName": "@renamed" }),
+    );
+    let changes = result["changes"]
+        .as_object()
+        .expect("WorkspaceEdit changes");
+    let key = changes
+        .keys()
+        .find(|u| u.ends_with("decisions/d.txt"))
+        .unwrap_or_else(|| panic!("rename must edit d.txt, got: {}", result));
+    let edits = changes[key].as_array().expect("edits for d.txt");
+    let mut spans: Vec<(u64, u64)> = edits
+        .iter()
+        .map(|e| {
+            (
+                e["range"]["start"]["line"].as_u64().unwrap(),
+                e["range"]["start"]["character"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    spans.sort_unstable();
+    assert_eq!(
+        spans,
+        vec![(0, 0), (2, 8)],
+        "definition and read, never the comment, got: {}",
+        result
+    );
+    assert!(edits.iter().all(|e| e["newText"] == "@renamed"));
+}
+
+#[test]
+fn test_prepare_rename_covers_at_constant_token() {
+    let doc = "@my_const = 5\nadec = {\n    x = @my_const\n}\n";
+    let files = &[("common/decisions/d.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/prepareRename",
+        serde_json::json!({ "position": { "line": 2, "character": 10 } }),
+    );
+    assert_eq!(result["start"]["character"], 8, "token start: {}", result);
+    assert_eq!(result["end"]["character"], 17, "token end: {}", result);
+}
+
+#[test]
 fn test_rename_targets_value_not_trailing_comment() {
     // Regression: a use site whose line repeats the instance name in a trailing
     // comment must rename the VALUE (col 16), never the comment occurrence. The

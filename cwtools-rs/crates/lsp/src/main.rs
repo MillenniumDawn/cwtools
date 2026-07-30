@@ -289,6 +289,10 @@ struct DocumentState {
     /// initialize. When `true`, documentSymbol returns a nested `DocumentSymbol`
     /// tree; otherwise it falls back to the flat `SymbolInformation` list.
     hierarchical_symbols: std::sync::atomic::AtomicBool,
+    /// Whether the client advertised `workspace.workspaceEdit.documentChanges`
+    /// at initialize. When `true`, rename emits versioned `documentChanges`
+    /// (stale-buffer safe); otherwise the legacy `changes` map.
+    pub(crate) workspace_edit_document_changes: std::sync::atomic::AtomicBool,
     /// Whether the client advertised `window.workDoneProgress` at initialize.
     /// A server-initiated `$/progress` has to register its token with
     /// `window/workDoneProgress/create` first, which a client that didn't
@@ -529,6 +533,7 @@ impl DocumentState {
             inlay_hints_loc_titles: std::sync::atomic::AtomicBool::new(true),
             inlay_hints_scopes: std::sync::atomic::AtomicBool::new(false),
             hierarchical_symbols: std::sync::atomic::AtomicBool::new(false),
+            workspace_edit_document_changes: std::sync::atomic::AtomicBool::new(false),
             client_work_done_progress: std::sync::atomic::AtomicBool::new(false),
             scan_progress_active: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),

@@ -725,6 +725,12 @@ impl Backend {
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_prefix);
 
+        // `@` script constant first: the sigil marks it unambiguously, and the
+        // rule walk can misclassify an `@` read as a type reference.
+        if let Some((_, range)) = self.at_var_rename_target(&uri, pos) {
+            return Ok(Some(PrepareRenameResponse::Range(range)));
+        }
+
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((_, instance_name)) = type_ref {
@@ -743,12 +749,99 @@ impl Backend {
         Ok(None)
     }
 
+    /// The `@name` constant under the cursor in `uri`, as (token, LSP range
+    /// over it). `None` when the cursor isn't on one or the text is missing.
+    fn at_var_rename_target(&self, uri: &str, pos: Position) -> Option<(String, Range)> {
+        let text = self.file_text_for(uri)?;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let (_, col) = lsp_pos_to_source_in_text(&text, pos, &encoding);
+        let (name, start_col) = at_var_at_cursor(&text, pos.line, col as u32)?;
+        let range = source_range_in_text(&text, pos.line, start_col, &name, &encoding);
+        Some((name, range))
+    }
+
+    /// File-local rename of an `@name` script constant: every comment-aware
+    /// whole-token occurrence in this one document. `@` constants are
+    /// per-file in the game's scripting, so no cross-file work is needed.
+    fn rename_at_var(&self, uri: &str, name: &str, new_name: &str) -> Option<WorkspaceEdit> {
+        let text = self.file_text_for(uri)?;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let edits: Vec<TextEdit> = text
+            .lines()
+            .enumerate()
+            .flat_map(|(line0, line)| {
+                let text = &text;
+                let encoding = &encoding;
+                code_token_cols_in_line(line, name)
+                    .into_iter()
+                    .map(move |col| TextEdit {
+                        range: source_range_in_text(text, line0 as u32, col, name, encoding),
+                        new_text: new_name.to_string(),
+                    })
+            })
+            .collect();
+        if edits.is_empty() {
+            return None;
+        }
+        Some(self.build_workspace_edit(vec![(uri.to_string(), edits)]))
+    }
+
+    /// Assemble the `WorkspaceEdit` shape the client negotiated: versioned
+    /// `documentChanges` when it advertised support (open docs carry their
+    /// version so a stale buffer rejects the edit, closed files `None`), the
+    /// legacy `changes` map otherwise.
+    fn build_workspace_edit(&self, by_uri: Vec<(String, Vec<TextEdit>)>) -> WorkspaceEdit {
+        if self
+            .state
+            .workspace_edit_document_changes
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let docs = self.state.documents.lock();
+            let edits = by_uri
+                .into_iter()
+                .filter_map(|(uri, edits)| {
+                    let url = uri.parse::<Url>().ok()?;
+                    Some(TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: url,
+                            version: docs.get(&uri).map(|d| d.version),
+                        },
+                        edits: edits.into_iter().map(OneOf::Left).collect(),
+                    })
+                })
+                .collect();
+            WorkspaceEdit {
+                changes: None,
+                document_changes: Some(DocumentChanges::Edits(edits)),
+                change_annotations: None,
+            }
+        } else {
+            let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+            for (uri, edits) in by_uri {
+                if let Ok(url) = uri.parse::<Url>() {
+                    changes.entry(url).or_default().extend(edits);
+                }
+            }
+            WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            }
+        }
+    }
+
     pub(crate) async fn rename_impl(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
         let new_name = params.new_name.clone();
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_prefix);
+
+        // `@` script constant first: the sigil marks it unambiguously, and the
+        // rule walk can misclassify an `@` read as a type reference.
+        if let Some((name, _)) = self.at_var_rename_target(&uri, pos) {
+            return Ok(self.rename_at_var(&uri, &name, &new_name));
+        }
 
         // Identify what's under the cursor
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
@@ -806,27 +899,21 @@ impl Backend {
         // Group text edits by file URI, deduping so overlapping edits (a
         // definition that also classifies as a use site) aren't emitted twice.
         let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
-        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
         for (file_uri, line0, col) in edits {
             if !seen.insert((file_uri.clone(), line0, col)) {
                 continue;
             }
-            let url = match file_uri.parse::<Url>() {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
             let edit = TextEdit {
                 range: self.source_range_at(&file_uri, line0, col, &instance_name),
                 new_text: new_name.clone(),
             };
-            changes.entry(url).or_default().push(edit);
+            by_uri.entry(file_uri).or_default().push(edit);
         }
 
-        Ok(Some(WorkspaceEdit {
-            changes: Some(changes),
-            document_changes: None,
-            change_annotations: None,
-        }))
+        Ok(Some(
+            self.build_workspace_edit(by_uri.into_iter().collect()),
+        ))
     }
 }
 
@@ -1174,6 +1261,34 @@ pub(crate) fn value_col_in_line(line: &str, name: &str, from: u32) -> Option<u32
         i += 1;
     }
     None
+}
+
+/// The `@name` script-constant token at (line0, col): the full token including
+/// the sigil, and its 0-based start char col. `None` when the cursor isn't on
+/// one.
+fn at_var_at_cursor(text: &str, line0: u32, col: u32) -> Option<(String, u32)> {
+    let line = text.lines().nth(line0 as usize)?;
+    let chars: Vec<char> = line.chars().collect();
+    let mut cur = (col as usize).min(chars.len());
+    // Cursor on the sigil itself: step into the name.
+    if cur < chars.len() && chars[cur] == '@' {
+        cur += 1;
+    }
+    let mut start = cur;
+    while start > 0 && is_ident_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = cur;
+    while end < chars.len() && is_ident_char(chars[end]) {
+        end += 1;
+    }
+    if start == end || start == 0 || chars[start - 1] != '@' {
+        return None;
+    }
+    let name: String = std::iter::once('@')
+        .chain(chars[start..end].iter().copied())
+        .collect();
+    Some((name, start as u32 - 1))
 }
 
 /// The identifier token the cursor sits in (extended both directions over the
@@ -1750,6 +1865,19 @@ mod tests {
         // Cursor on the indent whitespace: no token, chain starts at the block.
         let spans = selection_spans(text, &pairs, 1, 2);
         assert_eq!(spans, vec![((0, 5), (2, 0)), ((0, 4), (2, 1))]);
+    }
+
+    #[test]
+    fn at_var_at_cursor_finds_sigil_token() {
+        let text = "y = @foo\n";
+        assert_eq!(at_var_at_cursor(text, 0, 6), Some(("@foo".to_string(), 4)));
+        assert_eq!(at_var_at_cursor(text, 0, 4), Some(("@foo".to_string(), 4)));
+        // End-of-token cursor still resolves.
+        assert_eq!(at_var_at_cursor(text, 0, 8), Some(("@foo".to_string(), 4)));
+        // A plain identifier has no sigil.
+        assert_eq!(at_var_at_cursor("y = foo\n", 0, 5), None);
+        // A lone `@` is not a constant.
+        assert_eq!(at_var_at_cursor("y = @\n", 0, 4), None);
     }
 
     #[test]
