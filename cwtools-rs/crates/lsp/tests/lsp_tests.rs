@@ -3281,6 +3281,51 @@ fn test_references_finds_closed_file() {
 }
 
 #[test]
+fn test_references_exclude_declaration_omits_definition() {
+    // Same layout, but the client asks for includeDeclaration = false: the
+    // definition site in national_focus/f.txt must be omitted while the use
+    // sites in the decision files are still returned.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/a.txt",
+            "adec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+        (
+            "common/decisions/b.txt",
+            "bdec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/a.txt"],
+        serde_json::json!({}),
+        "common/decisions/a.txt",
+        "textDocument/references",
+        serde_json::json!({
+            "position": { "line": 1, "character": 16 },
+            "context": { "includeDeclaration": false }
+        }),
+    );
+    let locs = result.as_array().expect("references array");
+    assert!(
+        locs.iter()
+            .any(|l| l["uri"].as_str().unwrap_or("").ends_with("decisions/b.txt")),
+        "use sites must still be returned, got: {}",
+        result
+    );
+    assert!(
+        !locs.iter().any(|l| l["uri"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("national_focus/f.txt")),
+        "definition must be omitted when includeDeclaration is false, got: {}",
+        result
+    );
+}
+
+#[test]
 fn test_rename_edits_closed_file() {
     // Renaming MY_FOCUS from the open file A must also edit the closed file B, at
     // the value column (16), not the key.

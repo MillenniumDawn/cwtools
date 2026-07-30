@@ -225,21 +225,26 @@ impl Backend {
         // text (the parser records the leaf key, not the value, precisely).
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
+        let include_declaration = params.context.include_declaration;
+
         if let Some((type_name, instance_name)) = type_ref {
             let fallback = &params.text_document_position.text_document.uri;
             let mut all_locs: Vec<Location> = Vec::new();
 
-            // 1. Definition location(s) from TypeIndex.
-            let definitions = {
-                let info = self.state.info_service.read();
-                info.type_index
-                    .instances(&type_name)
-                    .iter()
-                    .filter(|(_, inst)| inst.name == instance_name)
-                    .map(|(file_uri, inst)| (file_uri.to_string(), inst.location))
-                    .collect::<Vec<_>>()
-            };
-            all_locs.extend(locations_at(self, definitions, &instance_name, fallback));
+            // 1. Definition location(s) from TypeIndex, unless the client asked
+            //    for use sites only.
+            if include_declaration {
+                let definitions = {
+                    let info = self.state.info_service.read();
+                    info.type_index
+                        .instances(&type_name)
+                        .iter()
+                        .filter(|(_, inst)| inst.name == instance_name)
+                        .map(|(file_uri, inst)| (file_uri.to_string(), inst.location))
+                        .collect::<Vec<_>>()
+                };
+                all_locs.extend(locations_at(self, definitions, &instance_name, fallback));
+            }
 
             // 2. Use-sites (open docs via live AST + closed files via index).
             let sites = self.collect_use_sites(&type_name, &instance_name);
@@ -266,7 +271,11 @@ impl Backend {
             let (definitions, references) = {
                 let info = self.state.info_service.read();
                 (
-                    info.find_definitions(&symbol).cloned().unwrap_or_default(),
+                    if include_declaration {
+                        info.find_definitions(&symbol).cloned().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                     info.find_references(&symbol).unwrap_or_default(),
                 )
             };
