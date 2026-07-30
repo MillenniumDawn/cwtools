@@ -3340,6 +3340,65 @@ fn test_document_highlight_skips_comments_and_reports_kinds() {
 }
 
 #[test]
+fn test_completion_label_details_carry_type_origin() {
+    // A client advertising labelDetailsSupport sees the type origin next to
+    // instance labels at build time (not deferred to resolve).
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        ("common/decisions/d.txt", "adec = {\n    has_focus = \n}\n"),
+    ];
+    let caps = serde_json::json!({
+        "textDocument": { "completion": { "completionItem": { "labelDetailsSupport": true } } }
+    });
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        caps,
+        "common/decisions/d.txt",
+        "textDocument/completion",
+        serde_json::json!({ "position": { "line": 1, "character": 16 } }),
+    );
+    let items = result["items"].as_array().expect("completion items");
+    let focus_item = items
+        .iter()
+        .find(|i| i["label"] == "MY_FOCUS")
+        .unwrap_or_else(|| panic!("MY_FOCUS must be offered, got: {}", result));
+    assert_eq!(
+        focus_item["labelDetails"]["description"], "focus",
+        "type origin as labelDetails, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_completion_label_details_absent_without_support() {
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        ("common/decisions/d.txt", "adec = {\n    has_focus = \n}\n"),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/completion",
+        serde_json::json!({ "position": { "line": 1, "character": 16 } }),
+    );
+    let items = result["items"].as_array().expect("completion items");
+    let focus_item = items
+        .iter()
+        .find(|i| i["label"] == "MY_FOCUS")
+        .unwrap_or_else(|| panic!("MY_FOCUS must be offered, got: {}", result));
+    assert!(
+        focus_item["labelDetails"].is_null(),
+        "no labelDetails without client support, got: {}",
+        result
+    );
+}
+
+#[test]
 fn test_workspace_symbols_rank_and_cover_all_sources() {
     // Three symbol sources match "my": a focus instance (exact-prefix rank on
     // "my_focus"), a loc key (prefix), and an @-constant (substring). The

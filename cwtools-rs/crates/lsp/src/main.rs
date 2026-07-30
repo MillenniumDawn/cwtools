@@ -293,6 +293,10 @@ struct DocumentState {
     /// at initialize. When `true`, rename emits versioned `documentChanges`
     /// (stale-buffer safe); otherwise the legacy `changes` map.
     pub(crate) workspace_edit_document_changes: std::sync::atomic::AtomicBool,
+    /// Whether the client advertised `completionItem.labelDetailsSupport` at
+    /// initialize. When `true`, deferred type/enum/alias items carry their
+    /// origin as `labelDetails.description` at build time.
+    pub(crate) completion_label_details: std::sync::atomic::AtomicBool,
     /// Whether the client advertised `window.workDoneProgress` at initialize.
     /// A server-initiated `$/progress` has to register its token with
     /// `window/workDoneProgress/create` first, which a client that didn't
@@ -534,6 +538,7 @@ impl DocumentState {
             inlay_hints_scopes: std::sync::atomic::AtomicBool::new(false),
             hierarchical_symbols: std::sync::atomic::AtomicBool::new(false),
             workspace_edit_document_changes: std::sync::atomic::AtomicBool::new(false),
+            completion_label_details: std::sync::atomic::AtomicBool::new(false),
             client_work_done_progress: std::sync::atomic::AtomicBool::new(false),
             scan_progress_active: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
@@ -1390,7 +1395,23 @@ impl LanguageServer for Backend {
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        self.completion_impl(params).await
+        let mut response = self.completion_impl(params).await;
+        // Origin labels are stamped once here so every completion path (game
+        // script, loc, .cwt) is covered, gated on the client capability.
+        if self
+            .state
+            .completion_label_details
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(Some(resp)) = response.as_mut()
+        {
+            match resp {
+                CompletionResponse::Array(items) => crate::completion::apply_label_details(items),
+                CompletionResponse::List(list) => {
+                    crate::completion::apply_label_details(&mut list.items)
+                }
+            }
+        }
+        response
     }
 
     async fn completion_resolve(&self, item: CompletionItem) -> Result<CompletionItem> {

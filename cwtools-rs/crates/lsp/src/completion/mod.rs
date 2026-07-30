@@ -23,8 +23,8 @@ mod scope_names;
 mod snippets;
 
 pub(crate) use builders::{
-    ValueCompletionSets, completions_from_rules, expanded_modifier_scopes, root_type_snippets,
-    value_completions, value_rules_need_loc_keys,
+    ValueCompletionSets, apply_label_details, completions_from_rules, expanded_modifier_scopes,
+    root_type_snippets, value_completions, value_rules_need_loc_keys,
 };
 pub(crate) use loc_keys::LocKeyIndex;
 pub(crate) use scope_names::loc_completions;

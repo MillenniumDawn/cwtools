@@ -368,6 +368,20 @@ impl Backend {
             .hierarchical_symbols
             .store(hierarchical, Ordering::Relaxed);
 
+        // completion: origin labels next to deferred type/enum/alias items,
+        // only when the client can render them.
+        let label_details = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|ci| ci.label_details_support)
+            .unwrap_or(false);
+        self.state
+            .completion_label_details
+            .store(label_details, Ordering::Relaxed);
+
         // rename: versioned documentChanges only when the client advertises
         // support; otherwise the legacy `changes` map is served.
         let document_changes = params
