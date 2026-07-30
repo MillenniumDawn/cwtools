@@ -67,13 +67,23 @@ pub(crate) fn loc_diag_to_validation_error(
     }
 }
 
+/// Parse one loc buffer into the `LocFile`s every consumer of an edit shares:
+/// the live-overlay key set, the diagnostics, and the hover text. Empty when the
+/// text doesn't parse as loc at all (#87).
+fn parse_loc_buffer(text: &str, path: &str) -> Vec<cwtools_localization::LocFile> {
+    cwtools_localization::parse_loc_files(path, text, None).unwrap_or_default()
+}
+
 /// Lowercased loc keys defined in a single loc file's text. A cheap single-file
 /// parse used to keep the live overlay current on edit (#36).
 fn loc_keys_of(text: &str, path: &str) -> HashSet<String> {
-    let svc =
-        cwtools_localization::LocService::from_files(vec![(path.to_string(), text.to_string())]);
+    loc_keys_from(&parse_loc_buffer(text, path))
+}
+
+/// [`loc_keys_of`] over an already-parsed buffer.
+fn loc_keys_from(files: &[cwtools_localization::LocFile]) -> HashSet<String> {
     let mut keys = HashSet::new();
-    for file in svc.files() {
+    for file in files {
         for entry in &file.entries {
             keys.insert(entry.key.to_lowercase());
         }
@@ -920,12 +930,8 @@ impl Backend {
     /// Update the hover loc_text map with entries from a single loc file,
     /// replacing any previous entries for the same file. Called on every loc
     /// file edit so tooltips reflect the latest changes without a full
-    /// workspace rescan (#53).
-    fn update_loc_text_for_file(&self, _uri: &str, text: &str, path: &str) {
-        let svc = cwtools_localization::LocService::from_files(vec![(
-            path.to_string(),
-            text.to_string(),
-        )]);
+    /// workspace rescan (#53). Takes the shared parse of the edited buffer.
+    fn update_loc_text_for_file(&self, files: &[cwtools_localization::LocFile]) {
         let hover_all = self
             .state
             .hover_show_all_languages
@@ -940,7 +946,7 @@ impl Backend {
         let new_entries = {
             let loc_index = self.state.loc_index.read();
             let mut new_entries = LocTextMap::default();
-            for file in svc.files() {
+            for file in files {
                 let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
                 let lang_included = hover_all || lang == primary_lang;
                 if !lang_included {
@@ -1018,6 +1024,18 @@ impl Backend {
         lines: &DocLines,
         extra: &HashSet<String>,
     ) -> Vec<Diagnostic> {
+        self.validate_loc_parsed(path, &parse_loc_buffer(text, path), lines, extra)
+    }
+
+    /// [`validate_loc_text`] over an already-parsed buffer, so the edited file's
+    /// own validate shares the one parse its key set and hover text came from.
+    fn validate_loc_parsed(
+        &self,
+        path: &str,
+        files: &[cwtools_localization::LocFile],
+        lines: &DocLines,
+        extra: &HashSet<String>,
+    ) -> Vec<Diagnostic> {
         // Hold the read guard across the validate call to avoid cloning the full
         // loc-key union (~2M Strings on Millennium Dawn).
         let loc_guard = self.state.loc_index.read();
@@ -1026,7 +1044,7 @@ impl Backend {
             .as_ref()
             .map(|idx| idx.union())
             .unwrap_or(&empty_union);
-        cwtools_localization::validate_loc_file_text(text, path, union, extra)
+        cwtools_localization::validate_parsed_loc_files(files, path, union, extra)
             .iter()
             .map(|d| validation_error_to_diagnostic(&loc_diag_to_validation_error(d), lines))
             .collect()
@@ -1126,9 +1144,13 @@ impl Backend {
             // first sight fire the whole-file cross-file sweep (#90). Watched
             // files record into `loc_watched_overlay` instead
             // (`record_watched_loc_keys`) with one coalesced sweep per batch.
+            // One parse of the edited buffer, shared by the key set, the
+            // diagnostics and the hover text below — each used to parse the
+            // whole file itself, and two of them copied it first (#87).
+            let parsed_loc = parse_loc_buffer(text, &path);
             let is_open = self.state.documents.lock().contains_key(uri);
             let changed_keys: HashSet<String> = if is_open {
-                let new_keys = loc_keys_of(text, &path);
+                let new_keys = loc_keys_from(&parsed_loc);
                 let mut overlay = self.state.loc_live_overlay.write();
                 let diff = match overlay.get(uri) {
                     Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
@@ -1142,10 +1164,10 @@ impl Backend {
             // Built once here and shared with the cross-file sweep below, which
             // would otherwise rebuild the whole name set per open loc file.
             let extra = self.loc_ref_names();
-            let diagnostics = self.validate_loc_text(&path, text, &lines, &extra);
+            let diagnostics = self.validate_loc_parsed(&path, &parsed_loc, &lines, &extra);
             // Update the hover loc_text map so tooltips reflect the latest
             // edits without waiting for a full workspace rescan (#53).
-            self.update_loc_text_for_file(uri, text, &path);
+            self.update_loc_text_for_file(&parsed_loc);
             // A change to this file's key set can fix or break `$ref$` checks in
             // other open loc files, so refresh them — that's the cross-file part
             // of the index that previously only updated on a window reload.
