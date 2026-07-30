@@ -357,6 +357,35 @@ pub fn validate_loc_file_text(
     )
 }
 
+/// As [`validate_loc_file_text`], but for a caller that already parsed the text
+/// (see [`crate::parse_loc_files`]), so one edited buffer isn't parsed once per
+/// consumer (#87).
+///
+/// `.csv` files produce nothing here, matching what the text entry point has
+/// always done — its `parse_loc_text` rejects them. The project path
+/// ([`validate_loc_project`]) is the one that lints CSV loc.
+pub fn validate_parsed_loc_files(
+    files: &[LocFile],
+    path: &str,
+    union: &LocKeySet,
+    extra_valid_refs: &HashSet<String>,
+) -> Vec<LocDiagnostic> {
+    files
+        .iter()
+        .filter(|file| !file.is_csv)
+        .flat_map(|file| {
+            build_diagnostics(
+                file,
+                path,
+                union,
+                extra_valid_refs,
+                hardcoded_loc_set(),
+                false,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,6 +398,29 @@ mod tests {
                 .map(|(p, t)| (p.to_string(), t.to_string()))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn parsed_and_text_entry_points_agree() {
+        // #87 shares one parse across the LSP's key/diagnostic/hover consumers,
+        // so the parsed entry point must return exactly what the text one did —
+        // including nothing at all for CSV loc, which `parse_loc_text` rejects.
+        let union = LocKeySet::default();
+        let extra = HashSet::new();
+        for (path, text) in [
+            (
+                "a_l_english.yml",
+                "l_english:\n key1: \"Hello $undefined_key$\"\n",
+            ),
+            ("events.yml", "l_english:\n key1: \"hi\"\n"),
+            ("names.csv", "key;english;french;x\nfoo;Foo;Fou;x\n"),
+        ] {
+            let from_text = validate_loc_file_text(text, path, &union, &extra);
+            let files = crate::parse_loc_files(path, text, None).unwrap_or_default();
+            let from_parsed = validate_parsed_loc_files(&files, path, &union, &extra);
+            let codes = |d: &[LocDiagnostic]| d.iter().map(|d| d.code).collect::<Vec<_>>();
+            assert_eq!(codes(&from_text), codes(&from_parsed), "path: {path}");
+        }
     }
 
     #[test]

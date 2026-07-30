@@ -14,10 +14,21 @@
   Fuse type/subtype collection, reuse indexed instances for CW100, cache
   ruleset lookups, and carry scan URIs across passes. Diagnostics must remain
   byte-identical.
+- Editing a localisation file is roughly four times cheaper. On a 1.29 MB Millennium Dawn loc file, the server-side work behind one keystroke went from 82ms to 14ms. Three changes get there: the edited buffer is parsed once instead of three times (the live overlay's key set, the diagnostics, and the hover text each parsed the whole file for themselves, and two of them copied it into an owned `String` first); the `$ref$` name universe, which costs 37ms to build at Millennium Dawn scale, is cached instead of rebuilt per edit; and an edit that leaves the key set alone, which is most of them, no longer writes the overlay at all, so that cache actually survives continuous typing. (#87)
+- The overlay key union the game-file localisation checks read is built once and shared rather than rebuilt and re-cloned for every validated file, so a batch of watched changes no longer pays for it once per file in the batch. (#87)
+- Completion's fallback list is filtered while the cache lock is held and only the matches are copied, instead of cloning the whole capped list on every keystroke and then discarding most of it. (#87)
+- Feature requests that arrive before a newly opened document's first validate share one parse. Hover, goto, completion, semantic tokens and inlay hints all fire off the same keystroke and each re-parsed the file for itself in that window. (#87)
+- Diagnostic ranges no longer allocate a string per squiggle to trim trailing whitespace off the end position. (#87)
+- The single-file parse, index and validate run inside `block_in_place`, so a large file no longer occupies an async runtime worker for the whole validation. The workspace scan already fenced its equivalent work. (#87)
 
 ## Notes
 
 - **Behavioral:** the sixteen codes above span their key token rather than the block or statement they open. Anything matching on diagnostic ranges rather than the start position will see the change.
+
+## Developer
+
+- `index_parsed_file`, `merged_rules_for_type`, `semantic_tokens_full_impl`, `TypeIndex::merge` and `vanilla_cache::load` carry tracing spans, so `CWTOOLS_PROFILE` ranks them against the paths that were already instrumented. PROFILING.md lists the full set. (#87)
+- Every write to a localisation overlay goes through a guard whose `Drop` bumps the revision the derived key-set caches are keyed on, so a new write site cannot leave those caches serving a key set that predates it. (#87)
 
 # 2.4.0
 

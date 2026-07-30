@@ -154,12 +154,24 @@ fn token_match_rank(hay: &str, token: &str) -> u8 {
 /// empty `token` matches everything, so only the `sort_text` order applies.
 fn filter_by_token(items: Vec<CompletionItem>, token: &str) -> Vec<CompletionItem> {
     let mut items = items;
-    fn hay(it: &CompletionItem) -> &str {
-        it.filter_text.as_deref().unwrap_or(it.label.as_str())
-    }
-    if !token.is_empty() {
-        items.retain(|it| subsequence_match(hay(it), token));
-    }
+    items.retain(|it| token_matches(it, token));
+    sort_by_token(&mut items, token);
+    items
+}
+
+/// The text a filter/sort compares against, matching what the client would use.
+fn hay(it: &CompletionItem) -> &str {
+    it.filter_text.as_deref().unwrap_or(it.label.as_str())
+}
+
+/// [`filter_by_token`]'s predicate half, so a caller holding a borrow of a
+/// shared list can clone only the survivors instead of the whole list.
+fn token_matches(it: &CompletionItem, token: &str) -> bool {
+    token.is_empty() || subsequence_match(hay(it), token)
+}
+
+/// [`filter_by_token`]'s ordering half.
+fn sort_by_token(items: &mut [CompletionItem], token: &str) {
     items.sort_by(|a, b| {
         if !token.is_empty() {
             let ra = token_match_rank(hay(a), token);
@@ -172,7 +184,6 @@ fn filter_by_token(items: Vec<CompletionItem>, token: &str) -> Vec<CompletionIte
         let kb = b.sort_text.as_deref().unwrap_or(b.label.as_str());
         ka.cmp(kb)
     });
-    items
 }
 
 /// [`filter_by_token`] then truncate to `cap`. Returns the (possibly shrunk)
@@ -762,31 +773,42 @@ impl Backend {
             .state
             .info_revision
             .load(std::sync::atomic::Ordering::Relaxed);
-        if let Some(cached) = self.state.fallback_cache.lock().as_ref()
-            && cached.revision == revision
-        {
-            let items = cached.items.clone();
-            if !items.is_empty() {
-                // Filter the retrieved copy, never the cache (see below): the
-                // cached list is shared across every request regardless of
-                // typed token.
-                let (mut items, _truncated) = filter_and_cap(items, &token, FALLBACK_CAP);
-                anchor_items(&mut items, replace_range);
-                log_completion_summary(
-                    t_start.elapsed(),
-                    ast_dur,
-                    rules_dur,
-                    build_dur,
-                    items.len(),
-                    "filtered",
-                    "fallback",
-                    ast_source.as_str(),
-                );
-                return Ok(Some(CompletionResponse::List(CompletionList {
-                    is_incomplete: true,
-                    items,
-                })));
+        // Filter under the lock and clone only the survivors. The cache never
+        // sees the token (it is shared across every request), and cloning the
+        // whole capped list per keystroke just to throw most of it away in the
+        // filter was the bulk of a cache-hit request.
+        let hit = {
+            let guard = self.state.fallback_cache.lock();
+            match guard.as_ref() {
+                Some(cached) if cached.revision == revision && !cached.items.is_empty() => Some(
+                    cached
+                        .items
+                        .iter()
+                        .filter(|it| token_matches(it, &token))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
             }
+        };
+        if let Some(mut items) = hit {
+            sort_by_token(&mut items, &token);
+            items.truncate(FALLBACK_CAP);
+            anchor_items(&mut items, replace_range);
+            log_completion_summary(
+                t_start.elapsed(),
+                ast_dur,
+                rules_dur,
+                build_dur,
+                items.len(),
+                "filtered",
+                "fallback",
+                ast_source.as_str(),
+            );
+            return Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items,
+            })));
         }
         // Narrowed fallback: only the dynamic value sets — variables and event
         // targets. The old fallback also dumped every type, enum, and top-level
@@ -849,26 +871,31 @@ impl Backend {
             // context-aware list replaces it. (#41)
             // Cache the un-anchored, un-filtered items: the replace-range is
             // per-request and the token narrows on every keystroke, so filter
-            // and anchor only the clone that is returned, not the cached copy.
-            *self.state.fallback_cache.lock() = Some(CompletionCacheEntry {
-                revision,
-                items: items.clone(),
-            });
-            let (mut items, _truncated) = filter_and_cap(items, &token, FALLBACK_CAP);
-            anchor_items(&mut items, replace_range);
+            // and anchor only what is returned, not the cached copy. Clone the
+            // survivors out first, then hand the full list to the cache — the
+            // reverse cloned every item whether or not it matched.
+            let mut returned: Vec<CompletionItem> = items
+                .iter()
+                .filter(|it| token_matches(it, &token))
+                .cloned()
+                .collect();
+            *self.state.fallback_cache.lock() = Some(CompletionCacheEntry { revision, items });
+            sort_by_token(&mut returned, &token);
+            returned.truncate(FALLBACK_CAP);
+            anchor_items(&mut returned, replace_range);
             log_completion_summary(
                 t_start.elapsed(),
                 ast_dur,
                 rules_dur,
                 build_dur,
-                items.len(),
+                returned.len(),
                 "filtered",
                 "fallback",
                 ast_source.as_str(),
             );
             Ok(Some(CompletionResponse::List(CompletionList {
                 is_incomplete: true,
-                items,
+                items: returned,
             })))
         }
     }

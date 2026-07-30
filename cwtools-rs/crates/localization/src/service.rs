@@ -142,12 +142,26 @@ fn parse_loc_file_entry(
     text: String,
     encoding: Option<FileEncoding>,
 ) -> Result<Vec<LocFile>, (String, String)> {
-    let is_csv = Path::new(&path)
+    parse_loc_files(&path, &text, encoding).map_err(|e| (path, e))
+}
+
+/// Parse one loc file's text into its [`LocFile`]s: a `.csv` yields one per
+/// language present in it, a `.yml` exactly one.
+///
+/// Borrows its inputs, so a caller that needs the keys, the diagnostics and the
+/// display text of the same buffer can parse it once and share the result
+/// instead of handing an owned copy to a fresh [`LocService`] per use (#87).
+pub fn parse_loc_files(
+    path: &str,
+    text: &str,
+    encoding: Option<FileEncoding>,
+) -> Result<Vec<LocFile>, String> {
+    let is_csv = Path::new(path)
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
     if is_csv {
         // CSV: produce one LocFile per language present in the file.
-        let entries_by_lang = parse_csv_loc_per_lang(&text, &path, None);
+        let entries_by_lang = parse_csv_loc_per_lang(text, path, None);
         let mut by_lang: std::collections::HashMap<Lang, Vec<crate::commands::LocEntry>> =
             std::collections::HashMap::new();
         for (_key, lang, entry) in entries_by_lang {
@@ -156,7 +170,7 @@ fn parse_loc_file_entry(
         let loc_files: Vec<LocFile> = by_lang
             .into_iter()
             .map(|(lang, entries)| LocFile {
-                path: path.clone(),
+                path: path.to_string(),
                 language_prefix: lang.to_string(),
                 lang: Some(lang),
                 is_csv: true,
@@ -167,12 +181,12 @@ fn parse_loc_file_entry(
             .collect();
         Ok(loc_files)
     } else {
-        match parse_loc_text(&text, &path) {
+        match parse_loc_text(text, path) {
             Ok(mut file) => {
                 file.encoding = encoding;
                 Ok(vec![file])
             }
-            Err(e) => Err((path, e)),
+            Err(e) => Err(e),
         }
     }
 }

@@ -584,6 +584,7 @@ fn value_token_span(line: &[char], from: usize) -> Option<(usize, usize)> {
 }
 
 impl Backend {
+    #[tracing::instrument(skip_all)]
     pub(crate) async fn semantic_tokens_full_impl(
         &self,
         params: SemanticTokensParams,

@@ -262,6 +262,22 @@ struct DocumentState {
     /// open overlay owns it from then on). Taken after `loc_live_overlay` when
     /// both are held.
     loc_watched_overlay: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
+    /// Monotonic counter bumped on every mutation of either loc overlay, so the
+    /// key sets derived from them can be cached. `info_revision` cannot stand in:
+    /// an open loc edit updates the overlay BEFORE it bumps that counter, so a
+    /// set keyed on it alone would keep serving a union missing the key just
+    /// typed and flag it as undefined. Bumped by [`LocOverlayWrite`]'s `Drop`,
+    /// under the write lock, so a new writer can't be missed.
+    loc_overlay_revision: AtomicU64,
+    /// Cached [`Backend::loc_overlay_keys`] union, keyed on
+    /// `loc_overlay_revision`. Was rebuilt (and every key cloned) per validated
+    /// file, which on a watched batch meant once per file in the batch.
+    loc_overlay_keys_cache: parking_lot::Mutex<Option<(u64, Arc<HashSet<String>>)>>,
+    /// Cached [`Backend::loc_ref_names`] set, keyed on
+    /// `(info_revision, loc_overlay_revision)`. ~200K Strings on Millennium
+    /// Dawn, previously rebuilt from scratch on every loc edit.
+    #[allow(clippy::type_complexity)]
+    loc_ref_names_cache: parking_lot::Mutex<Option<((u64, u64), Arc<HashSet<String>>)>>,
     /// When `false` (the default), hover shows localisation for the primary
     /// language only (the first of `config.loc_languages`, else English) and the
     /// `loc_text` map only stores that language. Set via the
@@ -378,6 +394,13 @@ struct DocumentState {
     /// Cached fallback list (the flat type/enum/var dump reached when
     /// context-aware matching returns nothing).
     fallback_cache: parking_lot::Mutex<Option<CompletionCacheEntry>>,
+    /// `(uri, version, ast)` of the last mid-edit re-parse `ast_snapshot_for`
+    /// did when the document had no stored AST yet. Hover, goto, completion,
+    /// semantic tokens and inlay hints all fire off one keystroke and each
+    /// re-parsed the whole file independently in that window. One entry is
+    /// enough: they are all for the focused document. Dropped on `did_close`.
+    #[allow(clippy::type_complexity)]
+    fresh_ast_cache: parking_lot::Mutex<Option<(String, i32, Arc<ParsedFile>)>>,
     /// Per-URI generation counter for in-flight completion requests. Each new
     /// `completion` request for a URI increments this and captures the value;
     /// the request checks the counter before doing any heavy work and bails
@@ -429,6 +452,41 @@ struct DocumentState {
     /// rewriting identical content) matches and skips the revalidate. A DELETE
     /// drops the entry; a URI with no entry always validates.
     watched_signatures: Mutex<HashMap<String, (u64, u128)>>,
+}
+
+/// Write access to a loc overlay that bumps `loc_overlay_revision` on drop,
+/// while the write lock is still held — so a reader that takes the lock after
+/// this writer always sees the new counter alongside the new contents.
+///
+/// Every overlay mutation must go through [`Backend::loc_live_overlay_mut`] or
+/// [`Backend::loc_watched_overlay_mut`] rather than the `RwLock` directly: a
+/// write that skipped the bump would leave `loc_overlay_keys` /
+/// `loc_ref_names` serving a cached union without the key that just changed,
+/// which reads to the user as a loc diagnostic on a key they can see in the
+/// file.
+pub(crate) struct LocOverlayWrite<'a> {
+    guard: parking_lot::RwLockWriteGuard<'a, HashMap<String, HashSet<String>>>,
+    revision: &'a AtomicU64,
+}
+
+impl std::ops::Deref for LocOverlayWrite<'_> {
+    type Target = HashMap<String, HashSet<String>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for LocOverlayWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for LocOverlayWrite<'_> {
+    fn drop(&mut self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 /// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
@@ -532,6 +590,9 @@ impl DocumentState {
             loc_locations: parking_lot::RwLock::new(LocLocationMap::default()),
             loc_live_overlay: parking_lot::RwLock::new(HashMap::new()),
             loc_watched_overlay: parking_lot::RwLock::new(HashMap::new()),
+            loc_overlay_revision: AtomicU64::new(0),
+            loc_overlay_keys_cache: parking_lot::Mutex::new(None),
+            loc_ref_names_cache: parking_lot::Mutex::new(None),
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
             hover_resolved_scope: std::sync::atomic::AtomicBool::new(false),
@@ -556,6 +617,7 @@ impl DocumentState {
             debounce_handles: Mutex::new(HashMap::new()),
             info_revision: AtomicU64::new(0),
             fallback_cache: parking_lot::Mutex::new(None),
+            fresh_ast_cache: parking_lot::Mutex::new(None),
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
             last_loc_signature: parking_lot::Mutex::new(None),
             last_scan_fingerprint: parking_lot::Mutex::new(None),
@@ -633,6 +695,23 @@ impl Backend {
         self.state
             .info_revision
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Write access to the open-document loc overlay. See [`LocOverlayWrite`]:
+    /// the revision bump the derived caches key on rides on the guard's `Drop`.
+    pub(crate) fn loc_live_overlay_mut(&self) -> LocOverlayWrite<'_> {
+        LocOverlayWrite {
+            guard: self.state.loc_live_overlay.write(),
+            revision: &self.state.loc_overlay_revision,
+        }
+    }
+
+    /// Write access to the watched-file loc overlay. See [`LocOverlayWrite`].
+    pub(crate) fn loc_watched_overlay_mut(&self) -> LocOverlayWrite<'_> {
+        LocOverlayWrite {
+            guard: self.state.loc_watched_overlay.write(),
+            revision: &self.state.loc_overlay_revision,
+        }
     }
 
     /// Called when the VS Code extension tells us the user switched to a file.
@@ -799,12 +878,17 @@ impl Backend {
 impl Backend {
     /// Snapshot the document AST for `uri`, plus whether it came from the
     /// current document version. When there is no cached AST, re-parse the live
-    /// text for THIS request only so hover/goto/completion still resolve a
-    /// context mid-edit. The fresh AST is not written back. The debounced
-    /// validate owns the long-term one. The `documents` mutex is held only for
-    /// the snapshot, never across the parse.
+    /// text so hover/goto/completion still resolve a context mid-edit. The fresh
+    /// AST is not written back to the document. The debounced validate owns the
+    /// long-term one. The `documents` mutex is held only for the snapshot, never
+    /// across the parse.
+    ///
+    /// The fresh parse is memoized by `(uri, version)` in `fresh_ast_cache`
+    /// (#87): a document has no stored AST from `did_open` until its first
+    /// successful validate, and every feature request landing in that window
+    /// used to re-parse the whole file for itself.
     pub(crate) fn ast_snapshot_for(&self, uri: &str) -> Option<AstSnapshot> {
-        let text = {
+        let (text, version) = {
             let docs = self.state.documents.lock();
             let doc = docs.get(uri)?;
             if let Some(ast) = &doc.ast {
@@ -818,15 +902,35 @@ impl Backend {
                     source,
                 });
             }
-            doc.text.clone()
+            (doc.text.clone(), doc.version)
         };
+        let cached = {
+            let guard = self.state.fresh_ast_cache.lock();
+            guard
+                .as_ref()
+                .filter(|(cached_uri, cached_version, _)| {
+                    cached_uri == uri && *cached_version == version
+                })
+                .map(|(_, _, ast)| Arc::clone(ast))
+        };
+        if let Some(ast) = cached {
+            return Some(AstSnapshot {
+                ast,
+                source: AstSource::FreshParse,
+            });
+        }
         let table = self.state.string_table.clone();
         tokio::task::block_in_place(|| {
             cwtools_parser::parser::parse_string(&text, &table)
                 .ok()
-                .map(|ast| AstSnapshot {
-                    ast: Arc::new(ast),
-                    source: AstSource::FreshParse,
+                .map(|ast| {
+                    let ast = Arc::new(ast);
+                    *self.state.fresh_ast_cache.lock() =
+                        Some((uri.to_string(), version, Arc::clone(&ast)));
+                    AstSnapshot {
+                        ast,
+                        source: AstSource::FreshParse,
+                    }
                 })
         })
     }
@@ -1219,7 +1323,7 @@ impl LanguageServer for Backend {
         // The open overlay owns this file's keys from here; a stale watched
         // entry left behind could resurrect keys the buffer removed.
         if crate::paths::is_loc_file(&uri) {
-            self.state.loc_watched_overlay.write().remove(&uri);
+            self.loc_watched_overlay_mut().remove(&uri);
         }
 
         // Offload validation off the message future so a burst of opens can't
@@ -1355,8 +1459,14 @@ impl LanguageServer for Backend {
                 self.bump_info_revision();
             }
             doc_tokens.remove(&uri);
-            self.state.loc_live_overlay.write().remove(&uri);
+            self.loc_live_overlay_mut().remove(&uri);
             self.state.completion_generation.lock().remove(&uri);
+            {
+                let mut fresh = self.state.fresh_ast_cache.lock();
+                if fresh.as_ref().is_some_and(|(cached, _, _)| cached == &uri) {
+                    *fresh = None;
+                }
+            }
 
             let info = self.state.info_service.read();
             (
@@ -1930,6 +2040,99 @@ mod tests {
     }
 
     // ── didFocusFile (background-reindex idle clock) ─────────────────────────
+
+    #[test]
+    fn test_loc_overlay_write_invalidates_the_cached_key_sets() {
+        // #87 caches both overlay-derived key sets. The cache is keyed on
+        // `loc_overlay_revision`, which `LocOverlayWrite::drop` bumps — so a
+        // write through the accessor MUST change what the next read sees. If it
+        // doesn't, a key the user just typed reads as undefined (CW225/CW122)
+        // for as long as the stale entry lives.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (service, _socket) = LspService::build(|client| Backend {
+                client,
+                state: Arc::new(DocumentState::new()),
+            })
+            .finish();
+            let backend = service.inner();
+            assert!(backend.loc_overlay_keys().is_empty());
+
+            backend
+                .loc_live_overlay_mut()
+                .insert("file:///a.yml".into(), HashSet::from(["live_key".into()]));
+            assert!(
+                backend.loc_overlay_keys().contains("live_key"),
+                "an open-doc overlay write must invalidate the cached union"
+            );
+
+            backend.loc_watched_overlay_mut().insert(
+                "file:///b.yml".into(),
+                HashSet::from(["watched_key".into()]),
+            );
+            let keys = backend.loc_overlay_keys();
+            assert!(
+                keys.contains("live_key") && keys.contains("watched_key"),
+                "a watched overlay write must invalidate it too, got: {keys:?}"
+            );
+
+            backend.loc_live_overlay_mut().remove("file:///a.yml");
+            assert!(
+                !backend.loc_overlay_keys().contains("live_key"),
+                "a removal must invalidate it as well, not just an insert"
+            );
+        });
+    }
+
+    #[test]
+    fn test_unchanged_loc_key_set_keeps_the_cached_union() {
+        // The common loc keystroke edits a VALUE, not the key set. Taking the
+        // overlay write guard is what invalidates the derived caches, so
+        // re-recording an identical set rebuilt the ~200K-String `$ref$`
+        // universe on every edit and the cache never hit while a `.yml` was
+        // being typed in. Measured on a 1.29 MB Millennium Dawn loc file:
+        // 65.7ms -> 13.7ms per edit once the no-op write is skipped.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (service, _socket) = LspService::build(|client| Backend {
+                client,
+                state: Arc::new(DocumentState::new()),
+            })
+            .finish();
+            let backend = service.inner();
+            let (uri, path) = ("file:///a_l_english.yml", "a_l_english.yml");
+
+            let changed =
+                backend.record_watched_loc_keys(uri, path, "l_english:\n MY_KEY:0 \"one\"\n");
+            assert!(changed.contains("my_key"), "got: {changed:?}");
+            let first = backend.loc_overlay_keys();
+
+            // Same keys, new value: nothing the derived sets depend on moved.
+            let changed =
+                backend.record_watched_loc_keys(uri, path, "l_english:\n MY_KEY:0 \"one two\"\n");
+            assert!(changed.is_empty(), "got: {changed:?}");
+            let second = backend.loc_overlay_keys();
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "an unchanged key set must leave the cached union in place"
+            );
+
+            // A real key change must still invalidate it.
+            let changed = backend.record_watched_loc_keys(
+                uri,
+                path,
+                "l_english:\n MY_KEY:0 \"one\"\n OTHER_KEY:0 \"two\"\n",
+            );
+            assert!(changed.contains("other_key"), "got: {changed:?}");
+            let third = backend.loc_overlay_keys();
+            assert!(!Arc::ptr_eq(&second, &third));
+            assert!(third.contains("other_key"), "got: {third:?}");
+        });
+    }
 
     #[test]
     fn test_did_focus_file_marks_activity() {
