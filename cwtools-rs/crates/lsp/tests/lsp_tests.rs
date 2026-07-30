@@ -3245,6 +3245,36 @@ fn test_document_highlight_occurrences() {
 }
 
 #[test]
+fn test_document_highlight_skips_comments_and_reports_kinds() {
+    // MY_FOCUS appears twice in code and once in a comment: the comment
+    // occurrence must not be highlighted, and value occurrences report
+    // kind Read (2) instead of Text (1).
+    let doc = "a = {\n    has_focus = MY_FOCUS\n}\n# note MY_FOCUS legacy\nb = {\n    has_focus = MY_FOCUS\n}\n";
+    let files = &[("common/decisions/d.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/documentHighlight",
+        serde_json::json!({ "position": { "line": 1, "character": 16 } }),
+    );
+    let hl = result.as_array().expect("highlights array");
+    assert_eq!(
+        hl.len(),
+        2,
+        "comment occurrence must be skipped, got: {}",
+        result
+    );
+    assert!(
+        hl.iter().all(|h| h["kind"] == 2),
+        "value occurrences must report Read (2), got: {}",
+        result
+    );
+}
+
+#[test]
 fn test_references_finds_closed_file() {
     // A (open) and B (never opened) both reference focus MY_FOCUS. Find-refs from
     // A must reach B via the workspace reverse index.

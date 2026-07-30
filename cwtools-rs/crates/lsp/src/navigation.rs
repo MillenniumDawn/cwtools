@@ -484,7 +484,7 @@ impl Backend {
             .flat_map(|(line0, line)| {
                 let position_encoding = &position_encoding;
                 let text = &text;
-                all_token_cols_in_line(line, symbol)
+                code_token_cols_in_line(line, symbol)
                     .into_iter()
                     .map(move |col| DocumentHighlight {
                         range: source_range_in_text(
@@ -494,7 +494,7 @@ impl Backend {
                             symbol,
                             position_encoding,
                         ),
-                        kind: Some(DocumentHighlightKind::TEXT),
+                        kind: Some(highlight_kind(line, col, symbol)),
                     })
             })
             .collect();
@@ -974,18 +974,25 @@ fn is_ident_char(c: char) -> bool {
 }
 
 /// Every 0-based char column where `name` appears on `line` as a whole
-/// identifier (bounded by non-identifier chars). Char-based to match the
-/// parser's column counting.
-fn all_token_cols_in_line(line: &str, name: &str) -> Vec<u32> {
+/// identifier (bounded by non-identifier chars), ignoring anything behind an
+/// unquoted `#` comment. Quoted occurrences still match (values may be
+/// quoted). Char-based to match the parser's column counting.
+fn code_token_cols_in_line(line: &str, name: &str) -> Vec<u32> {
     let chars: Vec<char> = line.chars().collect();
     let needle: Vec<char> = name.chars().collect();
     let mut out = Vec::new();
     if needle.is_empty() || needle.len() > chars.len() {
         return out;
     }
+    let mut in_string = false;
     let mut i = 0;
-    while i + needle.len() <= chars.len() {
-        if chars[i..i + needle.len()] == needle[..] {
+    while i < chars.len() {
+        match chars[i] {
+            '"' => in_string = !in_string,
+            '#' if !in_string => break,
+            _ => {}
+        }
+        if i + needle.len() <= chars.len() && chars[i..i + needle.len()] == needle[..] {
             let before_ok = i == 0 || !is_ident_char(chars[i - 1]);
             let after = i + needle.len();
             let after_ok = after >= chars.len() || !is_ident_char(chars[after]);
@@ -996,6 +1003,17 @@ fn all_token_cols_in_line(line: &str, name: &str) -> Vec<u32> {
         i += 1;
     }
     out
+}
+
+/// WRITE when the token at `col` is an assignment key (the next non-space char
+/// after it is `=`), READ otherwise. Advisory: clients only use this to tint
+/// the highlight.
+fn highlight_kind(line: &str, col: u32, name: &str) -> DocumentHighlightKind {
+    let after = col as usize + name.chars().count();
+    match line.chars().skip(after).find(|c| !c.is_whitespace()) {
+        Some('=') => DocumentHighlightKind::WRITE,
+        _ => DocumentHighlightKind::READ,
+    }
 }
 
 /// The 0-based char column just past the first `=` at/after `key_col` on `line`
@@ -1326,6 +1344,38 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn code_token_cols_skip_comment_matches() {
+        assert_eq!(
+            code_token_cols_in_line("x = FOO # FOO again", "FOO"),
+            vec![4]
+        );
+        assert_eq!(
+            code_token_cols_in_line("# only FOO", "FOO"),
+            Vec::<u32>::new()
+        );
+        assert_eq!(code_token_cols_in_line("x = \"FOO\" # FOO", "FOO"), vec![5]);
+        // A `#` inside a quoted string does not start a comment.
+        assert_eq!(code_token_cols_in_line("x = \"# FOO\"", "FOO"), vec![7]);
+        assert_eq!(code_token_cols_in_line("FOO = FOO", "FOO"), vec![0, 6]);
+    }
+
+    #[test]
+    fn highlight_kind_write_for_assignment_key_read_otherwise() {
+        assert_eq!(
+            highlight_kind("MY_FOCUS = { }", 0, "MY_FOCUS"),
+            DocumentHighlightKind::WRITE
+        );
+        assert_eq!(
+            highlight_kind("    has_focus = MY_FOCUS", 16, "MY_FOCUS"),
+            DocumentHighlightKind::READ
+        );
+        assert_eq!(
+            highlight_kind("    var >= MY_FOCUS", 11, "MY_FOCUS"),
+            DocumentHighlightKind::READ
+        );
     }
 
     #[test]
