@@ -675,13 +675,13 @@ impl Backend {
             // same URIs, or loc checks keep serving stale entries for a file
             // `info_service` just dropped.
             {
-                let mut overlay = self.state.loc_live_overlay.write();
+                let mut overlay = self.loc_live_overlay_mut();
                 for uri in &removed_uris {
                     overlay.remove(uri);
                 }
             }
             {
-                let mut watched = self.state.loc_watched_overlay.write();
+                let mut watched = self.loc_watched_overlay_mut();
                 for uri in &removed_uris {
                     watched.remove(uri);
                 }
@@ -1661,13 +1661,13 @@ impl Backend {
             }
         }
         {
-            let mut overlay = self.state.loc_live_overlay.write();
+            let mut overlay = self.loc_live_overlay_mut();
             for uri in deletes {
                 overlay.remove(uri);
             }
         }
         {
-            let mut watched = self.state.loc_watched_overlay.write();
+            let mut watched = self.loc_watched_overlay_mut();
             for uri in deletes {
                 watched.remove(uri);
             }

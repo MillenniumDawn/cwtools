@@ -67,13 +67,23 @@ pub(crate) fn loc_diag_to_validation_error(
     }
 }
 
+/// Parse one loc buffer into the `LocFile`s every consumer of an edit shares:
+/// the live-overlay key set, the diagnostics, and the hover text. Empty when the
+/// text doesn't parse as loc at all (#87).
+fn parse_loc_buffer(text: &str, path: &str) -> Vec<cwtools_localization::LocFile> {
+    cwtools_localization::parse_loc_files(path, text, None).unwrap_or_default()
+}
+
 /// Lowercased loc keys defined in a single loc file's text. A cheap single-file
 /// parse used to keep the live overlay current on edit (#36).
 fn loc_keys_of(text: &str, path: &str) -> HashSet<String> {
-    let svc =
-        cwtools_localization::LocService::from_files(vec![(path.to_string(), text.to_string())]);
+    loc_keys_from(&parse_loc_buffer(text, path))
+}
+
+/// [`loc_keys_of`] over an already-parsed buffer.
+fn loc_keys_from(files: &[cwtools_localization::LocFile]) -> HashSet<String> {
     let mut keys = HashSet::new();
-    for file in svc.files() {
+    for file in files {
         for entry in &file.entries {
             keys.insert(entry.key.to_lowercase());
         }
@@ -277,9 +287,17 @@ impl<'a> DocLines<'a> {
         let (mut line, mut col) = (line, col);
         loop {
             let text = self.lines.get(line as usize).copied().unwrap_or("");
-            let consumed: String = text.chars().take(col as usize).collect();
-            if !consumed.trim().is_empty() {
-                col = consumed.trim_end().chars().count() as u32;
+            // Chars up to and including the last non-whitespace one in the first
+            // `col`, counted in a single pass — this runs per diagnostic, so the
+            // old collect-then-trim allocated a String per squiggle.
+            let mut content_end = 0;
+            for (i, c) in text.chars().take(col as usize).enumerate() {
+                if !c.is_whitespace() {
+                    content_end = i as u32 + 1;
+                }
+            }
+            if content_end > 0 {
+                col = content_end;
                 break;
             }
             let Some(prev) = line.checked_sub(1) else {
@@ -496,6 +514,7 @@ impl Backend {
     /// `parsed_version` is the document version `parsed` came from, when it came
     /// from an open document. Callers indexing from disk (the workspace scan,
     /// the did_close restore) pass `None`.
+    #[tracing::instrument(skip_all, fields(uri = %uri))]
     pub(crate) fn index_parsed_file(
         &self,
         uri: &str,
@@ -897,7 +916,27 @@ impl Backend {
     /// checks (CW100/CW122) so a key just typed into an open `.yml` — or saved
     /// to a watched one — resolves without a full rescan (#36). Bounded by the
     /// open loc files plus the distinct watched ones.
-    pub(crate) fn loc_overlay_keys(&self) -> HashSet<String> {
+    ///
+    /// Cached by `loc_overlay_revision` and handed out by `Arc`: this ran per
+    /// validated file, so a watched batch cloned every overlay key once per file
+    /// in the batch even though nothing between them changed (#87). The revision
+    /// is read before the overlay locks, so a writer that lands in between only
+    /// costs a rebuild the next call, never a stale hit.
+    pub(crate) fn loc_overlay_keys(&self) -> Arc<HashSet<String>> {
+        let revision = self
+            .state
+            .loc_overlay_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cached = {
+            let guard = self.state.loc_overlay_keys_cache.lock();
+            guard
+                .as_ref()
+                .filter(|(cached_revision, _)| *cached_revision == revision)
+                .map(|(_, keys)| Arc::clone(keys))
+        };
+        if let Some(keys) = cached {
+            return keys;
+        }
         let mut keys = HashSet::new();
         for set in self.state.loc_live_overlay.read().values() {
             keys.extend(set.iter().cloned());
@@ -905,18 +944,16 @@ impl Backend {
         for set in self.state.loc_watched_overlay.read().values() {
             keys.extend(set.iter().cloned());
         }
+        let keys = Arc::new(keys);
+        *self.state.loc_overlay_keys_cache.lock() = Some((revision, Arc::clone(&keys)));
         keys
     }
 
     /// Update the hover loc_text map with entries from a single loc file,
     /// replacing any previous entries for the same file. Called on every loc
     /// file edit so tooltips reflect the latest changes without a full
-    /// workspace rescan (#53).
-    fn update_loc_text_for_file(&self, _uri: &str, text: &str, path: &str) {
-        let svc = cwtools_localization::LocService::from_files(vec![(
-            path.to_string(),
-            text.to_string(),
-        )]);
+    /// workspace rescan (#53). Takes the shared parse of the edited buffer.
+    fn update_loc_text_for_file(&self, files: &[cwtools_localization::LocFile]) {
         let hover_all = self
             .state
             .hover_show_all_languages
@@ -931,7 +968,7 @@ impl Backend {
         let new_entries = {
             let loc_index = self.state.loc_index.read();
             let mut new_entries = LocTextMap::default();
-            for file in svc.files() {
+            for file in files {
                 let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
                 let lang_included = hover_all || lang == primary_lang;
                 if !lang_included {
@@ -979,7 +1016,32 @@ impl Backend {
     /// Strings on Millennium Dawn), so it is built ONCE per edit and shared by
     /// `Arc` with every file that edit revalidates — building it per file cost
     /// the keystroke path one whole copy per open `.yml`.
+    ///
+    /// Cached across edits too, keyed on `(info_revision, loc_overlay_revision)`
+    /// — its inputs are the ruleset's modifier keys and the type index (both
+    /// covered by `info_revision`) plus the two overlays. Keying on
+    /// `info_revision` alone would be wrong: an open loc edit writes the overlay
+    /// before it bumps that counter, so the set the edit itself validates
+    /// against would still be missing the key just typed (#87).
     fn loc_ref_names(&self) -> Arc<HashSet<String>> {
+        let revision = (
+            self.state
+                .info_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.state
+                .loc_overlay_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        let cached = {
+            let guard = self.state.loc_ref_names_cache.lock();
+            guard
+                .as_ref()
+                .filter(|(cached_revision, _)| *cached_revision == revision)
+                .map(|(_, names)| Arc::clone(names))
+        };
+        if let Some(names) = cached {
+            return names;
+        }
         // Lock order: rules -> info_service. The overlay locks are independent
         // and taken after, never nested inside the others.
         let mut extra = {
@@ -995,7 +1057,9 @@ impl Backend {
         for keys in self.state.loc_watched_overlay.read().values() {
             extra.extend(keys.iter().cloned());
         }
-        Arc::new(extra)
+        let extra = Arc::new(extra);
+        *self.state.loc_ref_names_cache.lock() = Some((revision, Arc::clone(&extra)));
+        extra
     }
 
     /// Validate one loc file's text into diagnostics against the scanned union
@@ -1009,6 +1073,18 @@ impl Backend {
         lines: &DocLines,
         extra: &HashSet<String>,
     ) -> Vec<Diagnostic> {
+        self.validate_loc_parsed(path, &parse_loc_buffer(text, path), lines, extra)
+    }
+
+    /// [`validate_loc_text`] over an already-parsed buffer, so the edited file's
+    /// own validate shares the one parse its key set and hover text came from.
+    fn validate_loc_parsed(
+        &self,
+        path: &str,
+        files: &[cwtools_localization::LocFile],
+        lines: &DocLines,
+        extra: &HashSet<String>,
+    ) -> Vec<Diagnostic> {
         // Hold the read guard across the validate call to avoid cloning the full
         // loc-key union (~2M Strings on Millennium Dawn).
         let loc_guard = self.state.loc_index.read();
@@ -1017,7 +1093,7 @@ impl Backend {
             .as_ref()
             .map(|idx| idx.union())
             .unwrap_or(&empty_union);
-        cwtools_localization::validate_loc_file_text(text, path, union, extra)
+        cwtools_localization::validate_parsed_loc_files(files, path, union, extra)
             .iter()
             .map(|d| validation_error_to_diagnostic(&loc_diag_to_validation_error(d), lines))
             .collect()
@@ -1060,13 +1136,34 @@ impl Backend {
         text: &str,
     ) -> HashSet<String> {
         let new_keys = loc_keys_of(text, path);
-        let mut overlay = self.state.loc_watched_overlay.write();
+        if self.loc_overlay_entry_matches(&self.state.loc_watched_overlay, uri, &new_keys) {
+            return HashSet::new();
+        }
+        let mut overlay = self.loc_watched_overlay_mut();
         let changed = match overlay.get(uri) {
             Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
             None => new_keys.clone(),
         };
         overlay.insert(uri.to_string(), new_keys);
         changed
+    }
+
+    /// Whether an overlay already holds exactly `new_keys` for `uri`, checked
+    /// under a read lock.
+    ///
+    /// Taking the write guard is what bumps `loc_overlay_revision`, and most
+    /// loc keystrokes change a value rather than the key set — so re-inserting
+    /// an identical set invalidated both derived caches on every edit and the
+    /// `$ref$` name universe was rebuilt anyway. Skipping the write when
+    /// nothing moved is what makes those caches actually hit while a `.yml` is
+    /// being typed in.
+    fn loc_overlay_entry_matches(
+        &self,
+        overlay: &parking_lot::RwLock<std::collections::HashMap<String, HashSet<String>>>,
+        uri: &str,
+        new_keys: &HashSet<String>,
+    ) -> bool {
+        overlay.read().get(uri).is_some_and(|prev| prev == new_keys)
     }
 
     /// The cross-file refresh an open loc edit runs per file, done ONCE for a
@@ -1117,26 +1214,48 @@ impl Backend {
             // first sight fire the whole-file cross-file sweep (#90). Watched
             // files record into `loc_watched_overlay` instead
             // (`record_watched_loc_keys`) with one coalesced sweep per batch.
-            let is_open = self.state.documents.lock().contains_key(uri);
-            let changed_keys: HashSet<String> = if is_open {
-                let new_keys = loc_keys_of(text, &path);
-                let mut overlay = self.state.loc_live_overlay.write();
-                let diff = match overlay.get(uri) {
-                    Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
-                    None => new_keys.clone(),
+            // block_in_place: parsing and linting a loc buffer is sync CPU work
+            // that would otherwise hold a runtime worker for its whole duration,
+            // and MD ships loc files in the hundreds of KB. Matches how the scan
+            // paths already fence their sync work. (#87)
+            let (changed_keys, extra, diagnostics) = tokio::task::block_in_place(|| {
+                // One parse of the edited buffer, shared by the key set, the
+                // diagnostics and the hover text below — each used to parse the
+                // whole file itself, and two of them copied it first (#87).
+                let parsed_loc = parse_loc_buffer(text, &path);
+                let is_open = self.state.documents.lock().contains_key(uri);
+                let changed_keys: HashSet<String> = if is_open {
+                    let new_keys = loc_keys_from(&parsed_loc);
+                    // Skip the write when the key set is unchanged, which is
+                    // the common keystroke: taking the write guard bumps the
+                    // revision the derived caches key on, so re-inserting an
+                    // identical set rebuilt the whole `$ref$` name universe on
+                    // every edit. See `loc_overlay_entry_matches`.
+                    if self.loc_overlay_entry_matches(&self.state.loc_live_overlay, uri, &new_keys)
+                    {
+                        HashSet::new()
+                    } else {
+                        let mut overlay = self.loc_live_overlay_mut();
+                        let diff = match overlay.get(uri) {
+                            Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
+                            None => new_keys.clone(),
+                        };
+                        overlay.insert(uri.to_string(), new_keys);
+                        diff
+                    }
+                } else {
+                    HashSet::new()
                 };
-                overlay.insert(uri.to_string(), new_keys);
-                diff
-            } else {
-                HashSet::new()
-            };
-            // Built once here and shared with the cross-file sweep below, which
-            // would otherwise rebuild the whole name set per open loc file.
-            let extra = self.loc_ref_names();
-            let diagnostics = self.validate_loc_text(&path, text, &lines, &extra);
-            // Update the hover loc_text map so tooltips reflect the latest
-            // edits without waiting for a full workspace rescan (#53).
-            self.update_loc_text_for_file(uri, text, &path);
+                // Built once here and shared with the cross-file sweep below,
+                // which would otherwise rebuild the whole name set per open
+                // `.yml`.
+                let extra = self.loc_ref_names();
+                let diagnostics = self.validate_loc_parsed(&path, &parsed_loc, &lines, &extra);
+                // Update the hover loc_text map so tooltips reflect the latest
+                // edits without waiting for a full workspace rescan (#53).
+                self.update_loc_text_for_file(&parsed_loc);
+                (changed_keys, extra, diagnostics)
+            });
             // A change to this file's key set can fix or break `$ref$` checks in
             // other open loc files, so refresh them — that's the cross-file part
             // of the index that previously only updated on a window reload.
@@ -1217,7 +1336,11 @@ impl Backend {
 
         tracing::debug!(%uri, "[validate] parsing");
 
-        match parse_string(text, &self.state.string_table) {
+        // block_in_place: everything from here down is sync CPU work (parse,
+        // index, validate) with no await in it. Without the fence a 1 MB script
+        // file holds a tokio worker for the whole validate, while the scan paths
+        // that do the same work already fence theirs. (#87)
+        tokio::task::block_in_place(|| match parse_string(text, &self.state.string_table) {
             Ok(parsed) => {
                 for parse_err in &parsed.errors {
                     diagnostics.push(parse_error_to_diagnostic(parse_err, &lines));
@@ -1312,7 +1435,7 @@ impl Backend {
                 });
                 (diagnostics, None)
             }
-        }
+        })
     }
 }
 
@@ -1380,6 +1503,37 @@ mod perf_bench {
                 total += logical_path_from_uri(uri, &ws).len();
             }
             total
+        });
+    }
+
+    /// The parse a loc keystroke pays, before and after #87. The edited buffer
+    /// used to be parsed three times — once for the live overlay's key set, once
+    /// for the diagnostics, once for the hover text — and copied into an owned
+    /// `String` twice on the way, because `LocService::from_files` takes
+    /// ownership. Both sides exclude the diagnostics build, which is unchanged.
+    #[test]
+    #[ignore]
+    fn perf_loc_edit_parse() {
+        const ENTRIES: usize = 4_000;
+        let path = "localisation/bench_l_english.yml";
+        let mut text = String::from("\u{FEFF}l_english:\n");
+        for i in 0..ENTRIES {
+            text.push_str(&format!(
+                " key_{i:05}:0 \"Localised text for $other_key_{i:05}$ with [GetName] in it\"\n"
+            ));
+        }
+        eprintln!("fixture: {} bytes, {ENTRIES} entries", text.len());
+
+        bench("loc parse x1 (after)", 20, || {
+            parse_loc_buffer(&text, path).len()
+        });
+        bench("loc parse x3 + 2 copies (before)", 20, || {
+            let owned = text.to_string();
+            let a = parse_loc_buffer(&owned, path);
+            let b = parse_loc_buffer(&text, path);
+            let owned = text.to_string();
+            let c = parse_loc_buffer(&owned, path);
+            a.len() + b.len() + c.len()
         });
     }
 

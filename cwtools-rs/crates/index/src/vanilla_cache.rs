@@ -326,6 +326,7 @@ pub fn save_per_type(
 /// Load a vanilla cache file. Returns `(game, fingerprint, data)`; the caller
 /// compares `fingerprint` against the live install to decide whether it is
 /// fresh. Old JSON caches (pre-v4) fail the magic check and read as a miss.
+#[tracing::instrument(skip_all, fields(path = %path.display()))]
 pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> {
     let mut data = Vec::new();
     std::fs::File::open(path)?.read_to_end(&mut data)?;
