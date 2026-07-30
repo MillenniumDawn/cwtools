@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cwtools_cache = { workspace = true }
 cwtools_parser = { workspace = true }
 cwtools_file_manager = { workspace = true }
 cwtools_string_table = { workspace = true }

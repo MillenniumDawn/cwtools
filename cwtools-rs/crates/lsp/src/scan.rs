@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tower_lsp::lsp_types::*;
 
+use cwtools_cache::workspace as workspace_cache;
 use cwtools_parser::parser::parse_string_without_comments;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::build_modifier_keys;
@@ -17,7 +18,6 @@ use crate::validate::{
     DocLines, loc_diag_to_validation_error, make_prepared, parse_error_to_diagnostic,
     validate_parsed_with_indexes, validation_error_to_diagnostic,
 };
-use crate::workspace_cache;
 use crate::{Backend, LoadingBar, LocLocationMap, LocTextMap, UpdateFileList};
 
 /// Trailing window for coalescing `didChangeWatchedFiles` create/modify events.
@@ -436,7 +436,7 @@ impl Backend {
         // Resolve the parse-cache directory and settings fingerprint. The
         // fingerprint encodes the game, ruleset shape, and workspace root so
         // stale caches are cleared automatically when any of those change.
-        let (cache_info, cache_was_valid) = {
+        let (cache_info, cache_status) = {
             let (cache_dir, language) = {
                 let cfg = self.state.config.read();
                 (cfg.cache_dir.clone(), cfg.language.clone())
@@ -454,21 +454,20 @@ impl Backend {
                             &root_path,
                         ),
                     };
-                    let valid = workspace_cache::validate_or_clear(&cd, fp);
-                    (Some((cd, fp)), valid)
+                    match workspace_cache::validate_or_clear(&cd, fp) {
+                        Ok(true) => (Some((cd, fp)), "Parse cache: hit (settings match)"),
+                        Ok(false) => (Some((cd, fp)), "Parse cache: settings changed, cleared"),
+                        Err(error) => {
+                            tracing::warn!(dir = %cd.display(), error = %error, "parse cache unavailable");
+                            (None, "Parse cache: unavailable")
+                        }
+                    }
                 }
-                None => (None, true),
+                None => (None, "Parse cache: disabled"),
             }
         };
         self.client
-            .log_message(
-                MessageType::INFO,
-                if cache_was_valid {
-                    "Parse cache: hit (settings match)"
-                } else {
-                    "Parse cache: settings changed, cleared"
-                },
-            )
+            .log_message(MessageType::INFO, cache_status)
             .await;
 
         // Pass 1: parse + index every file (types, scripted triggers/effects,
@@ -526,6 +525,21 @@ impl Backend {
                     if open_uris.contains(&file.uri) {
                         return None;
                     }
+                    if let Some((ref cd, fp)) = cache_info
+                        && let Some((parsed, _)) = workspace_cache::load_path(
+                            cd,
+                            fp,
+                            &file.path,
+                            &self.state.string_table,
+                        )
+                    {
+                        return Some((true, parsed));
+                    }
+                    let source_key = (workspace_cache::PATH_METADATA_CACHE_SUPPORTED)
+                        .then(|| workspace_cache::source_cache_key(&file.path))
+                        .flatten();
+                    let use_content_cache =
+                        !workspace_cache::PATH_METADATA_CACHE_SUPPORTED || source_key.is_none();
                     // Read via the file manager so cp1252-encoded script files
                     // (pre-Jomini mods) are indexed instead of silently dropped.
                     let text = match cwtools_file_manager::file_manager::read_text(&file.path) {
@@ -535,23 +549,49 @@ impl Backend {
                             return None;
                         }
                     };
-                    // Try the parse cache first.
-                    if let Some((ref cd, fp)) = cache_info
-                        && let Some(parsed) =
-                            workspace_cache::load(cd, fp, &text, &self.state.string_table)
+                    if use_content_cache
+                        && let Some((cd, fp)) = cache_info.as_ref()
+                        && let Some(parsed) = workspace_cache::load(
+                            cd,
+                            *fp,
+                            &text,
+                            &self.state.string_table,
+                        )
                     {
                         return Some((true, parsed));
                     }
-                    // Cache miss — parse, then persist for the next scan.
                     let parsed =
                         parse_string_without_comments(&text, &self.state.string_table).ok()?;
-                    if let Some((ref cd, fp)) = cache_info {
-                        workspace_cache::store(cd, fp, &text, &parsed, &self.state.string_table);
+                    if let Some((cd, fp)) = cache_info.as_ref() {
+                        if let Some(source_key) = source_key.as_ref() {
+                            workspace_cache::store_path(
+                                cd,
+                                *fp,
+                                &file.path,
+                                source_key,
+                                &parsed,
+                                &self.state.string_table,
+                            );
+                        } else {
+                            workspace_cache::store(
+                                cd,
+                                *fp,
+                                &text,
+                                &parsed,
+                                &self.state.string_table,
+                            );
+                        }
                     }
                     Some((false, parsed))
                 })
                 .collect()
         });
+        let wrote_cache = outcomes
+            .iter()
+            .any(|outcome| outcome.as_ref().is_some_and(|(hit, _)| !hit));
+        if wrote_cache && let Some((cache_dir, fingerprint)) = cache_info.as_ref() {
+            workspace_cache::prune(cache_dir, *fingerprint);
+        }
 
         // Serial index phase, in file order.
         let mut parsed_files: Vec<Option<cwtools_parser::ast::ParsedFile>> =

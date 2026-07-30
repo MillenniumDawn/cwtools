@@ -231,6 +231,13 @@ pub enum FileError {
     MissingRoot(PathBuf),
 }
 
+/// A discovered script file before its source is read or parsed.
+#[derive(Debug, Clone)]
+pub struct DiscoveredFile {
+    pub path: PathBuf,
+    pub logical_path: String,
+}
+
 /// A discovered script file with its parsed AST.
 pub struct ParsedFile {
     /// Absolute path on disk.
@@ -341,15 +348,9 @@ impl FileManager {
         }
     }
 
-    /// Discover and parse all matching script files under the configured root.
-    /// Non-script files (localisation, resources) are silently skipped.
-    pub fn discover_and_parse(&mut self) -> Result<Vec<ParsedFile>, FileError> {
-        use rayon::prelude::*;
-
-        // Walk the tree to collect the candidate (path, logical_path) list first
-        // (cheap, ordered), then read+parse them in parallel. Parsing is the
-        // expensive part and is independent per file. `into_par_iter().collect()`
-        // preserves the input order, so discovery output is deterministic.
+    /// Discover all matching script files under the configured root without
+    /// reading or parsing them. Non-script files are silently skipped.
+    pub fn discover_files(&self) -> Result<Vec<DiscoveredFile>, FileError> {
         let mut paths: Vec<(PathBuf, String)> = Vec::new();
         let root = &self.config.root;
         if !root.is_dir() {
@@ -368,22 +369,33 @@ impl FileManager {
             self.collect_paths(&dir, &mut paths)?;
         }
 
+        Ok(paths
+            .into_iter()
+            .map(|(path, logical_path)| DiscoveredFile { path, logical_path })
+            .collect())
+    }
+
+    /// Discover and parse all matching script files under the configured root.
+    /// Non-script files (localisation, resources) are silently skipped.
+    pub fn discover_and_parse(&mut self) -> Result<Vec<ParsedFile>, FileError> {
+        use rayon::prelude::*;
+
         let table = &self.string_table;
-        let files = paths
+        let files = self
+            .discover_files()?
             .into_par_iter()
-            .filter_map(|(path, logical_path)| {
-                let content = read_text(&path).ok()?;
+            .filter_map(|file| {
+                let content = read_text(&file.path).ok()?;
                 match parse_string_without_comments(&content, table) {
                     Ok(parsed) => Some(ParsedFile {
-                        path,
-                        logical_path,
+                        path: file.path,
+                        logical_path: file.logical_path,
                         arena: parsed.arena,
                         root_children: parsed.root_children,
                         errors: parsed.errors,
                     }),
                     Err(e) => {
-                        // Non-fatal: skip files that fail to parse and continue
-                        eprintln!("warn: skipping {}: {}", path.display(), e);
+                        eprintln!("warn: skipping {}: {}", file.path.display(), e);
                         None
                     }
                 }
@@ -423,42 +435,38 @@ impl FileManager {
     /// The mods are layered by [`discover_files_multi_mod`]'s load order — a
     /// later-resolved mod (mods are name-sorted, so the alphabetically-greater
     /// name) wins a shared logical path, and a mod's `replace_path` suppresses
-    /// lower-priority files under that prefix. The surviving script files are
-    /// then filtered and parsed exactly as [`Self::discover_and_parse`] does for a
-    /// single root. Vanilla is NOT folded in here — the driver indexes the base
-    /// game separately, for reference only.
+    /// lower-priority files under that prefix. The surviving script files use
+    /// the same filters as [`Self::discover_files`]. Vanilla is not folded in;
+    /// the driver indexes the base game separately for reference only.
+    pub fn discover_files_multi_mod(&self) -> Vec<DiscoveredFile> {
+        let mods = expand_multiple_mods(&self.config.root);
+        discover_files_multi_mod(None, &mods, &self.config.include_dirs)
+            .into_iter()
+            .filter(|(path, _)| accept_script_file(&self.config, path))
+            .map(|(path, logical_path)| DiscoveredFile { path, logical_path })
+            .collect()
+    }
+
+    /// Discover and parse the script files of a `MultipleMod` workspace.
     pub fn discover_and_parse_multi_mod(&mut self) -> Result<Vec<ParsedFile>, FileError> {
         use rayon::prelude::*;
 
-        let mods = expand_multiple_mods(&self.config.root);
-        let discovered = discover_files_multi_mod(None, &mods, &self.config.include_dirs);
-
-        // Apply the same file-level filter the single-root walk uses, to the
-        // already load-order-deduplicated set.
-        let cfg = &self.config;
-        let candidates: Vec<(PathBuf, String)> = discovered
-            .into_iter()
-            .filter(|(path, _)| accept_script_file(cfg, path))
-            .collect();
-
-        // Parse in parallel; `into_par_iter().collect()` preserves the input
-        // order, so output stays deterministic (candidates are sorted by
-        // logical path).
         let table = &self.string_table;
-        let files = candidates
+        let files = self
+            .discover_files_multi_mod()
             .into_par_iter()
-            .filter_map(|(path, logical_path)| {
-                let content = read_text(&path).ok()?;
+            .filter_map(|file| {
+                let content = read_text(&file.path).ok()?;
                 match parse_string_without_comments(&content, table) {
                     Ok(parsed) => Some(ParsedFile {
-                        path,
-                        logical_path,
+                        path: file.path,
+                        logical_path: file.logical_path,
                         arena: parsed.arena,
                         root_children: parsed.root_children,
                         errors: parsed.errors,
                     }),
                     Err(e) => {
-                        eprintln!("warn: skipping {}: {}", path.display(), e);
+                        eprintln!("warn: skipping {}: {}", file.path.display(), e);
                         None
                     }
                 }

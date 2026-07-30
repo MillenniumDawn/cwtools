@@ -245,6 +245,68 @@ fn cw100_still_fires_when_loc_data_exists() {
     );
 }
 
+fn load_loc_session(
+    workspace: &std::path::Path,
+    parse_cache_dir: Option<PathBuf>,
+) -> cwtools_driver::SessionWithFiles {
+    Session::load_with_parse_cache(
+        SessionConfig {
+            game: Game::Hoi4,
+            rules: RulesInput::Dir(workspace.join("rules")),
+            directory: workspace.join("mod"),
+            vanilla: None,
+            vanilla_cache: None,
+            vanilla_cache_auto: None,
+            ignore_files: &[],
+            ignore_dirs: &[],
+            loc_languages: None,
+            on_rules_warning: None,
+        },
+        parse_cache_dir,
+    )
+}
+
+#[test]
+fn parse_cache_preserves_cold_and_warm_validation_output() {
+    let tmp = loc_gate_workspace(None);
+    std::fs::write(
+        tmp.path().join("mod/common/things/x.txt"),
+        "my_thing = { broken =\n",
+    )
+    .unwrap();
+    let uncached = load_loc_session(tmp.path(), None).validate_all();
+    let cache_dir = tmp.path().join("cache");
+    let cold = load_loc_session(tmp.path(), Some(cache_dir.clone())).validate_all();
+    let cache_entries: usize = std::fs::read_dir(cache_dir.join("parse-cache"))
+        .unwrap()
+        .flatten()
+        .map(|workspace| {
+            std::fs::read_dir(workspace.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "cwb"))
+                .count()
+        })
+        .sum();
+    let warm = load_loc_session(tmp.path(), Some(cache_dir)).validate_all();
+
+    assert!(cache_entries > 0);
+    assert!(uncached.iter().any(|(_, errors)| !errors.is_empty()));
+    assert_eq!(uncached, cold);
+    assert_eq!(cold, warm);
+}
+
+#[test]
+fn unusable_parse_cache_falls_back_to_uncached_validation() {
+    let tmp = loc_gate_workspace(None);
+    let uncached = load_loc_session(tmp.path(), None).validate_all();
+    let blocker = tmp.path().join("not-a-cache-directory");
+    std::fs::write(&blocker, b"x").unwrap();
+
+    let fallback = load_loc_session(tmp.path(), Some(blocker)).validate_all();
+    assert_eq!(uncached, fallback);
+}
+
 #[test]
 fn changed_source_is_not_validated_against_a_stale_index() {
     let tmp = loc_gate_workspace(None);

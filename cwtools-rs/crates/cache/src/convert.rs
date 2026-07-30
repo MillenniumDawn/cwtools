@@ -1,7 +1,7 @@
 use crate::cache_format::*;
 use crate::io::CacheError;
 use cwtools_parser::ast::{
-    Arena, Child, Comment, Leaf, LeafValue, Operator, SourcePos, SourceRange, Value,
+    Arena, Child, Comment, Leaf, LeafValue, Operator, ParseError, SourcePos, SourceRange, Value,
 };
 use cwtools_string_table::string_table::{StringResolver, StringTable, StringTokens};
 
@@ -26,6 +26,33 @@ pub fn arena_to_cached(
             .collect(),
         comments: arena.comments.iter().map(comment_to_cached).collect(),
     })
+}
+
+/// Convert recovered parse errors into their self-contained cache form.
+pub fn errors_to_cached(errors: &[ParseError]) -> CachedErrors {
+    CachedErrors {
+        errors: errors
+            .iter()
+            .map(|error| match error {
+                ParseError::Pos(line, col, message) => {
+                    CachedParseError::Pos(*line, *col, message.clone())
+                }
+                ParseError::General(message) => CachedParseError::General(message.clone()),
+            })
+            .collect(),
+    }
+}
+
+/// Rebuild recovered parse errors from their cache form.
+pub fn cached_errors_to_parse(cached: CachedErrors) -> Vec<ParseError> {
+    cached
+        .errors
+        .into_iter()
+        .map(|error| match error {
+            CachedParseError::Pos(line, col, message) => ParseError::Pos(line, col, message),
+            CachedParseError::General(message) => ParseError::General(message),
+        })
+        .collect()
 }
 
 /// Rebuild an arena AST from the rkyv archived view, interning strings straight

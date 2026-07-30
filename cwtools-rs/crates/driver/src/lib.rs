@@ -24,9 +24,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use cwtools_cache::workspace::{self as workspace_cache, SourceCacheKey};
 use cwtools_file_manager::file_manager::{
-    DirectoryType, FileManager, FileManagerConfig, classify_directory,
+    DirectoryType, DiscoveredFile, FileError, FileManager, FileManagerConfig, classify_directory,
 };
 use cwtools_file_manager::{FileEncoding, read_text, read_text_with_encoding};
 use cwtools_game::constants::Game;
@@ -52,27 +54,119 @@ use cwtools_validation::{
 pub struct SourceFile {
     pub path: PathBuf,
     pub logical_path: String,
-    fingerprint: Option<SourceFingerprint>,
+    fingerprint: SourceFingerprint,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 struct SourceFingerprint {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-}
-
-fn source_fingerprint(path: &Path) -> Option<SourceFingerprint> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some(SourceFingerprint {
-        len: metadata.len(),
-        modified: metadata.modified().ok(),
-    })
+    metadata: Option<SourceCacheKey>,
+    content_hash: Option<u64>,
 }
 
 struct ParsedFileSource {
     path: PathBuf,
     logical_path: String,
     parsed: ParsedFile,
+    fingerprint: SourceFingerprint,
+}
+
+struct LoadedParse {
+    parsed: ParsedFile,
+    fingerprint: SourceFingerprint,
+}
+
+struct ParseCache {
+    dir: PathBuf,
+    fingerprint: u64,
+    wrote: AtomicBool,
+}
+
+fn load_or_parse(
+    path: &Path,
+    table: &StringTable,
+    cache: Option<&ParseCache>,
+) -> Result<LoadedParse, FileError> {
+    if let Some(cache) = cache
+        && let Some((parsed, metadata)) =
+            workspace_cache::load_path(&cache.dir, cache.fingerprint, path, table)
+    {
+        return Ok(LoadedParse {
+            parsed,
+            fingerprint: SourceFingerprint {
+                metadata: Some(metadata),
+                content_hash: None,
+            },
+        });
+    }
+
+    let metadata = workspace_cache::source_cache_key(path);
+    let text = read_text(path)?;
+    let use_content_cache = !workspace_cache::PATH_METADATA_CACHE_SUPPORTED || metadata.is_none();
+    let cached = if use_content_cache {
+        cache.and_then(|cache| workspace_cache::load(&cache.dir, cache.fingerprint, &text, table))
+    } else {
+        None
+    };
+    let cache_hit = cached.is_some();
+    let parsed = match cached {
+        Some(parsed) => parsed,
+        None => parse_string_without_comments(&text, table)
+            .map_err(|error| FileError::Parse(error.to_string()))?,
+    };
+    let metadata =
+        metadata.filter(|key| workspace_cache::source_cache_key(path).as_ref() == Some(key));
+    if let Some(cache) = cache
+        && !cache_hit
+    {
+        if let Some(source_key) = metadata.as_ref()
+            && workspace_cache::PATH_METADATA_CACHE_SUPPORTED
+        {
+            workspace_cache::store_path(
+                &cache.dir,
+                cache.fingerprint,
+                path,
+                source_key,
+                &parsed,
+                table,
+            );
+            cache.wrote.store(true, Ordering::Relaxed);
+        } else {
+            workspace_cache::store(&cache.dir, cache.fingerprint, &text, &parsed, table);
+            cache.wrote.store(true, Ordering::Relaxed);
+        }
+    }
+    Ok(LoadedParse {
+        parsed,
+        fingerprint: SourceFingerprint {
+            metadata,
+            content_hash: use_content_cache.then(|| workspace_cache::content_hash(&text)),
+        },
+    })
+}
+
+fn parse_discovered_files(
+    files: Vec<DiscoveredFile>,
+    table: &StringTable,
+    cache: Option<&ParseCache>,
+) -> Vec<ParsedFileSource> {
+    use rayon::prelude::*;
+
+    files
+        .into_par_iter()
+        .filter_map(|file| match load_or_parse(&file.path, table, cache) {
+            Ok(loaded) => Some(ParsedFileSource {
+                path: file.path,
+                logical_path: file.logical_path,
+                parsed: loaded.parsed,
+                fingerprint: loaded.fingerprint,
+            }),
+            Err(FileError::Io(_)) => None,
+            Err(error) => {
+                eprintln!("warn: skipping {}: {}", file.path.display(), error);
+                None
+            }
+        })
+        .collect()
 }
 
 /// How to load the rules: a single `.cwt` file or a directory of them.
@@ -150,13 +244,20 @@ pub struct Session {
     loc_languages: Option<Vec<Lang>>,
     registry: Option<Arc<ScopeRegistry>>,
     directory: PathBuf,
+    parse_cache: Option<ParseCache>,
 }
 
 impl Session {
-    /// Run the full load pipeline: parse rules, discover/parse mod files, build the
-    /// type/var/vanilla indexes, expand modifier keys, build the loc index, and
-    /// prebuild the scope registry. Returns a ready-to-validate session.
+    /// Run the full load pipeline without a persistent parse cache.
     pub fn load(config: SessionConfig) -> SessionWithFiles {
+        Self::load_with_parse_cache(config, None)
+    }
+
+    /// Run the full load pipeline with an optional persistent per-file parse cache.
+    pub fn load_with_parse_cache(
+        config: SessionConfig,
+        parse_cache_dir: Option<PathBuf>,
+    ) -> SessionWithFiles {
         let SessionConfig {
             game,
             rules,
@@ -175,6 +276,25 @@ impl Session {
         let ruleset = load_rules(&rules, &rules_table, on_rules_warning).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             RuleSet::new()
+        });
+        let parse_cache = parse_cache_dir.and_then(|dir| {
+            let fingerprint =
+                workspace_cache::settings_fingerprint(&game.to_string(), &ruleset, &directory);
+            match workspace_cache::validate_or_clear(&dir, fingerprint) {
+                Ok(_) => Some(ParseCache {
+                    dir,
+                    fingerprint,
+                    wrote: AtomicBool::new(false),
+                }),
+                Err(error) => {
+                    eprintln!(
+                        "warn: parse cache unavailable at {}: {}",
+                        dir.display(),
+                        error
+                    );
+                    None
+                }
+            }
         });
 
         // Discover + parse mod files using the SAME string table. Layer the
@@ -206,34 +326,31 @@ impl Session {
             fm_config.include_dirs = ruleset.folders.clone();
         }
 
-        let mut manager = FileManager::with_string_table(fm_config, rules_table.clone());
+        let manager = FileManager::with_string_table(fm_config, rules_table.clone());
         let discovered = if is_multi_mod {
-            manager.discover_and_parse_multi_mod()
+            Ok(manager.discover_files_multi_mod())
         } else {
-            manager.discover_and_parse()
+            manager.discover_files()
         };
         let (files, discovery_failed) = match discovered {
-            Ok(f) => (f, false),
+            Ok(files) => (
+                parse_discovered_files(files, &rules_table, parse_cache.as_ref()),
+                false,
+            ),
             Err(e) => {
                 eprintln!("error: discovery failed for {}: {}", directory.display(), e);
                 (Vec::new(), true)
             }
         };
+        if let Some(cache) = &parse_cache
+            && cache.wrote.swap(false, Ordering::Relaxed)
+        {
+            workspace_cache::prune(&cache.dir, cache.fingerprint);
+        }
 
         // Take ownership of each parsed AST once for indexing. They are dropped
         // before localisation is built; validation reparses each source later.
-        let parsed: Vec<ParsedFileSource> = files
-            .into_iter()
-            .map(|f| ParsedFileSource {
-                path: f.path,
-                logical_path: f.logical_path,
-                parsed: ParsedFile {
-                    arena: f.arena,
-                    root_children: f.root_children,
-                    errors: f.errors,
-                },
-            })
-            .collect();
+        let parsed = files;
 
         // Cross-file TypeIndex from the already-parsed arenas. Per-file
         // collection runs in parallel (each call is pure &-borrows); merge is
@@ -301,7 +418,7 @@ impl Session {
             .map(|src| SourceFile {
                 path: src.path.clone(),
                 logical_path: src.logical_path.clone(),
-                fingerprint: source_fingerprint(&src.path),
+                fingerprint: src.fingerprint.clone(),
             })
             .collect();
         drop(parsed);
@@ -435,6 +552,7 @@ impl Session {
             loc_languages,
             registry,
             directory,
+            parse_cache,
         }
         .with_source_files(source_files, discovery_failed)
     }
@@ -559,8 +677,8 @@ impl SessionWithFiles {
             .par_iter()
             .map(|src| {
                 let file_str = src.path.to_str().unwrap_or("").to_string();
-                if source_fingerprint(&src.path) != src.fingerprint {
-                    return (
+                let changed_error = || {
+                    (
                         src.path.clone(),
                         vec![ValidationError {
                             message: format!(
@@ -569,19 +687,23 @@ impl SessionWithFiles {
                             severity: ErrorSeverity::Error,
                             line: 0,
                             col: 0,
-                            file: file_str,
+                            file: file_str.clone(),
                             code: None,
                             fix: None,
                             end: None,
                         }],
-                    );
+                    )
+                };
+                if workspace_cache::source_cache_key(&src.path) != src.fingerprint.metadata {
+                    return changed_error();
                 }
-                let parsed = match read_text(&src.path).and_then(|text| {
-                    parse_string_without_comments(&text, &self.session.rules_table).map_err(|e| {
-                        cwtools_file_manager::file_manager::FileError::Parse(e.to_string())
-                    })
-                }) {
-                    Ok(parsed) => parsed,
+                let parsed = match load_or_parse(
+                    &src.path,
+                    &self.session.rules_table,
+                    self.session.parse_cache.as_ref(),
+                ) {
+                    Ok(loaded) if loaded.fingerprint == src.fingerprint => loaded.parsed,
+                    Ok(_) => return changed_error(),
                     Err(error) => {
                         return (
                             src.path.clone(),
@@ -786,10 +908,9 @@ fn load_fresh_vanilla_cache(
     }
 }
 
-/// Where [`VanillaCacheAuto`] puts its cache when the caller has no preference:
+/// Default directory for automatic vanilla and parse caches:
 /// `XDG_CACHE_HOME`/`LOCALAPPDATA`, else `~/.cache` (Linux) or `~/Library/Caches`
-/// (macOS), else the temp dir — all under a `cwtools` subdirectory, the same
-/// location the LSP uses.
+/// (macOS), else the temp dir. All use the same `cwtools` directory as the LSP.
 pub fn default_cache_dir() -> Option<PathBuf> {
     if let Ok(x) = std::env::var("XDG_CACHE_HOME")
         && !x.is_empty()
@@ -1034,6 +1155,20 @@ mod tests {
                 "header-only read diverged from the full parse on {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn loaded_parse_keeps_the_fingerprint_it_was_parsed_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("source.txt");
+        std::fs::write(&path, "a = 1\n").unwrap();
+        let loaded = load_or_parse(&path, &StringTable::new(), None).unwrap();
+
+        std::fs::write(&path, "a = 200\n").unwrap();
+        assert_ne!(
+            workspace_cache::source_cache_key(&path),
+            loaded.fingerprint.metadata
+        );
     }
 
     /// The filename must survive both halves of the fingerprint verbatim where

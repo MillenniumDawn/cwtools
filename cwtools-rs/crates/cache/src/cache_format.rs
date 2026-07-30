@@ -12,6 +12,20 @@ pub struct CachedFile {
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(derive(Debug))]
+pub struct CachedErrors {
+    pub errors: Vec<CachedParseError>,
+}
+
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(derive(Debug))]
+#[repr(u8)]
+pub enum CachedParseError {
+    Pos(u32, u16, String),
+    General(String),
+}
+
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(derive(Debug))]
 #[repr(u8)]
 pub enum CachedChild {
     Leaf(u32),

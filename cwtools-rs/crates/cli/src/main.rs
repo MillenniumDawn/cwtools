@@ -1097,22 +1097,25 @@ fn main() {
             // rules, discover/parse mod files, build the type/var/vanilla indexes,
             // expand modifier keys, build the loc index, prebuild the scope
             // registry. The CLI and LSP share this one implementation.
-            let session = Session::load(SessionConfig {
-                game: game_id,
-                rules: RulesInput::from_path(rules.clone()),
-                directory: directory.clone(),
-                vanilla: vanilla.clone(),
-                vanilla_cache: vanilla_cache_index,
-                vanilla_cache_auto,
-                ignore_files: &ignore_files,
-                ignore_dirs: &ignore_dirs,
-                loc_languages: if loc_language.is_empty() {
-                    None
-                } else {
-                    Some(loc_language)
+            let session = Session::load_with_parse_cache(
+                SessionConfig {
+                    game: game_id,
+                    rules: RulesInput::from_path(rules.clone()),
+                    directory: directory.clone(),
+                    vanilla: vanilla.clone(),
+                    vanilla_cache: vanilla_cache_index,
+                    vanilla_cache_auto,
+                    ignore_files: &ignore_files,
+                    ignore_dirs: &ignore_dirs,
+                    loc_languages: if loc_language.is_empty() {
+                        None
+                    } else {
+                        Some(loc_language)
+                    },
+                    on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
                 },
-                on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
-            });
+                cwtools_driver::default_cache_dir(),
+            );
             let ruleset = session.ruleset();
             eprintln!(
                 "  Loaded {} types, {} enums, {} aliases",
@@ -1795,22 +1798,25 @@ fn main() {
                 })
             };
 
-            let session = Session::load(SessionConfig {
-                game: game_id,
-                rules: RulesInput::from_path(rules.clone()),
-                directory: directory.clone(),
-                vanilla: vanilla.clone(),
-                vanilla_cache: vanilla_cache_index,
-                vanilla_cache_auto,
-                ignore_files: &ignore_files,
-                ignore_dirs: &ignore_dirs,
-                loc_languages: if loc_language.is_empty() {
-                    None
-                } else {
-                    Some(loc_language)
+            let session = Session::load_with_parse_cache(
+                SessionConfig {
+                    game: game_id,
+                    rules: RulesInput::from_path(rules.clone()),
+                    directory: directory.clone(),
+                    vanilla: vanilla.clone(),
+                    vanilla_cache: vanilla_cache_index,
+                    vanilla_cache_auto,
+                    ignore_files: &ignore_files,
+                    ignore_dirs: &ignore_dirs,
+                    loc_languages: if loc_language.is_empty() {
+                        None
+                    } else {
+                        Some(loc_language)
+                    },
+                    on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
                 },
-                on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
-            });
+                cwtools_driver::default_cache_dir(),
+            );
 
             // Same guards as `validate`: a failed walk, an empty ruleset, or an
             // empty file set must not read as "nothing needed fixing".
