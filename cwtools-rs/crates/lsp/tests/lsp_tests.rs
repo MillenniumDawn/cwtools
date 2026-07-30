@@ -3222,6 +3222,32 @@ fn test_folding_ranges_nested_blocks() {
 }
 
 #[test]
+fn test_folding_ranges_comments_and_regions() {
+    // A comment block folds as kind "comment"; #region/#endregion pairs fold
+    // as kind "region"; brace folds are unchanged.
+    let doc = "# header one\n# header two\n# header three\n#region Alpha\na = {\n    x = 1\n}\n#endregion\n";
+    let files = &[("common/national_focus/f.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/national_focus/f.txt"],
+        serde_json::json!({}),
+        "common/national_focus/f.txt",
+        "textDocument/foldingRange",
+        serde_json::json!({}),
+    );
+    let ranges = result.as_array().expect("folding ranges");
+    let has = |s: u64, e: u64, k: &str| {
+        ranges
+            .iter()
+            .any(|r| r["startLine"] == s && r["endLine"] == e && r["kind"] == k)
+    };
+    assert!(has(0, 2, "comment"), "comment block fold, got: {}", result);
+    assert!(has(3, 7, "region"), "#region marker fold, got: {}", result);
+    assert!(has(4, 6, "region"), "brace fold, got: {}", result);
+}
+
+#[test]
 fn test_document_highlight_occurrences() {
     // `MY_FOCUS` appears three times; highlighting one returns all three.
     let doc = "a = {\n    has_focus = MY_FOCUS\n}\nb = {\n    has_focus = MY_FOCUS\n}\nc = {\n    load_oob = MY_FOCUS\n}\n";

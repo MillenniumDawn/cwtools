@@ -440,7 +440,8 @@ impl Backend {
         // Brace-matched folding over the text: the parser drops the exact `}`
         // line (it consumes trailing whitespace after a clause), so a direct
         // scan is more accurate than the AST for the closing-brace line.
-        let ranges = brace_folding_ranges(&text);
+        let mut ranges = brace_folding_ranges(&text);
+        ranges.extend(comment_and_region_folds(&text));
         if ranges.is_empty() {
             Ok(None)
         } else {
@@ -1201,6 +1202,74 @@ fn brace_folding_ranges(text: &str) -> Vec<FoldingRange> {
     ranges
 }
 
+/// Folding ranges the brace scan can't produce: runs of two or more full-line
+/// `#` comments fold as `Comment`, and `#region` / `#endregion` marker pairs
+/// (stack-matched, so they nest) fold as `Region`. Marker lines belong to
+/// their region fold and never count toward a comment run; unmatched markers
+/// are ignored.
+fn comment_and_region_folds(text: &str) -> Vec<FoldingRange> {
+    let mut folds = Vec::new();
+    let mut region_stack: Vec<u32> = Vec::new();
+    let mut run_start: Option<u32> = None;
+    let mut prev_line: u32 = 0;
+    let mut close_run = |start: Option<u32>, end_line: u32, folds: &mut Vec<FoldingRange>| {
+        if let Some(start) = start
+            && end_line > start
+        {
+            folds.push(FoldingRange {
+                start_line: start,
+                start_character: None,
+                end_line,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Comment),
+                collapsed_text: None,
+            });
+        }
+    };
+    for (line0, line) in text.lines().enumerate() {
+        let line0 = line0 as u32;
+        prev_line = line0;
+        let trimmed = line.trim_start();
+        let is_marker_start = region_marker(trimmed) == Some(true);
+        let is_marker_end = region_marker(trimmed) == Some(false);
+        if is_marker_start || is_marker_end || !trimmed.starts_with('#') {
+            close_run(run_start.take(), line0.saturating_sub(1), &mut folds);
+        } else if run_start.is_none() {
+            run_start = Some(line0);
+        }
+        if is_marker_start {
+            region_stack.push(line0);
+        } else if is_marker_end
+            && let Some(start) = region_stack.pop()
+            && line0 > start
+        {
+            folds.push(FoldingRange {
+                start_line: start,
+                start_character: None,
+                end_line: line0,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: None,
+            });
+        }
+    }
+    close_run(run_start.take(), prev_line, &mut folds);
+    folds
+}
+
+/// `Some(true)` for a `#region` marker, `Some(false)` for `#endregion`, `None`
+/// for anything else. `line` must already be left-trimmed. A marker may carry
+/// a trailing label (`#region Alpha`).
+fn region_marker(line: &str) -> Option<bool> {
+    if let Some(rest) = line.strip_prefix("#endregion") {
+        (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some(false)
+    } else if let Some(rest) = line.strip_prefix("#region") {
+        (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some(true)
+    } else {
+        None
+    }
+}
+
 /// The identity value of a block (`id` / `name` / `tag` child leaf, in that
 /// priority), used to give repeated block keys (`focus`, `country_event`, …)
 /// distinct outline names. `None` when the block has no such leaf.
@@ -1454,6 +1523,55 @@ mod tests {
         assert!(name_contains_ignore_case("Ship_Hull_Submarine", ""));
         assert!(!name_contains_ignore_case("Ship_Hull_Submarine", "cruiser"));
         assert!(!name_contains_ignore_case("abc", "abcd"));
+    }
+
+    #[test]
+    fn comment_folds_need_two_consecutive_lines() {
+        let folds = comment_and_region_folds("# one\n# two\n# three\nx = 1\n# lone\n");
+        assert_eq!(folds.len(), 1);
+        assert_eq!((folds[0].start_line, folds[0].end_line), (0, 2));
+        assert_eq!(folds[0].kind, Some(FoldingRangeKind::Comment));
+    }
+
+    #[test]
+    fn comment_fold_at_eof_without_newline() {
+        let folds = comment_and_region_folds("x = 1\n# a\n# b");
+        assert_eq!(folds.len(), 1);
+        assert_eq!((folds[0].start_line, folds[0].end_line), (1, 2));
+    }
+
+    #[test]
+    fn region_markers_fold_and_nest() {
+        let text = "#region outer\na = 1\n#region inner\nb = 2\n#endregion\n#endregion\n";
+        let folds = comment_and_region_folds(text);
+        let regions: Vec<(u32, u32)> = folds
+            .iter()
+            .filter(|f| f.kind == Some(FoldingRangeKind::Region))
+            .map(|f| (f.start_line, f.end_line))
+            .collect();
+        assert!(regions.contains(&(0, 5)), "outer region, got {:?}", regions);
+        assert!(regions.contains(&(2, 4)), "inner region, got {:?}", regions);
+    }
+
+    #[test]
+    fn unmatched_region_markers_are_ignored() {
+        assert!(comment_and_region_folds("#endregion\nx = 1\n").is_empty());
+        assert!(comment_and_region_folds("#region only\nx = 1\n").is_empty());
+    }
+
+    #[test]
+    fn region_markers_break_comment_runs() {
+        // The marker line belongs to its region fold, not to a comment run, so
+        // a lone comment next to a marker doesn't fold as a comment block.
+        let text = "# note\n#region r\nx = 1\n#endregion\n";
+        let folds = comment_and_region_folds(text);
+        assert!(
+            folds
+                .iter()
+                .all(|f| f.kind != Some(FoldingRangeKind::Comment)),
+            "got {:?}",
+            folds
+        );
     }
 
     #[test]
