@@ -3275,6 +3275,50 @@ fn test_document_highlight_skips_comments_and_reports_kinds() {
 }
 
 #[test]
+fn test_workspace_symbols_rank_and_cover_all_sources() {
+    // Three symbol sources match "my": a focus instance (exact-prefix rank on
+    // "my_focus"), a loc key (prefix), and an @-constant (substring). The
+    // result must cover all three with distinct kinds and be ordered
+    // rank-then-name, not hash order.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/d.txt",
+            "@my_const = 5\nadec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+        (
+            "localisation/english/x_l_english.yml",
+            "l_english:\n my_focus_tooltip:0 \"Text\"\n",
+        ),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &[],
+        serde_json::json!({}),
+        "common/national_focus/f.txt",
+        "workspace/symbol",
+        serde_json::json!({ "query": "my" }),
+    );
+    let syms = result.as_array().expect("symbols array");
+    let names: Vec<&str> = syms.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["MY_FOCUS", "my_focus_tooltip", "@my_const"],
+        "expected rank-then-name order, got: {}",
+        result
+    );
+    let kind_of = |n: &str| {
+        syms.iter()
+            .find(|s| s["name"] == n)
+            .map(|s| s["kind"].as_u64().unwrap())
+    };
+    assert_eq!(kind_of("MY_FOCUS"), Some(23), "focus instance is STRUCT");
+    assert_eq!(kind_of("@my_const"), Some(14), "@-constant is CONSTANT");
+    assert_eq!(kind_of("my_focus_tooltip"), Some(20), "loc key is KEY");
+}
+
+#[test]
 fn test_references_finds_closed_file() {
     // A (open) and B (never opened) both reference focus MY_FOCUS. Find-refs from
     // A must reach B via the workspace reverse index.

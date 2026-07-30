@@ -593,36 +593,74 @@ impl Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
-        let indexed_symbols = {
+        // All matches are collected, sorted deterministically by (rank, name,
+        // uri), then truncated — the old early break while iterating a HashMap
+        // returned an arbitrary hash-order 500.
+        let mut cands: Vec<SymbolCandidate> = Vec::new();
+        {
             let info = self.state.info_service.read();
-            let mut entries = Vec::new();
-            'scan: for (type_name, instances) in &info.type_index.map {
+            for (type_name, instances) in &info.type_index.map {
                 for (file_uri, inst) in instances {
-                    if !query.is_empty() && !name_contains_ignore_case(&inst.name, &query) {
-                        continue;
-                    }
-                    entries.push((
-                        type_name.clone(),
-                        file_uri.to_string(),
-                        inst.name.clone(),
-                        inst.location,
-                    ));
-                    if entries.len() >= 500 {
-                        break 'scan;
+                    if let Some(rank) = symbol_rank(&inst.name, &query) {
+                        cands.push(SymbolCandidate {
+                            rank,
+                            name: inst.name.clone(),
+                            container: Some(type_name.clone()),
+                            kind: SymbolKind::STRUCT,
+                            file_uri: file_uri.to_string(),
+                            line0: inst.location.line.saturating_sub(1),
+                            col: inst.location.col as u32,
+                        });
                     }
                 }
             }
-            entries
-        };
-        let mut symbols: Vec<SymbolInformation> = Vec::with_capacity(indexed_symbols.len());
+            // `@`-constants, still tracked per-file (as in the document outline).
+            for (file_uri, fi) in &info.files {
+                for (name, loc) in &fi.defined_variables {
+                    if let Some(rank) = symbol_rank(name, &query) {
+                        cands.push(SymbolCandidate {
+                            rank,
+                            name: name.clone(),
+                            container: None,
+                            kind: SymbolKind::CONSTANT,
+                            file_uri: file_uri.clone(),
+                            line0: loc.line.saturating_sub(1),
+                            col: loc.col as u32,
+                        });
+                    }
+                }
+            }
+        }
+        // Localisation keys (stored lowercased; loc keys are conventionally
+        // lowercase, so the display form matches the file).
+        {
+            let ll = self.state.loc_locations.read();
+            for (key, (file_uri, line0)) in ll.iter() {
+                if let Some(rank) = symbol_rank(key, &query) {
+                    cands.push(SymbolCandidate {
+                        rank,
+                        name: key.to_string(),
+                        container: None,
+                        kind: SymbolKind::KEY,
+                        file_uri: file_uri.to_string(),
+                        line0: *line0,
+                        col: 0,
+                    });
+                }
+            }
+        }
+        cands.sort_by(|a, b| (a.rank, &a.name, &a.file_uri).cmp(&(b.rank, &b.name, &b.file_uri)));
+        cands.truncate(500);
+
+        let mut symbols: Vec<SymbolInformation> = Vec::with_capacity(cands.len());
         // No request document to fall back to for a workspace-wide query.
         let fallback = Url::parse("file:///unknown").expect("static URI");
-        for (type_name, file_uri, name, loc) in indexed_symbols {
+        for c in cands {
             symbols.push(make_symbol(
-                name.clone(),
-                SymbolKind::STRUCT,
-                self.source_location(&file_uri, loc, &name, &fallback),
-                Some(type_name),
+                c.name.clone(),
+                c.kind,
+                self.source_location_at(&c.file_uri, c.line0, c.col, &c.name, &fallback),
+                c.container,
             ));
         }
 
@@ -965,6 +1003,38 @@ fn name_contains_ignore_case(name: &str, query: &str) -> bool {
     }
     let (n, q) = (name.as_bytes(), query.as_bytes());
     q.len() <= n.len() && n.windows(q.len()).any(|w| w.eq_ignore_ascii_case(q))
+}
+
+/// One `workspace/symbol` match before range conversion: where it lives
+/// (0-based line, char col) plus how it sorts (`rank`, then name, then uri).
+struct SymbolCandidate {
+    rank: u8,
+    name: String,
+    container: Option<String>,
+    kind: SymbolKind,
+    file_uri: String,
+    line0: u32,
+    col: u32,
+}
+
+/// Rank of a workspace-symbol candidate against the (already lowercased)
+/// query: 0 exact, 1 prefix, 2 substring, `None` when it doesn't match. The
+/// empty query admits everything (the picker's initial, unfiltered list).
+fn symbol_rank(name: &str, query: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(2);
+    }
+    if !name_contains_ignore_case(name, query) {
+        return None;
+    }
+    let lower = name.to_lowercase();
+    if lower == query {
+        Some(0)
+    } else if lower.starts_with(query) {
+        Some(1)
+    } else {
+        Some(2)
+    }
 }
 
 /// Whether `c` continues an identifier token (bare id charset plus `.` for
@@ -1384,6 +1454,16 @@ mod tests {
         assert!(name_contains_ignore_case("Ship_Hull_Submarine", ""));
         assert!(!name_contains_ignore_case("Ship_Hull_Submarine", "cruiser"));
         assert!(!name_contains_ignore_case("abc", "abcd"));
+    }
+
+    #[test]
+    fn symbol_rank_orders_exact_prefix_substring() {
+        assert_eq!(symbol_rank("MY_FOCUS", "my_focus"), Some(0));
+        assert_eq!(symbol_rank("my_focus_tooltip", "my_focus"), Some(1));
+        assert_eq!(symbol_rank("@my_const", "my"), Some(2));
+        assert_eq!(symbol_rank("unrelated", "my_focus"), None);
+        // Empty query admits everything (the picker's initial list).
+        assert_eq!(symbol_rank("anything", ""), Some(2));
     }
 
     #[test]
