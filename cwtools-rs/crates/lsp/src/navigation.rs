@@ -183,18 +183,7 @@ impl Backend {
             return Vec::new();
         }
         let rel = std::path::Path::new(path.trim_start_matches('/'));
-        let (ws_uri, vanilla_dir) = {
-            let cfg = self.state.config.read();
-            (cfg.workspace_uri.clone(), cfg.vanilla_dir.clone())
-        };
-        let mut roots: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(ws) = &ws_uri {
-            roots.push(std::path::PathBuf::from(crate::paths::uri_to_path_str(ws)));
-        }
-        if let Some(v) = vanilla_dir {
-            roots.push(v);
-        }
-        for root in roots {
+        for root in self.search_roots() {
             let candidate = root.join(rel);
             // Async stat: a goto request must not block the runtime on a sync
             // filesystem syscall (at most two candidate roots, so no batching).
@@ -206,6 +195,23 @@ impl Backend {
             }
         }
         Vec::new()
+    }
+
+    /// The roots a game-relative path resolves against, in probe order: the
+    /// workspace, then the configured vanilla install.
+    pub(crate) fn search_roots(&self) -> Vec<std::path::PathBuf> {
+        let (ws_uri, vanilla_dir) = {
+            let cfg = self.state.config.read();
+            (cfg.workspace_uri.clone(), cfg.vanilla_dir.clone())
+        };
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(ws) = &ws_uri {
+            roots.push(std::path::PathBuf::from(crate::paths::uri_to_path_str(ws)));
+        }
+        if let Some(v) = vanilla_dir {
+            roots.push(v);
+        }
+        roots
     }
 
     pub(crate) async fn references_impl(

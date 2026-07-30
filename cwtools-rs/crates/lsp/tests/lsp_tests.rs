@@ -3398,6 +3398,65 @@ fn test_completion_label_details_absent_without_support() {
     );
 }
 
+const LINK_RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+decision = {
+    ## cardinality = 0..1
+    picture = filepath[gfx/,.dds]
+    ## cardinality = 0..1
+    icon = icon[gfx/interface]
+}
+"#;
+
+#[test]
+fn test_document_links_resolve_filepath_and_icon_leaves() {
+    // `picture` is filepath[gfx/,.dds] and `icon` is icon[gfx/interface]:
+    // both leaves become links to the files they reference. A value whose
+    // target doesn't exist gets no link.
+    let files = &[
+        ("gfx/pic.dds", "dds"),
+        ("gfx/interface/myicon.dds", "dds"),
+        (
+            "common/decisions/d.txt",
+            "adec = {\n    picture = pic\n    icon = myicon\n}\n",
+        ),
+    ];
+    let result = feature_request(
+        LINK_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/documentLink",
+        serde_json::json!({}),
+    );
+    let links = result.as_array().expect("document links");
+    let link_at = |line: u64, ch: u64| {
+        links
+            .iter()
+            .find(|l| l["range"]["start"]["line"] == line && l["range"]["start"]["character"] == ch)
+            .unwrap_or_else(|| panic!("no link at {}:{}, got: {}", line, ch, result))
+    };
+    assert!(
+        link_at(1, 14)["target"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("gfx/pic.dds"),
+        "picture link target, got: {}",
+        result
+    );
+    assert!(
+        link_at(2, 11)["target"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("gfx/interface/myicon.dds"),
+        "icon link target, got: {}",
+        result
+    );
+}
+
 #[test]
 fn test_workspace_symbols_rank_and_cover_all_sources() {
     // Three symbol sources match "my": a focus instance (exact-prefix rank on

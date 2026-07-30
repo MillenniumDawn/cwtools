@@ -19,6 +19,7 @@ mod code_action;
 mod color;
 mod completion;
 mod config;
+mod documentlink;
 mod graph;
 mod hover;
 mod inlay;
@@ -1463,6 +1464,10 @@ impl LanguageServer for Backend {
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
         self.selection_range_impl(params).await
+    }
+
+    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
+        self.document_link_impl(params).await
     }
 
     async fn prepare_rename(
