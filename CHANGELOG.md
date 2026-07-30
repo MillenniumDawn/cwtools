@@ -14,10 +14,21 @@
   Fuse type/subtype collection, reuse indexed instances for CW100, cache
   ruleset lookups, and carry scan URIs across passes. Diagnostics must remain
   byte-identical.
+- A localisation edit parses the buffer once instead of three times. The live overlay's key set, the diagnostics, and the hover text each parsed the whole file for themselves, and two of them copied it into an owned `String` first. On a 292 KB loc file that is 7.2ms of parse per keystroke down to 2.4ms. (#87)
+- The two localisation key sets the validate path derives from the open-file and watched-file overlays are built once and shared. The `$ref$` name universe (37ms to build at Millennium Dawn scale) was rebuilt on every loc edit, and the overlay union was rebuilt and re-cloned for every validated file, so a watched batch paid it once per file in the batch. (#87)
+- Completion's fallback list is filtered while the cache lock is held and only the matches are copied, instead of cloning the whole capped list on every keystroke and then discarding most of it. (#87)
+- Feature requests that arrive before a newly opened document's first validate share one parse. Hover, goto, completion, semantic tokens and inlay hints all fire off the same keystroke and each re-parsed the file for itself in that window. (#87)
+- Diagnostic ranges no longer allocate a string per squiggle to trim trailing whitespace off the end position. (#87)
+- The single-file parse, index and validate run inside `block_in_place`, so a large file no longer occupies an async runtime worker for the whole validation. The workspace scan already fenced its equivalent work. (#87)
 
 ## Notes
 
 - **Behavioral:** the sixteen codes above span their key token rather than the block or statement they open. Anything matching on diagnostic ranges rather than the start position will see the change.
+
+## Developer
+
+- `index_parsed_file`, `merged_rules_for_type`, `semantic_tokens_full_impl`, `TypeIndex::merge` and `vanilla_cache::load` carry tracing spans, so `CWTOOLS_PROFILE` ranks them against the paths that were already instrumented. PROFILING.md lists the full set. (#87)
+- Every write to a localisation overlay goes through a guard whose `Drop` bumps the revision the derived key-set caches are keyed on, so a new write site cannot leave those caches serving a key set that predates it. (#87)
 
 # 2.4.0
 

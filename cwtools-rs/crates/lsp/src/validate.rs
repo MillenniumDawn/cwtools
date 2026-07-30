@@ -1475,6 +1475,37 @@ mod perf_bench {
         });
     }
 
+    /// The parse a loc keystroke pays, before and after #87. The edited buffer
+    /// used to be parsed three times — once for the live overlay's key set, once
+    /// for the diagnostics, once for the hover text — and copied into an owned
+    /// `String` twice on the way, because `LocService::from_files` takes
+    /// ownership. Both sides exclude the diagnostics build, which is unchanged.
+    #[test]
+    #[ignore]
+    fn perf_loc_edit_parse() {
+        const ENTRIES: usize = 4_000;
+        let path = "localisation/bench_l_english.yml";
+        let mut text = String::from("\u{FEFF}l_english:\n");
+        for i in 0..ENTRIES {
+            text.push_str(&format!(
+                " key_{i:05}:0 \"Localised text for $other_key_{i:05}$ with [GetName] in it\"\n"
+            ));
+        }
+        eprintln!("fixture: {} bytes, {ENTRIES} entries", text.len());
+
+        bench("loc parse x1 (after)", 20, || {
+            parse_loc_buffer(&text, path).len()
+        });
+        bench("loc parse x3 + 2 copies (before)", 20, || {
+            let owned = text.to_string();
+            let a = parse_loc_buffer(&owned, path);
+            let b = parse_loc_buffer(&text, path);
+            let owned = text.to_string();
+            let c = parse_loc_buffer(&owned, path);
+            a.len() + b.len() + c.len()
+        });
+    }
+
     /// The `$ref$` name set every loc-file edit builds ([`loc_ref_names`]), at
     /// Millennium-Dawn scale. `validate_loc_text` used to build one of these per
     /// call, so an edit with N loc files open paid it N+1 times; it is now built
