@@ -404,6 +404,7 @@ impl TypeIndex {
     /// kept out of `name_counts` — they share the instance's name with the base
     /// `type` entry, and double-counting would skew `is_any_instance` refcounts
     /// and document-symbol output without adding a distinct definition.
+    #[tracing::instrument(skip_all, fields(types = per_type.len()))]
     pub fn merge(&mut self, file_uri: &str, per_type: HashMap<String, Vec<TypeInstance>>) {
         let uri: Arc<str> = Arc::from(file_uri);
         for (type_name, instances) in per_type {

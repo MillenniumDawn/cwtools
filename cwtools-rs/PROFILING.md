@@ -32,8 +32,13 @@ instrumented hot path, with its busy/idle time. The instrumented paths today:
 
 - `parse_string` (parser) — one span per file parsed
 - `collect_type_instances` (index) — one span per file indexed
+- `TypeIndex::merge` (index) — one span per file merged into the type index
+- `load` (index, `vanilla_cache`) — the vanilla cache read at startup
 - `post_process` (rules) — the single ruleset post-processing pass
 - `validate_ast_with_loc` / `validate_prepared` (validation) — one span per file validated
+- `merged_rules_for_type` (validation) — one span per typed definition's subtype merge
+- `parse_and_validate` / `index_parsed_file` (lsp) — one span per file the server validates
+- `semantic_tokens_full_impl` (lsp) — one span per semantic-tokens request
 
 Filter to a single crate to cut noise:
 

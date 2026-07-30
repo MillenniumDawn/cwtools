@@ -277,9 +277,17 @@ impl<'a> DocLines<'a> {
         let (mut line, mut col) = (line, col);
         loop {
             let text = self.lines.get(line as usize).copied().unwrap_or("");
-            let consumed: String = text.chars().take(col as usize).collect();
-            if !consumed.trim().is_empty() {
-                col = consumed.trim_end().chars().count() as u32;
+            // Chars up to and including the last non-whitespace one in the first
+            // `col`, counted in a single pass — this runs per diagnostic, so the
+            // old collect-then-trim allocated a String per squiggle.
+            let mut content_end = 0;
+            for (i, c) in text.chars().take(col as usize).enumerate() {
+                if !c.is_whitespace() {
+                    content_end = i as u32 + 1;
+                }
+            }
+            if content_end > 0 {
+                col = content_end;
                 break;
             }
             let Some(prev) = line.checked_sub(1) else {
@@ -496,6 +504,7 @@ impl Backend {
     /// `parsed_version` is the document version `parsed` came from, when it came
     /// from an open document. Callers indexing from disk (the workspace scan,
     /// the did_close restore) pass `None`.
+    #[tracing::instrument(skip_all, fields(uri = %uri))]
     pub(crate) fn index_parsed_file(
         &self,
         uri: &str,

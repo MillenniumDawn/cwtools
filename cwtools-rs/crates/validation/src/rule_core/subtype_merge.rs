@@ -116,6 +116,7 @@ pub(crate) type MergedTypeRules<'a> = (
 /// set, `merged` is the union of every subtype's rules so discriminator-gated
 /// fields are offered before the discriminator is typed (see
 /// [`all_subtype_rules_union`]). Validation always passes `false`.
+#[tracing::instrument(skip_all, fields(type_name = %type_def.name))]
 pub(crate) fn merged_rules_for_type<'a>(
     ctx: &ValidationCtx,
     type_def: &'a TypeDefinition,
