@@ -3248,6 +3248,45 @@ fn test_folding_ranges_comments_and_regions() {
 }
 
 #[test]
+fn test_selection_range_expands_token_to_blocks() {
+    // Expanding from `bar`: token, then block content, then the full block.
+    let doc = "a = {\n    foo = bar\n}\n";
+    let files = &[("common/national_focus/f.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/national_focus/f.txt"],
+        serde_json::json!({}),
+        "common/national_focus/f.txt",
+        "textDocument/selectionRange",
+        serde_json::json!({ "positions": [{ "line": 1, "character": 10 }] }),
+    );
+    let chain = &result.as_array().expect("one entry per position")[0];
+    assert_eq!(
+        chain["range"]["start"]["character"], 10,
+        "token start: {}",
+        result
+    );
+    assert_eq!(
+        chain["range"]["end"]["character"], 13,
+        "token end: {}",
+        result
+    );
+    let parent = &chain["parent"];
+    assert_eq!(
+        parent["range"]["start"]["line"], 0,
+        "content parent: {}",
+        result
+    );
+    let grandparent = &parent["parent"];
+    assert_eq!(
+        grandparent["range"]["start"]["character"], 4,
+        "full-pair grandparent starts at the open brace: {}",
+        result
+    );
+}
+
+#[test]
 fn test_document_highlight_occurrences() {
     // `MY_FOCUS` appears three times; highlighting one returns all three.
     let doc = "a = {\n    has_focus = MY_FOCUS\n}\nb = {\n    has_focus = MY_FOCUS\n}\nc = {\n    load_oob = MY_FOCUS\n}\n";

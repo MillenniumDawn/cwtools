@@ -449,6 +449,50 @@ impl Backend {
         }
     }
 
+    pub(crate) async fn selection_range_impl(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let uri = params.text_document.uri.to_string();
+        let Some(text) = self.file_text_for(&uri) else {
+            return Ok(None);
+        };
+        let encoding = self.state.config.read().position_encoding.clone();
+        let pairs = brace_pairs(&text);
+        // One chain per requested position, in request order (LSP requires the
+        // result to line up with `positions`).
+        let out: Vec<SelectionRange> = params
+            .positions
+            .iter()
+            .map(|pos| {
+                // The conversion returns a 1-based line; only the char column
+                // is needed (the request's 0-based line is used directly).
+                let (_, col) = lsp_pos_to_source_in_text(&text, *pos, &encoding);
+                let spans = selection_spans(&text, &pairs, pos.line, col as u32);
+                let mut node: Option<SelectionRange> = None;
+                for &((sl, sc), (el, ec)) in spans.iter().rev() {
+                    node = Some(SelectionRange {
+                        range: Range {
+                            start: source_position_to_lsp(&text, sl, sc, &encoding),
+                            end: source_position_to_lsp(&text, el, ec, &encoding),
+                        },
+                        parent: node.map(Box::new),
+                    });
+                }
+                // Outside any token or block: an empty chain is not allowed,
+                // so anchor at the cursor itself.
+                node.unwrap_or(SelectionRange {
+                    range: Range {
+                        start: *pos,
+                        end: *pos,
+                    },
+                    parent: None,
+                })
+            })
+            .collect();
+        Ok(Some(out))
+    }
+
     pub(crate) async fn document_highlight_impl(
         &self,
         params: DocumentHighlightParams,
@@ -1202,6 +1246,92 @@ fn brace_folding_ranges(text: &str) -> Vec<FoldingRange> {
     ranges
 }
 
+/// A start/end span in source char coordinates: ((line, col), (line, col)),
+/// end-exclusive.
+type CharSpan = ((u32, u32), (u32, u32));
+
+/// Every matched `{ … }` pair in `text` as ((open_line, open_col),
+/// (close_line, close_col)) char positions of the braces themselves, from the
+/// same comment- and string-aware scan folding uses.
+fn brace_pairs(text: &str) -> Vec<CharSpan> {
+    let mut pairs = Vec::new();
+    let mut stack: Vec<(u32, u32)> = Vec::new();
+    let (mut line, mut col): (u32, u32) = (0, 0);
+    let mut in_string = false;
+    let mut in_comment = false;
+    for c in text.chars() {
+        if c == '\n' {
+            line += 1;
+            col = 0;
+            in_comment = false;
+            // Quoted strings never span lines in this grammar.
+            in_string = false;
+            continue;
+        }
+        let here = (line, col);
+        col += 1;
+        if c == '\r' || in_comment {
+            continue;
+        }
+        if in_string {
+            if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '#' => in_comment = true,
+            '"' => in_string = true,
+            '{' => stack.push(here),
+            '}' => {
+                if let Some(open) = stack.pop() {
+                    pairs.push((open, here));
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+/// The innermost-first selection chain at (line0, col): the identifier token
+/// under the cursor, then for each enclosing brace pair its content span
+/// (inside the braces) followed by the full span (including them). Every span
+/// contains the previous one, as `textDocument/selectionRange` requires.
+fn selection_spans(text: &str, pairs: &[CharSpan], line0: u32, col: u32) -> Vec<CharSpan> {
+    let mut spans: Vec<CharSpan> = Vec::new();
+    if let Some(line) = text.lines().nth(line0 as usize) {
+        let chars: Vec<char> = line.chars().collect();
+        let cur = (col as usize).min(chars.len());
+        let mut start = cur;
+        while start > 0 && is_ident_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = cur;
+        while end < chars.len() && is_ident_char(chars[end]) {
+            end += 1;
+        }
+        if start < end {
+            spans.push(((line0, start as u32), (line0, end as u32)));
+        }
+    }
+    let pos = (line0, col);
+    let mut enclosing: Vec<&CharSpan> = pairs
+        .iter()
+        .filter(|(open, close)| *open <= pos && pos <= *close)
+        .collect();
+    // Innermost first: the latest-opening enclosing pair is the tightest.
+    enclosing.sort_by_key(|p| std::cmp::Reverse(p.0));
+    for &&((ol, oc), (cl, cc)) in &enclosing {
+        let inner = ((ol, oc + 1), (cl, cc));
+        if inner.0 < inner.1 {
+            spans.push(inner);
+        }
+        spans.push(((ol, oc), (cl, cc + 1)));
+    }
+    spans
+}
+
 /// Folding ranges the brace scan can't produce: runs of two or more full-line
 /// `#` comments fold as `Comment`, and `#region` / `#endregion` marker pairs
 /// (stack-matched, so they nest) fold as `Region`. Marker lines belong to
@@ -1212,7 +1342,7 @@ fn comment_and_region_folds(text: &str) -> Vec<FoldingRange> {
     let mut region_stack: Vec<u32> = Vec::new();
     let mut run_start: Option<u32> = None;
     let mut prev_line: u32 = 0;
-    let mut close_run = |start: Option<u32>, end_line: u32, folds: &mut Vec<FoldingRange>| {
+    let close_run = |start: Option<u32>, end_line: u32, folds: &mut Vec<FoldingRange>| {
         if let Some(start) = start
             && end_line > start
         {
@@ -1572,6 +1702,54 @@ mod tests {
             "got {:?}",
             folds
         );
+    }
+
+    #[test]
+    fn selection_spans_token_then_inner_then_full_pair() {
+        let text = "a = {\n    foo = bar\n}\n";
+        let pairs = brace_pairs(text);
+        // Cursor inside `bar` (line 1, col 10).
+        let spans = selection_spans(text, &pairs, 1, 10);
+        assert_eq!(
+            spans,
+            vec![
+                ((1, 10), (1, 13)), // the token
+                ((0, 5), (2, 0)),   // inside the braces
+                ((0, 4), (2, 1)),   // including the braces
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_spans_nested_pairs_chain_outward() {
+        let text = "a = {\n    b = {\n        x = 1\n    }\n}\n";
+        let pairs = brace_pairs(text);
+        let spans = selection_spans(text, &pairs, 2, 8);
+        assert_eq!(
+            spans,
+            vec![
+                ((2, 8), (2, 9)), // `x`
+                ((1, 9), (3, 4)), // inside inner braces
+                ((1, 8), (3, 5)), // inner pair
+                ((0, 5), (4, 0)), // inside outer braces
+                ((0, 4), (4, 1)), // outer pair
+            ]
+        );
+    }
+
+    #[test]
+    fn brace_pairs_ignore_comments_and_strings() {
+        assert!(brace_pairs("# { not a block\n").is_empty());
+        assert!(brace_pairs("x = \"{\"\n").is_empty());
+    }
+
+    #[test]
+    fn selection_spans_on_whitespace_start_at_block() {
+        let text = "a = {\n    foo = bar\n}\n";
+        let pairs = brace_pairs(text);
+        // Cursor on the indent whitespace: no token, chain starts at the block.
+        let spans = selection_spans(text, &pairs, 1, 2);
+        assert_eq!(spans, vec![((0, 5), (2, 0)), ((0, 4), (2, 1))]);
     }
 
     #[test]

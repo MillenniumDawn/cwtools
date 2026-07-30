@@ -1432,6 +1432,13 @@ impl LanguageServer for Backend {
         self.document_highlight_impl(params).await
     }
 
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        self.selection_range_impl(params).await
+    }
+
     async fn prepare_rename(
         &self,
         params: TextDocumentPositionParams,
