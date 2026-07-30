@@ -1,10 +1,9 @@
 //! Header validation and corruption handling for `.cwb` files.
 //!
 //! Every case here has to come back as a `CacheError`, because that is what the
-//! consumers rely on: `cwtools_lsp::workspace_cache::load` collapses any error
-//! to `None` and re-parses the source. A panic instead would take the server
-//! (or the CLI) down over a cache file that a crash, a full disk, or a stale
-//! format left behind.
+//! consumers rely on: `cwtools_cache::workspace::load` collapses any error to
+//! `None` and re-parses the source. A panic instead would take the server or CLI
+//! down over a cache file that a crash, a full disk, or a stale format left behind.
 
 use cwtools_cache::cache_format::{
     CachedChild, CachedFile, CachedLeaf, CachedOperator, CachedValue,

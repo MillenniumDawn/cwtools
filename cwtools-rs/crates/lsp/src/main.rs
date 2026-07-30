@@ -27,7 +27,6 @@ mod paths;
 mod scan;
 mod semantic;
 mod validate;
-mod workspace_cache;
 
 pub(crate) type LocTextMap = FxHashMap<Arc<str>, Vec<(cwtools_localization::Lang, String)>>;
 pub(crate) type LocLocationMap = FxHashMap<Arc<str>, (Arc<str>, u32)>;

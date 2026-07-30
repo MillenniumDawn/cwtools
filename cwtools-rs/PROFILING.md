@@ -49,7 +49,7 @@ RUST_LOG=cwtools_index=info,cwtools_rules=info cargo run --release -p cwtools_cl
 
 Independent of the tracing subscriber, `cwtools validate` prints coarse
 per-phase timings on stderr when `CWTOOLS_TIMINGS` is set (any value). Each line
-is `  [t] <phase> <elapsed>` for the three top-level stages: `load` (the whole
+contains `[t] <phase> <elapsed>` for the three top-level stages: `load` (the whole
 `Session::load`: rules, discovery, indexing, loc, registry), `validate-config`
 (the file validation pass), and `validate-loc` (loc-project diagnostics). Use it
 for a quick where-did-the-time-go read without pulling in the full span output:
@@ -101,33 +101,18 @@ The CLI exposes the same two lists as repeatable flags:
 
 Two pieces:
 
-**3a (in-memory pass-through) — shipped.** The full-workspace scan runs two
-passes over every file. Pass 1 parses to populate the type index; pass 2
-re-parses and validates. Pass 1 used to throw away the AST and pass 2 used
-to re-parse from disk. With the loc service now scoped to an inner block
-(so peak RSS is bounded) we keep `Vec<Option<ParsedFile>>` between passes
-and drop it before the profile/RSS-summary block. Net effect: ~4-6s
-shaved off the scan, steady-state RSS unchanged.
+**3a (in-memory pass-through) — shipped.** The LSP full-workspace scan runs
+two passes over every file. Pass 1 parses to populate the type index, then hands
+its `Vec<Option<ParsedFile>>` to validation in pass 2. The ASTs are dropped before
+the profile/RSS-summary block. Net effect: ~4-6s shaved off the scan,
+steady-state RSS unchanged.
 
-**3b (on-disk persisted) — deferred.** The `ParsedFile` AST uses the LSP's
-process-wide `StringTable` for every key, exposed as `StringTokens`
-indices. Caching the AST to disk and reloading in a new process requires
-the AST to be self-contained (owned `String` keys, no interner). That
-crosses a parser/validation/info/LSP boundary and is too big to ride
-along on a perf-fix branch.
+**3b (on-disk persisted) — shipped.** The LSP and CLI share the parse cache
+under `<cache_dir>/parse-cache/<workspace-fingerprint>/`. Each entry contains
+a self-contained `.cwb` AST and a recovered-parse-error sidecar. Loading interns
+its strings into the current process's `StringTable`.
 
-When the time comes, the design is:
-
-- **Storage**: `<state.cache_dir>/workspaces/<workspace-fingerprint>/`
-  - `settings.sig` — 8-byte FNV-1a of (engine version, ruleset signature,
-    user globs, workspace exclude dirs). Changing this invalidates the
-    whole workspace dir.
-  - `<file-blob-hash>.cwb` — one per file, keyed by FNV-1a of
-    `(absolute_path, mtime_unix_nanos, file_size)`. rkyv+zstd, same crate
-    the vanilla `cwtools_cache` uses.
-- **Lookup order in pass 2**: in-memory (3a) → on-disk blob → re-parse.
-- **Prerequisite refactor**: parser outputs a self-contained AST variant
-  (or `rkyv::Archive` is derived directly after the `StringTable` is
-  peeled back to a `HashMap<String, u32>` lookup). Either way, the
-  `StringTable` becomes an optional layer on top of the AST, not baked
-  into the type.
+On Unix, disk-file entries use the path, mtime, size, inode, and ctime, so a
+warm hit skips reading the source. Other platforms use a content hash after the
+read. The CLI caches both indexing and validation, but still drops the first
+AST set before localisation indexing to keep the large-workspace memory bound.

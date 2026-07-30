@@ -1,7 +1,8 @@
-use crate::cache_format::{ArchivedCachedFile, CachedFile};
+use crate::cache_format::{ArchivedCachedFile, CachedErrors, CachedFile};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -45,6 +46,47 @@ const MAGIC: &[u8; 4] = b"CWB\x00";
 ///     clause slab; the AST/cache use only Leaf + Value::Clause).
 const FORMAT_VERSION: u8 = 3;
 
+const ERRORS_MAGIC: &[u8; 4] = b"CWE\x00";
+const ERRORS_FORMAT_VERSION: u8 = 1;
+
+static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+fn temp_path(path: &Path) -> PathBuf {
+    let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(format!(".tmp-{}-{id}", std::process::id()));
+    PathBuf::from(temp)
+}
+
+fn write_atomically(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<(), CacheError> {
+    let temp = temp_path(path);
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = File::create(&temp)?;
+        write(&mut file)
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(CacheError::Io(error));
+    }
+
+    if let Err(error) = std::fs::rename(&temp, path) {
+        #[cfg(windows)]
+        if path.exists() {
+            // Windows rename does not replace an existing destination. Removing
+            // it is safe because readers already treat a miss as a re-parse.
+            std::fs::remove_file(path)?;
+            std::fs::rename(&temp, path)?;
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&temp);
+        return Err(CacheError::Io(error));
+    }
+    Ok(())
+}
+
 /// Serialize a `CachedFile` to a `.cwb` file (zstd-compressed rkyv).
 ///
 /// Layout: `MAGIC (4 bytes) | FORMAT_VERSION (1 byte) | zstd(rkyv bytes)`.
@@ -67,11 +109,11 @@ pub fn serialize_to_file(cached: &CachedFile, path: &Path) -> Result<(), CacheEr
         encoder.finish().map_err(CacheError::Compression)?
     };
 
-    let mut file = File::create(path)?;
-    file.write_all(MAGIC)?;
-    file.write_all(&[FORMAT_VERSION])?;
-    file.write_all(&compressed)?;
-    Ok(())
+    write_atomically(path, |file| {
+        file.write_all(MAGIC)?;
+        file.write_all(&[FORMAT_VERSION])?;
+        file.write_all(&compressed)
+    })
 }
 
 /// Read a `.cwb` file, validate its header, and return the decompressed rkyv
@@ -117,4 +159,36 @@ pub fn with_archived_file<R>(
             }
         })?;
     Ok(f(archived))
+}
+
+/// Serialize recovered parse errors to the sidecar paired with a `.cwb`.
+pub fn serialize_errors_to_file(cached: &CachedErrors, path: &Path) -> Result<(), CacheError> {
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(cached).map_err(CacheError::Serialize)?;
+    write_atomically(path, |file| {
+        file.write_all(ERRORS_MAGIC)?;
+        file.write_all(&[ERRORS_FORMAT_VERSION])?;
+        file.write_all(&bytes)
+    })
+}
+
+/// Read and validate a recovered-parse-error sidecar.
+pub fn read_errors_from_file(path: &Path) -> Result<CachedErrors, CacheError> {
+    let data = std::fs::read(path)?;
+    if data.len() < ERRORS_MAGIC.len() + 1
+        || &data[..ERRORS_MAGIC.len()] != ERRORS_MAGIC
+        || data[ERRORS_MAGIC.len()] != ERRORS_FORMAT_VERSION
+    {
+        return Err(CacheError::Deserialize {
+            msg: "incompatible or missing error-cache header",
+            source: None,
+        });
+    }
+    let mut aligned = rkyv::util::AlignedVec::<16>::new();
+    aligned.extend_from_slice(&data[ERRORS_MAGIC.len() + 1..]);
+    rkyv::from_bytes::<CachedErrors, rkyv::rancor::Error>(&aligned).map_err(|error| {
+        CacheError::Deserialize {
+            msg: "error-cache rkyv access failed",
+            source: Some(error),
+        }
+    })
 }

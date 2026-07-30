@@ -1,15 +1,18 @@
-//! Persistent per-file parse cache for the workspace scan.
+//! Persistent per-file parse cache for workspace scans and batch validation.
 //!
-//! Each file is keyed by a content hash (FNV-1a of the text). A `settings.sig`
-//! file in the workspace cache directory records a fingerprint derived from the
-//! game type, ruleset shape, and workspace root so the entire cache is cleared
-//! automatically when any of those change.
+//! Entries can be keyed by source path, mtime, and size so a hit skips reading
+//! the source file. Content-keyed access remains available for in-memory text.
+//! A `settings.sig` records the game, ruleset shape, and workspace root.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cwtools_cache::convert::{archived_to_arena, arena_to_cached};
-use cwtools_cache::io::{serialize_to_file, with_archived_file};
+use crate::convert::{
+    archived_to_arena, arena_to_cached, cached_errors_to_parse, errors_to_cached,
+};
+use crate::io::{
+    read_errors_from_file, serialize_errors_to_file, serialize_to_file, with_archived_file,
+};
 use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
@@ -25,7 +28,11 @@ use cwtools_string_table::string_table::StringTable;
 /// v3: dropped `CachedNode`/`CachedChild::Node` from the `CachedFile` layout.
 /// v4: workspace scans discard comments before caching because only open-document
 /// semantic-token parsing needs them.
-const CACHE_VERSION: u32 = 4;
+/// v5: recovered parse errors are persisted with the AST.
+const CACHE_VERSION: u32 = 5;
+
+/// Whether platform metadata provides a reliable no-read change stamp.
+pub const PATH_METADATA_CACHE_SUPPORTED: bool = cfg!(unix);
 
 // ── Fingerprinting ──────────────────────────────────────────────────────────
 
@@ -51,6 +58,46 @@ pub fn content_hash(text: &str) -> u64 {
     fnv1a(text.as_bytes(), FNV_OFFSET)
 }
 
+/// Source metadata captured before reading and parsing a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCacheKey {
+    hash: u64,
+}
+
+/// Capture the path, mtime, and size key used for a no-read cache lookup.
+pub fn source_cache_key(path: &Path) -> Option<SourceCacheKey> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut hash = fnv1a(absolute.to_string_lossy().as_bytes(), FNV_OFFSET);
+    hash = fnv1a(b"\x1e", hash);
+    hash = fnv1a(&metadata.len().to_le_bytes(), hash);
+    if let Some(modified) = modified {
+        hash = fnv1a(&modified.as_secs().to_le_bytes(), hash);
+        hash = fnv1a(&modified.subsec_nanos().to_le_bytes(), hash);
+    } else {
+        hash = fnv1a(&[0; 12], hash);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hash = fnv1a(&metadata.dev().to_le_bytes(), hash);
+        hash = fnv1a(&metadata.ino().to_le_bytes(), hash);
+        hash = fnv1a(&metadata.ctime().to_le_bytes(), hash);
+        hash = fnv1a(&metadata.ctime_nsec().to_le_bytes(), hash);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        hash = fnv1a(&metadata.creation_time().to_le_bytes(), hash);
+        hash = fnv1a(&metadata.file_attributes().to_le_bytes(), hash);
+    }
+    Some(SourceCacheKey { hash })
+}
+
 /// Settings fingerprint: encodes everything that changes the parse or validation
 /// output for a workspace. If the fingerprint differs from `settings.sig`, the
 /// cached workspace directory is stale and must be cleared.
@@ -64,6 +111,9 @@ pub fn settings_fingerprint(language: &str, ruleset: &RuleSet, workspace_root: &
     h = sep(h);
     // Workspace root — distinguishes two mods opened in different windows that
     // happen to share the same ruleset.
+    let workspace_root = fs::canonicalize(workspace_root).unwrap_or_else(|_| {
+        std::path::absolute(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf())
+    });
     h = fnv1a(workspace_root.to_string_lossy().as_bytes(), h);
     h = sep(h);
     // Ruleset shape — we can't hash the full RuleSet cheaply (no Hash impl),
@@ -123,6 +173,10 @@ fn file_cache_path(dir: &Path, hash: u64) -> PathBuf {
     dir.join(format!("{:016x}.cwb", hash))
 }
 
+fn error_cache_path(dir: &Path, hash: u64) -> PathBuf {
+    dir.join(format!("{:016x}.cwe", hash))
+}
+
 // ── Settings sig ────────────────────────────────────────────────────────────
 
 /// Read the stored fingerprint from `settings.sig`. Returns `None` if the file
@@ -138,80 +192,65 @@ fn read_settings_sig(dir: &Path) -> Option<u64> {
 }
 
 /// Write the current fingerprint to `settings.sig`.
-fn write_settings_sig(dir: &Path, sig: u64) {
-    if let Err(e) = fs::create_dir_all(dir) {
-        tracing::warn!(dir = %dir.display(), error = %e, "settings.sig: create_dir_all failed");
-    }
-    if let Err(e) = fs::write(settings_sig_path(dir), sig.to_le_bytes()) {
-        tracing::warn!(dir = %dir.display(), error = %e, "settings.sig: write failed");
-    }
+fn write_settings_sig(dir: &Path, sig: u64) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    fs::write(settings_sig_path(dir), sig.to_le_bytes())
 }
 
 /// Validate (and update) the settings signature. Returns `true` if the cache is
 /// still valid; `false` if the directory was cleared and must be rebuilt.
-///
-/// Also sweeps sibling `parse-cache/<fp>/` directories that don't match the
-/// current fingerprint so old workspaces don't accumulate forever on disk.
-pub fn validate_or_clear(cache_dir: &Path, fingerprint: u64) -> bool {
+pub fn validate_or_clear(cache_dir: &Path, fingerprint: u64) -> std::io::Result<bool> {
     let dir = workspace_cache_dir(cache_dir, fingerprint);
-    sweep_orphan_dirs(cache_dir, fingerprint);
     match read_settings_sig(&dir) {
         Some(stored) if stored == fingerprint => {
-            // Valid cache: evict stale-content `.cwb` entries if the dir has
-            // grown past the cap. (A cleared dir below is already empty.)
-            prune_cache_dir(&dir);
-            true
+            prune(cache_dir, fingerprint);
+            Ok(true)
         }
         _ => {
-            // Stale or missing — wipe the directory and recreate.
-            if let Err(e) = fs::remove_dir_all(&dir)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(dir = %dir.display(), error = %e, "cache reset: remove_dir_all failed");
-            }
-            if let Err(e) = fs::create_dir_all(&dir) {
-                tracing::warn!(dir = %dir.display(), error = %e, "cache reset: create_dir_all failed");
-            }
-            write_settings_sig(&dir, fingerprint);
-            false
+            clear_cache_dir(&dir)?;
+            write_settings_sig(&dir, fingerprint)?;
+            prune_all_cache_dirs(cache_dir, &dir);
+            Ok(false)
         }
     }
 }
 
-/// Remove any `parse-cache/<old-fp>/` sibling directories whose fingerprint
-/// hex name differs from `current_fingerprint`. This prevents old per-workspace
-/// directories from accumulating on disk across ruleset/workspace-root changes.
-fn sweep_orphan_dirs(cache_dir: &Path, current_fingerprint: u64) {
-    let parse_cache_root = cache_dir.join("parse-cache");
-    let current_hex = format!("{:016x}", current_fingerprint);
-    let Ok(rd) = fs::read_dir(&parse_cache_root) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name != current_hex)
-            && let Err(e) = fs::remove_dir_all(&path)
-        {
-            tracing::warn!(path = %path.display(), error = %e, "orphan cache dir sweep failed");
-        }
-    }
+/// Enforce the per-fingerprint and global cache caps after a batch of writes.
+pub fn prune(cache_dir: &Path, fingerprint: u64) {
+    let dir = workspace_cache_dir(cache_dir, fingerprint);
+    prune_cache_dir(&dir);
+    prune_all_cache_dirs(cache_dir, &dir);
 }
 
 // ── Bounded cleanup ───────────────────────────────────────────────────────────
 
+fn clear_cache_dir(dir: &Path) -> std::io::Result<()> {
+    let files = match fs::read_dir(dir) {
+        Ok(files) => Some(files),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(files) = files {
+        for entry in files {
+            let path = entry?.path();
+            if path.is_file() {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    fs::create_dir_all(dir)
+}
+
 /// Cap on the number of `.cwb` entries kept in a single workspace cache dir.
-/// Each file's content hash gets its own entry and nothing is evicted on edit,
-/// so without a bound, every distinct version of every file accumulates forever.
+/// Each source version gets its own entry, so old versions must be bounded.
 const MAX_CACHE_ENTRIES: usize = 50_000;
 
-/// Cap on total `.cwb` bytes in a single workspace cache dir.
+/// Cap on total `.cwb` and parse-error sidecar bytes in one workspace cache dir.
 const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Caps across all workspace/settings fingerprints under one cache root.
+const MAX_TOTAL_CACHE_ENTRIES: usize = 100_000;
+const MAX_TOTAL_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 
 /// Prune to ~80% of the caps so we don't re-prune on every scan.
 const PRUNE_TARGET_RATIO: f64 = 0.8;
@@ -223,101 +262,220 @@ fn prune_cache_dir(dir: &Path) {
     prune_cache_dir_with_caps(dir, MAX_CACHE_ENTRIES, MAX_CACHE_BYTES);
 }
 
+fn prune_all_cache_dirs(cache_dir: &Path, current_dir: &Path) {
+    prune_all_cache_dirs_with_caps(
+        cache_dir,
+        MAX_TOTAL_CACHE_ENTRIES,
+        MAX_TOTAL_CACHE_BYTES,
+        Some(current_dir),
+    );
+}
+
+fn prune_all_cache_dirs_with_caps(
+    cache_dir: &Path,
+    max_entries: usize,
+    max_bytes: u64,
+    current_dir: Option<&Path>,
+) {
+    let root = cache_dir.join("parse-cache");
+    let Ok(dirs) = fs::read_dir(root) else {
+        return;
+    };
+    let dirs: Vec<PathBuf> = dirs
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    if dirs.len() > 2 {
+        let mut entries = Vec::new();
+        let mut total_bytes = 0u64;
+        for dir in &dirs {
+            collect_cache_entries(dir, &mut entries, &mut total_bytes);
+        }
+        prune_entries(entries, total_bytes, max_entries, max_bytes);
+    }
+    remove_empty_cache_dirs(&dirs, current_dir);
+}
+
+fn remove_empty_cache_dirs(dirs: &[PathBuf], current_dir: Option<&Path>) {
+    for dir in dirs {
+        if current_dir.is_some_and(|current| current == dir) || count_cache_entries(dir) != 0 {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(dir) else {
+            continue;
+        };
+        for file in files.flatten().filter(|entry| entry.path().is_file()) {
+            let _ = fs::remove_file(file.path());
+        }
+        let _ = fs::remove_dir(dir);
+    }
+}
+
+fn count_cache_entries(dir: &Path) -> usize {
+    let Ok(files) = fs::read_dir(dir) else {
+        return 0;
+    };
+    files
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "cwb")
+        })
+        .count()
+}
+
 /// Cap-parameterized core of [`prune_cache_dir`] (lets tests use small caps
 /// instead of writing 50k files).
 fn prune_cache_dir_with_caps(dir: &Path, max_entries: usize, max_bytes: u64) {
-    let Ok(rd) = fs::read_dir(dir) else {
+    let mut entries = Vec::new();
+    let mut total_bytes = 0u64;
+    collect_cache_entries(dir, &mut entries, &mut total_bytes);
+    prune_entries(entries, total_bytes, max_entries, max_bytes);
+}
+
+fn collect_cache_entries(
+    dir: &Path,
+    entries: &mut Vec<(std::time::SystemTime, u64, PathBuf)>,
+    total_bytes: &mut u64,
+) {
+    let Ok(files) = fs::read_dir(dir) else {
         return;
     };
-    // (mtime, size, path) for each `.cwb` entry.
-    let mut entries: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
-    let mut total_bytes: u64 = 0;
-    for entry in rd.flatten() {
+    for entry in files.flatten() {
         let path = entry.path();
-        if path.extension().is_none_or(|e| e != "cwb") {
+        if path.extension().is_none_or(|extension| extension != "cwb") {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
-        let size = meta.len();
-        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-        total_bytes += size;
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let sidecar_size = path
+            .with_extension("cwe")
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let size = metadata.len().saturating_add(sidecar_size);
+        let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        *total_bytes = total_bytes.saturating_add(size);
         entries.push((mtime, size, path));
     }
+}
 
-    let over_count = entries.len() > max_entries;
-    let over_bytes = total_bytes > max_bytes;
-    if !over_count && !over_bytes {
+fn prune_entries(
+    mut entries: Vec<(std::time::SystemTime, u64, PathBuf)>,
+    total_bytes: u64,
+    max_entries: usize,
+    max_bytes: u64,
+) {
+    if entries.len() <= max_entries && total_bytes <= max_bytes {
         return;
     }
-
-    // Oldest first, so we evict least-recently-written entries.
     entries.sort_by_key(|(mtime, _, _)| *mtime);
 
     let target_count = (max_entries as f64 * PRUNE_TARGET_RATIO) as usize;
     let target_bytes = (max_bytes as f64 * PRUNE_TARGET_RATIO) as u64;
     let mut cur_count = entries.len();
     let mut cur_bytes = total_bytes;
-    let mut pruned_count = 0usize;
-    let mut pruned_bytes = 0u64;
-
-    for (_, size, path) in &entries {
+    for (_, size, path) in entries {
         if cur_count <= target_count && cur_bytes <= target_bytes {
             break;
         }
-        if fs::remove_file(path).is_ok() {
+        if fs::remove_file(&path).is_ok() {
+            let _ = fs::remove_file(path.with_extension("cwe"));
             cur_count -= 1;
-            cur_bytes = cur_bytes.saturating_sub(*size);
-            pruned_count += 1;
-            pruned_bytes += *size;
+            cur_bytes = cur_bytes.saturating_sub(size);
         }
     }
-
-    tracing::info!(
-        dir = %dir.display(),
-        pruned_entries = pruned_count,
-        pruned_bytes,
-        remaining_entries = cur_count,
-        remaining_bytes = cur_bytes,
-        "pruned parse cache (over {} entries or {} bytes)",
-        max_entries,
-        max_bytes,
-    );
 }
 
 // ── Per-file load / store ───────────────────────────────────────────────────
 
-/// Try to load a previously cached `ParsedFile` for `text`.
-///
-/// Returns `Some(ParsedFile)` on cache hit, `None` on miss.
+fn load_hash(
+    cache_dir: &Path,
+    fingerprint: u64,
+    hash: u64,
+    table: &StringTable,
+) -> Option<ParsedFile> {
+    let dir = workspace_cache_dir(cache_dir, fingerprint);
+    let path = file_cache_path(&dir, hash);
+    let (arena, root_children) =
+        with_archived_file(&path, |archived| archived_to_arena(archived, table))
+            .ok()
+            .and_then(Result::ok)?;
+    let errors = cached_errors_to_parse(read_errors_from_file(&error_cache_path(&dir, hash)).ok()?);
+    Some(ParsedFile {
+        arena,
+        root_children,
+        errors,
+    })
+}
+
+fn store_hash(
+    cache_dir: &Path,
+    fingerprint: u64,
+    hash: u64,
+    parsed: &ParsedFile,
+    table: &StringTable,
+) {
+    let dir = workspace_cache_dir(cache_dir, fingerprint);
+    let path = file_cache_path(&dir, hash);
+    let cached = arena_to_cached(&parsed.arena, &parsed.root_children, table);
+    if let Err(error) = serialize_to_file(&cached, &path) {
+        tracing::warn!(path = %path.display(), error = %error, "parse cache write failed");
+        return;
+    }
+    let error_path = error_cache_path(&dir, hash);
+    if let Err(error) = serialize_errors_to_file(&errors_to_cached(&parsed.errors), &error_path) {
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&error_path);
+        tracing::warn!(path = %error_path.display(), error = %error, "parse error cache write failed");
+    }
+}
+
+/// Load a cache entry keyed by the source path, mtime, and size.
+pub fn load_path(
+    cache_dir: &Path,
+    fingerprint: u64,
+    source_path: &Path,
+    table: &StringTable,
+) -> Option<(ParsedFile, SourceCacheKey)> {
+    if !PATH_METADATA_CACHE_SUPPORTED {
+        return None;
+    }
+    let key = source_cache_key(source_path)?;
+    let parsed = load_hash(cache_dir, fingerprint, key.hash, table)?;
+    (source_cache_key(source_path).as_ref() == Some(&key)).then_some((parsed, key))
+}
+
+/// Persist an entry only if the source metadata still matches the snapshot
+/// captured before the source was read.
+pub fn store_path(
+    cache_dir: &Path,
+    fingerprint: u64,
+    source_path: &Path,
+    source_key: &SourceCacheKey,
+    parsed: &ParsedFile,
+    table: &StringTable,
+) {
+    if PATH_METADATA_CACHE_SUPPORTED && source_cache_key(source_path).as_ref() == Some(source_key) {
+        store_hash(cache_dir, fingerprint, source_key.hash, parsed, table);
+    }
+}
+
+/// Load a cache entry keyed by the source text.
 pub fn load(
     cache_dir: &Path,
     fingerprint: u64,
     text: &str,
     table: &StringTable,
 ) -> Option<ParsedFile> {
-    let dir = workspace_cache_dir(cache_dir, fingerprint);
-    let hash = content_hash(text);
-    let path = file_cache_path(&dir, hash);
-
-    // Zero-copy hit path: intern straight from the archived buffer instead of
-    // materializing an owned CachedFile first (halves per-string allocation).
-    // Either an IO/rkyv failure or an out-of-bounds child index collapses to a
-    // cache miss so the caller re-parses.
-    with_archived_file(&path, |archived| archived_to_arena(archived, table))
-        .ok()
-        .and_then(Result::ok)
-        .map(|(arena, root_children)| ParsedFile {
-            arena,
-            root_children,
-            errors: vec![],
-        })
+    load_hash(cache_dir, fingerprint, content_hash(text), table)
 }
 
-/// Persist a successfully parsed (error-free) `ParsedFile` to the cache.
-///
-/// Files with parse errors are intentionally NOT cached — the user will edit
-/// them, the content hash will change, and we'll re-parse. Caching error-free
-/// files only keeps the hot path fast for the common case.
+/// Persist an entry keyed by the source text.
 pub fn store(
     cache_dir: &Path,
     fingerprint: u64,
@@ -325,18 +483,7 @@ pub fn store(
     parsed: &ParsedFile,
     table: &StringTable,
 ) {
-    // Don't cache files that had parse errors — diagnostics would be lost.
-    if !parsed.errors.is_empty() {
-        return;
-    }
-    let dir = workspace_cache_dir(cache_dir, fingerprint);
-    let hash = content_hash(text);
-    let path = file_cache_path(&dir, hash);
-
-    let cached = arena_to_cached(&parsed.arena, &parsed.root_children, table);
-    if let Err(e) = serialize_to_file(&cached, &path) {
-        tracing::warn!(path = %path.display(), error = %e, "parse cache write failed");
-    }
+    store_hash(cache_dir, fingerprint, content_hash(text), parsed, table);
 }
 
 #[cfg(test)]
@@ -365,6 +512,11 @@ mod tests {
             base,
             settings_fingerprint("hoi4", &rs, Path::new("/tmp/other"))
         );
+        let absolute = fs::canonicalize(".").unwrap();
+        assert_eq!(
+            settings_fingerprint("hoi4", &rs, Path::new(".")),
+            settings_fingerprint("hoi4", &rs, &absolute)
+        );
     }
 
     #[test]
@@ -372,9 +524,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fp = 0xdead_beef_u64;
         // No settings.sig yet -> not valid (dir created + sig written).
-        assert!(!validate_or_clear(tmp.path(), fp));
+        assert!(!validate_or_clear(tmp.path(), fp).unwrap());
         // Same fingerprint on the next scan -> valid.
-        assert!(validate_or_clear(tmp.path(), fp));
+        assert!(validate_or_clear(tmp.path(), fp).unwrap());
+    }
+
+    #[test]
+    fn validate_or_clear_reports_an_unusable_cache_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("not-a-directory");
+        fs::write(&blocker, b"x").unwrap();
+
+        assert!(validate_or_clear(&blocker, 1).is_err());
     }
 
     #[test]
@@ -382,7 +543,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let table = StringTable::new();
         let fp = 1234;
-        validate_or_clear(tmp.path(), fp); // create the dir + sig
+        validate_or_clear(tmp.path(), fp).unwrap(); // create the dir + sig
         let text = "foo = { bar = 1 baz = \"two\" }\n";
         let parsed = parse_string(text, &table).unwrap();
 
@@ -402,7 +563,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let table = StringTable::new();
         let fp = 99;
-        validate_or_clear(tmp.path(), fp);
+        validate_or_clear(tmp.path(), fp).unwrap();
         let text = "a = 1\n";
         let parsed = parse_string(text, &table).unwrap();
         store(tmp.path(), fp, text, &parsed, &table);
@@ -411,24 +572,90 @@ mod tests {
     }
 
     #[test]
-    fn store_skips_files_with_parse_errors() {
+    fn store_preserves_parse_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let table = StringTable::new();
         let fp = 7;
-        validate_or_clear(tmp.path(), fp);
+        validate_or_clear(tmp.path(), fp).unwrap();
         let text = "x = 1\n";
         let mut parsed = parse_string(text, &table).unwrap();
         parsed.errors.push(ParseError::General("boom".into()));
         store(tmp.path(), fp, text, &parsed, &table);
-        // A file with parse errors must not be cached (diagnostics would be lost).
+
+        let loaded = load(tmp.path(), fp, text, &table).expect("expected a cache hit");
+        assert!(matches!(
+            loaded.errors.as_slice(),
+            [ParseError::General(message)] if message == "boom"
+        ));
+
+        let dir = workspace_cache_dir(tmp.path(), fp);
+        fs::write(error_cache_path(&dir, content_hash(text)), b"broken").unwrap();
         assert!(load(tmp.path(), fp, text, &table).is_none());
+    }
+
+    #[test]
+    fn path_key_hits_until_source_metadata_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        fs::write(&source, "a = 1\n").unwrap();
+        let table = StringTable::new();
+        let fp = 8;
+        validate_or_clear(tmp.path(), fp).unwrap();
+        let parsed = parse_string("a = 1\n", &table).unwrap();
+
+        let source_key = source_cache_key(&source).unwrap();
+        store_path(tmp.path(), fp, &source, &source_key, &parsed, &table);
+        assert!(load_path(tmp.path(), fp, &source, &table).is_some());
+
+        fs::write(&source, "a = 200\n").unwrap();
+        assert!(load_path(tmp.path(), fp, &source, &table).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_key_detects_same_size_edit_with_restored_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        fs::write(&source, "a = 1\n").unwrap();
+        let modified = source.metadata().unwrap().modified().unwrap();
+        let table = StringTable::new();
+        let fp = 9;
+        validate_or_clear(tmp.path(), fp).unwrap();
+        let parsed = parse_string("a = 1\n", &table).unwrap();
+        let source_key = source_cache_key(&source).unwrap();
+        store_path(tmp.path(), fp, &source, &source_key, &parsed, &table);
+
+        fs::write(&source, "a = 2\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(load_path(tmp.path(), fp, &source, &table).is_none());
+    }
+
+    #[test]
+    fn path_store_skips_a_source_changed_during_parse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        fs::write(&source, "a = 1\n").unwrap();
+        let table = StringTable::new();
+        let fp = 10;
+        validate_or_clear(tmp.path(), fp).unwrap();
+        let source_key = source_cache_key(&source).unwrap();
+        let parsed = parse_string("a = 1\n", &table).unwrap();
+
+        fs::write(&source, "a = 200\n").unwrap();
+        store_path(tmp.path(), fp, &source, &source_key, &parsed, &table);
+        assert!(load_hash(tmp.path(), fp, source_key.hash, &table).is_none());
     }
 
     /// Cold (parse + store) vs warm (deserialize) over the real Millennium Dawn
     /// corpus. The cache only earns its keep if `load` beats `parse_string`.
     ///
     /// Ignored by default (needs the MD mod on disk + is slow). Run with:
-    ///   cargo test -p cwtools_lsp --bin cwtools-server -- \
+    ///   cargo test -p cwtools_cache --lib -- \
     ///     --ignored --nocapture bench_parse_cache_vs_parse
     #[test]
     #[ignore]
@@ -448,23 +675,24 @@ mod tests {
         for sub in ["common", "events", "history"] {
             collect_txt(&root.join(sub), &mut files);
         }
-        let texts: Vec<String> = files
-            .iter()
-            .filter_map(|p| std::fs::read_to_string(p).ok())
-            .collect();
-        eprintln!("corpus: {} readable .txt files", texts.len());
+        eprintln!("corpus: {} .txt files", files.len());
 
         let table = StringTable::new();
         let tmp = tempfile::tempdir().unwrap();
         let fp = 0xabc;
-        validate_or_clear(tmp.path(), fp);
+        validate_or_clear(tmp.path(), fp).unwrap();
 
         // Cold pass: parse + persist.
         let t0 = Instant::now();
         let mut parsed_ok = 0usize;
-        for text in &texts {
-            if let Ok(parsed) = parse_string(text, &table) {
-                store(tmp.path(), fp, text, &parsed, &table);
+        for path in &files {
+            let Some(source_key) = source_cache_key(path) else {
+                continue;
+            };
+            if let Ok(text) = std::fs::read_to_string(path)
+                && let Ok(parsed) = parse_string(&text, &table)
+            {
+                store_path(tmp.path(), fp, path, &source_key, &parsed, &table);
                 parsed_ok += 1;
             }
         }
@@ -473,8 +701,8 @@ mod tests {
         // Warm pass: deserialize from cache.
         let t1 = Instant::now();
         let mut hits = 0usize;
-        for text in &texts {
-            if load(tmp.path(), fp, text, &table).is_some() {
+        for path in &files {
+            if load_path(tmp.path(), fp, path, &table).is_some() {
                 hits += 1;
             }
         }
@@ -488,7 +716,7 @@ mod tests {
             hits,
             cold.as_secs_f64() / warm.as_secs_f64().max(1e-9),
         );
-        assert!(hits > 0, "expected cache hits on the warm pass");
+        assert_eq!(hits, parsed_ok, "every stored file should hit when warm");
     }
 
     fn collect_txt(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -535,6 +763,36 @@ mod tests {
     }
 
     #[test]
+    fn global_prune_bounds_entries_across_fingerprints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("parse-cache");
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(20);
+        let mut paths = Vec::new();
+        for fingerprint in ["one", "two", "three"] {
+            let dir = root.join(fingerprint);
+            fs::create_dir_all(&dir).unwrap();
+            for i in 0..4u64 {
+                let path = dir.join(format!("{fingerprint}-{i}.cwb"));
+                fs::write(&path, b"x").unwrap();
+                filetime_set(
+                    &path,
+                    base + std::time::Duration::from_secs(paths.len() as u64),
+                );
+                paths.push(path);
+            }
+        }
+
+        prune_all_cache_dirs_with_caps(tmp.path(), 5, u64::MAX, None);
+        let remaining: usize = ["one", "two", "three"]
+            .iter()
+            .map(|fingerprint| count_cwb(&root.join(fingerprint)))
+            .sum();
+        assert!(remaining <= 4);
+        assert!(paths.last().unwrap().exists());
+        assert!(!paths.first().unwrap().exists());
+    }
+
+    #[test]
     fn prune_cache_dir_noop_under_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
@@ -547,7 +805,8 @@ mod tests {
 
     fn count_cwb(dir: &Path) -> usize {
         fs::read_dir(dir)
-            .unwrap()
+            .into_iter()
+            .flatten()
             .flatten()
             .filter(|e| e.path().extension().is_some_and(|x| x == "cwb"))
             .count()
@@ -565,11 +824,12 @@ mod tests {
         let table = StringTable::new();
         let text = "k = 1\n";
         let parsed = parse_string(text, &table).unwrap();
-        validate_or_clear(tmp.path(), 1);
+        validate_or_clear(tmp.path(), 1).unwrap();
         store(tmp.path(), 1, text, &parsed, &table);
+        validate_or_clear(tmp.path(), 2).unwrap();
         // Same text, different settings fingerprint -> different dir -> miss.
         assert!(load(tmp.path(), 2, text, &table).is_none());
-        // The original fingerprint still hits.
+        // Initializing another workspace must not delete the original cache.
         assert!(load(tmp.path(), 1, text, &table).is_some());
     }
 }
