@@ -916,7 +916,27 @@ impl Backend {
     /// checks (CW100/CW122) so a key just typed into an open `.yml` — or saved
     /// to a watched one — resolves without a full rescan (#36). Bounded by the
     /// open loc files plus the distinct watched ones.
-    pub(crate) fn loc_overlay_keys(&self) -> HashSet<String> {
+    ///
+    /// Cached by `loc_overlay_revision` and handed out by `Arc`: this ran per
+    /// validated file, so a watched batch cloned every overlay key once per file
+    /// in the batch even though nothing between them changed (#87). The revision
+    /// is read before the overlay locks, so a writer that lands in between only
+    /// costs a rebuild the next call, never a stale hit.
+    pub(crate) fn loc_overlay_keys(&self) -> Arc<HashSet<String>> {
+        let revision = self
+            .state
+            .loc_overlay_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cached = {
+            let guard = self.state.loc_overlay_keys_cache.lock();
+            guard
+                .as_ref()
+                .filter(|(cached_revision, _)| *cached_revision == revision)
+                .map(|(_, keys)| Arc::clone(keys))
+        };
+        if let Some(keys) = cached {
+            return keys;
+        }
         let mut keys = HashSet::new();
         for set in self.state.loc_live_overlay.read().values() {
             keys.extend(set.iter().cloned());
@@ -924,6 +944,8 @@ impl Backend {
         for set in self.state.loc_watched_overlay.read().values() {
             keys.extend(set.iter().cloned());
         }
+        let keys = Arc::new(keys);
+        *self.state.loc_overlay_keys_cache.lock() = Some((revision, Arc::clone(&keys)));
         keys
     }
 
@@ -994,7 +1016,32 @@ impl Backend {
     /// Strings on Millennium Dawn), so it is built ONCE per edit and shared by
     /// `Arc` with every file that edit revalidates — building it per file cost
     /// the keystroke path one whole copy per open `.yml`.
+    ///
+    /// Cached across edits too, keyed on `(info_revision, loc_overlay_revision)`
+    /// — its inputs are the ruleset's modifier keys and the type index (both
+    /// covered by `info_revision`) plus the two overlays. Keying on
+    /// `info_revision` alone would be wrong: an open loc edit writes the overlay
+    /// before it bumps that counter, so the set the edit itself validates
+    /// against would still be missing the key just typed (#87).
     fn loc_ref_names(&self) -> Arc<HashSet<String>> {
+        let revision = (
+            self.state
+                .info_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.state
+                .loc_overlay_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        let cached = {
+            let guard = self.state.loc_ref_names_cache.lock();
+            guard
+                .as_ref()
+                .filter(|(cached_revision, _)| *cached_revision == revision)
+                .map(|(_, names)| Arc::clone(names))
+        };
+        if let Some(names) = cached {
+            return names;
+        }
         // Lock order: rules -> info_service. The overlay locks are independent
         // and taken after, never nested inside the others.
         let mut extra = {
@@ -1010,7 +1057,9 @@ impl Backend {
         for keys in self.state.loc_watched_overlay.read().values() {
             extra.extend(keys.iter().cloned());
         }
-        Arc::new(extra)
+        let extra = Arc::new(extra);
+        *self.state.loc_ref_names_cache.lock() = Some((revision, Arc::clone(&extra)));
+        extra
     }
 
     /// Validate one loc file's text into diagnostics against the scanned union
@@ -1087,7 +1136,7 @@ impl Backend {
         text: &str,
     ) -> HashSet<String> {
         let new_keys = loc_keys_of(text, path);
-        let mut overlay = self.state.loc_watched_overlay.write();
+        let mut overlay = self.loc_watched_overlay_mut();
         let changed = match overlay.get(uri) {
             Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
             None => new_keys.clone(),
@@ -1151,7 +1200,7 @@ impl Backend {
             let is_open = self.state.documents.lock().contains_key(uri);
             let changed_keys: HashSet<String> = if is_open {
                 let new_keys = loc_keys_from(&parsed_loc);
-                let mut overlay = self.state.loc_live_overlay.write();
+                let mut overlay = self.loc_live_overlay_mut();
                 let diff = match overlay.get(uri) {
                     Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
                     None => new_keys.clone(),

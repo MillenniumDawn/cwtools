@@ -261,6 +261,22 @@ struct DocumentState {
     /// open overlay owns it from then on). Taken after `loc_live_overlay` when
     /// both are held.
     loc_watched_overlay: parking_lot::RwLock<HashMap<String, HashSet<String>>>,
+    /// Monotonic counter bumped on every mutation of either loc overlay, so the
+    /// key sets derived from them can be cached. `info_revision` cannot stand in:
+    /// an open loc edit updates the overlay BEFORE it bumps that counter, so a
+    /// set keyed on it alone would keep serving a union missing the key just
+    /// typed and flag it as undefined. Bumped by [`LocOverlayWrite`]'s `Drop`,
+    /// under the write lock, so a new writer can't be missed.
+    loc_overlay_revision: AtomicU64,
+    /// Cached [`Backend::loc_overlay_keys`] union, keyed on
+    /// `loc_overlay_revision`. Was rebuilt (and every key cloned) per validated
+    /// file, which on a watched batch meant once per file in the batch.
+    loc_overlay_keys_cache: parking_lot::Mutex<Option<(u64, Arc<HashSet<String>>)>>,
+    /// Cached [`Backend::loc_ref_names`] set, keyed on
+    /// `(info_revision, loc_overlay_revision)`. ~200K Strings on Millennium
+    /// Dawn, previously rebuilt from scratch on every loc edit.
+    #[allow(clippy::type_complexity)]
+    loc_ref_names_cache: parking_lot::Mutex<Option<((u64, u64), Arc<HashSet<String>>)>>,
     /// When `false` (the default), hover shows localisation for the primary
     /// language only (the first of `config.loc_languages`, else English) and the
     /// `loc_text` map only stores that language. Set via the
@@ -422,6 +438,41 @@ struct DocumentState {
     watched_signatures: Mutex<HashMap<String, (u64, u128)>>,
 }
 
+/// Write access to a loc overlay that bumps `loc_overlay_revision` on drop,
+/// while the write lock is still held — so a reader that takes the lock after
+/// this writer always sees the new counter alongside the new contents.
+///
+/// Every overlay mutation must go through [`Backend::loc_live_overlay_mut`] or
+/// [`Backend::loc_watched_overlay_mut`] rather than the `RwLock` directly: a
+/// write that skipped the bump would leave `loc_overlay_keys` /
+/// `loc_ref_names` serving a cached union without the key that just changed,
+/// which reads to the user as a loc diagnostic on a key they can see in the
+/// file.
+pub(crate) struct LocOverlayWrite<'a> {
+    guard: parking_lot::RwLockWriteGuard<'a, HashMap<String, HashSet<String>>>,
+    revision: &'a AtomicU64,
+}
+
+impl std::ops::Deref for LocOverlayWrite<'_> {
+    type Target = HashMap<String, HashSet<String>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for LocOverlayWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for LocOverlayWrite<'_> {
+    fn drop(&mut self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// One cached completion list. Stored behind a `Mutex<Option<_>>` so the
 /// completion handler can swap a freshly built list in on cache miss without
 /// holding any other lock.
@@ -523,6 +574,9 @@ impl DocumentState {
             loc_locations: parking_lot::RwLock::new(LocLocationMap::default()),
             loc_live_overlay: parking_lot::RwLock::new(HashMap::new()),
             loc_watched_overlay: parking_lot::RwLock::new(HashMap::new()),
+            loc_overlay_revision: AtomicU64::new(0),
+            loc_overlay_keys_cache: parking_lot::Mutex::new(None),
+            loc_ref_names_cache: parking_lot::Mutex::new(None),
             hover_show_all_languages: std::sync::atomic::AtomicBool::new(false),
             hover_debug: std::sync::atomic::AtomicBool::new(false),
             hover_resolved_scope: std::sync::atomic::AtomicBool::new(false),
@@ -622,6 +676,23 @@ impl Backend {
         self.state
             .info_revision
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Write access to the open-document loc overlay. See [`LocOverlayWrite`]:
+    /// the revision bump the derived caches key on rides on the guard's `Drop`.
+    pub(crate) fn loc_live_overlay_mut(&self) -> LocOverlayWrite<'_> {
+        LocOverlayWrite {
+            guard: self.state.loc_live_overlay.write(),
+            revision: &self.state.loc_overlay_revision,
+        }
+    }
+
+    /// Write access to the watched-file loc overlay. See [`LocOverlayWrite`].
+    pub(crate) fn loc_watched_overlay_mut(&self) -> LocOverlayWrite<'_> {
+        LocOverlayWrite {
+            guard: self.state.loc_watched_overlay.write(),
+            revision: &self.state.loc_overlay_revision,
+        }
     }
 
     /// Called when the VS Code extension tells us the user switched to a file.
@@ -1208,7 +1279,7 @@ impl LanguageServer for Backend {
         // The open overlay owns this file's keys from here; a stale watched
         // entry left behind could resurrect keys the buffer removed.
         if crate::paths::is_loc_file(&uri) {
-            self.state.loc_watched_overlay.write().remove(&uri);
+            self.loc_watched_overlay_mut().remove(&uri);
         }
 
         // Offload validation off the message future so a burst of opens can't
@@ -1344,7 +1415,7 @@ impl LanguageServer for Backend {
                 self.bump_info_revision();
             }
             doc_tokens.remove(&uri);
-            self.state.loc_live_overlay.write().remove(&uri);
+            self.loc_live_overlay_mut().remove(&uri);
             self.state.completion_generation.lock().remove(&uri);
 
             let info = self.state.info_service.read();
@@ -1892,6 +1963,51 @@ mod tests {
     }
 
     // ── didFocusFile (background-reindex idle clock) ─────────────────────────
+
+    #[test]
+    fn test_loc_overlay_write_invalidates_the_cached_key_sets() {
+        // #87 caches both overlay-derived key sets. The cache is keyed on
+        // `loc_overlay_revision`, which `LocOverlayWrite::drop` bumps — so a
+        // write through the accessor MUST change what the next read sees. If it
+        // doesn't, a key the user just typed reads as undefined (CW225/CW122)
+        // for as long as the stale entry lives.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (service, _socket) = LspService::build(|client| Backend {
+                client,
+                state: Arc::new(DocumentState::new()),
+            })
+            .finish();
+            let backend = service.inner();
+            assert!(backend.loc_overlay_keys().is_empty());
+
+            backend
+                .loc_live_overlay_mut()
+                .insert("file:///a.yml".into(), HashSet::from(["live_key".into()]));
+            assert!(
+                backend.loc_overlay_keys().contains("live_key"),
+                "an open-doc overlay write must invalidate the cached union"
+            );
+
+            backend.loc_watched_overlay_mut().insert(
+                "file:///b.yml".into(),
+                HashSet::from(["watched_key".into()]),
+            );
+            let keys = backend.loc_overlay_keys();
+            assert!(
+                keys.contains("live_key") && keys.contains("watched_key"),
+                "a watched overlay write must invalidate it too, got: {keys:?}"
+            );
+
+            backend.loc_live_overlay_mut().remove("file:///a.yml");
+            assert!(
+                !backend.loc_overlay_keys().contains("live_key"),
+                "a removal must invalidate it as well, not just an insert"
+            );
+        });
+    }
 
     #[test]
     fn test_did_focus_file_marks_activity() {
