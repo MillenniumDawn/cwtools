@@ -119,6 +119,12 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
                         table,
                         &mut ref_candidates,
                     );
+                    crate::config_validation::collect_definition_positions(
+                        path,
+                        &parsed,
+                        table,
+                        &mut combined.def_positions,
+                    );
                 }
                 Err(e) => {
                     let (line, col, message) = match e {

@@ -24,7 +24,7 @@ use cwtools_string_table::string_table::StringTable;
 
 use crate::rules_converter::field_parser::field_from_string;
 use crate::rules_converter::value_to_string;
-use crate::rules_types::{NewField, RuleSet, TypeType, ValueType};
+use crate::rules_types::{CwtDefKind, CwtDefPosition, NewField, RuleSet, TypeType, ValueType};
 use crate::ruleset_loader::RuleParseError;
 
 /// A single reference made by a `.cwt` rule, classified and positioned but not
@@ -98,6 +98,67 @@ pub fn validate_ruleset_references(
         collect_reference_candidates(path, ast, table, &mut candidates);
     }
     resolve_reference_candidates(&candidates, ruleset)
+}
+
+/// Collect the source position of every `type[x]` / `enum[x]` /
+/// `complex_enum[x]` / `single_alias[x]` definition in one parsed `.cwt`, for
+/// goto/hover inside rule files. Type and enum definitions live under the
+/// `types` / `enums` root blocks; single_aliases sit at the root.
+pub fn collect_definition_positions(
+    path: &Path,
+    ast: &ParsedFile,
+    table: &StringTable,
+    out: &mut Vec<CwtDefPosition>,
+) {
+    let def = |kind, name: &str, leaf: &cwtools_parser::ast::Leaf| CwtDefPosition {
+        kind,
+        name: name.to_string(),
+        file: path.to_path_buf(),
+        line: leaf.pos.start.line,
+        col: leaf.pos.start.col,
+    };
+    for child in &ast.root_children {
+        let Child::Leaf(idx) = child else { continue };
+        let leaf = &ast.arena.leaves[*idx as usize];
+        let raw_key = table.get_string(leaf.key.normal).unwrap_or_default();
+        let key = raw_key.trim_matches('"');
+        if let Some(name) = bracket_name(key, "single_alias") {
+            out.push(def(CwtDefKind::SingleAlias, name, leaf));
+            continue;
+        }
+        let member_kinds: &[(&str, CwtDefKind)] = if key.eq_ignore_ascii_case("types") {
+            &[("type", CwtDefKind::Type)]
+        } else if key.eq_ignore_ascii_case("enums") {
+            &[
+                ("complex_enum", CwtDefKind::Enum),
+                ("enum", CwtDefKind::Enum),
+            ]
+        } else {
+            continue;
+        };
+        let Value::Clause(inner) = &leaf.value else {
+            continue;
+        };
+        for c in inner {
+            let Child::Leaf(idx) = c else { continue };
+            let member = &ast.arena.leaves[*idx as usize];
+            let member_key = table.get_string(member.key.normal).unwrap_or_default();
+            let member_key = member_key.trim_matches('"');
+            for (prefix, kind) in member_kinds {
+                if let Some(name) = bracket_name(member_key, prefix) {
+                    out.push(def(*kind, name, member));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// `prefix[NAME]` → `NAME`; `None` for any other shape.
+fn bracket_name<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    key.strip_prefix(prefix)?
+        .strip_prefix('[')?
+        .strip_suffix(']')
 }
 
 fn collect_child(
@@ -230,6 +291,27 @@ mod tests {
         let ruleset = ast_to_ruleset(&parsed, &table);
         let files = vec![(PathBuf::from("test.cwt"), parsed)];
         validate_ruleset_references(&files, &ruleset, &table)
+    }
+
+    #[test]
+    fn collects_definition_positions_by_kind() {
+        let src = "types = {\n    type[focus] = { path = \"common/national_focus\" }\n}\n\
+                   enums = {\n    enum[stat] = { army navy }\n    complex_enum[cats] = { path = \"common/c\" name = { x } }\n}\n\
+                   single_alias[block] = { a = bool }\n";
+        let table = StringTable::new();
+        let parsed = parse_string(src, &table).unwrap();
+        let mut out = Vec::new();
+        collect_definition_positions(&PathBuf::from("defs.cwt"), &parsed, &table, &mut out);
+        let find = |kind: CwtDefKind, name: &str| {
+            out.iter()
+                .find(|d| d.kind == kind && d.name == name)
+                .unwrap_or_else(|| panic!("missing {:?} {}, got {:?}", kind, name, out))
+        };
+        assert_eq!(find(CwtDefKind::Type, "focus").line, 2);
+        assert_eq!(find(CwtDefKind::Enum, "stat").line, 5);
+        assert_eq!(find(CwtDefKind::Enum, "cats").line, 6);
+        assert_eq!(find(CwtDefKind::SingleAlias, "block").line, 8);
+        assert!(out.iter().all(|d| d.file == Path::new("defs.cwt")));
     }
 
     #[test]

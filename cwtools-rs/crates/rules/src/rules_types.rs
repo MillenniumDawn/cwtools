@@ -96,6 +96,31 @@ pub struct RuleSet {
     /// Built by `reindex()` from `alias[<scope>_pre_trigger:<name>] = bool`
     /// declarations: lowercased scope prefix -> lowercased trigger names. CW120 queries this.
     pub pretriggers: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>,
+    /// Source position of every `type[x]` / `enum[x]` / `complex_enum[x]` /
+    /// `single_alias[x]` definition, filled by the directory loader for `.cwt`
+    /// goto/hover. Empty for hand-built rulesets.
+    pub def_positions: Vec<CwtDefPosition>,
+}
+
+/// What a `.cwt` construct under the cursor refers to. Mirrors the reference
+/// kinds structural validation resolves (alias categories are out — see
+/// `config_validation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CwtDefKind {
+    Type,
+    Enum,
+    SingleAlias,
+}
+
+/// Where one `.cwt` definition lives: 1-based line, 0-based char col of its
+/// defining key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CwtDefPosition {
+    pub kind: CwtDefKind,
+    pub name: String,
+    pub file: std::path::PathBuf,
+    pub line: u32,
+    pub col: u16,
 }
 
 /// Scope/link config inputs (`scopes.cwt` / `links.cwt`). The types live in the
@@ -256,6 +281,7 @@ impl RuleSet {
             enum_has_at: Vec::new(),
             value_sets: rustc_hash::FxHashMap::default(),
             pretriggers: rustc_hash::FxHashMap::default(),
+            def_positions: Vec::new(),
         }
     }
 

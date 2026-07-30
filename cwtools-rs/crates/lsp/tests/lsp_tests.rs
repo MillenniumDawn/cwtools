@@ -3398,6 +3398,58 @@ fn test_completion_label_details_absent_without_support() {
     );
 }
 
+#[test]
+fn test_cwt_goto_type_reference_jumps_to_definition() {
+    // Goto on `<focus>` in an opened .cwt file lands on the `type[focus]`
+    // definition inside the loaded rules folder.
+    let files = &[("extra/my.cwt", "my_block = {\n    slot = <focus>\n}\n")];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["extra/my.cwt"],
+        serde_json::json!({}),
+        "extra/my.cwt",
+        "textDocument/definition",
+        serde_json::json!({ "position": { "line": 1, "character": 14 } }),
+    );
+    let locs = result.as_array().expect("definition locations");
+    assert!(
+        locs[0]["uri"].as_str().unwrap_or("").ends_with("r.cwt"),
+        "goto must land in the rules file, got: {}",
+        result
+    );
+    assert_eq!(
+        locs[0]["range"]["start"]["line"], 2,
+        "type[focus] line, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_cwt_hover_type_reference_describes_type() {
+    let files = &[("extra/my.cwt", "my_block = {\n    slot = <focus>\n}\n")];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["extra/my.cwt"],
+        serde_json::json!({}),
+        "extra/my.cwt",
+        "textDocument/hover",
+        serde_json::json!({ "position": { "line": 1, "character": 14 } }),
+    );
+    let md = result["contents"]["value"].as_str().unwrap_or("");
+    assert!(
+        md.contains("focus") && md.contains("type"),
+        "hover must describe the type, got: {}",
+        result
+    );
+    assert!(
+        md.contains("common/national_focus"),
+        "hover must list the type's path, got: {}",
+        result
+    );
+}
+
 const LINK_RULES: &str = r#"
 types = {
     type[decision] = { path = "game/common/decisions" }

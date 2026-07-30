@@ -25,9 +25,10 @@ impl Backend {
             return Ok(self.loc_ref_hover(&uri, pos));
         }
 
-        // `.cwt` rule files aren't game content — no rule-walk hover. (#43)
+        // `.cwt` rule file: describe the type/enum/single_alias the construct
+        // under the cursor references (no game rule walk).
         if crate::paths::is_cwt_file(&uri) {
-            return Ok(None);
+            return Ok(self.cwt_hover(&uri, pos));
         }
 
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
@@ -147,6 +148,57 @@ impl Backend {
             }
         }
         Ok(None)
+    }
+
+    /// Hover inside a `.cwt` rule file: describe the type/enum/single_alias
+    /// the construct under the cursor references, plus where it is defined.
+    fn cwt_hover(&self, uri: &str, pos: Position) -> Option<Hover> {
+        use cwtools_rules::rules_types::CwtDefKind;
+        let (kind, name) = self.cwt_ref_at_cursor(uri, pos)?;
+        let rules = self.state.rules.read();
+        let rs = rules.ruleset.as_ref()?;
+        let mut md = match kind {
+            CwtDefKind::Type => {
+                let mut s = format!("**type** `{}`", name);
+                if let Some(&idx) = rs.type_by_name.get(&name) {
+                    let paths = rs.types[idx].path_options.paths.join(", ");
+                    if !paths.is_empty() {
+                        s.push_str(&format!("\n\npath: {}", paths));
+                    }
+                }
+                s
+            }
+            CwtDefKind::Enum => {
+                let mut s = format!("**enum** `{}`", name);
+                if let Some(&idx) = rs.enum_by_name.get(&name) {
+                    let values = &rs.enums[idx].values;
+                    let shown = values.iter().take(5).cloned().collect::<Vec<_>>();
+                    let more = if values.len() > 5 { ", …" } else { "" };
+                    s.push_str(&format!(
+                        "\n\n{} values: {}{}",
+                        values.len(),
+                        shown.join(", "),
+                        more
+                    ));
+                }
+                s
+            }
+            CwtDefKind::SingleAlias => format!("**single_alias** `{}`", name),
+        };
+        if let Some(def) = rs
+            .def_positions
+            .iter()
+            .find(|d| d.kind == kind && d.name == name)
+        {
+            md.push_str(&format!("\n\ndefined in `{}`", def.file.display()));
+        }
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: md,
+            }),
+            range: None,
+        })
     }
 
     /// Hover for a `$KEY$` reference in a `.yml` loc file: show the referenced

@@ -74,9 +74,10 @@ impl Backend {
             return Ok(self.loc_ref_goto(&uri, pos, fallback));
         }
 
-        // `.cwt` rule files aren't game content — no goto into rule definitions. (#43)
+        // `.cwt` rule file: a `<type>` / `enum[..]` / `single_alias_right[..]`
+        // reference jumps to its definition in the loaded rules folder.
         if crate::paths::is_cwt_file(&uri) {
-            return Ok(None);
+            return Ok(self.cwt_goto(&uri, pos, fallback));
         }
 
         // Rule-aware lookup via the position resolver. The classified hint tells
@@ -195,6 +196,44 @@ impl Backend {
             }
         }
         Vec::new()
+    }
+
+    /// The classified `.cwt` reference under the cursor, read from the line
+    /// text (rule files aren't game ASTs, so no rule walk).
+    pub(crate) fn cwt_ref_at_cursor(
+        &self,
+        uri: &str,
+        pos: Position,
+    ) -> Option<(cwtools_rules::rules_types::CwtDefKind, String)> {
+        let text = self.file_text_for(uri)?;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let (_, col) = lsp_pos_to_source_in_text(&text, pos, &encoding);
+        let line = text.lines().nth(pos.line as usize)?;
+        cwt_ref_at(line, col as u32)
+    }
+
+    /// Goto inside a `.cwt`: jump to the referenced definition recorded by the
+    /// ruleset loader. `None` when the cursor isn't on a resolvable reference.
+    fn cwt_goto(&self, uri: &str, pos: Position, fallback: &Url) -> Option<GotoDefinitionResponse> {
+        let (kind, name) = self.cwt_ref_at_cursor(uri, pos)?;
+        let def = {
+            let rules = self.state.rules.read();
+            let rs = rules.ruleset.as_ref()?;
+            rs.def_positions
+                .iter()
+                .find(|d| d.kind == kind && d.name == name)
+                .cloned()
+        }?;
+        let target_uri = crate::paths::path_to_uri(&def.file);
+        Some(GotoDefinitionResponse::Array(vec![
+            self.source_location_at(
+                &target_uri,
+                def.line.saturating_sub(1),
+                def.col as u32,
+                &name,
+                fallback,
+            ),
+        ]))
     }
 
     /// The roots a game-relative path resolves against, in probe order: the
@@ -1269,6 +1308,76 @@ pub(crate) fn value_col_in_line(line: &str, name: &str, from: u32) -> Option<u32
     None
 }
 
+/// Classify the `.cwt` construct at char `col` on `line`: a `<type>` /
+/// `<!type>` / `<type.subtype>` reference, `enum[..]` / `complex_enum[..]`,
+/// or `single_alias_right[..]`. Alias categories and value sets are out —
+/// they have no single definition site (consistent with the structural lint).
+pub(crate) fn cwt_ref_at(
+    line: &str,
+    col: u32,
+) -> Option<(cwtools_rules::rules_types::CwtDefKind, String)> {
+    use cwtools_rules::rules_types::CwtDefKind;
+    let chars: Vec<char> = line.chars().collect();
+    let col = col as usize;
+    // `<...>` spans (angle brackets included in the hit area).
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<'
+            && let Some(close) = chars[i + 1..]
+                .iter()
+                .position(|&c| c == '>')
+                .map(|p| p + i + 1)
+        {
+            if (i..=close).contains(&col) {
+                let inner: String = chars[i + 1..close].iter().collect();
+                let name = inner.trim_start_matches('!');
+                // `<type.subtype>` is defined by its base type.
+                let base = name.split('.').next().unwrap_or(name);
+                return (!base.is_empty()).then(|| (CwtDefKind::Type, base.to_string()));
+            }
+            i = close + 1;
+            continue;
+        }
+        i += 1;
+    }
+    for (prefix, kind) in [
+        ("complex_enum", CwtDefKind::Enum),
+        ("enum", CwtDefKind::Enum),
+        ("single_alias_right", CwtDefKind::SingleAlias),
+    ] {
+        if let Some(name) = bracket_ref_at(&chars, col, prefix) {
+            return Some((kind, name));
+        }
+    }
+    None
+}
+
+/// The bracketed name of a `prefix[NAME]` occurrence whose span covers `col`,
+/// word-bounded so `enum[` inside `complex_enum[` doesn't match.
+fn bracket_ref_at(chars: &[char], col: usize, prefix: &str) -> Option<String> {
+    let p: Vec<char> = prefix.chars().collect();
+    let mut i = 0;
+    while i + p.len() < chars.len() {
+        if chars[i..i + p.len()] == p[..]
+            && chars.get(i + p.len()) == Some(&'[')
+            && (i == 0 || !is_ident_char(chars[i - 1]))
+            && let Some(close) = chars[i + p.len() + 1..]
+                .iter()
+                .position(|&c| c == ']')
+                .map(|q| q + i + p.len() + 1)
+        {
+            if (i..=close).contains(&col) {
+                let name: String = chars[i + p.len() + 1..close].iter().collect();
+                return (!name.is_empty()).then_some(name);
+            }
+            i = close + 1;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The `@name` script-constant token at (line0, col): the full token including
 /// the sigil, and its 0-based start char col. `None` when the cursor isn't on
 /// one.
@@ -1871,6 +1980,39 @@ mod tests {
         // Cursor on the indent whitespace: no token, chain starts at the block.
         let spans = selection_spans(text, &pairs, 1, 2);
         assert_eq!(spans, vec![((0, 5), (2, 0)), ((0, 4), (2, 1))]);
+    }
+
+    #[test]
+    fn cwt_ref_at_classifies_rule_references() {
+        use cwtools_rules::rules_types::CwtDefKind;
+        // `<focus>` anywhere in the span, including the angle brackets.
+        let line = "    has_focus = <focus>";
+        assert_eq!(
+            cwt_ref_at(line, 18),
+            Some((CwtDefKind::Type, "focus".to_string()))
+        );
+        assert_eq!(
+            cwt_ref_at(line, 16),
+            Some((CwtDefKind::Type, "focus".to_string()))
+        );
+        // `<!focus>` negation still names the type.
+        assert_eq!(
+            cwt_ref_at("    a = <!focus>", 12),
+            Some((CwtDefKind::Type, "focus".to_string()))
+        );
+        assert_eq!(
+            cwt_ref_at("    stat = enum[stat]", 17),
+            Some((CwtDefKind::Enum, "stat".to_string()))
+        );
+        assert_eq!(
+            cwt_ref_at("    b = single_alias_right[block]", 29),
+            Some((CwtDefKind::SingleAlias, "block".to_string()))
+        );
+        // Alias categories and value sets are out of scope.
+        assert_eq!(cwt_ref_at("    alias_name[effect] = x", 12), None);
+        assert_eq!(cwt_ref_at("    v = value[my_set]", 16), None);
+        // Cursor outside any construct.
+        assert_eq!(cwt_ref_at("    has_focus = <focus>", 6), None);
     }
 
     #[test]
