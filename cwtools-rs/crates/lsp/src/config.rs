@@ -368,6 +368,33 @@ impl Backend {
             .hierarchical_symbols
             .store(hierarchical, Ordering::Relaxed);
 
+        // completion: origin labels next to deferred type/enum/alias items,
+        // only when the client can render them.
+        let label_details = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|ci| ci.label_details_support)
+            .unwrap_or(false);
+        self.state
+            .completion_label_details
+            .store(label_details, Ordering::Relaxed);
+
+        // rename: versioned documentChanges only when the client advertises
+        // support; otherwise the legacy `changes` map is served.
+        let document_changes = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.workspace_edit.as_ref())
+            .and_then(|we| we.document_changes)
+            .unwrap_or(false);
+        self.state
+            .workspace_edit_document_changes
+            .store(document_changes, Ordering::Relaxed);
+
         // `$/progress`: only usable when the client says it will answer
         // `window/workDoneProgress/create`. See `scan::send_work_done_progress`.
         let work_done_progress = params
@@ -433,6 +460,13 @@ impl Backend {
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                // Filepath/icon leaves as clickable links; targets are built
+                // up-front in the handler, so no resolve step.
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
                 rename_provider: Some(OneOf::Right(RenameOptions {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),

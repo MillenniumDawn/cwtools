@@ -195,6 +195,29 @@ impl ResolveData {
     }
 }
 
+/// Stamp `labelDetails.description` with each item's origin — the type name,
+/// `enum <id>`, or alias category its `ResolveData` records. Free at build
+/// time (the origin is the deferral key itself); only the full detail /
+/// documentation stays deferred to resolve. Callers gate on the client's
+/// `labelDetailsSupport`.
+pub(crate) fn apply_label_details(items: &mut [CompletionItem]) {
+    for item in items {
+        let Some(data) = item.data.as_ref().and_then(|d| d.as_str()) else {
+            continue;
+        };
+        let description = match ResolveData::parse(data) {
+            Some(ResolveData::Type { t }) => t,
+            Some(ResolveData::Enum { id }) => format!("enum {id}"),
+            Some(ResolveData::Alias { cat, .. }) => cat,
+            None => continue,
+        };
+        item.label_details = Some(CompletionItemLabelDetails {
+            detail: None,
+            description: Some(description),
+        });
+    }
+}
+
 /// Build context-aware completion items from the child rules at the cursor's
 /// position (the rules come from `position::rules_at_pos`, which resolves
 /// aliases, typed keys, and subtypes the same way validation does).
@@ -1616,6 +1639,52 @@ mod resolve_data_tests {
     use cwtools_rules::rules_types::{EnumDefinition, Options};
 
     use super::*;
+
+    #[test]
+    fn label_details_describe_origin_from_resolve_data() {
+        let mut items = vec![
+            CompletionItem {
+                label: "MY_FOCUS".to_string(),
+                data: ResolveData::Type {
+                    t: "focus".to_string(),
+                }
+                .into_value(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "army".to_string(),
+                data: ResolveData::Enum {
+                    id: "stat".to_string(),
+                }
+                .into_value(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "add_political_power".to_string(),
+                data: ResolveData::Alias {
+                    cat: "effect".to_string(),
+                    name: "add_political_power".to_string(),
+                }
+                .into_value(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "plain".to_string(),
+                ..Default::default()
+            },
+        ];
+        apply_label_details(&mut items);
+        let desc = |i: usize| {
+            items[i]
+                .label_details
+                .as_ref()
+                .and_then(|d| d.description.as_deref())
+        };
+        assert_eq!(desc(0), Some("focus"));
+        assert_eq!(desc(1), Some("enum stat"));
+        assert_eq!(desc(2), Some("effect"));
+        assert!(items[3].label_details.is_none());
+    }
 
     #[test]
     fn alias_item_defers_documentation() {

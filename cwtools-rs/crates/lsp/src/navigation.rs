@@ -74,9 +74,10 @@ impl Backend {
             return Ok(self.loc_ref_goto(&uri, pos, fallback));
         }
 
-        // `.cwt` rule files aren't game content — no goto into rule definitions. (#43)
+        // `.cwt` rule file: a `<type>` / `enum[..]` / `single_alias_right[..]`
+        // reference jumps to its definition in the loaded rules folder.
         if crate::paths::is_cwt_file(&uri) {
-            return Ok(None);
+            return Ok(self.cwt_goto(&uri, pos, fallback));
         }
 
         // Rule-aware lookup via the position resolver. The classified hint tells
@@ -183,18 +184,7 @@ impl Backend {
             return Vec::new();
         }
         let rel = std::path::Path::new(path.trim_start_matches('/'));
-        let (ws_uri, vanilla_dir) = {
-            let cfg = self.state.config.read();
-            (cfg.workspace_uri.clone(), cfg.vanilla_dir.clone())
-        };
-        let mut roots: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(ws) = &ws_uri {
-            roots.push(std::path::PathBuf::from(crate::paths::uri_to_path_str(ws)));
-        }
-        if let Some(v) = vanilla_dir {
-            roots.push(v);
-        }
-        for root in roots {
+        for root in self.search_roots() {
             let candidate = root.join(rel);
             // Async stat: a goto request must not block the runtime on a sync
             // filesystem syscall (at most two candidate roots, so no batching).
@@ -206,6 +196,61 @@ impl Backend {
             }
         }
         Vec::new()
+    }
+
+    /// The classified `.cwt` reference under the cursor, read from the line
+    /// text (rule files aren't game ASTs, so no rule walk).
+    pub(crate) fn cwt_ref_at_cursor(
+        &self,
+        uri: &str,
+        pos: Position,
+    ) -> Option<(cwtools_rules::rules_types::CwtDefKind, String)> {
+        let text = self.file_text_for(uri)?;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let (_, col) = lsp_pos_to_source_in_text(&text, pos, &encoding);
+        let line = text.lines().nth(pos.line as usize)?;
+        cwt_ref_at(line, col as u32)
+    }
+
+    /// Goto inside a `.cwt`: jump to the referenced definition recorded by the
+    /// ruleset loader. `None` when the cursor isn't on a resolvable reference.
+    fn cwt_goto(&self, uri: &str, pos: Position, fallback: &Url) -> Option<GotoDefinitionResponse> {
+        let (kind, name) = self.cwt_ref_at_cursor(uri, pos)?;
+        let def = {
+            let rules = self.state.rules.read();
+            let rs = rules.ruleset.as_ref()?;
+            rs.def_positions
+                .iter()
+                .find(|d| d.kind == kind && d.name == name)
+                .cloned()
+        }?;
+        let target_uri = crate::paths::path_to_uri(&def.file);
+        Some(GotoDefinitionResponse::Array(vec![
+            self.source_location_at(
+                &target_uri,
+                def.line.saturating_sub(1),
+                def.col as u32,
+                &name,
+                fallback,
+            ),
+        ]))
+    }
+
+    /// The roots a game-relative path resolves against, in probe order: the
+    /// workspace, then the configured vanilla install.
+    pub(crate) fn search_roots(&self) -> Vec<std::path::PathBuf> {
+        let (ws_uri, vanilla_dir) = {
+            let cfg = self.state.config.read();
+            (cfg.workspace_uri.clone(), cfg.vanilla_dir.clone())
+        };
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(ws) = &ws_uri {
+            roots.push(std::path::PathBuf::from(crate::paths::uri_to_path_str(ws)));
+        }
+        if let Some(v) = vanilla_dir {
+            roots.push(v);
+        }
+        roots
     }
 
     pub(crate) async fn references_impl(
@@ -225,21 +270,26 @@ impl Backend {
         // text (the parser records the leaf key, not the value, precisely).
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
+        let include_declaration = params.context.include_declaration;
+
         if let Some((type_name, instance_name)) = type_ref {
             let fallback = &params.text_document_position.text_document.uri;
             let mut all_locs: Vec<Location> = Vec::new();
 
-            // 1. Definition location(s) from TypeIndex.
-            let definitions = {
-                let info = self.state.info_service.read();
-                info.type_index
-                    .instances(&type_name)
-                    .iter()
-                    .filter(|(_, inst)| inst.name == instance_name)
-                    .map(|(file_uri, inst)| (file_uri.to_string(), inst.location))
-                    .collect::<Vec<_>>()
-            };
-            all_locs.extend(locations_at(self, definitions, &instance_name, fallback));
+            // 1. Definition location(s) from TypeIndex, unless the client asked
+            //    for use sites only.
+            if include_declaration {
+                let definitions = {
+                    let info = self.state.info_service.read();
+                    info.type_index
+                        .instances(&type_name)
+                        .iter()
+                        .filter(|(_, inst)| inst.name == instance_name)
+                        .map(|(file_uri, inst)| (file_uri.to_string(), inst.location))
+                        .collect::<Vec<_>>()
+                };
+                all_locs.extend(locations_at(self, definitions, &instance_name, fallback));
+            }
 
             // 2. Use-sites (open docs via live AST + closed files via index).
             let sites = self.collect_use_sites(&type_name, &instance_name);
@@ -266,7 +316,11 @@ impl Backend {
             let (definitions, references) = {
                 let info = self.state.info_service.read();
                 (
-                    info.find_definitions(&symbol).cloned().unwrap_or_default(),
+                    if include_declaration {
+                        info.find_definitions(&symbol).cloned().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                     info.find_references(&symbol).unwrap_or_default(),
                 )
             };
@@ -431,12 +485,57 @@ impl Backend {
         // Brace-matched folding over the text: the parser drops the exact `}`
         // line (it consumes trailing whitespace after a clause), so a direct
         // scan is more accurate than the AST for the closing-brace line.
-        let ranges = brace_folding_ranges(&text);
+        let mut ranges = brace_folding_ranges(&text);
+        ranges.extend(comment_and_region_folds(&text));
         if ranges.is_empty() {
             Ok(None)
         } else {
             Ok(Some(ranges))
         }
+    }
+
+    pub(crate) async fn selection_range_impl(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let uri = params.text_document.uri.to_string();
+        let Some(text) = self.file_text_for(&uri) else {
+            return Ok(None);
+        };
+        let encoding = self.state.config.read().position_encoding.clone();
+        let pairs = brace_pairs(&text);
+        // One chain per requested position, in request order (LSP requires the
+        // result to line up with `positions`).
+        let out: Vec<SelectionRange> = params
+            .positions
+            .iter()
+            .map(|pos| {
+                // The conversion returns a 1-based line; only the char column
+                // is needed (the request's 0-based line is used directly).
+                let (_, col) = lsp_pos_to_source_in_text(&text, *pos, &encoding);
+                let spans = selection_spans(&text, &pairs, pos.line, col as u32);
+                let mut node: Option<SelectionRange> = None;
+                for &((sl, sc), (el, ec)) in spans.iter().rev() {
+                    node = Some(SelectionRange {
+                        range: Range {
+                            start: source_position_to_lsp(&text, sl, sc, &encoding),
+                            end: source_position_to_lsp(&text, el, ec, &encoding),
+                        },
+                        parent: node.map(Box::new),
+                    });
+                }
+                // Outside any token or block: an empty chain is not allowed,
+                // so anchor at the cursor itself.
+                node.unwrap_or(SelectionRange {
+                    range: Range {
+                        start: *pos,
+                        end: *pos,
+                    },
+                    parent: None,
+                })
+            })
+            .collect();
+        Ok(Some(out))
     }
 
     pub(crate) async fn document_highlight_impl(
@@ -475,7 +574,7 @@ impl Backend {
             .flat_map(|(line0, line)| {
                 let position_encoding = &position_encoding;
                 let text = &text;
-                all_token_cols_in_line(line, symbol)
+                code_token_cols_in_line(line, symbol)
                     .into_iter()
                     .map(move |col| DocumentHighlight {
                         range: source_range_in_text(
@@ -485,7 +584,7 @@ impl Backend {
                             symbol,
                             position_encoding,
                         ),
-                        kind: Some(DocumentHighlightKind::TEXT),
+                        kind: Some(highlight_kind(line, col, symbol)),
                     })
             })
             .collect();
@@ -584,36 +683,74 @@ impl Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
-        let indexed_symbols = {
+        // All matches are collected, sorted deterministically by (rank, name,
+        // uri), then truncated — the old early break while iterating a HashMap
+        // returned an arbitrary hash-order 500.
+        let mut cands: Vec<SymbolCandidate> = Vec::new();
+        {
             let info = self.state.info_service.read();
-            let mut entries = Vec::new();
-            'scan: for (type_name, instances) in &info.type_index.map {
+            for (type_name, instances) in &info.type_index.map {
                 for (file_uri, inst) in instances {
-                    if !query.is_empty() && !name_contains_ignore_case(&inst.name, &query) {
-                        continue;
-                    }
-                    entries.push((
-                        type_name.clone(),
-                        file_uri.to_string(),
-                        inst.name.clone(),
-                        inst.location,
-                    ));
-                    if entries.len() >= 500 {
-                        break 'scan;
+                    if let Some(rank) = symbol_rank(&inst.name, &query) {
+                        cands.push(SymbolCandidate {
+                            rank,
+                            name: inst.name.clone(),
+                            container: Some(type_name.clone()),
+                            kind: SymbolKind::STRUCT,
+                            file_uri: file_uri.to_string(),
+                            line0: inst.location.line.saturating_sub(1),
+                            col: inst.location.col as u32,
+                        });
                     }
                 }
             }
-            entries
-        };
-        let mut symbols: Vec<SymbolInformation> = Vec::with_capacity(indexed_symbols.len());
+            // `@`-constants, still tracked per-file (as in the document outline).
+            for (file_uri, fi) in &info.files {
+                for (name, loc) in &fi.defined_variables {
+                    if let Some(rank) = symbol_rank(name, &query) {
+                        cands.push(SymbolCandidate {
+                            rank,
+                            name: name.clone(),
+                            container: None,
+                            kind: SymbolKind::CONSTANT,
+                            file_uri: file_uri.clone(),
+                            line0: loc.line.saturating_sub(1),
+                            col: loc.col as u32,
+                        });
+                    }
+                }
+            }
+        }
+        // Localisation keys (stored lowercased; loc keys are conventionally
+        // lowercase, so the display form matches the file).
+        {
+            let ll = self.state.loc_locations.read();
+            for (key, (file_uri, line0)) in ll.iter() {
+                if let Some(rank) = symbol_rank(key, &query) {
+                    cands.push(SymbolCandidate {
+                        rank,
+                        name: key.to_string(),
+                        container: None,
+                        kind: SymbolKind::KEY,
+                        file_uri: file_uri.to_string(),
+                        line0: *line0,
+                        col: 0,
+                    });
+                }
+            }
+        }
+        cands.sort_by(|a, b| (a.rank, &a.name, &a.file_uri).cmp(&(b.rank, &b.name, &b.file_uri)));
+        cands.truncate(500);
+
+        let mut symbols: Vec<SymbolInformation> = Vec::with_capacity(cands.len());
         // No request document to fall back to for a workspace-wide query.
         let fallback = Url::parse("file:///unknown").expect("static URI");
-        for (type_name, file_uri, name, loc) in indexed_symbols {
+        for c in cands {
             symbols.push(make_symbol(
-                name.clone(),
-                SymbolKind::STRUCT,
-                self.source_location(&file_uri, loc, &name, &fallback),
-                Some(type_name),
+                c.name.clone(),
+                c.kind,
+                self.source_location_at(&c.file_uri, c.line0, c.col, &c.name, &fallback),
+                c.container,
             ));
         }
 
@@ -633,6 +770,12 @@ impl Backend {
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_prefix);
 
+        // `@` script constant first: the sigil marks it unambiguously, and the
+        // rule walk can misclassify an `@` read as a type reference.
+        if let Some((_, range)) = self.at_var_rename_target(&uri, pos) {
+            return Ok(Some(PrepareRenameResponse::Range(range)));
+        }
+
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
 
         if let Some((_, instance_name)) = type_ref {
@@ -651,12 +794,99 @@ impl Backend {
         Ok(None)
     }
 
+    /// The `@name` constant under the cursor in `uri`, as (token, LSP range
+    /// over it). `None` when the cursor isn't on one or the text is missing.
+    fn at_var_rename_target(&self, uri: &str, pos: Position) -> Option<(String, Range)> {
+        let text = self.file_text_for(uri)?;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let (_, col) = lsp_pos_to_source_in_text(&text, pos, &encoding);
+        let (name, start_col) = at_var_at_cursor(&text, pos.line, col as u32)?;
+        let range = source_range_in_text(&text, pos.line, start_col, &name, &encoding);
+        Some((name, range))
+    }
+
+    /// File-local rename of an `@name` script constant: every comment-aware
+    /// whole-token occurrence in this one document. `@` constants are
+    /// per-file in the game's scripting, so no cross-file work is needed.
+    fn rename_at_var(&self, uri: &str, name: &str, new_name: &str) -> Option<WorkspaceEdit> {
+        let text = self.file_text_for(uri)?;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let edits: Vec<TextEdit> = text
+            .lines()
+            .enumerate()
+            .flat_map(|(line0, line)| {
+                let text = &text;
+                let encoding = &encoding;
+                code_token_cols_in_line(line, name)
+                    .into_iter()
+                    .map(move |col| TextEdit {
+                        range: source_range_in_text(text, line0 as u32, col, name, encoding),
+                        new_text: new_name.to_string(),
+                    })
+            })
+            .collect();
+        if edits.is_empty() {
+            return None;
+        }
+        Some(self.build_workspace_edit(vec![(uri.to_string(), edits)]))
+    }
+
+    /// Assemble the `WorkspaceEdit` shape the client negotiated: versioned
+    /// `documentChanges` when it advertised support (open docs carry their
+    /// version so a stale buffer rejects the edit, closed files `None`), the
+    /// legacy `changes` map otherwise.
+    fn build_workspace_edit(&self, by_uri: Vec<(String, Vec<TextEdit>)>) -> WorkspaceEdit {
+        if self
+            .state
+            .workspace_edit_document_changes
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let docs = self.state.documents.lock();
+            let edits = by_uri
+                .into_iter()
+                .filter_map(|(uri, edits)| {
+                    let url = uri.parse::<Url>().ok()?;
+                    Some(TextDocumentEdit {
+                        text_document: OptionalVersionedTextDocumentIdentifier {
+                            uri: url,
+                            version: docs.get(&uri).map(|d| d.version),
+                        },
+                        edits: edits.into_iter().map(OneOf::Left).collect(),
+                    })
+                })
+                .collect();
+            WorkspaceEdit {
+                changes: None,
+                document_changes: Some(DocumentChanges::Edits(edits)),
+                change_annotations: None,
+            }
+        } else {
+            let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+            for (uri, edits) in by_uri {
+                if let Ok(url) = uri.parse::<Url>() {
+                    changes.entry(url).or_default().extend(edits);
+                }
+            }
+            WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            }
+        }
+    }
+
     pub(crate) async fn rename_impl(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = params.text_document_position.text_document.uri.to_string();
         let pos = params.text_document_position.position;
         let new_name = params.new_name.clone();
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_prefix);
+
+        // `@` script constant first: the sigil marks it unambiguously, and the
+        // rule walk can misclassify an `@` read as a type reference.
+        if let Some((name, _)) = self.at_var_rename_target(&uri, pos) {
+            return Ok(self.rename_at_var(&uri, &name, &new_name));
+        }
 
         // Identify what's under the cursor
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);
@@ -714,27 +944,21 @@ impl Backend {
         // Group text edits by file URI, deduping so overlapping edits (a
         // definition that also classifies as a use site) aren't emitted twice.
         let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
-        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
         for (file_uri, line0, col) in edits {
             if !seen.insert((file_uri.clone(), line0, col)) {
                 continue;
             }
-            let url = match file_uri.parse::<Url>() {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
             let edit = TextEdit {
                 range: self.source_range_at(&file_uri, line0, col, &instance_name),
                 new_text: new_name.clone(),
             };
-            changes.entry(url).or_default().push(edit);
+            by_uri.entry(file_uri).or_default().push(edit);
         }
 
-        Ok(Some(WorkspaceEdit {
-            changes: Some(changes),
-            document_changes: None,
-            change_annotations: None,
-        }))
+        Ok(Some(
+            self.build_workspace_edit(by_uri.into_iter().collect()),
+        ))
     }
 }
 
@@ -958,6 +1182,38 @@ fn name_contains_ignore_case(name: &str, query: &str) -> bool {
     q.len() <= n.len() && n.windows(q.len()).any(|w| w.eq_ignore_ascii_case(q))
 }
 
+/// One `workspace/symbol` match before range conversion: where it lives
+/// (0-based line, char col) plus how it sorts (`rank`, then name, then uri).
+struct SymbolCandidate {
+    rank: u8,
+    name: String,
+    container: Option<String>,
+    kind: SymbolKind,
+    file_uri: String,
+    line0: u32,
+    col: u32,
+}
+
+/// Rank of a workspace-symbol candidate against the (already lowercased)
+/// query: 0 exact, 1 prefix, 2 substring, `None` when it doesn't match. The
+/// empty query admits everything (the picker's initial, unfiltered list).
+fn symbol_rank(name: &str, query: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(2);
+    }
+    if !name_contains_ignore_case(name, query) {
+        return None;
+    }
+    let lower = name.to_lowercase();
+    if lower == query {
+        Some(0)
+    } else if lower.starts_with(query) {
+        Some(1)
+    } else {
+        Some(2)
+    }
+}
+
 /// Whether `c` continues an identifier token (bare id charset plus `.` for
 /// dotted event ids). Used to word-bound the token searches below.
 fn is_ident_char(c: char) -> bool {
@@ -965,18 +1221,25 @@ fn is_ident_char(c: char) -> bool {
 }
 
 /// Every 0-based char column where `name` appears on `line` as a whole
-/// identifier (bounded by non-identifier chars). Char-based to match the
-/// parser's column counting.
-fn all_token_cols_in_line(line: &str, name: &str) -> Vec<u32> {
+/// identifier (bounded by non-identifier chars), ignoring anything behind an
+/// unquoted `#` comment. Quoted occurrences still match (values may be
+/// quoted). Char-based to match the parser's column counting.
+fn code_token_cols_in_line(line: &str, name: &str) -> Vec<u32> {
     let chars: Vec<char> = line.chars().collect();
     let needle: Vec<char> = name.chars().collect();
     let mut out = Vec::new();
     if needle.is_empty() || needle.len() > chars.len() {
         return out;
     }
+    let mut in_string = false;
     let mut i = 0;
-    while i + needle.len() <= chars.len() {
-        if chars[i..i + needle.len()] == needle[..] {
+    while i < chars.len() {
+        match chars[i] {
+            '"' => in_string = !in_string,
+            '#' if !in_string => break,
+            _ => {}
+        }
+        if i + needle.len() <= chars.len() && chars[i..i + needle.len()] == needle[..] {
             let before_ok = i == 0 || !is_ident_char(chars[i - 1]);
             let after = i + needle.len();
             let after_ok = after >= chars.len() || !is_ident_char(chars[after]);
@@ -987,6 +1250,17 @@ fn all_token_cols_in_line(line: &str, name: &str) -> Vec<u32> {
         i += 1;
     }
     out
+}
+
+/// WRITE when the token at `col` is an assignment key (the next non-space char
+/// after it is `=`), READ otherwise. Advisory: clients only use this to tint
+/// the highlight.
+fn highlight_kind(line: &str, col: u32, name: &str) -> DocumentHighlightKind {
+    let after = col as usize + name.chars().count();
+    match line.chars().skip(after).find(|c| !c.is_whitespace()) {
+        Some('=') => DocumentHighlightKind::WRITE,
+        _ => DocumentHighlightKind::READ,
+    }
 }
 
 /// The 0-based char column just past the first `=` at/after `key_col` on `line`
@@ -1032,6 +1306,104 @@ pub(crate) fn value_col_in_line(line: &str, name: &str, from: u32) -> Option<u32
         i += 1;
     }
     None
+}
+
+/// Classify the `.cwt` construct at char `col` on `line`: a `<type>` /
+/// `<!type>` / `<type.subtype>` reference, `enum[..]` / `complex_enum[..]`,
+/// or `single_alias_right[..]`. Alias categories and value sets are out —
+/// they have no single definition site (consistent with the structural lint).
+pub(crate) fn cwt_ref_at(
+    line: &str,
+    col: u32,
+) -> Option<(cwtools_rules::rules_types::CwtDefKind, String)> {
+    use cwtools_rules::rules_types::CwtDefKind;
+    let chars: Vec<char> = line.chars().collect();
+    let col = col as usize;
+    // `<...>` spans (angle brackets included in the hit area).
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '<'
+            && let Some(close) = chars[i + 1..]
+                .iter()
+                .position(|&c| c == '>')
+                .map(|p| p + i + 1)
+        {
+            if (i..=close).contains(&col) {
+                let inner: String = chars[i + 1..close].iter().collect();
+                let name = inner.trim_start_matches('!');
+                // `<type.subtype>` is defined by its base type.
+                let base = name.split('.').next().unwrap_or(name);
+                return (!base.is_empty()).then(|| (CwtDefKind::Type, base.to_string()));
+            }
+            i = close + 1;
+            continue;
+        }
+        i += 1;
+    }
+    for (prefix, kind) in [
+        ("complex_enum", CwtDefKind::Enum),
+        ("enum", CwtDefKind::Enum),
+        ("single_alias_right", CwtDefKind::SingleAlias),
+    ] {
+        if let Some(name) = bracket_ref_at(&chars, col, prefix) {
+            return Some((kind, name));
+        }
+    }
+    None
+}
+
+/// The bracketed name of a `prefix[NAME]` occurrence whose span covers `col`,
+/// word-bounded so `enum[` inside `complex_enum[` doesn't match.
+fn bracket_ref_at(chars: &[char], col: usize, prefix: &str) -> Option<String> {
+    let p: Vec<char> = prefix.chars().collect();
+    let mut i = 0;
+    while i + p.len() < chars.len() {
+        if chars[i..i + p.len()] == p[..]
+            && chars.get(i + p.len()) == Some(&'[')
+            && (i == 0 || !is_ident_char(chars[i - 1]))
+            && let Some(close) = chars[i + p.len() + 1..]
+                .iter()
+                .position(|&c| c == ']')
+                .map(|q| q + i + p.len() + 1)
+        {
+            if (i..=close).contains(&col) {
+                let name: String = chars[i + p.len() + 1..close].iter().collect();
+                return (!name.is_empty()).then_some(name);
+            }
+            i = close + 1;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The `@name` script-constant token at (line0, col): the full token including
+/// the sigil, and its 0-based start char col. `None` when the cursor isn't on
+/// one.
+fn at_var_at_cursor(text: &str, line0: u32, col: u32) -> Option<(String, u32)> {
+    let line = text.lines().nth(line0 as usize)?;
+    let chars: Vec<char> = line.chars().collect();
+    let mut cur = (col as usize).min(chars.len());
+    // Cursor on the sigil itself: step into the name.
+    if cur < chars.len() && chars[cur] == '@' {
+        cur += 1;
+    }
+    let mut start = cur;
+    while start > 0 && is_ident_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = cur;
+    while end < chars.len() && is_ident_char(chars[end]) {
+        end += 1;
+    }
+    if start == end || start == 0 || chars[start - 1] != '@' {
+        return None;
+    }
+    let name: String = std::iter::once('@')
+        .chain(chars[start..end].iter().copied())
+        .collect();
+    Some((name, start as u32 - 1))
 }
 
 /// The identifier token the cursor sits in (extended both directions over the
@@ -1102,6 +1474,160 @@ fn brace_folding_ranges(text: &str) -> Vec<FoldingRange> {
         }
     }
     ranges
+}
+
+/// A start/end span in source char coordinates: ((line, col), (line, col)),
+/// end-exclusive.
+type CharSpan = ((u32, u32), (u32, u32));
+
+/// Every matched `{ … }` pair in `text` as ((open_line, open_col),
+/// (close_line, close_col)) char positions of the braces themselves, from the
+/// same comment- and string-aware scan folding uses.
+fn brace_pairs(text: &str) -> Vec<CharSpan> {
+    let mut pairs = Vec::new();
+    let mut stack: Vec<(u32, u32)> = Vec::new();
+    let (mut line, mut col): (u32, u32) = (0, 0);
+    let mut in_string = false;
+    let mut in_comment = false;
+    for c in text.chars() {
+        if c == '\n' {
+            line += 1;
+            col = 0;
+            in_comment = false;
+            // Quoted strings never span lines in this grammar.
+            in_string = false;
+            continue;
+        }
+        let here = (line, col);
+        col += 1;
+        if c == '\r' || in_comment {
+            continue;
+        }
+        if in_string {
+            if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '#' => in_comment = true,
+            '"' => in_string = true,
+            '{' => stack.push(here),
+            '}' => {
+                if let Some(open) = stack.pop() {
+                    pairs.push((open, here));
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+/// The innermost-first selection chain at (line0, col): the identifier token
+/// under the cursor, then for each enclosing brace pair its content span
+/// (inside the braces) followed by the full span (including them). Every span
+/// contains the previous one, as `textDocument/selectionRange` requires.
+fn selection_spans(text: &str, pairs: &[CharSpan], line0: u32, col: u32) -> Vec<CharSpan> {
+    let mut spans: Vec<CharSpan> = Vec::new();
+    if let Some(line) = text.lines().nth(line0 as usize) {
+        let chars: Vec<char> = line.chars().collect();
+        let cur = (col as usize).min(chars.len());
+        let mut start = cur;
+        while start > 0 && is_ident_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = cur;
+        while end < chars.len() && is_ident_char(chars[end]) {
+            end += 1;
+        }
+        if start < end {
+            spans.push(((line0, start as u32), (line0, end as u32)));
+        }
+    }
+    let pos = (line0, col);
+    let mut enclosing: Vec<&CharSpan> = pairs
+        .iter()
+        .filter(|(open, close)| *open <= pos && pos <= *close)
+        .collect();
+    // Innermost first: the latest-opening enclosing pair is the tightest.
+    enclosing.sort_by_key(|p| std::cmp::Reverse(p.0));
+    for &&((ol, oc), (cl, cc)) in &enclosing {
+        let inner = ((ol, oc + 1), (cl, cc));
+        if inner.0 < inner.1 {
+            spans.push(inner);
+        }
+        spans.push(((ol, oc), (cl, cc + 1)));
+    }
+    spans
+}
+
+/// Folding ranges the brace scan can't produce: runs of two or more full-line
+/// `#` comments fold as `Comment`, and `#region` / `#endregion` marker pairs
+/// (stack-matched, so they nest) fold as `Region`. Marker lines belong to
+/// their region fold and never count toward a comment run; unmatched markers
+/// are ignored.
+fn comment_and_region_folds(text: &str) -> Vec<FoldingRange> {
+    let mut folds = Vec::new();
+    let mut region_stack: Vec<u32> = Vec::new();
+    let mut run_start: Option<u32> = None;
+    let mut prev_line: u32 = 0;
+    let close_run = |start: Option<u32>, end_line: u32, folds: &mut Vec<FoldingRange>| {
+        if let Some(start) = start
+            && end_line > start
+        {
+            folds.push(FoldingRange {
+                start_line: start,
+                start_character: None,
+                end_line,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Comment),
+                collapsed_text: None,
+            });
+        }
+    };
+    for (line0, line) in text.lines().enumerate() {
+        let line0 = line0 as u32;
+        prev_line = line0;
+        let trimmed = line.trim_start();
+        let is_marker_start = region_marker(trimmed) == Some(true);
+        let is_marker_end = region_marker(trimmed) == Some(false);
+        if is_marker_start || is_marker_end || !trimmed.starts_with('#') {
+            close_run(run_start.take(), line0.saturating_sub(1), &mut folds);
+        } else if run_start.is_none() {
+            run_start = Some(line0);
+        }
+        if is_marker_start {
+            region_stack.push(line0);
+        } else if is_marker_end
+            && let Some(start) = region_stack.pop()
+            && line0 > start
+        {
+            folds.push(FoldingRange {
+                start_line: start,
+                start_character: None,
+                end_line: line0,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: None,
+            });
+        }
+    }
+    close_run(run_start.take(), prev_line, &mut folds);
+    folds
+}
+
+/// `Some(true)` for a `#region` marker, `Some(false)` for `#endregion`, `None`
+/// for anything else. `line` must already be left-trimmed. A marker may carry
+/// a trailing label (`#region Alpha`).
+fn region_marker(line: &str) -> Option<bool> {
+    if let Some(rest) = line.strip_prefix("#endregion") {
+        (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some(false)
+    } else if let Some(rest) = line.strip_prefix("#region") {
+        (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some(true)
+    } else {
+        None
+    }
 }
 
 /// The identity value of a block (`id` / `name` / `tag` child leaf, in that
@@ -1320,11 +1846,196 @@ mod tests {
     }
 
     #[test]
+    fn code_token_cols_skip_comment_matches() {
+        assert_eq!(
+            code_token_cols_in_line("x = FOO # FOO again", "FOO"),
+            vec![4]
+        );
+        assert_eq!(
+            code_token_cols_in_line("# only FOO", "FOO"),
+            Vec::<u32>::new()
+        );
+        assert_eq!(code_token_cols_in_line("x = \"FOO\" # FOO", "FOO"), vec![5]);
+        // A `#` inside a quoted string does not start a comment.
+        assert_eq!(code_token_cols_in_line("x = \"# FOO\"", "FOO"), vec![7]);
+        assert_eq!(code_token_cols_in_line("FOO = FOO", "FOO"), vec![0, 6]);
+    }
+
+    #[test]
+    fn highlight_kind_write_for_assignment_key_read_otherwise() {
+        assert_eq!(
+            highlight_kind("MY_FOCUS = { }", 0, "MY_FOCUS"),
+            DocumentHighlightKind::WRITE
+        );
+        assert_eq!(
+            highlight_kind("    has_focus = MY_FOCUS", 16, "MY_FOCUS"),
+            DocumentHighlightKind::READ
+        );
+        assert_eq!(
+            highlight_kind("    var >= MY_FOCUS", 11, "MY_FOCUS"),
+            DocumentHighlightKind::READ
+        );
+    }
+
+    #[test]
     fn name_contains_ignore_case_matches_ascii_case_insensitively() {
         assert!(name_contains_ignore_case("Ship_Hull_Submarine", "hull_sub"));
         assert!(name_contains_ignore_case("Ship_Hull_Submarine", ""));
         assert!(!name_contains_ignore_case("Ship_Hull_Submarine", "cruiser"));
         assert!(!name_contains_ignore_case("abc", "abcd"));
+    }
+
+    #[test]
+    fn comment_folds_need_two_consecutive_lines() {
+        let folds = comment_and_region_folds("# one\n# two\n# three\nx = 1\n# lone\n");
+        assert_eq!(folds.len(), 1);
+        assert_eq!((folds[0].start_line, folds[0].end_line), (0, 2));
+        assert_eq!(folds[0].kind, Some(FoldingRangeKind::Comment));
+    }
+
+    #[test]
+    fn comment_fold_at_eof_without_newline() {
+        let folds = comment_and_region_folds("x = 1\n# a\n# b");
+        assert_eq!(folds.len(), 1);
+        assert_eq!((folds[0].start_line, folds[0].end_line), (1, 2));
+    }
+
+    #[test]
+    fn region_markers_fold_and_nest() {
+        let text = "#region outer\na = 1\n#region inner\nb = 2\n#endregion\n#endregion\n";
+        let folds = comment_and_region_folds(text);
+        let regions: Vec<(u32, u32)> = folds
+            .iter()
+            .filter(|f| f.kind == Some(FoldingRangeKind::Region))
+            .map(|f| (f.start_line, f.end_line))
+            .collect();
+        assert!(regions.contains(&(0, 5)), "outer region, got {:?}", regions);
+        assert!(regions.contains(&(2, 4)), "inner region, got {:?}", regions);
+    }
+
+    #[test]
+    fn unmatched_region_markers_are_ignored() {
+        assert!(comment_and_region_folds("#endregion\nx = 1\n").is_empty());
+        assert!(comment_and_region_folds("#region only\nx = 1\n").is_empty());
+    }
+
+    #[test]
+    fn region_markers_break_comment_runs() {
+        // The marker line belongs to its region fold, not to a comment run, so
+        // a lone comment next to a marker doesn't fold as a comment block.
+        let text = "# note\n#region r\nx = 1\n#endregion\n";
+        let folds = comment_and_region_folds(text);
+        assert!(
+            folds
+                .iter()
+                .all(|f| f.kind != Some(FoldingRangeKind::Comment)),
+            "got {:?}",
+            folds
+        );
+    }
+
+    #[test]
+    fn selection_spans_token_then_inner_then_full_pair() {
+        let text = "a = {\n    foo = bar\n}\n";
+        let pairs = brace_pairs(text);
+        // Cursor inside `bar` (line 1, col 10).
+        let spans = selection_spans(text, &pairs, 1, 10);
+        assert_eq!(
+            spans,
+            vec![
+                ((1, 10), (1, 13)), // the token
+                ((0, 5), (2, 0)),   // inside the braces
+                ((0, 4), (2, 1)),   // including the braces
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_spans_nested_pairs_chain_outward() {
+        let text = "a = {\n    b = {\n        x = 1\n    }\n}\n";
+        let pairs = brace_pairs(text);
+        let spans = selection_spans(text, &pairs, 2, 8);
+        assert_eq!(
+            spans,
+            vec![
+                ((2, 8), (2, 9)), // `x`
+                ((1, 9), (3, 4)), // inside inner braces
+                ((1, 8), (3, 5)), // inner pair
+                ((0, 5), (4, 0)), // inside outer braces
+                ((0, 4), (4, 1)), // outer pair
+            ]
+        );
+    }
+
+    #[test]
+    fn brace_pairs_ignore_comments_and_strings() {
+        assert!(brace_pairs("# { not a block\n").is_empty());
+        assert!(brace_pairs("x = \"{\"\n").is_empty());
+    }
+
+    #[test]
+    fn selection_spans_on_whitespace_start_at_block() {
+        let text = "a = {\n    foo = bar\n}\n";
+        let pairs = brace_pairs(text);
+        // Cursor on the indent whitespace: no token, chain starts at the block.
+        let spans = selection_spans(text, &pairs, 1, 2);
+        assert_eq!(spans, vec![((0, 5), (2, 0)), ((0, 4), (2, 1))]);
+    }
+
+    #[test]
+    fn cwt_ref_at_classifies_rule_references() {
+        use cwtools_rules::rules_types::CwtDefKind;
+        // `<focus>` anywhere in the span, including the angle brackets.
+        let line = "    has_focus = <focus>";
+        assert_eq!(
+            cwt_ref_at(line, 18),
+            Some((CwtDefKind::Type, "focus".to_string()))
+        );
+        assert_eq!(
+            cwt_ref_at(line, 16),
+            Some((CwtDefKind::Type, "focus".to_string()))
+        );
+        // `<!focus>` negation still names the type.
+        assert_eq!(
+            cwt_ref_at("    a = <!focus>", 12),
+            Some((CwtDefKind::Type, "focus".to_string()))
+        );
+        assert_eq!(
+            cwt_ref_at("    stat = enum[stat]", 17),
+            Some((CwtDefKind::Enum, "stat".to_string()))
+        );
+        assert_eq!(
+            cwt_ref_at("    b = single_alias_right[block]", 29),
+            Some((CwtDefKind::SingleAlias, "block".to_string()))
+        );
+        // Alias categories and value sets are out of scope.
+        assert_eq!(cwt_ref_at("    alias_name[effect] = x", 12), None);
+        assert_eq!(cwt_ref_at("    v = value[my_set]", 16), None);
+        // Cursor outside any construct.
+        assert_eq!(cwt_ref_at("    has_focus = <focus>", 6), None);
+    }
+
+    #[test]
+    fn at_var_at_cursor_finds_sigil_token() {
+        let text = "y = @foo\n";
+        assert_eq!(at_var_at_cursor(text, 0, 6), Some(("@foo".to_string(), 4)));
+        assert_eq!(at_var_at_cursor(text, 0, 4), Some(("@foo".to_string(), 4)));
+        // End-of-token cursor still resolves.
+        assert_eq!(at_var_at_cursor(text, 0, 8), Some(("@foo".to_string(), 4)));
+        // A plain identifier has no sigil.
+        assert_eq!(at_var_at_cursor("y = foo\n", 0, 5), None);
+        // A lone `@` is not a constant.
+        assert_eq!(at_var_at_cursor("y = @\n", 0, 4), None);
+    }
+
+    #[test]
+    fn symbol_rank_orders_exact_prefix_substring() {
+        assert_eq!(symbol_rank("MY_FOCUS", "my_focus"), Some(0));
+        assert_eq!(symbol_rank("my_focus_tooltip", "my_focus"), Some(1));
+        assert_eq!(symbol_rank("@my_const", "my"), Some(2));
+        assert_eq!(symbol_rank("unrelated", "my_focus"), None);
+        // Empty query admits everything (the picker's initial list).
+        assert_eq!(symbol_rank("anything", ""), Some(2));
     }
 
     #[test]

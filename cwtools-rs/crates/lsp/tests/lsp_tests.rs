@@ -3222,6 +3222,71 @@ fn test_folding_ranges_nested_blocks() {
 }
 
 #[test]
+fn test_folding_ranges_comments_and_regions() {
+    // A comment block folds as kind "comment"; #region/#endregion pairs fold
+    // as kind "region"; brace folds are unchanged.
+    let doc = "# header one\n# header two\n# header three\n#region Alpha\na = {\n    x = 1\n}\n#endregion\n";
+    let files = &[("common/national_focus/f.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/national_focus/f.txt"],
+        serde_json::json!({}),
+        "common/national_focus/f.txt",
+        "textDocument/foldingRange",
+        serde_json::json!({}),
+    );
+    let ranges = result.as_array().expect("folding ranges");
+    let has = |s: u64, e: u64, k: &str| {
+        ranges
+            .iter()
+            .any(|r| r["startLine"] == s && r["endLine"] == e && r["kind"] == k)
+    };
+    assert!(has(0, 2, "comment"), "comment block fold, got: {}", result);
+    assert!(has(3, 7, "region"), "#region marker fold, got: {}", result);
+    assert!(has(4, 6, "region"), "brace fold, got: {}", result);
+}
+
+#[test]
+fn test_selection_range_expands_token_to_blocks() {
+    // Expanding from `bar`: token, then block content, then the full block.
+    let doc = "a = {\n    foo = bar\n}\n";
+    let files = &[("common/national_focus/f.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/national_focus/f.txt"],
+        serde_json::json!({}),
+        "common/national_focus/f.txt",
+        "textDocument/selectionRange",
+        serde_json::json!({ "positions": [{ "line": 1, "character": 10 }] }),
+    );
+    let chain = &result.as_array().expect("one entry per position")[0];
+    assert_eq!(
+        chain["range"]["start"]["character"], 10,
+        "token start: {}",
+        result
+    );
+    assert_eq!(
+        chain["range"]["end"]["character"], 13,
+        "token end: {}",
+        result
+    );
+    let parent = &chain["parent"];
+    assert_eq!(
+        parent["range"]["start"]["line"], 0,
+        "content parent: {}",
+        result
+    );
+    let grandparent = &parent["parent"];
+    assert_eq!(
+        grandparent["range"]["start"]["character"], 4,
+        "full-pair grandparent starts at the open brace: {}",
+        result
+    );
+}
+
+#[test]
 fn test_document_highlight_occurrences() {
     // `MY_FOCUS` appears three times; highlighting one returns all three.
     let doc = "a = {\n    has_focus = MY_FOCUS\n}\nb = {\n    has_focus = MY_FOCUS\n}\nc = {\n    load_oob = MY_FOCUS\n}\n";
@@ -3242,6 +3307,250 @@ fn test_document_highlight_occurrences() {
         "expected 3 occurrences of MY_FOCUS, got: {}",
         result
     );
+}
+
+#[test]
+fn test_document_highlight_skips_comments_and_reports_kinds() {
+    // MY_FOCUS appears twice in code and once in a comment: the comment
+    // occurrence must not be highlighted, and value occurrences report
+    // kind Read (2) instead of Text (1).
+    let doc = "a = {\n    has_focus = MY_FOCUS\n}\n# note MY_FOCUS legacy\nb = {\n    has_focus = MY_FOCUS\n}\n";
+    let files = &[("common/decisions/d.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/documentHighlight",
+        serde_json::json!({ "position": { "line": 1, "character": 16 } }),
+    );
+    let hl = result.as_array().expect("highlights array");
+    assert_eq!(
+        hl.len(),
+        2,
+        "comment occurrence must be skipped, got: {}",
+        result
+    );
+    assert!(
+        hl.iter().all(|h| h["kind"] == 2),
+        "value occurrences must report Read (2), got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_completion_label_details_carry_type_origin() {
+    // A client advertising labelDetailsSupport sees the type origin next to
+    // instance labels at build time (not deferred to resolve).
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        ("common/decisions/d.txt", "adec = {\n    has_focus = \n}\n"),
+    ];
+    let caps = serde_json::json!({
+        "textDocument": { "completion": { "completionItem": { "labelDetailsSupport": true } } }
+    });
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        caps,
+        "common/decisions/d.txt",
+        "textDocument/completion",
+        serde_json::json!({ "position": { "line": 1, "character": 16 } }),
+    );
+    let items = result["items"].as_array().expect("completion items");
+    let focus_item = items
+        .iter()
+        .find(|i| i["label"] == "MY_FOCUS")
+        .unwrap_or_else(|| panic!("MY_FOCUS must be offered, got: {}", result));
+    assert_eq!(
+        focus_item["labelDetails"]["description"], "focus",
+        "type origin as labelDetails, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_completion_label_details_absent_without_support() {
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        ("common/decisions/d.txt", "adec = {\n    has_focus = \n}\n"),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/completion",
+        serde_json::json!({ "position": { "line": 1, "character": 16 } }),
+    );
+    let items = result["items"].as_array().expect("completion items");
+    let focus_item = items
+        .iter()
+        .find(|i| i["label"] == "MY_FOCUS")
+        .unwrap_or_else(|| panic!("MY_FOCUS must be offered, got: {}", result));
+    assert!(
+        focus_item["labelDetails"].is_null(),
+        "no labelDetails without client support, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_cwt_goto_type_reference_jumps_to_definition() {
+    // Goto on `<focus>` in an opened .cwt file lands on the `type[focus]`
+    // definition inside the loaded rules folder.
+    let files = &[("extra/my.cwt", "my_block = {\n    slot = <focus>\n}\n")];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["extra/my.cwt"],
+        serde_json::json!({}),
+        "extra/my.cwt",
+        "textDocument/definition",
+        serde_json::json!({ "position": { "line": 1, "character": 14 } }),
+    );
+    let locs = result.as_array().expect("definition locations");
+    assert!(
+        locs[0]["uri"].as_str().unwrap_or("").ends_with("r.cwt"),
+        "goto must land in the rules file, got: {}",
+        result
+    );
+    assert_eq!(
+        locs[0]["range"]["start"]["line"], 2,
+        "type[focus] line, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_cwt_hover_type_reference_describes_type() {
+    let files = &[("extra/my.cwt", "my_block = {\n    slot = <focus>\n}\n")];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["extra/my.cwt"],
+        serde_json::json!({}),
+        "extra/my.cwt",
+        "textDocument/hover",
+        serde_json::json!({ "position": { "line": 1, "character": 14 } }),
+    );
+    let md = result["contents"]["value"].as_str().unwrap_or("");
+    assert!(
+        md.contains("focus") && md.contains("type"),
+        "hover must describe the type, got: {}",
+        result
+    );
+    assert!(
+        md.contains("common/national_focus"),
+        "hover must list the type's path, got: {}",
+        result
+    );
+}
+
+const LINK_RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+decision = {
+    ## cardinality = 0..1
+    picture = filepath[gfx/,.dds]
+    ## cardinality = 0..1
+    icon = icon[gfx/interface]
+}
+"#;
+
+#[test]
+fn test_document_links_resolve_filepath_and_icon_leaves() {
+    // `picture` is filepath[gfx/,.dds] and `icon` is icon[gfx/interface]:
+    // both leaves become links to the files they reference. A value whose
+    // target doesn't exist gets no link.
+    let files = &[
+        ("gfx/pic.dds", "dds"),
+        ("gfx/interface/myicon.dds", "dds"),
+        (
+            "common/decisions/d.txt",
+            "adec = {\n    picture = pic\n    icon = myicon\n}\n",
+        ),
+    ];
+    let result = feature_request(
+        LINK_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/documentLink",
+        serde_json::json!({}),
+    );
+    let links = result.as_array().expect("document links");
+    let link_at = |line: u64, ch: u64| {
+        links
+            .iter()
+            .find(|l| l["range"]["start"]["line"] == line && l["range"]["start"]["character"] == ch)
+            .unwrap_or_else(|| panic!("no link at {}:{}, got: {}", line, ch, result))
+    };
+    assert!(
+        link_at(1, 14)["target"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("gfx/pic.dds"),
+        "picture link target, got: {}",
+        result
+    );
+    assert!(
+        link_at(2, 11)["target"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("gfx/interface/myicon.dds"),
+        "icon link target, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_workspace_symbols_rank_and_cover_all_sources() {
+    // Three symbol sources match "my": a focus instance (exact-prefix rank on
+    // "my_focus"), a loc key (prefix), and an @-constant (substring). The
+    // result must cover all three with distinct kinds and be ordered
+    // rank-then-name, not hash order.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/d.txt",
+            "@my_const = 5\nadec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+        (
+            "localisation/english/x_l_english.yml",
+            "l_english:\n my_focus_tooltip:0 \"Text\"\n",
+        ),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &[],
+        serde_json::json!({}),
+        "common/national_focus/f.txt",
+        "workspace/symbol",
+        serde_json::json!({ "query": "my" }),
+    );
+    let syms = result.as_array().expect("symbols array");
+    let names: Vec<&str> = syms.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["MY_FOCUS", "my_focus_tooltip", "@my_const"],
+        "expected rank-then-name order, got: {}",
+        result
+    );
+    let kind_of = |n: &str| {
+        syms.iter()
+            .find(|s| s["name"] == n)
+            .map(|s| s["kind"].as_u64().unwrap())
+    };
+    assert_eq!(kind_of("MY_FOCUS"), Some(23), "focus instance is STRUCT");
+    assert_eq!(kind_of("@my_const"), Some(14), "@-constant is CONSTANT");
+    assert_eq!(kind_of("my_focus_tooltip"), Some(20), "loc key is KEY");
 }
 
 #[test]
@@ -3276,6 +3585,51 @@ fn test_references_finds_closed_file() {
         locs.iter()
             .any(|l| l["uri"].as_str().unwrap_or("").ends_with("decisions/b.txt")),
         "references must include the closed file b.txt, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_references_exclude_declaration_omits_definition() {
+    // Same layout, but the client asks for includeDeclaration = false: the
+    // definition site in national_focus/f.txt must be omitted while the use
+    // sites in the decision files are still returned.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/a.txt",
+            "adec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+        (
+            "common/decisions/b.txt",
+            "bdec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/a.txt"],
+        serde_json::json!({}),
+        "common/decisions/a.txt",
+        "textDocument/references",
+        serde_json::json!({
+            "position": { "line": 1, "character": 16 },
+            "context": { "includeDeclaration": false }
+        }),
+    );
+    let locs = result.as_array().expect("references array");
+    assert!(
+        locs.iter()
+            .any(|l| l["uri"].as_str().unwrap_or("").ends_with("decisions/b.txt")),
+        "use sites must still be returned, got: {}",
+        result
+    );
+    assert!(
+        !locs.iter().any(|l| l["uri"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("national_focus/f.txt")),
+        "definition must be omitted when includeDeclaration is false, got: {}",
         result
     );
 }
@@ -3318,6 +3672,126 @@ fn test_rename_edits_closed_file() {
         result
     );
     assert_eq!(edits[0]["newText"], "NEW_FOCUS");
+}
+
+#[test]
+fn test_rename_emits_versioned_document_changes_when_supported() {
+    // A client that advertises workspace.workspaceEdit.documentChanges gets
+    // TextDocumentEdits with versions: the open doc carries its version, the
+    // closed file null.
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        (
+            "common/decisions/a.txt",
+            "adec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+        (
+            "common/decisions/b.txt",
+            "bdec = {\n    has_focus = MY_FOCUS\n}\n",
+        ),
+    ];
+    let caps = serde_json::json!({
+        "workspace": { "workspaceEdit": { "documentChanges": true } }
+    });
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/a.txt"],
+        caps,
+        "common/decisions/a.txt",
+        "textDocument/rename",
+        serde_json::json!({ "position": { "line": 1, "character": 16 }, "newName": "NEW_FOCUS" }),
+    );
+    assert!(
+        result["changes"].is_null(),
+        "legacy changes must be absent, got: {}",
+        result
+    );
+    let doc_changes = result["documentChanges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("documentChanges must be present, got: {}", result));
+    let entry_for = |suffix: &str| {
+        doc_changes
+            .iter()
+            .find(|e| {
+                e["textDocument"]["uri"]
+                    .as_str()
+                    .unwrap_or("")
+                    .ends_with(suffix)
+            })
+            .unwrap_or_else(|| panic!("no documentChanges entry for {}, got: {}", suffix, result))
+    };
+    assert_eq!(
+        entry_for("decisions/a.txt")["textDocument"]["version"],
+        1,
+        "open doc carries its version, got: {}",
+        result
+    );
+    assert!(
+        entry_for("decisions/b.txt")["textDocument"]["version"].is_null(),
+        "closed file version is null, got: {}",
+        result
+    );
+}
+
+#[test]
+fn test_rename_at_constant_renames_file_locally() {
+    // `@` script constants are file-local: renaming from the definition
+    // rewrites the definition and the read, but never the occurrence in a
+    // trailing comment.
+    let doc = "@my_const = 5\nadec = {\n    x = @my_const # @my_const stays\n}\n";
+    let files = &[("common/decisions/d.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/rename",
+        serde_json::json!({ "position": { "line": 0, "character": 2 }, "newName": "@renamed" }),
+    );
+    let changes = result["changes"]
+        .as_object()
+        .expect("WorkspaceEdit changes");
+    let key = changes
+        .keys()
+        .find(|u| u.ends_with("decisions/d.txt"))
+        .unwrap_or_else(|| panic!("rename must edit d.txt, got: {}", result));
+    let edits = changes[key].as_array().expect("edits for d.txt");
+    let mut spans: Vec<(u64, u64)> = edits
+        .iter()
+        .map(|e| {
+            (
+                e["range"]["start"]["line"].as_u64().unwrap(),
+                e["range"]["start"]["character"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    spans.sort_unstable();
+    assert_eq!(
+        spans,
+        vec![(0, 0), (2, 8)],
+        "definition and read, never the comment, got: {}",
+        result
+    );
+    assert!(edits.iter().all(|e| e["newText"] == "@renamed"));
+}
+
+#[test]
+fn test_prepare_rename_covers_at_constant_token() {
+    let doc = "@my_const = 5\nadec = {\n    x = @my_const\n}\n";
+    let files = &[("common/decisions/d.txt", doc)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["common/decisions/d.txt"],
+        serde_json::json!({}),
+        "common/decisions/d.txt",
+        "textDocument/prepareRename",
+        serde_json::json!({ "position": { "line": 2, "character": 10 } }),
+    );
+    assert_eq!(result["start"]["character"], 8, "token start: {}", result);
+    assert_eq!(result["end"]["character"], 17, "token end: {}", result);
 }
 
 #[test]

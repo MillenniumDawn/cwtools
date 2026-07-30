@@ -518,7 +518,7 @@ fn hint_token_type(hint: &ReferenceHint) -> Option<u32> {
 /// Bodies of the matched `NodeRule`s — the rules that apply inside the clause
 /// this key opens. `SubtypeRule` branches are unioned in, the way
 /// `position::descend` flattens nested subtype blocks.
-fn node_bodies(matched: &[(RuleType, Options)]) -> Vec<(RuleType, Options)> {
+pub(crate) fn node_bodies(matched: &[(RuleType, Options)]) -> Vec<(RuleType, Options)> {
     let mut out = Vec::new();
     for (rt, _) in matched {
         if let RuleType::NodeRule { rules, .. } = rt {
@@ -533,7 +533,7 @@ fn node_bodies(matched: &[(RuleType, Options)]) -> Vec<(RuleType, Options)> {
     out
 }
 
-fn valueclause_bodies(rules: &[(RuleType, Options)]) -> Vec<(RuleType, Options)> {
+pub(crate) fn valueclause_bodies(rules: &[(RuleType, Options)]) -> Vec<(RuleType, Options)> {
     rules
         .iter()
         .filter_map(|(rt, _)| match rt {
