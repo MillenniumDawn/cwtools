@@ -1136,6 +1136,9 @@ impl Backend {
         text: &str,
     ) -> HashSet<String> {
         let new_keys = loc_keys_of(text, path);
+        if self.loc_overlay_entry_matches(&self.state.loc_watched_overlay, uri, &new_keys) {
+            return HashSet::new();
+        }
         let mut overlay = self.loc_watched_overlay_mut();
         let changed = match overlay.get(uri) {
             Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
@@ -1143,6 +1146,24 @@ impl Backend {
         };
         overlay.insert(uri.to_string(), new_keys);
         changed
+    }
+
+    /// Whether an overlay already holds exactly `new_keys` for `uri`, checked
+    /// under a read lock.
+    ///
+    /// Taking the write guard is what bumps `loc_overlay_revision`, and most
+    /// loc keystrokes change a value rather than the key set — so re-inserting
+    /// an identical set invalidated both derived caches on every edit and the
+    /// `$ref$` name universe was rebuilt anyway. Skipping the write when
+    /// nothing moved is what makes those caches actually hit while a `.yml` is
+    /// being typed in.
+    fn loc_overlay_entry_matches(
+        &self,
+        overlay: &parking_lot::RwLock<std::collections::HashMap<String, HashSet<String>>>,
+        uri: &str,
+        new_keys: &HashSet<String>,
+    ) -> bool {
+        overlay.read().get(uri).is_some_and(|prev| prev == new_keys)
     }
 
     /// The cross-file refresh an open loc edit runs per file, done ONCE for a
@@ -1205,13 +1226,23 @@ impl Backend {
                 let is_open = self.state.documents.lock().contains_key(uri);
                 let changed_keys: HashSet<String> = if is_open {
                     let new_keys = loc_keys_from(&parsed_loc);
-                    let mut overlay = self.loc_live_overlay_mut();
-                    let diff = match overlay.get(uri) {
-                        Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
-                        None => new_keys.clone(),
-                    };
-                    overlay.insert(uri.to_string(), new_keys);
-                    diff
+                    // Skip the write when the key set is unchanged, which is
+                    // the common keystroke: taking the write guard bumps the
+                    // revision the derived caches key on, so re-inserting an
+                    // identical set rebuilt the whole `$ref$` name universe on
+                    // every edit. See `loc_overlay_entry_matches`.
+                    if self.loc_overlay_entry_matches(&self.state.loc_live_overlay, uri, &new_keys)
+                    {
+                        HashSet::new()
+                    } else {
+                        let mut overlay = self.loc_live_overlay_mut();
+                        let diff = match overlay.get(uri) {
+                            Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
+                            None => new_keys.clone(),
+                        };
+                        overlay.insert(uri.to_string(), new_keys);
+                        diff
+                    }
                 } else {
                     HashSet::new()
                 };

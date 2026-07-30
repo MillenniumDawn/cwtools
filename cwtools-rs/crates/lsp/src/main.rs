@@ -2049,6 +2049,54 @@ mod tests {
     }
 
     #[test]
+    fn test_unchanged_loc_key_set_keeps_the_cached_union() {
+        // The common loc keystroke edits a VALUE, not the key set. Taking the
+        // overlay write guard is what invalidates the derived caches, so
+        // re-recording an identical set rebuilt the ~200K-String `$ref$`
+        // universe on every edit and the cache never hit while a `.yml` was
+        // being typed in. Measured on a 1.29 MB Millennium Dawn loc file:
+        // 65.7ms -> 13.7ms per edit once the no-op write is skipped.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (service, _socket) = LspService::build(|client| Backend {
+                client,
+                state: Arc::new(DocumentState::new()),
+            })
+            .finish();
+            let backend = service.inner();
+            let (uri, path) = ("file:///a_l_english.yml", "a_l_english.yml");
+
+            let changed =
+                backend.record_watched_loc_keys(uri, path, "l_english:\n MY_KEY:0 \"one\"\n");
+            assert!(changed.contains("my_key"), "got: {changed:?}");
+            let first = backend.loc_overlay_keys();
+
+            // Same keys, new value: nothing the derived sets depend on moved.
+            let changed =
+                backend.record_watched_loc_keys(uri, path, "l_english:\n MY_KEY:0 \"one two\"\n");
+            assert!(changed.is_empty(), "got: {changed:?}");
+            let second = backend.loc_overlay_keys();
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "an unchanged key set must leave the cached union in place"
+            );
+
+            // A real key change must still invalidate it.
+            let changed = backend.record_watched_loc_keys(
+                uri,
+                path,
+                "l_english:\n MY_KEY:0 \"one\"\n OTHER_KEY:0 \"two\"\n",
+            );
+            assert!(changed.contains("other_key"), "got: {changed:?}");
+            let third = backend.loc_overlay_keys();
+            assert!(!Arc::ptr_eq(&second, &third));
+            assert!(third.contains("other_key"), "got: {third:?}");
+        });
+    }
+
+    #[test]
     fn test_did_focus_file_marks_activity() {
         // A focus switch is user activity: the handler must reset the idle
         // clock the background reindex loop watches, like edits and feature
