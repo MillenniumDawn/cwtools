@@ -385,6 +385,13 @@ struct DocumentState {
     /// Cached fallback list (the flat type/enum/var dump reached when
     /// context-aware matching returns nothing).
     fallback_cache: parking_lot::Mutex<Option<CompletionCacheEntry>>,
+    /// `(uri, version, ast)` of the last mid-edit re-parse `ast_snapshot_for`
+    /// did when the document had no stored AST yet. Hover, goto, completion,
+    /// semantic tokens and inlay hints all fire off one keystroke and each
+    /// re-parsed the whole file independently in that window. One entry is
+    /// enough: they are all for the focused document. Dropped on `did_close`.
+    #[allow(clippy::type_complexity)]
+    fresh_ast_cache: parking_lot::Mutex<Option<(String, i32, Arc<ParsedFile>)>>,
     /// Per-URI generation counter for in-flight completion requests. Each new
     /// `completion` request for a URI increments this and captures the value;
     /// the request checks the counter before doing any heavy work and bails
@@ -599,6 +606,7 @@ impl DocumentState {
             debounce_handles: Mutex::new(HashMap::new()),
             info_revision: AtomicU64::new(0),
             fallback_cache: parking_lot::Mutex::new(None),
+            fresh_ast_cache: parking_lot::Mutex::new(None),
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
             last_loc_signature: parking_lot::Mutex::new(None),
             last_scan_fingerprint: parking_lot::Mutex::new(None),
@@ -859,12 +867,17 @@ impl Backend {
 impl Backend {
     /// Snapshot the document AST for `uri`, plus whether it came from the
     /// current document version. When there is no cached AST, re-parse the live
-    /// text for THIS request only so hover/goto/completion still resolve a
-    /// context mid-edit. The fresh AST is not written back. The debounced
-    /// validate owns the long-term one. The `documents` mutex is held only for
-    /// the snapshot, never across the parse.
+    /// text so hover/goto/completion still resolve a context mid-edit. The fresh
+    /// AST is not written back to the document. The debounced validate owns the
+    /// long-term one. The `documents` mutex is held only for the snapshot, never
+    /// across the parse.
+    ///
+    /// The fresh parse is memoized by `(uri, version)` in `fresh_ast_cache`
+    /// (#87): a document has no stored AST from `did_open` until its first
+    /// successful validate, and every feature request landing in that window
+    /// used to re-parse the whole file for itself.
     pub(crate) fn ast_snapshot_for(&self, uri: &str) -> Option<AstSnapshot> {
-        let text = {
+        let (text, version) = {
             let docs = self.state.documents.lock();
             let doc = docs.get(uri)?;
             if let Some(ast) = &doc.ast {
@@ -878,15 +891,35 @@ impl Backend {
                     source,
                 });
             }
-            doc.text.clone()
+            (doc.text.clone(), doc.version)
         };
+        let cached = {
+            let guard = self.state.fresh_ast_cache.lock();
+            guard
+                .as_ref()
+                .filter(|(cached_uri, cached_version, _)| {
+                    cached_uri == uri && *cached_version == version
+                })
+                .map(|(_, _, ast)| Arc::clone(ast))
+        };
+        if let Some(ast) = cached {
+            return Some(AstSnapshot {
+                ast,
+                source: AstSource::FreshParse,
+            });
+        }
         let table = self.state.string_table.clone();
         tokio::task::block_in_place(|| {
             cwtools_parser::parser::parse_string(&text, &table)
                 .ok()
-                .map(|ast| AstSnapshot {
-                    ast: Arc::new(ast),
-                    source: AstSource::FreshParse,
+                .map(|ast| {
+                    let ast = Arc::new(ast);
+                    *self.state.fresh_ast_cache.lock() =
+                        Some((uri.to_string(), version, Arc::clone(&ast)));
+                    AstSnapshot {
+                        ast,
+                        source: AstSource::FreshParse,
+                    }
                 })
         })
     }
@@ -1417,6 +1450,12 @@ impl LanguageServer for Backend {
             doc_tokens.remove(&uri);
             self.loc_live_overlay_mut().remove(&uri);
             self.state.completion_generation.lock().remove(&uri);
+            {
+                let mut fresh = self.state.fresh_ast_cache.lock();
+                if fresh.as_ref().is_some_and(|(cached, _, _)| cached == &uri) {
+                    *fresh = None;
+                }
+            }
 
             let info = self.state.info_service.read();
             (

@@ -1193,30 +1193,38 @@ impl Backend {
             // first sight fire the whole-file cross-file sweep (#90). Watched
             // files record into `loc_watched_overlay` instead
             // (`record_watched_loc_keys`) with one coalesced sweep per batch.
-            // One parse of the edited buffer, shared by the key set, the
-            // diagnostics and the hover text below — each used to parse the
-            // whole file itself, and two of them copied it first (#87).
-            let parsed_loc = parse_loc_buffer(text, &path);
-            let is_open = self.state.documents.lock().contains_key(uri);
-            let changed_keys: HashSet<String> = if is_open {
-                let new_keys = loc_keys_from(&parsed_loc);
-                let mut overlay = self.loc_live_overlay_mut();
-                let diff = match overlay.get(uri) {
-                    Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
-                    None => new_keys.clone(),
+            // block_in_place: parsing and linting a loc buffer is sync CPU work
+            // that would otherwise hold a runtime worker for its whole duration,
+            // and MD ships loc files in the hundreds of KB. Matches how the scan
+            // paths already fence their sync work. (#87)
+            let (changed_keys, extra, diagnostics) = tokio::task::block_in_place(|| {
+                // One parse of the edited buffer, shared by the key set, the
+                // diagnostics and the hover text below — each used to parse the
+                // whole file itself, and two of them copied it first (#87).
+                let parsed_loc = parse_loc_buffer(text, &path);
+                let is_open = self.state.documents.lock().contains_key(uri);
+                let changed_keys: HashSet<String> = if is_open {
+                    let new_keys = loc_keys_from(&parsed_loc);
+                    let mut overlay = self.loc_live_overlay_mut();
+                    let diff = match overlay.get(uri) {
+                        Some(prev) => prev.symmetric_difference(&new_keys).cloned().collect(),
+                        None => new_keys.clone(),
+                    };
+                    overlay.insert(uri.to_string(), new_keys);
+                    diff
+                } else {
+                    HashSet::new()
                 };
-                overlay.insert(uri.to_string(), new_keys);
-                diff
-            } else {
-                HashSet::new()
-            };
-            // Built once here and shared with the cross-file sweep below, which
-            // would otherwise rebuild the whole name set per open loc file.
-            let extra = self.loc_ref_names();
-            let diagnostics = self.validate_loc_parsed(&path, &parsed_loc, &lines, &extra);
-            // Update the hover loc_text map so tooltips reflect the latest
-            // edits without waiting for a full workspace rescan (#53).
-            self.update_loc_text_for_file(&parsed_loc);
+                // Built once here and shared with the cross-file sweep below,
+                // which would otherwise rebuild the whole name set per open
+                // `.yml`.
+                let extra = self.loc_ref_names();
+                let diagnostics = self.validate_loc_parsed(&path, &parsed_loc, &lines, &extra);
+                // Update the hover loc_text map so tooltips reflect the latest
+                // edits without waiting for a full workspace rescan (#53).
+                self.update_loc_text_for_file(&parsed_loc);
+                (changed_keys, extra, diagnostics)
+            });
             // A change to this file's key set can fix or break `$ref$` checks in
             // other open loc files, so refresh them — that's the cross-file part
             // of the index that previously only updated on a window reload.
@@ -1297,7 +1305,11 @@ impl Backend {
 
         tracing::debug!(%uri, "[validate] parsing");
 
-        match parse_string(text, &self.state.string_table) {
+        // block_in_place: everything from here down is sync CPU work (parse,
+        // index, validate) with no await in it. Without the fence a 1 MB script
+        // file holds a tokio worker for the whole validate, while the scan paths
+        // that do the same work already fence theirs. (#87)
+        tokio::task::block_in_place(|| match parse_string(text, &self.state.string_table) {
             Ok(parsed) => {
                 for parse_err in &parsed.errors {
                     diagnostics.push(parse_error_to_diagnostic(parse_err, &lines));
@@ -1392,7 +1404,7 @@ impl Backend {
                 });
                 (diagnostics, None)
             }
-        }
+        })
     }
 }
 
