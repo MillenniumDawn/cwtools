@@ -245,6 +245,120 @@ fn cw100_still_fires_when_loc_data_exists() {
     );
 }
 
+// ── CW239 unused-instance pass ───────────────────────────────────────────────
+
+/// Two types: `thing`, whose instances are expected to be referenced, and
+/// `user`, which references one. `{SHOULD_BE_USED}` is filled per test so the
+/// same mod can be validated with the check armed and disarmed.
+const UNUSED_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        {SHOULD_BE_USED}
+    }
+    type[user] = {
+        path = "game/common/users"
+    }
+}
+thing = { }
+user = { uses = <thing> }
+"#;
+
+/// A temp workspace holding two `thing` instances, only one of which `a_user`
+/// references. `armed` controls whether the config asks for the check at all.
+fn unused_workspace(armed: bool) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let rules = UNUSED_RULES.replace(
+        "{SHOULD_BE_USED}",
+        if armed { "should_be_used = yes" } else { "" },
+    );
+    std::fs::create_dir_all(tmp.path().join("rules")).unwrap();
+    std::fs::write(tmp.path().join("rules").join("things.cwt"), rules).unwrap();
+
+    let things = tmp.path().join("mod").join("common").join("things");
+    std::fs::create_dir_all(&things).unwrap();
+    std::fs::write(things.join("x.txt"), "used_thing = { }\nlone_thing = { }\n").unwrap();
+
+    let users = tmp.path().join("mod").join("common").join("users");
+    std::fs::create_dir_all(&users).unwrap();
+    std::fs::write(users.join("u.txt"), "a_user = { uses = used_thing }\n").unwrap();
+    tmp
+}
+
+fn unused_session(workspace: &std::path::Path) -> cwtools_driver::SessionWithFiles {
+    Session::load(SessionConfig {
+        game: Game::Hoi4,
+        rules: RulesInput::Dir(workspace.join("rules")),
+        directory: workspace.join("mod"),
+        vanilla: None,
+        vanilla_cache: None,
+        vanilla_cache_auto: None,
+        ignore_files: &[],
+        ignore_dirs: &[],
+        loc_languages: None,
+        on_rules_warning: None,
+    })
+}
+
+fn cw239_rows(workspace: &std::path::Path) -> Vec<(PathBuf, String)> {
+    unused_session(workspace)
+        .validate_all()
+        .into_iter()
+        .flat_map(|(path, errs)| {
+            errs.into_iter()
+                .filter(|e| e.code == Some("CW239"))
+                .map(move |e| (path.clone(), e.message))
+        })
+        .collect()
+}
+
+/// The batch path's two-phase pass runs end to end: uses recorded across every
+/// file, merged, and the definition nothing referenced reported against the
+/// file that defines it. A per-file check could not tell these two apart, since
+/// the reference lives in a different file from both definitions.
+#[test]
+fn validate_all_reports_the_unreferenced_instance() {
+    let tmp = unused_workspace(true);
+    let rows = cw239_rows(tmp.path());
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly one instance is unreferenced: {rows:?}"
+    );
+    let (path, message) = &rows[0];
+    assert!(
+        message.contains("lone_thing"),
+        "the unreferenced instance should be named: {rows:?}"
+    );
+    assert!(
+        path.ends_with("common/things/x.txt"),
+        "CW239 belongs to the file that defines the instance, got {}",
+        path.display()
+    );
+}
+
+/// The same mod under a config that marks no type `should_be_used` reports
+/// nothing. This pins the output, not the `needs_use_tracking` short-circuit:
+/// that gate only saves work, and `is_tracked` keeps the result empty either
+/// way, so forcing the gate on is not observable here.
+#[test]
+fn validate_all_reports_nothing_without_should_be_used() {
+    let tmp = unused_workspace(false);
+    assert!(
+        cw239_rows(tmp.path()).is_empty(),
+        "no type asks to be referenced, so nothing should report"
+    );
+}
+
+/// The pass is part of `validate_all`'s result, so it must be as repeatable as
+/// the rest of it. The per-file uses are merged out of a rayon collect, and a
+/// set iteration leaking into the output would show up here.
+#[test]
+fn validate_all_unused_rows_are_deterministic() {
+    let tmp = unused_workspace(true);
+    assert_eq!(cw239_rows(tmp.path()), cw239_rows(tmp.path()));
+}
+
 fn load_loc_session(
     workspace: &std::path::Path,
     parse_cache_dir: Option<PathBuf>,

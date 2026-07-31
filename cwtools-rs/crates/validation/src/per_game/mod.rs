@@ -21,7 +21,9 @@ pub(crate) fn run_game_validators(ctx: &ValidationCtx, game: Game) -> Vec<Valida
     let table = ctx.table;
     let file_path = ctx.file_path;
 
-    // Common checks (unique types, should_be_referenced, warning_only downgrade)
+    // Common checks (duplicate `unique` type keys). Whether a
+    // `should_be_referenced` type is ever referenced is a project-wide question,
+    // so it lives in `crate::references`, not here.
     common::validate_common(ast, ruleset, table, file_path, &mut errors);
 
     // Cross-game structural hints.
@@ -37,6 +39,7 @@ pub(crate) fn run_game_validators(ctx: &ValidationCtx, game: Game) -> Vec<Valida
                 ctx.type_index,
                 &mut errors,
             );
+            stellaris::mark_exempt_technologies(ctx);
         }
         Game::Hoi4 => {
             hoi4::validate_hoi4(ast, ruleset, table, file_path, &mut errors);

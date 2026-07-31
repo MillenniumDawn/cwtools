@@ -11,6 +11,7 @@ pub mod error_codes;
 pub mod missing_loc;
 pub mod per_game;
 pub mod position;
+pub mod references;
 
 mod common;
 mod ctx;
@@ -295,6 +296,30 @@ pub fn validate_prepared(
     file_path: &str,
     prepared: &Prepared,
 ) -> Vec<ValidationError> {
+    validate_prepared_inner(ast, file_path, prepared, None)
+}
+
+/// As [`validate_prepared`], but also reporting which instances of the
+/// reference-tracked types this file uses, for the project-wide unused check
+/// (CW239/CW231). The batch driver calls this once per file, merges the sets,
+/// and then runs [`references::check_unused_instances`] over each file's own
+/// definitions. See [`references`] for why it can't be decided per file.
+pub fn validate_prepared_tracking_uses(
+    ast: &ParsedFile,
+    file_path: &str,
+    prepared: &Prepared,
+) -> (Vec<ValidationError>, references::UsedInstances) {
+    let used = std::cell::RefCell::new(references::UsedInstances::default());
+    let errors = validate_prepared_inner(ast, file_path, prepared, Some(&used));
+    (errors, used.into_inner())
+}
+
+fn validate_prepared_inner(
+    ast: &ParsedFile,
+    file_path: &str,
+    prepared: &Prepared,
+    type_uses: Option<&std::cell::RefCell<references::UsedInstances>>,
+) -> Vec<ValidationError> {
     let Prepared {
         ruleset,
         table,
@@ -328,6 +353,7 @@ pub fn validate_prepared(
         scope_checks,
         var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),
+        type_uses,
     };
 
     // Pre-compute path-based type match (most specific wins).

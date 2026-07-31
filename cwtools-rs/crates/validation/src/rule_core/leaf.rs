@@ -164,6 +164,11 @@ pub(super) fn validate_leaf(
                     TypeType::Simple(n) => n.as_str(),
                     TypeType::Complex { name, .. } => name.as_str(),
                 };
+                // Record the use for the project-wide unused check (CW239/CW231)
+                // before the CW500 gate: a run without vanilla data still knows
+                // this value referenced the instance, it just can't say whether
+                // the instance exists.
+                crate::references::mark_type_field_use(ctx, type_type, value_str);
                 // Subtype-qualified references (`<type.subtype>`, e.g.
                 // `<event.country_event>` / `<equipment.naval_equip>`) resolve
                 // permissively. The index's `type.subtype` membership is derived from

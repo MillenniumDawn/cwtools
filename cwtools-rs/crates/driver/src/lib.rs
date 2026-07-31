@@ -45,9 +45,10 @@ use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
+use cwtools_validation::references::{UsedInstances, check_unused_instances, needs_use_tracking};
 use cwtools_validation::{
     ErrorSeverity, Prepared, ValidationError, build_modifier_keys, build_scope_registry_arc,
-    checks_from_env, validate_prepared,
+    checks_from_env, validate_prepared, validate_prepared_tracking_uses,
 };
 
 /// A discovered workspace/mod file, retained between indexing and validation.
@@ -673,7 +674,15 @@ impl SessionWithFiles {
         use rayon::prelude::*;
 
         let prepared = self.session.prepared();
-        self.files
+        // CW239/CW231 need every file's `<type>` references before any file can
+        // be judged, so the per-file pass collects them and a second pass over
+        // the same results reports what nothing used. Off entirely for a config
+        // that declares no `should_be_used` type outside Stellaris, and without
+        // an index there are no definitions to report against.
+        let track_uses =
+            prepared.type_index.is_some() && needs_use_tracking(prepared.ruleset, prepared.game);
+        let mut results: Vec<(PathBuf, Vec<ValidationError>, UsedInstances)> = self
+            .files
             .par_iter()
             .map(|src| {
                 let file_str: cwtools_validation::FilePath =
@@ -693,6 +702,7 @@ impl SessionWithFiles {
                             fix: None,
                             end: None,
                         }],
+                        UsedInstances::default(),
                     )
                 };
                 if workspace_cache::source_cache_key(&src.path) != src.fingerprint.metadata {
@@ -718,11 +728,20 @@ impl SessionWithFiles {
                                 fix: None,
                                 end: None,
                             }],
+                            UsedInstances::default(),
                         );
                     }
                 };
                 let mut errors = parse_errors_to_validation(&parsed.errors, &file_str);
-                errors.extend(validate_prepared(&parsed, &file_str, &prepared));
+                let used = if track_uses {
+                    let (errs, used) =
+                        validate_prepared_tracking_uses(&parsed, &file_str, &prepared);
+                    errors.extend(errs);
+                    used
+                } else {
+                    errors.extend(validate_prepared(&parsed, &file_str, &prepared));
+                    UsedInstances::default()
+                };
                 // CW100: objects defined here whose `## required` localisation
                 // keys aren't provided by any loc file. Gated on the loc index
                 // being non-empty, same as the LSP's `append_missing_loc_errors`:
@@ -740,8 +759,34 @@ impl SessionWithFiles {
                         |k| loc.exists_any(k),
                     ));
                 }
-                (src.path.clone(), errors)
+                (src.path.clone(), errors, used)
             })
+            .collect();
+
+        if track_uses && let Some(type_index) = prepared.type_index {
+            let mut used = UsedInstances::default();
+            for (_, _, file_used) in &mut results {
+                used.absorb(std::mem::take(file_used));
+            }
+            // Only the mod's own files are checked: the base game is indexed but
+            // never validated, so its definitions never reach this loop.
+            for (path, errors, _) in &mut results {
+                let file_str: cwtools_validation::FilePath =
+                    std::sync::Arc::from(path.to_str().unwrap_or(""));
+                let instances = type_index.instances_in_file(&file_str);
+                errors.extend(check_unused_instances(
+                    prepared.ruleset,
+                    prepared.game,
+                    &instances,
+                    &used,
+                    &file_str,
+                ));
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|(path, errors, _)| (path, errors))
             .collect()
     }
 
