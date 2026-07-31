@@ -9,8 +9,8 @@ use smallvec::SmallVec;
 
 use crate::common::*;
 use crate::ctx::ValidationCtx;
-use crate::error_codes;
 use crate::scope::{enter_block_scope, scope_matches_required};
+use cwtools_error_codes as error_codes;
 
 use super::children::{rule_right_is_math_expr, validate_children};
 use super::leaf::validate_leaf;

@@ -9,8 +9,8 @@ use std::sync::LazyLock;
 
 use crate::common::*;
 use crate::ctx::ValidationCtx;
-use crate::error_codes;
 use crate::scope::{enter_block_scope, scope_matches_required};
+use cwtools_error_codes as error_codes;
 
 use super::alias::validate_alias_usage;
 use super::leaf::{check_variable_get, field_matches_value, validate_leaf};

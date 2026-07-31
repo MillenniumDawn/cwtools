@@ -7,7 +7,8 @@ use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
 use std::collections::HashSet;
 
-pub mod error_codes;
+use cwtools_error_codes as error_codes;
+
 pub mod missing_loc;
 pub mod per_game;
 pub mod position;
@@ -203,12 +204,6 @@ pub fn validate_ast_with_loc(
             var_checks,
         },
     )
-}
-
-/// Look up an enum definition by name directly from the ruleset.
-pub fn enum_def<'a>(ruleset: &'a RuleSet, name: &str) -> Option<&'a EnumDefinition> {
-    let idx = *ruleset.enum_by_name.get(name)?;
-    ruleset.enums.get(idx)
 }
 
 /// Build the config-driven scope/link registry once, wrapped in an `Arc` so it

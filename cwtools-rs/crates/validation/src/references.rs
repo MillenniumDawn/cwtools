@@ -18,8 +18,8 @@ use cwtools_rules::rules_types::{RuleSet, TypeType};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ctx::ValidationCtx;
-use crate::error_codes;
 use crate::{FilePath, ValidationError};
+use cwtools_error_codes as error_codes;
 
 /// The Stellaris type whose unused check is CW231 (`Technology {} is not used`)
 /// rather than the generic CW239.
