@@ -5,12 +5,16 @@
 //! - `validateIfWithNoEffect`   -> CW121 (empty if/else_if)
 //! - `validateRedundantANDWithNOR` -> CW251 (AND-in-AND / OR-in-OR)
 //!
+//! Also hosts game-agnostic checks ported from Stellaris-specific validation:
+//! - CW107 (event may fire every tick)
+//! - CW238 (else/else_if without preceding if)
+//!
 //! F# scopes these to the rules engine's classified effect/trigger blocks. This
 //! parser has no such classification, so the walk instead keys off the reserved
 //! logic keywords (`NOT`/`AND`/`OR`/`NOR`/`if`/`else_if`), which only appear in
 //! trigger/effect script — running it file-wide matches F# in practice.
 
-use super::common::as_block;
+use super::common::{as_block, child_is_always_no, under_dir_segment};
 use crate::{ValidationError, error_codes};
 use cwtools_game::constants::Game;
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
@@ -43,8 +47,14 @@ struct Keywords {
     or: StringId,
     nor: StringId,
     limit: StringId,
+    modifier: StringId,
     count_triggers: StringId,
     value: StringId,
+    mean_time_to_happen: StringId,
+    is_triggered_only: StringId,
+    fire_only_once: StringId,
+    base: StringId,
+    trigger: StringId,
 }
 
 impl Keywords {
@@ -58,8 +68,14 @@ impl Keywords {
             or: table.intern("or").lower,
             nor: table.intern("nor").lower,
             limit: table.intern("limit").lower,
+            modifier: table.intern("modifier").lower,
             count_triggers: table.intern("count_triggers").lower,
             value: table.intern("value").lower,
+            mean_time_to_happen: table.intern("mean_time_to_happen").lower,
+            is_triggered_only: table.intern("is_triggered_only").lower,
+            fire_only_once: table.intern("fire_only_once").lower,
+            base: table.intern("base").lower,
+            trigger: table.intern("trigger").lower,
         }
     }
 }
@@ -156,6 +172,114 @@ fn push_fix(
             .with_fix(fix)
             .with_end(r.end),
     );
+}
+
+// ── CW107: event may fire every tick ───────────────────
+
+/// Validate that events have a guard against firing every tick.
+fn validate_event_every_tick(
+    ast: &ParsedFile,
+    table: &StringTable,
+    kw: &Keywords,
+    file_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !under_dir_segment(file_path, "events") {
+        return;
+    }
+    for child in &ast.root_children {
+        let Some(block) = as_block(child, ast) else {
+            continue;
+        };
+        // The event keys are an open set (`country_event`, `planet_event`, …),
+        // so this one match needs the text rather than an interned id.
+        let Some((is_event, key_len)) = table.with_string(block.key_lower, |k| {
+            (k.ends_with("_event") || k == "event", k.chars().count())
+        }) else {
+            continue;
+        };
+        if !is_event {
+            continue;
+        }
+
+        let has_guard = block.children.iter().any(|c| {
+            let Child::Leaf(idx) = c else { return false };
+            let key = ast.arena.leaves[*idx as usize].key.lower;
+            key == kw.mean_time_to_happen
+                || key == kw.is_triggered_only
+                || key == kw.fire_only_once
+                || key == kw.base
+                || (key == kw.trigger && child_is_always_no(c, ast, table))
+        });
+
+        if !has_guard {
+            // Advice about the event, so the squiggle covers its key rather
+            // than burying the whole body (same treatment CW223/CW251 got).
+            push(
+                errors,
+                &error_codes::CW107_EVENT_EVERY_TICK,
+                error_codes::CW107_EVENT_EVERY_TICK
+                    .message_template
+                    .to_string(),
+                key_token_range(block.range.start, key_len),
+                file_path,
+            );
+        }
+    }
+}
+
+// ── CW238: else/else_if without preceding if ───────────
+
+/// Validate that `else`/`else_if` blocks have a preceding `if`.
+///
+/// Two spellings are legal and both must pass. Stellaris 2.1+ chains the
+/// followers as siblings (`if = {…} else = {…}`); HOI4 and pre-2.1 Stellaris
+/// nest them inside the `if` they belong to, so an `if`/`else_if` block is
+/// itself the antecedent for the followers among its own children.
+fn validate_if_else_order(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    kw: &Keywords,
+    file_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    for child in children {
+        let Some(block) = as_block(child, ast) else {
+            continue;
+        };
+        let key = block.key_lower;
+
+        // limit/modifier bodies are not part of an if/else chain.
+        if key != kw.limit && key != kw.modifier {
+            let mut prev_was_if = key == kw.if_ || key == kw.else_if;
+            for c in block.children {
+                let Some(inner) = as_block(c, ast) else {
+                    continue;
+                };
+                let k = inner.key_lower;
+                if k != kw.if_ && k != kw.else_ && k != kw.else_if {
+                    continue;
+                }
+                if !prev_was_if && k != kw.if_ {
+                    let key_len = table.with_string(key, |s| s.chars().count()).unwrap_or(0);
+                    push(
+                        errors,
+                        &error_codes::CW238_IF_ELSE_ORDER,
+                        error_codes::CW238_IF_ELSE_ORDER
+                            .message_template
+                            .to_string(),
+                        key_token_range(block.range.start, key_len),
+                        file_path,
+                    );
+                    break;
+                }
+                prev_was_if = k == kw.if_ || k == kw.else_if;
+            }
+        }
+
+        validate_if_else_order(block.children, ast, table, kw, file_path, errors);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -308,6 +432,9 @@ pub fn validate_structural(
         cw223_msg,
         errors,
     );
+
+    validate_event_every_tick(ast, table, &kw, file_path, errors);
+    validate_if_else_order(&ast.root_children, ast, table, &kw, file_path, errors);
 }
 
 #[cfg(test)]
@@ -318,10 +445,15 @@ mod tests {
 
     /// The codes emitted for `src`, in emit order.
     fn codes(src: &str) -> Vec<&'static str> {
+        codes_at("test.txt", src)
+    }
+
+    /// The codes emitted for `src` at `path` (path matters for CW107's events-dir check).
+    fn codes_at(path: &str, src: &str) -> Vec<&'static str> {
         let table = StringTable::new();
         let ast = parse_string(src, &table).unwrap();
         let mut errors = Vec::new();
-        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+        validate_structural(&ast, &table, path, Game::Hoi4, &mut errors);
         errors.iter().filter_map(|e| e.code).collect()
     }
 
@@ -475,9 +607,14 @@ mod tests {
 
     #[test]
     fn empty_if_flagged_in_every_casing() {
-        for key in ["if", "IF", "If", "else_if", "ELSE_IF", "Else_if"] {
+        for key in ["if", "IF", "If"] {
             let src = format!("x = {{ {key} = {{ }} }}\n");
             assert_eq!(codes(&src), ["CW121"], "{key}");
+        }
+        // else_if without a preceding if also fires CW238.
+        for key in ["else_if", "ELSE_IF", "Else_if"] {
+            let src = format!("x = {{ {key} = {{ }} }}\n");
+            assert_eq!(codes(&src), ["CW121", "CW238"], "{key}");
         }
     }
 
@@ -576,5 +713,202 @@ mod tests {
             let src = format!("{key} = {{ amount = 2 AND = {{ has_war = yes tag = GER }} }}\n");
             assert!(codes(&src).is_empty(), "{key}: {:?}", codes(&src));
         }
+    }
+
+    // ── CW107: event may fire every tick ────────────────────────────────────
+
+    #[test]
+    fn event_without_mtth_or_trigger_is_cw107() {
+        let c = codes_at("events/test.txt", "my_event = { }\n");
+        assert!(
+            c.contains(&"CW107"),
+            "event with no MTTH/trigger/once should emit CW107, got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn event_with_mtth_is_clean() {
+        let c = codes_at(
+            "events/test.txt",
+            "my_event = { mean_time_to_happen = { years = 5 } }\n",
+        );
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_is_triggered_only_is_clean() {
+        let c = codes_at(
+            "events/test.txt",
+            "my_event = { is_triggered_only = yes }\n",
+        );
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_fire_only_once_is_clean() {
+        let c = codes_at("events/test.txt", "my_event = { fire_only_once = yes }\n");
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_trigger_always_no_is_clean() {
+        let c = codes_at(
+            "events/test.txt",
+            "my_event = { trigger = { always = no } }\n",
+        );
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_trigger_always_yes_still_cw107() {
+        // `trigger = { always = yes }` does NOT suppress CW107; only always=no does.
+        let c = codes_at(
+            "events/test.txt",
+            "my_event = { trigger = { always = yes } }\n",
+        );
+        assert!(c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn non_event_root_is_not_cw107() {
+        // The CW107 check is scoped to *_event / event keys only.
+        let c = codes_at("events/test.txt", "foo = { }\n");
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_key_outside_events_dir_is_not_cw107() {
+        let c = codes_at("common/scripted_effects/test.txt", "my_event = { }\n");
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn mixed_case_event_key_is_cw107() {
+        let c = codes_at("events/test.txt", "My_Event = { }\n");
+        assert!(c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn mixed_case_events_dir_is_cw107() {
+        let c = codes_at("Events/test.txt", "my_event = { }\n");
+        assert!(c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn cw107_underlines_only_the_event_key() {
+        let table = StringTable::new();
+        let ast = parse_string("my_event = {\n    id = test.1\n}\n", &table).unwrap();
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, "events/test.txt", Game::Hoi4, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW107"))
+            .expect("CW107 emitted");
+
+        assert_eq!((err.line, err.col), (1, 0));
+        assert_eq!(
+            err.end,
+            Some((1, "my_event".len() as u16)),
+            "CW107 must span only the key"
+        );
+    }
+
+    // ── CW238: else/else_if without preceding if ────────────────────────────
+
+    #[test]
+    fn else_without_preceding_if_is_cw238() {
+        let c = codes("foo = { else = { a = 1 } }\n");
+        assert!(c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn if_then_else_is_clean_order() {
+        let c = codes("foo = { if = { limit = { } a = 1 } else = { b = 2 } }\n");
+        assert!(!c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn properly_ordered_if_else_if_is_clean() {
+        let c = codes("foo = { if = { limit = { } a = 1 } else_if = { limit = { } b = 2 } }\n");
+        assert!(!c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn nested_limit_and_modifier_do_not_false_positive_cw238() {
+        // `limit` and `modifier` blocks are excluded from the if/else order walk.
+        for key in ["limit", "modifier"] {
+            let src = format!("foo = {{ {key} = {{ else = {{ a = 1 }} }} }}\n");
+            let c = codes(&src);
+            assert!(!c.contains(&"CW238"), "{key}: {:?}", c);
+        }
+    }
+
+    // HOI4 and pre-2.1 Stellaris nest the follower inside the `if` it hangs
+    // off, so the parent is the antecedent, not a preceding sibling.
+
+    #[test]
+    fn nested_else_inside_if_is_clean() {
+        let c = codes("foo = { if = { limit = { tag = GER } a = 1 else = { b = 2 } } }\n");
+        assert!(!c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn nested_else_if_without_an_else_is_clean() {
+        let c = codes(
+            "foo = { if = { limit = { tag = GER } a = 1 else_if = { limit = { tag = FRA } b = 2 } } }\n",
+        );
+        assert!(!c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn nested_else_if_then_else_is_clean() {
+        let c = codes(
+            "foo = { if = { limit = { tag = GER } a = 1 else_if = { limit = { tag = FRA } b = 2 } else = { c = 3 } } }\n",
+        );
+        assert!(!c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    // The nested chain still ends at its `else`: a second one has no antecedent.
+    #[test]
+    fn second_nested_else_is_cw238() {
+        let c = codes(
+            "foo = { if = { limit = { tag = GER } a = 1 else = { b = 2 } else = { c = 3 } } }\n",
+        );
+        assert!(c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn else_if_after_else_is_cw238() {
+        let c = codes("foo = { if = { a = 1 } else = { b = 2 } else_if = { c = 3 } }\n");
+        assert!(c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    // An `else` parent is not an antecedent — nothing chains off an else.
+    #[test]
+    fn else_nested_inside_else_is_cw238() {
+        let c = codes("foo = { if = { a = 1 } else = { b = 2 else = { c = 3 } } }\n");
+        assert!(c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn cw238_underlines_only_the_containing_key() {
+        let table = StringTable::new();
+        let ast = parse_string("foo = {\n    else = { a = 1 }\n}\n", &table).unwrap();
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW238"))
+            .expect("CW238 emitted");
+
+        assert_eq!((err.line, err.col), (1, 0));
+        assert_eq!(
+            err.end,
+            Some((1, "foo".len() as u16)),
+            "CW238 must span only the key"
+        );
     }
 }

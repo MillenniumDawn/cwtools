@@ -593,6 +593,7 @@ mod tests {
         assert!(load(tmp.path(), fp, text, &table).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn path_key_hits_until_source_metadata_changes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -608,6 +609,25 @@ mod tests {
         assert!(load_path(tmp.path(), fp, &source, &table).is_some());
 
         fs::write(&source, "a = 200\n").unwrap();
+        assert!(load_path(tmp.path(), fp, &source, &table).is_none());
+    }
+
+    /// Off `PATH_METADATA_CACHE_SUPPORTED` there is no reliable no-read stamp, so
+    /// a store must not produce a hit: the caller re-reads and keys on content
+    /// instead of being served an entry nothing can invalidate.
+    #[cfg(not(unix))]
+    #[test]
+    fn path_key_never_hits_without_metadata_support() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        fs::write(&source, "a = 1\n").unwrap();
+        let table = StringTable::new();
+        let fp = 8;
+        validate_or_clear(tmp.path(), fp).unwrap();
+        let parsed = parse_string("a = 1\n", &table).unwrap();
+
+        let source_key = source_cache_key(&source).unwrap();
+        store_path(tmp.path(), fp, &source, &source_key, &parsed, &table);
         assert!(load_path(tmp.path(), fp, &source, &table).is_none());
     }
 

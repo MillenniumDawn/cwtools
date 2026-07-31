@@ -1,5 +1,5 @@
-use super::common::{as_block, walk_blocks};
-use crate::{ErrorSeverity, ValidationError, error_codes};
+use super::common::{as_block, child_key_eq, under_dir_segment, walk_blocks};
+use crate::{ValidationError, error_codes};
 use cwtools_index::TypeIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_parser::fix::{SuggestedFix, key_token_range};
@@ -28,10 +28,9 @@ pub fn validate_stellaris(
         };
         let key = block.key_string_lower(table);
         if in_events && (key.ends_with("_event") || key == "event") {
-            validate_event(
+            validate_event_pretriggers(
                 &key,
                 block.children,
-                block.range.start.line,
                 ast,
                 ruleset,
                 table,
@@ -95,28 +94,7 @@ fn parent_dir_is(file_path: &str, suffix: &str) -> bool {
     dir_of(file_path).is_some_and(|dir| dir == suffix || dir.ends_with(&format!("/{suffix}")))
 }
 
-/// True when any directory segment equals `segment` (mods sometimes nest
-/// `events/` into subfolders).
-fn under_dir_segment(file_path: &str, segment: &str) -> bool {
-    dir_of(file_path).is_some_and(|dir| dir.split('/').any(|s| s == segment))
-}
-
-// ── If/Else & set_name structural hints (CW236/CW237/CW238/CW253) ─────────
-
-/// Lowercased keys of a block's direct keyed children, in order.
-fn child_keys(children: &[Child], ast: &ParsedFile, table: &StringTable) -> Vec<String> {
-    children
-        .iter()
-        .filter_map(|c| match c {
-            Child::Leaf(idx) => Some(
-                table
-                    .get_string(ast.arena.leaves[*idx as usize].key.lower)
-                    .unwrap_or_default(),
-            ),
-            _ => None,
-        })
-        .collect()
-}
+// ── If/Else & set_name structural hints (CW236/CW237/CW253) ─────────
 
 fn walk_if_else(
     children: &[Child],
@@ -151,20 +129,19 @@ fn walk_if_else(
             );
         }
 
-        if key != "limit" && key != "modifier" {
+        if key == "if" || key == "else_if" {
             let has_else = block_children
                 .iter()
                 .any(|c| child_key_eq(c, ast, table, "else"));
             let has_if = block_children
                 .iter()
                 .any(|c| child_key_eq(c, ast, table, "if"));
-            let deprecated_else = (key == "if" || key == "else_if") && has_else && !has_if;
             // Advice about the keyword, so the squiggle covers the key, not the
             // whole block it opens (same treatment CW253 got above).
             let key_end = key_token_range(block.range.start, key.chars().count()).end;
 
             // CW236 — old nested if/else style.
-            if deprecated_else {
+            if has_else && !has_if {
                 errors.push(
                     ValidationError::from_code(
                         &error_codes::CW236_DEPRECATED_ELSE,
@@ -190,39 +167,11 @@ fn walk_if_else(
                     .with_end(key_end),
                 );
             }
-
-            // CW238 — else/else_if missing a preceding if (skip the deprecated case).
-            if !deprecated_else {
-                let mut prev_was_if = false;
-                for k in child_keys(block_children, ast, table) {
-                    if k != "if" && k != "else" && k != "else_if" {
-                        continue;
-                    }
-                    if prev_was_if {
-                        prev_was_if = k == "if" || k == "else_if";
-                    } else if k == "if" {
-                        prev_was_if = true;
-                    } else {
-                        // else / else_if with no preceding if.
-                        errors.push(
-                            ValidationError::from_code(
-                                &error_codes::CW238_IF_ELSE_ORDER,
-                                file_path,
-                                line,
-                                col,
-                                &[],
-                            )
-                            .with_end(key_end),
-                        );
-                        break;
-                    }
-                }
-            }
         }
     });
 }
 
-// ── Event Validation (CW107 / CW120) ───────────────────
+// ── Event Validation (CW120) ───────────────────────────
 
 /// Pretrigger set for an event key (`planet_event` -> `planet_pre_trigger` names).
 /// `pop_group_event` maps to the `pop` category; event types with no
@@ -236,49 +185,16 @@ fn event_pretriggers<'a>(
     ruleset.pretriggers.get(scope)
 }
 
-/// Validate a Stellaris event body (children of `*_event = { ... }`).
-/// `event_line` is the line of the event key for anchoring the CW107 diagnostic.
-#[allow(clippy::too_many_arguments)]
-fn validate_event(
+/// Validate a Stellaris event body for pretrigger placement (CW120).
+fn validate_event_pretriggers(
     event_key: &str,
     children: &[Child],
-    event_line: u32,
     ast: &ParsedFile,
     ruleset: &RuleSet,
     table: &StringTable,
     file_path: &str,
     errors: &mut Vec<ValidationError>,
 ) {
-    let mut has_mtth = false;
-    let mut has_trig = false;
-    let mut has_once = false;
-    let mut has_base = false;
-    let mut has_always_no = false;
-    for c in children {
-        if child_key_eq(c, ast, table, "mean_time_to_happen") {
-            has_mtth = true;
-        } else if child_key_eq(c, ast, table, "is_triggered_only") {
-            has_trig = true;
-        } else if child_key_eq(c, ast, table, "fire_only_once") {
-            has_once = true;
-        } else if child_key_eq(c, ast, table, "base") {
-            has_base = true;
-        } else if child_key_eq(c, ast, table, "trigger") && child_is_always_no(c, ast, table) {
-            has_always_no = true;
-        }
-    }
-
-    if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
-        errors.push(ValidationError::from_code_with(
-            &error_codes::CW107_EVENT_EVERY_TICK,
-            ErrorSeverity::Information,
-            file_path,
-            event_line,
-            0,
-            "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
-        ));
-    }
-
     // CW120: a trigger-block pretrigger could move to `pre_triggers` for perf.
     // F#'s validatePreTriggers was hardcoded to planet_event; this uses the
     // config's per-scope sets instead.
@@ -600,36 +516,6 @@ fn validate_planet_killer(
 
 // ── Helpers ────────────────────────────────────────────
 
-fn child_key_eq(child: &Child, ast: &ParsedFile, table: &StringTable, expected: &str) -> bool {
-    match child {
-        Child::Leaf(idx) => {
-            let leaf = &ast.arena.leaves[*idx as usize];
-            table
-                .with_string(leaf.key.normal, |k| k.eq_ignore_ascii_case(expected))
-                .unwrap_or(false)
-        }
-        _ => false,
-    }
-}
-
-fn child_is_always_no(child: &Child, ast: &ParsedFile, table: &StringTable) -> bool {
-    as_block(child, ast).is_some_and(|block| {
-        block.children.iter().any(|c| {
-            if !child_key_eq(c, ast, table, "always") {
-                return false;
-            }
-            let Child::Leaf(idx) = c else { return false };
-            match &ast.arena.leaves[*idx as usize].value {
-                Value::Bool(b) => !*b,
-                Value::String(t) | Value::QString(t) => table
-                    .with_string(t.normal, |s| s.eq_ignore_ascii_case("no"))
-                    .unwrap_or(false),
-                _ => false,
-            }
-        })
-    })
-}
-
 /// Scalar value of the first child leaf whose key matches `key` (case-insensitive),
 /// or None if the key is absent or the leaf carries a clause.
 fn child_scalar(
@@ -797,71 +683,6 @@ mod tests {
         );
     }
 
-    // ── Event validation (CW107) ──────────────────────────────────────────────
-
-    #[test]
-    fn event_without_mtth_or_trigger_is_cw107() {
-        let c = codes_at(EVENTS, "my_event = { }\n");
-        assert!(
-            has_code(&c, "CW107"),
-            "event with no MTTH/trigger/once should emit CW107, got: {:?}",
-            c
-        );
-    }
-
-    #[test]
-    fn event_with_mtth_is_clean() {
-        let c = codes_at(
-            EVENTS,
-            "my_event = { mean_time_to_happen = { years = 5 } }\n",
-        );
-        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn event_is_triggered_only_is_clean() {
-        let c = codes_at(EVENTS, "my_event = { is_triggered_only = yes }\n");
-        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn event_fire_only_once_is_clean() {
-        let c = codes_at(EVENTS, "my_event = { fire_only_once = yes }\n");
-        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn event_trigger_always_no_is_clean() {
-        let c = codes_at(EVENTS, "my_event = { trigger = { always = no } }\n");
-        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn event_trigger_always_yes_still_cw107() {
-        // `trigger = { always = yes }` does NOT suppress CW107; only always=no does.
-        let c = codes_at(EVENTS, "my_event = { trigger = { always = yes } }\n");
-        assert!(has_code(&c, "CW107"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn non_event_root_is_not_cw107() {
-        // The CW107 check is scoped to *_event / event keys only.
-        let c = codes_at(EVENTS, "foo = { }\n");
-        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn event_key_outside_events_dir_is_not_cw107() {
-        let c = codes_at("common/scripted_effects/test.txt", "my_event = { }\n");
-        assert!(!has_code(&c, "CW107"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn mixed_case_event_key_is_cw107() {
-        let c = codes_at(EVENTS, "My_Event = { }\n");
-        assert!(has_code(&c, "CW107"), "got: {:?}", c);
-    }
-
     // ── Pre-trigger placement (CW120, event-scoped) ───────────────────────────
 
     #[test]
@@ -1025,7 +846,7 @@ mod tests {
         assert!(has_code(&c, "CW253"), "got: {:?}", c);
     }
 
-    // ── If/else structural hints (CW236/CW237/CW238) ──────────────────────────
+    // ── If/else structural hints (CW236/CW237) ────────────────────────────────
 
     #[test]
     fn deprecated_nested_else_is_cw236() {
@@ -1042,28 +863,6 @@ mod tests {
             "foo = { if = { limit = { } if = { a = 1 } else = { b = 2 } } }\n",
         );
         assert!(has_code(&c, "CW237"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn else_without_preceding_if_is_cw238() {
-        let c = codes_at(EVENTS, "foo = { else = { a = 1 } }\n");
-        assert!(has_code(&c, "CW238"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn properly_ordered_if_else_if_is_clean() {
-        let c = codes_at(
-            EVENTS,
-            "foo = { if = { limit = { } a = 1 } else_if = { limit = { } b = 2 } }\n",
-        );
-        assert!(!has_code(&c, "CW238"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn nested_limit_and_modifier_do_not_false_positive() {
-        // `limit` and `modifier` blocks are excluded from the if/else order walk.
-        let c = codes_at(EVENTS, "foo = { limit = { } modifier = { } }\n");
-        assert!(!has_code(&c, "CW236") && !has_code(&c, "CW237") && !has_code(&c, "CW238"));
     }
 
     // ── Technology (CW110) ────────────────────────────────────────────────
