@@ -20,7 +20,7 @@ mod rule_core;
 mod scope;
 mod subtype;
 
-pub use common::{ErrorSeverity, ValidationError, error_hash};
+pub use common::{ErrorSeverity, FilePath, ValidationError, error_hash};
 pub use loc_field::build_modifier_keys;
 pub use scope::scope_matches_required;
 pub use subtype::{collect_subtype_instances, subtype_membership_for_instance};
@@ -311,11 +311,15 @@ pub fn validate_prepared(
 
     let mut scope_context = initial_scope_context(file_path, registry);
 
+    // Interned once per file; every diagnostic this run emits (including the
+    // candidate errors the disjunctions discard) shares it.
+    let file_arc: common::FilePath = std::sync::Arc::from(file_path);
+
     let ctx = ValidationCtx {
         ast,
         ruleset,
         table,
-        file_path,
+        file_path: &file_arc,
         game,
         type_index,
         modifier_keys,

@@ -56,7 +56,7 @@ pub(crate) fn loc_diag_to_validation_error(
         severity: d.severity,
         line: d.line as u32,
         col: d.col.saturating_sub(1) as u16,
-        file: d.file.clone(),
+        file: d.file.as_str().into(),
         code: Some(d.code),
         // Carry the loc fix (CW268 quote-wrap) so it reaches the code-action
         // path through the shared `validation_error_to_diagnostic` renderer.
@@ -151,7 +151,7 @@ pub(crate) fn truncate_validation_errors(
             severity: cwtools_validation::ErrorSeverity::Information,
             line: 0,
             col: 0,
-            file: uri.to_string(),
+            file: uri.into(),
             code: None,
             fix: None,
             end: None,
@@ -195,7 +195,7 @@ pub(crate) fn append_missing_loc_errors(
         errs.extend(cwtools_validation::missing_loc::check_missing_localisation(
             &instances,
             uri,
-            uri,
+            &uri.into(),
             prepared.ruleset,
             |k| loc.exists_any(k) || overlay.is_some_and(|o| o.contains(k)),
         ));
@@ -1689,7 +1689,7 @@ mod perf_bench {
                 cwtools_validation::missing_loc::check_missing_localisation(
                     &instances,
                     logical_path,
-                    logical_path,
+                    &logical_path.into(),
                     &ruleset,
                     |_| true,
                 )
@@ -1700,7 +1700,7 @@ mod perf_bench {
                 cwtools_validation::missing_loc::check_missing_localisation(
                     &instances,
                     logical_path,
-                    logical_path,
+                    &logical_path.into(),
                     &ruleset,
                     |_| true,
                 )

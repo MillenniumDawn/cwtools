@@ -10,13 +10,21 @@ use cwtools_string_table::string_table::{StringTable, StringTokens};
 use cwtools_error_codes::ErrorCode;
 pub use cwtools_error_codes::ErrorSeverity;
 
+/// The file path a run's diagnostics are tagged with. Built once per file and
+/// cloned into every diagnostic.
+pub type FilePath = std::sync::Arc<str>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidationError {
     pub message: String,
     pub severity: ErrorSeverity,
     pub line: u32,
     pub col: u16,
-    pub file: String,
+    /// Path of the file the diagnostic is in. Shared rather than owned: every
+    /// diagnostic from one file names the same path, and the candidate errors
+    /// that `pick_best_candidate` and the alias disjunction build and throw away
+    /// far outnumber the ones that survive.
+    pub file: std::sync::Arc<str>,
     /// CW### error code, e.g. "CW262" for an unexpected property node. The id is
     /// `&'static` (the catalog `ErrorCode.id`), so no per-error allocation.
     pub code: Option<&'static str>,
@@ -41,7 +49,7 @@ impl ValidationError {
     /// code→severity mapping so call sites don't restate it.
     pub(crate) fn from_code(
         code: &ErrorCode,
-        file: &str,
+        file: &FilePath,
         line: u32,
         col: u16,
         args: &[&str],
@@ -51,7 +59,7 @@ impl ValidationError {
             severity: code.severity,
             line,
             col,
-            file: file.to_string(),
+            file: std::sync::Arc::clone(file),
             code: Some(code.id),
             fix: None,
             end: None,
@@ -65,7 +73,7 @@ impl ValidationError {
     pub(crate) fn from_code_with(
         code: &ErrorCode,
         severity: ErrorSeverity,
-        file: &str,
+        file: &FilePath,
         line: u32,
         col: u16,
         message: String,
@@ -75,7 +83,7 @@ impl ValidationError {
             severity,
             line,
             col,
-            file: file.to_string(),
+            file: std::sync::Arc::clone(file),
             code: Some(code.id),
             fix: None,
             end: None,
@@ -315,6 +323,20 @@ pub(crate) fn with_match_text<R: Default>(
         .unwrap_or_default()
 }
 
+/// `s` starts with `prefix`, ASCII-case-insensitively. Byte-wise, so it matches
+/// what `to_ascii_lowercase().starts_with(..)` decides without the two owned
+/// copies that spelling allocates.
+pub(crate) fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    let (s, prefix) = (s.as_bytes(), prefix.as_bytes());
+    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// `s` ends with `suffix`, ASCII-case-insensitively. See [`starts_with_ci`].
+pub(crate) fn ends_with_ci(s: &str, suffix: &str) -> bool {
+    let (s, suffix) = (s.as_bytes(), suffix.as_bytes());
+    s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
 /// Strip a balanced pair of surrounding double-quotes from a child key.
 pub(crate) fn unquote_key(s: &str) -> &str {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
@@ -368,4 +390,101 @@ pub fn error_hash(error: &ValidationError) -> String {
         "{}|{}|{}|{}",
         sev_str, error.file, error.line, error.message
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference spelling these two replace. Every case below asserts the
+    /// pair agrees with it, so the helpers can't drift from the semantics the
+    /// filepath checks were written against.
+    fn starts_ref(s: &str, prefix: &str) -> bool {
+        s.to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase())
+    }
+    fn ends_ref(s: &str, suffix: &str) -> bool {
+        s.to_ascii_lowercase()
+            .ends_with(&suffix.to_ascii_lowercase())
+    }
+
+    #[test]
+    fn starts_with_ci_folds_ascii_case() {
+        assert!(starts_with_ci("GFX/interface/x.dds", "gfx/"));
+        assert!(starts_with_ci("gfx/interface/x.dds", "GFX/"));
+        assert!(starts_with_ci("gfx/interface/x.dds", "gfx/"));
+        assert!(!starts_with_ci("sound/x.wav", "gfx/"));
+    }
+
+    #[test]
+    fn ends_with_ci_folds_ascii_case() {
+        assert!(ends_with_ci("gfx/x.DDS", ".dds"));
+        assert!(ends_with_ci("gfx/x.dds", ".DDS"));
+        assert!(ends_with_ci("sound/zom_vo.ASSET", ".asset"));
+        assert!(!ends_with_ci("gfx/x.dds", ".tga"));
+    }
+
+    /// A needle longer than the haystack must answer false, not panic on the
+    /// slice. This is the boundary the byte-slice form has to guard itself.
+    #[test]
+    fn needle_longer_than_haystack_is_false() {
+        assert!(!starts_with_ci("a", "abc"));
+        assert!(!ends_with_ci("a", "abc"));
+        assert!(!starts_with_ci("", "x"));
+        assert!(!ends_with_ci("", "x"));
+    }
+
+    /// An empty needle matches anything, the same as `str::starts_with("")`.
+    #[test]
+    fn empty_needle_always_matches() {
+        assert!(starts_with_ci("anything", ""));
+        assert!(ends_with_ci("anything", ""));
+        assert!(starts_with_ci("", ""));
+        assert!(ends_with_ci("", ""));
+    }
+
+    /// Non-ASCII bytes are compared verbatim (ASCII folding leaves them alone)
+    /// and slicing by byte offset must not split one. `é` is two bytes, so a
+    /// needle whose length crosses it would land mid-character if the offset
+    /// were computed in characters instead of bytes.
+    #[test]
+    fn non_ascii_is_compared_bytewise_without_splitting() {
+        // Identical non-ASCII bytes match, and the ASCII tail still folds.
+        assert!(ends_with_ci("gfx/café.DDS", ".dds"));
+        assert!(starts_with_ci("café/x.dds", "CAFé/"));
+        // ASCII folding does not reach non-ASCII case: É (0xC9) is not é (0xE9).
+        assert!(!starts_with_ci("café/x.dds", "CAFÉ/"));
+        assert!(!ends_with_ci("x.dés", ".des"));
+        // A needle exactly as long as a trailing multi-byte character.
+        assert!(!ends_with_ci("x.dé", "dé!"));
+        assert!(ends_with_ci("x.dé", "é"));
+    }
+
+    /// Both helpers must decide exactly what the allocating spelling decided.
+    #[test]
+    fn helpers_agree_with_the_lowercasing_spelling() {
+        let cases = [
+            ("gfx/interface/Button.DDS", ".dds"),
+            ("gfx/interface/Button.DDS", ".tga"),
+            ("gfx/interface/Button.DDS", "gfx/"),
+            ("gfx/interface/Button.DDS", "GFX/INTERFACE/"),
+            ("", ""),
+            ("", ".dds"),
+            (".dds", ".dds"),
+            ("café.DDS", ".dds"),
+            ("ΑΣ.dds", ".DDS"),
+        ];
+        for (s, needle) in cases {
+            assert_eq!(
+                starts_with_ci(s, needle),
+                starts_ref(s, needle),
+                "starts_with_ci({s:?}, {needle:?})"
+            );
+            assert_eq!(
+                ends_with_ci(s, needle),
+                ends_ref(s, needle),
+                "ends_with_ci({s:?}, {needle:?})"
+            );
+        }
+    }
 }

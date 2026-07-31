@@ -59,7 +59,10 @@ pub fn subtype_membership_for_instance(
     table: &StringTable,
     out: &mut std::collections::HashMap<String, Vec<cwtools_index::TypeInstance>>,
 ) {
-    // Only reached for types that declare subtypes.
+    // Only reached for types that declare subtypes. The `type.subtype` key is
+    // assembled into one reused buffer and only handed to the map on the first
+    // instance of each subtype; after that the entry already exists.
+    let mut key = String::new();
     for st in &node.td.subtypes {
         if subtype_matches(
             st,
@@ -70,15 +73,21 @@ pub fn subtype_membership_for_instance(
             Some(node.node_key),
             None,
         ) {
-            out.entry(format!("{}.{}", node.td.name, st.name))
-                .or_default()
-                .push(cwtools_index::TypeInstance {
-                    name: node.name.to_string(),
-                    location: node.location,
-                    // Hover resolves the primary loc key via the base-type
-                    // instances; subtype-qualified entries don't need it.
-                    primary_loc_key: None,
-                });
+            key.clear();
+            key.push_str(&node.td.name);
+            key.push('.');
+            key.push_str(&st.name);
+            let entry = match out.get_mut(key.as_str()) {
+                Some(v) => v,
+                None => out.entry(key.clone()).or_default(),
+            };
+            entry.push(cwtools_index::TypeInstance {
+                name: node.name.to_string(),
+                location: node.location,
+                // Hover resolves the primary loc key via the base-type
+                // instances; subtype-qualified entries don't need it.
+                primary_loc_key: None,
+            });
         }
     }
 }

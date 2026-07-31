@@ -21,7 +21,7 @@ pub(crate) struct ValidationCtx<'a> {
     pub(crate) ast: &'a ParsedFile,
     pub(crate) ruleset: &'a RuleSet,
     pub(crate) table: &'a StringTable,
-    pub(crate) file_path: &'a str,
+    pub(crate) file_path: &'a crate::common::FilePath,
     pub(crate) game: Option<Game>,
     pub(crate) type_index: Option<&'a cwtools_index::TypeIndex>,
     pub(crate) modifier_keys: Option<&'a HashSet<String>>,

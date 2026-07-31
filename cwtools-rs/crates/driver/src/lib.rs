@@ -676,7 +676,8 @@ impl SessionWithFiles {
         self.files
             .par_iter()
             .map(|src| {
-                let file_str = src.path.to_str().unwrap_or("").to_string();
+                let file_str: cwtools_validation::FilePath =
+                    std::sync::Arc::from(src.path.to_str().unwrap_or(""));
                 let changed_error = || {
                     (
                         src.path.clone(),
@@ -687,7 +688,7 @@ impl SessionWithFiles {
                             severity: ErrorSeverity::Error,
                             line: 0,
                             col: 0,
-                            file: file_str.clone(),
+                            file: std::sync::Arc::clone(&file_str),
                             code: None,
                             fix: None,
                             end: None,
@@ -752,7 +753,10 @@ impl SessionWithFiles {
 
 /// Convert parse errors from a partially-parsed file into `ValidationError`s so
 /// they appear in the CLI report (and count toward the exit-1 threshold).
-fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<ValidationError> {
+fn parse_errors_to_validation(
+    errors: &[ParseError],
+    file_path: &cwtools_validation::FilePath,
+) -> Vec<ValidationError> {
     errors
         .iter()
         .map(|e| {
@@ -765,7 +769,7 @@ fn parse_errors_to_validation(errors: &[ParseError], file_path: &str) -> Vec<Val
                 severity: ErrorSeverity::Error,
                 line,
                 col,
-                file: file_path.to_string(),
+                file: std::sync::Arc::clone(file_path),
                 code: None,
                 fix: None,
                 end: None,

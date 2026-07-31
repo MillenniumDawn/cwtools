@@ -67,6 +67,13 @@ impl Block<'_> {
     }
 }
 
+/// Character length of an interned key, for the `key_token_range` spans the
+/// structural hints squiggle with. Borrowed rather than materialised: the
+/// walkers only ever need the count.
+pub(crate) fn key_len(table: &StringTable, key: StringId) -> usize {
+    table.with_string(key, |k| k.chars().count()).unwrap_or(0)
+}
+
 /// Normalise a `key = { ... }` child (a Leaf with a Clause value) into a
 /// [`Block`]. Returns `None` for leaves whose value isn't a clause, and for
 /// comments / bare values.
@@ -107,45 +114,50 @@ pub fn validate_common(
     ast: &ParsedFile,
     ruleset: &RuleSet,
     table: &StringTable,
-    file_path: &str,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
-    let mut type_counts: FxHashMap<String, usize> = FxHashMap::default();
+    // Root keys repeat (a file is many instances of one type), so the owned key
+    // is only materialised the first time each distinct one is seen.
+    let mut type_counts: FxHashMap<StringId, usize> = FxHashMap::default();
 
     for child in &ast.root_children {
-        let (key, line, col, end) = match child {
+        let (leaf, key_id) = match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
-                let k = table.get_string(leaf.key.normal).unwrap_or_default();
-                // The complaint is the duplicated key, so the squiggle covers
-                // the key token, not the whole entity definition.
-                let key_end = key_token_range(leaf.pos.start, k.chars().count()).end;
-                (k, leaf.pos.start.line, leaf.pos.start.col, key_end)
+                (leaf, leaf.key.normal)
             }
             Child::LeafValue(_) | Child::Comment(_) => continue,
         };
-        *type_counts.entry(key.clone()).or_insert(0) += 1;
+        let count = type_counts.entry(key_id).or_insert(0);
+        *count += 1;
+        let count = *count;
 
-        // Check if this type is defined with unique=true
-        if let Some(type_def) = find_matching_type(&key, ruleset)
-            && type_def.unique
-        {
-            let count = type_counts.get(&key).copied().unwrap_or(0);
-            // Emit exactly once, at the second occurrence, so the error anchors
-            // at the duplicate rather than at 0,0.
-            if count == 2 {
-                // CW261 (DuplicateTypeDef). F#'s message is
-                // "Key {id} of type {typename} is defined multiple times";
-                // this per-file detection keys off the type name appearing
-                // as repeated sibling keys, so `id` and `typename` collapse
-                // to the same token. F#'s check is project-wide and grouped
-                // by extracted instance id — a known refinement gap.
-                let code = &error_codes::CW261_DUPLICATE_TYPE_DEF;
-                errors.push(
-                    ValidationError::from_code(code, file_path, line, col, &[&key, &key])
-                        .with_end(end),
-                );
-            }
+        // Check if this type is defined with unique=true, and emit exactly once,
+        // at the second occurrence, so the error anchors at the duplicate rather
+        // than at 0,0.
+        let unique_dup = count == 2
+            && table
+                .with_string(key_id, |k| {
+                    find_matching_type(k, ruleset).is_some_and(|td| td.unique)
+                })
+                .unwrap_or(false);
+        if unique_dup {
+            let key = table.get_string(key_id).unwrap_or_default();
+            // The complaint is the duplicated key, so the squiggle covers
+            // the key token, not the whole entity definition.
+            let end = key_token_range(leaf.pos.start, key.chars().count()).end;
+            let (line, col) = (leaf.pos.start.line, leaf.pos.start.col);
+            // CW261 (DuplicateTypeDef). F#'s message is
+            // "Key {id} of type {typename} is defined multiple times";
+            // this per-file detection keys off the type name appearing
+            // as repeated sibling keys, so `id` and `typename` collapse
+            // to the same token. F#'s check is project-wide and grouped
+            // by extracted instance id — a known refinement gap.
+            let code = &error_codes::CW261_DUPLICATE_TYPE_DEF;
+            errors.push(
+                ValidationError::from_code(code, file_path, line, col, &[&key, &key]).with_end(end),
+            );
         }
     }
 }

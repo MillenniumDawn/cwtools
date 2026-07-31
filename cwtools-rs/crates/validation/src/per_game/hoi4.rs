@@ -46,22 +46,22 @@ pub fn validate_hoi4(
     ast: &ParsedFile,
     _ruleset: &cwtools_rules::rules_types::RuleSet,
     table: &StringTable,
-    file_path: &str,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
-    walk_blocks(&ast.root_children, ast, &mut |block| {
-        let key = block.key_string_lower(table);
+    // Fields whose body `{ always = <bool> }` matches the game default (so the
+    // field is a no-op) -> the default the `always` value must equal. Listed
+    // explicitly: an idea/spirit's allowed_civil_war defaults to "no". Interned
+    // once, so the walk compares token ids instead of pulling every block's key
+    // out of the string table.
+    let defaults = [(table.intern("allowed_civil_war").lower, false)];
 
-        // Fields whose body `{ always = <bool> }` matches the game default (so the
-        // field is a no-op) -> the default the `always` value must equal. Listed
-        // explicitly: an idea/spirit's allowed_civil_war defaults to "no".
-        let default = match key.as_str() {
-            "allowed_civil_war" => Some(false),
-            _ => None,
+    walk_blocks(&ast.root_children, ast, &mut |block| {
+        let Some(&(_, default)) = defaults.iter().find(|(id, _)| *id == block.key_lower) else {
+            return;
         };
-        if let Some(default) = default
-            && sole_always_value(block.children, ast, table) == Some(default)
-        {
+        if sole_always_value(block.children, ast, table) == Some(default) {
+            let key = block.key_string_lower(table);
             // Fix: delete the whole redundant `key = { always = <default> }`
             // field. `block.range` spans the leaf; its end lands at the start of
             // the next token, so the line (and its newline) go with it.
@@ -91,7 +91,7 @@ mod tests {
         let ast = parse_string(src, &table).expect("parse");
         let ruleset = cwtools_rules::rules_types::RuleSet::new();
         let mut errors = Vec::new();
-        validate_hoi4(&ast, &ruleset, &table, "test.txt", &mut errors);
+        validate_hoi4(&ast, &ruleset, &table, &"test.txt".into(), &mut errors);
         errors
     }
 
@@ -138,7 +138,7 @@ mod tests {
         let ast = parse_string(src, &table).expect("parse");
         let ruleset = cwtools_rules::rules_types::RuleSet::new();
         let mut errors = Vec::new();
-        validate_hoi4(&ast, &ruleset, &table, "test.txt", &mut errors);
+        validate_hoi4(&ast, &ruleset, &table, &"test.txt".into(), &mut errors);
 
         let err = errors
             .iter()
@@ -150,7 +150,7 @@ mod tests {
 
         let ast2 = parse_string(&fixed, &table).expect("parse");
         let mut errors2 = Vec::new();
-        validate_hoi4(&ast2, &ruleset, &table, "test.txt", &mut errors2);
+        validate_hoi4(&ast2, &ruleset, &table, &"test.txt".into(), &mut errors2);
         assert!(
             !errors2.iter().any(|e| e.code == Some("CW280")),
             "CW280 must be gone after applying the fix"

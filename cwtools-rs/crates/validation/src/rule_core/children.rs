@@ -4,7 +4,6 @@
 use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, Value};
 use cwtools_rules::rules_types::*;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::sync::LazyLock;
 
@@ -258,24 +257,109 @@ pub(crate) fn validate_children(
         rules
     };
 
+    // Cardinality bookkeeping for this rule list, derived once and shared by the
+    // counting pass and phase 3 — both are no-ops for an absent rule kind.
+    let mut block = BlockRules::of(rules);
+
     // Phases 1+2 fused: one pass over `children` both tallies occurrences (for
     // cardinality) and validates each child. Phase-2 validation never reads the
     // phase-1 counts (only phase 3 does) and counting emits nothing, so the two
     // passes collapse into one with identical output.
-    let (key_counts, leafvalue_counts, valueclause_counts) =
-        count_and_validate_children(ctx, children, rules, scope_context, errors);
+    let (leafvalue_counts, valueclause_counts) =
+        count_and_validate_children(ctx, children, rules, &mut block, scope_context, errors);
 
     // Phase 3: cardinality enforcement against the phase-1 counts.
     enforce_cardinality(
         ctx,
         children,
         rules,
+        &mut block,
         block_pos,
-        &key_counts,
         &leafvalue_counts,
         &valueclause_counts,
         errors,
     );
+}
+
+/// Aggregated cardinality for one distinct keyed rule key within a block.
+///
+/// Duplicate keys are overloads/alternatives (e.g. two `clicksound =` rules in
+/// one subtype), so the key is checked once against the most permissive bounds
+/// rather than once per overload — otherwise a present-once field reads as
+/// missing N-1 times, or an absent optional alternative double-reports.
+struct KeyCard<'a> {
+    /// The rule's key as authored. Paradox keys are case-insensitive and every
+    /// comparison against this one is too, so no lowercased copy is ever
+    /// materialised — this runs for every block in the corpus.
+    key: &'a str,
+    min: i32,
+    max: i32,
+    /// A `~` (soft) minimum on ANY overload of the key makes the whole key's
+    /// minimum soft, so an under-count is not flagged.
+    strict_min: bool,
+    /// Occurrences of the key among the block's children.
+    count: i32,
+    /// Set once the key has been reported, so the per-rule report loop below
+    /// visits each key once rather than once per overload.
+    reported: bool,
+}
+
+/// A block's rule list reduced to what cardinality needs: one card per distinct
+/// keyed rule key, plus whether the list has any bare-value or value-clause rule
+/// at all. The dominant block kind (effect/trigger bodies whose sole rule is an
+/// `alias_name[...]` wildcard) has none of them, so nothing is allocated and
+/// phase 3 has nothing to enforce.
+struct BlockRules<'a> {
+    cards: SmallVec<[KeyCard<'a>; 8]>,
+    leafvalue: bool,
+    valueclause: bool,
+}
+
+impl<'a> BlockRules<'a> {
+    fn of(rules: &'a [(RuleType, Options)]) -> Self {
+        let mut out = BlockRules {
+            cards: SmallVec::new(),
+            leafvalue: false,
+            valueclause: false,
+        };
+        for (rule_type, opts) in rules {
+            match rule_type {
+                RuleType::LeafValueRule { .. } => out.leafvalue = true,
+                RuleType::ValueClauseRule { .. } => out.valueclause = true,
+                _ => {}
+            }
+            let Some(key) = get_rule_key(rule_type) else {
+                continue;
+            };
+            match out.position(key) {
+                Some(i) => {
+                    let c = &mut out.cards[i];
+                    c.min = c.min.min(opts.min);
+                    c.max = c.max.max(opts.max);
+                    c.strict_min = c.strict_min && opts.strict_min;
+                }
+                None => out.cards.push(KeyCard {
+                    key,
+                    min: opts.min,
+                    max: opts.max,
+                    strict_min: opts.strict_min,
+                    count: 0,
+                    reported: false,
+                }),
+            }
+        }
+        out
+    }
+
+    fn position(&self, key: &str) -> Option<usize> {
+        self.cards
+            .iter()
+            .position(|c| c.key.eq_ignore_ascii_case(key))
+    }
+
+    fn any(&self) -> bool {
+        !self.cards.is_empty() || self.leafvalue || self.valueclause
+    }
 }
 
 /// Whether a rule's right-hand side is the `math_expr` value type.
@@ -352,18 +436,19 @@ pub(super) fn validate_math_clause(
 /// Phases 1+2 of [`validate_children`], fused into one pass: tally occurrences of
 /// every child kind (for cardinality) AND validate each child against the matching
 /// rules, emitting unexpected-property and per-rule diagnostics. Recurses into
-/// nested blocks via [`validate_children`]. Returns the three count maps that
-/// phase 3 ([`enforce_cardinality`]) consumes:
-/// - `key_counts`: lowercased key string -> count (Leaf/Node children),
+/// nested blocks via [`validate_children`]. Tallies keyed children straight into
+/// `block`'s cards, and returns the two per-rule count vectors that phase 3
+/// ([`enforce_cardinality`]) consumes:
 /// - `leafvalue_counts`: per-rule count of matching `LeafValueRule`s,
 /// - `valueclause_counts`: per-rule count of anonymous `{ ... }` clauses.
-fn count_and_validate_children(
+fn count_and_validate_children<'r>(
     ctx: &ValidationCtx,
     children: &[Child],
-    rules: &[(RuleType, Options)],
+    rules: &'r [(RuleType, Options)],
+    block: &mut BlockRules<'r>,
     scope_context: &mut Option<ScopeContext>,
     errors: &mut Vec<ValidationError>,
-) -> (FxHashMap<String, usize>, Vec<usize>, Vec<usize>) {
+) -> (Vec<usize>, Vec<usize>) {
     let ast = ctx.ast;
     let table = ctx.table;
     let file_path = ctx.file_path;
@@ -371,25 +456,10 @@ fn count_and_validate_children(
     let type_index = ctx.type_index;
     let modifier_keys = ctx.modifier_keys;
 
-    // Only the rule kinds actually present in `rules` need a count structure.
-    // The dominant block kind (effect/trigger bodies whose sole rule is an
-    // `alias_name[...]` wildcard) has no keyed / LeafValue / ValueClause rule at
-    // all, so every count structure below stays unallocated and its tally is
-    // skipped — the block is still validated in the same pass.
-    let any_keyed = rules.iter().any(|(rt, _)| get_rule_key(rt).is_some());
-    let any_leafvalue = rules
-        .iter()
-        .any(|(rt, _)| matches!(rt, RuleType::LeafValueRule { .. }));
-    let any_valueclause = rules
-        .iter()
-        .any(|(rt, _)| matches!(rt, RuleType::ValueClauseRule { .. }));
+    let any_keyed = !block.cards.is_empty();
+    let any_leafvalue = block.leafvalue;
+    let any_valueclause = block.valueclause;
 
-    // Keyed children (Leaf/Node): key string -> count.
-    let mut key_counts: FxHashMap<String, usize> = if any_keyed {
-        FxHashMap::with_capacity_and_hasher(children.len(), Default::default())
-    } else {
-        FxHashMap::default()
-    };
     // Item 5: LeafValues — count per LeafValueRule index.
     let mut leafvalue_counts: Vec<usize> = if any_leafvalue {
         vec![0usize; rules.len()]
@@ -402,9 +472,6 @@ fn count_and_validate_children(
     } else {
         Vec::new()
     };
-    // Reused lowercase buffer for the keyed tally (the phase-2 `key` below keeps
-    // its original case for value-sensitive candidate matching and messages).
-    let mut lowerbuf: SmallVec<[u8; 24]> = SmallVec::new();
 
     for child in children {
         match child {
@@ -419,21 +486,12 @@ fn count_and_validate_children(
                     keybuf.extend_from_slice(unquote_key(s).as_bytes())
                 });
                 let key: &str = std::str::from_utf8(&keybuf).unwrap_or_default();
-                // Phase-1 tally: keyed children counted in lowercase so a field
-                // written `texturefile` satisfies a rule keyed `textureFile`. The
-                // owned String is allocated only on the first occurrence of each
-                // distinct key.
-                if any_keyed {
-                    lowerbuf.clear();
-                    lowerbuf.extend_from_slice(&keybuf);
-                    lowerbuf.make_ascii_lowercase();
-                    let lkey: &str = std::str::from_utf8(&lowerbuf).unwrap_or_default();
-                    match key_counts.get_mut(lkey) {
-                        Some(c) => *c += 1,
-                        None => {
-                            key_counts.insert(lkey.to_owned(), 1);
-                        }
-                    }
+                // Phase-1 tally: keyed children matched case-insensitively so a
+                // field written `texturefile` satisfies a rule keyed
+                // `textureFile`. Only keys a rule actually asks about are
+                // counted; the rest can't affect cardinality.
+                if any_keyed && let Some(i) = block.position(key) {
+                    block.cards[i].count += 1;
                 }
                 let candidates =
                     matching_candidates(rules, key, ruleset, type_index, rule_matches_leaf_key);
@@ -644,16 +702,17 @@ fn count_and_validate_children(
                             // project-wide variable index (CW246), mirroring the
                             // Leaf path and F# checkVariableGetFieldNE.
                             if let NewField::VariableGetField(ns) = right {
-                                let raw = leaf_value_to_string(&lv.value, table);
-                                check_variable_get(
-                                    ctx,
-                                    ns,
-                                    &raw,
-                                    lv.pos.start.line,
-                                    lv.pos.start.col,
-                                    lv.pos.end,
-                                    errors,
-                                );
+                                with_leaf_value_str(&lv.value, table, |raw| {
+                                    check_variable_get(
+                                        ctx,
+                                        ns,
+                                        raw,
+                                        lv.pos.start.line,
+                                        lv.pos.start.col,
+                                        lv.pos.end,
+                                        errors,
+                                    );
+                                });
                             }
                             matched = true;
                             break;
@@ -678,23 +737,31 @@ fn count_and_validate_children(
         }
     }
 
-    (key_counts, leafvalue_counts, valueclause_counts)
+    (leafvalue_counts, valueclause_counts)
 }
 
 /// Phase 3 of [`validate_children`]: enforce cardinality (min/max occurrence)
-/// against the counts gathered by [`count_and_validate_children`]. Reads `key_counts`,
-/// `leafvalue_counts`, and `valueclause_counts`; emits CW242 diagnostics.
+/// against the counts gathered by [`count_and_validate_children`]. Reads
+/// `block`'s key cards, `leafvalue_counts`, and `valueclause_counts`; emits
+/// CW242 diagnostics.
 #[allow(clippy::too_many_arguments)]
 fn enforce_cardinality(
     ctx: &ValidationCtx,
     children: &[Child],
     rules: &[(RuleType, Options)],
+    block: &mut BlockRules<'_>,
     block_pos: (u32, u16),
-    key_counts: &FxHashMap<String, usize>,
     leafvalue_counts: &[usize],
     valueclause_counts: &[usize],
     errors: &mut Vec<ValidationError>,
 ) {
+    // Every arm below is keyed on one of the three rule kinds; with none of them
+    // present there is no cardinality to enforce, so the block (the common
+    // effect/trigger body) skips the rule scan entirely.
+    if !block.any() {
+        return;
+    }
+
     let ast = ctx.ast;
     let table = ctx.table;
     let file_path = ctx.file_path;
@@ -713,37 +780,6 @@ fn enforce_cardinality(
             .unwrap_or(block_pos)
     };
 
-    // Aggregate keyed-rule cardinality per (lowercased) key. Duplicate keys are
-    // overloads/alternatives (e.g. two `clicksound =` rules in one subtype), so
-    // the key is checked once against the most permissive bounds rather than
-    // once per overload — otherwise a present-once field reads as missing N-1
-    // times, or an absent optional alternative double-reports.
-    // Third field tracks strictness: a `~` (soft) minimum on ANY overload of a
-    // key makes the whole key's minimum soft, so an under-count is not flagged.
-    // Rule keys are ruleset-static; lowercase each into a reused buffer rather
-    // than materialising a per-block Vec of owned Strings. The 4th field is a
-    // "reported" flag that dedups the per-rule report loop (each key once).
-    let mut keybuf = String::new();
-    let mut key_card: FxHashMap<String, (i32, i32, bool, bool)> =
-        FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
-    for (rule_type, opts) in rules {
-        if let Some(k) = get_rule_key(rule_type) {
-            keybuf.clear();
-            keybuf.push_str(k);
-            keybuf.make_ascii_lowercase();
-            match key_card.get_mut(keybuf.as_str()) {
-                Some(e) => {
-                    e.0 = e.0.min(opts.min);
-                    e.1 = e.1.max(opts.max);
-                    e.2 = e.2 && opts.strict_min;
-                }
-                None => {
-                    key_card.insert(keybuf.clone(), (opts.min, opts.max, opts.strict_min, false));
-                }
-            }
-        }
-    }
-
     for (rule_idx, (rule_type, opts)) in rules.iter().enumerate() {
         // Both under- and over-count default to a WARNING (config cardinalities are
         // often stricter than the game, and cardinality-max is emitted as a Warning);
@@ -759,20 +795,16 @@ fn enforce_cardinality(
         match rule_type {
             RuleType::LeafRule { .. } | RuleType::NodeRule { .. } => {
                 if let Some(key) = get_rule_key(rule_type) {
-                    keybuf.clear();
-                    keybuf.push_str(key);
-                    keybuf.make_ascii_lowercase();
                     // Each distinct key is reported at most once, deduped via the
-                    // "reported" flag stored alongside the aggregated bounds.
-                    let bounds = match key_card.get_mut(keybuf.as_str()) {
-                        Some(e) if !e.3 => {
-                            e.3 = true;
-                            Some((e.0, e.1, e.2))
+                    // card's "reported" flag.
+                    let bounds = match block.position(key).map(|i| &mut block.cards[i]) {
+                        Some(c) if !c.reported => {
+                            c.reported = true;
+                            Some((c.min, c.max, c.strict_min, c.count))
                         }
                         _ => None,
                     };
-                    if let Some((kmin, kmax, kstrict)) = bounds {
-                        let count = key_counts.get(keybuf.as_str()).copied().unwrap_or(0) as i32;
+                    if let Some((kmin, kmax, kstrict, count)) = bounds {
                         if count < kmin && kstrict {
                             errors.push(ValidationError::from_code_with(
                                 &error_codes::CW242_WRONG_NUMBER,
@@ -795,7 +827,7 @@ fn enforce_cardinality(
                             // occurrence to point at, so it stays on the block.)
                             let (line, col) = children
                                 .iter()
-                                .find(|c| child_key_matches(c, ast, table, keybuf.as_str()))
+                                .find(|c| child_key_matches(c, ast, table, key))
                                 .and_then(|c| child_start_pos(c, ast))
                                 .unwrap_or((block_line, block_col));
                             errors.push(ValidationError::from_code_with(

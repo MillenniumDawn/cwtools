@@ -1,10 +1,41 @@
-use super::common::{as_block, child_key_eq, under_dir_segment, walk_blocks};
+use super::common::{as_block, child_key_eq, key_len, under_dir_segment, walk_blocks};
 use crate::{ValidationError, error_codes};
 use cwtools_index::TypeIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
 use cwtools_parser::fix::{SuggestedFix, key_token_range};
 use cwtools_rules::rules_types::RuleSet;
-use cwtools_string_table::string_table::StringTable;
+use cwtools_string_table::string_table::{StringId, StringTable};
+
+/// The block keys these checks dispatch on, interned once per file so the walks
+/// compare token ids instead of pulling every block's key out of the string
+/// table. Paradox keys are case-insensitive, so each is a `lower` id.
+struct Keys {
+    set_empire_name: StringId,
+    set_planet_name: StringId,
+    if_: StringId,
+    else_if: StringId,
+    ship_design: StringId,
+    global_ship_design: StringId,
+    section: StringId,
+    component: StringId,
+    research_leader: StringId,
+}
+
+impl Keys {
+    fn new(table: &StringTable) -> Self {
+        Self {
+            set_empire_name: table.intern("set_empire_name").lower,
+            set_planet_name: table.intern("set_planet_name").lower,
+            if_: table.intern("if").lower,
+            else_if: table.intern("else_if").lower,
+            ship_design: table.intern("ship_design").lower,
+            global_ship_design: table.intern("global_ship_design").lower,
+            section: table.intern("section").lower,
+            component: table.intern("component").lower,
+            research_leader: table.intern("research_leader").lower,
+        }
+    }
+}
 
 /// Stellaris-specific validators.
 /// Ported from CWTools/Validation/Stellaris/STLValidation.fs
@@ -12,7 +43,7 @@ pub fn validate_stellaris(
     ast: &ParsedFile,
     ruleset: &RuleSet,
     table: &StringTable,
-    file_path: &str,
+    file_path: &crate::FilePath,
     type_index: Option<&TypeIndex>,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -21,13 +52,21 @@ pub fn validate_stellaris(
     let in_technology = parent_dir_is(file_path, "common/technology");
     let in_pop_jobs = parent_dir_is(file_path, "common/pop_jobs");
     let in_component_templates = parent_dir_is(file_path, "common/component_templates");
+    let kw = Keys::new(table);
 
     for child in &ast.root_children {
         let Some(block) = as_block(child, ast) else {
             continue;
         };
-        let key = block.key_string_lower(table);
-        if in_events && (key.ends_with("_event") || key == "event") {
+        // The event keys are an open set (`planet_event`, `country_event`, …), so
+        // this one match needs the text — but only inside an events folder, and
+        // only for a block that actually is one.
+        if in_events
+            && table
+                .with_string(block.key_lower, |k| k.ends_with("_event") || k == "event")
+                .unwrap_or(false)
+        {
+            let key = block.key_string_lower(table);
             validate_event_pretriggers(
                 &key,
                 block.children,
@@ -44,6 +83,7 @@ pub fn validate_stellaris(
                 block.range.start.line,
                 ast,
                 table,
+                &kw,
                 file_path,
                 errors,
             );
@@ -70,13 +110,14 @@ pub fn validate_stellaris(
         &ast.root_children,
         ast,
         table,
+        &kw,
         file_path,
         type_index,
         errors,
     );
 
     // Stellaris-specific structural hints (if/else 2.1, deprecated set_name).
-    walk_if_else(&ast.root_children, ast, table, file_path, errors);
+    walk_if_else(&ast.root_children, ast, table, &kw, file_path, errors);
 }
 
 // ── Path scoping helpers ───────────────────────────────
@@ -100,21 +141,22 @@ fn walk_if_else(
     children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
-    file_path: &str,
+    kw: &Keys,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
     walk_blocks(children, ast, &mut |block| {
-        let key = block.key_string_lower(table);
+        let key = block.key_lower;
         let block_children = block.children;
         let line = block.range.start.line;
         let col = block.range.start.col;
 
         // CW253 — deprecated set_empire_name / set_planet_name.
-        if key == "set_empire_name" || key == "set_planet_name" {
+        if key == kw.set_empire_name || key == kw.set_planet_name {
             // Fix: rename just the key token to `set_name` (the block body is
             // unchanged). The squiggle covers the same span, since the body is
             // not what's deprecated.
-            let key_range = key_token_range(block.range.start, key.chars().count());
+            let key_range = key_token_range(block.range.start, key_len(table, key));
             let fix = SuggestedFix::replace("Rename to set_name", key_range, "set_name");
             errors.push(
                 ValidationError::from_code(
@@ -129,7 +171,7 @@ fn walk_if_else(
             );
         }
 
-        if key == "if" || key == "else_if" {
+        if key == kw.if_ || key == kw.else_if {
             let has_else = block_children
                 .iter()
                 .any(|c| child_key_eq(c, ast, table, "else"));
@@ -138,7 +180,7 @@ fn walk_if_else(
                 .any(|c| child_key_eq(c, ast, table, "if"));
             // Advice about the keyword, so the squiggle covers the key, not the
             // whole block it opens (same treatment CW253 got above).
-            let key_end = key_token_range(block.range.start, key.chars().count()).end;
+            let key_end = key_token_range(block.range.start, key_len(table, key)).end;
 
             // CW236 — old nested if/else style.
             if has_else && !has_if {
@@ -155,7 +197,7 @@ fn walk_if_else(
             }
 
             // CW237 — ambiguous if = { if ... else }.
-            if key == "if" && has_else && has_if {
+            if key == kw.if_ && has_else && has_if {
                 errors.push(
                     ValidationError::from_code(
                         &error_codes::CW237_AMBIGUOUS_IF_ELSE,
@@ -192,7 +234,7 @@ fn validate_event_pretriggers(
     ast: &ParsedFile,
     ruleset: &RuleSet,
     table: &StringTable,
-    file_path: &str,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
     // CW120: a trigger-block pretrigger could move to `pre_triggers` for perf.
@@ -220,7 +262,7 @@ fn flag_pretriggers(
     ast: &ParsedFile,
     pretriggers: &rustc_hash::FxHashSet<String>,
     table: &StringTable,
-    file_path: &str,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
     for tc in children {
@@ -254,7 +296,7 @@ fn validate_pop_job(
     ast: &ParsedFile,
     ruleset: &RuleSet,
     table: &StringTable,
-    file_path: &str,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
     let Some(pretriggers) = ruleset.pretriggers.get("pop") else {
@@ -287,7 +329,8 @@ fn validate_ship_designs(
     root_children: &[Child],
     ast: &ParsedFile,
     table: &StringTable,
-    file_path: &str,
+    kw: &Keys,
+    file_path: &crate::FilePath,
     type_index: Option<&TypeIndex>,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -306,25 +349,26 @@ fn validate_ship_designs(
         let Some(block) = as_block(child, ast) else {
             continue;
         };
-        let key = block.key_string_lower(table);
-        if key != "ship_design" && key != "global_ship_design" {
+        if block.key_lower != kw.ship_design && block.key_lower != kw.global_ship_design {
             continue;
         }
         for grandchild in block.children {
             let Some(gc_block) = as_block(grandchild, ast) else {
                 continue;
             };
-            let gc_key = gc_block.key_string_lower(table);
-            let (type_name, code) = match gc_key.as_str() {
-                "section" => (
+            let gc_key = gc_block.key_lower;
+            let (type_name, code) = if gc_key == kw.section {
+                (
                     "section_template",
                     &error_codes::CW227_UNKNOWN_SECTION_TEMPLATE,
-                ),
-                "component" => (
+                )
+            } else if gc_key == kw.component {
+                (
                     "component_template",
                     &error_codes::CW229_UNKNOWN_COMPONENT_TEMPLATE,
-                ),
-                _ => continue,
+                )
+            } else {
+                continue;
             };
             let Some(template) = child_scalar(gc_block.children, ast, table, "template") else {
                 continue;
@@ -349,7 +393,7 @@ fn validate_ship_designs(
                     gc_block.range.start.col,
                     &[&template],
                 )
-                .with_end(key_token_range(gc_block.range.start, gc_key.chars().count()).end),
+                .with_end(key_token_range(gc_block.range.start, key_len(table, gc_key)).end),
             );
         }
     }
@@ -364,7 +408,8 @@ fn validate_technology(
     tech_line: u32,
     ast: &ParsedFile,
     table: &StringTable,
-    file_path: &str,
+    kw: &Keys,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
     if !technology_has_category(children, ast, table) {
@@ -378,7 +423,7 @@ fn validate_technology(
     }
 
     let tech_area = child_scalar(children, ast, table, "area").unwrap_or_default();
-    walk_research_leaders(children, &tech_area, ast, table, file_path, errors);
+    walk_research_leaders(children, &tech_area, ast, table, kw, file_path, errors);
 }
 
 /// `category = { physics }` (block with a member, the game's form) or a bare
@@ -414,13 +459,13 @@ fn walk_research_leaders(
     tech_area: &str,
     ast: &ParsedFile,
     table: &StringTable,
-    file_path: &str,
+    kw: &Keys,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
     walk_blocks(children, ast, &mut |block| {
-        let key = block.key_string_lower(table);
-        if key == "research_leader" {
-            let key_end = key_token_range(block.range.start, key.chars().count()).end;
+        if block.key_lower == kw.research_leader {
+            let key_end = key_token_range(block.range.start, key_len(table, block.key_lower)).end;
             match child_scalar(block.children, ast, table, "area") {
                 None => {
                     let code = &error_codes::CW108_RESEARCH_LEADER_AREA;
@@ -467,7 +512,7 @@ fn validate_planet_killer(
     block_line: u32,
     ast: &ParsedFile,
     table: &StringTable,
-    file_path: &str,
+    file_path: &crate::FilePath,
     type_index: Option<&TypeIndex>,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -612,7 +657,7 @@ mod tests {
         let table = StringTable::new();
         let ast = parse_string(script, &table).unwrap();
         let mut errors = Vec::new();
-        validate_stellaris(&ast, ruleset, &table, path, type_index, &mut errors);
+        validate_stellaris(&ast, ruleset, &table, &path.into(), type_index, &mut errors);
         errors
             .into_iter()
             .filter_map(|e| e.code.map(|c| (c.to_string(), e.line, e.col)))
@@ -631,7 +676,14 @@ mod tests {
         let ast = parse_string(src, &table).unwrap();
         let ruleset = RuleSet::new();
         let mut errors = Vec::new();
-        validate_stellaris(&ast, &ruleset, &table, "events/test.txt", None, &mut errors);
+        validate_stellaris(
+            &ast,
+            &ruleset,
+            &table,
+            &"events/test.txt".into(),
+            None,
+            &mut errors,
+        );
 
         let err = errors
             .iter()
@@ -648,7 +700,7 @@ mod tests {
             &ast2,
             &ruleset,
             &table,
-            "events/test.txt",
+            &"events/test.txt".into(),
             None,
             &mut errors2,
         );
