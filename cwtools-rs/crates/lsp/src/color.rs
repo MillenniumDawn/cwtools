@@ -884,7 +884,7 @@ mod tests {
     fn colour_node(value: ValueType, min: i32) -> RuleType {
         RuleType::NodeRule {
             left: cwtools_rules::rules_types::NewField::SpecificField("color".into()),
-            rules: vec![(
+            rules: [(
                 RuleType::LeafValueRule {
                     right: cwtools_rules::rules_types::NewField::ValueField(value),
                 },
@@ -894,7 +894,8 @@ mod tests {
                     leafvalue: true,
                     ..Options::default()
                 },
-            )],
+            )]
+            .into(),
         }
     }
 
@@ -926,7 +927,7 @@ mod tests {
         // A block of named fields is never a colour.
         assert!(!is_colour_rule(&RuleType::NodeRule {
             left: cwtools_rules::rules_types::NewField::SpecificField("color".into()),
-            rules: vec![(
+            rules: [(
                 RuleType::LeafRule {
                     left: cwtools_rules::rules_types::NewField::SpecificField("r".into()),
                     right: cwtools_rules::rules_types::NewField::ValueField(ValueType::Int {
@@ -935,7 +936,8 @@ mod tests {
                     }),
                 },
                 Options::default(),
-            )],
+            )]
+            .into(),
         }));
         assert!(!is_colour_rule(&RuleType::LeafValueRule {
             right: cwtools_rules::rules_types::NewField::ValueField(ValueType::Bool),

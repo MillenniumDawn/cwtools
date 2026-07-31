@@ -650,12 +650,16 @@ impl Backend {
                                 ) {
                                     // Mid-edit `key = |`: the last good parse has no such
                                     // leaf yet; resolve the value rules from the live line.
-                                    let vr = value_rules_for_key(
-                                        rs,
-                                        Some(&info_guard.type_index),
-                                        &rctx.child_rules,
-                                        &key,
-                                    );
+                                    let vr: Vec<cwtools_rules::rules_types::NewRule> =
+                                        value_rules_for_key(
+                                            rs,
+                                            Some(&info_guard.type_index),
+                                            &rctx.child_rules,
+                                            &key,
+                                        )
+                                        .into_iter()
+                                        .cloned()
+                                        .collect();
                                     let resolved = !vr.is_empty();
                                     let loc_keys = if value_rules_need_loc_keys(&vr) {
                                         self.completion_loc_keys(&token)
@@ -929,7 +933,7 @@ mod tests {
         (
             RuleType::NodeRule {
                 left: NewField::SpecificField(key.to_string()),
-                rules: children,
+                rules: children.into(),
             },
             Options::default(),
         )
@@ -1002,7 +1006,7 @@ mod tests {
         let rules = if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
             rs.root_rules.first()
         {
-            rules.as_slice()
+            rules.as_ref()
         } else {
             panic!("expected TypeRule");
         };
@@ -1048,7 +1052,7 @@ mod tests {
         let info = cwtools_info::InfoService::new();
         let first_root = rs.root_rules.first().expect("expected root rule");
         let rules: &[(RuleType, cwtools_rules::rules_types::Options)] = match first_root {
-            RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _)) => rules.as_slice(),
+            RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _)) => rules.as_ref(),
             _ => panic!("expected TypeRule"),
         };
         let items = completions_from_rules(
@@ -1089,7 +1093,7 @@ mod tests {
         let first_root = rs.root_rules.first().expect("expected root rule");
         let rules: &[(RuleType, cwtools_rules::rules_types::Options)] =
             if let RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _)) = first_root {
-                rules.as_slice()
+                rules.as_ref()
             } else {
                 panic!("expected TypeRule");
             };
@@ -1292,12 +1296,12 @@ mod tests {
             (
                 RuleType::NodeRule {
                     left: NewField::SpecificField("alias[effect:if]".to_string()),
-                    rules: vec![
+                    rules: [
                         // `limit` has no ## cardinality -> required (1..1).
                         (
                             RuleType::NodeRule {
                                 left: NewField::SpecificField("limit".to_string()),
-                                rules: vec![],
+                                rules: [].into(),
                             },
                             Options {
                                 min: 1,
@@ -1313,7 +1317,8 @@ mod tests {
                             },
                             Options::default(),
                         ),
-                    ],
+                    ]
+                    .into(),
                 },
                 Options::default(),
             ),
@@ -1437,7 +1442,7 @@ mod tests {
             (
                 RuleType::NodeRule {
                     left: NewField::SpecificField("alias[effect:if]".to_string()),
-                    rules: recursive_body(),
+                    rules: recursive_body().into(),
                 },
                 Options {
                     required_scopes: vec!["any".to_string()],
@@ -1450,7 +1455,7 @@ mod tests {
             (
                 RuleType::NodeRule {
                     left: NewField::SpecificField("alias[effect:else]".to_string()),
-                    rules: recursive_body(),
+                    rules: recursive_body().into(),
                 },
                 Options::default(),
             ),
@@ -2219,7 +2224,7 @@ mod tests {
         // Key-context snippets across the leaf/node/enum builder arms.
         let rs = bool_enum_ruleset();
         let rules = match rs.root_rules.first() {
-            Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) => rules.as_slice(),
+            Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) => rules.as_ref(),
             _ => panic!("expected TypeRule"),
         };
         snips.extend(snippet_texts(
@@ -2283,7 +2288,7 @@ mod tests {
         let node_required = vec![(
             RuleType::NodeRule {
                 left: NewField::SpecificField("child".to_string()),
-                rules: vec![],
+                rules: [].into(),
             },
             Options {
                 min: 1,
@@ -2433,7 +2438,7 @@ mod perf_bench {
                 (
                     RuleType::NodeRule {
                         left: NewField::SpecificField(format!("alias[effect:{}]", name)),
-                        rules: alias_usage("effect"),
+                        rules: alias_usage("effect").into(),
                     },
                     Options::default(),
                 ),

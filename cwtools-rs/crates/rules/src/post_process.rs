@@ -7,6 +7,7 @@
 /// definitions referenced in one file but defined in another are all present.
 use crate::rules_types::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Borrowed name -> body index over a single_alias snapshot, built once per pass
 /// for O(1) lookups (see `build_alias_index`). On duplicate names the first wins,
@@ -39,6 +40,37 @@ fn for_each_root_rule_mut(ruleset: &mut RuleSet, mut f: impl FnMut(&mut NewRule)
     for (_, rule) in ruleset.single_aliases.iter_mut() {
         f(rule);
     }
+}
+
+/// The child rules of a clause-shaped rule, if it has any.
+fn body_of(rt: &RuleType) -> Option<&RuleBody> {
+    match rt {
+        RuleType::NodeRule { rules, .. }
+        | RuleType::ValueClauseRule { rules }
+        | RuleType::SubtypeRule { rules, .. } => Some(rules),
+        _ => None,
+    }
+}
+
+fn body_mut(rt: &mut RuleType) -> Option<&mut RuleBody> {
+    match rt {
+        RuleType::NodeRule { rules, .. }
+        | RuleType::ValueClauseRule { rules }
+        | RuleType::SubtypeRule { rules, .. } => Some(rules),
+        _ => None,
+    }
+}
+
+/// Whether `rule` or anything below it matches `pred`.
+///
+/// Every pass below checks this before taking a mutable body. Single-alias
+/// inlining substitutes the same `Arc` body at each reference site, and
+/// `Arc::make_mut` on a shared body copies it, so a pass that descended
+/// unconditionally would un-share every tree the previous pass had just shared.
+/// The markers these passes look for are rare, so the check answers "no" for
+/// nearly every subtree and the body is left alone.
+fn any_rule(rule: &NewRule, pred: &dyn Fn(&RuleType) -> bool) -> bool {
+    pred(&rule.0) || body_of(&rule.0).is_some_and(|b| b.iter().any(|r| any_rule(r, pred)))
 }
 
 /// Run all four post-processing passes over `ruleset` in the same order as F#.
@@ -127,37 +159,41 @@ fn inline_single_alias_rule(rule: &mut NewRule, map: &AliasIndex) -> bool {
         }
         return false;
     }
-    match &mut rule.0 {
-        RuleType::NodeRule { rules, .. } => inline_rules_list(rules, map),
-        RuleType::ValueClauseRule { rules } => inline_rules_list(rules, map),
-        RuleType::SubtypeRule { rules, .. } => inline_rules_list(rules, map),
-        _ => false,
+    match body_mut(&mut rule.0) {
+        Some(rules) => inline_rules_list(rules, map),
+        None => false,
     }
 }
 
-/// Walk a `Vec<NewRule>` in place, replacing SingleAliasField entries by
+fn is_single_alias_ref(rt: &RuleType) -> bool {
+    matches!(
+        rt,
+        RuleType::LeafRule {
+            right: NewField::SingleAliasField(..),
+            ..
+        }
+    )
+}
+
+/// Walk a rule body in place, replacing SingleAliasField entries by
 /// substituting the resolved body and recursing into nested rules.
 /// Returns `true` if any rewrite occurred.
-fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex) -> bool {
-    let needs_rewrite = rules.iter().any(|r| {
-        matches!(
-            r.0,
-            RuleType::LeafRule {
-                right: NewField::SingleAliasField(..),
-                ..
-            }
-        )
-    });
+fn inline_rules_list(rules: &mut RuleBody, map: &AliasIndex) -> bool {
+    if !rules.iter().any(|r| any_rule(r, &is_single_alias_ref)) {
+        return false;
+    }
+    let needs_rewrite = rules.iter().any(|r| is_single_alias_ref(&r.0));
     if !needs_rewrite {
         let mut changed = false;
-        for rule in rules.iter_mut() {
+        for rule in Arc::make_mut(rules) {
             changed |= inline_single_alias_rule(rule, map);
         }
         return changed;
     }
     let mut changed = false;
-    let original = std::mem::take(rules);
-    for mut rule in original {
+    let mut out: Vec<NewRule> = Vec::with_capacity(rules.len());
+    for rule in rules.iter() {
+        let mut rule = rule.clone();
         match &rule.0 {
             // LeafRule whose right-hand side is a SingleAliasField
             RuleType::LeafRule {
@@ -170,7 +206,7 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex) -> bool {
                     changed = true;
                     match resolved.0 {
                         RuleType::LeafRule { right: ar, .. } => {
-                            rules.push((
+                            out.push((
                                 RuleType::LeafRule {
                                     left: extract_leaf_left(&rule.0),
                                     right: ar,
@@ -179,7 +215,7 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex) -> bool {
                             ));
                         }
                         RuleType::NodeRule { rules: ar, .. } => {
-                            rules.push((
+                            out.push((
                                 RuleType::NodeRule {
                                     left: extract_leaf_left(&rule.0),
                                     rules: ar,
@@ -189,32 +225,27 @@ fn inline_rules_list(rules: &mut Vec<NewRule>, map: &AliasIndex) -> bool {
                         }
                         other => {
                             // Fallback: keep original
-                            rules.push((other, opts));
+                            out.push((other, opts));
                         }
                     }
                 } else {
                     // Not found — keep original
-                    rules.push(rule);
+                    out.push(rule);
                 }
             }
             // Recurse into nested rule containers
-            RuleType::NodeRule { .. } => {
+            RuleType::NodeRule { .. }
+            | RuleType::ValueClauseRule { .. }
+            | RuleType::SubtypeRule { .. } => {
                 changed |= inline_single_alias_rule(&mut rule, map);
-                rules.push(rule);
-            }
-            RuleType::ValueClauseRule { .. } => {
-                changed |= inline_single_alias_rule(&mut rule, map);
-                rules.push(rule);
-            }
-            RuleType::SubtypeRule { .. } => {
-                changed |= inline_single_alias_rule(&mut rule, map);
-                rules.push(rule);
+                out.push(rule);
             }
             _ => {
-                rules.push(rule);
+                out.push(rule);
             }
         }
     }
+    *rules = out.into();
     changed
 }
 
@@ -265,44 +296,45 @@ fn replace_colour_field(ruleset: &mut RuleSet) {
 }
 
 fn expand_colour_in_rule(rule: &mut NewRule) {
-    let (rt, _) = rule;
-    match rt {
-        RuleType::NodeRule { rules, .. } => expand_colour_in_list(rules),
-        RuleType::ValueClauseRule { rules } => expand_colour_in_list(rules),
-        RuleType::SubtypeRule { rules, .. } => expand_colour_in_list(rules),
-        _ => {}
+    if let Some(rules) = body_mut(&mut rule.0) {
+        expand_colour_in_list(rules);
     }
 }
 
-fn expand_colour_in_list(rules: &mut Vec<NewRule>) {
-    let needs_expand = rules.iter().any(|r| {
-        matches!(
-            &r.0,
-            RuleType::LeafRule {
-                right: NewField::MarkerField(Marker::ColourField),
-                ..
-            } | RuleType::LeafRule {
-                left: NewField::MarkerField(Marker::IrCountryTag),
-                ..
-            } | RuleType::LeafRule {
-                right: NewField::MarkerField(Marker::IrCountryTag),
-                ..
-            } | RuleType::NodeRule {
-                left: NewField::MarkerField(Marker::IrCountryTag),
-                ..
-            }
-        )
-    });
-    if !needs_expand {
-        for rule in rules.iter_mut() {
+fn is_colour_marker(rt: &RuleType) -> bool {
+    matches!(
+        rt,
+        RuleType::LeafRule {
+            right: NewField::MarkerField(Marker::ColourField),
+            ..
+        } | RuleType::LeafRule {
+            left: NewField::MarkerField(Marker::IrCountryTag),
+            ..
+        } | RuleType::LeafRule {
+            right: NewField::MarkerField(Marker::IrCountryTag),
+            ..
+        } | RuleType::NodeRule {
+            left: NewField::MarkerField(Marker::IrCountryTag),
+            ..
+        }
+    )
+}
+
+fn expand_colour_in_list(rules: &mut RuleBody) {
+    if !rules.iter().any(|r| any_rule(r, &is_colour_marker)) {
+        return;
+    }
+    if !rules.iter().any(|r| is_colour_marker(&r.0)) {
+        for rule in Arc::make_mut(rules) {
             expand_colour_in_rule(rule);
         }
         return;
     }
-    let original = std::mem::take(rules);
-    for rule in original {
-        rules.extend(expand_colour_rule(rule));
+    let mut out: Vec<NewRule> = Vec::with_capacity(rules.len());
+    for rule in rules.iter() {
+        out.extend(expand_colour_rule(rule.clone()));
     }
+    *rules = out.into();
 }
 
 fn expand_colour_rule(mut rule: NewRule) -> Vec<NewRule> {
@@ -332,7 +364,7 @@ fn expand_colour_rule(mut rule: NewRule) -> Vec<NewRule> {
             vec![(
                 RuleType::NodeRule {
                     left,
-                    rules: vec![inner_rule],
+                    rules: [inner_rule].into(),
                 },
                 opts,
             )]
@@ -468,8 +500,21 @@ fn rewrite_vsm_in_rule(rule: &mut NewRule) {
     }
 }
 
-fn rewrite_vsm_in_list(rules: &mut [NewRule]) {
-    for rule in rules.iter_mut() {
+fn has_vsm_field(rt: &RuleType) -> bool {
+    let is_vsm = |f: &NewField| matches!(f, NewField::ValueScopeMarkerField { .. });
+    match rt {
+        RuleType::LeafRule { left, right } => is_vsm(left) || is_vsm(right),
+        RuleType::LeafValueRule { right } => is_vsm(right),
+        RuleType::NodeRule { left, .. } => is_vsm(left),
+        _ => false,
+    }
+}
+
+fn rewrite_vsm_in_list(rules: &mut RuleBody) {
+    if !rules.iter().any(|r| any_rule(r, &has_vsm_field)) {
+        return;
+    }
+    for rule in Arc::make_mut(rules) {
         rewrite_vsm_in_rule(rule);
     }
 }
@@ -495,42 +540,38 @@ fn replace_ignore_marker_fields(ruleset: &mut RuleSet) {
 }
 
 fn expand_ignore_in_rule(rule: &mut NewRule) {
-    let (rt, _) = rule;
-    match rt {
-        RuleType::NodeRule { rules, .. } => expand_ignore_in_list(rules),
-        RuleType::ValueClauseRule { rules } => expand_ignore_in_list(rules),
-        RuleType::SubtypeRule { rules, .. } => expand_ignore_in_list(rules),
-        _ => {}
+    if let Some(rules) = body_mut(&mut rule.0) {
+        expand_ignore_in_list(rules);
     }
 }
 
-fn expand_ignore_in_list(rules: &mut [NewRule]) {
-    for rule in rules.iter_mut() {
-        if matches!(
-            rule.0,
-            RuleType::LeafRule {
-                right: NewField::IgnoreMarkerField,
-                ..
-            }
-        ) {
+fn is_ignore_marker(rt: &RuleType) -> bool {
+    matches!(
+        rt,
+        RuleType::LeafRule {
+            right: NewField::IgnoreMarkerField,
+            ..
+        }
+    )
+}
+
+fn expand_ignore_in_list(rules: &mut RuleBody) {
+    if !rules.iter().any(|r| any_rule(r, &is_ignore_marker)) {
+        return;
+    }
+    for rule in Arc::make_mut(rules) {
+        if is_ignore_marker(&rule.0) {
             let left = extract_leaf_left(&rule.0);
             let opts = rule.1.clone();
             *rule = (
                 RuleType::NodeRule {
                     left: NewField::IgnoreField(Box::new(left)),
-                    rules: vec![],
+                    rules: RuleBody::default(),
                 },
                 opts,
             );
         } else {
-            match &rule.0 {
-                RuleType::NodeRule { .. }
-                | RuleType::ValueClauseRule { .. }
-                | RuleType::SubtypeRule { .. } => {
-                    expand_ignore_in_rule(rule);
-                }
-                _ => {}
-            }
+            expand_ignore_in_rule(rule);
         }
     }
 }
@@ -548,6 +589,125 @@ mod tests {
         let mut ruleset = ast_to_ruleset(&parsed, &table);
         post_process(&mut ruleset);
         ruleset
+    }
+
+    /// The body reached by following `path` down `rule`'s nested `key = { … }`
+    /// blocks.
+    fn body_at<'a>(rule: &'a NewRule, path: &[&str]) -> &'a [NewRule] {
+        let mut rules: &[NewRule] = match &rule.0 {
+            RuleType::NodeRule { rules, .. } => rules,
+            other => panic!("expected a NodeRule, got {other:?}"),
+        };
+        for key in path {
+            let next = rules
+                .iter()
+                .find(|(rt, _)| {
+                    matches!(rt, RuleType::NodeRule { left: NewField::SpecificField(s), .. } if s == key)
+                })
+                .unwrap_or_else(|| panic!("no `{key}` block in {rules:?}"));
+            rules = match &next.0 {
+                RuleType::NodeRule { rules, .. } => rules,
+                _ => unreachable!(),
+            };
+        }
+        rules
+    }
+
+    fn rule_named<'a>(rules: &'a [NewRule], key: &str) -> &'a NewRule {
+        rules
+            .iter()
+            .find(|(rt, _)| match rt {
+                RuleType::LeafRule {
+                    left: NewField::SpecificField(s),
+                    ..
+                }
+                | RuleType::NodeRule {
+                    left: NewField::SpecificField(s),
+                    ..
+                } => s == key,
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("no `{key}` rule in {rules:?}"))
+    }
+
+    // -----------------------------------------------------------------------
+    // Every pass, below the top level
+    // -----------------------------------------------------------------------
+
+    /// Each pass skips a body whose subtree holds none of its markers, so that a
+    /// tree shared by single-alias inlining is not copied to rewrite nothing.
+    /// A marker two blocks down is what catches a check that only looks at the
+    /// rules directly in front of it.
+    #[test]
+    fn a_marker_nested_below_the_top_level_still_expands() {
+        let input = r#"
+single_alias[deep_sa] = {
+    ## cardinality = 0..1
+    from_alias = scalar
+}
+
+alias[effect:nested] = {
+    outer = {
+        inner = {
+            colour = colour_field
+            amount = value_field
+            skipped = ignore_field
+            aliased = single_alias_right[deep_sa]
+        }
+    }
+}
+"#;
+        let rs = parse_and_post(input);
+        let (_, rule) = rs
+            .aliases
+            .iter()
+            .find(|(n, _)| n == "effect:nested")
+            .unwrap();
+        let inner = body_at(rule, &["outer", "inner"]);
+
+        // Pass 1: value_field -> ValueScopeField.
+        match &rule_named(inner, "amount").0 {
+            RuleType::LeafRule { right, .. } => assert!(
+                matches!(right, NewField::ValueScopeField { .. }),
+                "value_field not rewritten: {right:?}"
+            ),
+            other => panic!("expected a LeafRule for `amount`, got {other:?}"),
+        }
+
+        // Pass 2: single_alias_right -> the referenced body.
+        let aliased = body_at(rule_named(inner, "aliased"), &[]);
+        assert!(
+            aliased
+                .iter()
+                .any(|(rt, _)| matches!(rt, RuleType::LeafRule { left: NewField::SpecificField(s), .. } if s == "from_alias")),
+            "single_alias not inlined: {aliased:?}"
+        );
+
+        // Pass 3: colour_field -> a 3x float block.
+        let colour = body_at(rule_named(inner, "colour"), &[]);
+        assert_eq!(colour.len(), 1, "colour body: {colour:?}");
+        assert!(
+            matches!(
+                &colour[0].0,
+                RuleType::LeafValueRule {
+                    right: NewField::ValueField(ValueType::Float { .. })
+                }
+            ) && colour[0].1.min == 3,
+            "colour_field not expanded: {colour:?}"
+        );
+
+        // Pass 4: ignore_field -> an IgnoreField NodeRule, which no longer
+        // carries its own key, so it is found by shape.
+        assert!(
+            inner.iter().any(|(rt, _)| matches!(
+                rt,
+                RuleType::NodeRule {
+                    left: NewField::IgnoreField(_),
+                    ..
+                }
+            )),
+            "ignore_field not expanded: {inner:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -1124,7 +1124,7 @@ pub(crate) fn is_type_ref_leaf(
         }
 
         let rules = match rule_type {
-            RuleType::NodeRule { rules, .. } => rules.as_slice(),
+            RuleType::NodeRule { rules, .. } => rules.as_ref(),
             _ => continue,
         };
 

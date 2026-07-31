@@ -102,7 +102,7 @@ pub(crate) fn find_rules_by_name<'a>(
         && let RootRule::TypeRule(_, (rule, _)) = &ruleset.root_rules[i]
         && let RuleType::NodeRule { rules, .. } = rule
     {
-        return rules.as_slice();
+        return rules.as_ref();
     }
     &[]
 }

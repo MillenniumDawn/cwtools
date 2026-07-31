@@ -19,4 +19,9 @@ cwtools_localization = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 tempfile = "3"
+
+[[bench]]
+name = "rules_hot"
+harness = false

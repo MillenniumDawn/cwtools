@@ -1598,7 +1598,7 @@ pub(crate) fn root_type_snippets(ruleset: &RuleSet, logical_path: &str) -> Vec<C
             ruleset.root_rules.iter().find_map(|r| {
                 if let RootRule::TypeRule(name, (RuleType::NodeRule { rules, .. }, _)) = r {
                     if name == &td.name {
-                        Some(rules.as_slice())
+                        Some(rules.as_ref())
                     } else {
                         None
                     }

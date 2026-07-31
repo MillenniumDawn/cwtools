@@ -1,4 +1,5 @@
-//! `textDocument/semanticTokens/full`: rule-aware highlighting for game script.
+//! `textDocument/semanticTokens/{full,range}`: rule-aware highlighting for game
+//! script.
 //!
 //! A TextMate grammar can only see `key = value`, which describes every line in
 //! the language and therefore distinguishes nothing. The classification that
@@ -22,6 +23,10 @@
 //! and the descent from there reuses the parent's matched `NodeRule` bodies the
 //! way `position::descend` does. Per-leaf resolution would be a full root
 //! descent per token and is what makes the naive version unusable on a real file.
+//!
+//! The `range` request runs the same walk with a line span: a child whose source
+//! range misses the span is skipped whole, so an off-screen entity costs neither
+//! its bootstrap nor its descent.
 //!
 //! ## Wire format
 //!
@@ -150,6 +155,10 @@ pub(crate) fn encode(mut tokens: Vec<AbsToken>) -> Vec<SemanticToken> {
     out
 }
 
+/// Parser lines (1-based, inclusive) a request is limited to. `None` = the whole
+/// document.
+type LineSpan = (u32, u32);
+
 /// Per-request immutable context for the walk.
 struct Ctx<'a> {
     arena: &'a Arena,
@@ -157,6 +166,7 @@ struct Ctx<'a> {
     lines: Vec<Vec<char>>,
     encoding: &'a PositionEncodingKind,
     rules: Option<RuleCtx<'a>>,
+    span: Option<LineSpan>,
 }
 
 /// Everything needed to resolve rules during the walk, plus the bootstrap budget.
@@ -181,12 +191,34 @@ impl RuleCtx<'_> {
 }
 
 impl Ctx<'_> {
+    /// Whether the walk needs to enter `child`. A clause leaf's range spans its
+    /// whole block, so a child that misses the span misses with its entire
+    /// subtree, which is what makes `range` cheaper than `full`: a skipped
+    /// top-level entity costs no rule bootstrap.
+    ///
+    /// Deliberately generous. The parser extends a leaf's range over the trailing
+    /// whitespace up to the next token (see `parse_value`), so this says yes to
+    /// the entity before the span too; [`Self::token`] does the exact clipping.
+    fn worth_entering(&self, child: &Child) -> bool {
+        let Some((first, last)) = self.span else {
+            return true;
+        };
+        let pos = match child {
+            Child::Leaf(i) => self.arena.leaves[*i as usize].pos,
+            Child::LeafValue(i) => self.arena.leaf_values[*i as usize].pos,
+            Child::Comment(i) => self.arena.comments[*i as usize].pos,
+        };
+        pos.start.line <= last && pos.end.line >= first
+    }
+
     fn line(&self, line0: u32) -> &[char] {
         self.lines.get(line0 as usize).map_or(&[], |l| l.as_slice())
     }
 
     /// Absolute token covering `[start_col, end_col)` of `line0`, converted from
-    /// parser char columns into the negotiated encoding.
+    /// parser char columns into the negotiated encoding. `None` outside the
+    /// request's span, so a `range` result holds only the lines that were asked
+    /// for even where the walk entered a block that starts before them.
     fn token(
         &self,
         line0: u32,
@@ -195,6 +227,11 @@ impl Ctx<'_> {
         token_type: u32,
         modifiers: u32,
     ) -> Option<AbsToken> {
+        if let Some((first, last)) = self.span
+            && !(first..=last).contains(&(line0 + 1))
+        {
+            return None;
+        }
         let line = self.line(line0);
         if start_col >= end_col || end_col > line.len() {
             return None;
@@ -222,13 +259,15 @@ fn encoded_len(chars: &[char], encoding: &PositionEncodingKind) -> u32 {
 
 /// Compute the semantic tokens for `file`. Pure (no locks, no IO) so the handler
 /// and the tests exercise the same mapping. `rules` is `None` when no ruleset is
-/// loaded, which downgrades the result to structural tokens only.
+/// loaded, which downgrades the result to structural tokens only. `span` limits
+/// the walk to those parser lines (the `range` request); `None` walks the file.
 pub(crate) fn semantic_tokens(
     file: &ParsedFile,
     table: &StringTable,
     text: &str,
     encoding: &PositionEncodingKind,
     rules: Option<(&Prepared<'_>, &str)>,
+    span: Option<LineSpan>,
 ) -> Vec<AbsToken> {
     let cx = Ctx {
         arena: &file.arena,
@@ -244,6 +283,7 @@ pub(crate) fn semantic_tokens(
             ruleset: prepared.ruleset,
             bootstraps_left: Cell::new(MAX_RULE_BOOTSTRAPS),
         }),
+        span,
     };
     let mut out = Vec::new();
     // The root level only carries rules in a `type_per_file` file, where the file
@@ -304,6 +344,9 @@ fn collect(
     out: &mut Vec<AbsToken>,
 ) {
     for child in children {
+        if !cx.worth_entering(child) {
+            continue;
+        }
         match child {
             Child::Comment(idx) => {
                 let c = &cx.arena.comments[*idx as usize];
@@ -419,7 +462,7 @@ fn collect_leaf(
 fn key_token_class(
     cx: &Ctx<'_>,
     block_rules: Option<&[(RuleType, Options)]>,
-    matched: &[(RuleType, Options)],
+    matched: &[&(RuleType, Options)],
     key: &str,
 ) -> (u32, u32) {
     let (Some(r), Some(rules)) = (cx.rules.as_ref(), block_rules) else {
@@ -456,7 +499,7 @@ fn key_token_class(
 
 /// The token type for a `key = value` right-hand side: literal kind first, then
 /// the [`ReferenceHint`] upgrade from the matched rule's right field.
-fn value_token_type(value: &Value, matched: &[(RuleType, Options)], cx: &Ctx<'_>) -> u32 {
+fn value_token_type(value: &Value, matched: &[&(RuleType, Options)], cx: &Ctx<'_>) -> u32 {
     match value {
         Value::Int(_) | Value::Float(_) => TY_NUMBER,
         Value::Bool(_) => TY_KEYWORD,
@@ -491,10 +534,9 @@ fn leaf_value_token_type(
             let Some(rules) = block_rules else {
                 return TY_STRING;
             };
-            let leaf_values: Vec<(RuleType, Options)> = rules
+            let leaf_values: Vec<&(RuleType, Options)> = rules
                 .iter()
                 .filter(|(rt, _)| matches!(rt, RuleType::LeafValueRule { .. }))
-                .cloned()
                 .collect();
             value_token_type(value, &leaf_values, cx)
         }
@@ -518,11 +560,11 @@ fn hint_token_type(hint: &ReferenceHint) -> Option<u32> {
 /// Bodies of the matched `NodeRule`s — the rules that apply inside the clause
 /// this key opens. `SubtypeRule` branches are unioned in, the way
 /// `position::descend` flattens nested subtype blocks.
-pub(crate) fn node_bodies(matched: &[(RuleType, Options)]) -> Vec<(RuleType, Options)> {
+pub(crate) fn node_bodies(matched: &[&(RuleType, Options)]) -> Vec<(RuleType, Options)> {
     let mut out = Vec::new();
-    for (rt, _) in matched {
+    for (rt, _) in matched.iter().copied() {
         if let RuleType::NodeRule { rules, .. } = rt {
-            for r in rules {
+            for r in rules.iter() {
                 match &r.0 {
                     RuleType::SubtypeRule { rules: inner, .. } => out.extend(inner.iter().cloned()),
                     _ => out.push(r.clone()),
@@ -590,18 +632,50 @@ impl Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri.to_string();
+        Ok(self.tokens_for(&uri, None).map(|data| {
+            SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data,
+            })
+        }))
+    }
+
+    /// `textDocument/semanticTokens/range`: the same walk bounded to the
+    /// viewport. Line-granular, since a token never spans lines.
+    #[tracing::instrument(skip_all)]
+    pub(crate) async fn semantic_tokens_range_impl(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        let uri = params.text_document.uri.to_string();
+        // An LSP range end is exclusive, so one landing on column 0 stops on the
+        // line before. Both ends are 0-based; parser lines are 1-based.
+        let end = params.range.end;
+        let last = if end.character == 0 {
+            end.line.saturating_sub(1)
+        } else {
+            end.line
+        };
+        let span = (params.range.start.line + 1, last + 1);
+        Ok(self.tokens_for(&uri, Some(span)).map(|data| {
+            SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data,
+            })
+        }))
+    }
+
+    /// Shared body of both semantic-token requests: resolve the document, build
+    /// `Prepared` if a ruleset is loaded, and encode the walk's tokens.
+    fn tokens_for(&self, uri: &str, span: Option<LineSpan>) -> Option<Vec<SemanticToken>> {
         // Loc (`.yml`) and rule (`.cwt`) files aren't game ASTs; the parser's
         // script grammar doesn't describe them, so highlighting them here would
         // be worse than the client's own grammar.
-        if crate::paths::has_loc_ext(&uri) || crate::paths::is_cwt_file(&uri) {
-            return Ok(None);
+        if crate::paths::has_loc_ext(uri) || crate::paths::is_cwt_file(uri) {
+            return None;
         }
-        let Some(ast) = self.ast_for(&uri) else {
-            return Ok(None);
-        };
-        let Some(text) = self.file_text_for(&uri) else {
-            return Ok(None);
-        };
+        let ast = self.ast_for(uri)?;
+        let text = self.file_text_for(uri)?;
         let (game, scope_checks, var_checks, encoding, ws_prefix) = {
             let cfg = self.state.config.read();
             (
@@ -612,7 +686,7 @@ impl Backend {
                 cfg.workspace_prefix.clone(),
             )
         };
-        let logical_path = crate::paths::logical_path_from_uri(&uri, &ws_prefix);
+        let logical_path = crate::paths::logical_path_from_uri(uri, &ws_prefix);
         let (ruleset, modifier_keys, scope_registry) = {
             let rules = self.state.rules.read();
             (
@@ -645,15 +719,13 @@ impl Backend {
                     &text,
                     &encoding,
                     Some((&prepared, logical_path.as_str())),
+                    span,
                 )
             }
-            None => semantic_tokens(&ast, &self.state.string_table, &text, &encoding, None),
+            None => semantic_tokens(&ast, &self.state.string_table, &text, &encoding, None, span),
         };
 
-        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-            result_id: None,
-            data: encode(tokens),
-        })))
+        Some(encode(tokens))
     }
 }
 
@@ -664,7 +736,20 @@ mod tests {
     fn tokens_for(text: &str) -> Vec<AbsToken> {
         let table = StringTable::new();
         let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
-        semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF16, None)
+        semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF16, None, None)
+    }
+
+    fn tokens_in_span(text: &str, span: LineSpan) -> Vec<AbsToken> {
+        let table = StringTable::new();
+        let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
+        semantic_tokens(
+            &ast,
+            &table,
+            text,
+            &PositionEncodingKind::UTF16,
+            None,
+            Some(span),
+        )
     }
 
     fn at(tokens: &[AbsToken], line: u32, start: u32) -> AbsToken {
@@ -890,6 +975,47 @@ mod tests {
         );
     }
 
+    // ── The range span ───────────────────────────────────────────────────────
+
+    // Three entities, one per pair of lines. A span over the middle one must
+    // produce exactly its tokens.
+    const THREE_ENTITIES: &str = "a = {\n  x = 1\n}\nb = {\n  y = 2\n}\nc = {\n  z = 3\n}\n";
+
+    #[test]
+    fn a_span_keeps_only_the_entities_it_covers() {
+        // Parser lines 4..6 are the `b` block.
+        let tokens = tokens_in_span(THREE_ENTITIES, (4, 6));
+        assert!(
+            tokens.iter().all(|t| (3..=5).contains(&t.line)),
+            "tokens outside the span leaked: {tokens:#?}"
+        );
+        // `b`, `=`, `y`, `=`, `2`. The block braces carry no token.
+        assert_eq!(tokens.len(), 5, "{tokens:#?}");
+    }
+
+    #[test]
+    fn a_span_produces_the_same_tokens_full_would() {
+        let full = tokens_for(THREE_ENTITIES);
+        let ranged = tokens_in_span(THREE_ENTITIES, (4, 6));
+        let expected: Vec<AbsToken> = full
+            .into_iter()
+            .filter(|t| (3..=5).contains(&t.line))
+            .collect();
+        assert_eq!(ranged, expected);
+    }
+
+    #[test]
+    fn a_span_inside_an_entity_still_gets_its_lines() {
+        // Parser line 5 is `y = 2`, inside `b`. The walk has to enter a block
+        // that starts before the span to reach it.
+        let tokens = tokens_in_span(THREE_ENTITIES, (5, 5));
+        assert!(
+            tokens.iter().all(|t| t.line == 4),
+            "only the requested line: {tokens:#?}"
+        );
+        assert_eq!(tokens.len(), 3, "{tokens:#?}");
+    }
+
     // ── Position encoding ────────────────────────────────────────────────────
 
     #[test]
@@ -899,7 +1025,7 @@ mod tests {
         let text = "a = 😀\n";
         let table = StringTable::new();
         let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
-        let tokens = semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF16, None);
+        let tokens = semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF16, None, None);
         let value = tokens.iter().find(|t| t.token_type == TY_STRING).unwrap();
         assert_eq!((value.start, value.length), (4, 2));
     }
@@ -909,7 +1035,7 @@ mod tests {
         let text = "a = 😀\n";
         let table = StringTable::new();
         let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
-        let tokens = semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF32, None);
+        let tokens = semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF32, None, None);
         let value = tokens.iter().find(|t| t.token_type == TY_STRING).unwrap();
         assert_eq!((value.start, value.length), (4, 1));
     }
@@ -919,7 +1045,7 @@ mod tests {
         let text = "😀 = 1\n";
         let table = StringTable::new();
         let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
-        let tokens = semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF16, None);
+        let tokens = semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF16, None, None);
         let number = tokens.iter().find(|t| t.token_type == TY_NUMBER).unwrap();
         assert_eq!(number.start, 5, "char col 4 is UTF-16 col 5");
     }

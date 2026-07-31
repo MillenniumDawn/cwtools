@@ -7269,6 +7269,86 @@ my_focus = {
 }
 
 #[test]
+fn test_semantic_tokens_range_returns_only_the_requested_lines() {
+    // Two entities; the request covers the second one's body only.
+    let text = "\
+first_focus = {
+    id = first_focus
+    cost = 10
+}
+second_focus = {
+    id = second_focus
+    cost = 20
+}
+";
+    let rel = "common/national_focus/tree.txt";
+    let (ws, _rules, mut child, mut reader) = editor_server(&[(rel, text)]);
+
+    let body = jsonrpc_request(
+        2,
+        "textDocument/semanticTokens/range",
+        serde_json::json!({
+            "textDocument": { "uri": path_uri(ws.path().join(rel)) },
+            // Exclusive end on column 0: lines 5 and 6, not 7.
+            "range": {
+                "start": { "line": 5, "character": 0 },
+                "end": { "line": 7, "character": 0 },
+            },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let raw = read_response(&mut reader).expect("no semanticTokens/range response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(resp["id"], 2, "got: {raw}");
+    let data = resp["result"]["data"].as_array().expect("token data");
+    let tokens = decode_semantic_tokens(data);
+    println!("decoded (line, start, len, type, mods) = {tokens:#?}");
+
+    assert!(!tokens.is_empty(), "range should still classify: {raw}");
+    assert!(
+        tokens.iter().all(|t| (5..=6).contains(&t.0)),
+        "tokens outside the requested range: {tokens:#?}"
+    );
+    // `id`, `=`, `second_focus`, `cost`, `=`, `20`.
+    assert_eq!(tokens.len(), 6, "{tokens:#?}");
+}
+
+#[test]
+fn test_semantic_tokens_range_end_column_zero_is_exclusive() {
+    // `first = 1` on line 0, `second = 2` on line 1. A range ending at 1:0
+    // covers line 0 only.
+    let text = "first = 1\nsecond = 2\n";
+    let rel = "common/national_focus/tree.txt";
+    let (ws, _rules, mut child, mut reader) = editor_server(&[(rel, text)]);
+
+    let body = jsonrpc_request(
+        2,
+        "textDocument/semanticTokens/range",
+        serde_json::json!({
+            "textDocument": { "uri": path_uri(ws.path().join(rel)) },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 1, "character": 0 },
+            },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let raw = read_response(&mut reader).expect("no semanticTokens/range response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let data = resp["result"]["data"].as_array().expect("token data");
+    let tokens = decode_semantic_tokens(data);
+    assert!(
+        tokens.iter().all(|t| t.0 == 0),
+        "line 1 is past the exclusive end: {tokens:#?}"
+    );
+    assert_eq!(tokens.len(), 3, "{tokens:#?}");
+}
+
+#[test]
 fn test_semantic_tokens_skip_loc_and_cwt_files() {
     let files = [
         (

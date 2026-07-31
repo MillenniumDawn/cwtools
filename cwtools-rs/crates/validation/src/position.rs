@@ -541,7 +541,10 @@ fn leaf_context(
 ) -> RuleContext {
     RuleContext {
         child_rules: rules.to_vec(),
-        value_rules: value_rules_for_key(ctx.ruleset, ctx.type_index, rules, key),
+        value_rules: value_rules_for_key(ctx.ruleset, ctx.type_index, rules, key)
+            .into_iter()
+            .cloned()
+            .collect(),
         leaf: Some(LeafAtPos {
             key: key.to_string(),
             value,
@@ -584,17 +587,19 @@ pub fn alias_category_for_key(
 /// reads LeafRule/LeafValueRule rights, while hover wants any matched rule's
 /// description. Public so the LSP can resolve a mid-edit `key = |` line where
 /// no leaf exists in the last good parse yet.
-pub fn value_rules_for_key(
-    ruleset: &RuleSet,
+/// Borrows: the matches all live in `child_rules` or in the ruleset's alias
+/// table, so the per-leaf semantic-token sweep copies nothing.
+pub fn value_rules_for_key<'a>(
+    ruleset: &'a RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
-    child_rules: &[(RuleType, Options)],
+    child_rules: &'a [(RuleType, Options)],
     key: &str,
-) -> Vec<(RuleType, Options)> {
+) -> Vec<&'a (RuleType, Options)> {
     let candidates =
         matching_candidates(child_rules, key, ruleset, type_index, rule_matches_leaf_key);
-    let mut out: Vec<(RuleType, Options)> = Vec::new();
-    for (rule_type, opts) in candidates {
-        match rule_type {
+    let mut out: Vec<&(RuleType, Options)> = Vec::new();
+    for rule in candidates {
+        match &rule.0 {
             RuleType::LeafRule {
                 left: NewField::AliasField(cat),
                 ..
@@ -602,14 +607,8 @@ pub fn value_rules_for_key(
             | RuleType::NodeRule {
                 left: NewField::AliasField(cat),
                 ..
-            } => {
-                for (ort, oopts) in alias_overloads(ruleset, type_index, cat, key) {
-                    out.push((ort.clone(), oopts.clone()));
-                }
-            }
-            RuleType::LeafRule { .. } | RuleType::NodeRule { .. } => {
-                out.push((rule_type.clone(), opts.clone()))
-            }
+            } => out.extend(alias_overloads(ruleset, type_index, cat, key)),
+            RuleType::LeafRule { .. } | RuleType::NodeRule { .. } => out.push(rule),
             _ => {}
         }
     }
