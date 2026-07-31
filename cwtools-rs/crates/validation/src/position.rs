@@ -112,6 +112,9 @@ pub fn rules_at_pos(
         scope_checks: prepared.scope_checks,
         var_checks: prepared.var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),
+        // The resolver is a read-only navigation walk; it never contributes to
+        // the project-wide unused check.
+        type_uses: None,
     };
 
     // Path candidates depend only on the file path, so compute them once and

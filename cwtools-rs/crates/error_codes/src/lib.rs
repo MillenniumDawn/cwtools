@@ -571,7 +571,9 @@ pub const CW230_MISMATCHED_COMPONENT_AND_SLOT: ErrorCode = ErrorCode {
     message_template: "Component and slot do not match, slot {} has size {} and component {} has size {}",
 };
 
-/// Technology is never used. F# `UnusedTech`.
+/// Technology is never used. F# `UnusedTech`. Rides the project-wide reference
+/// map CW239 uses (`validation::references`); the exemptions F# applies first
+/// live in the Stellaris validator.
 pub const CW231_UNUSED_TECH: ErrorCode = ErrorCode {
     id: "CW231",
     severity: ErrorSeverity::Warning,
@@ -622,13 +624,13 @@ pub const CW500_TYPE_NOT_FOUND: ErrorCode = ErrorCode {
 // (`CW261_DUPLICATE_TYPE_DEF`). See the reconciliation note there.
 
 // CW502 (unused type) retired: converged onto F#'s CW239 (`UnusedType`) below.
-// Not emitted yet — needs cross-file reference tracking (the `should_be_referenced`
-// pass collects no references today). See the reconciliation note on CW239.
+// See the reconciliation note on CW239.
 
 /// A `should_be_referenced` type instance that is never referenced anywhere.
 /// F# `UnusedType`. Reconciliation: cwtools-rs reserved the Rust-invented CW502
 /// for this; F#'s ID is CW239. Converging on CW239. Args are `(referenceName, typeName)`.
-/// Emission pending the cross-file reference-tracking subsystem.
+/// Emitted by the batch path only (`validation::references`): the answer needs
+/// every file's references at once.
 pub const CW239_UNUSED_TYPE: ErrorCode = ErrorCode {
     id: "CW239",
     severity: ErrorSeverity::Warning,

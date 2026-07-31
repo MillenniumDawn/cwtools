@@ -2,6 +2,7 @@
 
 ## Features
 
+- `cwtools validate` reports definitions nothing in the mod uses. A type the config marks `should_be_used = yes` promises every one of its instances is referenced somewhere, and a Stellaris technology promises the same; neither could be checked before, because the answer needs every file at once and the validator only ever saw one. The rule engine now records each `<type>` reference it resolves, the run merges them, and every instance the merged set does not cover is reported as CW239 (`X of type Y is not used anywhere, but is expected to be`) or, for a technology, CW231 (`Technology X is not used`). Technologies the game uses on its own are exempt, matching F#: one that grants a modifier, documents what it unlocks, is weighted out of the draw, or sits behind a feature flag. The whole pass is skipped for a config that marks no type `should_be_used`, which is every HOI4 config today, so HOI4 diagnostics are unchanged. The LSP does not emit either code: a single-file revalidation has no way to recompute a project-wide answer, so the squiggle would go stale on the next edit. (#93)
 - Semantic tokens now answer `textDocument/semanticTokens/range` as well as `full`. `full` is the only entry point the server had, so VS Code re-highlighted the whole document after every edit, and each top-level entity in it costs a rule bootstrap (a root descent with subtype merging, the same work the validator does for one entity). The range request runs the same walk with the off-screen entities skipped whole, so a 300-entity file re-resolves what is on screen instead of all of it. `full/delta` stays declined: it needs server-side result caching there is still no invalidation story for. (#84)
 
 ## Bug Fixes
@@ -39,6 +40,7 @@
 - **Behavioral:** CW246 now runs by default. `CWTOOLS_NO_VAR_CHECKS=1` turns it off, matching `CWTOOLS_NO_SCOPE_CHECKS`; the old opt-in `CWTOOLS_VAR_CHECKS=1` is gone. Millennium Dawn gains 60 warnings and Kaiserreich 1, all of them variables a dynamic modifier reads but nothing ever sets. Millennium Dawn also gains 29 `is_puppet` info hints: those are the config's own `error_if_only_match` advice, previously masked because a competing alias overload happened to match cleanly.
 - The base-game cache format is v9 (array names are now part of the cached variable set). Existing v8 caches rebuild on first run.
 - **Behavioral:** goto-definition on a localisation key the mod redefines lands in the mod's file. The base game used to win: both trees were walked in one pass, and for the primary language whichever file came last overwrote the entry. (#89)
+- **Behavioral:** a Stellaris `cwtools validate` run gains CW231 for every technology nothing references, and any config that marks a type `should_be_used` gains CW239 for its unreferenced instances. HOI4 is unaffected: its config marks no type, so the pass never runs. (#93)
 
 ## Developer
 
@@ -46,6 +48,7 @@
 - Every write to a localisation overlay goes through a guard whose `Drop` bumps the revision the derived key-set caches are keyed on, so a new write site cannot leave those caches serving a key set that predates it. (#87)
 - `cargo bench -p cwtools_driver --bench rules_hot` measures the editor hot paths (`rules_at_pos` for completion and hover, `value_rules_for_key` per leaf) against a real ruleset. It needs a `cwtools-hoi4-config/Config` checkout, found via `CWTOOLS_RULES` or `CWTOOLS_PROJECTS` the way the corpus guard finds its inputs, and reports why it measured nothing when there isn't one. (#84)
 - `ValidationError.file` is an `Arc<str>` (`cwtools_validation::FilePath`) instead of a `String`, and the CLI's report row carries the same handle plus a `&'static str` code. Anything constructing a `ValidationError` by hand needs `.into()` on the path. (#85)
+- `cwtools_validation::references` holds the project-wide unused check. A caller that wants it validates with `validate_prepared_tracking_uses` instead of `validate_prepared`, merges the returned `UsedInstances` across its files, and calls `check_unused_instances` per file afterwards. `validate_prepared` is unchanged and records nothing. (#93)
 
 # 2.4.0
 

@@ -46,6 +46,16 @@ fn validate_leaf_against_rule(
     if rule_left_is_ignore(rule_type) {
         return;
     }
+    // A rule keyed by `<type>` (`<technology> = { … }`) makes the KEY the
+    // reference, not the value — F# records the same two shapes for its unused
+    // check. An overloaded key runs every candidate here, so a losing candidate
+    // can record too; that only ever marks something used, which is the safe
+    // direction for CW239/CW231.
+    if let RuleType::LeafRule { left, .. } | RuleType::NodeRule { left, .. } = rule_type
+        && let NewField::TypeField(type_type) = left
+    {
+        crate::references::mark_type_field_use(ctx, type_type, key);
+    }
     if let Some(sc) = scope_context.as_ref()
         && !opts.required_scopes.is_empty()
         && !scope_matches_required(sc.current(), sc.registry.as_ref(), &opts.required_scopes)
@@ -712,6 +722,14 @@ fn count_and_validate_children<'r>(
                                         lv.pos.end,
                                         errors,
                                     );
+                                });
+                            }
+                            // A bare `<type>` member of a list (`prerequisites =
+                            // { tech_x }`) is a reference too — record it for the
+                            // project-wide unused check.
+                            if let NewField::TypeField(type_type) = right {
+                                with_leaf_value_str(&lv.value, table, |raw| {
+                                    crate::references::mark_type_field_use(ctx, type_type, raw);
                                 });
                             }
                             matched = true;

@@ -1,4 +1,6 @@
 use super::common::{as_block, child_key_eq, key_len, under_dir_segment, walk_blocks};
+use crate::common::value_is_zero;
+use crate::ctx::ValidationCtx;
 use crate::{ValidationError, error_codes};
 use cwtools_index::TypeIndex;
 use cwtools_parser::ast::{Child, ParsedFile, Value};
@@ -557,6 +559,64 @@ fn validate_planet_killer(
             ));
         }
     }
+}
+
+// ── Unused technology (CW231) ──────────────────────────
+//
+// Whether a technology is used is a project-wide question: the answer lives in
+// the `<technology>` references the rule engine collects across every file (a
+// prerequisite of another tech, a building's unlock, a `has_technology` check).
+// See `crate::references`. This half only handles the technologies the game uses
+// without any script naming them, which F# `validateTechnologies` exempts before
+// reporting `UnusedTech`: marking them used keeps CW231 quiet without inventing
+// a second notion of "used".
+
+/// Mark the technologies in this file that the game uses on its own: one that
+/// grants a modifier, documents what it unlocks, is weighted out of the draw, or
+/// sits behind a feature flag.
+pub(super) fn mark_exempt_technologies(ctx: &ValidationCtx) {
+    if !ctx.tracks_type_uses(crate::references::TECHNOLOGY)
+        || !parent_dir_is(ctx.file_path, "common/technology")
+    {
+        return;
+    }
+    for child in &ctx.ast.root_children {
+        let Some(block) = as_block(child, ctx.ast) else {
+            continue;
+        };
+        if technology_is_exempt(block.children, ctx.ast, ctx.table) {
+            let key = block.key_string_lower(ctx.table);
+            ctx.mark_type_use(crate::references::TECHNOLOGY, &key);
+        }
+    }
+}
+
+fn technology_is_exempt(children: &[Child], ast: &ParsedFile, table: &StringTable) -> bool {
+    let has = |key: &str| children.iter().any(|c| child_key_eq(c, ast, table, key));
+    if has("prereqfor_desc") || has("modifier") || has("feature_flags") {
+        return true;
+    }
+    // A tech the draw can never pick is unreachable by design, not unused.
+    if children.iter().any(|c| {
+        let Child::Leaf(idx) = c else { return false };
+        let leaf = &ast.arena.leaves[*idx as usize];
+        child_key_eq(c, ast, table, "weight") && value_is_zero(&leaf.value)
+    }) {
+        return true;
+    }
+    children.iter().any(|c| {
+        let Some(block) = as_block(c, ast) else {
+            return false;
+        };
+        table
+            .with_string(block.key_lower, |k| k == "weight_modifier")
+            .unwrap_or(false)
+            && block.children.iter().any(|wc| {
+                let Child::Leaf(idx) = wc else { return false };
+                let leaf = &ast.arena.leaves[*idx as usize];
+                child_key_eq(wc, ast, table, "factor") && value_is_zero(&leaf.value)
+            })
+    })
 }
 
 // ── Helpers ────────────────────────────────────────────

@@ -41,9 +41,30 @@ pub(crate) struct ValidationCtx<'a> {
     /// sibling/parent blocks. The single `ValidationCtx` is shared by `&`, so
     /// this uses interior mutability.
     pub(crate) loop_vars: RefCell<Vec<String>>,
+    /// Sink for the project-wide unused check (CW239/CW231): the instances of
+    /// reference-tracked types this file uses. `None` on every path that didn't
+    /// ask for the tracking, which is all of them but the batch driver's, so the
+    /// recording sites cost one branch. Shared by `&` like the rest of the
+    /// context, hence the `RefCell`.
+    pub(crate) type_uses: Option<&'a RefCell<crate::references::UsedInstances>>,
 }
 
 impl ValidationCtx<'_> {
+    /// Whether uses of `type_name`'s instances are being recorded this run.
+    /// Checked before the affix forms a complex `<type>` reference expands to,
+    /// so a run that tracks nothing never builds them.
+    pub(crate) fn tracks_type_uses(&self, type_name: &str) -> bool {
+        self.type_uses.is_some()
+            && crate::references::is_tracked(self.ruleset, self.game, type_name)
+    }
+
+    /// Record `instance` as a use of a `type_name` instance.
+    pub(crate) fn mark_type_use(&self, type_name: &str, instance: &str) {
+        if let Some(sink) = self.type_uses {
+            sink.borrow_mut().mark(type_name, instance);
+        }
+    }
+
     /// Whether `name`, normalized the same way the variable index is, currently
     /// names a loop-local variable in scope.
     pub(crate) fn is_loop_var(&self, name: &str) -> bool {

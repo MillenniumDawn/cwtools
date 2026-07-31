@@ -54,10 +54,22 @@ The full load pipeline lives in `crates/driver/src/lib.rs`:
 5. Build the loc index (`LocIndex`) over the mod + vanilla loc keys.
 6. Build the per-run `ScopeRegistry` from the config's scopes and links.
 7. Validate every file against that prebuilt state.
+8. Report the definitions nothing referenced (CW239/CW231).
 
 Steps 3 through 7 are the reusable primitives (`index_game_dir`,
 `build_scope_registry_arc`, `Prepared`/`validate_prepared`). Both front ends call
 them directly, so the order can't drift the way it did before.
+
+Step 8 is the one check a single file can't answer. Whether a
+`should_be_used` type's instance (or a Stellaris technology) is ever referenced
+depends on every other file, so step 7 records each `<type>` reference the rule
+engine resolves (`validate_prepared_tracking_uses`), the driver merges those into
+one set, and `references::check_unused_instances` then flags each file's own
+definitions that the set doesn't cover. The whole thing is skipped for a config
+that marks no type `should_be_used`, which is every non-Stellaris config today.
+The LSP does not run it: its per-file revalidation has no project-wide view to
+recompute the answer from, so it would publish diagnostics that go stale on the
+next edit.
 
 ### CLI vs LSP
 
@@ -102,7 +114,7 @@ interval and idle window for tests.
 Generic rule validation runs first (the `.cwt` engine in `validation/src/rule_core`).
 Then `run_game_validators` (`validation/src/per_game/mod.rs`) adds:
 
-- `common` checks (unique types, `should_be_referenced`, warning-only downgrades),
+- `common` checks (unique types, warning-only downgrades),
 - cross-game `structural` hints (empty `if`/`limit`, `NOT` misuse, redundant booleans), then
 - a dispatch on `Game`: `stellaris` (full validators), `hoi4` (cleanup hints),
   and `_ =>` common-only for every other game, EU4 included.

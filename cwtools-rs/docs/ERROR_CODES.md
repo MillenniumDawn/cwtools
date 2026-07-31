@@ -90,7 +90,7 @@ and CW241 by CW262-265.
 | CW228 | Error | Section template {} does not have a slot {} | A section template is referenced with a slot name it doesn't define. | Defined, emission pending (vanilla data registries) |
 | CW229 | Error | Component template {} can not be found | A ship design references a component template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500) |
 | CW230 | Warning | Component and slot do not match, slot {} has size {} and component {} has size {} | The size of a component doesn't fit the slot it's placed in. | Defined, emission pending (vanilla data registries) |
-| CW231 | Warning | Technology {} is not used | A technology definition is never referenced anywhere. | Defined, emission pending (cross-file reference tracking) |
+| CW231 | Warning | Technology {} is not used | A technology definition is never referenced anywhere. | Emitted (Stellaris only, batch/CLI only; same reference map as CW239, minus F#'s exemptions: `prereqfor_desc`, `modifier`, `feature_flags`, `weight = 0`, `weight_modifier` factor 0) |
 | CW233 | Error | Entity {} is not defined | A section or other asset references an entity that isn't defined. | Defined, emission pending (vanilla data registries / asset index) |
 
 ### CW234-CW238 -- Loc placeholders, zero-modifier, if/else order
@@ -107,7 +107,19 @@ and CW241 by CW262-265.
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW239 | Warning | {} of type {} is not used anywhere, but is expected to be | A `should_be_referenced` type instance is never referenced in any other file. | Defined, emission pending (cross-file reference-tracking subsystem) (reconciled from Rust CW502) |
+| CW239 | Warning | {} of type {} is not used anywhere, but is expected to be | A `should_be_referenced` type instance is never referenced in any other file. | Emitted (batch/CLI only) (reconciled from Rust CW502) |
+
+Both CW239 and CW231 answer a project-wide question, so they run once at the end
+of a batch run instead of per file: the rule engine records every `<type>`
+reference it resolves, the driver merges those, and each file's own definitions
+are then checked against the merged set. Nothing happens unless the config marks
+a type `should_be_used` (Stellaris also tracks `technology`, for CW231), so on a
+config that marks none the whole pass is skipped.
+
+Two consequences worth knowing. The LSP does not emit either code: a single-file
+revalidation cannot recompute the project-wide answer, so the diagnostic would go
+stale on the next edit. And only the mod's own definitions are checked, since a
+run validates the mod, not the base game it sits on.
 
 ### CW240-CW248 -- Rules-engine dynamic codes
 
@@ -214,7 +226,6 @@ corpus to validate.
 |---|---|
 | Event-target dataflow + cross-file event index | CW220, CW221 |
 | Per-template field data (slots/sizes) + asset index | CW228, CW230, CW233 |
-| Cross-file reference tracking (unused type / tech) | CW231, CW239 |
 | List-merge optimisation hint | CW269 |
 | Modifier-type registry | CW273 |
 
