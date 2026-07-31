@@ -4686,7 +4686,9 @@ fn spawn_frame_collector(
 
 /// Collect frames from `rx` until none arrives for `quiet`, or `budget` elapses.
 /// `quiet` must exceed the coalescing window so the drain doesn't stop before it
-/// fires.
+/// fires. Use this only where zero frames is a legitimate outcome (a no-op
+/// guard that must not revalidate); anything asserting on what arrived wants
+/// [`drain_after_first`].
 fn drain_until_quiet(
     rx: &std::sync::mpsc::Receiver<serde_json::Value>,
     quiet: std::time::Duration,
@@ -4700,6 +4702,24 @@ fn drain_until_quiet(
             Err(_) => break,
         }
     }
+    out
+}
+
+/// [`drain_until_quiet`], but the wait for the FIRST frame is the whole budget.
+/// `quiet` bounds the gap between frames; spending it before anything has
+/// arrived turns "how fast did the host answer" into "did the server do the
+/// work", which is how these tests read as green on a dev machine and red on a
+/// loaded CI runner that needs seconds to publish.
+fn drain_after_first(
+    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
+    quiet: std::time::Duration,
+    budget: std::time::Duration,
+) -> Vec<serde_json::Value> {
+    let mut out = match rx.recv_timeout(budget) {
+        Ok(v) => vec![v],
+        Err(_) => return Vec::new(),
+    };
+    out.extend(drain_until_quiet(rx, quiet, budget));
     out
 }
 
@@ -4797,7 +4817,7 @@ fn test_watched_repeated_change_coalesces_to_one_validate() {
         write_frame(&mut child, &watched_changes(std::slice::from_ref(&uri))).unwrap();
     }
 
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(8),
@@ -4835,7 +4855,7 @@ fn test_watched_distinct_files_each_validate_once() {
 
     write_frame(&mut child, &watched_changes(&uris)).unwrap();
 
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(10),
@@ -4876,7 +4896,7 @@ fn test_watched_bulk_flood_uses_rescan_not_per_file() {
 
     write_frame(&mut child, &watched_changes(&uris)).unwrap();
 
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1500),
         std::time::Duration::from_secs(20),
@@ -5019,7 +5039,7 @@ fn test_watched_loc_value_change_does_not_sweep_open_loc_files() {
         &watched_changes(std::slice::from_ref(&watched_uri)),
     )
     .unwrap();
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(8),
@@ -5041,7 +5061,7 @@ fn test_watched_loc_value_change_does_not_sweep_open_loc_files() {
         &watched_changes(std::slice::from_ref(&watched_uri)),
     )
     .unwrap();
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(8),
@@ -5116,7 +5136,7 @@ fn test_watched_loc_new_keys_resolve_cross_file_with_one_sweep() {
     );
     write_frame(&mut child, &watched_changes(&[b_uri, c_uri])).unwrap();
 
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(8),
@@ -5216,7 +5236,7 @@ fn test_watched_loc_keys_survive_scan_index_install() {
         " B_KEY:0 \"b\"\n NEW_KEY:0 \"n1\"\n",
     );
     write_frame(&mut child, &watched_changes(std::slice::from_ref(&b_uri))).unwrap();
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(8),
@@ -5245,7 +5265,7 @@ fn test_watched_loc_keys_survive_scan_index_install() {
         ),
     )
     .unwrap();
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1500),
         std::time::Duration::from_secs(15),
@@ -5302,7 +5322,7 @@ fn test_watched_loc_removed_key_stops_resolving() {
         " B_KEY:0 \"b\"\n NEW_KEY:0 \"n1\"\n",
     );
     write_frame(&mut child, &watched_changes(std::slice::from_ref(&b_uri))).unwrap();
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(8),
@@ -5322,7 +5342,7 @@ fn test_watched_loc_removed_key_stops_resolving() {
         " B_KEY:0 \"b\"\n",
     );
     write_frame(&mut child, &watched_changes(std::slice::from_ref(&b_uri))).unwrap();
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(8),
@@ -5382,7 +5402,7 @@ fn test_config_no_op_skips_revalidate_then_real_change_runs() {
 
     // First send changes the (empty) live codes → one configChange pass.
     write_frame(&mut child, &cfg(&["CW999"])).unwrap();
-    drain_until_quiet(&rx, quiet, budget);
+    drain_after_first(&rx, quiet, budget);
     let log1 = fetch_profiling_log(&mut child, &rx, 1101);
     assert_eq!(
         count_validate_log(&log1, "configChange"),
@@ -5408,7 +5428,7 @@ fn test_config_no_op_skips_revalidate_then_real_change_runs() {
 
     // A real change → one more configChange pass (total 2).
     write_frame(&mut child, &cfg(&["CW998"])).unwrap();
-    drain_until_quiet(&rx, quiet, budget);
+    drain_after_first(&rx, quiet, budget);
     let log3 = fetch_profiling_log(&mut child, &rx, 1103);
     child.kill().ok();
     assert_eq!(
@@ -5459,7 +5479,7 @@ fn test_config_idle_only_change_passes_noop_guard() {
 
     // 5 differs from the 15s default → one configChange pass.
     write_frame(&mut child, &cfg(5)).unwrap();
-    drain_until_quiet(&rx, quiet, budget);
+    drain_after_first(&rx, quiet, budget);
     let log1 = fetch_profiling_log(&mut child, &rx, 1201);
     assert_eq!(
         count_validate_log(&log1, "configChange"),
@@ -5522,7 +5542,7 @@ fn test_config_partial_payload_keeps_ignore_lists() {
         ),
     )
     .unwrap();
-    drain_until_quiet(&rx, quiet, budget);
+    drain_after_first(&rx, quiet, budget);
     let log1 = fetch_profiling_log(&mut child, &rx, 1301);
     assert_eq!(
         count_validate_log(&log1, "configChange"),
@@ -5540,7 +5560,7 @@ fn test_config_partial_payload_keeps_ignore_lists() {
         ),
     )
     .unwrap();
-    drain_until_quiet(&rx, quiet, budget);
+    drain_after_first(&rx, quiet, budget);
     let log2 = fetch_profiling_log(&mut child, &rx, 1302);
     assert_eq!(
         count_validate_log(&log2, "configChange"),
@@ -5699,7 +5719,7 @@ fn test_did_open_validates_deferred() {
     )
     .unwrap();
 
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(800),
         std::time::Duration::from_secs(6),
@@ -5753,7 +5773,7 @@ fn test_did_open_then_immediate_close_ends_empty() {
     )
     .unwrap();
 
-    let frames = drain_until_quiet(
+    let frames = drain_after_first(
         &rx,
         std::time::Duration::from_millis(1000),
         std::time::Duration::from_secs(6),

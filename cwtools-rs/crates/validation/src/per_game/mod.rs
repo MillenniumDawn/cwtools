@@ -24,7 +24,7 @@ pub(crate) fn run_game_validators(ctx: &ValidationCtx, game: Game) -> Vec<Valida
     // Common checks (unique types, should_be_referenced, warning_only downgrade)
     common::validate_common(ast, ruleset, table, file_path, &mut errors);
 
-    // Cross-game structural hints (empty if, NOT misuse, redundant booleans).
+    // Cross-game structural hints.
     structural::validate_structural(ast, table, file_path, game, &mut errors);
 
     match game {
