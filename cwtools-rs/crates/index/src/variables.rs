@@ -316,12 +316,17 @@ fn scan_children_for_varset(
 }
 
 /// The set of effect/trigger names that DEFINE a `value_set[variable]` (e.g.
-/// `set_variable`, `set_temp_variable`, `add_to_variable`). An alias qualifies
-/// when its rule body contains a `VariableSetField("variable")`. Config-driven,
-/// so it tracks whatever the game's `.cwt` declares rather than a hardcoded list.
+/// `set_variable`, `set_temp_variable`, `add_to_variable`) or a
+/// `value_set[array]` (`add_to_array`, `resize_array`, …). An alias qualifies
+/// when its rule body contains a matching `VariableSetField`. Config-driven, so
+/// it tracks whatever the game's `.cwt` declares rather than a hardcoded list.
+///
+/// Arrays are folded in with variables because the engine stores them the same
+/// way — `my_arr^num` is a variable read — so a name defined by `add_to_array`
+/// is "set" for CW246.
 pub fn variable_defining_effects(ruleset: &RuleSet) -> HashSet<String> {
     fn is_var_set(f: &NewField) -> bool {
-        matches!(f, NewField::VariableSetField(ns) if ns == "variable")
+        matches!(f, NewField::VariableSetField(ns) if ns == "variable" || ns == "array")
     }
     fn defines(rule: &RuleType) -> bool {
         match rule {
@@ -429,8 +434,9 @@ pub(crate) fn extract_set_variable_defs_block(
     table: &StringTable,
     out: &mut Vec<DefinedVariable>,
 ) {
-    // Explicit form: a `var`/`variable` child holds the name as its value;
-    // the assigned value (if any) is the sibling `value`/`amount`/`add` leaf.
+    // Explicit form: a `var`/`variable`/`array` child holds the name as its
+    // value; the assigned value (if any) is the sibling `value`/`amount`/`add`
+    // leaf.
     let mut explicit = false;
     let sibling_value = sibling_value_in_children(children, arena, table);
     for child in children {
@@ -438,7 +444,9 @@ pub(crate) fn extract_set_variable_defs_block(
             let leaf = &arena.leaves[*li as usize];
             let is_var_key = table
                 .with_string(leaf.key.normal, |k| {
-                    k.eq_ignore_ascii_case("var") || k.eq_ignore_ascii_case("variable")
+                    k.eq_ignore_ascii_case("var")
+                        || k.eq_ignore_ascii_case("variable")
+                        || k.eq_ignore_ascii_case("array")
                 })
                 .unwrap_or(false);
             if is_var_key {

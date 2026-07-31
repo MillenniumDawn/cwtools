@@ -643,10 +643,11 @@ fn count_and_validate_children(
                             // VariableGetField bare read: validate against the
                             // project-wide variable index (CW246), mirroring the
                             // Leaf path and F# checkVariableGetFieldNE.
-                            if let NewField::VariableGetField(_) = right {
+                            if let NewField::VariableGetField(ns) = right {
                                 let raw = leaf_value_to_string(&lv.value, table);
                                 check_variable_get(
                                     ctx,
+                                    ns,
                                     &raw,
                                     lv.pos.start.line,
                                     lv.pos.start.col,

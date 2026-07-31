@@ -17,6 +17,8 @@ types = { type[foo] = { path = "game/common/foo" } }
 values = {
     value[variable] = {
         faction_leader
+        party_popularity@<ideology>
+        opinion@enum[country_tags]
     }
 }
 foo = {
@@ -24,6 +26,8 @@ foo = {
     prec = variable_field_32
     ref = variable_field
     get = value[variable]
+    flag = value[country_flag]
+    arr = value[array]
 }
 "#;
 
@@ -106,6 +110,20 @@ fn builtin_variable_field_is_clean() {
 }
 
 #[test]
+fn builtin_with_scope_suffix_is_clean() {
+    // variables.cwt declares the whole family as `party_popularity@<ideology>`,
+    // and a read carries its own suffix (`party_popularity@social_democrat`), so
+    // the match has to compare the base name on both sides of the `@`.
+    let c = codes(
+        "foo = { ref = party_popularity@social_democrat }",
+        &["something_else"],
+    );
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+    let c = codes("foo = { get = opinion@RUS }", &["something_else"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
 fn builtin_variable_get_is_clean() {
     let c = codes("foo = { get = faction_leader }", &["something_else"]);
     assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
@@ -131,6 +149,16 @@ fn at_variable_is_never_cw246() {
 }
 
 #[test]
+fn macro_parameter_name_is_never_cw246() {
+    // A scripted effect builds the name from its `$ARG$` parameters, so the
+    // written token is not the runtime name and can never be looked up.
+    let c = codes("foo = { ref = $TAG$_stability }", &["something_else"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+    let c = codes("foo = { get = prefix_$ARG$ }", &["something_else"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
 fn variable_get_field_defined_is_clean() {
     let c = codes("foo = { get = my_var }", &["my_var"]);
     assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
@@ -140,6 +168,21 @@ fn variable_get_field_defined_is_clean() {
 fn variable_get_field_undefined_is_cw246() {
     let c = codes("foo = { get = mystery }", &["something_else"]);
     assert!(c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn other_value_namespace_is_never_cw246() {
+    // `value[country_flag]` reads a country flag, not a variable. The variable
+    // index only ever holds `value_set[variable]` names, so checking any other
+    // namespace against it flags every flag/array/token read in the corpus.
+    let c = codes("foo = { flag = my_flag }", &["something_else"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn array_namespace_is_never_cw246() {
+    let c = codes("foo = { arr = my_array }", &["something_else"]);
+    assert!(!c.contains(&"CW246".to_string()), "got: {:?}", c);
 }
 
 // ── Issue #31: `?<default>` selector on a variable-defining key ────────────────
