@@ -218,10 +218,19 @@ struct DocumentState {
     /// `"<vanilla-cache>"` sentinel.
     vanilla_merged_uris: Mutex<HashSet<Arc<str>>>,
     /// Vanilla loc keys per language (display name -> lowercased keys), from the
-    /// vanilla cache or extracted when rebuilding it. When set, the loc rebuild
-    /// skips walking the install's loc files and merges these instead.
+    /// vanilla cache or extracted when rebuilding it. They stand in for the
+    /// install's loc when there is no dir to read it from; when there is one,
+    /// the first loc rebuild takes them and `vanilla_loc` below supersedes them.
     #[allow(clippy::type_complexity)]
     vanilla_loc_keys: Mutex<Option<Vec<(String, Vec<String>)>>>,
+    /// The base-game install's loc keys, hover text and definition sites, read
+    /// from disk on the first loc rebuild and reused for the rest of the session
+    /// (#89) — vanilla is ~2000 loc files that cannot change while the editor is
+    /// running. Paired with the inputs it was built for so a change to any of
+    /// them rebuilds. Dropped by `cacheVanilla` / `clearAllCaches`, which is how
+    /// a user who updated the game mid-session picks up the new files.
+    #[allow(clippy::type_complexity)]
+    vanilla_loc: Mutex<Option<(scan::VanillaLocKey, Arc<scan::VanillaLoc>)>>,
     /// loc-key index (workspace + vanilla) for CW100/CW122 on config files and
     /// for scope-aware loc-command checks. Rebuilt on each full workspace scan.
     loc_index: parking_lot::RwLock<Option<cwtools_localization::LocIndex>>,
@@ -584,6 +593,7 @@ impl DocumentState {
             vanilla_index: Mutex::new(None),
             vanilla_merged_uris: Mutex::new(HashSet::new()),
             vanilla_loc_keys: Mutex::new(None),
+            vanilla_loc: Mutex::new(None),
             loc_index: parking_lot::RwLock::new(None),
             loc_key_index: parking_lot::RwLock::new(None),
             loc_text: parking_lot::RwLock::new(LocTextMap::default()),

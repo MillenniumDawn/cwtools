@@ -2900,6 +2900,183 @@ fn test_goto_vanilla_definition_resolves_to_vanilla_file() {
     );
 }
 
+#[test]
+fn test_vanilla_loc_is_read_once_and_the_mod_wins_a_shared_key() {
+    // #89: the base game's loc is read on the first scan and kept for the rest
+    // of the session — a rescan walks the workspace only. Two things follow,
+    // and both are asserted here: a key the mod redefines resolves to the mod's
+    // file, and a base-game-only key still resolves after a re-index even
+    // though the install's loc is no longer on disk (nothing re-read it).
+    let ws = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), GOTO_RULES).unwrap();
+
+    let vanilla_loc = vanilla.path().join("localisation/english");
+    std::fs::create_dir_all(&vanilla_loc).unwrap();
+    std::fs::write(
+        vanilla_loc.join("base_l_english.yml"),
+        "\u{FEFF}l_english:\n SHARED_KEY:0 \"Base text\"\n BASE_ONLY_KEY:0 \"Base only\"\n",
+    )
+    .unwrap();
+
+    let ws_loc = ws.path().join("localisation/english");
+    std::fs::create_dir_all(&ws_loc).unwrap();
+    std::fs::write(
+        ws_loc.join("def_l_english.yml"),
+        "\u{FEFF}l_english:\n SHARED_KEY:0 \"Mod text\"\n",
+    )
+    .unwrap();
+    let use_rel = "localisation/english/use_l_english.yml";
+    let use_path = ws.path().join(use_rel);
+    let use_text =
+        "\u{FEFF}l_english:\n A:0 \"$SHARED_KEY$\"\n B:0 \"$BASE_ONLY_KEY$\"\n".to_string();
+    std::fs::write(&use_path, &use_text).unwrap();
+    let trigger = ws.path().join("common/scan_trigger.txt");
+    std::fs::create_dir_all(trigger.parent().unwrap()).unwrap();
+    std::fs::write(&trigger, "# trigger\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                    "cacheDir": cache.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    let doc_uri = path_uri(&use_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": doc_uri, "languageId": "hoi4", "version": 1, "text": use_text,
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, use_rel);
+
+    // `$SHARED_KEY$` on line 1 col 10, `$BASE_ONLY_KEY$` on line 2 col 10.
+    let goto = |child: &mut std::process::Child,
+                reader: &mut BufReader<std::process::ChildStdout>,
+                line: u32,
+                id_base: i64|
+     -> Vec<String> {
+        // loc_locations lands via the async scan, so poll until it answers.
+        for attempt in 0..50 {
+            write_frame(
+                child,
+                &jsonrpc_request(
+                    id_base + attempt,
+                    "textDocument/definition",
+                    serde_json::json!({
+                        "textDocument": { "uri": doc_uri },
+                        "position": { "line": line, "character": 10 },
+                    }),
+                ),
+            )
+            .unwrap();
+            let resp: serde_json::Value =
+                serde_json::from_str(&read_response(reader).expect("no definition response"))
+                    .unwrap();
+            let arr = resp["result"]
+                .as_array()
+                .cloned()
+                .or_else(|| {
+                    resp["result"]
+                        .as_object()
+                        .map(|o| vec![serde_json::Value::Object(o.clone())])
+                })
+                .unwrap_or_default();
+            let out: Vec<String> = arr
+                .iter()
+                .filter_map(|l| Some(l["uri"].as_str()?.to_string()))
+                .collect();
+            if !out.is_empty() {
+                return out;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        Vec::new()
+    };
+
+    let shared = goto(&mut child, &mut reader, 1, 100);
+    assert!(
+        shared.iter().any(|u| u.ends_with("def_l_english.yml")),
+        "a key the mod redefines should resolve to the mod's file, got: {:?}",
+        shared
+    );
+    assert!(
+        !shared.iter().any(|u| u.ends_with("base_l_english.yml")),
+        "the base game must not win over the mod, got: {:?}",
+        shared
+    );
+    let base_only = goto(&mut child, &mut reader, 2, 200);
+    assert!(
+        base_only.iter().any(|u| u.ends_with("base_l_english.yml")),
+        "a base-game-only key should resolve to the install, got: {:?}",
+        base_only
+    );
+
+    // Take the install's loc away and re-index. The memo still has it, so the
+    // key resolves; a rescan that re-read the install would lose it.
+    std::fs::remove_dir_all(vanilla.path().join("localisation")).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            300,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let reindexed: serde_json::Value =
+        serde_json::from_str(&read_response(&mut reader).expect("no reindex response")).unwrap();
+    assert_eq!(
+        reindexed["result"].as_str(),
+        Some("Workspace re-indexed."),
+        "re-index should have run, got: {reindexed}"
+    );
+
+    let after = goto(&mut child, &mut reader, 2, 400);
+    child.kill().ok();
+    assert!(
+        after.iter().any(|u| u.ends_with("base_l_english.yml")),
+        "the base game's loc must survive a re-index without being re-read, got: {:?}",
+        after
+    );
+}
+
 // ── did_open re-validates open dependents (stale scripted_effect bug) ─────────
 
 /// Read frames until a publishDiagnostics for a URI ending in `suffix` arrives
