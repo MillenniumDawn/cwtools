@@ -5,6 +5,52 @@ use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 use cwtools_string_table::string_table::{StringId, StringTable};
 use rustc_hash::FxHashMap;
 
+/// True when any directory segment of `file_path` equals `segment`
+/// (case-insensitive). Mods sometimes nest `events/` into subfolders.
+pub(crate) fn under_dir_segment(file_path: &str, segment: &str) -> bool {
+    let norm = file_path.replace('\\', "/");
+    norm.rsplit_once('/')
+        .map(|(dir, _)| dir.to_ascii_lowercase())
+        .is_some_and(|dir| dir.split('/').any(|s| s == segment))
+}
+
+/// Whether a child's key matches `expected` (case-insensitive).
+pub(crate) fn child_key_eq(
+    child: &Child,
+    ast: &ParsedFile,
+    table: &StringTable,
+    expected: &str,
+) -> bool {
+    match child {
+        Child::Leaf(idx) => {
+            let leaf = &ast.arena.leaves[*idx as usize];
+            table
+                .with_string(leaf.key.normal, |k| k.eq_ignore_ascii_case(expected))
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a child is a block whose only non-comment child is `always = no`.
+pub(crate) fn child_is_always_no(child: &Child, ast: &ParsedFile, table: &StringTable) -> bool {
+    as_block(child, ast).is_some_and(|block| {
+        block.children.iter().any(|c| {
+            if !child_key_eq(c, ast, table, "always") {
+                return false;
+            }
+            let Child::Leaf(idx) = c else { return false };
+            match &ast.arena.leaves[*idx as usize].value {
+                Value::Bool(b) => !*b,
+                Value::String(t) | Value::QString(t) => table
+                    .with_string(t.normal, |s| s.eq_ignore_ascii_case("no"))
+                    .unwrap_or(false),
+                _ => false,
+            }
+        })
+    })
+}
+
 /// A `key = { ... }` block (a `Leaf` whose value is a `Clause`), normalised so
 /// the per-game structural walkers share one `Value::Clause` extraction. The key
 /// is kept as a lowercased `StringId` so callers that only compare it avoid an

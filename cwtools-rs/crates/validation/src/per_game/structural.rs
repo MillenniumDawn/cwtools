@@ -5,12 +5,16 @@
 //! - `validateIfWithNoEffect`   -> CW121 (empty if/else_if)
 //! - `validateRedundantANDWithNOR` -> CW251 (AND-in-AND / OR-in-OR)
 //!
+//! Also hosts game-agnostic checks ported from Stellaris-specific validation:
+//! - CW107 (event may fire every tick)
+//! - CW238 (else/else_if without preceding if)
+//!
 //! F# scopes these to the rules engine's classified effect/trigger blocks. This
 //! parser has no such classification, so the walk instead keys off the reserved
 //! logic keywords (`NOT`/`AND`/`OR`/`NOR`/`if`/`else_if`), which only appear in
 //! trigger/effect script — running it file-wide matches F# in practice.
 
-use super::common::as_block;
+use super::common::{as_block, child_is_always_no, child_key_eq, under_dir_segment};
 use crate::{ValidationError, error_codes};
 use cwtools_game::constants::Game;
 use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
@@ -156,6 +160,113 @@ fn push_fix(
             .with_fix(fix)
             .with_end(r.end),
     );
+}
+
+// ── CW107: event may fire every tick ───────────────────
+
+/// Validate that events have a guard against firing every tick.
+fn validate_event(
+    ast: &ParsedFile,
+    table: &StringTable,
+    file_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !under_dir_segment(file_path, "events") {
+        return;
+    }
+    for child in &ast.root_children {
+        let Some(block) = as_block(child, ast) else {
+            continue;
+        };
+        let key = block.key_string_lower(table);
+        if !key.ends_with("_event") && key != "event" {
+            continue;
+        }
+
+        let mut has_mtth = false;
+        let mut has_trig = false;
+        let mut has_once = false;
+        let mut has_base = false;
+        let mut has_always_no = false;
+        for c in block.children {
+            if child_key_eq(c, ast, table, "mean_time_to_happen") {
+                has_mtth = true;
+            } else if child_key_eq(c, ast, table, "is_triggered_only") {
+                has_trig = true;
+            } else if child_key_eq(c, ast, table, "fire_only_once") {
+                has_once = true;
+            } else if child_key_eq(c, ast, table, "base") {
+                has_base = true;
+            } else if child_key_eq(c, ast, table, "trigger") && child_is_always_no(c, ast, table) {
+                has_always_no = true;
+            }
+        }
+
+        if !has_mtth && !has_trig && !has_once && !has_always_no && !has_base {
+            errors.push(ValidationError::from_code_with(
+                &error_codes::CW107_EVENT_EVERY_TICK,
+                error_codes::CW107_EVENT_EVERY_TICK.severity,
+                file_path,
+                block.range.start.line,
+                0,
+                "Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick.".to_string(),
+            ));
+        }
+    }
+}
+
+// ── CW238: else/else_if without preceding if ───────────
+
+/// Validate that `else`/`else_if` blocks have a preceding `if`.
+fn validate_if_else_order(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    file_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    for child in children {
+        let Some(block) = as_block(child, ast) else {
+            continue;
+        };
+        let key = block.key_string_lower(table);
+
+        // Skip limit and modifier blocks — they can contain if/else without
+        // the structural if/else chain rules applying.
+        if key != "limit" && key != "modifier" {
+            let mut prev_was_if = false;
+            for c in block.children {
+                let Some(inner) = as_block(c, ast) else {
+                    continue;
+                };
+                let k = inner.key_string_lower(table);
+                if k != "if" && k != "else" && k != "else_if" {
+                    continue;
+                }
+                if prev_was_if {
+                    prev_was_if = k == "if" || k == "else_if";
+                } else if k == "if" {
+                    prev_was_if = true;
+                } else {
+                    // else / else_if with no preceding if.
+                    let key_end = key_token_range(block.range.start, key.chars().count()).end;
+                    errors.push(
+                        ValidationError::from_code(
+                            &error_codes::CW238_IF_ELSE_ORDER,
+                            file_path,
+                            block.range.start.line,
+                            block.range.start.col,
+                            &[],
+                        )
+                        .with_end(key_end),
+                    );
+                    break;
+                }
+            }
+        }
+
+        validate_if_else_order(block.children, ast, table, file_path, errors);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -308,6 +419,12 @@ pub fn validate_structural(
         cw223_msg,
         errors,
     );
+
+    // CW107 — event may fire every tick (game-agnostic).
+    validate_event(ast, table, file_path, errors);
+
+    // CW238 — else/else_if without preceding if (game-agnostic).
+    validate_if_else_order(&ast.root_children, ast, table, file_path, errors);
 }
 
 #[cfg(test)]
@@ -322,6 +439,15 @@ mod tests {
         let ast = parse_string(src, &table).unwrap();
         let mut errors = Vec::new();
         validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+        errors.iter().filter_map(|e| e.code).collect()
+    }
+
+    /// The codes emitted for `src` at `path` (path matters for CW107's events-dir check).
+    fn codes_at(path: &str, src: &str) -> Vec<&'static str> {
+        let table = StringTable::new();
+        let ast = parse_string(src, &table).unwrap();
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, path, Game::Hoi4, &mut errors);
         errors.iter().filter_map(|e| e.code).collect()
     }
 
@@ -475,9 +601,14 @@ mod tests {
 
     #[test]
     fn empty_if_flagged_in_every_casing() {
-        for key in ["if", "IF", "If", "else_if", "ELSE_IF", "Else_if"] {
+        for key in ["if", "IF", "If"] {
             let src = format!("x = {{ {key} = {{ }} }}\n");
             assert_eq!(codes(&src), ["CW121"], "{key}");
+        }
+        // else_if without a preceding if also fires CW238.
+        for key in ["else_if", "ELSE_IF", "Else_if"] {
+            let src = format!("x = {{ {key} = {{ }} }}\n");
+            assert_eq!(codes(&src), ["CW121", "CW238"], "{key}");
         }
     }
 
@@ -576,5 +707,132 @@ mod tests {
             let src = format!("{key} = {{ amount = 2 AND = {{ has_war = yes tag = GER }} }}\n");
             assert!(codes(&src).is_empty(), "{key}: {:?}", codes(&src));
         }
+    }
+
+    // ── CW107: event may fire every tick ────────────────────────────────────
+
+    #[test]
+    fn event_without_mtth_or_trigger_is_cw107() {
+        let c = codes_at("events/test.txt", "my_event = { }\n");
+        assert!(
+            c.contains(&"CW107"),
+            "event with no MTTH/trigger/once should emit CW107, got: {:?}",
+            c
+        );
+    }
+
+    #[test]
+    fn event_with_mtth_is_clean() {
+        let c = codes_at(
+            "events/test.txt",
+            "my_event = { mean_time_to_happen = { years = 5 } }\n",
+        );
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_is_triggered_only_is_clean() {
+        let c = codes_at(
+            "events/test.txt",
+            "my_event = { is_triggered_only = yes }\n",
+        );
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_fire_only_once_is_clean() {
+        let c = codes_at("events/test.txt", "my_event = { fire_only_once = yes }\n");
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_trigger_always_no_is_clean() {
+        let c = codes_at(
+            "events/test.txt",
+            "my_event = { trigger = { always = no } }\n",
+        );
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_trigger_always_yes_still_cw107() {
+        // `trigger = { always = yes }` does NOT suppress CW107; only always=no does.
+        let c = codes_at(
+            "events/test.txt",
+            "my_event = { trigger = { always = yes } }\n",
+        );
+        assert!(c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn non_event_root_is_not_cw107() {
+        // The CW107 check is scoped to *_event / event keys only.
+        let c = codes_at("events/test.txt", "foo = { }\n");
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn event_key_outside_events_dir_is_not_cw107() {
+        let c = codes_at("common/scripted_effects/test.txt", "my_event = { }\n");
+        assert!(!c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn mixed_case_event_key_is_cw107() {
+        let c = codes_at("events/test.txt", "My_Event = { }\n");
+        assert!(c.contains(&"CW107"), "got: {:?}", c);
+    }
+
+    // ── CW238: else/else_if without preceding if ────────────────────────────
+
+    #[test]
+    fn else_without_preceding_if_is_cw238() {
+        let c = codes_at("test.txt", "foo = { else = { a = 1 } }\n");
+        assert!(c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn if_then_else_is_clean_order() {
+        let c = codes_at(
+            "test.txt",
+            "foo = { if = { limit = { } a = 1 } else = { b = 2 } }\n",
+        );
+        assert!(!c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn properly_ordered_if_else_if_is_clean() {
+        let c = codes_at(
+            "test.txt",
+            "foo = { if = { limit = { } a = 1 } else_if = { limit = { } b = 2 } }\n",
+        );
+        assert!(!c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn nested_limit_and_modifier_do_not_false_positive_cw238() {
+        // `limit` and `modifier` blocks are excluded from the if/else order walk.
+        let c = codes_at("test.txt", "foo = { limit = { } modifier = { } }\n");
+        assert!(!c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn cw238_underlines_only_the_containing_key() {
+        let table = StringTable::new();
+        let ast = parse_string("foo = {\n    else = { a = 1 }\n}\n", &table).unwrap();
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW238"))
+            .expect("CW238 emitted");
+
+        assert_eq!((err.line, err.col), (1, 0));
+        assert_eq!(
+            err.end,
+            Some((1, "foo".len() as u16)),
+            "CW238 must span only the key"
+        );
     }
 }
