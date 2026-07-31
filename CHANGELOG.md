@@ -1,5 +1,9 @@
 # 2.5.0
 
+## Features
+
+- Semantic tokens now answer `textDocument/semanticTokens/range` as well as `full`. `full` is the only entry point the server had, so VS Code re-highlighted the whole document after every edit, and each top-level entity in it costs a rule bootstrap (a root descent with subtype merging, the same work the validator does for one entity). The range request runs the same walk with the off-screen entities skipped whole, so a 300-entity file re-resolves what is on screen instead of all of it. `full/delta` stays declined: it needs server-side result caching there is still no invalidation story for. (#84)
+
 ## Bug Fixes
 
 - CW246 ("the variable X has not been set") ran against the variable index for every `value[...]` reference, not just `value[variable]`. Country flags, arrays, division template names, GUI font names and every other named value set were looked up in an index that only ever holds variables, so with the check enabled Millennium Dawn reported 43,646 hits, all but ~60 of them false. It now applies only to the variable namespace. (#92)
@@ -24,6 +28,7 @@
 - Feature requests that arrive before a newly opened document's first validate share one parse. Hover, goto, completion, semantic tokens and inlay hints all fire off the same keystroke and each re-parsed the file for itself in that window. (#87)
 - Diagnostic ranges no longer allocate a string per squiggle to trim trailing whitespace off the end position. (#87)
 - The single-file parse, index and validate run inside `block_in_place`, so a large file no longer occupies an async runtime worker for the whole validation. The workspace scan already fenced its equivalent work. (#87)
+- A rule's child rules are shared rather than owned, so copying a rule no longer copies its whole subtree. The editor paths copy matched rules out constantly (per leaf for semantic tokens, per request for completion and hover) and an `alias[effect:…]` body is one of the largest trees in the ruleset. Resolving the rules at a cursor is about a quarter cheaper (12.8µs vs 16.9µs for completion, 13.9µs vs 18.2µs for hover against the HOI4 config), and per-leaf key resolution is 80% cheaper (1.27µs vs 6.29µs for eight keys in an effect block) because it now borrows its matches instead of copying them. Single-alias inlining substitutes the same body at every reference site instead of duplicating it, which takes about 2MB off a loaded HOI4 ruleset. Batch validation is unchanged, and so are its diagnostics. (#84)
 
 ## Notes
 
@@ -35,6 +40,7 @@
 
 - `index_parsed_file`, `merged_rules_for_type`, `semantic_tokens_full_impl`, `TypeIndex::merge` and `vanilla_cache::load` carry tracing spans, so `CWTOOLS_PROFILE` ranks them against the paths that were already instrumented. PROFILING.md lists the full set. (#87)
 - Every write to a localisation overlay goes through a guard whose `Drop` bumps the revision the derived key-set caches are keyed on, so a new write site cannot leave those caches serving a key set that predates it. (#87)
+- `cargo bench -p cwtools_driver --bench rules_hot` measures the editor hot paths (`rules_at_pos` for completion and hover, `value_rules_for_key` per leaf) against a real ruleset. It needs a `cwtools-hoi4-config/Config` checkout, found via `CWTOOLS_RULES` or `CWTOOLS_PROJECTS` the way the corpus guard finds its inputs, and reports why it measured nothing when there isn't one. (#84)
 
 # 2.4.0
 

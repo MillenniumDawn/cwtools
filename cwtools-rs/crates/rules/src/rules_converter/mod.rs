@@ -178,7 +178,7 @@ fn leaf_to_rule(
                 left: NewField::SpecificField(
                     table.get_string(leaf.key.normal).unwrap_or_default(),
                 ),
-                rules: inner,
+                rules: inner.into(),
             }
         }
         _ => {
@@ -220,7 +220,7 @@ pub(crate) fn children_to_rules(
                             RuleType::SubtypeRule {
                                 name,
                                 positive,
-                                rules: inner,
+                                rules: inner.into(),
                             },
                             options_from_comments(comments, false),
                         ));
@@ -235,7 +235,7 @@ pub(crate) fn children_to_rules(
                         let inner = children_to_rules(ch, ast, table);
                         RuleType::NodeRule {
                             left: field_from_string(&key),
-                            rules: inner,
+                            rules: inner.into(),
                         }
                     }
                     _ => {
@@ -245,7 +245,7 @@ pub(crate) fn children_to_rules(
                             let colour_rules = build_colour_rules(&right_str);
                             RuleType::NodeRule {
                                 left: field_from_string(&key),
-                                rules: colour_rules,
+                                rules: colour_rules.into(),
                             }
                         } else {
                             let left = field_from_string(&key);
@@ -262,7 +262,12 @@ pub(crate) fn children_to_rules(
                     // Anonymous {…} block in a rule definition — same as F# ValueClauseC.
                     let opts = options_from_comments(comments, false);
                     let inner = children_to_rules(clause_ch, ast, table);
-                    rules.push((RuleType::ValueClauseRule { rules: inner }, opts));
+                    rules.push((
+                        RuleType::ValueClauseRule {
+                            rules: inner.into(),
+                        },
+                        opts,
+                    ));
                 } else {
                     let val_str = value_to_string(&lv.value, table);
                     let field = field_from_string(&val_str);

@@ -388,6 +388,7 @@ dependencies = [
 name = "cwtools_driver"
 version = "2.4.0"
 dependencies = [
+ "criterion",
  "cwtools_cache",
  "cwtools_file_manager",
  "cwtools_game",

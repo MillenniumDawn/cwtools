@@ -321,7 +321,7 @@ impl RuleSet {
                 } => out.push((key.to_ascii_lowercase(), ns.clone())),
                 RuleType::NodeRule { left, rules } => {
                     if let NewField::SpecificField(key) = left {
-                        for (rt, _) in rules {
+                        for (rt, _) in rules.iter() {
                             if let RuleType::LeafValueRule {
                                 right: NewField::VariableSetField(ns),
                             } = rt
@@ -330,12 +330,12 @@ impl RuleSet {
                             }
                         }
                     }
-                    for (rt, _) in rules {
+                    for (rt, _) in rules.iter() {
                         collect_binding_fields(rt, out);
                     }
                 }
                 RuleType::ValueClauseRule { rules } | RuleType::SubtypeRule { rules, .. } => {
-                    for (rt, _) in rules {
+                    for (rt, _) in rules.iter() {
                         collect_binding_fields(rt, out);
                     }
                 }
@@ -442,7 +442,7 @@ impl RuleSet {
             let RuleType::NodeRule { rules, .. } = rule_type else {
                 continue;
             };
-            for (inner, _) in rules {
+            for (inner, _) in rules.iter() {
                 if let RuleType::LeafRule {
                     left: NewField::SpecificField(key),
                     right: NewField::TypeField(TypeType::Simple(ref_type)),
@@ -645,12 +645,22 @@ pub struct ReplaceScopes {
 /// A rule is a (RuleType, Options) pair.
 pub type NewRule = (RuleType, Options);
 
+/// The child rules of a clause-shaped rule.
+///
+/// Shared rather than owned so cloning a rule is O(1) in its subtree: single
+/// alias inlining substitutes the same body at every reference site, and the
+/// editor paths (`rules_at_pos`, `value_rules_for_key`, semantic tokens) copy
+/// matched rules out per request. With an owned `Vec` both duplicate the whole
+/// tree. Rebuild through `Arc::make_mut` or by assigning a fresh `Vec`; the
+/// post-processing passes in `post_process` are the only writers.
+pub type RuleBody = std::sync::Arc<[NewRule]>;
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuleType {
     NodeRule {
         left: NewField,
-        rules: Vec<NewRule>,
+        rules: RuleBody,
     },
     LeafRule {
         left: NewField,
@@ -660,12 +670,12 @@ pub enum RuleType {
         right: NewField,
     },
     ValueClauseRule {
-        rules: Vec<NewRule>,
+        rules: RuleBody,
     },
     SubtypeRule {
         name: String,
         positive: bool,
-        rules: Vec<NewRule>,
+        rules: RuleBody,
     },
 }
 

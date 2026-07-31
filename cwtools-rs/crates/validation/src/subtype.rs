@@ -144,7 +144,7 @@ pub(crate) fn subtype_rules_match(
                     .entry(k.as_str())
                     .or_default()
                     .node_inners
-                    .push((inner.as_slice(), opts));
+                    .push((inner.as_ref(), opts));
             }
             _ => {}
         }

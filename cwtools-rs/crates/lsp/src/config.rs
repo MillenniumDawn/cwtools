@@ -491,16 +491,17 @@ impl Backend {
                 // The handler gates each kind on its setting and returns nothing
                 // when both are off, so a client always-on capability is harmless.
                 inlay_hint_provider: Some(OneOf::Left(true)),
-                // Semantic tokens: `full` only. `range` would need its own walk
-                // (the rule bootstrap is per top-level entity, not per line) for
-                // no real gain on files this size, and `full/delta` needs
-                // server-side result caching we have no invalidation story for.
+                // Semantic tokens: `full` and `range`. `range` runs the same walk
+                // with root children outside the viewport skipped, so an edit in
+                // a 300-entity file re-resolves the entities on screen instead of
+                // all of them. `full/delta` stays off: it needs server-side result
+                // caching we have no invalidation story for.
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
                             legend: crate::semantic::legend(),
                             full: Some(SemanticTokensFullOptions::Bool(true)),
-                            range: Some(false),
+                            range: Some(true),
                             work_done_progress_options: Default::default(),
                         },
                     ),

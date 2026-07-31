@@ -270,7 +270,7 @@ fn build_type_ref_keys(ruleset: &RuleSet) -> HashMap<String, Vec<TypeRefRule>> {
         };
         let (rule_type, _) = rule;
         let rules = match rule_type {
-            RuleType::NodeRule { rules, .. } => rules.as_slice(),
+            RuleType::NodeRule { rules, .. } => rules.as_ref(),
             _ => continue,
         };
         let root_type: Option<Arc<str>> = if is_type_rule {

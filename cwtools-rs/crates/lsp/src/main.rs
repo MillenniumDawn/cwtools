@@ -1607,6 +1607,13 @@ impl LanguageServer for Backend {
         self.semantic_tokens_full_impl(params).await
     }
 
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        self.semantic_tokens_range_impl(params).await
+    }
+
     async fn document_color(&self, params: DocumentColorParams) -> Result<Vec<ColorInformation>> {
         self.document_color_impl(params).await
     }
@@ -1705,7 +1712,7 @@ mod tests {
         (
             RuleType::NodeRule {
                 left: NewField::SpecificField(key.to_string()),
-                rules: children,
+                rules: children.into(),
             },
             Options::default(),
         )
@@ -1777,7 +1784,7 @@ mod tests {
         let rules = if let Some(RootRule::TypeRule(_, (RuleType::NodeRule { rules, .. }, _))) =
             rs.root_rules.first()
         {
-            rules.as_slice()
+            rules.as_ref()
         } else {
             panic!("expected TypeRule");
         };
@@ -1957,7 +1964,7 @@ mod tests {
             (
                 RuleType::NodeRule {
                     left: NewField::SpecificField("owner_type".to_string()),
-                    rules: vec![(
+                    rules: [(
                         RuleType::LeafRule {
                             left: NewField::SpecificField("base".to_string()),
                             right: NewField::TypeField(
@@ -1965,7 +1972,8 @@ mod tests {
                             ),
                         },
                         Options::default(),
-                    )],
+                    )]
+                    .into(),
                 },
                 Options::default(),
             ),
@@ -2004,7 +2012,7 @@ mod tests {
             (
                 RuleType::NodeRule {
                     left: NewField::SpecificField("use_type".to_string()),
-                    rules: vec![(
+                    rules: [(
                         RuleType::LeafRule {
                             left: NewField::SpecificField("base".to_string()),
                             right: NewField::TypeField(
@@ -2012,7 +2020,8 @@ mod tests {
                             ),
                         },
                         Options::default(),
-                    )],
+                    )]
+                    .into(),
                 },
                 Options::default(),
             ),

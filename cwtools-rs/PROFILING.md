@@ -38,7 +38,7 @@ instrumented hot path, with its busy/idle time. The instrumented paths today:
 - `validate_ast_with_loc` / `validate_prepared` (validation) — one span per file validated
 - `merged_rules_for_type` (validation) — one span per typed definition's subtype merge
 - `parse_and_validate` / `index_parsed_file` (lsp) — one span per file the server validates
-- `semantic_tokens_full_impl` (lsp) — one span per semantic-tokens request
+- `semantic_tokens_full_impl` / `semantic_tokens_range_impl` (lsp) — one span per semantic-tokens request
 
 Filter to a single crate to cut noise:
 
