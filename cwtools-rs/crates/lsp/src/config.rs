@@ -925,6 +925,7 @@ impl Backend {
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
+                *self.state.vanilla_loc.lock() = None;
                 self.ensure_vanilla_index(true, false).await;
                 self.merge_pending_vanilla_index();
                 self.rebuild_modifier_keys();
@@ -973,6 +974,7 @@ impl Backend {
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
+                *self.state.vanilla_loc.lock() = None;
                 // validate_entire_workspace's CAS guard returns false when a scan
                 // (e.g. the periodic background pass) is already running. That
                 // scan started before this purge and may already be past its

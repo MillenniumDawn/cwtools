@@ -116,6 +116,44 @@ impl LocIndex {
         }
     }
 
+    /// Merge an index built over a different file set into this one — the LSP
+    /// memoizes the base-game install as its own index and folds it under the
+    /// freshly-walked workspace on every scan (#89).
+    ///
+    /// Keys are already interned, so one this index doesn't have costs a
+    /// refcount bump instead of a fresh allocation. `self` wins on a collision:
+    /// it holds the workspace, which overrides the base game. `other` must be
+    /// unscoped ([`build_scoped`](Self::build_scoped) with `langs = None`) —
+    /// its languages are walked in `languages_with_data` order, which is the
+    /// complete set only when nothing was scoped out.
+    pub fn merge_from(&mut self, other: &LocIndex, langs: Option<&[Lang]>) {
+        for lang in &other.languages_with_data {
+            let Some(keys) = other.per_language.get(lang) else {
+                continue;
+            };
+            let set = self.per_language.entry(*lang).or_default();
+            for key in keys {
+                let key = match self.union.get(&**key) {
+                    Some(existing) => Arc::clone(existing),
+                    None => {
+                        self.union.insert(Arc::clone(key));
+                        Arc::clone(key)
+                    }
+                };
+                set.insert(key);
+            }
+            let allowed = langs.map(|ls| ls.contains(lang)).unwrap_or(true);
+            if allowed && !self.languages_with_data.contains(lang) {
+                self.languages_with_data.push(*lang);
+            }
+        }
+        for (key, entry) in &other.entries {
+            self.entries
+                .entry(Arc::clone(key))
+                .or_insert_with(|| entry.clone());
+        }
+    }
+
     /// synced=false: the key exists in at least one language.
     pub fn exists_any(&self, key_lower: &str) -> bool {
         self.union.contains(key_lower)
@@ -244,6 +282,63 @@ mod tests {
         assert_eq!(missing, vec![Lang::German]);
         // a project that ships no french never reports french missing
         assert!(!missing.contains(&Lang::French));
+    }
+
+    #[test]
+    fn merge_from_folds_a_second_index_under_this_one() {
+        // The LSP builds the base game once and merges it under each fresh
+        // workspace walk (#89): its keys and languages join, its shared key
+        // allocations are reused, and the workspace wins a collision.
+        let workspace = LocIndex::build(&service_from(&[(
+            "ws_l_english.yml",
+            "l_english:\n shared: \"mod [ROOT.GetName]\"\n ws_only: \"w\"\n",
+        )]));
+        let vanilla = LocIndex::build(&service_from(&[
+            (
+                "v_l_english.yml",
+                "l_english:\n shared: \"base [ROOT.GetName]\"\n base_only: \"base [ROOT.GetFlag]\"\n",
+            ),
+            ("v_l_german.yml", "l_german:\n base_only: \"b\"\n"),
+        ]));
+        let mut merged = workspace;
+        merged.merge_from(&vanilla, None);
+
+        assert!(merged.exists_any("ws_only"));
+        assert!(merged.exists_any("base_only"));
+        // German only has base-game data, so it joins languages_with_data.
+        assert_eq!(
+            merged.languages_with_data(),
+            &[Lang::English, Lang::German],
+            "base-game-only languages must join, in the order the merge saw them"
+        );
+        assert_eq!(
+            merged.missing_synced_languages("ws_only"),
+            vec![Lang::German]
+        );
+        // A key both sides define keeps this index's parsed entry.
+        assert!(merged.entry("shared").unwrap().desc.contains("mod"));
+        assert!(merged.entry("base_only").is_some());
+        // A base-game-only key reuses the allocation the base index owns.
+        assert!(Arc::ptr_eq(
+            merged.union.get("base_only").unwrap(),
+            vanilla.union.get("base_only").unwrap()
+        ));
+    }
+
+    #[test]
+    fn merge_from_scopes_languages_like_the_cached_merge() {
+        let mut english_only = LocIndex::build_scoped(
+            &service_from(&[("ws_l_english.yml", "l_english:\n ws_only: \"w\"\n")]),
+            Some(&[Lang::English]),
+        );
+        let vanilla = LocIndex::build(&service_from(&[(
+            "v_l_german.yml",
+            "l_german:\n base_only: \"b\"\n",
+        )]));
+        english_only.merge_from(&vanilla, Some(&[Lang::English]));
+        // Scoped out of the missing-translation check, but still resolvable.
+        assert_eq!(english_only.languages_with_data(), &[Lang::English]);
+        assert!(english_only.exists_any("base_only"));
     }
 
     #[test]

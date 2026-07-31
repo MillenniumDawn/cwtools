@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tower_lsp::lsp_types::*;
 
 use cwtools_cache::workspace as workspace_cache;
+use cwtools_localization::Lang;
 use cwtools_parser::parser::parse_string_without_comments;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::build_modifier_keys;
@@ -70,6 +71,102 @@ pub(crate) fn index_vanilla_dir(
     let aux = cwtools_driver::build_vanilla_cache_aux(dir, &index);
     let per_type = index.map.into_iter().collect();
     (per_type, aux)
+}
+
+/// The base-game install's share of the loc maps, built once per session by
+/// [`Backend::vanilla_loc`] and merged under the freshly-walked workspace on
+/// every loc rebuild.
+pub(crate) struct VanillaLoc {
+    /// Unscoped key index — the merge applies the caller's language scoping,
+    /// exactly as the vanilla-cache key merge does.
+    index: cwtools_localization::LocIndex,
+    /// Hover text, already narrowed to the languages hover shows.
+    text: LocTextMap,
+    /// Goto-definition sites, one per key.
+    locations: LocLocationMap,
+}
+
+/// What a [`VanillaLoc`] was built for: the install dir, the primary language
+/// and the hover-all-languages toggle. All three come from the initialize
+/// options and never change afterwards, but keying on them keeps the memo
+/// honest if that ever stops being true.
+pub(crate) type VanillaLocKey = (std::path::PathBuf, Lang, bool);
+
+impl VanillaLoc {
+    fn build(
+        service: &cwtools_localization::LocService,
+        primary_lang: Lang,
+        hover_all: bool,
+    ) -> Self {
+        let index = cwtools_localization::LocIndex::build_scoped(service, None);
+        let mut text = LocTextMap::default();
+        let mut locations = LocLocationMap::default();
+        collect_loc_display(
+            service,
+            &index,
+            primary_lang,
+            hover_all,
+            &mut text,
+            &mut locations,
+        );
+        Self {
+            index,
+            text,
+            locations,
+        }
+    }
+}
+
+/// Extract the per-key hover text and a representative definition site from a
+/// loaded [`LocService`], keyed by `index`'s interned keys so the maps share
+/// their allocations with the loc index.
+///
+/// `text` accumulates every included language's display string per key, in file
+/// order. `locations` keeps one site per key, preferring `primary_lang` so
+/// Ctrl+Click lands on the canonical entry rather than whichever language was
+/// scanned first. Shared by the workspace walk and the base-game memo so the
+/// two can't drift.
+fn collect_loc_display(
+    service: &cwtools_localization::LocService,
+    index: &cwtools_localization::LocIndex,
+    primary_lang: Lang,
+    hover_all: bool,
+    text: &mut LocTextMap,
+    locations: &mut LocLocationMap,
+) {
+    for file in service.files() {
+        // A file whose header language the parser didn't recognise is absent
+        // from the key index; hover and goto still show it, under English.
+        let lang = file.lang.unwrap_or(Lang::English);
+        let lang_included = hover_all || lang == primary_lang;
+        // Every entry in a file shares the same source path.
+        let file_uri: Arc<str> = path_to_uri(std::path::Path::new(&file.path)).into();
+        for entry in &file.entries {
+            let key = index
+                .key(&entry.key)
+                .unwrap_or_else(|| Arc::from(entry.key.to_lowercase()));
+            let loc = || {
+                (
+                    Arc::clone(&file_uri),
+                    (entry.position.line.saturating_sub(1)) as u32,
+                )
+            };
+            if lang == primary_lang {
+                locations.insert(Arc::clone(&key), loc());
+            } else {
+                locations.entry(Arc::clone(&key)).or_insert_with(loc);
+            }
+            if !lang_included {
+                continue;
+            }
+            let display = loc_display_text(&entry.desc);
+            if !display.is_empty() {
+                text.entry(key)
+                    .or_default()
+                    .push((lang, display.to_string()));
+            }
+        }
+    }
 }
 
 /// RAII guard for `DocumentState::scan_in_progress`. Resets the flag to
@@ -1054,31 +1151,64 @@ impl Backend {
         }
     }
 
-    /// Directories `rebuild_and_publish_loc` scans for loc files: the
-    /// workspace root plus the configured vanilla install, if any. Shared
-    /// with `compute_loc_signature` so the two can never walk different
-    /// trees.
-    fn loc_dirs(&self, root_path: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut dirs = vec![root_path.to_path_buf()];
-        if let Some(v) = self.state.config.read().vanilla_dir.clone() {
-            dirs.push(v);
-        }
-        dirs
-    }
-
     /// Stat-only signature (path, size, mtime) over the loc files
-    /// `rebuild_and_publish_loc` would read. Lets a quiet background pass
-    /// detect "nothing loc-related changed" and skip the full rebuild without
-    /// reading or parsing a single file. Discovers files via
+    /// `rebuild_and_publish_loc` re-reads on every scan. Lets a quiet background
+    /// pass detect "nothing loc-related changed" and skip the full rebuild
+    /// without reading or parsing a single file. Discovers files via
     /// `LocService::discover_files` — the exact walk `rebuild_and_publish_loc`
-    /// uses via `LocService::from_folders` — so this can't drift from what it
-    /// actually reads. Blocking (stats every discovered file); call from
+    /// uses via `LocService::from_folder` — so this can't drift from what it
+    /// actually reads. The base-game install is deliberately absent: it can't
+    /// change while the editor is running and its contribution is memoized by
+    /// [`Backend::vanilla_loc`], so stat'ing its ~2000 loc files every pass
+    /// would only cost time. Blocking (stats every discovered file); call from
     /// within `block_in_place`.
     pub(crate) fn compute_loc_signature(&self, root_path: &std::path::Path) -> u64 {
-        let dirs = self.loc_dirs(root_path);
-        let dir_refs: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
-        let files = cwtools_localization::LocService::discover_files(&dir_refs);
+        let files = cwtools_localization::LocService::discover_files(&[root_path]);
         stat_signature_for(&files)
+    }
+
+    /// The base-game install's contribution to the loc maps, built on first use
+    /// and kept for the rest of the session.
+    ///
+    /// Vanilla loc is ~2000 files / 150 MB on HOI4 and it cannot change while
+    /// the editor is running, yet every foreground scan used to re-read and
+    /// re-parse all of it just to rebuild the same hover text, the same
+    /// definition sites and the same keys (#89).
+    ///
+    /// Keyed by the inputs that shape the maps — the install dir, the primary
+    /// language and the hover-all-languages toggle — so a session that somehow
+    /// changes one of them rebuilds rather than serving the wrong map.
+    ///
+    /// `None` when no base-game dir is configured, and also when the configured
+    /// one yielded no loc at all (an install on a drive that isn't mounted):
+    /// nothing is memoized then, so the next scan tries again, and the caller
+    /// keeps falling back to the vanilla cache's keys meanwhile. Blocking; call
+    /// from within `block_in_place`.
+    fn vanilla_loc(&self, primary_lang: Lang, hover_all: bool) -> Option<Arc<VanillaLoc>> {
+        let Some(dir) = self.state.config.read().vanilla_dir.clone() else {
+            *self.state.vanilla_loc.lock() = None;
+            return None;
+        };
+        let key = (dir, primary_lang, hover_all);
+        if let Some((cached_key, loc)) = self.state.vanilla_loc.lock().as_ref()
+            && *cached_key == key
+        {
+            return Some(Arc::clone(loc));
+        }
+        let service = cwtools_localization::LocService::from_folder(&key.0);
+        if service.files().is_empty() {
+            tracing::warn!(dir = %key.0.display(), "base-game dir holds no localisation files");
+            return None;
+        }
+        let built = Arc::new(VanillaLoc::build(&service, primary_lang, hover_all));
+        tracing::info!(
+            "[loc] indexed base-game loc: {} files, {} keys, {} hover entries (kept for the session)",
+            service.files().len(),
+            built.index.union().len(),
+            built.text.len(),
+        );
+        *self.state.vanilla_loc.lock() = Some((key, Arc::clone(&built)));
+        Some(built)
     }
 
     /// Build the loc-key index from the workspace root plus the vanilla install,
@@ -1086,13 +1216,10 @@ impl Backend {
     /// diagnostics (CW225/CW234/CW259/CW268/CW275) for the workspace loc files.
     #[tracing::instrument(skip_all)]
     pub(crate) async fn rebuild_and_publish_loc(&self, root_path: &std::path::Path) {
-        // Cached vanilla loc keys (from the vanilla cache) supplement the key
-        // index, but the hover text map needs the actual loc text from the files.
-        // Always load the vanilla loc files when the dir is available so hover
-        // shows translations for keys that exist only in the base game (#51).
-        let cached_vanilla_loc = self.state.vanilla_loc_keys.lock().clone();
-        let loc_dirs = self.loc_dirs(root_path);
-        let dir_refs: Vec<&std::path::Path> = loc_dirs.iter().map(|p| p.as_path()).collect();
+        // The base game's loc files are read whenever the install dir is known,
+        // so hover shows translations for keys that exist only there (#51). The
+        // vanilla cache's key lists stand in when it isn't. Either way it costs
+        // one read per session, not one per scan (#89).
         let loc_languages = self.state.config.read().loc_languages.clone();
 
         // Hover language scope: unless the user opted into all translations, keep
@@ -1128,11 +1255,27 @@ impl Backend {
         // from disk — synchronous I/O that must not starve the async executor.
         let (loc_index, mut by_file, loc_text_map, loc_loc_map) =
             tokio::task::block_in_place(|| {
-                let service = cwtools_localization::LocService::from_folders(&dir_refs);
+                // The base game is read once per session and reused; only the
+                // workspace is walked again (#89).
+                let vanilla = self.vanilla_loc(primary_lang, hover_all);
+                // The install dir is the source of truth for its own loc: the
+                // memo walked exactly the tree the vanilla cache's key lists
+                // were extracted from, so keeping those around is a second copy
+                // of 1.3M keys (as owned strings) that every rebuild would
+                // re-intern. Hand them over. Without a dir they're all we have.
+                let cached_vanilla_loc = if vanilla.is_some() {
+                    self.state.vanilla_loc_keys.lock().take()
+                } else {
+                    self.state.vanilla_loc_keys.lock().clone()
+                };
+                let service = cwtools_localization::LocService::from_folder(root_path);
                 let mut idx = cwtools_localization::LocIndex::build_scoped(
                     &service,
                     loc_languages.as_deref(),
                 );
+                if let Some(vanilla) = &vanilla {
+                    idx.merge_from(&vanilla.index, loc_languages.as_deref());
+                }
                 if let Some(cached) = cached_vanilla_loc {
                     let typed: Vec<(cwtools_localization::Lang, Vec<String>)> = cached
                         .into_iter()
@@ -1143,17 +1286,17 @@ impl Backend {
                     idx.merge_cached_keys(typed, loc_languages.as_deref());
                 }
                 let mut by_file: HashMap<String, Vec<Diagnostic>> = HashMap::new();
-                // Reuse the merged loc-index union (with cached vanilla keys)
+                // Reuse the merged loc-index union (with the base game's keys)
                 // instead of rebuilding the ~2M-key set inside the validate pass.
+                // Every file the service holds is under the workspace root, so
+                // there is nothing to filter out — the base game is never
+                // validated, only indexed.
                 for d in cwtools_localization::validate_loc_project_with_union(
                     &service,
                     loc_languages.as_deref(),
                     idx.union(),
                     &extra_valid_refs,
                 ) {
-                    if !std::path::Path::new(&d.file).starts_with(root_path) {
-                        continue;
-                    }
                     let ve = loc_diag_to_validation_error(&d);
                     // Project-wide loc scan feeds the Problems panel; open files
                     // get whole-line squiggles and encoded columns when
@@ -1168,40 +1311,20 @@ impl Backend {
                 let mut lt = LocTextMap::default();
                 let mut ll = LocLocationMap::default();
                 for file in service.files() {
-                    if std::path::Path::new(&file.path).starts_with(root_path) {
-                        by_file.entry(file.path.clone()).or_default();
+                    by_file.entry(file.path.clone()).or_default();
+                }
+                collect_loc_display(&service, &idx, primary_lang, hover_all, &mut lt, &mut ll);
+                // Fold the base game in under the workspace: a key the mod
+                // redefines keeps the mod's definition site, and its hover shows
+                // the mod's text first.
+                if let Some(vanilla) = &vanilla {
+                    for (key, translations) in &vanilla.text {
+                        lt.entry(Arc::clone(key))
+                            .or_default()
+                            .extend(translations.iter().cloned());
                     }
-                    let lang = file.lang.unwrap_or(cwtools_localization::Lang::English);
-                    let lang_included = hover_all || lang == primary_lang;
-                    // Every entry in a file shares the same source path.
-                    let file_uri: Arc<str> = path_to_uri(std::path::Path::new(&file.path)).into();
-                    for entry in &file.entries {
-                        let key_lower = idx
-                            .key(&entry.key)
-                            .expect("loc index must contain every service key");
-                        // goto: prefer the primary language's location (English by
-                        // default) so Ctrl+Click lands on the canonical entry, not
-                        // whichever language happened to be scanned first.
-                        let loc = || {
-                            (
-                                file_uri.clone(),
-                                (entry.position.line.saturating_sub(1)) as u32,
-                            )
-                        };
-                        if lang == primary_lang {
-                            ll.insert(key_lower.clone(), loc());
-                        } else {
-                            ll.entry(key_lower.clone()).or_insert_with(loc);
-                        }
-                        if !lang_included {
-                            continue;
-                        }
-                        let display = loc_display_text(&entry.desc);
-                        if !display.is_empty() {
-                            lt.entry(key_lower)
-                                .or_default()
-                                .push((lang, display.to_string()));
-                        }
+                    for (key, loc) in &vanilla.locations {
+                        ll.entry(Arc::clone(key)).or_insert_with(|| loc.clone());
                     }
                 }
                 (idx, by_file, lt, ll)
