@@ -14,6 +14,7 @@ use cwtools_parser::ast::ParsedFile;
 use cwtools_rules::rules_types::{NewField, RuleSet, RuleType, TypeType, ValueType};
 use cwtools_string_table::string_table::{StringId, StringTable};
 use cwtools_validation::position::rules_at_pos;
+use cwtools_validation::references;
 
 mod code_action;
 mod color;
@@ -374,7 +375,24 @@ struct DocumentState {
     /// aborted because a newer edit landed, the union of names it was processing
     /// is merged here so the next sweep (triggered by the newer edit) drains and
     /// includes them, preventing stale dependents after rapid successive edits.
+    /// A use-set change (see `type_uses`) queues its names here too, so the
+    /// sweep also covers unused-instance (CW239/CW231) transitions.
     pending_changed_names: Mutex<HashSet<String>>,
+    /// Per file, the `<type>` references it makes to instances of a tracked
+    /// (`should_be_used`) type — the LSP's counterpart of the batch driver's
+    /// merged [`cwtools_validation::references::UsedInstances`]. Seeded for
+    /// every file by the workspace scan and replaced per file on each
+    /// validation, so the merged view stays answerable between scans. Empty
+    /// for a config with nothing tracked (the recording itself is gated on
+    /// `needs_use_tracking`).
+    type_uses: parking_lot::RwLock<HashMap<String, references::UsedInstances>>,
+    /// Cached merge of every `type_uses` entry, keyed on `type_uses_revision`.
+    /// Rebuilt only when some file's use set actually changed; the common
+    /// keystroke (uses unchanged) hits the cache.
+    #[allow(clippy::type_complexity)]
+    type_uses_merged: parking_lot::Mutex<Option<(u64, Arc<references::UsedInstances>)>>,
+    /// Bumped whenever a `type_uses` entry changes, invalidating the merge.
+    type_uses_revision: AtomicU64,
     /// Set to `true` once the vanilla index has been loaded and merged into
     /// `info_service.type_index`. After the merge the raw `vanilla_index` data
     /// is dropped to eliminate double residency; this flag prevents
@@ -622,6 +640,9 @@ impl DocumentState {
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
             pending_changed_names: Mutex::new(HashSet::new()),
+            type_uses: parking_lot::RwLock::new(HashMap::new()),
+            type_uses_merged: parking_lot::Mutex::new(None),
+            type_uses_revision: AtomicU64::new(0),
             vanilla_merged: std::sync::atomic::AtomicBool::new(false),
             scan_in_progress: AtomicBool::new(false),
             debounce_handles: Mutex::new(HashMap::new()),
@@ -1467,6 +1488,24 @@ impl LanguageServer for Backend {
             } else {
                 self.state.info_service.write().clear_file(&uri);
                 self.bump_info_revision();
+                // The file is gone from disk too, so its recorded `<type>` uses
+                // must not keep suppressing CW239 on the instances it referenced.
+                // Queue those names so the sweep below revalidates their
+                // definition files. (A file that still exists keeps its
+                // last-validated entry: the buffer just closed normally matches
+                // the disk content it was saved from.)
+                if let Some(uses) = self.state.type_uses.write().remove(&uri) {
+                    let dropped = uses.changed_names(&Default::default());
+                    if !dropped.is_empty() {
+                        self.state
+                            .type_uses_revision
+                            .fetch_add(1, Ordering::Release);
+                        self.state
+                            .pending_changed_names
+                            .lock()
+                            .extend(dropped.into_iter());
+                    }
+                }
             }
             doc_tokens.remove(&uri);
             self.loc_live_overlay_mut().remove(&uri);
@@ -1493,12 +1532,12 @@ impl LanguageServer for Backend {
                 .await;
         }
 
-        if exports_before != exports_after {
-            let mut changed_names: HashSet<String> = names_before
-                .symmetric_difference(&names_after)
-                .cloned()
-                .collect();
-            changed_names.extend(self.state.pending_changed_names.lock().drain());
+        let mut changed_names: HashSet<String> = names_before
+            .symmetric_difference(&names_after)
+            .cloned()
+            .collect();
+        changed_names.extend(self.state.pending_changed_names.lock().drain());
+        if exports_before != exports_after || !changed_names.is_empty() {
             self.revalidate_open_dependents(
                 &uri,
                 generation,

@@ -10,6 +10,8 @@ use cwtools_localization::Lang;
 use cwtools_parser::parser::parse_string_without_comments;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_validation::build_modifier_keys;
+use cwtools_validation::references::{UsedInstances, check_unused_instances, needs_use_tracking};
+use cwtools_validation::validate_prepared_tracking_uses;
 
 use crate::paths::{
     default_cache_dir, discover_vanilla_dir, loc_display_text, logical_path_from_uri, path_to_uri,
@@ -885,6 +887,28 @@ impl Backend {
             let cfg = self.state.config.read();
             (cfg.scope_checks, cfg.var_checks)
         };
+        // Whether this config tracks `<type>` uses at all (a `should_be_used`
+        // type, or Stellaris technologies). When it does, pass 2 doubles as the
+        // batch driver's two-phase unused-instance pass: every file's uses are
+        // recorded, merged into the store the per-edit path keeps current, and
+        // CW239/CW231 appended per file against the merged view.
+        let track_uses = scan_ruleset
+            .as_ref()
+            .is_some_and(|rs| needs_use_tracking(rs, scan_game));
+        // Cached ASTs of the open docs, snapshotted BEFORE the info guard below
+        // (request handlers lock `documents` before the info service; taking
+        // them in the other order here would be an ABBA deadlock). Both scan
+        // passes skip open docs, but their `<type>` uses still count: without
+        // them a definition referenced only from an open buffer would scan up
+        // as unused.
+        let open_doc_asts: Vec<(String, Arc<cwtools_parser::ast::ParsedFile>)> = if track_uses {
+            let docs = self.state.documents.lock();
+            docs.iter()
+                .filter_map(|(u, d)| d.ast.clone().map(|ast| (u.clone(), ast)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let results: Vec<(String, Vec<Diagnostic>)> = {
             let info_guard = self.state.info_service.read();
             let loc_guard = self.state.loc_index.read();
@@ -910,7 +934,7 @@ impl Backend {
                 )
             });
 
-            scan_files
+            let mut results: Vec<(String, Vec<Diagnostic>, Option<UsedInstances>)> = scan_files
                 .par_iter()
                 .zip(parsed_files.par_iter())
                 .filter_map(|(file, parsed_opt)| {
@@ -925,18 +949,90 @@ impl Backend {
                     // info, and the cheap single-char range at the parser's own
                     // column. did_open republishes the precise range.
                     let no_lines = DocLines::none();
-                    let diagnostics = match &prepared {
-                        Some(prepared) => {
-                            validate_parsed_with_indexes(&file.uri, parsed, prepared, &no_lines)
-                        }
-                        None => parsed
-                            .errors
-                            .iter()
-                            .map(|e| parse_error_to_diagnostic(e, &no_lines))
-                            .collect(),
+                    let (diagnostics, used) = match &prepared {
+                        Some(prepared) => validate_parsed_with_indexes(
+                            &file.uri, parsed, prepared, &no_lines, track_uses,
+                        ),
+                        None => (
+                            parsed
+                                .errors
+                                .iter()
+                                .map(|e| parse_error_to_diagnostic(e, &no_lines))
+                                .collect(),
+                            None,
+                        ),
                     };
-                    Some((file.uri.clone(), diagnostics))
+                    Some((file.uri.clone(), diagnostics, used))
                 })
+                .collect();
+
+            if track_uses && let Some(prepared) = &prepared {
+                // Open docs whose uses aren't recorded yet (opened before the
+                // rules loaded, so their validates couldn't track): compute
+                // from the cached AST. The rest carry their stored entry
+                // forward — it was refreshed by their last validate, so it is
+                // never staler than the buffer.
+                let unrecorded: Vec<(String, Arc<cwtools_parser::ast::ParsedFile>)> = {
+                    let store = self.state.type_uses.read();
+                    open_doc_asts
+                        .iter()
+                        .filter(|(u, _)| !store.contains_key(u))
+                        .cloned()
+                        .collect()
+                };
+                let open_uses: Vec<(String, UsedInstances)> = unrecorded
+                    .par_iter()
+                    .map(|(u, ast)| {
+                        let (_, used) = validate_prepared_tracking_uses(ast, u, prepared);
+                        (u.clone(), used)
+                    })
+                    .collect();
+
+                // Rebuild the store from this scan: fresh entries for every
+                // scanned file, the carried/computed ones for open docs, and
+                // nothing else — which is what prunes files deleted since the
+                // last scan.
+                let merged = {
+                    let mut store = self.state.type_uses.write();
+                    store.retain(|uri, _| open_uris.contains(uri));
+                    for (uri, _, used) in &mut results {
+                        store.insert(uri.clone(), used.take().unwrap_or_default());
+                    }
+                    for (uri, used) in open_uses {
+                        store.insert(uri, used);
+                    }
+                    let mut merged = UsedInstances::default();
+                    for uses in store.values() {
+                        merged.merge_from(uses);
+                    }
+                    merged
+                };
+                self.state
+                    .type_uses_revision
+                    .fetch_add(1, Ordering::Release);
+
+                // Phase 2 of the batch shape: with every file's uses merged,
+                // flag each scanned file's own definitions nothing referenced.
+                // Open docs get the same check from the post-scan
+                // `revalidate_all_open_docs`, which reads the store just built.
+                let no_lines = DocLines::none();
+                for (uri, diagnostics, _) in &mut results {
+                    let file: cwtools_validation::FilePath = uri.as_str().into();
+                    for err in check_unused_instances(
+                        prepared.ruleset,
+                        scan_game,
+                        &type_index.instances_in_file(uri),
+                        &merged,
+                        &file,
+                    ) {
+                        diagnostics.push(validation_error_to_diagnostic(&err, &no_lines));
+                    }
+                }
+            }
+
+            results
+                .into_iter()
+                .map(|(uri, diagnostics, _)| (uri, diagnostics))
                 .collect()
             // info_guard / loc_guard dropped here, before any await.
         };
@@ -1749,6 +1845,17 @@ impl Backend {
                 self.refresh_after_watched_loc_changes(&changed_loc_keys)
                     .await;
             }
+            // Uses added/removed by the batch (a watched change's validate, or
+            // a delete above) queued names whose CW239 status may have flipped;
+            // sweep the open docs that mention them. Without this the names
+            // sat in `pending_changed_names` until the next unrelated edit.
+            let queued: HashSet<String> =
+                { self.state.pending_changed_names.lock().drain().collect() };
+            if !queued.is_empty() {
+                let generation = self.state.edit_generation.load(Ordering::SeqCst);
+                self.revalidate_open_dependents("", generation, Some(&queued))
+                    .await;
+            }
         }
         // Clear our slot before the final check so a producer that queued an
         // event while we ran can arm the next window (or we do it here). Setting
@@ -1799,6 +1906,26 @@ impl Backend {
             let mut sigs = self.state.watched_signatures.lock();
             for uri in deletes {
                 sigs.remove(uri);
+            }
+        }
+        // A deleted file's recorded `<type>` uses must not keep suppressing
+        // CW239 on the instances it referenced. Queue the affected names; the
+        // batch's closing sweep republishes their open definition files.
+        {
+            let mut dropped: HashSet<String> = HashSet::new();
+            {
+                let mut store = self.state.type_uses.write();
+                for uri in deletes {
+                    if let Some(uses) = store.remove(uri) {
+                        dropped.extend(uses.changed_names(&Default::default()));
+                    }
+                }
+            }
+            if !dropped.is_empty() {
+                self.state
+                    .type_uses_revision
+                    .fetch_add(1, Ordering::Release);
+                self.state.pending_changed_names.lock().extend(dropped);
             }
         }
         self.bump_info_revision();

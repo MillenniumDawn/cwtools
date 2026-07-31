@@ -67,9 +67,12 @@ engine resolves (`validate_prepared_tracking_uses`), the driver merges those int
 one set, and `references::check_unused_instances` then flags each file's own
 definitions that the set doesn't cover. The whole thing is skipped for a config
 that marks no type `should_be_used`, which is every non-Stellaris config today.
-The LSP does not run it: its per-file revalidation has no project-wide view to
-recompute the answer from, so it would publish diagnostics that go stale on the
-next edit.
+The LSP runs the same shape against a store it keeps current: the workspace
+scan records every file's uses and checks each file against the merged set,
+and a per-file revalidation replaces its own file's entry, re-checks that
+file, and sweeps the open files that define an instance whose used-status
+changed. Same staleness contract as CW100: open files update on edit, closed
+files catch up on the next scan.
 
 ### CLI vs LSP
 

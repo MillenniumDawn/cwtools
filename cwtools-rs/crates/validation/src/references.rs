@@ -26,8 +26,9 @@ use crate::{FilePath, ValidationError};
 pub(crate) const TECHNOLOGY: &str = "technology";
 
 /// Instance names seen used, per type name. Built per file by the validator and
-/// merged into one run-wide set by the driver.
-#[derive(Debug, Default)]
+/// merged into one run-wide set by the driver (or, in the LSP, into a per-file
+/// store the editor keeps current across edits).
+#[derive(Debug, Default, PartialEq)]
 pub struct UsedInstances(FxHashMap<String, FxHashSet<String>>);
 
 impl UsedInstances {
@@ -58,6 +59,36 @@ impl UsedInstances {
         for (type_name, names) in other.0 {
             self.0.entry(type_name).or_default().extend(names);
         }
+    }
+
+    /// [`Self::absorb`] without consuming the source, for callers merging out of
+    /// a store they keep (the LSP's per-file map).
+    pub fn merge_from(&mut self, other: &Self) {
+        for (type_name, names) in &other.0 {
+            self.0
+                .entry(type_name.clone())
+                .or_default()
+                .extend(names.iter().cloned());
+        }
+    }
+
+    /// The instance names recorded in exactly one of the two sets, across all
+    /// types. This is the set of names whose "is it used?" answer may have
+    /// changed between two versions of a file, so the LSP scopes its dependent
+    /// sweep to the open docs that mention one of them.
+    pub fn changed_names(&self, other: &Self) -> FxHashSet<String> {
+        let mut out = FxHashSet::default();
+        for (a, b) in [(self, other), (other, self)] {
+            for (type_name, names) in &a.0 {
+                let b_names = b.0.get(type_name);
+                for name in names {
+                    if !b_names.is_some_and(|n| n.contains(name)) {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn contains(&self, type_name: &str, instance_lower: &str) -> bool {
@@ -642,6 +673,40 @@ building = {
             )],
         );
         assert!(found.is_empty(), "got: {found:?}");
+    }
+
+    #[test]
+    fn merge_from_matches_absorb() {
+        let mut a = UsedInstances::default();
+        a.mark("thing", "one");
+        let mut b = UsedInstances::default();
+        b.mark("thing", "two");
+        b.mark("other", "three");
+
+        let mut by_ref = UsedInstances::default();
+        by_ref.merge_from(&a);
+        by_ref.merge_from(&b);
+        let mut by_value = UsedInstances::default();
+        by_value.absorb(a);
+        by_value.absorb(b);
+        assert_eq!(by_ref, by_value);
+    }
+
+    #[test]
+    fn changed_names_is_the_symmetric_difference() {
+        let mut before = UsedInstances::default();
+        before.mark("thing", "kept");
+        before.mark("thing", "removed");
+        let mut after = UsedInstances::default();
+        after.mark("thing", "kept");
+        after.mark("other", "added");
+
+        let changed = before.changed_names(&after);
+        assert_eq!(
+            changed,
+            FxHashSet::from_iter(["removed".to_string(), "added".to_string()])
+        );
+        assert!(before.changed_names(&before).is_empty());
     }
 
     #[test]
