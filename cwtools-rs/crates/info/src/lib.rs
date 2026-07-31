@@ -1408,6 +1408,42 @@ alias[effect:set_temp_variable] = {
         assert!(!names.contains(&"value".to_string()), "got: {:?}", names);
     }
 
+    /// HOI4 arrays are variables too: an effect that declares a `value_set[array]`
+    /// defines names, and the name lives in the block's `array` child, not `var`.
+    /// Without this, every array read (`array = my_arr` in a scripted GUI's
+    /// `dynamic_lists`) flags CW246.
+    #[test]
+    fn test_collect_array_variable_names() {
+        const RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:add_to_array] = {
+    array = value_set[array]
+    value = int_variable_field
+}
+alias[effect:resize_array] = {
+    array = value_set[array]
+    size = int_variable_field
+}
+"#;
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        let table = StringTable::new();
+        let ruleset = ast_to_ruleset(&parse_string(RULES, &table).unwrap(), &table);
+
+        let effects = variable_defining_effects(&ruleset);
+        assert!(effects.contains("add_to_array"), "got: {:?}", effects);
+        assert!(effects.contains("resize_array"), "got: {:?}", effects);
+
+        let script = "foo = { add_to_array = { array = my_arr value = 3 } resize_array = { array = other_arr size = 2 } }";
+        let parsed = parse_string(script, &table).unwrap();
+        let mut names = Vec::new();
+        collect_set_variable_names(&parsed, &table, &effects, &mut names);
+        assert!(names.contains(&"my_arr".to_string()), "got: {:?}", names);
+        assert!(names.contains(&"other_arr".to_string()), "got: {:?}", names);
+        // The `array` key names the array; it is not itself a variable.
+        assert!(!names.contains(&"array".to_string()), "got: {:?}", names);
+    }
+
     /// `collect_set_variable_defs` captures the assigned value for both the
     /// explicit (`var = X value = N`) and shorthand (`X = N`) forms.
     #[test]

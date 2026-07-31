@@ -120,7 +120,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW243 | Error | Target "{}" has incorrect scope. Is {} but expect {} | A scope target resolves to a scope the field doesn't expect. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
 | CW244 | Error | {} is not a target. Expected a target in scope(s) {} | A value is not a valid target in any of the expected scopes. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
 | CW245 | Error | Error in target. Link {} was used in scope {} but expected {} | A scope link inside a target chain was used in the wrong scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
-| CW246 | Warning | The variable {} has not been set | A referenced variable hasn't been assigned anywhere the engine can see. | Wired, gated off (`CWTOOLS_VAR_CHECKS=1`; needs a complete mod+vanilla variable index) |
+| CW246 | Warning | The variable {} has not been set | A referenced variable hasn't been assigned anywhere the engine can see. | Emitted (escape hatch `CWTOOLS_NO_VAR_CHECKS=1`) |
 | CW247 | Error | Trigger/Effect/Modifier {} used in wrong scope. In {} but expect {} | A trigger, effect, or modifier rule was used in the wrong scope. | Emitted |
 | CW248 | Error | Invalid scope command {} | A scope command is not valid here. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
 
@@ -223,10 +223,12 @@ corpus to validate.
 The scope family is config-driven and ON by default; set `CWTOOLS_NO_SCOPE_CHECKS=1`
 to disable: **CW104, CW105, CW106, CW243, CW244, CW245, CW247, CW248, CW260**.
 
-The "variable has not been set" check (**CW246**) is wired but OFF by default
-(`CWTOOLS_VAR_CHECKS=1` to enable) until the mod+vanilla variable index is proven
-complete for a corpus; on Millennium Dawn it surfaces ~99 genuine unset-variable
-references plus some runtime/concatenated-name false positives still being triaged.
+The "variable has not been set" check (**CW246**) is also ON by default; set
+`CWTOOLS_NO_VAR_CHECKS=1` to disable. It only applies to the `variable` value set
+(and arrays, which the engine stores the same way), accepts the built-ins declared
+in `variables.cwt`, and skips names that cannot be resolved statically (`@`-vars,
+inline math, `$ARG$`-built names, and `prefix:` reads). Millennium Dawn reports 60
+hits and Kaiserreich 1, all genuine unset variables.
 
 ### Rust-only extensions (no F# equivalent)
 

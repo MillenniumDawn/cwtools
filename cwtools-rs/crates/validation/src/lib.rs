@@ -220,15 +220,14 @@ pub fn build_scope_registry_arc(
     game.map(|g| std::sync::Arc::new(build_scope_registry(ruleset, g)))
 }
 
-/// Whether the trigger/effect/target scope checks (CW104/105/106/243/244/245/248)
-/// are on. ON by default; set `CWTOOLS_NO_SCOPE_CHECKS=1` as an escape hatch.
-/// Whether the "variable has not been set" check (CW246) is on. OFF by default;
-/// opt in with `CWTOOLS_VAR_CHECKS=1` once the variable index is proven complete.
+/// Whether the scope checks (CW104/105/106/243/244/245/248) and the "variable has
+/// not been set" check (CW246) are on. Both are ON by default; set
+/// `CWTOOLS_NO_SCOPE_CHECKS=1` / `CWTOOLS_NO_VAR_CHECKS=1` as escape hatches.
 /// Read once at context-construction time.
 pub fn checks_from_env() -> (bool, bool) {
     (
         std::env::var("CWTOOLS_NO_SCOPE_CHECKS").is_err(),
-        std::env::var("CWTOOLS_VAR_CHECKS").is_ok(),
+        std::env::var("CWTOOLS_NO_VAR_CHECKS").is_err(),
     )
 }
 

@@ -51,7 +51,10 @@ const MAGIC: &[u8; 4] = b"CWV\x00";
 // vanilla instance carries its full extent (`SourceLocation.end`), matching
 // live-scanned instances. v7 files lack the end fields, so the rkyv layout
 // differs and they must rebuild.
-const CACHE_VERSION: u8 = 8;
+// v9 folds `value_set[array]` names into the cached variable names (arrays are
+// variables to the engine, so `add_to_array` defines a name CW246 must accept).
+// v8 caches were written without them and would flag every vanilla array read.
+const CACHE_VERSION: u8 = 9;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CachedInstance {

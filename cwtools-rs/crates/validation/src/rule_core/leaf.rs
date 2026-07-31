@@ -23,34 +23,43 @@ use super::children::validate_math_clause;
 /// `value[variable]` set (variables.cwt lists engine-provided reads like
 /// `faction_leader`, `num_days`, `threat`). These are valid variable references
 /// even without the `var:` prefix and are never dynamically "set", so they must
-/// not flag CW246. Members may carry a scope suffix (`name@<type>` /
-/// `name@enum[...]`); match the base name before the `@`.
+/// not flag CW246. Both sides may carry a scope suffix — the member declares the
+/// family (`party_popularity@<ideology>`) and the read names one of it
+/// (`party_popularity@social_democrat`) — so match on the base before the `@`.
 fn is_builtin_variable(ruleset: &RuleSet, token: &str) -> bool {
+    let token_base = token.split('@').next().unwrap_or(token);
     ruleset.values.get("variable").is_some_and(|members| {
         members.iter().any(|m| {
             let base = m.split('@').next().unwrap_or(m);
-            base.eq_ignore_ascii_case(token)
+            base.eq_ignore_ascii_case(token_base)
         })
     })
 }
 
 pub(super) fn check_variable_get(
     ctx: &ValidationCtx,
+    namespace: &str,
     raw: &str,
     line: u32,
     col: u16,
     end: SourcePos,
     errors: &mut Vec<ValidationError>,
 ) {
-    if !ctx.var_checks {
+    // Only the `variable` namespace is backed by an index. Every other
+    // `value[ns]` (country_flag, array, division_template_name, font_name, …)
+    // is a different value set the variable index never holds, so checking it
+    // here would flag every flag/array/token read in the corpus.
+    if !ctx.var_checks || namespace != "variable" {
         return;
     }
     let v = raw.trim_matches('"').trim();
-    // Dynamic / non-variable forms that resolve at runtime are accepted.
+    // Dynamic / non-variable forms that resolve at runtime are accepted: @-vars,
+    // inline math, a `$ARG$`-concatenated name (the written token is not the
+    // runtime name), and any `prefix:` read (`var:`, `token:`, `event_target:`).
     if v.is_empty()
         || v.starts_with('@')
         || v.starts_with('[')
-        || v.contains("$$")
+        || v.contains('$')
         || v.contains(':')
     {
         return;
@@ -305,8 +314,8 @@ pub(super) fn validate_leaf(
         //     always — they only fire on a value that parses as a number and
         //     violates the field's int/precision constraint, so they cannot
         //     flood valid config.
-        //   - the "variable has not been set" check (CW246) is gated behind
-        //     `ctx.var_checks` because it needs a complete variable index.
+        //   - the "variable has not been set" check (CW246) needs a populated
+        //     variable index, so it also honours `ctx.var_checks`.
         if let NewField::VariableField {
             is_int, is_32bit, ..
         } = right
@@ -322,16 +331,16 @@ pub(super) fn validate_leaf(
             }
             with_leaf_value_str(&leaf.value, table, |raw| {
                 let v = raw.trim_matches('"').trim();
-                // Accept at-vars (@x), inline math ([...]), loc refs ($$) and boolean
-                // literals (`yes`/`no`, used by boolean modifiers) — all valid in a
-                // value slot (F# FieldValidators bypasses).
+                // Accept at-vars (@x), inline math ([...]), `$ARG$`-built names and
+                // boolean literals (`yes`/`no`, used by boolean modifiers) — all
+                // valid in a value slot (F# FieldValidators bypasses).
                 let is_bool = matches!(leaf.value, Value::Bool(_))
                     || v.eq_ignore_ascii_case("yes")
                     || v.eq_ignore_ascii_case("no");
                 let bypass = v.is_empty()
                     || v.starts_with('@')
                     || v.starts_with('[')
-                    || v.contains("$$")
+                    || v.contains('$')
                     || is_bool;
                 if !bypass {
                     // Strip a `?`/`^` default-value selector before parsing.
@@ -398,14 +407,14 @@ pub(super) fn validate_leaf(
             return;
         }
 
-        // VariableGetField (rules `value[variable]`): a bare read of a defined
-        // variable. Mirrors F# `checkVariableGetField` — the value must name a
-        // variable that was set somewhere. Gated like CW246 (needs a complete
-        // variable index) so empty-index setups don't false-positive.
-        if let NewField::VariableGetField(_) = right {
+        // VariableGetField (rules `value[ns]`): a bare read of a member of the
+        // `ns` value set. Mirrors F# `checkVariableGetField` — for the `variable`
+        // namespace the value must name a variable that was set somewhere.
+        if let NewField::VariableGetField(ns) = right {
             with_leaf_value_str(&leaf.value, table, |raw| {
                 check_variable_get(
                     ctx,
+                    ns,
                     raw,
                     leaf.pos.start.line,
                     leaf.pos.start.col,
