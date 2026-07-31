@@ -29,7 +29,7 @@ fn has_required_name_loc(td: &TypeDefinition) -> bool {
 pub fn check_missing_localisation(
     instances: &[(&str, &TypeInstance)],
     logical_path: &str,
-    file_path: &str,
+    file_path: &crate::FilePath,
     ruleset: &RuleSet,
     loc_exists: impl Fn(&str) -> bool,
 ) -> Vec<ValidationError> {
@@ -114,9 +114,13 @@ thing = { x = scalar }
                     .map(move |instance| (type_name.as_str(), instance))
             })
             .collect();
-        check_missing_localisation(&instances, logical_path, logical_path, &ruleset, |k| {
-            present.contains(k)
-        })
+        check_missing_localisation(
+            &instances,
+            logical_path,
+            &logical_path.into(),
+            &ruleset,
+            |k| present.contains(k),
+        )
     }
 
     fn run(script: &str, has: &[&str]) -> Vec<ValidationError> {

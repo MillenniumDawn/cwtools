@@ -129,7 +129,7 @@ pub(crate) fn github_row(d: &Diag, base: &Path) -> String {
     );
     if !d.code.is_empty() {
         props.push_str(",title=");
-        props.push_str(&escape_property(&d.code));
+        props.push_str(&escape_property(d.code));
     }
     format!(
         "::{} {}::{}\n",
@@ -198,9 +198,17 @@ pub(crate) fn sarif_report(diags: &[&Diag], base: &Path) -> String {
     // then has a definition by construction, so the comma accounting can't be
     // thrown off by a lookup that fails on the second pass.
     let mut rules: Vec<&'static (&'static str, ErrorCode)> =
-        diags.iter().filter_map(|d| codes::entry(&d.code)).collect();
+        diags.iter().filter_map(|d| codes::entry(d.code)).collect();
     rules.sort_unstable_by_key(|(_, c)| c.id);
     rules.dedup_by_key(|(_, c)| c.id);
+
+    // id -> position in `rules`, built once: the per-result lookup below is
+    // otherwise a linear scan of the rule array for every diagnostic.
+    let rule_index: std::collections::HashMap<String, usize> = rules
+        .iter()
+        .enumerate()
+        .map(|(i, (_, c))| (c.id.to_ascii_lowercase(), i))
+        .collect();
 
     let mut out = String::new();
     out.push_str("{\n");
@@ -243,7 +251,7 @@ pub(crate) fn sarif_report(diags: &[&Diag], base: &Path) -> String {
     out.push_str("      \"columnKind\": \"unicodeCodePoints\",\n");
     out.push_str("      \"results\": [\n");
     for (i, d) in diags.iter().enumerate() {
-        out.push_str(&sarif_result(d, base, &rules, i + 1 == diags.len()));
+        out.push_str(&sarif_result(d, base, &rule_index, i + 1 == diags.len()));
     }
     out.push_str("      ]\n");
     out.push_str("    }\n");
@@ -279,7 +287,12 @@ fn sarif_rule((const_name, code): &(&str, ErrorCode), last: bool) -> String {
     )
 }
 
-fn sarif_result(d: &Diag, base: &Path, rules: &[&(&str, ErrorCode)], last: bool) -> String {
+fn sarif_result(
+    d: &Diag,
+    base: &Path,
+    rule_index: &std::collections::HashMap<String, usize>,
+    last: bool,
+) -> String {
     let (path, relative) = locate(&d.file, base);
     let uri = if relative {
         s(&uri_encode(&path, false))
@@ -294,12 +307,9 @@ fn sarif_result(d: &Diag, base: &Path, rules: &[&(&str, ErrorCode)], last: bool)
 
     let mut out = String::from("        {\n");
     if !d.code.is_empty() {
-        out.push_str(&format!("          \"ruleId\": {},\n", s(&d.code)));
+        out.push_str(&format!("          \"ruleId\": {},\n", s(d.code)));
         // Case-insensitively, to match how the rules were collected.
-        if let Some(idx) = rules
-            .iter()
-            .position(|(_, c)| c.id.eq_ignore_ascii_case(&d.code))
-        {
+        if let Some(idx) = rule_index.get(&d.code.to_ascii_lowercase()) {
             out.push_str(&format!("          \"ruleIndex\": {idx},\n"));
         }
     }
@@ -337,11 +347,11 @@ fn sarif_result(d: &Diag, base: &Path, rules: &[&(&str, ErrorCode)], last: bool)
 mod tests {
     use super::*;
 
-    fn diag(file: &str, line: u32, col: u32, code: &str, message: &str) -> Diag {
+    fn diag(file: &str, line: u32, col: u32, code: &'static str, message: &str) -> Diag {
         Diag {
-            file: file.to_string(),
+            file: file.into(),
             severity: ErrorSeverity::Error,
-            code: code.to_string(),
+            code,
             message: message.to_string(),
             line,
             col,
@@ -494,6 +504,18 @@ mod tests {
         assert_eq!(out.matches("\"ruleIndex\": 0").count(), 1);
         assert_eq!(out.matches("\"ruleIndex\": 1").count(), 2);
         assert_eq!(out.matches("\"id\": \"CW113\"").count(), 1);
+    }
+
+    /// The catalog resolves a code case-insensitively, so a diagnostic carrying
+    /// a non-canonical spelling still contributes a rule — and must still find
+    /// its index. Keying the lookup on the raw spelling would drop the
+    /// `ruleIndex` for exactly these rows.
+    #[test]
+    fn sarif_rule_index_resolves_a_non_canonical_code_spelling() {
+        let d = diag("/repo/x.txt", 3, 2, "cw113", "missing file");
+        let out = sarif_report(&[&d], Path::new("/repo"));
+        assert!(out.contains("\"id\": \"CW113\""), "got: {out}");
+        assert!(out.contains("\"ruleIndex\": 0"), "got: {out}");
     }
 
     #[test]

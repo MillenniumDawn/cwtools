@@ -6,7 +6,7 @@ use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_parser::ast::Value;
 use cwtools_rules::rules_types::*;
 
-use crate::common::{ValidationError, leaf_value_to_string};
+use crate::common::{ValidationError, with_leaf_value_str};
 use crate::ctx::ValidationCtx;
 use crate::error_codes;
 
@@ -20,6 +20,9 @@ pub fn build_modifier_keys(
     type_index: &cwtools_index::TypeIndex,
 ) -> std::collections::HashSet<String> {
     let mut mk = std::collections::HashSet::new();
+    // One expansion buffer for the whole (template x instance) product; only the
+    // lowercased result is handed to the set.
+    let mut expanded = String::new();
     for (m, _category) in &ruleset.modifiers {
         match (m.find('<'), m.find('>')) {
             (Some(open), Some(close)) if open < close => {
@@ -27,7 +30,11 @@ pub fn build_modifier_keys(
                 let pre = &m[..open];
                 let suf = &m[close + 1..];
                 for (_uri, inst) in type_index.instances(tn) {
-                    mk.insert(format!("{}{}{}", pre, inst.name, suf).to_lowercase());
+                    expanded.clear();
+                    expanded.push_str(pre);
+                    expanded.push_str(&inst.name);
+                    expanded.push_str(suf);
+                    mk.insert(expanded.to_lowercase());
                 }
             }
             _ => {
@@ -50,19 +57,44 @@ pub(crate) fn validate_localisation_field(
     scope_context: Option<&ScopeContext>,
     errors: &mut Vec<ValidationError>,
 ) {
-    let table = ctx.table;
-    let file_path = ctx.file_path;
-    let game = ctx.game;
-    let loc_index = ctx.loc_index;
     // The meta-localisation block form `{ localization_key = X PARAM = ... }` is
     // accepted unconditionally (its inner key is validated as its own leaf).
     if let Value::Clause(_) = &leaf.value {
         return;
     }
-
     let was_quoted = matches!(leaf.value, Value::QString(_));
-    let raw = leaf_value_to_string(&leaf.value, table);
-    let key_raw = raw.trim_matches('"');
+    // Borrow the reference text rather than copying it out of the string table:
+    // every loc-bearing field in the corpus comes through here.
+    with_leaf_value_str(&leaf.value, ctx.table, |raw| {
+        check_loc_key(
+            ctx,
+            leaf,
+            raw.trim_matches('"'),
+            was_quoted,
+            synced,
+            is_inline,
+            scope_context,
+            errors,
+        )
+    });
+}
+
+/// The body of [`validate_localisation_field`], with the reference text already
+/// unquoted and borrowed.
+#[allow(clippy::too_many_arguments)]
+fn check_loc_key(
+    ctx: &ValidationCtx,
+    leaf: &cwtools_parser::ast::Leaf,
+    key_raw: &str,
+    was_quoted: bool,
+    synced: bool,
+    is_inline: bool,
+    scope_context: Option<&ScopeContext>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let file_path = ctx.file_path;
+    let game = ctx.game;
+    let loc_index = ctx.loc_index;
 
     // F# skip rules: empty keys, keys with spaces (prose / compound), `[...]`
     // inline command blocks, `$VAR$` scripted references, and `@`-vars are not
@@ -83,12 +115,23 @@ pub(crate) fn validate_localisation_field(
     let Some(idx) = loc_index else {
         return;
     };
-    let key_lower = key_raw.to_lowercase();
+    // Loc keys are ASCII in practice, so fold on the stack; anything else falls
+    // back to `to_lowercase` so the Unicode special cases still hold.
+    let mut lower_buf: smallvec::SmallVec<[u8; 64]> = smallvec::SmallVec::new();
+    let lower_owned;
+    let key_lower: &str = if key_raw.is_ascii() {
+        lower_buf.extend_from_slice(key_raw.as_bytes());
+        lower_buf.make_ascii_lowercase();
+        std::str::from_utf8(&lower_buf).unwrap_or_default()
+    } else {
+        lower_owned = key_raw.to_lowercase();
+        &lower_owned
+    };
     // A key present in the live overlay (just typed into an open `.yml`, not yet
     // rescanned) counts as existing — keeps live editing from flagging a key the
     // user already added. (#36)
-    let in_overlay = ctx.extra_loc_keys.is_some_and(|e| e.contains(&key_lower));
-    let exists = idx.exists_any(&key_lower) || in_overlay;
+    let in_overlay = ctx.extra_loc_keys.is_some_and(|e| e.contains(key_lower));
+    let exists = idx.exists_any(key_lower) || in_overlay;
 
     let push_missing = |errors: &mut Vec<ValidationError>, lang: &str| {
         let code = &error_codes::CW100_MISSING_LOCALISATION;
@@ -133,7 +176,7 @@ pub(crate) fn validate_localisation_field(
     } else if synced && !in_overlay {
         // Must exist in every language the project ships loc data for. A key in
         // the live overlay is accepted leniently (no per-language data there).
-        for lang in idx.missing_synced_languages(&key_lower) {
+        for lang in idx.missing_synced_languages(key_lower) {
             push_missing(errors, &lang.to_string());
         }
     } else if !exists {
@@ -142,7 +185,7 @@ pub(crate) fn validate_localisation_field(
 
     // Scope-aware loc-command validation at the reference site: validate the
     // referenced loc string's `[command]` chains against the scope of THIS field.
-    if exists && let Some(entry) = idx.entry(&key_lower) {
+    if exists && let Some(entry) = idx.entry(key_lower) {
         let initial = scope_context
             .map(|c| c.current())
             .unwrap_or(cwtools_game::scope_engine::SCOPE_ANY);
@@ -170,7 +213,7 @@ fn push_loc_command_diagnostic(
     diag: &cwtools_localization::LocCommandDiagnostic,
     loc_key: &str,
     leaf: &cwtools_parser::ast::Leaf,
-    file_path: &str,
+    file_path: &crate::FilePath,
     registry: Option<&ScopeRegistry>,
     errors: &mut Vec<ValidationError>,
 ) {

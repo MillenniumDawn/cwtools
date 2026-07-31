@@ -61,7 +61,7 @@ pub(crate) fn validate_scope_target(
     value: &str,
     expected: &[String],
     leaf: &cwtools_parser::ast::Leaf,
-    file_path: &str,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
     if value.is_empty() || looks_like_data_ref(value) {

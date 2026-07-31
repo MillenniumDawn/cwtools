@@ -5,6 +5,7 @@ use cwtools_game::scope_engine::ScopeContext;
 use cwtools_parser::ast::{Child, SourcePos, Value};
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::StringTable;
+use smallvec::SmallVec;
 
 use crate::common::*;
 use crate::ctx::ValidationCtx;
@@ -14,6 +15,9 @@ use crate::scope::{enter_block_scope, scope_matches_required};
 use super::children::{rule_right_is_math_expr, validate_children};
 use super::leaf::validate_leaf;
 use super::matching::{PatternMatch, classify_pattern_match, is_scope_key};
+
+/// The overload set a single alias usage resolves to, each tagged `confident`.
+type Overloads<'a> = SmallVec<[(&'a (RuleType, Options), bool); 4]>;
 
 /// Gather every alias overload `alias[cat:key]` that the usage `key` resolves
 /// to: exact name, lowercase retry, `<type>`/`value[..]`/`enum[..]` patterns,
@@ -48,15 +52,18 @@ pub(crate) fn alias_overloads<'a>(
 /// Push order is exact → lowercase → patterns → scope_field; [`alias_overloads`]
 /// keeps all, the scope check filters to the confident subset, preserving that
 /// order. Order feeds `pick_best`'s tie-break.
+///
+/// A usage resolves to a handful of overloads at most, and this runs for every
+/// effect/trigger in the corpus, so the set is inline until it doesn't fit.
 fn alias_overloads_with_confidence<'a>(
     ruleset: &'a RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
     category: &str,
     key: &str,
-) -> Vec<(&'a (RuleType, Options), bool)> {
+) -> Overloads<'a> {
     // Gather candidate overloads via the precomputed alias index (O(1) exact +
     // O(patterns)) rather than scanning every alias.
-    let mut overloads: Vec<(&(RuleType, Options), bool)> = Vec::new();
+    let mut overloads: Overloads<'a> = SmallVec::new();
     if let Some(idxs) = ruleset.alias_exact.get(category).and_then(|m| m.get(key)) {
         for &i in idxs {
             overloads.push((&ruleset.aliases[i].1, true));
@@ -154,8 +161,9 @@ fn collect_loop_vars(
                 })
                 .unwrap_or(false);
             if matches_key {
-                let name = leaf_value_to_string(&leaf.value, table);
-                let norm = cwtools_index::VarIndex::normalize(&name);
+                let norm = with_leaf_value_str(&leaf.value, table, |name| {
+                    cwtools_index::VarIndex::normalize(name)
+                });
                 if !norm.is_empty() {
                     seeded.push(norm);
                 }
@@ -198,8 +206,6 @@ pub(super) fn validate_alias_usage(
         // permissive key-match in field_matches_key.
         return;
     }
-    let overloads: Vec<&(RuleType, Options)> =
-        overloads_conf.iter().map(|(rule, _)| *rule).collect();
     // Advice-about-the-key diagnostics below (scope, shape mismatch, custom
     // error) squiggle the key token, not the whole usage. Node-form usages
     // have no leaf and keep the whole-line fallback.
@@ -212,13 +218,15 @@ pub(super) fn validate_alias_usage(
     if ctx.scope_checks
         && key.contains('.')
         && !looks_like_data_ref(key)
-        && let Some(sc) = scope_context.as_ref()
+        && let Some(sc) = scope_context.as_mut()
     {
-        let mut probe = sc.clone();
-        if matches!(
-            probe.change_scope(key),
-            cwtools_game::scope_engine::ScopeResult::NotFound
-        ) {
+        // Probe on the live context and roll back: `save` snapshots into inline
+        // storage, where cloning the whole context heap-allocates its two scope
+        // stacks for every dotted key in the corpus.
+        let saved = sc.save();
+        let result = sc.change_scope(key);
+        sc.restore(saved);
+        if matches!(result, cwtools_game::scope_engine::ScopeResult::NotFound) {
             let code = &error_codes::CW248_INVALID_SCOPE_COMMAND;
             let (line, col) = leaf
                 .map(|l| (l.pos.start.line, l.pos.start.col))
@@ -260,19 +268,23 @@ pub(super) fn validate_alias_usage(
         // e.g. `oil` when vanilla resources aren't indexed) must not contribute
         // its unrelated `## scope`. With no confident overload the key's real
         // alias is unverifiable here, so stay lenient and skip the check.
-        let confident: Vec<&(RuleType, Options)> = overloads_conf
-            .iter()
-            .filter(|(_, c)| *c)
-            .map(|(rule, _)| *rule)
-            .collect();
-        let any_ok = confident.is_empty()
-            || confident
+        let mut any_confident = false;
+        let mut any_ok = false;
+        for &((_, opts), confident) in &overloads_conf {
+            if !confident {
+                continue;
+            }
+            any_confident = true;
+            if scope_matches_required(current, reg, &opts.required_scopes) {
+                any_ok = true;
+                break;
+            }
+        }
+        if any_confident && !any_ok {
+            let mut expected: Vec<String> = overloads_conf
                 .iter()
-                .any(|(_, opts)| scope_matches_required(current, reg, &opts.required_scopes));
-        if !any_ok {
-            let mut expected: Vec<String> = confident
-                .iter()
-                .flat_map(|(_, o)| o.required_scopes.iter().cloned())
+                .filter(|(_, c)| *c)
+                .flat_map(|((_, o), _)| o.required_scopes.iter().cloned())
                 .collect();
             expected.sort_unstable();
             expected.dedup();
@@ -307,7 +319,9 @@ pub(super) fn validate_alias_usage(
     // diagnostic. Mirrors the same authoritative bypass in `count_and_validate_children`.
     if let Some(leaf) = leaf
         && matches!(&leaf.value, Value::Clause(_))
-        && let Some((mrt, _)) = overloads.iter().find(|(rt, _)| rule_right_is_math_expr(rt))
+        && let Some(((mrt, _), _)) = overloads_conf
+            .iter()
+            .find(|((rt, _), _)| rule_right_is_math_expr(rt))
     {
         validate_leaf(ctx, leaf, mrt, scope_context.as_ref(), errors);
         return;
@@ -319,7 +333,7 @@ pub(super) fn validate_alias_usage(
     // match exists (F# `errorIfOnlyMatch` / CW272).
     let mut only_match: Option<ValidationError> = None;
     let mut temp: Vec<ValidationError> = Vec::new();
-    for (rule_type, opts) in overloads {
+    for &((rule_type, opts), _) in &overloads_conf {
         temp.clear();
         match rule_type {
             RuleType::LeafRule { .. } => {
@@ -441,7 +455,7 @@ pub(super) fn validate_alias_usage(
 /// usage; it ranks a candidate and, when no better candidate exists, is surfaced
 /// at the offending leaf's position. F# `ConfigRulesUnexpectedAliasKeyValue`.
 fn alias_mismatch_error(
-    file_path: &str,
+    file_path: &crate::FilePath,
     category: &str,
     value: &str,
     line: u32,

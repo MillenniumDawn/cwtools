@@ -102,7 +102,7 @@ fn test_error_hash() {
         severity: ErrorSeverity::Error,
         line: 3,
         col: 10,
-        file: "test.txt".to_string(),
+        file: "test.txt".into(),
         code: None,
         fix: None,
         end: None,
@@ -129,7 +129,7 @@ fn fix_payload_does_not_change_error_hash() {
         severity: ErrorSeverity::Warning,
         line: 7,
         col: 4,
-        file: "common/ideas/x.txt".to_string(),
+        file: "common/ideas/x.txt".into(),
         code: Some("CW282"),
         fix: None,
         end: None,
@@ -417,6 +417,137 @@ sound = {
         cw113.is_empty(),
         "sound file beside the .asset should resolve, got: {:?}",
         cw113
+    );
+}
+
+/// `filepath[gfx/,.dds]` declares both a root prefix and an extension. A
+/// reference that already carries either one — in any case — must not have it
+/// appended or prepended a second time.
+const PREFIX_EXT_CWT: &str = r#"
+spriteType = {
+    texturefile = filepath[gfx/,.dds]
+}
+types = {
+    type[spriteType] = {
+        path = "game/interface"
+    }
+}
+"#;
+
+fn filepath_errors(script: &str, indexed: &[&str]) -> Vec<(Option<&'static str>, String)> {
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(PREFIX_EXT_CWT, &table).unwrap(), &table);
+    let mut idx = TypeIndex::new();
+    idx.file_index
+        .add_paths(indexed.iter().map(|s| s.to_string()));
+    let parsed = parse_string(script, &table).unwrap();
+    validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/interface/test.gfx",
+        Some(cwtools_validation::Game::Hoi4),
+        Some(&idx),
+        None,
+    )
+    .into_iter()
+    .filter(|e| e.code == Some("CW113"))
+    .map(|e| (e.code, e.message))
+    .collect()
+}
+
+#[test]
+fn extension_already_present_in_mixed_case_is_not_appended_twice() {
+    // `.DDS` is the configured `.dds` in another case. Appending would look for
+    // `gfx/x.DDS.dds`, which is not what the engine resolves.
+    let errs = filepath_errors(
+        "spriteType = {\n    texturefile = \"gfx/x.DDS\"\n}\n",
+        &["gfx/x.dds"],
+    );
+    assert!(
+        errs.is_empty(),
+        "a mixed-case extension must count as already present, got: {errs:?}"
+    );
+}
+
+#[test]
+fn prefix_already_present_in_mixed_case_is_not_prepended_twice() {
+    // `GFX/` is the configured `gfx/` in another case. Prepending would look for
+    // `gfx/GFX/x.dds`.
+    let errs = filepath_errors(
+        "spriteType = {\n    texturefile = \"GFX/x.dds\"\n}\n",
+        &["gfx/x.dds"],
+    );
+    assert!(
+        errs.is_empty(),
+        "a mixed-case prefix must count as already present, got: {errs:?}"
+    );
+}
+
+#[test]
+fn missing_prefix_and_extension_are_both_supplied() {
+    // The complement of the two above: a bare reference gets both, and the
+    // resulting candidate is what resolves against the index.
+    let errs = filepath_errors(
+        "spriteType = {\n    texturefile = \"x\"\n}\n",
+        &["gfx/x.dds"],
+    );
+    assert!(
+        errs.is_empty(),
+        "a bare reference must resolve as gfx/x.dds, got: {errs:?}"
+    );
+}
+
+#[test]
+fn a_genuinely_missing_prefixed_reference_still_reports_the_built_candidate() {
+    // Guard against blanket suppression, and pin the message: the candidate the
+    // diagnostic names is the prefixed-and-extended form actually looked up.
+    let errs = filepath_errors(
+        "spriteType = {\n    texturefile = \"ghost\"\n}\n",
+        &["gfx/x.dds"],
+    );
+    assert_eq!(
+        errs.len(),
+        1,
+        "a missing reference must report, got: {errs:?}"
+    );
+    assert!(
+        errs[0].1.contains("gfx/ghost.dds"),
+        "the diagnostic should name the built candidate, got: {:?}",
+        errs[0].1
+    );
+}
+
+#[test]
+fn texture_sibling_lookup_handles_a_mixed_case_non_ascii_path() {
+    // The sibling swap rewrites the last four bytes of the candidate. A
+    // non-ASCII stem makes that a byte offset that must still land on a
+    // character boundary, and the extension is matched case-insensitively.
+    // No configured extension here: with one, the field appends it before the
+    // sibling swap is ever reached.
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table).unwrap(), &table);
+    let mut idx = TypeIndex::new();
+    idx.file_index.add_paths(["gfx/café.dds".to_string()]);
+
+    let parsed = parse_string(
+        "spriteType = {\n    texturefile = \"gfx/café.TGA\"\n}\n",
+        &table,
+    )
+    .unwrap();
+    let errs = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/interface/test.gfx",
+        Some(cwtools_validation::Game::Hoi4),
+        Some(&idx),
+        None,
+    );
+    let cw113: Vec<_> = errs.iter().filter(|e| e.code == Some("CW113")).collect();
+    assert!(
+        cw113.is_empty(),
+        "a .TGA reference should resolve via its .dds sibling, got: {cw113:?}"
     );
 }
 

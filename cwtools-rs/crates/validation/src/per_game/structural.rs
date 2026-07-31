@@ -149,7 +149,7 @@ fn push(
     code: &error_codes::ErrorCode,
     msg: String,
     r: SourceRange,
-    file: &str,
+    file: &crate::FilePath,
 ) {
     errors.push(
         ValidationError::from_code_with(code, code.severity, file, r.start.line, r.start.col, msg)
@@ -164,7 +164,7 @@ fn push_fix(
     code: &error_codes::ErrorCode,
     msg: String,
     r: SourceRange,
-    file: &str,
+    file: &crate::FilePath,
     fix: SuggestedFix,
 ) {
     errors.push(
@@ -181,7 +181,7 @@ fn validate_event_every_tick(
     ast: &ParsedFile,
     table: &StringTable,
     kw: &Keywords,
-    file_path: &str,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
     if !under_dir_segment(file_path, "events") {
@@ -241,7 +241,7 @@ fn validate_if_else_order(
     ast: &ParsedFile,
     table: &StringTable,
     kw: &Keywords,
-    file_path: &str,
+    file_path: &crate::FilePath,
     errors: &mut Vec<ValidationError>,
 ) {
     for child in children {
@@ -287,7 +287,7 @@ fn walk(
     children: &[Child],
     ast: &ParsedFile,
     kw: &Keywords,
-    file_path: &str,
+    file_path: &crate::FilePath,
     parent: BoolState,
     cw223_msg: &str,
     errors: &mut Vec<ValidationError>,
@@ -413,7 +413,7 @@ fn walk(
 pub fn validate_structural(
     ast: &ParsedFile,
     table: &StringTable,
-    file_path: &str,
+    file_path: &crate::FilePath,
     game: Game,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -453,7 +453,7 @@ mod tests {
         let table = StringTable::new();
         let ast = parse_string(src, &table).unwrap();
         let mut errors = Vec::new();
-        validate_structural(&ast, &table, path, Game::Hoi4, &mut errors);
+        validate_structural(&ast, &table, &path.into(), Game::Hoi4, &mut errors);
         errors.iter().filter_map(|e| e.code).collect()
     }
 
@@ -463,7 +463,7 @@ mod tests {
         let table = StringTable::new();
         let ast = parse_string(src, &table).unwrap();
         let mut errors = Vec::new();
-        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+        validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
         let err = errors
             .iter()
@@ -475,7 +475,7 @@ mod tests {
 
         let ast2 = parse_string(&fixed, &table).unwrap();
         let mut errors2 = Vec::new();
-        validate_structural(&ast2, &table, "test.txt", Game::Hoi4, &mut errors2);
+        validate_structural(&ast2, &table, &"test.txt".into(), Game::Hoi4, &mut errors2);
         assert!(
             !errors2.iter().any(|e| e.code == Some(code)),
             "{code} must be gone after applying the fix"
@@ -490,7 +490,7 @@ mod tests {
         let table = StringTable::new();
         let ast = parse_string(src, &table).unwrap();
         let mut errors = Vec::new();
-        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+        validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
         let err = errors
             .iter()
@@ -536,7 +536,7 @@ mod tests {
             let table = StringTable::new();
             let ast = parse_string(src, &table).unwrap();
             let mut errors = Vec::new();
-            validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+            validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
             let err = errors
                 .iter()
@@ -567,7 +567,7 @@ mod tests {
             let table = StringTable::new();
             let ast = parse_string(src, &table).unwrap();
             let mut errors = Vec::new();
-            validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+            validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
             let err = errors
                 .iter()
@@ -800,7 +800,13 @@ mod tests {
         let table = StringTable::new();
         let ast = parse_string("my_event = {\n    id = test.1\n}\n", &table).unwrap();
         let mut errors = Vec::new();
-        validate_structural(&ast, &table, "events/test.txt", Game::Hoi4, &mut errors);
+        validate_structural(
+            &ast,
+            &table,
+            &"events/test.txt".into(),
+            Game::Hoi4,
+            &mut errors,
+        );
 
         let err = errors
             .iter()
@@ -897,7 +903,7 @@ mod tests {
         let table = StringTable::new();
         let ast = parse_string("foo = {\n    else = { a = 1 }\n}\n", &table).unwrap();
         let mut errors = Vec::new();
-        validate_structural(&ast, &table, "test.txt", Game::Hoi4, &mut errors);
+        validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
         let err = errors
             .iter()

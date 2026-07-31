@@ -96,11 +96,14 @@ pub fn rules_at_pos(
     let ruleset = prepared.ruleset;
     let table = prepared.table;
     let mut scope_context = initial_scope_context(file_path, prepared.registry);
+    // The resolver discards the diagnostics it produces, but the shared context
+    // still wants the run's shared path.
+    let file_arc: crate::FilePath = std::sync::Arc::from(file_path);
     let ctx = ValidationCtx {
         ast,
         ruleset,
         table,
-        file_path,
+        file_path: &file_arc,
         game: prepared.game,
         type_index: prepared.type_index,
         modifier_keys: prepared.modifier_keys,

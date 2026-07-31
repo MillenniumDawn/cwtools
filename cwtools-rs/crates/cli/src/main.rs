@@ -428,9 +428,11 @@ fn json_escape(s: &str) -> String {
 /// file/severity/code/message/line/hash — never a diagnostic's `fix`, so a
 /// `SuggestedFix` payload is inert here (locked in by `fix_payload_is_inert`).
 struct Diag {
-    file: String,
+    file: cwtools_validation::FilePath,
     severity: cwtools_validation::ErrorSeverity,
-    code: String,
+    /// The catalog id (`""` for a diagnostic with no code). Both sources hand
+    /// one out as `&'static str`, so the row never owns a copy.
+    code: &'static str,
     message: String,
     line: u32,
     /// 1-based column, normalised from the emitting subsystem's convention.
@@ -439,6 +441,9 @@ struct Diag {
     col: u32,
     hash: String,
     /// The previous line-number digest, for matching older baselines only.
+    /// Empty unless an `--ignore-hashes` baseline was loaded — nothing else
+    /// reads it, and computing one costs another relativize-and-digest per
+    /// diagnostic.
     legacy_hash: String,
 }
 
@@ -450,16 +455,35 @@ fn is_ignored(ignored: &std::collections::HashSet<String>, d: &Diag) -> bool {
     ignored.contains(&d.hash) || ignored.contains(&d.legacy_hash)
 }
 
+/// The legacy line-number digest, or an empty string when no baseline is loaded
+/// and nothing will ever compare against it.
+fn legacy_hash_if_wanted(
+    wanted: bool,
+    root: &Path,
+    file: &str,
+    code: &str,
+    message: &str,
+    line: u32,
+) -> String {
+    if wanted {
+        legacy_diag_hash(root, file, code, message, line)
+    } else {
+        String::new()
+    }
+}
+
 /// Map a `ValidationError` to a report `Diag`, computing its hash from the
-/// trimmed source line. Consumes the error (moves the message). The `fix` field
-/// is deliberately dropped. `root` is the mod root the hash is relativized
-/// against; the emitted `file` column is untouched.
-fn validation_to_diag(root: &Path, file: &str, err: ValidationError, line_text: &str) -> Diag {
-    let code = err.code.unwrap_or_default().to_string();
-    let hash = diag_hash(root, file, &code, &err.message, line_text);
-    let legacy_hash = legacy_diag_hash(root, file, &code, &err.message, err.line);
+/// trimmed source line. Consumes the error (moves the message and the shared
+/// file path). The `fix` field is deliberately dropped. `root` is the mod root
+/// the hash is relativized against; the emitted `file` column is untouched.
+/// `legacy` requests the older line-number digest, needed only when matching an
+/// `--ignore-hashes` baseline.
+fn validation_to_diag(root: &Path, err: ValidationError, line_text: &str, legacy: bool) -> Diag {
+    let code = err.code.unwrap_or_default();
+    let hash = diag_hash(root, &err.file, code, &err.message, line_text);
+    let legacy_hash = legacy_hash_if_wanted(legacy, root, &err.file, code, &err.message, err.line);
     Diag {
-        file: file.to_string(),
+        file: err.file,
         severity: err.severity,
         code,
         message: err.message,
@@ -479,15 +503,15 @@ fn loc_diagnostic_to_diag(
     root: &Path,
     d: cwtools_localization::LocDiagnostic,
     line_text: &str,
+    legacy: bool,
 ) -> Diag {
     let line = d.line as u32;
-    let code = d.code.to_string();
-    let hash = diag_hash(root, &d.file, &code, &d.message, line_text);
-    let legacy_hash = legacy_diag_hash(root, &d.file, &code, &d.message, line);
+    let hash = diag_hash(root, &d.file, d.code, &d.message, line_text);
+    let legacy_hash = legacy_hash_if_wanted(legacy, root, &d.file, d.code, &d.message, line);
     Diag {
-        file: d.file,
+        file: d.file.as_str().into(),
         severity: d.severity,
-        code,
+        code: d.code,
         message: d.message,
         line,
         // Loc diagnostics already count columns from 1.
@@ -502,13 +526,13 @@ fn loc_diagnostic_to_diag(
 /// Error-severity; `line` is 0 like other whole-file diagnostics, so there's no
 /// source line to key the hash on. `root` is the mod root the hash is
 /// relativized against.
-fn loc_parse_error_to_diag(root: &Path, file: String, message: String) -> Diag {
+fn loc_parse_error_to_diag(root: &Path, file: String, message: String, legacy: bool) -> Diag {
     let hash = diag_hash(root, &file, "", &message, "");
-    let legacy_hash = legacy_diag_hash(root, &file, "", &message, 0);
+    let legacy_hash = legacy_hash_if_wanted(legacy, root, &file, "", &message, 0);
     Diag {
-        file,
+        file: file.as_str().into(),
         severity: ErrorSeverity::Error,
-        code: String::new(),
+        code: "",
         message,
         line: 0,
         col: 1,
@@ -524,7 +548,7 @@ fn csv_row(d: &Diag) -> String {
         csv_escape(&d.file),
         d.line,
         d.severity,
-        csv_escape(&d.code),
+        csv_escape(d.code),
         csv_escape(&d.message),
         d.hash
     )
@@ -537,7 +561,7 @@ fn json_row(d: &Diag, last: bool) -> String {
         json_escape(&d.file),
         d.line,
         d.severity,
-        json_escape(&d.code),
+        json_escape(d.code),
         json_escape(&d.message),
         d.hash,
         if last { "" } else { "," }
@@ -1187,18 +1211,19 @@ fn main() {
 
             // The driver validates files in parallel, in input order, so the
             // report is byte-for-byte identical to the sequential version.
+            let want_legacy_hash = !ignored.is_empty();
             let mut sources = SourceLines::default();
             let mut diags: Vec<Diag> = Vec::new();
             for (path, errors) in session.validate_all() {
-                let file_str = path.to_str().unwrap_or("").to_string();
+                let file_str = path.to_str().unwrap_or("");
                 for err in errors {
                     // Same placement as the hash baseline: a suppressed code
                     // never reaches the counts, the report or --output-hashes.
                     if !codes::wanted(err.code.unwrap_or_default(), &only_codes, &ignore_codes) {
                         continue;
                     }
-                    let line_text = sources.trimmed(&file_str, err.line);
-                    let d = validation_to_diag(&directory, &file_str, err, line_text);
+                    let line_text = sources.trimmed(file_str, err.line);
+                    let d = validation_to_diag(&directory, err, line_text, want_legacy_hash);
                     if is_ignored(&ignored, &d) {
                         continue;
                     }
@@ -1226,7 +1251,7 @@ fn main() {
                     continue;
                 }
                 let line_text = sources.trimmed(&d.file, d.line as u32).to_string();
-                let d = loc_diagnostic_to_diag(&directory, d, &line_text);
+                let d = loc_diagnostic_to_diag(&directory, d, &line_text, want_legacy_hash);
                 if is_ignored(&ignored, &d) {
                     continue;
                 }
@@ -1317,7 +1342,7 @@ fn main() {
                     // cli: grouped by file
                     let mut current = "";
                     for d in &diags {
-                        if d.file != current {
+                        if &*d.file != current {
                             out.push_str(&format!("\n  {}:\n", d.file));
                             current = &d.file;
                         }
@@ -1514,6 +1539,7 @@ fn main() {
 
             // Standalone loc lint uses the scope-independent checks (CW225 etc.);
             // scope-aware command checks need the referencing config's scope.
+            let want_legacy_hash = !ignored.is_empty();
             let mut sources = SourceLines::default();
             let keep = |d: &Diag| {
                 !is_ignored(&ignored, d)
@@ -1524,7 +1550,7 @@ fn main() {
                 .filter(|d| codes::wanted(d.code, &only_codes, &ignore_codes))
                 .map(|d| {
                     let line_text = sources.trimmed(&d.file, d.line as u32).to_string();
-                    loc_diagnostic_to_diag(&directory, d, &line_text)
+                    loc_diagnostic_to_diag(&directory, d, &line_text, want_legacy_hash)
                 })
                 .filter(keep)
                 .collect();
@@ -1539,7 +1565,12 @@ fn main() {
                 .errors()
                 .iter()
                 .map(|(file, message)| {
-                    loc_parse_error_to_diag(&directory, file.clone(), message.clone())
+                    loc_parse_error_to_diag(
+                        &directory,
+                        file.clone(),
+                        message.clone(),
+                        want_legacy_hash,
+                    )
                 })
                 .filter(keep)
                 .collect();
@@ -1584,10 +1615,10 @@ fn main() {
                     out.push_str(&report::sarif_report(&all, &report::report_root()));
                 }
                 ReportType::Cli => {
-                    let mut by_file: std::collections::BTreeMap<String, Vec<&Diag>> =
+                    let mut by_file: std::collections::BTreeMap<&str, Vec<&Diag>> =
                         std::collections::BTreeMap::new();
                     for d in &diags {
-                        by_file.entry(d.file.clone()).or_default().push(d);
+                        by_file.entry(&d.file).or_default().push(d);
                     }
                     for (file, ds) in &by_file {
                         out.push_str(&format!("\n  {} — {} issues:\n", file, ds.len()));
@@ -1962,7 +1993,7 @@ mod tests {
             severity: ErrorSeverity::Information,
             line: 12,
             col: 4,
-            file: "common/ideas/x.txt".to_string(),
+            file: "common/ideas/x.txt".into(),
             code: Some("CW282"),
             fix: None,
             end: None,
@@ -2054,8 +2085,8 @@ mod tests {
         let mut moved = err_base();
         moved.line += 2;
         let root = Path::new(".");
-        let before = validation_to_diag(root, "common/ideas/x.txt", err_base(), "cost = 150");
-        let after = validation_to_diag(root, "common/ideas/x.txt", moved, "cost = 150");
+        let before = validation_to_diag(root, err_base(), "cost = 150", true);
+        let after = validation_to_diag(root, moved, "cost = 150", true);
         assert_eq!(
             before.hash, after.hash,
             "inserting a line above a diagnostic must not change its digest"
@@ -2071,8 +2102,8 @@ mod tests {
     #[test]
     fn hash_changes_when_the_source_line_changes() {
         let root = Path::new(".");
-        let a = validation_to_diag(root, "common/ideas/x.txt", err_base(), "cost = 150");
-        let b = validation_to_diag(root, "common/ideas/x.txt", err_base(), "cost = 200");
+        let a = validation_to_diag(root, err_base(), "cost = 150", true);
+        let b = validation_to_diag(root, err_base(), "cost = 200", true);
         assert_ne!(a.hash, b.hash);
     }
 
@@ -2081,7 +2112,7 @@ mod tests {
     #[test]
     fn legacy_hashes_still_match_but_are_not_emitted() {
         let root = Path::new(".");
-        let d = validation_to_diag(root, "common/ideas/x.txt", err_base(), "cost = 150");
+        let d = validation_to_diag(root, err_base(), "cost = 150", true);
         let legacy = legacy_diag_hash(
             root,
             "common/ideas/x.txt",
@@ -2108,6 +2139,54 @@ mod tests {
         assert!(!csv_row(&d).contains(&d.legacy_hash));
     }
 
+    /// The legacy digest exists only to match an `--ignore-hashes` baseline, so
+    /// a run without one does not compute it. Everything else about the row is
+    /// unchanged, including the emitted digest.
+    #[test]
+    fn legacy_hash_is_skipped_without_a_baseline() {
+        let root = Path::new(".");
+        let with_baseline = validation_to_diag(root, err_base(), "cost = 150", true);
+        let without = validation_to_diag(root, err_base(), "cost = 150", false);
+
+        assert!(
+            without.legacy_hash.is_empty(),
+            "no baseline means no legacy digest, got {:?}",
+            without.legacy_hash
+        );
+        assert!(!with_baseline.legacy_hash.is_empty());
+        assert_eq!(
+            with_baseline.hash, without.hash,
+            "the emitted digest must not depend on whether a baseline was loaded"
+        );
+        assert_eq!(csv_row(&with_baseline), csv_row(&without));
+    }
+
+    /// Skipping the legacy digest must not change which diagnostics a baseline
+    /// suppresses. The new digest still matches, and an unrelated baseline still
+    /// does not — an empty `legacy_hash` must never be treated as a match.
+    #[test]
+    fn skipping_the_legacy_hash_does_not_change_suppression() {
+        let root = Path::new(".");
+        let d = validation_to_diag(root, err_base(), "cost = 150", false);
+
+        let fresh: std::collections::HashSet<String> = [d.hash.clone()].into_iter().collect();
+        assert!(
+            is_ignored(&fresh, &d),
+            "a baseline holding the new digest still suppresses"
+        );
+
+        let unrelated: std::collections::HashSet<String> =
+            ["0000000000000000".to_string()].into_iter().collect();
+        assert!(
+            !is_ignored(&unrelated, &d),
+            "an unrelated baseline must not suppress"
+        );
+        assert!(
+            !is_ignored(&std::collections::HashSet::new(), &d),
+            "an empty baseline must not suppress"
+        );
+    }
+
     /// The legacy digest is a compatibility contract with baselines already on
     /// disk, so its bytes are frozen, not just its shape. This value is FNV-1a-64
     /// over `common/ideas/x.txt|CW282|redundant default|12`, exactly what the
@@ -2131,8 +2210,8 @@ mod tests {
     #[test]
     fn parse_error_hashes_are_distinct_without_a_source_line() {
         let root = Path::new(".");
-        let a = loc_parse_error_to_diag(root, "l_english.yml".into(), "bad yaml".into());
-        let b = loc_parse_error_to_diag(root, "l_english.yml".into(), "worse yaml".into());
+        let a = loc_parse_error_to_diag(root, "l_english.yml".into(), "bad yaml".into(), true);
+        let b = loc_parse_error_to_diag(root, "l_english.yml".into(), "worse yaml".into(), true);
         assert_ne!(a.hash, b.hash);
     }
 
@@ -2171,8 +2250,8 @@ mod tests {
         with_fix.end = Some((12, 30));
 
         let root = Path::new(".");
-        let d0 = validation_to_diag(root, &base.file.clone(), base, "cost = 150");
-        let d1 = validation_to_diag(root, &with_fix.file.clone(), with_fix, "cost = 150");
+        let d0 = validation_to_diag(root, base, "cost = 150", true);
+        let d1 = validation_to_diag(root, with_fix, "cost = 150", true);
 
         assert_eq!(d0.hash, d1.hash, "hash must ignore the fix");
         assert_eq!(csv_row(&d0), csv_row(&d1), "csv row must ignore the fix");

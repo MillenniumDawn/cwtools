@@ -94,14 +94,16 @@ pub(super) fn check_variable_get(
 /// candidate is a texture whose sibling-extension file exists in the index, so
 /// CW113 only fires when neither extension is present.
 fn texture_sibling_exists(candidate: &str, file_index: &cwtools_index::FileIndex) -> bool {
-    let lower = candidate.to_ascii_lowercase();
-    let sibling = if let Some(stem) = lower.strip_suffix(".dds") {
-        format!("{stem}.tga")
-    } else if let Some(stem) = lower.strip_suffix(".tga") {
-        format!("{stem}.dds")
+    let swap = if ends_with_ci(candidate, ".dds") {
+        ".tga"
+    } else if ends_with_ci(candidate, ".tga") {
+        ".dds"
     } else {
         return false;
     };
+    let mut sibling = candidate.to_ascii_lowercase();
+    sibling.truncate(sibling.len() - 4);
+    sibling.push_str(swap);
     file_index.contains(&sibling)
 }
 
@@ -260,33 +262,33 @@ pub(super) fn validate_leaf(
                         // The reference with the field's configured extension applied
                         // (if any), without the root prefix. Used for the root-prefixed
                         // lookup and the `.asset`-relative fallback below.
-                        let mut rel_value = value.to_string();
+                        let mut rel_value = String::with_capacity(value.len() + 8);
+                        rel_value.push_str(value);
                         if let Some(ext) = extension
                             && !ext.is_empty()
-                            && !rel_value
-                                .to_ascii_lowercase()
-                                .ends_with(&ext.to_ascii_lowercase())
+                            && !ends_with_ci(&rel_value, ext)
                         {
                             rel_value.push_str(ext);
                         }
-                        let candidate = match prefix {
-                            Some(p)
-                                if !value
-                                    .to_ascii_lowercase()
-                                    .starts_with(&p.to_ascii_lowercase()) =>
-                            {
-                                format!("{}{}", p, rel_value)
+                        // Prefixed form, built only when the value doesn't already
+                        // carry the root prefix; otherwise the reference IS the
+                        // candidate and needs no second copy.
+                        let prefixed;
+                        let candidate: &str = match prefix {
+                            Some(p) if !starts_with_ci(value, p) => {
+                                prefixed = format!("{}{}", p, rel_value);
+                                &prefixed
                             }
-                            _ => rel_value.clone(),
+                            _ => &rel_value,
                         };
                         // A `.asset` `file =` (sound/entity assets) resolves relative
                         // to the .asset's own directory, not the field's root prefix
                         // (e.g. `sound/zom/zom_vo.asset` -> `zom_idle_001.wav` beside
                         // it). Genuinely-missing siblings still fail to resolve.
-                        let asset_relative = file_path.to_ascii_lowercase().ends_with(".asset")
+                        let asset_relative = ends_with_ci(file_path, ".asset")
                             && idx.file_index.resolve_relative(file_path, &rel_value);
-                        if !idx.file_index.contains(&candidate)
-                            && !texture_sibling_exists(&candidate, &idx.file_index)
+                        if !idx.file_index.contains(candidate)
+                            && !texture_sibling_exists(candidate, &idx.file_index)
                             && !asset_relative
                         {
                             let code = &error_codes::CW113_MISSING_FILE;
@@ -296,7 +298,7 @@ pub(super) fn validate_leaf(
                                     file_path,
                                     leaf.pos.start.line,
                                     leaf.pos.start.col,
-                                    &[&candidate],
+                                    &[candidate],
                                 )
                                 .with_end(leaf.pos.end),
                             );
