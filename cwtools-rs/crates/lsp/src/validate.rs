@@ -7,7 +7,10 @@ use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringId;
-use cwtools_validation::{Prepared, ValidationError, validate_prepared};
+use cwtools_validation::references::{UsedInstances, check_unused_instances, needs_use_tracking};
+use cwtools_validation::{
+    Prepared, ValidationError, validate_prepared, validate_prepared_tracking_uses,
+};
 
 use crate::paths::{
     encoded_position_len, logical_path_from_uri, source_column_to_lsp, uri_to_path_str,
@@ -206,24 +209,35 @@ pub(crate) fn append_missing_loc_errors(
 /// returning LSP diagnostics. The prebuilt state is passed in (not re-locked
 /// here) so the full-workspace pass can take its read guards once and share the
 /// `Prepared` across rayon threads — it is `Copy` and all-borrows, so `Sync`.
+///
+/// With `track_uses`, the file's `<type>` references to tracked
+/// (`should_be_used`) types are recorded and returned alongside the
+/// diagnostics; the caller folds them into the workspace-wide store the
+/// unused-instance check (CW239/CW231) reads. `false` keeps the plain path.
 pub(crate) fn validate_parsed_with_indexes(
     uri: &str,
     parsed: &ParsedFile,
     prepared: &Prepared,
     lines: &DocLines,
-) -> Vec<Diagnostic> {
+    track_uses: bool,
+) -> (Vec<Diagnostic>, Option<UsedInstances>) {
     let mut diagnostics: Vec<Diagnostic> = parsed
         .errors
         .iter()
         .map(|e| parse_error_to_diagnostic(e, lines))
         .collect();
-    let mut errs = validate_prepared(parsed, uri, prepared);
+    let (mut errs, used) = if track_uses {
+        let (errs, used) = validate_prepared_tracking_uses(parsed, uri, prepared);
+        (errs, Some(used))
+    } else {
+        (validate_prepared(parsed, uri, prepared), None)
+    };
     append_missing_loc_errors(uri, prepared, &mut errs);
     truncate_validation_errors(&mut errs, uri);
     for err in &errs {
         diagnostics.push(validation_error_to_diagnostic(err, lines));
     }
-    diagnostics
+    (diagnostics, used)
 }
 
 /// A document's lines plus the negotiated position encoding: everything the
@@ -606,7 +620,103 @@ impl Backend {
             scope_checks,
             var_checks,
         );
-        validate_parsed_with_indexes(uri, parsed, &prepared, lines)
+        let track = needs_use_tracking(ruleset, game);
+        let (mut diagnostics, used) =
+            validate_parsed_with_indexes(uri, parsed, &prepared, lines, track);
+        if let Some(used) = used {
+            for err in
+                &self.unused_instance_errors(uri, used, ruleset, game, &info_guard.type_index)
+            {
+                diagnostics.push(validation_error_to_diagnostic(err, lines));
+            }
+        }
+        diagnostics
+    }
+
+    /// Replace `uri`'s recorded `<type>` uses and return the instance names
+    /// whose "is it used?" answer may have changed (empty when nothing moved).
+    /// The merge revision is only bumped on a real change, so the common
+    /// keystroke — uses identical to last time — keeps [`Self::merged_type_uses`]
+    /// hitting its cache.
+    fn refresh_type_uses(&self, uri: &str, uses: UsedInstances) -> HashSet<String> {
+        let mut store = self.state.type_uses.write();
+        let changed: HashSet<String> = match store.get(uri) {
+            Some(prev) => prev.changed_names(&uses).into_iter().collect(),
+            None => uses
+                .changed_names(&UsedInstances::default())
+                .into_iter()
+                .collect(),
+        };
+        if !changed.is_empty() || !store.contains_key(uri) {
+            store.insert(uri.to_string(), uses);
+        }
+        drop(store);
+        if !changed.is_empty() {
+            self.state
+                .type_uses_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        changed
+    }
+
+    /// The union of every file's recorded uses — what the batch driver folds
+    /// per run, kept as a cache keyed on `type_uses_revision` here because the
+    /// LSP needs it per validated file rather than once.
+    pub(crate) fn merged_type_uses(&self) -> Arc<UsedInstances> {
+        let revision = self
+            .state
+            .type_uses_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cached = {
+            let guard = self.state.type_uses_merged.lock();
+            guard
+                .as_ref()
+                .filter(|(cached_revision, _)| *cached_revision == revision)
+                .map(|(_, merged)| Arc::clone(merged))
+        };
+        if let Some(merged) = cached {
+            return merged;
+        }
+        let mut merged = UsedInstances::default();
+        for uses in self.state.type_uses.read().values() {
+            merged.merge_from(uses);
+        }
+        let merged = Arc::new(merged);
+        *self.state.type_uses_merged.lock() = Some((revision, Arc::clone(&merged)));
+        merged
+    }
+
+    /// Fold one file's freshly-recorded uses into the store, queue the names
+    /// whose used-status changed for the dependent sweep, and return the
+    /// CW239/CW231 errors for the definitions in `uri` nothing in the
+    /// workspace references.
+    ///
+    /// Gated on `index_ready`: before the first scan the store only covers the
+    /// files validated so far, so "nothing uses this" would be answered from a
+    /// fragment and flag almost everything. The scan itself runs the check
+    /// against its own complete pass instead (see `validate_entire_workspace`).
+    pub(crate) fn unused_instance_errors(
+        &self,
+        uri: &str,
+        uses: UsedInstances,
+        ruleset: &RuleSet,
+        game: Option<cwtools_game::constants::Game>,
+        type_index: &cwtools_info::TypeIndex,
+    ) -> Vec<ValidationError> {
+        let changed = self.refresh_type_uses(uri, uses);
+        if !changed.is_empty() {
+            self.state.pending_changed_names.lock().extend(changed);
+        }
+        if !self
+            .state
+            .index_ready
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Vec::new();
+        }
+        let merged = self.merged_type_uses();
+        let instances = type_index.instances_in_file(uri);
+        check_unused_instances(ruleset, game, &instances, &merged, &uri.into())
     }
 
     /// Publish diagnostics after dropping any whose code the user suppressed via
@@ -730,27 +840,31 @@ impl Backend {
             let info = self.state.info_service.read();
             (info.export_fingerprint(&uri), info.export_names(&uri))
         };
-        if exports_before != exports_after {
-            // Only the names that were added or removed can change another
-            // file's diagnostics. Revalidate the open docs that reference any of
-            // them (symmetric difference of the before/after name sets).
-            //
-            // The fingerprint also tracks multiplicity, so it can differ while
-            // the name SET is unchanged (e.g. a duplicate definition added, or a
-            // type changed under the same name) — a case that can still flip a
-            // dependent's diagnostic. When that happens `changed_names` is empty;
-            // fall back to `None` (revalidate every dependent) so we never miss
-            // one. Soundness beats scoping here.
-            let mut changed_names: HashSet<String> = names_before
-                .symmetric_difference(&names_after)
-                .cloned()
-                .collect();
-            // Drain any names accumulated from preempted prior sweeps so this
-            // sweep covers their dependents too.
-            {
-                let mut pending = self.state.pending_changed_names.lock();
-                changed_names.extend(pending.drain());
-            }
+        let exports_changed = exports_before != exports_after;
+        // Only the names that were added or removed can change another
+        // file's diagnostics. Revalidate the open docs that reference any of
+        // them (symmetric difference of the before/after name sets).
+        //
+        // The fingerprint also tracks multiplicity, so it can differ while
+        // the name SET is unchanged (e.g. a duplicate definition added, or a
+        // type changed under the same name) — a case that can still flip a
+        // dependent's diagnostic. When that happens `changed_names` is empty;
+        // fall back to `None` (revalidate every dependent) so we never miss
+        // one. Soundness beats scoping here.
+        let mut changed_names: HashSet<String> = names_before
+            .symmetric_difference(&names_after)
+            .cloned()
+            .collect();
+        // Drain any names accumulated from preempted prior sweeps so this
+        // sweep covers their dependents too — plus the names this edit's own
+        // validate queued when the file's `<type>` use set changed, which is
+        // how an added or removed reference reaches the file DEFINING the
+        // instance and flips its CW239/CW231 without its exports moving.
+        {
+            let mut pending = self.state.pending_changed_names.lock();
+            changed_names.extend(pending.drain());
+        }
+        if exports_changed || !changed_names.is_empty() {
             let scope = if changed_names.is_empty() {
                 None
             } else {
@@ -1385,7 +1499,19 @@ impl Backend {
                             scope_checks,
                             var_checks,
                         );
-                        let mut errs = validate_prepared(&parsed, uri, &prepared);
+                        let track = needs_use_tracking(ruleset, game);
+                        let (mut errs, used) = if track {
+                            let (errs, used) =
+                                validate_prepared_tracking_uses(&parsed, uri, &prepared);
+                            (errs, Some(used))
+                        } else {
+                            (validate_prepared(&parsed, uri, &prepared), None)
+                        };
+                        if let Some(used) = used {
+                            errs.extend(
+                                self.unused_instance_errors(uri, used, ruleset, game, type_index),
+                            );
+                        }
                         append_missing_loc_errors(uri, &prepared, &mut errs);
                         drop(loc_guard);
                         drop(info_guard);

@@ -3234,6 +3234,170 @@ fn test_did_open_definition_clears_open_caller_stale_error() {
     );
 }
 
+// ── CW239: unused should_be_used instances in the LSP (issue #123) ──────────
+
+const UNUSED_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        should_be_used = yes
+    }
+    type[user] = { path = "game/common/users" }
+}
+thing = { x = scalar }
+user = { uses = <thing> }
+"#;
+
+/// Spawn a server over a workspace with one `should_be_used` type: `a.txt`
+/// defines `used_thing` (referenced from `b.txt`) and `lone_thing` (referenced
+/// from nowhere). Returns the child, reader, and the two file paths.
+#[allow(clippy::type_complexity)]
+fn spawn_unused_workspace() -> (
+    tempfile::TempDir,
+    std::process::Child,
+    BufReader<std::process::ChildStdout>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), UNUSED_RULES).unwrap();
+
+    let a_path = ws.path().join("common/things/a.txt");
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, A_TEXT).unwrap();
+    let b_path = ws.path().join("common/users/b.txt");
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(&b_path, B_TEXT).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let mut reader = reader;
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // rules_dir/vanilla TempDirs may drop once the scan has read them; the
+    // workspace must outlive the test, so it is returned.
+    (ws, child, reader, a_path, b_path)
+}
+
+const A_TEXT: &str = "used_thing = { x = a }\nlone_thing = { x = b }\n";
+const B_TEXT: &str = "a_user = { uses = used_thing }\n";
+
+#[test]
+fn test_scan_reports_unused_should_be_used_instance() {
+    // The workspace scan runs the batch-style two-phase pass, so a definition
+    // nothing in the workspace references gets CW239 without any file open.
+    let (_ws, mut child, mut reader, _a, _b) = spawn_unused_workspace();
+    let a_diags = diags_for(&mut reader, "a.txt", 1).expect("a.txt scan diagnostics");
+    child.kill().ok();
+    assert!(
+        a_diags.contains(&"CW239".to_string()),
+        "lone_thing is referenced nowhere, expected CW239, got: {a_diags:?}"
+    );
+}
+
+#[test]
+fn test_edit_toggling_reference_updates_open_cw239() {
+    // Editing a reference in one open file must flip CW239 on the open file
+    // that DEFINES the instance, through the dependent sweep — no rescan.
+    let (ws, mut child, mut reader, a_path, b_path) = spawn_unused_workspace();
+    wait_for_scan_done(&mut reader);
+
+    let a_uri = path_uri(&a_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":a_uri,"languageId":"hoi4","version":1,
+                "text": A_TEXT}}),
+        ),
+    )
+    .unwrap();
+    let before = diags_for(&mut reader, "a.txt", 1).expect("a.txt diagnostics");
+    assert!(
+        before.contains(&"CW239".to_string()),
+        "expected CW239 on lone_thing while unreferenced, got: {before:?}"
+    );
+
+    let b_uri = path_uri(&b_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text": B_TEXT}}),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, "b.txt", 1).expect("b.txt diagnostics");
+
+    // Add a reference to lone_thing: the sweep must republish a.txt clean.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": b_uri, "version": 2 },
+                "contentChanges": [{ "text":
+                    "a_user = { uses = used_thing }\nb_user = { uses = lone_thing }\n" }]
+            }),
+        ),
+    )
+    .unwrap();
+    let after_add = diags_for(&mut reader, "a.txt", 1).expect("a.txt re-validated after add");
+    assert!(
+        !after_add.contains(&"CW239".to_string()),
+        "adding a reference should clear lone_thing's CW239, got: {after_add:?}"
+    );
+
+    // Remove it again: the CW239 must come back the same way.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": b_uri, "version": 3 },
+                "contentChanges": [{ "text": B_TEXT }]
+            }),
+        ),
+    )
+    .unwrap();
+    let after_remove = diags_for(&mut reader, "a.txt", 1).expect("a.txt re-validated after remove");
+    child.kill().ok();
+    drop(ws);
+    assert!(
+        after_remove.contains(&"CW239".to_string()),
+        "removing the only reference should resurrect CW239, got: {after_remove:?}"
+    );
+}
+
 // ── B5/B7: document symbols, folding, highlight, cross-file references/rename ──
 
 /// Spawn a server with `rules`, write `files` to disk, initialize with
