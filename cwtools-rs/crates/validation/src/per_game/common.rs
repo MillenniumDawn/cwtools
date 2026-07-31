@@ -10,8 +10,7 @@ use rustc_hash::FxHashMap;
 pub(crate) fn under_dir_segment(file_path: &str, segment: &str) -> bool {
     let norm = file_path.replace('\\', "/");
     norm.rsplit_once('/')
-        .map(|(dir, _)| dir.to_ascii_lowercase())
-        .is_some_and(|dir| dir.split('/').any(|s| s == segment))
+        .is_some_and(|(dir, _)| dir.split('/').any(|s| s.eq_ignore_ascii_case(segment)))
 }
 
 /// Whether a child's key matches `expected` (case-insensitive).
@@ -32,7 +31,7 @@ pub(crate) fn child_key_eq(
     }
 }
 
-/// Whether a child is a block whose only non-comment child is `always = no`.
+/// Whether a child is a block containing an `always = no` leaf.
 pub(crate) fn child_is_always_no(child: &Child, ast: &ParsedFile, table: &StringTable) -> bool {
     as_block(child, ast).is_some_and(|block| {
         block.children.iter().any(|c| {

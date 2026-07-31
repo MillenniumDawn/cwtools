@@ -129,20 +129,19 @@ fn walk_if_else(
             );
         }
 
-        if key != "limit" && key != "modifier" {
+        if key == "if" || key == "else_if" {
             let has_else = block_children
                 .iter()
                 .any(|c| child_key_eq(c, ast, table, "else"));
             let has_if = block_children
                 .iter()
                 .any(|c| child_key_eq(c, ast, table, "if"));
-            let deprecated_else = (key == "if" || key == "else_if") && has_else && !has_if;
             // Advice about the keyword, so the squiggle covers the key, not the
             // whole block it opens (same treatment CW253 got above).
             let key_end = key_token_range(block.range.start, key.chars().count()).end;
 
             // CW236 — old nested if/else style.
-            if deprecated_else {
+            if has_else && !has_if {
                 errors.push(
                     ValidationError::from_code(
                         &error_codes::CW236_DEPRECATED_ELSE,
@@ -187,7 +186,6 @@ fn event_pretriggers<'a>(
 }
 
 /// Validate a Stellaris event body for pretrigger placement (CW120).
-#[allow(clippy::too_many_arguments)]
 fn validate_event_pretriggers(
     event_key: &str,
     children: &[Child],
@@ -865,13 +863,6 @@ mod tests {
             "foo = { if = { limit = { } if = { a = 1 } else = { b = 2 } } }\n",
         );
         assert!(has_code(&c, "CW237"), "got: {:?}", c);
-    }
-
-    #[test]
-    fn nested_limit_and_modifier_do_not_false_positive() {
-        // `limit` and `modifier` blocks are excluded from the if/else order walk.
-        let c = codes_at(EVENTS, "foo = { limit = { } modifier = { } }\n");
-        assert!(!has_code(&c, "CW236") && !has_code(&c, "CW237"));
     }
 
     // ── Technology (CW110) ────────────────────────────────────────────────

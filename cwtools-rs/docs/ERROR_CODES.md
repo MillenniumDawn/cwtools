@@ -101,7 +101,7 @@ and CW241 by CW262-265.
 | CW235 | Warning | Modifier {} has value 0. Modifiers are additive so likely doesn't do anything | A known modifier is set to `0`, which is a no-op for additive modifiers. | Emitted (fires on confirmed modifier names; rule-matched modifier fields not yet covered) |
 | CW236 | Warning | Nested if/else in effects was deprecated with 2.1 and will be removed in a future release | Stellaris: nested `if/else` in effects, deprecated since 2.1. | Emitted |
 | CW237 | Information | 2.1 changed nested if = { if else } behaviour in effects. Check this still works as expected | Stellaris: ambiguous nested `if = { if else }` after 2.1 behaviour change. | Emitted |
-| CW238 | Error | An else/else_if is missing a preceding if | An `else` or `else_if` block appears with no matching `if` before it. | Emitted (cross-game; CW236/CW237 remain Stellaris-only) |
+| CW238 | Error | An else/else_if is missing a preceding if | An `else` or `else_if` block has no antecedent, either as a preceding sibling (`if = {…} else = {…}`, Stellaris 2.1+) or as the enclosing `if`/`else_if` it nests inside (HOI4 and pre-2.1 Stellaris). | Emitted (cross-game, both chain spellings; CW236/CW237 remain Stellaris-only) |
 
 ### CW239 -- Unused type
 
