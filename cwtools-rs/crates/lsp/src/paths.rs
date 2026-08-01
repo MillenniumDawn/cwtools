@@ -52,6 +52,19 @@ pub(crate) fn logical_path_from_uri(
     path
 }
 
+/// Whether `uri` names a file under the workspace root, as opposed to the
+/// vanilla install merged in alongside it (or anywhere else outside the mod).
+/// Used where a generated edit must only ever land in the mod's own tree — the
+/// create-loc-key code action picks a sibling loc-key site from
+/// `loc_locations`, which mixes workspace and vanilla definitions, and must
+/// reject a vanilla one before offering to edit it.
+pub(crate) fn uri_is_in_workspace(uri: &str, workspace_prefix: &str) -> bool {
+    if workspace_prefix.is_empty() {
+        return false;
+    }
+    normalize_separators(uri_to_path_str(uri)).starts_with(workspace_prefix)
+}
+
 /// Normalise path separators to `/`. On the common (Linux/macOS) path the input
 /// has no backslash, so the owned string is returned unchanged with no
 /// allocation or scan-and-copy; only Windows paths actually pay the `replace`.
@@ -890,6 +903,24 @@ mod tests {
     fn test_logical_path_fallback() {
         let lp = logical_path_from_uri("file:///some/path/events/foo.txt", &None);
         assert_eq!(lp, "/some/path/events/foo.txt");
+    }
+
+    #[test]
+    fn test_uri_is_in_workspace() {
+        let ws = workspace_prefix_of("file:///home/user/mod");
+        assert!(uri_is_in_workspace(
+            "file:///home/user/mod/localisation/x_l_english.yml",
+            &ws
+        ));
+        assert!(!uri_is_in_workspace(
+            "file:///home/user/vanilla/localisation/x_l_english.yml",
+            &ws
+        ));
+        // No workspace prefix known → nothing counts as workspace.
+        assert!(!uri_is_in_workspace(
+            "file:///home/user/mod/localisation/x_l_english.yml",
+            ""
+        ));
     }
 
     #[test]
