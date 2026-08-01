@@ -136,8 +136,8 @@ fn dollar_var_reference_is_skipped() {
 /// scope-independent loc-entry checks must match the validation crate's catalog.
 #[test]
 fn loc_pipeline_codes_match_error_catalog() {
+    use cwtools_error_codes as ec;
     use cwtools_localization::{LocErrorKind, loc_error_code, loc_error_severity};
-    use cwtools_validation::error_codes as ec;
 
     let cases = [
         (

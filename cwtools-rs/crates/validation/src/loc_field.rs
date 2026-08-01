@@ -8,7 +8,7 @@ use cwtools_rules::rules_types::*;
 
 use crate::common::{ValidationError, with_leaf_value_str};
 use crate::ctx::ValidationCtx;
-use crate::error_codes;
+use cwtools_error_codes as error_codes;
 
 /// Build the set of valid modifier names for `alias_name[modifier]` slots from
 /// the ruleset's `modifiers = { ... }` block. Templated entries like

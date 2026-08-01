@@ -11,7 +11,7 @@ use cwtools_index::{NormalizedPath, TypeInstance, check_path_dir_norm};
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 
 use crate::ValidationError;
-use crate::error_codes;
+use cwtools_error_codes as error_codes;
 
 /// Whether a type declares a loc key this check can flag: `## required`, not
 /// `## optional`, and derived from the instance name rather than a child field.

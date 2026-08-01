@@ -8,9 +8,9 @@ use cwtools_string_table::string_table::StringTable;
 
 use crate::common::*;
 use crate::ctx::ValidationCtx;
-use crate::error_codes;
 use crate::loc_field::validate_localisation_field;
 use crate::scope::validate_scope_target;
+use cwtools_error_codes as error_codes;
 
 use super::children::validate_math_clause;
 

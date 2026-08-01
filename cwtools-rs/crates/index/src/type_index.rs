@@ -348,22 +348,12 @@ impl TypeIndex {
     }
 
     /// Borrowing form of [`loc_bindable_names`](Self::loc_bindable_names): yields
-    /// each bindable name by reference, no per-name allocation. Use this when the
-    /// caller only needs to read the names (membership, iteration) rather than own
-    /// them.
+    /// each bindable name by reference, no per-name allocation.
     pub(crate) fn loc_bindable_names_iter(&self) -> impl Iterator<Item = &str> + '_ {
         self.name_counts
             .keys()
             .map(AsRef::as_ref)
             .chain(self.var_index.names().map(String::as_str))
-    }
-
-    /// Whether `name` is a loc-bindable name (a type-instance name or defined
-    /// variable). `name` is matched against the already-lowercased index keys, so
-    /// the caller must pass a lowercased name (as the loc validator does). O(1)
-    /// instead of building/scanning the whole bindable-name set.
-    pub fn contains_loc_bindable(&self, name: &str) -> bool {
-        self.name_counts.contains_key(name) || self.var_index.names.contains_key(name)
     }
 
     /// Every `(type_name, instance)` defined in `file_uri`. Used by

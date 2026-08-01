@@ -107,24 +107,13 @@ pub(crate) fn parse_csv_loc_per_lang(
 }
 
 /// Convenience wrapper: parse CSV and return a flat `Vec<LocEntry>` for a
-/// single language, matching the old `parse_csv_loc` signature for callers
-/// that only care about one language.
-///
-/// Uses `CK2_COLUMN_LANGS` column mapping.
-pub(crate) fn parse_csv_loc_for_lang(text: &str, name: &str, lang: Lang) -> Vec<LocEntry> {
+/// single language. Uses `CK2_COLUMN_LANGS` column mapping.
+#[cfg(test)]
+fn parse_csv_loc_for_lang(text: &str, name: &str, lang: Lang) -> Vec<LocEntry> {
     parse_csv_loc_per_lang(text, name, None)
         .into_iter()
         .filter_map(|(_, l, e)| if l == lang { Some(e) } else { None })
         .collect()
-}
-
-/// Legacy API: parse all columns into flat entries (preserved for backwards
-/// compatibility).  Each row produces **one** entry; `desc` is the English
-/// column (col 1), or empty if the file has no col 1.
-///
-/// New callers should prefer `parse_csv_loc_per_lang`.
-pub fn parse_csv_loc(text: &str, name: &str) -> Vec<LocEntry> {
-    parse_csv_loc_for_lang(text, name, Lang::English)
 }
 
 /* ======================================================================== */
@@ -203,13 +192,5 @@ mod tests {
         assert!(langs.contains(&Lang::Spanish));
         // No duplicate for the skip columns
         assert_eq!(langs.len(), 4);
-    }
-
-    #[test]
-    fn test_legacy_parse_csv_loc() {
-        // Backwards-compat wrapper returns English column
-        let entries = parse_csv_loc(SAMPLE, "test.csv");
-        assert_eq!(entries[0].key, "key1");
-        assert_eq!(entries[0].desc, "English text");
     }
 }

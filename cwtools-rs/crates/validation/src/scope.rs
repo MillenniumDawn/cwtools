@@ -7,8 +7,8 @@ use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_rules::rules_types::*;
 
 use crate::common::{ValidationError, looks_like_data_ref};
-use crate::error_codes;
 use crate::resolve::find_type_rule_opts;
+use cwtools_error_codes as error_codes;
 
 /// Build the runtime [`ScopeRegistry`] for a ruleset. Thin wrapper over
 /// [`ScopeRegistry::from_config`], which owns the construction (config inputs
