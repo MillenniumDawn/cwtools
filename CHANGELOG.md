@@ -8,6 +8,8 @@
 
 ## Bug Fixes
 
+- The CLI no longer advertises non-emitted diagnostic codes in SARIF `tool.driver.rules`, but `--only-code` still validates pending, non-wired IDs (`CW220`, `CW221`, `CW228`, `CW230`, `CW233`, `CW269`, `CW273`, `CW274`) at parse time. Retired `CW258` is no longer accepted there either. This keeps filters strict while preventing SARIF report metadata from promising diagnostics that cannot fire yet. (#103)
+
 - CW246 ("the variable X has not been set") ran against the variable index for every `value[...]` reference, not just `value[variable]`. Country flags, arrays, division template names, GUI font names and every other named value set were looked up in an index that only ever holds variables, so with the check enabled Millennium Dawn reported 43,646 hits, all but ~60 of them false. It now applies only to the variable namespace. (#92)
 - `add_to_array = { array = my_arr value = 1 }` recorded the literal key `array` as a defined variable instead of `my_arr`, and effects that only touch arrays (`resize_array`, `remove_from_array`) were not treated as defining anything at all. Arrays are variables to the engine, so a name defined by an array effect now counts as set, and reading it no longer flags CW246. (#92)
 - A built-in variable declared with a scope suffix in `variables.cwt` (`party_popularity@<ideology>`) did not match a read carrying its own suffix (`party_popularity@social_democrat`); only the config side of the `@` was stripped. This was 158 of Kaiserreich's 159 CW246 hits. (#92)

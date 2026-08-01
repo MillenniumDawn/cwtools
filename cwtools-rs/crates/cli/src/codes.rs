@@ -2,17 +2,15 @@
 //!
 //! `cwtools_error_codes` exposes one `pub const` per code but no list of them,
 //! so the list is mirrored here: `--ignore-code` / `--only-code` validate
-//! against it (a typo is an error, not a silent no-op) and the SARIF report
-//! turns it into `tool.driver.rules`. Every definition still comes from
-//! `cwtools_error_codes`; only the enumeration is local, and
-//! `catalog_covers_every_error_code_const` fails if the two drift.
+//! against it (a typo is an error, not a silent no-op). Not every mirrored code
+//! is currently emitted; pending codes are marked in `PENDING_CODES`. The SARIF
+//! report only turns emitted codes into `tool.driver.rules`.
 
 use cwtools_error_codes::ErrorCode;
 
 macro_rules! catalog {
     ($($name:ident),+ $(,)?) => {
-        /// Every code the engine can emit, paired with its `cwtools_error_codes`
-        /// const name (the source of the SARIF rule name).
+        /// Known diagnostic codes, including wired and pending checks.
         const CATALOG: &[(&str, ErrorCode)] = &[
             $((stringify!($name), cwtools_error_codes::$name),)+
         ];
@@ -66,7 +64,6 @@ catalog![
     CW255_MISSING_LOC_FILE_LANG,
     CW256_MISSING_LOC_FILE_LANG_HEADER,
     CW257_LOC_FILE_LANG_MISMATCH,
-    CW258_LOC_FILE_LANG_WRONG_PLACE,
     CW259_RECURSIVE_LOC_REF,
     CW260_LOC_COMMAND_WRONG_SCOPE,
     CW261_DUPLICATE_TYPE_DEF,
@@ -91,10 +88,24 @@ catalog![
     CW500_TYPE_NOT_FOUND,
 ];
 
-/// The catalog entry for `id` (case-insensitive), or `None` when the engine
-/// can't emit that code.
+// Codes defined in `error_codes` but not yet wired.
+const PENDING_CODES: &[&str] = &[
+    "CW220", "CW221", "CW228", "CW230", "CW233", "CW269", "CW273", "CW274",
+];
+
+fn is_pending_code(id: &str) -> bool {
+    PENDING_CODES.iter().any(|p| p.eq_ignore_ascii_case(id))
+}
+
+/// The catalog entry for `id` (case-insensitive), or `None` when no CLI parse-time
+/// validation entry exists for that code.
 pub(crate) fn entry(id: &str) -> Option<&'static (&'static str, ErrorCode)> {
     CATALOG.iter().find(|(_, c)| c.id.eq_ignore_ascii_case(id))
+}
+
+/// The entry for emitted codes only, for SARIF rule metadata.
+pub(crate) fn emitted_entry(id: &str) -> Option<&'static (&'static str, ErrorCode)> {
+    entry(id).filter(|(_, c)| !is_pending_code(c.id))
 }
 
 /// Parse an `--ignore-code` / `--only-code` value, normalising it to the
@@ -156,28 +167,31 @@ mod tests {
     use super::*;
 
     /// The enumeration above is hand-mirrored, so a code added to
-    /// `cwtools_error_codes` without a line here would be invisible to
-    /// `--ignore-code` and missing from the SARIF rules. Diff the two lists
-    /// straight from the source rather than trusting the mirror.
+    /// `cwtools_error_codes` without a line here could be invisible to
+    /// `--ignore-code`. Diff the two lists straight from the source rather than
+    /// trusting the mirror.
     #[test]
-    fn catalog_covers_every_error_code_const() {
+    fn catalog_covers_supported_error_code_consts() {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../error_codes/src/lib.rs"),
         )
         .expect("error_codes source is a sibling crate in the same workspace");
+        const RETIRED_CODES: &[&str] = &["CW258_LOC_FILE_LANG_WRONG_PLACE"];
+
         let mut declared: Vec<&str> = src
             .lines()
             .filter_map(|l| {
                 let (name, ty) = l.strip_prefix("pub const ")?.split_once(':')?;
                 ty.trim_start().starts_with("ErrorCode").then_some(name)
             })
+            .filter(|name| !RETIRED_CODES.contains(name))
             .collect();
         declared.sort_unstable();
         let mut mirrored: Vec<&str> = CATALOG.iter().map(|(name, _)| *name).collect();
         mirrored.sort_unstable();
         assert_eq!(
             declared, mirrored,
-            "crates/cli/src/codes.rs must list exactly the ErrorCode consts in crates/error_codes"
+            "crates/cli/src/codes.rs must list all supported ErrorCode consts in crates/error_codes"
         );
     }
 
@@ -201,6 +215,28 @@ mod tests {
         let err = parse_code("CW999").unwrap_err();
         assert!(err.contains("CW999"), "got: {err}");
         assert!(err.contains("ERROR_CODES.md"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_code_rejects_retired_code() {
+        let err = parse_code("CW258").unwrap_err();
+        assert!(err.contains("CW258"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_code_accepts_pending_codes() {
+        assert_eq!(parse_code("CW220").unwrap(), "CW220");
+        assert_eq!(parse_code("CW269").unwrap(), "CW269");
+    }
+
+    #[test]
+    fn emitted_entry_skips_pending_codes() {
+        assert!(entry("CW220").is_some(), "pending code is still parseable");
+        assert!(
+            emitted_entry("CW220").is_none(),
+            "pending code stays out of SARIF rules"
+        );
+        assert!(emitted_entry("CW113").is_some());
     }
 
     #[test]

@@ -190,15 +190,17 @@ fn s(value: &str) -> String {
 /// the run's source root: locations under it are emitted relative to
 /// `%SRCROOT%`, so the report resolves in any checkout of the same tree.
 ///
-/// `tool.driver.rules` is generated from the shared error-code catalog, and
-/// carries only the codes this run actually reported so every `ruleIndex`
-/// resolves.
+/// `tool.driver.rules` is generated from the shared emitted error-code
+/// catalog entries, and carries only the codes this run actually reported so
+/// every `ruleIndex` resolves.
 pub(crate) fn sarif_report(diags: &[&Diag], base: &Path) -> String {
     // Carry the catalog entry itself, not just the id: every rule in the array
     // then has a definition by construction, so the comma accounting can't be
     // thrown off by a lookup that fails on the second pass.
-    let mut rules: Vec<&'static (&'static str, ErrorCode)> =
-        diags.iter().filter_map(|d| codes::entry(d.code)).collect();
+    let mut rules: Vec<&'static (&'static str, ErrorCode)> = diags
+        .iter()
+        .filter_map(|d| codes::emitted_entry(d.code))
+        .collect();
     rules.sort_unstable_by_key(|(_, c)| c.id);
     rules.dedup_by_key(|(_, c)| c.id);
 
