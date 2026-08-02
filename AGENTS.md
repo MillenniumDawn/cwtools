@@ -24,6 +24,14 @@ location with `CWTOOLS_PROJECTS`):
 - `cwtools-vscode` is the VS Code extension. A new LSP capability usually needs
   a change there too.
 
+The workspace shape: `parser` builds the AST, `rules` loads the `.cwt` config,
+`index` builds the cross-file lookups, `validation` is the rule engine plus the
+per-game validators, and `driver` is the shared load-and-validate pipeline both
+binaries call. The `cwtools` CLI is batch (one `Session` per run); the
+`cwtools-server` LSP keeps its own incremental state and does not use
+`Session`. Run the CLI from source with
+`cargo run -p cwtools_cli -- validate --game hoi4 --directory <mod> --rules <rules>/Config`.
+
 Start with [ARCHITECTURE.md](cwtools-rs/docs/ARCHITECTURE.md) for the crate map
 and the CLI-vs-LSP split, and [ERROR_CODES.md](cwtools-rs/docs/ERROR_CODES.md)
 for what a CWxxx code means.
@@ -37,6 +45,10 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
+
+While iterating, scope tests down: `cargo test -p cwtools_validation`, or
+`cargo test -p cwtools_parser <substring>` for one test. Packages are named
+`cwtools_*`; the short directory names under `crates/` won't resolve.
 
 Then, from the repo root, the corpus guard. Run it for anything that touches the
 parser, the rule engine, a validator, or the ruleset types:
@@ -104,3 +116,7 @@ instrumentation.
   Windows, so CI fails there even though Linux/macOS are fine. Build the
   fixture with the `abs()` helper already in `crates/cli/src/report.rs` /
   `crates/cli/src/config.rs` (or add an equivalent local one).
+- Don't change a type that gets serialized into a cache without bumping the
+  format version next to it (`FORMAT_VERSION` in `crates/cache/src/io.rs` for
+  `.cwb`, `CACHE_VERSION` in `crates/index/src/vanilla_cache.rs`). The bump is
+  what turns an old cache into a clean miss instead of a load error.
