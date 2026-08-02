@@ -449,6 +449,7 @@ impl Backend {
                         "clearAllCaches".to_string(),
                         "reloadrulesconfig".to_string(),
                         "genlocall".to_string(),
+                        "fixAllWorkspace".to_string(),
                         "reindexWorkspace".to_string(),
                         // The extension greys out its graph commands unless it
                         // finds this name here (`graphAvailability.ts`).
@@ -1031,6 +1032,10 @@ impl Backend {
             // and hand them back to the client to open for review (no files are
             // written server-side).
             "genlocall" => Ok(Some(Value::Array(self.generate_missing_loc()))),
+            // Apply every currently-fixable diagnostic across the workspace in
+            // one `workspace/applyEdit`, mirroring `cwtools fix --apply`. See
+            // `code_action::fix_all_workspace_impl`.
+            "fixAllWorkspace" => Ok(Some(Value::String(self.fix_all_workspace_impl().await))),
             // User-triggered re-index (no cache purge, unlike clearAllCaches).
             // validate_entire_workspace's CAS guard returns false when a scan
             // (foreground or the periodic background pass) is already

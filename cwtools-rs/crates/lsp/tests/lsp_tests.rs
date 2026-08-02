@@ -8037,6 +8037,662 @@ types = {
     assert_eq!(fixed, "a = { }\nb = { }\n");
 }
 
+// ── Create missing localisation key (CW100) / fixAllWorkspace ────────────────
+
+/// Like [`read_response`], but answers any `workspace/applyEdit` request the
+/// server sends before returning the next real response — `fixAllWorkspace`
+/// is the server's first server-initiated request, so the harness has never
+/// had to act as an LSP *client* before. A request (has both `method` and
+/// `id`) is answered on `stdin` and drained; a response (`id` alone) is
+/// returned. Also returns the edit from the first `workspace/applyEdit`
+/// request seen, if any, so the caller can assert on its contents.
+fn read_response_answering_apply_edit(
+    child: &mut std::process::Child,
+    reader: &mut BufReader<std::process::ChildStdout>,
+) -> std::io::Result<(String, Option<serde_json::Value>)> {
+    let mut captured = None;
+    loop {
+        let raw = read_frame(reader)?;
+        if raw.is_empty() {
+            return Ok((raw, captured));
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Ok((raw, captured));
+        };
+        if v.get("method").and_then(|m| m.as_str()) == Some("workspace/applyEdit") {
+            captured = Some(v["params"]["edit"].clone());
+            let reply = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": v["id"],
+                "result": { "applied": true },
+            });
+            write_frame(child, &reply.to_string())?;
+            continue;
+        }
+        if v.get("id").is_some() {
+            return Ok((raw, captured));
+        }
+    }
+}
+
+#[test]
+fn test_create_loc_key_code_action_inserts_after_sibling_key() {
+    // A type declaring two `## required` name-derived loc keys; the mod's own
+    // loc file already has one of them (`my_thing`). CW100 fires for the
+    // other (`my_thing_desc`), and its code action must insert the missing
+    // stub right after the sibling's definition — the cross-file
+    // `WorkspaceEdit` this feature exists for.
+    const RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        localisation = {
+            ## required
+            name = "$"
+            ## required
+            desc = "$_desc"
+        }
+    }
+}
+thing = { x = scalar }
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/things/test.txt";
+    let text = "my_thing = { x = yes }\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let loc_path = ws.path().join("localisation/things_l_english.yml");
+    std::fs::create_dir_all(loc_path.parent().unwrap()).unwrap();
+    let loc_text = "l_english:\n my_thing:0 \"My Thing\"\n";
+    std::fs::write(&loc_path, loc_text).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW100")
+        .expect("CW100 diagnostic published for my_thing_desc");
+    assert!(
+        diag["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("my_thing_desc")),
+        "got: {diag}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag], "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let resp_str = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    let actions = resp["result"].as_array().expect("array result");
+    assert_eq!(actions.len(), 1, "one create-loc-key action: {resp_str}");
+    let action = &actions[0];
+    assert_eq!(action["title"], "Create localisation key my_thing_desc");
+    assert_eq!(action["kind"], "quickfix");
+
+    let ops = action["edit"]["documentChanges"]
+        .as_array()
+        .expect("documentChanges carries the cross-file edit");
+    assert_eq!(ops.len(), 1, "no sibling file needed creating: {resp_str}");
+    let op = &ops[0];
+    assert!(
+        op["textDocument"]["uri"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("things_l_english.yml")),
+        "got: {op}"
+    );
+    let edits = op["edits"].as_array().expect("edits array");
+    assert_eq!(edits.len(), 1);
+    let e = &edits[0];
+    // Inserted right after the sibling's line (`l_english:` is line 0,
+    // ` my_thing:0 "My Thing"` is line 1), at the start of the next line.
+    assert_eq!(e["range"]["start"]["line"], 2);
+    assert_eq!(e["range"]["start"]["character"], 0);
+    assert_eq!(
+        e["range"]["start"], e["range"]["end"],
+        "an empty (insertion) range"
+    );
+    assert_eq!(e["newText"], " my_thing_desc:0 \"TODO\"\n");
+
+    // Applying it reproduces the expected file.
+    let mut lines: Vec<&str> = loc_text.lines().collect();
+    lines.insert(2, " my_thing_desc:0 \"TODO\"");
+    let fixed = format!("{}\n", lines.join("\n"));
+    assert_eq!(
+        fixed,
+        "l_english:\n my_thing:0 \"My Thing\"\n my_thing_desc:0 \"TODO\"\n"
+    );
+}
+
+#[test]
+fn test_create_loc_key_code_action_creates_a_new_loc_file_when_the_workspace_has_none() {
+    // The third resolution tier (`LocInsertTarget::NewFile`): the workspace
+    // has no loc file at all, so the create-loc-key action must add a
+    // `Create` resource op alongside the insertion edit, and the inserted
+    // text must open with the BOM the game requires for a loc file to load —
+    // nothing else in the suite pins that byte.
+    //
+    // CW100 is gated on the merged loc index being non-empty
+    // (`append_missing_loc_errors`), so an empty workspace with no loc
+    // anywhere would suppress it entirely. The base-game (vanilla) dir is
+    // given a loc file instead: it merges into the union (index non-empty,
+    // CW100 fires) but isn't a workspace file (`uri_is_in_workspace` rejects
+    // it), so neither the sibling-site nor the existing-file tier applies and
+    // resolution falls through to NewFile.
+    const RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        localisation = {
+            ## required
+            name = "$"
+            ## required
+            desc = "$_desc"
+        }
+    }
+}
+thing = { x = scalar }
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/things/test.txt";
+    let text = "my_thing = { x = yes }\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    // Only vanilla defines `my_thing`'s name loc — the workspace has no
+    // `localisation/` directory at all.
+    let vanilla_loc_path = vanilla.path().join("localisation/things_l_english.yml");
+    std::fs::create_dir_all(vanilla_loc_path.parent().unwrap()).unwrap();
+    std::fs::write(&vanilla_loc_path, "l_english:\n my_thing:0 \"My Thing\"\n").unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW100")
+        .expect("CW100 diagnostic published for my_thing_desc");
+    assert!(
+        diag["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("my_thing_desc")),
+        "got: {diag}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag], "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let resp_str = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    let actions = resp["result"].as_array().expect("array result");
+    assert_eq!(actions.len(), 1, "one create-loc-key action: {resp_str}");
+    let action = &actions[0];
+    assert_eq!(action["title"], "Create localisation key my_thing_desc");
+    assert_eq!(action["kind"], "quickfix");
+
+    let ops = action["edit"]["documentChanges"]
+        .as_array()
+        .expect("documentChanges carries the cross-file edit");
+    assert_eq!(
+        ops.len(),
+        2,
+        "a Create op plus the insertion edit: {resp_str}"
+    );
+
+    let create_op = &ops[0];
+    assert_eq!(create_op["kind"], "create");
+    assert!(
+        create_op["uri"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("localisation/cwtools_generated_l_english.yml")),
+        "got: {create_op}"
+    );
+    assert_eq!(create_op["options"]["overwrite"], false);
+    assert_eq!(create_op["options"]["ignoreIfExists"], true);
+
+    let edit_op = &ops[1];
+    assert_eq!(edit_op["textDocument"]["uri"], create_op["uri"]);
+    let edits = edit_op["edits"].as_array().expect("edits array");
+    assert_eq!(edits.len(), 1);
+    let e = &edits[0];
+    assert_eq!(e["range"]["start"]["line"], 0);
+    assert_eq!(e["range"]["start"]["character"], 0);
+    assert_eq!(
+        e["range"]["start"], e["range"]["end"],
+        "an empty (insertion) range"
+    );
+    assert_eq!(
+        e["newText"], "\u{FEFF}l_english:\n my_thing_desc:0 \"TODO\"\n",
+        "the new file's content must open with the BOM the game requires"
+    );
+}
+
+#[test]
+fn test_fix_all_workspace_applies_every_fixable_diagnostic() {
+    // Two empty `limit = { }` blocks -> two CW281 diagnostics, each carrying a
+    // fix. `fixAllWorkspace` must send one `workspace/applyEdit` covering both,
+    // then report how many fixes/files it applied — the workspace-wide
+    // counterpart of `source.fixAll` (and of `cwtools fix --apply`).
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel = "common/decisions/test.txt";
+    let text = "a = { limit = { } }\nb = { limit = { } }\n";
+    let p = ws.path().join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, text).unwrap();
+    let doc_uri = path_uri(&p);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+    wait_for_diags(&mut reader, rel).expect("diagnostics published for the document");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "fixAllWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let (resp_str, applied_edit) =
+        read_response_answering_apply_edit(&mut child, &mut reader).expect("no command response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(
+        resp["result"].as_str(),
+        Some("Applied 2 fix(es) across 1 file(s)"),
+        "got: {resp_str}"
+    );
+
+    let edit = applied_edit.expect("the server must call workspace/applyEdit");
+    let changes = edit["changes"].as_object().expect("changes map");
+    assert_eq!(changes.len(), 1, "one file touched: {edit}");
+    let edits = changes.values().next().unwrap().as_array().unwrap();
+    assert_eq!(edits.len(), 2, "one edit per fixable diagnostic");
+
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut resolved: Vec<(usize, usize, usize, String)> = edits
+        .iter()
+        .map(|e| {
+            (
+                e["range"]["start"]["line"].as_u64().unwrap() as usize,
+                e["range"]["start"]["character"].as_u64().unwrap() as usize,
+                e["range"]["end"]["character"].as_u64().unwrap() as usize,
+                e["newText"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    resolved.sort_by(|a, b| b.cmp(a));
+    for (line, sc, ec, new_text) in resolved {
+        let chars: Vec<char> = lines[line].chars().collect();
+        let mut out: String = chars[..sc].iter().collect();
+        out.push_str(&new_text);
+        out.extend(chars[ec..].iter());
+        lines[line] = out;
+    }
+    let fixed = format!("{}\n", lines.join("\n"));
+    assert_eq!(fixed, "a = { }\nb = { }\n");
+}
+
+#[test]
+fn test_fix_all_workspace_reports_nothing_to_fix() {
+    // No diagnostics ever published -> the store is empty -> the command must
+    // say so without sending a `workspace/applyEdit` at all.
+    let ws = tempfile::tempdir().unwrap();
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "fixAllWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let (resp_str, applied_edit) =
+        read_response_answering_apply_edit(&mut child, &mut reader).expect("no command response");
+    child.kill().ok();
+    assert!(
+        applied_edit.is_none(),
+        "nothing to fix -> no applyEdit call"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(
+        resp["result"].as_str(),
+        Some("No auto-fixable problems in the workspace."),
+        "got: {resp_str}"
+    );
+}
+
+#[test]
+fn test_fix_all_workspace_finds_nothing_once_the_applied_fix_is_reopened_clean() {
+    // Full lifecycle: fixAllWorkspace applies a fix, the client applies it (a
+    // didChange with the fixed text on the still-open document), the server
+    // republishes without the diagnostic — which also drops the entry from
+    // the `fixable_edits` store, since `publish_filtered` updates the store
+    // before it publishes (validate.rs) — and a second fixAllWorkspace call
+    // must then report nothing left to fix rather than resending the
+    // already-applied edit.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel = "common/decisions/test.txt";
+    let text = "a = { limit = { } }\n";
+    let p = ws.path().join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, text).unwrap();
+    let doc_uri = path_uri(&p);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+    let before = wait_for_diags(&mut reader, rel).expect("diagnostics published for the document");
+    assert!(
+        before.iter().any(|d| d["code"] == "CW281"),
+        "expected CW281 before the fix, got: {before:?}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "fixAllWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let (resp_str, applied_edit) =
+        read_response_answering_apply_edit(&mut child, &mut reader).expect("no command response");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&resp_str).unwrap()["result"].as_str(),
+        Some("Applied 1 fix(es) across 1 file(s)"),
+        "got: {resp_str}"
+    );
+    assert!(
+        applied_edit.is_some(),
+        "the server must call workspace/applyEdit"
+    );
+
+    // Simulate the client having applied that edit itself.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri, "version": 2 },
+                "contentChanges": [{ "text": "a = { }\n" }],
+            }),
+        ),
+    )
+    .unwrap();
+    let after = diags_for(&mut reader, rel, 1).expect("republish after the didChange");
+    assert!(
+        !after.contains(&"CW281".to_string()),
+        "the fixed text must not still report CW281, got: {:?}",
+        after
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            3,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "fixAllWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let (resp_str2, applied_edit2) = read_response_answering_apply_edit(&mut child, &mut reader)
+        .expect("no second command response");
+    child.kill().ok();
+    assert!(
+        applied_edit2.is_none(),
+        "nothing left to fix -> no second applyEdit call"
+    );
+    let resp2: serde_json::Value = serde_json::from_str(&resp_str2).unwrap();
+    assert_eq!(
+        resp2["result"].as_str(),
+        Some("No auto-fixable problems in the workspace."),
+        "got: {resp_str2}"
+    );
+}
+
 #[test]
 fn test_scan_reports_standard_work_done_progress() {
     // A client that advertises window.workDoneProgress must see the standard

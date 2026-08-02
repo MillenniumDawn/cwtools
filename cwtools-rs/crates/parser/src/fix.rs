@@ -26,6 +26,16 @@ pub struct SpanEdit {
 pub struct SuggestedFix {
     pub title: String,
     pub edits: SmallVec<[SpanEdit; 1]>,
+    /// The loc key a "create missing localisation key" fix would add, for a
+    /// diagnostic whose fix can't be expressed as an in-file span edit (the
+    /// key doesn't exist anywhere yet, so there's no span to replace — it may
+    /// need a new line in an existing loc file, or a whole new file). `None`
+    /// for every other fix. A consumer that only applies `edits` (the CLI
+    /// `fix` subcommand, the LSP's per-diagnostic quickfix / `source.fixAll`)
+    /// sees an empty `edits` for one of these and skips it; the LSP's
+    /// dedicated "Create missing localisation key" code action is the only
+    /// consumer that reads this field (see `lsp/src/code_action.rs`).
+    pub create_loc_key: Option<String>,
 }
 
 impl SuggestedFix {
@@ -41,12 +51,23 @@ impl SuggestedFix {
                 range,
                 replacement: replacement.into(),
             }],
+            create_loc_key: None,
         }
     }
 
     /// A one-edit deletion of `range` (empty replacement).
     pub fn delete(title: impl Into<String>, range: SourceRange) -> Self {
         Self::replace(title, range, String::new())
+    }
+
+    /// A fix with no span edit, carrying only the loc key a dedicated
+    /// out-of-file action should create. See [`create_loc_key`](Self::create_loc_key).
+    pub fn create_loc_key(title: impl Into<String>, key: impl Into<String>) -> Self {
+        SuggestedFix {
+            title: title.into(),
+            edits: SmallVec::new(),
+            create_loc_key: Some(key.into()),
+        }
     }
 }
 
@@ -265,5 +286,26 @@ mod tests {
     fn plan_of_an_empty_list_is_empty() {
         let (kept, skipped) = plan_file_edits::<&str>("x = y\n", Vec::new());
         assert!(kept.is_empty() && skipped.is_empty());
+    }
+
+    #[test]
+    fn create_loc_key_fix_carries_the_key_with_no_span_edits() {
+        // A "create missing localisation key" fix has nothing to replace — it
+        // carries the key for a dedicated out-of-file action instead, and
+        // must not be mistaken for an in-file edit by a consumer that only
+        // walks `edits` (the CLI `fix` subcommand, `source.fixAll`).
+        let fix =
+            SuggestedFix::create_loc_key("Create localisation key my_thing_desc", "my_thing_desc");
+        assert_eq!(fix.title, "Create localisation key my_thing_desc");
+        assert!(fix.edits.is_empty());
+        assert_eq!(fix.create_loc_key.as_deref(), Some("my_thing_desc"));
+    }
+
+    #[test]
+    fn span_edit_fixes_leave_create_loc_key_unset() {
+        let replace = SuggestedFix::replace("x", key_token_range(pos(1, 0), 1), "y");
+        let delete = SuggestedFix::delete("x", key_token_range(pos(1, 0), 1));
+        assert_eq!(replace.create_loc_key, None);
+        assert_eq!(delete.create_loc_key, None);
     }
 }

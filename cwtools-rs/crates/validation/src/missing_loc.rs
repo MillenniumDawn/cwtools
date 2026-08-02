@@ -8,6 +8,7 @@
 //! "object has no localisation" warning.
 
 use cwtools_index::{NormalizedPath, TypeInstance, check_path_dir_norm};
+use cwtools_parser::fix::SuggestedFix;
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 
 use crate::ValidationError;
@@ -61,13 +62,20 @@ pub fn check_missing_localisation(
                 }
                 let expected = format!("{}{}{}", loc.prefix, inst.name, loc.suffix);
                 if !loc_exists(&expected.to_ascii_lowercase()) {
-                    errors.push(ValidationError::from_code(
-                        &error_codes::CW100_MISSING_LOCALISATION,
-                        file_path,
-                        inst.location.line,
-                        inst.location.col,
-                        &[&expected, &inst.name],
-                    ));
+                    let fix = SuggestedFix::create_loc_key(
+                        format!("Create localisation key {expected}"),
+                        &expected,
+                    );
+                    errors.push(
+                        ValidationError::from_code(
+                            &error_codes::CW100_MISSING_LOCALISATION,
+                            file_path,
+                            inst.location.line,
+                            inst.location.col,
+                            &[&expected, &inst.name],
+                        )
+                        .with_fix(fix),
+                    );
                 }
             }
         }
@@ -140,6 +148,13 @@ thing = { x = scalar }
         );
         assert!(errs[0].message.contains("my_thing_desc"), "got: {:?}", msgs);
         assert_eq!(errs[0].code, Some("CW100"));
+
+        // The fix carries the missing key for the LSP's "create localisation
+        // key" action, not a span edit — there's no existing text to replace.
+        let fix = errs[0].fix.as_ref().expect("CW100 carries a fix");
+        assert_eq!(fix.create_loc_key.as_deref(), Some("my_thing_desc"));
+        assert!(fix.edits.is_empty());
+        assert_eq!(fix.title, "Create localisation key my_thing_desc");
     }
 
     #[test]

@@ -110,6 +110,12 @@ instrumentation.
   used (`cargo machete`). Both run in CI.
 - Don't widen a public API for one caller. Most crates here are internal to the
   workspace.
+- Don't hardcode a Unix-style absolute path (`Path::new("/ws")`, a bare
+  `"/foo/bar"`) in a test that reaches `Url::from_file_path` or
+  `Path::is_absolute`. A leading `/` with no drive letter isn't absolute on
+  Windows, so CI fails there even though Linux/macOS are fine. Build the
+  fixture with the `abs()` helper already in `crates/cli/src/report.rs` /
+  `crates/cli/src/config.rs` (or add an equivalent local one).
 - Don't change a type that gets serialized into a cache without bumping the
   format version next to it (`FORMAT_VERSION` in `crates/cache/src/io.rs` for
   `.cwb`, `CACHE_VERSION` in `crates/index/src/vanilla_cache.rs`). The bump is

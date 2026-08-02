@@ -479,6 +479,18 @@ struct DocumentState {
     /// rewriting identical content) matches and skips the revalidate. A DELETE
     /// drops the entry; a URI with no entry always validates.
     watched_signatures: Mutex<HashMap<String, (u64, u128)>>,
+    /// Per-URI span edits of the diagnostics currently published for that file
+    /// (parser-convention ranges — the same `SpanEdit` shape a `SuggestedFix`
+    /// carries), tagged with the diagnostic's code. Replaced wholesale on
+    /// every `publish_filtered` call (scan, keystroke, loc rebuild), so it
+    /// always matches what the client's Problems panel shows; a URI with
+    /// nothing fixable has no entry. Backs the `fixAllWorkspace` command: it
+    /// snapshots this store instead of re-running validation, so "fix all in
+    /// the workspace" fixes exactly the diagnostics currently visible. CW100's
+    /// create-key fix is excluded by construction (its payload carries no span
+    /// edits, see `SuggestedFix::create_loc_key`) — `genlocall` covers mass
+    /// stub generation instead.
+    fixable_edits: Mutex<HashMap<String, Vec<(String, cwtools_parser::fix::SpanEdit)>>>,
 }
 
 /// Write access to a loc overlay that bumps `loc_overlay_revision` on drop,
@@ -659,6 +671,7 @@ impl DocumentState {
             watched_deleted: Mutex::new(HashSet::new()),
             watched_debounce: Mutex::new(None),
             watched_signatures: Mutex::new(HashMap::new()),
+            fixable_edits: Mutex::new(HashMap::new()),
         }
     }
 }

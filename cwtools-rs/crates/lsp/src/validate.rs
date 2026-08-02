@@ -737,6 +737,22 @@ impl Backend {
                     .retain(|d| !code_is_suppressed(d.code.as_ref(), &cfg.ignored_error_codes));
             }
         }
+        // Keep the `fixAllWorkspace` store in lockstep with what's about to be
+        // published, so a snapshot of it always matches the Problems panel.
+        // CW100's create-key fix has no span edit (`fixable_span_edits`
+        // returns nothing for it), so it never lands here.
+        let entries: Vec<(String, cwtools_parser::fix::SpanEdit)> = diagnostics
+            .iter()
+            .flat_map(crate::code_action::fixable_span_edits)
+            .collect();
+        {
+            let mut store = self.state.fixable_edits.lock();
+            if entries.is_empty() {
+                store.remove(uri.as_str());
+            } else {
+                store.insert(uri.as_str().to_string(), entries);
+            }
+        }
         self.client
             .publish_diagnostics(uri, diagnostics, version)
             .await;
