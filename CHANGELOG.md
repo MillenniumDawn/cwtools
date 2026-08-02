@@ -54,6 +54,7 @@
 - `cargo bench -p cwtools_driver --bench rules_hot` measures the editor hot paths (`rules_at_pos` for completion and hover, `value_rules_for_key` per leaf) against a real ruleset. It needs a `cwtools-hoi4-config/Config` checkout, found via `CWTOOLS_RULES` or `CWTOOLS_PROJECTS` the way the corpus guard finds its inputs, and reports why it measured nothing when there isn't one. (#84)
 - `ValidationError.file` is an `Arc<str>` (`cwtools_validation::FilePath`) instead of a `String`, and the CLI's report row carries the same handle plus a `&'static str` code. Anything constructing a `ValidationError` by hand needs `.into()` on the path. (#85)
 - `cwtools_validation::references` holds the project-wide unused check. A caller that wants it validates with `validate_prepared_tracking_uses` instead of `validate_prepared`, merges the returned `UsedInstances` across its files, and calls `check_unused_instances` per file afterwards. `validate_prepared` is unchanged and records nothing. (#93)
+- Two `resolve_loc_insert_target` unit tests hardcoded a Unix-only absolute path (`Path::new("/ws")`) and panicked on Windows CI, where a bare leading `/` isn't absolute without a drive letter. They now build the fixture with the `abs()` helper `crates/cli/src/report.rs`/`config.rs` already use for the same problem. (#108)
 
 # 2.4.0
 

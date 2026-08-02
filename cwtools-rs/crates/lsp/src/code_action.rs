@@ -1358,6 +1358,17 @@ mod tests {
         assert_eq!(insert, "\n my_thing_desc:0 \"TODO\"");
     }
 
+    /// An absolute path spelled the host's way: `Url::from_file_path` needs a
+    /// real absolute path, and on Windows a bare leading `/` isn't one (no
+    /// drive prefix), so it fails where a Unix host would succeed.
+    fn abs(tail: &str) -> String {
+        if cfg!(windows) {
+            format!("C:/{tail}")
+        } else {
+            format!("/{tail}")
+        }
+    }
+
     #[test]
     fn resolve_loc_insert_target_resolves_independently_per_language() {
         // `build_create_loc_key_action` resolves one target per configured
@@ -1369,7 +1380,7 @@ mod tests {
         // needs a running Backend (`file_text_for`, config locks) to exercise
         // — not covered here; the CreateFile-tier integration test covers the
         // NewFile branch end to end for a single language instead.
-        let root = Path::new("/ws");
+        let root = PathBuf::from(abs("ws"));
         let locs = loc_locations_with(&[(
             "my_thing",
             "file:///ws/localisation/things_l_english.yml",
@@ -1378,7 +1389,7 @@ mod tests {
         let siblings = vec!["my_thing".to_string()];
 
         let en =
-            resolve_loc_insert_target(Lang::English, &siblings, &locs, "/ws", &[], root).unwrap();
+            resolve_loc_insert_target(Lang::English, &siblings, &locs, "/ws", &[], &root).unwrap();
         assert_eq!(
             en,
             LocInsertTarget::ExistingFileAfterLine {
@@ -1390,11 +1401,11 @@ mod tests {
         );
 
         let fr =
-            resolve_loc_insert_target(Lang::French, &siblings, &locs, "/ws", &[], root).unwrap();
+            resolve_loc_insert_target(Lang::French, &siblings, &locs, "/ws", &[], &root).unwrap();
         assert_eq!(
             fr,
             LocInsertTarget::NewFile {
-                uri: Url::from_file_path("/ws/localisation/cwtools_generated_l_french.yml")
+                uri: Url::from_file_path(abs("ws/localisation/cwtools_generated_l_french.yml"))
                     .unwrap(),
             }
         );
@@ -1402,7 +1413,7 @@ mod tests {
 
     #[test]
     fn resolve_loc_insert_target_prefers_sibling_over_existing_file_over_new() {
-        let root = Path::new("/ws");
+        let root = PathBuf::from(abs("ws"));
         // Case 1: a sibling site exists -> ExistingFileAfterLine.
         let locs = loc_locations_with(&[(
             "my_thing",
@@ -1411,7 +1422,7 @@ mod tests {
         )]);
         let siblings = vec!["my_thing".to_string()];
         let target =
-            resolve_loc_insert_target(Lang::English, &siblings, &locs, "/ws", &[], root).unwrap();
+            resolve_loc_insert_target(Lang::English, &siblings, &locs, "/ws", &[], &root).unwrap();
         assert_eq!(
             target,
             LocInsertTarget::ExistingFileAfterLine {
@@ -1424,31 +1435,31 @@ mod tests {
 
         // Case 2: no sibling site, but a discovered loc file for the language.
         let empty_locs = crate::LocLocationMap::default();
-        let discovered = vec![PathBuf::from("/ws/localisation/things_l_english.yml")];
+        let discovered = vec![PathBuf::from(abs("ws/localisation/things_l_english.yml"))];
         let target = resolve_loc_insert_target(
             Lang::English,
             &siblings,
             &empty_locs,
             "/ws",
             &discovered,
-            root,
+            &root,
         )
         .unwrap();
         assert_eq!(
             target,
             LocInsertTarget::ExistingFileAppend {
-                uri: Url::from_file_path("/ws/localisation/things_l_english.yml").unwrap(),
+                uri: Url::from_file_path(abs("ws/localisation/things_l_english.yml")).unwrap(),
             }
         );
 
         // Case 3: nothing at all -> a brand new generated file.
         let target =
-            resolve_loc_insert_target(Lang::English, &siblings, &empty_locs, "/ws", &[], root)
+            resolve_loc_insert_target(Lang::English, &siblings, &empty_locs, "/ws", &[], &root)
                 .unwrap();
         assert_eq!(
             target,
             LocInsertTarget::NewFile {
-                uri: Url::from_file_path("/ws/localisation/cwtools_generated_l_english.yml")
+                uri: Url::from_file_path(abs("ws/localisation/cwtools_generated_l_english.yml"))
                     .unwrap(),
             }
         );
