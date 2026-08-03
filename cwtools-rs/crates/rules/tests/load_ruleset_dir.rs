@@ -97,6 +97,26 @@ fn load_ruleset_dir_merges_every_cwt_file() {
     );
 }
 
+/// A directory walk failure must remain non-fatal but reach callers through
+/// the structured rules-error channel. A regular file is a portable way to
+/// make `read_dir` fail without relying on permissions or a race.
+#[test]
+fn load_ruleset_dir_reports_directory_read_error() {
+    let path = fixture_dir().join("nested/notes.txt");
+    let table = StringTable::new();
+    let (ruleset, errors) = load_ruleset_from_dir(&path, &table);
+
+    assert!(ruleset.types.is_empty());
+    assert_eq!(errors.len(), 1, "errors: {errors:?}");
+    let error = &errors[0];
+    assert_eq!(error.file, path);
+    assert_eq!((error.line, error.col), (1, 0));
+    assert!(
+        error.message.starts_with("read directory error:"),
+        "error: {error}"
+    );
+}
+
 /// End-to-end load of the real HOI4 config (`cwtools-hoi4-config`), which is
 /// its own repo and not vendored here.
 ///

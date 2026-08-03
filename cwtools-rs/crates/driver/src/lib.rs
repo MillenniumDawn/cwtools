@@ -161,7 +161,6 @@ fn parse_discovered_files(
                 parsed: loaded.parsed,
                 fingerprint: loaded.fingerprint,
             }),
-            Err(FileError::Io(_)) => None,
             Err(error) => {
                 eprintln!("warn: skipping {}: {}", file.path.display(), error);
                 None
@@ -1240,6 +1239,32 @@ mod tests {
         assert_eq!(
             path,
             Path::new("/cache/vanilla-hoi4-v1.19.2.0_rs_493876ece638460f.cwv")
+        );
+    }
+
+    #[test]
+    fn load_rules_forwards_directory_read_errors_to_warning_sink() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let table = StringTable::new();
+        let mut warnings = Vec::new();
+        let mut on_warning = |warning| warnings.push(warning);
+
+        let ruleset = load_rules(
+            &RulesInput::Dir(file.path().to_path_buf()),
+            &table,
+            Some(&mut on_warning),
+        )
+        .expect("directory load remains non-fatal");
+
+        assert!(ruleset.types.is_empty());
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(
+            warnings[0].starts_with(&format!(
+                "{}:1:0: read directory error:",
+                file.path().display()
+            )),
+            "warning: {}",
+            warnings[0]
         );
     }
 }

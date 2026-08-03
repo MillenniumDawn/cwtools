@@ -11,6 +11,7 @@
 
 ## Bug Fixes
 
+- A script file that disappears or becomes unreadable after discovery is no longer silently omitted. `discover`, `validate` and `fix` now warn with the path and IO error while continuing over the remaining files. A rules directory that cannot be read now travels through the existing rules-error path instead of loading a partial ruleset without an explanation. (#151)
 - The CLI no longer advertises non-emitted diagnostic codes in SARIF `tool.driver.rules`, but `--only-code` still validates pending, non-wired IDs (`CW220`, `CW221`, `CW228`, `CW230`, `CW233`, `CW269`, `CW273`, `CW274`) at parse time. Retired `CW258` is no longer accepted there either. This keeps filters strict while preventing SARIF report metadata from promising diagnostics that cannot fire yet. (#103)
 
 - CW246 ("the variable X has not been set") ran against the variable index for every `value[...]` reference, not just `value[variable]`. Country flags, arrays, division template names, GUI font names and every other named value set were looked up in an index that only ever holds variables, so with the check enabled Millennium Dawn reported 43,646 hits, all but ~60 of them false. It now applies only to the variable namespace. (#92)

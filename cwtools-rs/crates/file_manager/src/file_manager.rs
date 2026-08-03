@@ -385,7 +385,13 @@ impl FileManager {
             .discover_files()?
             .into_par_iter()
             .filter_map(|file| {
-                let content = read_text(&file.path).ok()?;
+                let content = match read_text(&file.path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("warn: skipping {}: {}", file.path.display(), e);
+                        return None;
+                    }
+                };
                 match parse_string_without_comments(&content, table) {
                     Ok(parsed) => Some(ParsedFile {
                         path: file.path,
@@ -456,7 +462,13 @@ impl FileManager {
             .discover_files_multi_mod()
             .into_par_iter()
             .filter_map(|file| {
-                let content = read_text(&file.path).ok()?;
+                let content = match read_text(&file.path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("warn: skipping {}: {}", file.path.display(), e);
+                        return None;
+                    }
+                };
                 match parse_string_without_comments(&content, table) {
                     Ok(parsed) => Some(ParsedFile {
                         path: file.path,

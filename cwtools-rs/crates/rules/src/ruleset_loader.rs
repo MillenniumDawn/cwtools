@@ -33,20 +33,46 @@ impl std::fmt::Display for RuleParseError {
     }
 }
 
+fn directory_read_error(dir: &Path, error: std::io::Error) -> RuleParseError {
+    RuleParseError {
+        file: dir.to_path_buf(),
+        line: 1,
+        col: 0,
+        message: format!("read directory error: {error}"),
+    }
+}
+
 /// Recursively collect all `*.cwt` files under `dir`.
-fn collect_cwt_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_cwt_files(&path, out);
-            } else if path
-                .extension()
-                .map(|e| e.eq_ignore_ascii_case("cwt"))
-                .unwrap_or(false)
-            {
-                out.push(path);
+fn collect_cwt_files(
+    dir: &Path,
+    out: &mut Vec<std::path::PathBuf>,
+    errors: &mut Vec<RuleParseError>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push(directory_read_error(dir, error));
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(directory_read_error(dir, error));
+                continue;
             }
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            collect_cwt_files(&path, out, errors);
+        } else if path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("cwt"))
+            .unwrap_or(false)
+        {
+            out.push(path);
         }
     }
 }
@@ -89,10 +115,10 @@ fn parse_folders_list(content: &str) -> Vec<String> {
 /// or parse are skipped and their messages collected.
 pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<RuleParseError>) {
     let mut cwt_files = Vec::new();
-    collect_cwt_files(dir, &mut cwt_files);
+    let mut errors = Vec::new();
+    collect_cwt_files(dir, &mut cwt_files, &mut errors);
 
     let mut combined = RuleSet::new();
-    let mut errors = Vec::new();
     // Lightweight reference candidates collected from each AST while it is alive.
     // The AST itself is dropped as soon as it is converted; only these positioned
     // (kind, name) records are retained for the post-merge resolution pass, so we
