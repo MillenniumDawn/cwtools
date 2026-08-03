@@ -5099,6 +5099,100 @@ fn test_background_reindex_picks_up_new_file_quietly() {
 }
 
 #[test]
+fn test_background_reindex_survives_a_panicking_pass() {
+    // #155: CWTOOLS_REINDEX_PANIC_ONCE makes the FIRST background pass panic
+    // before it ever scans. `run_reindex_pass`'s wrapper must log-and-swallow
+    // that panic and let `background_reindex_loop`'s own task keep going, so
+    // the SECOND pass (one interval later) still discovers the file — same
+    // setup as test_background_reindex_picks_up_new_file_quietly, but this
+    // proves the loop survives one bad pass instead of just that it works.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let b_rel = "common/decisions/b.txt";
+    let b_path = ws.path().join(b_rel);
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &b_path,
+        "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n",
+    )
+    .unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let mut child = cwtools_server_cmd()
+        .env("CWTOOLS_REINDEX_INTERVAL_SECS", "1")
+        .env("CWTOOLS_REINDEX_IDLE_SECS", "0")
+        .env("CWTOOLS_REINDEX_PANIC_ONCE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // The startup scan runs non-quiet; drain its loadingBar traffic before the
+    // quiet-observation window starts. The startup scan is a separate spawn
+    // from the reindex loop, so CWTOOLS_REINDEX_PANIC_ONCE does not touch it.
+    wait_for_scan_done(&mut reader);
+
+    let b_uri = path_uri(&b_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text":"my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n"}}),
+        ),
+    )
+    .unwrap();
+    let before = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics before background pass");
+    assert!(
+        before.contains(&"CW263".to_string()),
+        "expected CW263 before the definition exists, got: {:?}",
+        before
+    );
+
+    // Create the defining file directly on disk — no didOpen, no
+    // didChangeWatchedFiles notification. Only the periodic background
+    // pass's own filesystem walk can find it.
+    let a_rel = "common/scripted_effects/a.txt";
+    let a_path = ws.path().join(a_rel);
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, "my_se = { log = \"hi\" }\n").unwrap();
+
+    // The first pass (interval #1) panics and is swallowed; only the second
+    // pass (interval #2, ~1s later) actually scans and finds a.txt.
+    let result = wait_for_cleared_diag_quiet(&mut reader, "b.txt", "CW263");
+    child.kill().ok();
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+}
+
+#[test]
 fn test_background_reindex_idle_window_from_init_option() {
     // `backgroundReindexIdleSeconds` in initializationOptions must drive the
     // idle gate — here 0, so the pass fires as soon as the 1s interval
@@ -5526,6 +5620,52 @@ fn test_watched_repeated_change_coalesces_to_one_validate() {
         count_publishes(&frames, "a.txt"),
         1,
         "should publish diagnostics for a.txt exactly once"
+    );
+}
+
+#[test]
+fn test_watched_batch_panic_is_recovered_and_retried() {
+    // #155: CWTOOLS_WATCHED_BATCH_PANIC_ONCE makes the FIRST watched batch
+    // panic before it validates anything. spawn_watched_batch_window's
+    // recovery path must log-and-swallow that panic, put the drained change
+    // back on the queue, and arm a fresh window directly (not through
+    // arm_watched_batch's is_finished() gate, which would see its own
+    // not-yet-returned handle as still running and skip the retry) — so the
+    // file still validates and publishes exactly once, just one debounce
+    // window late, instead of being silently dropped.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server_env(
+        ws.path(),
+        rules_dir.path(),
+        vanilla.path(),
+        &[("CWTOOLS_WATCHED_BATCH_PANIC_ONCE", "1")],
+    );
+    let uri = write_disk_file(ws.path(), "common/decisions/a.txt", STORM_FILE);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(&mut child, &watched_changes(std::slice::from_ref(&uri))).unwrap();
+
+    let frames = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1010);
+    child.kill().ok();
+
+    assert_eq!(
+        count_validate_log(&log, "watched"),
+        1,
+        "the panicking first attempt must not double- or zero-validate after retry"
+    );
+    assert_eq!(
+        count_publishes(&frames, "a.txt"),
+        1,
+        "a.txt should still be published exactly once despite the first batch panicking"
     );
 }
 

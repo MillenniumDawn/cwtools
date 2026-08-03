@@ -30,6 +30,13 @@ const WATCHED_DEBOUNCE_MS: u64 = 500;
 /// once (a rules re-clone / git checkout) instead of per file.
 const WATCHED_BULK_CAP: usize = 200;
 
+/// Test-only one-shot panic switches for `CWTOOLS_WATCHED_BATCH_PANIC_ONCE`
+/// and `CWTOOLS_REINDEX_PANIC_ONCE` (#155): each fires at most once per
+/// server process, so the e2e suite can exercise a background task's panic
+/// recovery without leaving the injected panic armed for every later pass.
+static WATCHED_BATCH_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
+static REINDEX_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
+
 /// One open document captured for a post-scan / config-change revalidation: its
 /// uri, current text, version, and — when the cached AST still matches the
 /// version — that AST (a current AST routes the doc through the no-reparse
@@ -1731,32 +1738,81 @@ impl Backend {
         if guard.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
-        let client = self.client.clone();
-        let state = self.state.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(WATCHED_DEBOUNCE_MS)).await;
-            Backend { client, state }.process_watched_batch().await;
-        });
-        *guard = Some(handle);
+        *guard = Some(self.spawn_watched_batch_window());
     }
 
-    /// Drain the queued watched events (changes + deletes) and apply them off
-    /// the message future. A batch larger than `WATCHED_BULK_CAP` collapses
-    /// into one CAS-guarded rescan instead of hundreds of per-file
-    /// validations — its on-disk prune drops the deleted URIs too, so deletes
-    /// need no separate handling on that path. Below the cap, deletions apply
-    /// first (one `info_service` write), then per-file validation. Re-arms if
-    /// new events landed while it was running.
-    async fn process_watched_batch(&self) {
-        let changes: HashSet<String> = { self.state.watched_pending.lock().drain().collect() };
-        // A URI both changed and deleted this window is treated as a change.
-        let deletes: Vec<String> = {
-            let mut deleted = self.state.watched_deleted.lock();
-            resolve_watched_deletes(&changes, deleted.drain())
-        };
-        if changes.is_empty() && deletes.is_empty() {
-            return;
-        }
+    /// Spawn the debounce-window task itself (sleep, drain, hand the batch to
+    /// `process_watched_batch`) and return its handle, without the
+    /// `is_finished()` gate `arm_watched_batch` applies. That gate exists so a
+    /// concurrent caller doesn't stack a second window on top of a running
+    /// one — it can't be reused by the panic-recovery path below, because
+    /// this task's own handle always reads as unfinished while the task is
+    /// still the one asking.
+    ///
+    /// The drain happens here rather than in `process_watched_batch`, so a
+    /// panic in the batch can't strand the events it was handed: they're
+    /// cloned before the handoff, and if `spawn_logging_panics` reports a
+    /// panic, the clones go back onto the queues and a fresh window is armed
+    /// directly (#155) — the same recovery `is_finished()` already gives a
+    /// later, unrelated watched-file event, just without waiting for one.
+    fn spawn_watched_batch_window(&self) -> tokio::task::JoinHandle<()> {
+        let client = self.client.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(WATCHED_DEBOUNCE_MS)).await;
+            let changes: HashSet<String> = { state.watched_pending.lock().drain().collect() };
+            // A URI both changed and deleted this window is treated as a change.
+            let deletes: Vec<String> = {
+                let mut deleted = state.watched_deleted.lock();
+                resolve_watched_deletes(&changes, deleted.drain())
+            };
+            if changes.is_empty() && deletes.is_empty() {
+                return;
+            }
+            let requeue_changes = changes.clone();
+            let requeue_deletes = deletes.clone();
+            let (batch_client, batch_state) = (client.clone(), state.clone());
+            let ok = spawn_logging_panics("watched batch", async move {
+                // Test-only panic injection (#155): CWTOOLS_WATCHED_BATCH_PANIC_ONCE
+                // panics the first batch after the server starts, then clears
+                // itself, so the e2e suite can exercise the recovery path above.
+                if std::env::var("CWTOOLS_WATCHED_BATCH_PANIC_ONCE").is_ok()
+                    && WATCHED_BATCH_PANIC_ONCE.swap(false, Ordering::SeqCst)
+                {
+                    panic!(
+                        "CWTOOLS_WATCHED_BATCH_PANIC_ONCE: injected panic for #155 test coverage"
+                    );
+                }
+                Backend {
+                    client: batch_client,
+                    state: batch_state,
+                }
+                .process_watched_batch(changes, deletes)
+                .await;
+            })
+            .await;
+            if !ok {
+                state.watched_pending.lock().extend(requeue_changes);
+                state.watched_deleted.lock().extend(requeue_deletes);
+                let retry = Backend {
+                    client,
+                    state: state.clone(),
+                }
+                .spawn_watched_batch_window();
+                *state.watched_debounce.lock() = Some(retry);
+            }
+        })
+    }
+
+    /// Apply a coalesced batch of watched events (`changes` + `deletes`,
+    /// already drained by `spawn_watched_batch_window`) off the message
+    /// future. A batch larger than `WATCHED_BULK_CAP` collapses into one
+    /// CAS-guarded rescan instead of hundreds of per-file validations — its
+    /// on-disk prune drops the deleted URIs too, so deletes need no separate
+    /// handling on that path. Below the cap, deletions apply first (one
+    /// `info_service` write), then per-file validation. Re-arms if new events
+    /// landed while it was running.
+    async fn process_watched_batch(&self, changes: HashSet<String>, deletes: Vec<String>) {
         let mut lost_scan_cas = false;
         if watched_batch_over_cap(changes.len(), deletes.len()) {
             tracing::info!(
@@ -2006,7 +2062,11 @@ impl Backend {
     /// lowering or disabling either setting is noticed promptly even when
     /// the window is hours — before running a quiet
     /// `validate_entire_workspace`. Never unwraps: a malformed env var
-    /// degrades to "disabled"/"default", it doesn't panic the loop.
+    /// degrades to "disabled"/"default", it doesn't panic the loop. Each
+    /// pass runs through `run_reindex_pass`, so a panic inside one pass is
+    /// logged and this loop's own task survives to try again next interval
+    /// (#155) instead of silently ending periodic reindexing for the rest of
+    /// the session.
     pub(crate) async fn background_reindex_loop(&self) {
         loop {
             let interval_secs = self.effective_reindex_interval_secs();
@@ -2025,7 +2085,7 @@ impl Backend {
                 }
                 let idle_ms = self.reindex_idle_ms();
                 if self.should_run_background_pass(idle_ms) {
-                    self.validate_entire_workspace(true).await;
+                    self.run_reindex_pass().await;
                     break;
                 }
                 // Not idle yet — slip forward and check again rather than
@@ -2035,6 +2095,51 @@ impl Backend {
                 )))
                 .await;
             }
+        }
+    }
+
+    /// Run one background reindex pass on its own task via
+    /// `spawn_logging_panics`, so a panic inside `validate_entire_workspace`
+    /// is logged instead of silently killing `background_reindex_loop`'s task
+    /// (#155) — `scan_in_progress` already self-heals through `ScanGuard`
+    /// regardless, but nothing previously stopped the panic from also ending
+    /// every reindex pass after it.
+    async fn run_reindex_pass(&self) {
+        let client = self.client.clone();
+        let state = self.state.clone();
+        spawn_logging_panics("background reindex pass", async move {
+            // Test-only panic injection (#155): CWTOOLS_REINDEX_PANIC_ONCE
+            // panics the first pass after the server starts, then clears
+            // itself, so the e2e suite can exercise the recovery path above.
+            if std::env::var("CWTOOLS_REINDEX_PANIC_ONCE").is_ok()
+                && REINDEX_PANIC_ONCE.swap(false, Ordering::SeqCst)
+            {
+                panic!("CWTOOLS_REINDEX_PANIC_ONCE: injected panic for #155 test coverage");
+            }
+            Backend { client, state }
+                .validate_entire_workspace(true)
+                .await;
+        })
+        .await;
+    }
+}
+
+/// Spawn `fut` on its own task and await it, turning a panic into a
+/// `tracing::error!` instead of letting it vanish with a dropped `JoinHandle`
+/// — the same pattern the startup scan's watcher in `initialized` uses, split
+/// out so `background_reindex_loop` and `arm_watched_batch`'s debounce window
+/// share it (#155). `context` names the task in the log line. Returns whether
+/// `fut` completed without panicking, so a caller holding state the task also
+/// touched (the watched-batch queues) can react.
+async fn spawn_logging_panics<F>(context: &str, fut: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::spawn(fut).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!("{context} panicked: {e}");
+            false
         }
     }
 }
@@ -2153,6 +2258,25 @@ mod tests {
     fn test_discover_vanilla_dir_unknown_game_is_none() {
         assert!(discover_vanilla_dir("not_a_real_game").is_none());
         assert!(discover_vanilla_dir("").is_none());
+    }
+
+    // ── spawn_logging_panics (#155 shared background-task wrapper) ──────────
+
+    #[tokio::test]
+    async fn test_spawn_logging_panics_survives_a_panicking_task() {
+        // The whole point of the wrapper: a panicking task body must not
+        // propagate to (or panic) the caller awaiting it.
+        let ok = spawn_logging_panics("test task", async {
+            panic!("boom");
+        })
+        .await;
+        assert!(!ok, "a panicking task must report false, not propagate");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_logging_panics_reports_true_on_success() {
+        let ok = spawn_logging_panics("test task", async {}).await;
+        assert!(ok, "a task that returns normally must report true");
     }
 
     // ── is_idle (background reindex gating) ────────────────────────────────
