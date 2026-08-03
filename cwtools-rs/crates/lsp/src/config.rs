@@ -73,6 +73,18 @@ pub(crate) fn extract_u64_setting(opts: &Value, key: &str) -> Option<u64> {
     parsed
 }
 
+/// Decode workspace-folder URIs to filesystem paths, for the access boundary's
+/// root list. Strict on purpose: a folder URI that isn't a `file:` URI
+/// contributes no root, where the lax converter would turn
+/// `http://localhost/` into `/` and authorize the whole filesystem. One that
+/// doesn't resolve on disk is dropped later, when `refresh_authorized_roots`
+/// canonicalizes it.
+fn folders_to_paths(uris: &[String]) -> Vec<std::path::PathBuf> {
+    uris.iter()
+        .filter_map(|uri| crate::access::file_uri_to_path(uri))
+        .collect()
+}
+
 /// Render one localisation stub file for `lang` covering every `missing` key,
 /// as `{language, filename_suggestion, content}`. Standard Paradox loc shape:
 /// an `l_<lang>:` header then ` KEY:0 "TODO"` entries. The file needs a UTF-8
@@ -271,7 +283,11 @@ impl Backend {
             if let Some(vd) = opts.get("vanilla").and_then(|v| v.as_str()) {
                 let p = std::path::PathBuf::from(vd);
                 if p.is_dir() {
-                    self.state.config.write().vanilla_dir = Some(p);
+                    {
+                        let mut cfg = self.state.config.write();
+                        cfg.vanilla_dir = Some(p);
+                        cfg.refresh_authorized_roots();
+                    }
                     self.client
                         .log_message(MessageType::INFO, format!("Base-game dir set: {}", vd))
                         .await;
@@ -289,24 +305,32 @@ impl Backend {
             // `reloadrulesconfig` command can re-read it later without a restart.
             if let Some(cache) = opts.get("rulesCache").and_then(|v| v.as_str()) {
                 let cache_path = std::path::PathBuf::from(cache);
-                self.state.config.write().rules_dir = Some(cache_path.clone());
+                {
+                    let mut cfg = self.state.config.write();
+                    cfg.rules_dir = Some(cache_path.clone());
+                    cfg.refresh_authorized_roots();
+                }
                 self.load_rules_config(&cache_path).await;
             }
         }
 
         // Store workspace URI: prefer workspace_folders (multi-root aware), fall
         // back to the legacy root_uri field for clients that only send that.
-        let root = if let Some(folders) = &params.workspace_folders
-            && let Some(first) = folders.first()
-        {
-            Some(first.uri.to_string())
-        } else {
-            params.root_uri.as_ref().map(|u| u.to_string())
+        let folders: Vec<String> = match &params.workspace_folders {
+            Some(folders) if !folders.is_empty() => {
+                folders.iter().map(|f| f.uri.to_string()).collect()
+            }
+            _ => params.root_uri.iter().map(|u| u.to_string()).collect(),
         };
-        if let Some(root) = root {
+        if let Some(root) = folders.first() {
             let mut cfg = self.state.config.write();
-            cfg.workspace_prefix = Some(crate::paths::workspace_prefix_of(&root));
-            cfg.workspace_uri = Some(root.into());
+            cfg.workspace_prefix = Some(crate::paths::workspace_prefix_of(root));
+            cfg.workspace_uri = Some(root.as_str().into());
+            // The rest of the server only knows the primary folder; the whole
+            // list exists so the access boundary doesn't refuse files in a
+            // multi-root window's other folders.
+            cfg.workspace_roots = folders_to_paths(&folders);
+            cfg.refresh_authorized_roots();
         }
 
         // Per-workspace ignore globs from the extension. The extension
@@ -763,6 +787,19 @@ impl Backend {
                     cfg.workspace_uri = None;
                 }
             }
+        }
+        // The access boundary tracks every folder, not just the primary one, so
+        // it follows add/remove even when the primary is untouched.
+        {
+            let removed_paths = folders_to_paths(&removed);
+            let mut cfg = self.state.config.write();
+            cfg.workspace_roots.retain(|r| !removed_paths.contains(r));
+            for path in folders_to_paths(&added) {
+                if !cfg.workspace_roots.contains(&path) {
+                    cfg.workspace_roots.push(path);
+                }
+            }
+            cfg.refresh_authorized_roots();
         }
         self.client
             .log_message(

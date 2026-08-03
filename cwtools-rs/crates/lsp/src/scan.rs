@@ -1475,11 +1475,19 @@ impl Backend {
             let cfg = self.state.config.read();
             (cfg.vanilla_dir.clone(), cfg.language.clone())
         };
+        let was_explicit = explicit_dir.is_some();
         let dir = explicit_dir.or_else(|| discover_vanilla_dir(&game));
         let dir = match dir {
             Some(d) if d.is_dir() => d,
             _ => return,
         };
+        // An install we found ourselves has to go back into the config, or the
+        // URI access boundary refuses every base-game file this then indexes.
+        if !was_explicit {
+            let mut cfg = self.state.config.write();
+            cfg.vanilla_dir = Some(dir.clone());
+            cfg.refresh_authorized_roots();
+        }
 
         // We need the ruleset both to key the cache (the fingerprint folds in the
         // ruleset shape) and to map definitions to their types when rebuilding.
@@ -1790,28 +1798,32 @@ impl Backend {
                     continue;
                 }
                 let path = uri_to_path_str(&uri);
+                // A watched event is as client-supplied as a request URI, so it
+                // goes through the same boundary before anything is read or any
+                // diagnostic is published.
+                let Some(authorized) = self.authorized_path(&uri) else {
+                    tracing::debug!(%uri, "watched file outside the access boundary; skipping");
+                    continue;
+                };
                 // Stat-gate: a toucher that rewrote identical bytes leaves
                 // size+mtime unchanged, so skip the read + revalidate. `None`
                 // (vanished/unreadable, or first-ever event) falls through.
-                let sig = watched_stat_sig(std::path::Path::new(&path));
+                let sig = watched_stat_sig(&authorized);
                 if let Some(sig) = sig
                     && self.state.watched_signatures.lock().get(&uri) == Some(&sig)
                 {
                     tracing::debug!(%uri, "watched file unchanged (stat match); skipping");
                     continue;
                 }
-                // Read on a blocking thread via the file manager so cp1252
-                // script files are validated (not silently dropped) and the
-                // async runtime isn't stalled on the sync read.
-                let read = {
-                    let path = path.clone();
-                    tokio::task::spawn_blocking(move || {
-                        cwtools_file_manager::file_manager::read_text(std::path::Path::new(&path))
-                    })
-                    .await
-                };
+                // Read on a blocking thread via the boundary's capped reader so
+                // cp1252 script files are validated (not silently dropped) and
+                // the async runtime isn't stalled on the sync read.
+                let read = tokio::task::spawn_blocking(move || {
+                    crate::access::read_capped_text(&authorized, crate::access::MAX_URI_READ_BYTES)
+                })
+                .await;
                 match read {
-                    Ok(Ok(text)) => {
+                    Ok(Some(text)) => {
                         // Record before validating so the file's own diagnostics
                         // resolve keys it just defined.
                         if crate::paths::is_loc_file(&uri) {
@@ -1833,8 +1845,8 @@ impl Backend {
                             self.publish_gated(uri_obj, diagnostics, None).await;
                         }
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!("could not read watched file {}: {}", path, e);
+                    Ok(None) => {
+                        tracing::warn!("could not read watched file {}", path);
                     }
                     Err(e) => {
                         tracing::warn!("read task panicked for watched file {}: {}", path, e);

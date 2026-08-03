@@ -11,6 +11,7 @@
 
 ## Bug Fixes
 
+- The language server no longer reads whatever file a client request names. Every per-file URI must be a `file:` URI that resolves to a regular file inside the workspace, the base-game install or the rules directory, and a single read is capped at 64 MiB; anything else is refused quietly (the request answers nothing, and no index state changes). A request naming `file:///dev/zero` previously hung the server reading a device to EOF. An auto-discovered base-game install now counts as readable the same as an explicitly configured one. (#163)
 - A script file that disappears or becomes unreadable after discovery is no longer silently omitted. `discover`, `validate` and `fix` now warn with the path and IO error while continuing over the remaining files. A rules directory that cannot be read now travels through the existing rules-error path instead of loading a partial ruleset without an explanation. (#151)
 - The CLI no longer advertises non-emitted diagnostic codes in SARIF `tool.driver.rules`, but `--only-code` still validates pending, non-wired IDs (`CW220`, `CW221`, `CW228`, `CW230`, `CW233`, `CW269`, `CW273`, `CW274`) at parse time. Retired `CW258` is no longer accepted there either. This keeps filters strict while preventing SARIF report metadata from promising diagnostics that cannot fire yet. (#103)
 

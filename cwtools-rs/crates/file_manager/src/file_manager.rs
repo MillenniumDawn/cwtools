@@ -84,7 +84,13 @@ pub fn read_text(path: &Path) -> Result<String, FileError> {
 /// As [`read_text`], but also reports how the file was encoded so callers can
 /// enforce encoding rules (e.g. localisation must be UTF-8 BOM).
 pub fn read_text_with_encoding(path: &Path) -> Result<(String, FileEncoding), FileError> {
-    let bytes = std::fs::read(path)?;
+    Ok(decode_bytes(std::fs::read(path)?))
+}
+
+/// Decode already-read file bytes by the same rules as [`read_text`], for
+/// callers that must own the read itself (the LSP's URI access boundary reads
+/// through a cap) but still need script files to decode identically.
+pub fn decode_bytes(bytes: Vec<u8>) -> (String, FileEncoding) {
     let has_bom = bytes.starts_with(&UTF8_BOM);
     // Fast path: valid UTF-8 (includes pure ASCII). The BOM, when present, is
     // valid UTF-8 (U+FEFF) and is kept in the string — existing parsers already
@@ -96,14 +102,14 @@ pub fn read_text_with_encoding(path: &Path) -> Result<(String, FileEncoding), Fi
             } else {
                 FileEncoding::Utf8NoBom
             };
-            return Ok((s, enc));
+            return (s, enc);
         }
         Err(e) => e.into_bytes(),
     };
     // Not valid UTF-8: strip a leading BOM if any, then decode as Windows-1252.
     let body = if has_bom { &bytes[3..] } else { &bytes[..] };
     let text = body.iter().map(|&b| cp1252_byte(b)).collect();
-    Ok((text, FileEncoding::NonUtf8))
+    (text, FileEncoding::NonUtf8)
 }
 
 /// How the file should be treated during discovery.

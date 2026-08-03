@@ -16,6 +16,7 @@ use cwtools_string_table::string_table::{StringId, StringTable};
 use cwtools_validation::position::rules_at_pos;
 use cwtools_validation::references;
 
+mod access;
 mod code_action;
 mod color;
 mod completion;
@@ -68,6 +69,18 @@ pub(crate) struct Config {
     /// `workspace_uri` so per-request logical-path derivation doesn't re-parse
     /// the constant workspace URI (see `paths::workspace_prefix_of`).
     pub(crate) workspace_prefix: Option<Arc<str>>,
+    /// Every workspace folder the client reported, `workspace_uri` first.
+    /// Only the URI access boundary reads the whole list — the scan, the
+    /// logical paths and the type index are all built from the primary folder
+    /// alone. Kept so a multi-root window doesn't lose closed-file features in
+    /// its other folders (see `access`).
+    pub(crate) workspace_roots: Vec<std::path::PathBuf>,
+    /// Canonicalized directories a client URI is allowed to name:
+    /// `workspace_roots` plus `vanilla_dir` and `rules_dir`. Recomputed by
+    /// [`Config::refresh_authorized_roots`] whenever one of those is set, so a
+    /// request pays one `canonicalize` of its target instead of re-canonicalizing
+    /// every root. `Arc` so the per-request read is a refcount bump.
+    pub(crate) authorized_roots: Arc<[std::path::PathBuf]>,
     /// base-game install dir (from the `vanilla` init option, or auto-discovered).
     /// Indexed lazily into `vanilla_index` on the first full-workspace scan.
     pub(crate) vanilla_dir: Option<std::path::PathBuf>,
@@ -122,6 +135,8 @@ impl Config {
             language: "paradox".to_string(),
             workspace_uri: None,
             workspace_prefix: None,
+            workspace_roots: Vec::new(),
+            authorized_roots: Arc::from([]),
             vanilla_dir: None,
             cache_dir: None,
             loc_languages: None,
@@ -141,6 +156,20 @@ impl Config {
     /// sites that only need the typed game (not the raw language string).
     pub(crate) fn game(&self) -> Option<cwtools_game::constants::Game> {
         cwtools_game::constants::Game::from_str(&self.language)
+    }
+
+    /// Rebuild [`Config::authorized_roots`] from the workspace folders, the
+    /// base-game install and the rules dir. Call after writing any of them.
+    /// A root that doesn't resolve is dropped rather than kept unresolved: it
+    /// could never match a canonicalized target anyway.
+    pub(crate) fn refresh_authorized_roots(&mut self) {
+        self.authorized_roots = self
+            .workspace_roots
+            .iter()
+            .chain(self.vanilla_dir.iter())
+            .chain(self.rules_dir.iter())
+            .filter_map(|root| std::fs::canonicalize(root).ok())
+            .collect();
     }
 }
 
@@ -610,6 +639,18 @@ impl ValidateTrigger {
             ValidateTrigger::Reindex => "reindex",
         }
     }
+}
+
+/// What `did_close` found on disk when it re-read the file the buffer just
+/// released. Three states, not two: only `Absent` means "gone", and only "gone"
+/// may drop the file's index entry.
+enum DiskState {
+    Parsed(ParsedFile),
+    /// Nothing to index — deleted, unreadable, or it no longer parses.
+    Absent,
+    /// The URI access boundary refused the re-read, so what is on disk is
+    /// unknown and the index must not move.
+    Denied,
 }
 
 impl DocumentState {
@@ -1474,19 +1515,28 @@ impl LanguageServer for Backend {
             (info.export_fingerprint(&uri), info.export_names(&uri))
         };
         let disk_ast = if !crate::paths::has_loc_ext(&uri) && !crate::paths::is_cwt_file(&uri) {
-            let path = crate::paths::uri_to_path_str(&uri);
+            let roots = self.state.config.read().authorized_roots.clone();
             let table = self.state.string_table.clone();
+            let uri = uri.clone();
             tokio::task::spawn_blocking(move || {
-                let text =
-                    cwtools_file_manager::file_manager::read_text(std::path::Path::new(&path))
-                        .ok()?;
-                cwtools_parser::parser::parse_string(&text, &table).ok()
+                use crate::access::{FileRead, MAX_URI_READ_BYTES, read_authorized};
+                match read_authorized(&uri, &roots, MAX_URI_READ_BYTES) {
+                    FileRead::Text(text) => {
+                        match cwtools_parser::parser::parse_string(&text, &table) {
+                            Ok(parsed) => DiskState::Parsed(parsed),
+                            Err(_) => DiskState::Absent,
+                        }
+                    }
+                    FileRead::Missing => DiskState::Absent,
+                    // Refused is not gone: a file the boundary turned away keeps
+                    // whatever index entry it already has.
+                    FileRead::Refused => DiskState::Denied,
+                }
             })
             .await
-            .ok()
-            .flatten()
+            .unwrap_or(DiskState::Denied)
         } else {
-            None
+            DiskState::Absent
         };
 
         let (exports_after, names_after, generation) = {
@@ -1496,29 +1546,33 @@ impl LanguageServer for Backend {
                 return;
             }
 
-            if let Some(parsed) = disk_ast.as_ref() {
-                self.index_parsed_file(&uri, parsed, None);
-            } else {
-                self.state.info_service.write().clear_file(&uri);
-                self.bump_info_revision();
-                // The file is gone from disk too, so its recorded `<type>` uses
-                // must not keep suppressing CW239 on the instances it referenced.
-                // Queue those names so the sweep below revalidates their
-                // definition files. (A file that still exists keeps its
-                // last-validated entry: the buffer just closed normally matches
-                // the disk content it was saved from.)
-                if let Some(uses) = self.state.type_uses.write().remove(&uri) {
-                    let dropped = uses.changed_names(&Default::default());
-                    if !dropped.is_empty() {
-                        self.state
-                            .type_uses_revision
-                            .fetch_add(1, Ordering::Release);
-                        self.state
-                            .pending_changed_names
-                            .lock()
-                            .extend(dropped.into_iter());
+            match &disk_ast {
+                DiskState::Parsed(parsed) => self.index_parsed_file(&uri, parsed, None),
+                DiskState::Absent => {
+                    self.state.info_service.write().clear_file(&uri);
+                    self.bump_info_revision();
+                    // The file is gone from disk too, so its recorded `<type>` uses
+                    // must not keep suppressing CW239 on the instances it referenced.
+                    // Queue those names so the sweep below revalidates their
+                    // definition files. (A file that still exists keeps its
+                    // last-validated entry: the buffer just closed normally matches
+                    // the disk content it was saved from.)
+                    if let Some(uses) = self.state.type_uses.write().remove(&uri) {
+                        let dropped = uses.changed_names(&Default::default());
+                        if !dropped.is_empty() {
+                            self.state
+                                .type_uses_revision
+                                .fetch_add(1, Ordering::Release);
+                            self.state
+                                .pending_changed_names
+                                .lock()
+                                .extend(dropped.into_iter());
+                        }
                     }
                 }
+                // The boundary refused the re-read, which says nothing about
+                // what is on disk — leave the index exactly as it is.
+                DiskState::Denied => {}
             }
             doc_tokens.remove(&uri);
             self.loc_live_overlay_mut().remove(&uri);
