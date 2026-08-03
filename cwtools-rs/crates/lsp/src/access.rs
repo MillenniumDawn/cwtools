@@ -12,6 +12,12 @@
 //! canonicalizes inside one of the roots the server was configured with (the
 //! workspace folders, the base-game install, the rules dir). Anything else is
 //! refused quietly: requests answer `None`, notifications no-op, no index moves.
+//!
+//! Containment is canonical, so a workspace subtree reached through a directory
+//! symlink canonicalizes outside the roots and is refused here even though the
+//! workspace scan (which follows symlinked directories) indexes it. That
+//! disagreement is deliberate for now; issue #161 owns the symlink policy and
+//! is where the two sides get reconciled.
 
 use std::path::{Path, PathBuf};
 
@@ -61,17 +67,10 @@ impl Backend {
 /// sides of the containment test have to come from `canonicalize` or the
 /// Windows verbatim `\\?\` prefix stops them ever matching.
 pub(crate) fn authorized_path(uri: &str, roots: &[PathBuf]) -> Option<PathBuf> {
-    let url = Url::parse(uri).ok()?;
-    // `Url::to_file_path` does not look at the scheme: with an empty or
-    // `localhost` host it happily turns `http://localhost/etc/passwd` into
-    // `/etc/passwd`, so the scheme test has to be made here.
-    if url.scheme() != "file" {
-        tracing::debug!(%uri, "access: not a file URI");
+    let Some(path) = file_uri_to_path(uri) else {
+        tracing::debug!(%uri, "access: not a usable file URI");
         return None;
-    }
-    // No `uri_to_path_str` fallback: its raw-string branch turns
-    // `file://../../etc/passwd` into a relative path read from the CWD.
-    let path = url.to_file_path().ok()?;
+    };
     let path = canonicalize_for_containment(&path)?;
     if !roots.iter().any(|root| path.starts_with(root)) {
         tracing::debug!(path = %path.display(), "access: outside every authorized root");
@@ -89,6 +88,22 @@ pub(crate) fn authorized_path(uri: &str, roots: &[PathBuf]) -> Option<PathBuf> {
         return None;
     }
     Some(path)
+}
+
+/// The path a `file:` URI names, unresolved. `None` for any other scheme.
+///
+/// The strict counterpart to [`crate::paths::uri_to_path_str`], which anything
+/// deriving a *root* must use too: `Url::to_file_path` ignores the scheme (with
+/// an empty or `localhost` host it turns `http://localhost/etc/passwd` into
+/// `/etc/passwd`), and the lax converter's raw-string fallback turns
+/// `file://../../etc/passwd` into a relative path resolved against the CWD. A
+/// `rootUri` of `http://localhost/` would otherwise authorize the filesystem.
+pub(crate) fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let url = Url::parse(uri).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    url.to_file_path().ok()
 }
 
 /// Canonical form of `path` for the containment test. Resolving the whole path
@@ -152,7 +167,7 @@ fn read_capped(path: &Path, max_bytes: u64) -> FileRead {
         return FileRead::Missing;
     }
     if bytes.len() as u64 > max_bytes {
-        tracing::warn!(path = %path.display(), max_bytes, "access: file over the read cap");
+        tracing::debug!(path = %path.display(), max_bytes, "access: file over the read cap");
         return FileRead::Refused;
     }
     FileRead::Text(cwtools_file_manager::file_manager::decode_bytes(bytes).0)
@@ -319,6 +334,20 @@ mod tests {
         );
     }
 
+    /// Over-cap must be `Refused`, never `Missing`: `did_close` maps `Missing`
+    /// to "gone from disk" and clears the file's index entry, so flipping this
+    /// would start wiping the index for large in-workspace files on close.
+    #[test]
+    fn an_over_cap_file_is_refused_not_missing() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, "0123456789abcdefg").unwrap();
+        assert_eq!(
+            read_authorized(&uri(&file), &roots([tmp.path()]), 16),
+            FileRead::Refused
+        );
+    }
+
     /// The boundary owns the read, so it also owns keeping cp1252 script files
     /// readable (pre-Jomini mods) rather than dropping them as invalid UTF-8.
     #[test]
@@ -353,6 +382,21 @@ mod tests {
         assert_eq!(
             read_authorized(&uri(&gone), &roots([root.path()]), MAX_URI_READ_BYTES),
             FileRead::Refused
+        );
+    }
+
+    /// Roots go through the strict conversion too. `uri_to_path_str` would turn
+    /// `http://localhost/` into the path `/` — as a root, that authorizes the
+    /// whole filesystem.
+    #[test]
+    fn a_non_file_folder_uri_contributes_no_root() {
+        assert_eq!(file_uri_to_path("http://localhost/"), None);
+        assert_eq!(file_uri_to_path("untitled:Untitled-1"), None);
+        assert_eq!(file_uri_to_path("file://../../etc"), None);
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        assert_eq!(
+            file_uri_to_path(&uri(tmp.path())).as_deref(),
+            Some(tmp.path())
         );
     }
 

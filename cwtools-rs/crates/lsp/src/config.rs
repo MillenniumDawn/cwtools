@@ -74,11 +74,14 @@ pub(crate) fn extract_u64_setting(opts: &Value, key: &str) -> Option<u64> {
 }
 
 /// Decode workspace-folder URIs to filesystem paths, for the access boundary's
-/// root list. One that doesn't resolve on disk is dropped later, when
-/// `refresh_authorized_roots` canonicalizes it.
+/// root list. Strict on purpose: a folder URI that isn't a `file:` URI
+/// contributes no root, where the lax converter would turn
+/// `http://localhost/` into `/` and authorize the whole filesystem. One that
+/// doesn't resolve on disk is dropped later, when `refresh_authorized_roots`
+/// canonicalizes it.
 fn folders_to_paths(uris: &[String]) -> Vec<std::path::PathBuf> {
     uris.iter()
-        .map(|uri| std::path::PathBuf::from(crate::paths::uri_to_path_str(uri)))
+        .filter_map(|uri| crate::access::file_uri_to_path(uri))
         .collect()
 }
 

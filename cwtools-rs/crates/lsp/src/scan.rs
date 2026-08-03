@@ -1475,11 +1475,19 @@ impl Backend {
             let cfg = self.state.config.read();
             (cfg.vanilla_dir.clone(), cfg.language.clone())
         };
+        let was_explicit = explicit_dir.is_some();
         let dir = explicit_dir.or_else(|| discover_vanilla_dir(&game));
         let dir = match dir {
             Some(d) if d.is_dir() => d,
             _ => return,
         };
+        // An install we found ourselves has to go back into the config, or the
+        // URI access boundary refuses every base-game file this then indexes.
+        if !was_explicit {
+            let mut cfg = self.state.config.write();
+            cfg.vanilla_dir = Some(dir.clone());
+            cfg.refresh_authorized_roots();
+        }
 
         // We need the ruleset both to key the cache (the fingerprint folds in the
         // ruleset shape) and to map definitions to their types when rebuilding.
