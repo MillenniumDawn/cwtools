@@ -156,7 +156,7 @@ fn validate_leaf_against_rule(
                 if let Some(sc) = scope_context.as_mut() {
                     // Explicit field rule (e.g. `int = {}` random_list weight): a
                     // numeric key here is NOT a state scope, so `numeric_state_ok=false`.
-                    enter_block_scope(sc, key, opts, ctx.game, false);
+                    enter_block_scope(sc, key, opts, ctx.game, false, ctx.type_index);
                 }
                 validate_children(
                     ctx,

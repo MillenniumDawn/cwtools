@@ -5,13 +5,22 @@
 //! - root scope seeding via `## replace_scope` (state-history `state` object)
 
 use cwtools_game::constants::Game;
+use cwtools_index::{SourceLocation, TypeIndex, TypeInstance};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 fn errors_hoi4(cwt: &str, script: &str) -> Vec<cwtools_validation::ValidationError> {
+    errors_hoi4_with_index(cwt, script, None)
+}
+
+fn errors_hoi4_with_index(
+    cwt: &str,
+    script: &str,
+    type_index: Option<&TypeIndex>,
+) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
     let parsed_cwt = parse_string(cwt, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
@@ -24,7 +33,7 @@ fn errors_hoi4(cwt: &str, script: &str) -> Vec<cwtools_validation::ValidationErr
             ruleset: &ruleset,
             table: &table,
             game: Some(Game::Hoi4),
-            type_index: None,
+            type_index,
             modifier_keys: None,
             loc_index: None,
             extra_loc_keys: None,
@@ -68,6 +77,64 @@ fn state_trigger_in_country_scope_is_cw104() {
 #[test]
 fn country_trigger_in_country_scope_is_clean() {
     let c = codes_hoi4(SCOPE_RULES, "foo = { country_only = yes }");
+    assert!(!c.contains(&"CW104".to_string()), "got: {:?}", c);
+}
+
+const MIXED_CASE_BLOCK_RULES: &str = r#"
+scopes = {
+    Country = { aliases = { country } }
+    State = { aliases = { state } }
+}
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    alias_name[trigger] = alias_match_left[trigger]
+}
+## scope = country
+alias[trigger:country_block] = {
+    alias_name[trigger] = alias_match_left[trigger]
+}
+alias[trigger:scope_field] = {
+    alias_name[trigger] = alias_match_left[trigger]
+}
+## scope = state
+alias[trigger:state_only] = bool
+"#;
+
+#[test]
+fn mixed_case_block_keeps_parent_scope() {
+    let c = codes_hoi4(
+        MIXED_CASE_BLOCK_RULES,
+        "foo = { country_Block = { state_only = yes } }",
+    );
+    assert!(c.contains(&"CW104".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn indexed_instance_block_remains_lenient() {
+    let mut index = TypeIndex::new();
+    index.merge(
+        "file://characters.txt",
+        HashMap::from([(
+            "character".to_string(),
+            vec![TypeInstance {
+                name: "RUS_known_character".to_string(),
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
+                primary_loc_key: None,
+            }],
+        )]),
+    );
+    let c = errors_hoi4_with_index(
+        MIXED_CASE_BLOCK_RULES,
+        "foo = { RUS_known_character = { state_only = yes } }",
+        Some(&index),
+    )
+    .into_iter()
+    .filter_map(|e| e.code.map(String::from))
+    .collect::<Vec<_>>();
     assert!(!c.contains(&"CW104".to_string()), "got: {:?}", c);
 }
 

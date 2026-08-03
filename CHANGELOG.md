@@ -41,6 +41,7 @@
 
 ## Notes
 
+- **Behavioral:** a mixed-case effect or trigger block key no longer opens the wildcard scope merely because it has an uppercase letter. Nested scope diagnostics, including CW104/CW105/CW106 and CW248, can now report. Full uppercase 2-4-character alphanumeric tags, numeric IDs, and `prefix:data` references remain lenient. (#143)
 - **Behavioral:** the sixteen codes above span their key token rather than the block or statement they open. Anything matching on diagnostic ranges rather than the start position will see the change.
 - **Behavioral:** CW246 now runs by default. `CWTOOLS_NO_VAR_CHECKS=1` turns it off, matching `CWTOOLS_NO_SCOPE_CHECKS`; the old opt-in `CWTOOLS_VAR_CHECKS=1` is gone. Millennium Dawn gains 60 warnings and Kaiserreich 1, all of them variables a dynamic modifier reads but nothing ever sets. Millennium Dawn also gains 29 `is_puppet` info hints: those are the config's own `error_if_only_match` advice, previously masked because a competing alias overload happened to match cleanly.
 - The base-game cache format is v9 (array names are now part of the cached variable set). Existing v8 caches rebuild on first run.
