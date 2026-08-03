@@ -7,9 +7,12 @@
 //! [`vanilla_cache::is_cache_file`] — and everything else is left where it is,
 //! including a foreign directory that happens to be named `parse-cache` (#159).
 //!
-//! Only `remove_file` and empty-directory `remove_dir` are ever called. Neither
-//! follows a symlink, so a link swapped in behind the checks below costs the
-//! link, never what it points at.
+//! Only `remove_file` and empty-directory `remove_dir` are ever called, and
+//! neither follows a symlink at the name it is handed: an entry swapped for a
+//! link between its check and its removal costs the link, not its target. That
+//! holds for the leaf being removed. A directory *component* replaced mid-walk
+//! resolves through the new link like any other path would, so the checks here
+//! are point-in-time and not a defence against a race.
 
 use std::path::Path;
 
@@ -21,16 +24,28 @@ use cwtools_info::vanilla_cache;
 pub(crate) fn purge_caches(cache_dir: &Path) -> (usize, Vec<String>) {
     // A symlinked root is refused outright: every path below is derived from it,
     // so following one would move the whole purge somewhere the client named
-    // only indirectly.
+    // only indirectly. Reported, not just logged, or the command answers
+    // "cleared" having done nothing.
     if std::fs::symlink_metadata(cache_dir).is_ok_and(|metadata| metadata.is_symlink()) {
         tracing::warn!(path = %cache_dir.display(), "cache dir is a symlink; nothing purged");
-        return (0, Vec::new());
+        return (
+            0,
+            vec![format!(
+                "{}: cannot purge a symlinked cache directory",
+                cache_dir.display()
+            )],
+        );
     }
     // Canonical from here on, so every entry below is `<canonical root>/<one
-    // component>` and containment needs no second opinion. A cache dir that
-    // isn't there yet fails this and leaves nothing to do.
-    let Ok(root) = std::fs::canonicalize(cache_dir) else {
-        return (0, Vec::new());
+    // component>` and containment needs no second opinion.
+    let root = match std::fs::canonicalize(cache_dir) {
+        Ok(root) => root,
+        // No cache directory yet is the ordinary case; anything else (no
+        // permission, a file in the way) is a purge that did not happen.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (0, Vec::new()),
+        Err(error) => {
+            return (0, vec![format!("{}: {}", cache_dir.display(), error)]);
+        }
     };
 
     let removal = workspace_cache::remove_all(&root);
@@ -41,8 +56,12 @@ pub(crate) fn purge_caches(cache_dir: &Path) -> (usize, Vec<String>) {
         .map(|(path, error)| format!("{}: {}", path.display(), error))
         .collect();
 
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return (files, failures);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            failures.push(format!("{}: {}", root.display(), error));
+            return (files, failures);
+        }
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -127,7 +146,11 @@ mod tests {
         let (removed, failures) = purge_caches(&link);
 
         assert_eq!(removed, 0);
-        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(
+            failures.len(),
+            1,
+            "a refusal must be reported: {failures:?}"
+        );
         assert!(real.join("parse-cache").exists());
     }
 
