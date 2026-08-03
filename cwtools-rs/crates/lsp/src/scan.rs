@@ -37,6 +37,16 @@ const WATCHED_BULK_CAP: usize = 200;
 static WATCHED_BATCH_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
 static REINDEX_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
 
+/// True when `name` is set to a truthy value (`1`, `true`, `yes`, `on`) — same
+/// convention as `cwtools_profiling::profile_enabled`, so `VAR=0` or an empty
+/// value (a shell habit for "unset") doesn't accidentally arm a test hook.
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 /// One open document captured for a post-scan / config-change revalidation: its
 /// uri, current text, version, and — when the cached AST still matches the
 /// version — that AST (a current AST routes the doc through the no-reparse
@@ -1738,24 +1748,32 @@ impl Backend {
         if guard.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
-        *guard = Some(self.spawn_watched_batch_window());
+        *guard = Some(self.spawn_watched_batch_window(false));
     }
 
     /// Spawn the debounce-window task itself (sleep, drain, hand the batch to
     /// `process_watched_batch`) and return its handle, without the
     /// `is_finished()` gate `arm_watched_batch` applies. That gate exists so a
     /// concurrent caller doesn't stack a second window on top of a running
-    /// one — it can't be reused by the panic-recovery path below, because
-    /// this task's own handle always reads as unfinished while the task is
-    /// still the one asking.
+    /// one — it can't be reused for the panic-recovery retry below: at the
+    /// moment a panic is observed, this task's own handle in the slot still
+    /// reads as unfinished (we're suspended awaiting `spawn_logging_panics`,
+    /// not returned), so `arm_watched_batch`'s gate would always defer to
+    /// itself and never actually retry.
     ///
     /// The drain happens here rather than in `process_watched_batch`, so a
     /// panic in the batch can't strand the events it was handed: they're
     /// cloned before the handoff, and if `spawn_logging_panics` reports a
-    /// panic, the clones go back onto the queues and a fresh window is armed
-    /// directly (#155) — the same recovery `is_finished()` already gives a
-    /// later, unrelated watched-file event, just without waiting for one.
-    fn spawn_watched_batch_window(&self) -> tokio::task::JoinHandle<()> {
+    /// panic, the clones go back onto the queues (#155). `retried` bounds
+    /// that recovery to ONE immediate retry — a *deterministic* panic (a
+    /// validator panicking on one file's content is the realistic trigger
+    /// here) would otherwise loop forever: requeue, retry, panic again,
+    /// every `WATCHED_DEBOUNCE_MS`, re-running a full rescan each cycle on
+    /// the over-cap path. On a second panic in a row the events are left
+    /// requeued for the next natural trigger instead — `arm_watched_batch`
+    /// itself (the next unrelated watched-file event), the requeue check at
+    /// the end of `validate_entire_workspace`, or a periodic reindex pass.
+    fn spawn_watched_batch_window(&self, retried: bool) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let state = self.state.clone();
         tokio::spawn(async move {
@@ -1776,7 +1794,7 @@ impl Backend {
                 // Test-only panic injection (#155): CWTOOLS_WATCHED_BATCH_PANIC_ONCE
                 // panics the first batch after the server starts, then clears
                 // itself, so the e2e suite can exercise the recovery path above.
-                if std::env::var("CWTOOLS_WATCHED_BATCH_PANIC_ONCE").is_ok()
+                if env_flag("CWTOOLS_WATCHED_BATCH_PANIC_ONCE")
                     && WATCHED_BATCH_PANIC_ONCE.swap(false, Ordering::SeqCst)
                 {
                     panic!(
@@ -1791,15 +1809,40 @@ impl Backend {
                 .await;
             })
             .await;
-            if !ok {
-                state.watched_pending.lock().extend(requeue_changes);
-                state.watched_deleted.lock().extend(requeue_deletes);
-                let retry = Backend {
-                    client,
-                    state: state.clone(),
-                }
-                .spawn_watched_batch_window();
-                *state.watched_debounce.lock() = Some(retry);
+            if ok {
+                return;
+            }
+            let (changes_len, deletes_len) = (requeue_changes.len(), requeue_deletes.len());
+            state.watched_pending.lock().extend(requeue_changes);
+            state.watched_deleted.lock().extend(requeue_deletes);
+            if retried {
+                tracing::error!(
+                    changes = changes_len,
+                    deletes = deletes_len,
+                    "watched batch panicked twice in a row; giving up on an immediate \
+                     retry, events requeued for the next watched-file event, workspace \
+                     rescan, or reindex pass"
+                );
+                return;
+            }
+            let retry = Backend {
+                client,
+                state: state.clone(),
+            }
+            .spawn_watched_batch_window(true);
+            // The slot should still hold only this now-finishing window's own
+            // handle — nothing else replaces it while a window is running.
+            // Guard the write anyway so a change to that invariant fails
+            // loudly instead of silently dropping a live handle the slot no
+            // longer points at.
+            let mut slot = state.watched_debounce.lock();
+            if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+                tracing::error!(
+                    "watched-debounce slot held an unexpected live handle during panic \
+                     recovery; retry window spawned but not tracked in the slot"
+                );
+            } else {
+                *slot = Some(retry);
             }
         })
     }
@@ -2111,7 +2154,7 @@ impl Backend {
             // Test-only panic injection (#155): CWTOOLS_REINDEX_PANIC_ONCE
             // panics the first pass after the server starts, then clears
             // itself, so the e2e suite can exercise the recovery path above.
-            if std::env::var("CWTOOLS_REINDEX_PANIC_ONCE").is_ok()
+            if env_flag("CWTOOLS_REINDEX_PANIC_ONCE")
                 && REINDEX_PANIC_ONCE.swap(false, Ordering::SeqCst)
             {
                 panic!("CWTOOLS_REINDEX_PANIC_ONCE: injected panic for #155 test coverage");
@@ -2127,11 +2170,12 @@ impl Backend {
 /// Spawn `fut` on its own task and await it, turning a panic into a
 /// `tracing::error!` instead of letting it vanish with a dropped `JoinHandle`
 /// — the same pattern the startup scan's watcher in `initialized` uses, split
-/// out so `background_reindex_loop` and `arm_watched_batch`'s debounce window
-/// share it (#155). `context` names the task in the log line. Returns whether
-/// `fut` completed without panicking, so a caller holding state the task also
+/// out so `run_reindex_pass`, `arm_watched_batch`'s debounce window, and
+/// `initialized`'s own wrap of the whole `background_reindex_loop` task share
+/// it (#155). `context` names the task in the log line. Returns whether `fut`
+/// completed without panicking, so a caller holding state the task also
 /// touched (the watched-batch queues) can react.
-async fn spawn_logging_panics<F>(context: &str, fut: F) -> bool
+pub(crate) async fn spawn_logging_panics<F>(context: &str, fut: F) -> bool
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
