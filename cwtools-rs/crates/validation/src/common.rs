@@ -203,15 +203,20 @@ pub(crate) fn child_key_matches(
 }
 
 /// A block key that isn't a known scope command but resolves to a scope via the
-/// game data: a numeric state/province id, an upper-case country/state tag, or a
-/// `prefix:data` reference. Plain lowercase effect/trigger names are excluded.
+/// game data: a numeric state/province id, a 2-4 character upper-case
+/// alphanumeric country/state tag, or a `prefix:data` reference. Plain
+/// effect/trigger names are excluded.
 pub(crate) fn looks_like_data_ref(key: &str) -> bool {
     if key.is_empty() {
         return false;
     }
     key.contains(':')
         || key.bytes().all(|b| b.is_ascii_digit())
-        || key.chars().any(|c| c.is_ascii_uppercase())
+        || ((2..=4).contains(&key.len())
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            && key.bytes().any(|b| b.is_ascii_uppercase()))
 }
 
 /// Check that a string has the YYYY.MM.DD shape for a CW date field.
@@ -484,6 +489,19 @@ mod tests {
                 ends_with_ci(s, needle),
                 ends_ref(s, needle),
                 "ends_with_ci({s:?}, {needle:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn data_ref_requires_a_complete_country_tag_shape() {
+        for key in ["GER", "D01", "G1R2", "42", "event_target:foo"] {
+            assert!(looks_like_data_ref(key), "{key:?} should be a data ref");
+        }
+        for key in ["A", "country_Block", "uSA", "GER_tag", "TOOLONG"] {
+            assert!(
+                !looks_like_data_ref(key),
+                "{key:?} should not be a data ref"
             );
         }
     }

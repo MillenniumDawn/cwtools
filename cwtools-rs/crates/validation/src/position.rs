@@ -455,7 +455,14 @@ fn descend(
                         };
                     }
                     if let (Some(sc), Some(opts)) = (scope_context.as_mut(), entered) {
-                        enter_block_scope(sc, &key, opts, ctx.game, entered_via_alias);
+                        enter_block_scope(
+                            sc,
+                            &key,
+                            opts,
+                            ctx.game,
+                            entered_via_alias,
+                            ctx.type_index,
+                        );
                     }
                     return descend(ctx, clause_children, &next, scope_context, line, col);
                 }

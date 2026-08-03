@@ -361,7 +361,7 @@ pub(super) fn validate_alias_usage(
                     if let Some(sc) = scope_context.as_mut() {
                         // Effect/trigger alias usage: a bare integer block key here
                         // is a HOI4 state-id scope (`129 = {}`), so allow numeric→state.
-                        enter_block_scope(sc, key, opts, ctx.game, true);
+                        enter_block_scope(sc, key, opts, ctx.game, true, ctx.type_index);
                     }
                     // Seed loop-local variables: a `for_each_loop`-style block
                     // exposes `value`/`index`/`break` temp variables its body can

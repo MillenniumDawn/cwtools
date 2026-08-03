@@ -180,10 +180,9 @@ pub(crate) fn push_named_scope(ctx: &mut ScopeContext, push: &str) {
 /// 1. an explicit `## push_scope` on the rule (alias effects like `every_state`);
 /// 2. otherwise the scope produced by the key itself when it's a scope-change
 ///    link/iterator/data-ref (`owner`, `random_owned_state`, `root`, `prev`, …);
-/// 3. otherwise, if the key looks like a data reference we don't model
-///    (`sp:foo`, `state:5`, any `prefix:data`), enter ANY scope so inner
-///    effects aren't falsely scope-checked. Plain effect blocks keep the
-///    current scope unchanged.
+/// 3. otherwise, an unmodeled data reference (a tag/id/prefix or verified
+///    indexed instance) enters ANY scope so inner effects aren't falsely
+///    scope-checked. Plain effect blocks keep the current scope unchanged.
 ///
 /// `numeric_state_ok` lets a bare integer block key resolve to the `state` scope
 /// in HOI4 (`129 = { ... }` scopes to state 129). It must be `true` ONLY when the
@@ -196,6 +195,7 @@ pub(crate) fn enter_block_scope(
     opts: &Options,
     game: Option<Game>,
     numeric_state_ok: bool,
+    type_index: Option<&cwtools_index::TypeIndex>,
 ) {
     if key.contains(':') {
         // A `prefix:data` key (`var:x`, `event_target:y`, `sp:z`) is resolved by
@@ -216,8 +216,11 @@ pub(crate) fn enter_block_scope(
         ctx.change_scope(key);
         // change_scope didn't recognise the key, but a from-data reference used
         // as a block key DOES change scope to whatever it resolves to: a numeric
-        // state/province id (`857 = {...}`) or a country tag (`GER = {...}`).
-        if ctx.scope_depth() == before && looks_like_data_ref(key) {
+        // state/province id (`857 = {...}`), a country tag (`GER = {...}`), or an
+        // indexed type instance. The type index does not retain the target scope,
+        // so an indexed instance remains lenient rather than inheriting its parent.
+        let indexed_instance = type_index.is_some_and(|index| index.is_any_instance(key));
+        if ctx.scope_depth() == before && (looks_like_data_ref(key) || indexed_instance) {
             // HOI4: a bare integer scope block is a state (`129 = {...}`), so push
             // `state` rather than the lenient ANY — the body's resource/state
             // triggers then resolve against the right scope and hover shows it.
