@@ -25,11 +25,26 @@ pub struct TypeInstance {
 
 /// Holds all known instances for every type, aggregated across files.
 /// An index of every file path under the game roots (mod + vanilla), used to
-/// check that `filepath` references resolve (CW113). Paths are stored lowercased
-/// and forward-slashed, relative to their root, so lookups are case-insensitive.
+/// check that `filepath` references resolve (CW113). Paths are stored
+/// forward-slashed, relative to their root. Lookups are case-insensitive by
+/// default (Windows-authored mods); after [`FileIndex::set_case_sensitive`] the
+/// files are matched by exact on-disk case, so a reference that only differs
+/// from the on-disk path by case is caught for the case-sensitive filesystems
+/// (Linux/Mac). The on-disk case is collected only while `case_sensitive` is
+/// set, so the default run stores nothing extra. Cache-restored paths carry
+/// their on-disk case (the cache stores it), so they are case-checked too.
 #[derive(Debug, Default)]
 pub struct FileIndex {
+    /// Lowercased relative paths; the case-insensitive membership set.
     files: FxHashSet<String>,
+    /// Lowercased relative path -> on-disk (original) case. Populated only
+    /// while [`FileIndex::set_case_sensitive`] is true, so the default
+    /// (case-insensitive) run pays nothing extra.
+    files_exact: FxHashMap<String, String>,
+    /// When true, [`FileIndex::contains`] enforces exact on-disk case for every
+    /// indexed path, and [`FileIndex::add_root`]/[`FileIndex::add_paths`] record
+    /// the original case needed to do so.
+    case_sensitive: bool,
 }
 
 impl FileIndex {
@@ -39,10 +54,20 @@ impl FileIndex {
 
     /// Walk `root` recursively and add every file's path relative to `root`.
     pub fn add_root(&mut self, root: &std::path::Path) {
-        Self::walk(root, root, &mut self.files);
+        Self::walk(
+            root,
+            root,
+            &mut self.files,
+            self.case_sensitive.then_some(&mut self.files_exact),
+        );
     }
 
-    fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut FxHashSet<String>) {
+    fn walk(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut FxHashSet<String>,
+        mut out_exact: Option<&mut FxHashMap<String, String>>,
+    ) {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) => {
@@ -53,11 +78,15 @@ impl FileIndex {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                Self::walk(root, &path, out);
+                Self::walk(root, &path, out, out_exact.as_deref_mut());
             } else if let Ok(rel) = path.strip_prefix(root)
                 && let Some(s) = rel.to_str()
             {
-                out.insert(s.replace('\\', "/").to_ascii_lowercase());
+                let norm = s.replace('\\', "/");
+                out.insert(norm.to_ascii_lowercase());
+                if let Some(exact) = out_exact.as_deref_mut() {
+                    exact.insert(norm.to_ascii_lowercase(), norm);
+                }
             }
         }
     }
@@ -70,11 +99,18 @@ impl FileIndex {
         self.files.len()
     }
 
-    /// Whether a game-relative path exists (case-insensitive). The argument is
-    /// normalised (lowercased, forward slashes, leading slash stripped, repeated
-    /// slashes collapsed — the engine treats `gfx//interface` as `gfx/interface`,
-    /// and some mod files write the doubled form).
+    /// Whether a game-relative path exists. Case-insensitive by default;
+    /// case-sensitive for live-walked files after [`FileIndex::set_case_sensitive`].
     pub fn contains(&self, path: &str) -> bool {
+        if self.case_sensitive {
+            self.contains_exact(path)
+        } else {
+            self.contains_ci(path)
+        }
+    }
+
+    /// Case-insensitive membership (the default; tolerant of Windows-authored mods).
+    fn contains_ci(&self, path: &str) -> bool {
         thread_local! {
             static NORM_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
         }
@@ -95,14 +131,76 @@ impl FileIndex {
         })
     }
 
-    /// Add already-normalized relative paths (the vanilla-cache restore path).
-    pub fn add_paths<I: IntoIterator<Item = String>>(&mut self, paths: I) {
-        self.files.extend(paths);
+    /// Exact-case membership. A reference that matches a known path only
+    /// case-insensitively is treated as absent (it would fail to load on a
+    /// case-sensitive filesystem). Falls back to case-insensitive membership
+    /// for a path whose on-disk case was never recorded (possible only when the
+    /// flag was turned on after the paths were added), so it isn't spuriously
+    /// flagged.
+    fn contains_exact(&self, path: &str) -> bool {
+        thread_local! {
+            static NORM_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        NORM_BUF.with(|buf| {
+            let mut norm = buf.borrow_mut();
+            norm.clear();
+            // Single pass: split on both separators, drop empty segments
+            // (collapsing repeated/leading slashes), join with '/'. Case kept.
+            let mut first = true;
+            for seg in path.trim().split(['/', '\\']).filter(|s| !s.is_empty()) {
+                if !first {
+                    norm.push('/');
+                }
+                first = false;
+                norm.push_str(seg);
+            }
+            let norm_ci = norm.to_ascii_lowercase();
+            match self.files_exact.get(&norm_ci) {
+                // We know this file's true case: require an exact match.
+                Some(orig) => orig.as_str() == norm.as_str(),
+                // On-disk case never recorded: case-insensitive membership.
+                None => self.files.contains(norm_ci.as_str()),
+            }
+        })
     }
 
-    /// The normalized relative paths, for persisting to the vanilla cache.
+    /// Add relative paths (the vanilla-cache restore path), each carrying its
+    /// on-disk case. Lowercased into the case-insensitive set always; recorded
+    /// into the exact-case map only while `case_sensitive` is set, so the
+    /// default run pays nothing extra.
+    pub fn add_paths<I: IntoIterator<Item = String>>(&mut self, paths: I) {
+        if self.case_sensitive {
+            for p in paths {
+                let ci = p.to_ascii_lowercase();
+                self.files.insert(ci.clone());
+                self.files_exact.insert(ci, p);
+            }
+        } else {
+            for p in paths {
+                self.files.insert(p.to_ascii_lowercase());
+            }
+        }
+    }
+
+    /// Toggle exact-case matching. Off by default (Windows-authored mods);
+    /// enable for mods that also target case-sensitive filesystems (Linux/Mac),
+    /// so a reference that only differs from the file by case is flagged. While
+    /// on, every path added records its on-disk case. Call before building the
+    /// index.
+    pub fn set_case_sensitive(&mut self, case_sensitive: bool) {
+        self.case_sensitive = case_sensitive;
+    }
+
+    /// The lowercased relative paths, for the case-insensitive membership set.
     pub fn paths(&self) -> impl Iterator<Item = &String> {
         self.files.iter()
+    }
+
+    /// The on-disk-case relative paths, for persisting to the vanilla cache so a
+    /// later case-sensitive run can restore exact case. Empty unless
+    /// [`FileIndex::set_case_sensitive`] was set before the paths were added.
+    pub fn paths_exact(&self) -> impl Iterator<Item = &String> {
+        self.files_exact.values()
     }
 
     /// Resolve `value` as a reference made relative to `referencing_file`'s own
@@ -132,7 +230,11 @@ impl FileIndex {
                 } else {
                     format!("{}/{}", dir.join("/"), value)
                 };
-                return self.contains(&sibling);
+                // `.asset`-relative resolution stays case-insensitive even in
+                // case-sensitive mode: the directory segments are recovered from
+                // the referencing file's lowercased path and can't be trusted
+                // for an exact compare.
+                return self.contains_ci(&sibling);
             }
         }
         false
@@ -565,6 +667,42 @@ mod tests {
             "double-slash reference must resolve"
         );
         assert!(idx.contains("gfx/interface/x.dds"));
+    }
+
+    #[test]
+    fn file_index_exact_case_flag_enforces_original_case() {
+        // Live-walked paths record on-disk case when the flag is on.
+        let mut idx = FileIndex::new();
+        idx.set_case_sensitive(true);
+        idx.add_paths(vec!["gfx/interface/x.dds".to_string()]);
+        assert!(
+            !idx.contains("GFX/interface/X.dds"),
+            "case mismatch must be flagged in case-sensitive mode"
+        );
+        assert!(idx.contains("gfx/interface/x.dds"));
+    }
+
+    #[test]
+    fn file_index_flag_off_skips_exact_case_collection() {
+        // With the flag off, no on-disk case is recorded (no memory overhead),
+        // and lookup stays case-insensitive.
+        let mut idx = FileIndex::new();
+        idx.add_paths(vec!["gfx/interface/x.dds".to_string()]);
+        assert!(idx.files_exact.is_empty());
+        assert!(idx.contains("GFX/interface/X.dds"));
+    }
+
+    #[test]
+    fn file_index_exact_case_applies_to_cache_restored_paths() {
+        // Cache-restored paths carry on-disk case, so they are case-checked too.
+        let mut idx = FileIndex::new();
+        idx.set_case_sensitive(true);
+        idx.add_paths(vec!["gfx/interface/y.dds".to_string()]);
+        assert!(
+            !idx.contains("GFX/interface/Y.dds"),
+            "cache-restored case mismatch must be flagged too"
+        );
+        assert!(idx.contains("gfx/interface/y.dds"));
     }
 
     #[test]

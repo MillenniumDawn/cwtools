@@ -138,6 +138,12 @@ enum Commands {
         /// language with data (current behavior).
         #[arg(long = "loc-language", value_name = "LANG", value_parser = parse_lang)]
         loc_language: Vec<Lang>,
+        /// Enforce exact on-disk case for CW113 `filepath` references. On by
+        /// default; pass `false` (or set `case-sensitive-files = false` in
+        /// `cwtools.toml`) for a Windows-authored mod that must tolerate case
+        /// mismatches.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = clap::value_parser!(bool))]
+        case_sensitive_files: Option<bool>,
         /// Only report diagnostics at or above this severity. Valid values:
         /// error, warning, info, hint. Omit to report everything (current
         /// behavior).
@@ -253,6 +259,12 @@ enum Commands {
         /// Restrict loc validation/lookup to this language (repeatable).
         #[arg(long = "loc-language", value_name = "LANG", value_parser = parse_lang)]
         loc_language: Vec<Lang>,
+        /// Enforce exact on-disk case for CW113 `filepath` references. On by
+        /// default; pass `false` (or set `case-sensitive-files = false` in
+        /// `cwtools.toml`) for a Windows-authored mod that must tolerate case
+        /// mismatches.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = clap::value_parser!(bool))]
+        case_sensitive_files: Option<bool>,
         /// Only fix diagnostics with this CW code (repeatable). Omit to fix every
         /// fixable diagnostic. Example: --code CW282 --code CW280
         #[arg(long = "code", value_name = "CWxxx")]
@@ -933,6 +945,7 @@ fn main() {
             ignore_files,
             ignore_dirs,
             loc_language,
+            case_sensitive_files,
             min_severity,
             ignore_codes,
             only_codes,
@@ -979,6 +992,12 @@ fn main() {
                 refresh_vanilla_cache,
                 fc.is_some_and(|c| c.refresh_vanilla_cache),
                 "refresh-vanilla-cache",
+                &mut applied,
+            );
+            let case_sensitive_files = config::pick_flag_default(
+                case_sensitive_files,
+                fc.and_then(|c| c.case_sensitive_files),
+                "case-sensitive-files",
                 &mut applied,
             );
             let report_type = config::pick(
@@ -1136,6 +1155,7 @@ fn main() {
                     } else {
                         Some(loc_language)
                     },
+                    case_sensitive_files,
                     on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
                 },
                 cwtools_driver::default_cache_dir(),
@@ -1700,6 +1720,7 @@ fn main() {
             ignore_files,
             ignore_dirs,
             loc_language,
+            case_sensitive_files,
             codes: only_flag,
             apply,
             allow_empty,
@@ -1746,6 +1767,12 @@ fn main() {
                 refresh_vanilla_cache,
                 fc.is_some_and(|c| c.refresh_vanilla_cache),
                 "refresh-vanilla-cache",
+                &mut applied,
+            );
+            let case_sensitive_files = config::pick_flag_default(
+                case_sensitive_files,
+                fc.and_then(|c| c.case_sensitive_files),
+                "case-sensitive-files",
                 &mut applied,
             );
             let ignore_files = config::pick_list(
@@ -1844,6 +1871,7 @@ fn main() {
                     } else {
                         Some(loc_language)
                     },
+                    case_sensitive_files,
                     on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
                 },
                 cwtools_driver::default_cache_dir(),

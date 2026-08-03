@@ -12,7 +12,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use cwtools_driver::{
-    RulesInput, Session, SessionConfig, VanillaCacheAuto, index_game_dir, search_config_for,
+    RulesInput, Session, SessionConfig, VanillaCacheAuto, build_vanilla_cache_aux, index_game_dir,
+    search_config_for,
 };
 use cwtools_game::constants::Game;
 use cwtools_index::variable_defining_effects;
@@ -142,6 +143,7 @@ fn load_perf_session() -> cwtools_driver::SessionWithFiles {
         ignore_files: &[],
         ignore_dirs: &[],
         loc_languages: None,
+        case_sensitive_files: false,
         on_rules_warning: None,
     })
 }
@@ -210,6 +212,7 @@ fn cw100_count(workspace: &std::path::Path) -> usize {
         ignore_files: &[],
         ignore_dirs: &[],
         loc_languages: None,
+        case_sensitive_files: false,
         on_rules_warning: None,
     });
     session
@@ -242,6 +245,169 @@ fn cw100_still_fires_when_loc_data_exists() {
         cw100_count(tmp.path()),
         1,
         "CW100 must still fire for a missing key once loc data is loaded"
+    );
+}
+
+// ── CW113 case-sensitive filepath check ─────────────────────────────────────
+
+const FILEPATH_RULES: &str = r#"
+spriteType = {
+    texturefile = filepath
+}
+types = {
+    type[spriteType] = {
+        path = "gfx"
+    }
+}
+"#;
+
+/// A mod whose `ref.gfx` references `gfx/test/button.dds` while the on-disk file
+/// is `Button.DDS` (case differs), plus a minimal vanilla install so the file
+/// index (mod walk) is populated.
+fn filepath_workspace() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("rules")).unwrap();
+    std::fs::write(tmp.path().join("rules").join("gfx.cwt"), FILEPATH_RULES).unwrap();
+    let gfx_dir = tmp.path().join("mod").join("gfx");
+    std::fs::create_dir_all(&gfx_dir).unwrap();
+    std::fs::write(
+        gfx_dir.join("ref.gfx"),
+        "spriteType = { texturefile = \"gfx/test/button.dds\" }\n",
+    )
+    .unwrap();
+    let asset = gfx_dir.join("test");
+    std::fs::create_dir_all(&asset).unwrap();
+    std::fs::write(asset.join("Button.DDS"), b"").unwrap();
+    std::fs::create_dir_all(tmp.path().join("vanilla").join("common")).unwrap();
+    std::fs::write(
+        tmp.path().join("vanilla").join("common").join("dummy.txt"),
+        "x = {}\n",
+    )
+    .unwrap();
+    tmp
+}
+
+fn cw113_count(workspace: &std::path::Path, case_sensitive: bool) -> usize {
+    let session = Session::load(SessionConfig {
+        game: Game::Hoi4,
+        rules: RulesInput::Dir(workspace.join("rules")),
+        directory: workspace.join("mod"),
+        vanilla: Some(workspace.join("vanilla")),
+        vanilla_cache: None,
+        vanilla_cache_auto: None,
+        ignore_files: &[],
+        ignore_dirs: &[],
+        loc_languages: None,
+        case_sensitive_files: case_sensitive,
+        on_rules_warning: None,
+    });
+    session
+        .validate_all()
+        .iter()
+        .flat_map(|(_, errs)| errs.iter())
+        .filter(|e| e.code == Some("CW113"))
+        .count()
+}
+
+#[test]
+fn cw113_case_mismatch_only_flagged_in_case_sensitive_mode() {
+    let tmp = filepath_workspace();
+    assert_eq!(
+        cw113_count(tmp.path(), false),
+        0,
+        "case-insensitive (default) must resolve a case-differing reference"
+    );
+    assert_eq!(
+        cw113_count(tmp.path(), true),
+        1,
+        "case-sensitive mode must flag a reference that only differs by case"
+    );
+}
+
+/// A mod whose `ref.gfx` references a vanilla file with the wrong case, loaded
+/// from a pre-built vanilla cache (not a live install walk).
+fn vanilla_cache_workspace() -> (
+    tempfile::TempDir,
+    cwtools_index::vanilla_cache::VanillaCacheData,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("rules")).unwrap();
+    std::fs::write(tmp.path().join("rules").join("gfx.cwt"), FILEPATH_RULES).unwrap();
+    let gfx_dir = tmp.path().join("mod").join("gfx");
+    std::fs::create_dir_all(&gfx_dir).unwrap();
+    std::fs::write(
+        gfx_dir.join("ref.gfx"),
+        "spriteType = { texturefile = \"gfx/vanilla/icon.dds\" }\n",
+    )
+    .unwrap();
+    // The vanilla cache carries the on-disk case `Icon.DDS`; the mod's reference
+    // is the lowercased `icon.dds`.
+    let cache = cwtools_index::vanilla_cache::VanillaCacheData {
+        per_type: std::collections::HashMap::new(),
+        loc_keys: Vec::new(),
+        file_paths: vec!["gfx/vanilla/Icon.DDS".to_string()],
+        var_names: Vec::new(),
+        complex_enum_values: Vec::new(),
+        value_set_values: Vec::new(),
+    };
+    (tmp, cache)
+}
+
+fn cw113_count_from_cache(
+    workspace: &std::path::Path,
+    cache: cwtools_index::vanilla_cache::VanillaCacheData,
+    case_sensitive: bool,
+) -> usize {
+    let session = Session::load(SessionConfig {
+        game: Game::Hoi4,
+        rules: RulesInput::Dir(workspace.join("rules")),
+        directory: workspace.join("mod"),
+        vanilla: None,
+        vanilla_cache: Some(cache),
+        vanilla_cache_auto: None,
+        ignore_files: &[],
+        ignore_dirs: &[],
+        loc_languages: None,
+        case_sensitive_files: case_sensitive,
+        on_rules_warning: None,
+    });
+    session
+        .validate_all()
+        .iter()
+        .flat_map(|(_, errs)| errs.iter())
+        .filter(|e| e.code == Some("CW113"))
+        .count()
+}
+
+#[test]
+fn cw113_case_mismatch_on_cache_restored_vanilla_flagged_in_case_sensitive_mode() {
+    let (tmp, cache) = vanilla_cache_workspace();
+    assert_eq!(
+        cw113_count_from_cache(tmp.path(), cache, false),
+        0,
+        "case-insensitive (default) must resolve a cache-restored vanilla file"
+    );
+    let (tmp2, cache2) = vanilla_cache_workspace();
+    assert_eq!(
+        cw113_count_from_cache(tmp2.path(), cache2, true),
+        1,
+        "case-sensitive mode must flag a case-mismatched cache-restored vanilla file"
+    );
+}
+
+#[test]
+fn vanilla_cache_aux_preserves_original_case_file_paths() {
+    // The cache must store on-disk case so a later case-sensitive run can enforce
+    // it against base-game files too.
+    let tmp = tempfile::tempdir().unwrap();
+    let asset = tmp.path().join("gfx").join("test");
+    std::fs::create_dir_all(&asset).unwrap();
+    std::fs::write(asset.join("Icon.DDS"), b"").unwrap();
+    let aux = build_vanilla_cache_aux(tmp.path(), &cwtools_index::TypeIndex::default());
+    assert!(
+        aux.file_paths.contains(&"gfx/test/Icon.DDS".to_string()),
+        "cache must store original on-disk case, got: {:?}",
+        aux.file_paths
     );
 }
 
@@ -296,6 +462,7 @@ fn unused_session(workspace: &std::path::Path) -> cwtools_driver::SessionWithFil
         ignore_files: &[],
         ignore_dirs: &[],
         loc_languages: None,
+        case_sensitive_files: false,
         on_rules_warning: None,
     })
 }
@@ -374,6 +541,7 @@ fn load_loc_session(
             ignore_files: &[],
             ignore_dirs: &[],
             loc_languages: None,
+            case_sensitive_files: false,
             on_rules_warning: None,
         },
         parse_cache_dir,
@@ -434,6 +602,7 @@ fn changed_source_is_not_validated_against_a_stale_index() {
         ignore_files: &[],
         ignore_dirs: &[],
         loc_languages: None,
+        case_sensitive_files: false,
         on_rules_warning: None,
     });
     std::fs::write(
@@ -503,6 +672,7 @@ fn load_cached(workspace: &std::path::Path, refresh: bool) -> cwtools_driver::Se
         ignore_files: &[],
         ignore_dirs: &[],
         loc_languages: None,
+        case_sensitive_files: false,
         on_rules_warning: None,
     })
 }
@@ -656,6 +826,7 @@ fn load_scoped(
         ignore_files: &[],
         ignore_dirs: &[],
         loc_languages: langs,
+        case_sensitive_files: false,
         on_rules_warning: None,
     })
 }

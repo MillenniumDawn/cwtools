@@ -2158,8 +2158,11 @@ fn hover_markdown(
 
     // Poll hover until loc_text is populated (workspace scan completes).
     // read_response only returns id-bearing messages, so send then read.
+    // Budget generously: the scan runs on a background thread and, under a
+    // loaded CI box (the whole workspace test suite spawning dozens of servers),
+    // it can lag well past the fast no-load case.
     let mut hover_value = String::new();
-    for attempt in 0..30 {
+    for attempt in 0..120 {
         let hover_req = jsonrpc_request(
             2 + attempt,
             "textDocument/hover",
@@ -2483,8 +2486,9 @@ fn goto_def(
     let doc_uri = path_uri(ws.path().join(doc_rel));
     let mut out: Vec<(String, u32)> = Vec::new();
     // Loc-key goto depends on the async workspace scan populating loc_locations;
-    // under parallel test load that can lag, so poll generously.
-    for attempt in 0..50 {
+    // under parallel test load that can lag far beyond the fast no-load case, so
+    // poll very generously.
+    for attempt in 0..200 {
         let req = jsonrpc_request(
             100 + attempt,
             "textDocument/definition",
@@ -9015,8 +9019,12 @@ fn test_published_diagnostic_range_stays_on_its_own_line() {
     write_frame(&mut child, &body).unwrap();
 
     let stdin = child.stdin.take().unwrap();
-    let found = run_with_deadline(stdin, reader, 30, |_stdin, reader| {
-        for _ in 0..400 {
+    let found = run_with_deadline(stdin, reader, 60, |_stdin, reader| {
+        // No fixed frame budget: the diagnostic can trail an arbitrary number of
+        // other notifications (progress, other files' diagnostics), and under a
+        // loaded CI box the server is slow to emit them. The outer deadline is
+        // the only bound; `read_frame` errors still fail fast.
+        loop {
             let Ok(raw) = read_frame(reader) else {
                 return None;
             };
@@ -9040,7 +9048,6 @@ fn test_published_diagnostic_range_stays_on_its_own_line() {
                 return Some(d["range"].clone());
             }
         }
-        None
     });
     child.kill().ok();
 

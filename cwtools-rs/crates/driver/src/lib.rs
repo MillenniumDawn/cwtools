@@ -224,6 +224,11 @@ pub struct SessionConfig<'a> {
     pub ignore_dirs: &'a [String],
     /// Languages to scope loc validation to. `None` = every language with data.
     pub loc_languages: Option<Vec<Lang>>,
+    /// Enforce exact on-disk case for CW113 `filepath` references against the
+    /// mod's own (live-walked) files. Off by default (Windows-authored mods);
+    /// enable for mods that also target case-sensitive filesystems (Linux/Mac),
+    /// so a reference that only differs from the file by case is flagged.
+    pub case_sensitive_files: bool,
     /// Optional sink for rules-load warnings (so the CLI can print them on stderr).
     pub on_rules_warning: Option<&'a mut dyn FnMut(String)>,
 }
@@ -269,6 +274,7 @@ impl Session {
             ignore_files,
             ignore_dirs,
             loc_languages,
+            case_sensitive_files,
             on_rules_warning,
         } = config;
 
@@ -401,6 +407,9 @@ impl Session {
             .collect();
 
         let mut type_index = TypeIndex::new();
+        type_index
+            .file_index
+            .set_case_sensitive(case_sensitive_files);
         for (src, (instances, subtype_instances, var_names, value_sets)) in
             parsed.iter().zip(per_file)
         {
@@ -999,10 +1008,13 @@ pub fn build_vanilla_cache_aux(
     let loc_service = LocService::from_folders(&[vanilla_dir]);
     let loc_keys = cwtools_localization::loc_index::per_language_keys(&loc_service);
     let mut file_index = cwtools_index::FileIndex::new();
+    // Collect on-disk case so a later case-sensitive run can case-check vanilla
+    // references restored from this cache.
+    file_index.set_case_sensitive(true);
     file_index.add_root(vanilla_dir);
     cwtools_index::vanilla_cache::VanillaCacheAux {
         loc_keys,
-        file_paths: file_index.paths().cloned().collect(),
+        file_paths: file_index.paths_exact().cloned().collect(),
         var_names: index.var_index.names().cloned().collect(),
         complex_enum_values: index.complex_enum_values.export(),
         value_set_values: index.value_set_values.export(),
