@@ -1,5 +1,5 @@
 use crate::constants::Game;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use super::{ScopeId, ScopeLink};
 
@@ -8,7 +8,7 @@ use super::{ScopeId, ScopeLink};
 /// Populate the hardcoded scope-link table for a game. HOI4 is config-driven
 /// (its links come from `links.cwt` via the scope registry), so it adds nothing
 /// here. Used only by [`crate::scope_registry::ScopeRegistry::from_hardcoded`].
-pub fn load_scope_links(game: Game, links: &mut HashMap<String, ScopeLink>) {
+pub fn load_scope_links(game: Game, links: &mut FxHashMap<String, ScopeLink>) {
     use crate::constants::Game::*;
     match game {
         Hoi4 => {}
@@ -34,7 +34,7 @@ fn sc(valid: &[u32], target: u32) -> ScopeLink {
 }
 
 /// Insert a link under multiple alias keys.
-fn insert_aliases(links: &mut HashMap<String, ScopeLink>, names: &[&str], link: ScopeLink) {
+fn insert_aliases(links: &mut FxHashMap<String, ScopeLink>, names: &[&str], link: ScopeLink) {
     for name in names {
         links.insert(name.to_string(), link.clone());
     }
@@ -43,7 +43,7 @@ fn insert_aliases(links: &mut HashMap<String, ScopeLink>, names: &[&str], link: 
 /// Register every `(aliases, valid_scopes, target)` entry as a scope-change
 /// link. Shared by the per-game `load_*_links` tables, whose loop bodies were
 /// byte-identical.
-fn load_entries(links: &mut HashMap<String, ScopeLink>, entries: &[(&[&str], &[u32], u32)]) {
+fn load_entries(links: &mut FxHashMap<String, ScopeLink>, entries: &[(&[&str], &[u32], u32)]) {
     for (aliases, valid, target) in entries {
         insert_aliases(links, aliases, sc(valid, *target));
     }
@@ -59,7 +59,7 @@ fn load_entries(links: &mut HashMap<String, ScopeLink>, entries: &[(&[&str], &[u
 //
 // Source: STLScopes.fs (oneToOneScopes) + Stellaris CWT config rules.
 // STLScopes.fs has no scopedEffects list; links derive from CWT and docs.
-fn load_stellaris_links(links: &mut HashMap<String, ScopeLink>) {
+fn load_stellaris_links(links: &mut FxHashMap<String, ScopeLink>) {
     const COUNTRY: u32 = 200;
     const LEADER: u32 = 201;
     const SYSTEM: u32 = 202;
@@ -417,7 +417,7 @@ fn load_stellaris_links(links: &mut HashMap<String, ScopeLink>) {
 // Source: EU4Scopes.fs (oneToOneScopes + scopedEffects).
 // scopedEffects: only "owner" (Province→Country) is active; others commented out.
 // Additional links from EU4 CWT rules and modding docs.
-fn load_eu4_links(links: &mut HashMap<String, ScopeLink>) {
+fn load_eu4_links(links: &mut FxHashMap<String, ScopeLink>) {
     const COUNTRY: u32 = 300;
     const PROVINCE: u32 = 301;
     const TRADE_NODE: u32 = 302;
@@ -580,7 +580,7 @@ fn load_eu4_links(links: &mut HashMap<String, ScopeLink>) {
 // scopedEffects has: primary_title, mother, mother_even_if_dead, father,
 // father_even_if_dead, killer, liege, liege_before_war, top_liege,
 // capital_scope, owner.  Additional iterators from CK2 CWT rules.
-fn load_ck2_links(links: &mut HashMap<String, ScopeLink>) {
+fn load_ck2_links(links: &mut FxHashMap<String, ScopeLink>) {
     const CHARACTER: u32 = 400;
     const TITLE: u32 = 401;
     const PROVINCE: u32 = 402;
@@ -786,7 +786,7 @@ fn load_ck2_links(links: &mut HashMap<String, ScopeLink>) {
 //
 // Source: CK3Scopes.fs.  scopedEffects are all commented out upstream;
 // links are derived from CK3 CWT config rules and CK3 modding docs.
-fn load_ck3_links(links: &mut HashMap<String, ScopeLink>) {
+fn load_ck3_links(links: &mut FxHashMap<String, ScopeLink>) {
     const CHARACTER: u32 = 505;
     const PROVINCE: u32 = 506;
     const COMBAT: u32 = 507;
@@ -976,7 +976,7 @@ fn load_ck3_links(links: &mut HashMap<String, ScopeLink>) {
 //
 // Source: VIC2Scopes.fs.  scopedEffects all commented out; links from CWT
 // rules and VIC2 modding docs.
-fn load_vic2_links(links: &mut HashMap<String, ScopeLink>) {
+fn load_vic2_links(links: &mut FxHashMap<String, ScopeLink>) {
     const COUNTRY: u32 = 604;
     const CHARACTER: u32 = 605;
     const PROVINCE: u32 = 606;
@@ -1088,7 +1088,7 @@ fn load_vic2_links(links: &mut HashMap<String, ScopeLink>) {
 //
 // Source: IRScopes.fs.  scopedEffects all commented out; additional links from
 // IR CWT rules, modding docs, and the IR effects/triggers .log test files.
-fn load_ir_links(links: &mut HashMap<String, ScopeLink>) {
+fn load_ir_links(links: &mut FxHashMap<String, ScopeLink>) {
     const COUNTRY: u32 = 704;
     const CHARACTER: u32 = 705;
     const PROVINCE: u32 = 706;
@@ -1287,11 +1287,11 @@ fn load_ir_links(links: &mut HashMap<String, ScopeLink>) {
 // the standard oneToOneScopes (THIS/ROOT/FROM/PREV chains).  Scope IDs are not
 // assigned in constants.rs (empty arrays), so no links to register here.
 // These stubs are kept so load_scope_links can dispatch cleanly.
-fn load_vic3_links(_links: &mut HashMap<String, ScopeLink>) {
+fn load_vic3_links(_links: &mut FxHashMap<String, ScopeLink>) {
     // No game-specific scope data yet — VIC3 uses only the generic THIS/ROOT/etc.
 }
 
-fn load_eu5_links(_links: &mut HashMap<String, ScopeLink>) {
+fn load_eu5_links(_links: &mut FxHashMap<String, ScopeLink>) {
     // No game-specific scope data yet — EU5 uses only the generic THIS/ROOT/etc.
 }
 

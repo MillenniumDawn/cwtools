@@ -7,8 +7,8 @@
 
 use crate::constants::Game;
 use crate::scope_engine::{SCOPE_ANY, SCOPE_INVALID, ScopeId, ScopeLink};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use std::collections::HashMap;
 
 /// A scope definition parsed from `scopes.cwt` (`Country = { aliases = { country } }`).
 #[derive(Debug, Clone, PartialEq)]
@@ -51,11 +51,11 @@ pub struct ScopeDefOwned {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScopeRegistry {
     /// id -> definition (name, aliases, parents).
-    pub by_id: HashMap<ScopeId, ScopeDefOwned>,
+    pub by_id: FxHashMap<ScopeId, ScopeDefOwned>,
     /// lowercased name AND every alias -> id.
-    pub by_name: HashMap<String, ScopeId>,
+    pub by_name: FxHashMap<String, ScopeId>,
     /// Named links / iterators (`owner`, `every_state`, …) keyed by lowercase name.
-    pub links: HashMap<String, ScopeLink>,
+    pub links: FxHashMap<String, ScopeLink>,
     /// Prefix links (`var:`, `sp:`, `event_target:`), matched by key prefix.
     pub prefix_links: Vec<(String, ScopeLink)>,
 }
@@ -295,7 +295,7 @@ fn backfill_hardcoded(reg: &mut ScopeRegistry, game: Game, next_id: &mut u32) {
 
     // Map each hardcoded id to its id in the merged registry: an existing reg id
     // if the config already defines that scope by name, else a fresh id.
-    let mut hc_to_reg: HashMap<ScopeId, ScopeId> = HashMap::new();
+    let mut hc_to_reg: FxHashMap<ScopeId, ScopeId> = FxHashMap::default();
     for (hid, hdef) in &hc.by_id {
         let existing = std::iter::once(&hdef.name)
             .chain(hdef.aliases.iter())
@@ -376,7 +376,7 @@ fn backfill_hardcoded(reg: &mut ScopeRegistry, game: Game, next_id: &mut u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScopeInput, ScopeRegistry};
+    use super::{LinkInput, ScopeInput, ScopeRegistry};
     use crate::constants::Game;
 
     fn country_only() -> Vec<ScopeInput> {
@@ -402,9 +402,48 @@ mod tests {
         assert!(reg.id_of("planet").is_some(), "planet backfilled");
         assert!(reg.id_of("ship").is_some(), "ship backfilled");
         assert!(reg.id_of("leader").is_some(), "leader backfilled");
+        let planet = reg.id_of("planet").expect("planet backfilled");
+        let owner = reg.links.get("owner").expect("owner link backfilled");
+        assert_eq!(owner.target, Some(country));
+        assert!(owner.valid_scopes.contains(&planet));
         // System has several aliases; any of them must resolve to one id.
         let system = reg.id_of("system").expect("system backfilled");
         assert_eq!(reg.id_of("galactic_object"), Some(system));
+    }
+
+    #[test]
+    fn config_registry_resolves_names_links_and_subscopes() {
+        let reg = ScopeRegistry::from_config(
+            &[
+                ScopeInput {
+                    name: "Country".to_string(),
+                    aliases: vec!["country".to_string()],
+                    is_subscope_of: Vec::new(),
+                },
+                ScopeInput {
+                    name: "Character".to_string(),
+                    aliases: vec!["character".to_string()],
+                    is_subscope_of: vec!["country".to_string()],
+                },
+            ],
+            &[LinkInput {
+                name: "owner".to_string(),
+                output_scope: Some("country".to_string()),
+                input_scopes: vec!["country".to_string()],
+                prefix: None,
+                from_data: false,
+                data_source: Vec::new(),
+            }],
+            Game::Hoi4,
+        );
+        let country = reg.id_of("country").expect("country resolves");
+        let character = reg.id_of("character").expect("character resolves");
+
+        assert_eq!(reg.id_of("Character"), Some(character));
+        assert!(reg.is_subscope_or_eq(character, country));
+        let owner = reg.links.get("owner").expect("owner link resolves");
+        assert_eq!(owner.target, Some(country));
+        assert_eq!(owner.valid_scopes, vec![country]);
     }
 
     /// HOI4 has no hardcoded scope table, so the backfill is a no-op: a config

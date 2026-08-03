@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rustc-hash = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
 

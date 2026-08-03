@@ -423,6 +423,7 @@ name = "cwtools_game"
 version = "2.4.0"
 dependencies = [
  "criterion",
+ "rustc-hash",
  "smallvec",
  "tracing",
 ]
