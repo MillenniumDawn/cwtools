@@ -77,10 +77,16 @@ pub(crate) struct Config {
     pub(crate) workspace_roots: Vec<std::path::PathBuf>,
     /// Canonicalized directories a client URI is allowed to name:
     /// `workspace_roots` plus `vanilla_dir` and `rules_dir`. Recomputed by
-    /// [`Config::refresh_authorized_roots`] whenever one of those is set, so a
+    /// [`Config::refresh_roots`] whenever one of those is set, so a
     /// request pays one `canonicalize` of its target instead of re-canonicalizing
     /// every root. `Arc` so the per-request read is a refcount bump.
     pub(crate) authorized_roots: Arc<[std::path::PathBuf]>,
+    /// Canonicalized directories a server-generated edit is allowed to write
+    /// to: the workspace folders alone. A strict subset of `authorized_roots` —
+    /// the base-game install and the rules dir are readable but never writable
+    /// (see `access::editable_path`). Refreshed with `authorized_roots`, so a
+    /// folder added or removed mid-session moves both.
+    pub(crate) editable_roots: Arc<[std::path::PathBuf]>,
     /// base-game install dir (from the `vanilla` init option, or auto-discovered).
     /// Indexed lazily into `vanilla_index` on the first full-workspace scan.
     pub(crate) vanilla_dir: Option<std::path::PathBuf>,
@@ -137,6 +143,7 @@ impl Config {
             workspace_prefix: None,
             workspace_roots: Vec::new(),
             authorized_roots: Arc::from([]),
+            editable_roots: Arc::from([]),
             vanilla_dir: None,
             cache_dir: None,
             loc_languages: None,
@@ -158,18 +165,27 @@ impl Config {
         cwtools_game::constants::Game::from_str(&self.language)
     }
 
-    /// Rebuild [`Config::authorized_roots`] from the workspace folders, the
-    /// base-game install and the rules dir. Call after writing any of them.
-    /// A root that doesn't resolve is dropped rather than kept unresolved: it
-    /// could never match a canonicalized target anyway.
-    pub(crate) fn refresh_authorized_roots(&mut self) {
-        self.authorized_roots = self
+    /// Rebuild [`Config::authorized_roots`] and [`Config::editable_roots`] from
+    /// the workspace folders, the base-game install and the rules dir. Call
+    /// after writing any of them. A root that doesn't resolve is dropped rather
+    /// than kept unresolved: it could never match a canonicalized target anyway.
+    pub(crate) fn refresh_roots(&mut self) {
+        let editable: Vec<std::path::PathBuf> = self
             .workspace_roots
             .iter()
-            .chain(self.vanilla_dir.iter())
-            .chain(self.rules_dir.iter())
             .filter_map(|root| std::fs::canonicalize(root).ok())
             .collect();
+        self.authorized_roots = editable
+            .iter()
+            .cloned()
+            .chain(
+                self.vanilla_dir
+                    .iter()
+                    .chain(self.rules_dir.iter())
+                    .filter_map(|root| std::fs::canonicalize(root).ok()),
+            )
+            .collect();
+        self.editable_roots = editable.into();
     }
 }
 
@@ -1811,6 +1827,33 @@ mod tests {
         TypeDefinition, ValueType,
     };
     use cwtools_string_table::string_table::StringTable;
+
+    /// The base game and the rules dir are readable but never writable, so
+    /// `refresh_roots` must keep them out of `editable_roots` while leaving
+    /// them in `authorized_roots`. Collapsing the two lists would let a
+    /// generated edit write into the user's game install (#160).
+    #[test]
+    fn refresh_roots_keeps_read_only_roots_out_of_the_edit_boundary() {
+        let ws = tempfile::TempDir::new().expect("tmpdir");
+        let vanilla = tempfile::TempDir::new().expect("tmpdir");
+        let rules = tempfile::TempDir::new().expect("tmpdir");
+        let canonical = |dir: &std::path::Path| std::fs::canonicalize(dir).expect("canonical");
+
+        let mut cfg = Config::new();
+        cfg.workspace_roots = vec![ws.path().to_path_buf()];
+        cfg.vanilla_dir = Some(vanilla.path().to_path_buf());
+        cfg.rules_dir = Some(rules.path().to_path_buf());
+        cfg.refresh_roots();
+
+        assert_eq!(cfg.editable_roots.as_ref(), [canonical(ws.path())]);
+        for root in [ws.path(), vanilla.path(), rules.path()] {
+            assert!(
+                cfg.authorized_roots.contains(&canonical(root)),
+                "{} must stay readable",
+                root.display()
+            );
+        }
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

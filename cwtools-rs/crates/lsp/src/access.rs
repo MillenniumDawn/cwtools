@@ -18,6 +18,12 @@
 //! workspace scan (which follows symlinked directories) indexes it. That
 //! disagreement is deliberate for now; issue #161 owns the symlink policy and
 //! is where the two sides get reconciled.
+//!
+//! Edits get their own, stricter boundary in [`editable_path`]: a generated
+//! `WorkspaceEdit` may only name a path inside a *workspace* root, and may not
+//! name a symlink at all. The base game and the rules dir are readable but
+//! never writable, so the two boundaries take different root lists
+//! ([`crate::Config::authorized_roots`] and [`crate::Config::editable_roots`]).
 
 use std::path::{Path, PathBuf};
 
@@ -63,7 +69,7 @@ impl Backend {
 
 /// The canonical path `uri` names, when it is a `file:` URI naming a regular
 /// file inside `roots`. `roots` must already be canonical
-/// ([`crate::Config::refresh_authorized_roots`] keeps them that way) — both
+/// ([`crate::Config::refresh_roots`] keeps them that way) — both
 /// sides of the containment test have to come from `canonicalize` or the
 /// Windows verbatim `\\?\` prefix stops them ever matching.
 pub(crate) fn authorized_path(uri: &str, roots: &[PathBuf]) -> Option<PathBuf> {
@@ -118,6 +124,116 @@ fn canonicalize_for_containment(path: &Path) -> Option<PathBuf> {
             let parent = std::fs::canonicalize(path.parent()?).ok()?;
             Some(parent.join(path.file_name()?))
         }
+    }
+}
+
+/// Why a path may not be the target of a server-generated edit. Carried so a
+/// refusal the user sees (the rename cancellation) can name the actual cause
+/// instead of guessing at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditRefusal {
+    /// Not a `file:` URI, so it names nothing on disk to contain.
+    NotAFile,
+    /// The leaf is a symlink. Refused rather than followed — see
+    /// [`editable_target`].
+    Symlink,
+    /// Exists, but is a directory, a device, or another non-regular file.
+    NotARegularFile,
+    /// Resolves outside every workspace root.
+    OutsideWorkspace,
+    /// Doesn't resolve at all: a `..` that would climb past the canonical
+    /// ancestor, or a parent directory that can't be read.
+    Unresolvable,
+}
+
+impl EditRefusal {
+    /// The cause as a predicate, for a message of the form `'<uri>' <reason>`.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::NotAFile => "is not a file on disk",
+            Self::Symlink => "is a symbolic link",
+            Self::NotARegularFile => "is not a regular file",
+            Self::OutsideWorkspace => "is outside the workspace",
+            Self::Unresolvable => "cannot be resolved on disk",
+        }
+    }
+}
+
+/// The canonical path `uri` names, when a server-generated edit may write to
+/// it, else why it may not.
+///
+/// The write-side counterpart of [`authorized_path`], and stricter in two ways
+/// because an edit changes what a read only observes: `roots` here is
+/// [`crate::Config::editable_roots`] — the workspace folders alone, never the
+/// base-game install or the rules dir — and a symlink at the leaf is refused
+/// outright rather than followed.
+///
+/// The leaf rule is the tighter half. Resolving a link would already catch one
+/// aiming out of the workspace, but the leaf is the component the workspace
+/// author can re-point between this check and the client's write, so a link
+/// there is refused even when it currently resolves back inside a root. That
+/// narrows the window to an active swap; it cannot close it, because the client
+/// performs the write long after the server answers.
+pub(crate) fn editable_path(uri: &str, roots: &[PathBuf]) -> Result<PathBuf, EditRefusal> {
+    let Some(path) = file_uri_to_path(uri) else {
+        tracing::debug!(%uri, "access: not a usable file URI for an edit");
+        return Err(EditRefusal::NotAFile);
+    };
+    editable_target(&path, roots)
+}
+
+/// [`editable_path`] for a path the server derived itself rather than one that
+/// arrived as a URI — the loc-file candidates the create-loc-key action picks
+/// between.
+pub(crate) fn editable_target(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, EditRefusal> {
+    let resolved = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            tracing::debug!(path = %path.display(), "access: edit target is a symlink");
+            return Err(EditRefusal::Symlink);
+        }
+        Ok(meta) if !meta.is_file() => {
+            tracing::debug!(path = %path.display(), "access: edit target is not a regular file");
+            return Err(EditRefusal::NotARegularFile);
+        }
+        // Resolves any symlink among the ancestors; the leaf is already known
+        // not to be one.
+        Ok(_) => std::fs::canonicalize(path).map_err(|_| EditRefusal::Unresolvable)?,
+        // No metadata at all. Usually the file simply isn't there yet (the
+        // create-loc-key `NewFile` tier), but an unreadable or non-directory
+        // parent lands here too — `canonicalize_new_path` refuses those rather
+        // than assuming the path is merely new.
+        Err(_) => canonicalize_new_path(path).ok_or(EditRefusal::Unresolvable)?,
+    };
+    if !roots.iter().any(|root| resolved.starts_with(root)) {
+        tracing::debug!(path = %resolved.display(), "access: edit target outside every workspace root");
+        return Err(EditRefusal::OutsideWorkspace);
+    }
+    Ok(resolved)
+}
+
+/// Canonical form of a path that does not exist yet, for an edit that creates
+/// its target: resolve the deepest ancestor that *does* exist and re-attach the
+/// missing tail.
+///
+/// The read path's [`canonicalize_for_containment`] falls back one level, which
+/// is enough for a file that was just deleted but not for the create-loc-key
+/// `NewFile` tier — it targets `<workspace>/localisation/…` in a workspace that
+/// may have no `localisation` directory at all. Every missing component has to
+/// be a plain name: a `..` can't be resolved against the canonical ancestor, so
+/// it is refused rather than normalized.
+fn canonicalize_new_path(path: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(base) = std::fs::canonicalize(cursor) {
+            return Some(base.join(tail.iter().rev().collect::<PathBuf>()));
+        }
+        let std::path::Component::Normal(name) = cursor.components().next_back()? else {
+            tracing::debug!(path = %path.display(), "access: edit target is not a plain path");
+            return None;
+        };
+        tail.push(name);
+        cursor = cursor.parent()?;
     }
 }
 
@@ -406,5 +522,157 @@ mod tests {
         let file = tmp.path().join("a.txt");
         std::fs::write(&file, "foo = { }\n").unwrap();
         assert_eq!(authorized_path(&uri(&file), &[]), None);
+    }
+
+    // ── The edit boundary ─────────────────────────────────────────────────
+
+    #[test]
+    fn accepts_a_regular_file_under_an_edit_root() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("localisation/x_l_english.yml");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "l_english:\n").unwrap();
+        assert!(editable_path(&uri(&file), &roots([tmp.path()])).is_ok());
+    }
+
+    /// The reported bug: workspace `/ws/mod` with the base game at
+    /// `/ws/mod-vanilla` — a string prefix says the vanilla file is in the
+    /// workspace, and the create-loc-key action then offers to edit the
+    /// base-game install.
+    #[test]
+    fn rejects_a_sibling_edit_root_with_a_shared_name_prefix() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path().join("mod");
+        let sibling = tmp.path().join("mod-vanilla");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let file = sibling.join("x_l_english.yml");
+        std::fs::write(&file, "l_english:\n").unwrap();
+        assert_eq!(
+            editable_path(&uri(&file), &roots([&root])),
+            Err(EditRefusal::OutsideWorkspace)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_leaf_symlink_pointing_out_of_the_root() {
+        let root = tempfile::TempDir::new().expect("tmpdir");
+        let other = tempfile::TempDir::new().expect("tmpdir");
+        let target = other.path().join("secret.txt");
+        std::fs::write(&target, "secret\n").unwrap();
+        let link = root.path().join("x_l_english.yml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            editable_path(&uri(&link), &roots([root.path()])),
+            Err(EditRefusal::Symlink)
+        );
+    }
+
+    /// Stricter than the read side on purpose: even a link that resolves back
+    /// inside the root is refused, because the leaf is the one component the
+    /// workspace author can re-point between this check and the client's write.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_leaf_symlink_even_when_its_target_is_inside_the_root() {
+        let root = tempfile::TempDir::new().expect("tmpdir");
+        let target = root.path().join("real_l_english.yml");
+        std::fs::write(&target, "l_english:\n").unwrap();
+        let link = root.path().join("link_l_english.yml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            editable_path(&uri(&link), &roots([root.path()])),
+            Err(EditRefusal::Symlink)
+        );
+        assert!(
+            editable_path(&uri(&target), &roots([root.path()])).is_ok(),
+            "the real file behind the link is still editable"
+        );
+    }
+
+    /// The create-loc-key `NewFile` tier: neither the file nor its directory
+    /// exists yet, so `canonicalize` can't resolve either.
+    #[test]
+    fn accepts_a_new_file_whose_parent_directory_does_not_exist_yet() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let new = tmp
+            .path()
+            .join("localisation/cwtools_generated_l_english.yml");
+        let resolved = editable_path(&uri(&new), &roots([tmp.path()])).expect("contained");
+        assert!(resolved.ends_with("localisation/cwtools_generated_l_english.yml"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_new_file_under_a_directory_symlink_pointing_out_of_the_root() {
+        let root = tempfile::TempDir::new().expect("tmpdir");
+        let other = tempfile::TempDir::new().expect("tmpdir");
+        std::os::unix::fs::symlink(other.path(), root.path().join("localisation")).unwrap();
+        let new = root
+            .path()
+            .join("localisation/cwtools_generated_l_english.yml");
+        assert_eq!(
+            editable_path(&uri(&new), &roots([root.path()])),
+            Err(EditRefusal::OutsideWorkspace)
+        );
+    }
+
+    /// A `..` in the not-yet-existing tail can't be resolved against the
+    /// canonical ancestor, so it is refused rather than normalized.
+    #[test]
+    fn rejects_a_new_path_that_climbs_out_with_dot_dot() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path().join("mod");
+        std::fs::create_dir(&root).unwrap();
+        let climbing = root.join("gone/../../escaped.yml");
+        assert_eq!(
+            editable_target(&climbing, &roots([&root])),
+            Err(EditRefusal::Unresolvable)
+        );
+    }
+
+    #[test]
+    fn rejects_a_directory_and_a_non_file_scheme() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let dir = tmp.path().join("localisation");
+        std::fs::create_dir(&dir).unwrap();
+        let roots = roots([tmp.path()]);
+        assert_eq!(
+            editable_path(&uri(&dir), &roots),
+            Err(EditRefusal::NotARegularFile)
+        );
+        let file = tmp.path().join("a.yml");
+        std::fs::write(&file, "l_english:\n").unwrap();
+        let http = uri(&file).replacen("file://", "http://localhost", 1);
+        assert_eq!(editable_path(&http, &roots), Err(EditRefusal::NotAFile));
+        assert_eq!(
+            editable_path("untitled:Untitled-1", &roots),
+            Err(EditRefusal::NotAFile)
+        );
+    }
+
+    #[test]
+    fn refuses_every_edit_when_no_root_is_configured() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("a.yml");
+        std::fs::write(&file, "l_english:\n").unwrap();
+        assert_eq!(
+            editable_path(&uri(&file), &[]),
+            Err(EditRefusal::OutsideWorkspace)
+        );
+    }
+
+    /// Every cause reads as `'<uri>' <reason>` in the rename refusal.
+    #[test]
+    fn every_refusal_names_its_cause() {
+        for refusal in [
+            EditRefusal::NotAFile,
+            EditRefusal::Symlink,
+            EditRefusal::NotARegularFile,
+            EditRefusal::OutsideWorkspace,
+            EditRefusal::Unresolvable,
+        ] {
+            assert!(refusal.reason().starts_with("is ") || refusal.reason().starts_with("cannot "));
+        }
     }
 }

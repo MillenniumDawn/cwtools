@@ -37,7 +37,7 @@ use cwtools_parser::ast::{SourcePos, SourceRange};
 use cwtools_parser::fix::{SpanEdit, SuggestedFix, plan_file_edits};
 
 use crate::Backend;
-use crate::paths::{source_column_to_lsp, source_position_to_lsp, uri_is_in_workspace};
+use crate::paths::{source_column_to_lsp, source_position_to_lsp};
 
 /// Key under which a fix payload lives in `Diagnostic.data`. Namespaced so a
 /// codeAction request only treats data it put there as a fix (future diagnostic
@@ -349,32 +349,40 @@ fn sibling_loc_keys(
         .collect()
 }
 
-/// The first of `siblings` that has a known definition site in a workspace
-/// (not vanilla) loc file matching `lang`'s filename convention
-/// (`l_<lang>`), if any. Siblings are tried in the type's declaration order,
-/// so the choice is deterministic.
+/// The first of `siblings` that has a known definition site in a loc file the
+/// edit boundary will accept (`edit_roots`, so never vanilla) matching `lang`'s
+/// filename convention (`l_<lang>`), if any. Siblings are tried in the type's
+/// declaration order, so the choice is deterministic.
+///
+/// `loc_locations` mixes workspace and base-game definition sites and records
+/// the path the loc walk saw, which can be a symlink; a site the boundary
+/// refuses is skipped and the next sibling tried.
 fn resolve_sibling_site(
     siblings: &[String],
     loc_locations: &crate::LocLocationMap,
-    workspace_prefix: &str,
+    edit_roots: &[PathBuf],
     lang: Lang,
 ) -> Option<(std::sync::Arc<str>, u32)> {
     let marker = format!("l_{lang}").to_ascii_lowercase();
     siblings.iter().find_map(|sib| {
         let (uri, line0) = loc_locations.get(sib.to_ascii_lowercase().as_str())?;
-        if !uri_is_in_workspace(uri, workspace_prefix) {
+        // Name first, boundary second: the filename test is free, the boundary
+        // stats the disk.
+        let fname = uri.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+        if !fname.contains(&marker) {
             return None;
         }
-        let fname = uri.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
-        fname
-            .contains(&marker)
-            .then(|| (std::sync::Arc::clone(uri), *line0))
+        crate::access::editable_path(uri, edit_roots).ok()?;
+        Some((std::sync::Arc::clone(uri), *line0))
     })
 }
 
 /// The first (sorted, for determinism) discovered loc file whose name matches
-/// `lang`'s `l_<lang>` convention.
-fn pick_lang_file(discovered: &[PathBuf], lang: Lang) -> Option<PathBuf> {
+/// `lang`'s `l_<lang>` convention and which the edit boundary accepts. The loc
+/// walk follows symlinks, so a discovered path can name a file outside the
+/// workspace; the boundary runs after the sort, so a workspace full of loc
+/// files costs one `canonicalize`, not one per file.
+fn pick_lang_file(discovered: &[PathBuf], lang: Lang, edit_roots: &[PathBuf]) -> Option<PathBuf> {
     let marker = format!("l_{lang}").to_ascii_lowercase();
     let mut matches: Vec<&PathBuf> = discovered
         .iter()
@@ -385,7 +393,10 @@ fn pick_lang_file(discovered: &[PathBuf], lang: Lang) -> Option<PathBuf> {
         })
         .collect();
     matches.sort();
-    matches.first().map(|p| (*p).clone())
+    matches
+        .into_iter()
+        .find(|p| crate::access::editable_target(p, edit_roots).is_ok())
+        .cloned()
 }
 
 /// Path for a brand-new generated loc file, when no loc file at all covers
@@ -400,31 +411,42 @@ fn generated_loc_file_path(workspace_root: &Path, lang: Lang) -> PathBuf {
 /// a sibling key's site, else an existing loc file for the language, else a
 /// new one. `discovered_loc_files` is the workspace's loc-file listing
 /// (`LocService::discover_files`), walked once up front by the caller and
-/// shared across languages. `None` only when a resolved path fails to parse
-/// as a `file://` URI (never observed in practice for an absolute path).
+/// shared across languages.
+///
+/// Every tier is filtered by the edit boundary against `edit_roots`, so the
+/// target this returns is one a generated edit may write to (#160). Filtering
+/// per tier rather than once at the end keeps the fall-through: a site the
+/// boundary refuses drops to the next tier instead of costing the whole action.
+/// `None` when even the new-file path is refused, or when a resolved path fails
+/// to parse as a `file://` URI.
 fn resolve_loc_insert_target(
     lang: Lang,
     siblings: &[String],
     loc_locations: &crate::LocLocationMap,
-    workspace_prefix: &str,
+    edit_roots: &[PathBuf],
     discovered_loc_files: &[PathBuf],
     workspace_root: &Path,
 ) -> Option<LocInsertTarget> {
     if let Some((uri, after_line0)) =
-        resolve_sibling_site(siblings, loc_locations, workspace_prefix, lang)
+        resolve_sibling_site(siblings, loc_locations, edit_roots, lang)
     {
         return Some(LocInsertTarget::ExistingFileAfterLine {
             uri: Url::parse(&uri).ok()?,
             after_line0,
         });
     }
-    if let Some(path) = pick_lang_file(discovered_loc_files, lang) {
+    if let Some(path) = pick_lang_file(discovered_loc_files, lang, edit_roots) {
         return Some(LocInsertTarget::ExistingFileAppend {
             uri: Url::from_file_path(&path).ok()?,
         });
     }
+    // The new file doesn't exist yet, so nothing else will ever check it: this
+    // is the only gate between a symlinked `localisation/` and a file created
+    // outside the workspace.
+    let new_path = generated_loc_file_path(workspace_root, lang);
+    crate::access::editable_target(&new_path, edit_roots).ok()?;
     Some(LocInsertTarget::NewFile {
-        uri: Url::from_file_path(generated_loc_file_path(workspace_root, lang)).ok()?,
+        uri: Url::from_file_path(new_path).ok()?,
     })
 }
 
@@ -548,18 +570,20 @@ impl Backend {
         if candidates.is_empty() {
             return Vec::new();
         }
-        let (workspace_root, workspace_prefix) = {
+        // The roots are read here, per request, so a folder added or removed
+        // since the last one is already reflected.
+        let (workspace_root, edit_roots) = {
             let cfg = self.state.config.read();
             let Some(ws_uri) = cfg.workspace_uri.clone() else {
                 return Vec::new();
             };
-            let Some(prefix) = cfg.workspace_prefix.clone() else {
+            // The strict conversion, not `uri_to_path_str`: this path is a root
+            // for everything below, and the lax converter's fallback would turn
+            // a malformed workspace URI into a path relative to the CWD.
+            let Some(root) = crate::access::file_uri_to_path(&ws_uri) else {
                 return Vec::new();
             };
-            (
-                std::path::PathBuf::from(crate::paths::uri_to_path_str(&ws_uri)),
-                prefix,
-            )
+            (root, cfg.editable_roots.clone())
         };
         let langs: Vec<Lang> = {
             let cfg = self.state.config.read();
@@ -585,7 +609,7 @@ impl Backend {
                     &langs,
                     &discovered,
                     &workspace_root,
-                    &workspace_prefix,
+                    &edit_roots,
                     encoding,
                 )
             })
@@ -646,7 +670,7 @@ impl Backend {
         langs: &[Lang],
         discovered: &[PathBuf],
         workspace_root: &Path,
-        workspace_prefix: &str,
+        edit_roots: &[PathBuf],
         encoding: &PositionEncodingKind,
     ) -> Option<CodeAction> {
         let siblings = self.sibling_loc_keys_for_diagnostic(uri, diag, create_loc_key);
@@ -658,7 +682,7 @@ impl Backend {
                 lang,
                 &siblings,
                 &loc_locations,
-                workspace_prefix,
+                edit_roots,
                 discovered,
                 workspace_root,
             )?;
@@ -725,7 +749,8 @@ impl Backend {
 // diagnostic across the whole workspace in one `workspace/applyEdit`,
 // mirroring `cwtools fix --apply`. It snapshots `DocumentState::fixable_edits`
 // (kept current by every `validate::publish_filtered` call) instead of
-// re-running validation, so it fixes exactly what the Problems panel shows.
+// re-running validation, so it fixes exactly what the Problems panel shows,
+// minus any file the edit boundary refuses to write to.
 // CW100's create-key fix never appears in that store — see its doc comment.
 
 /// One URI's resolved fix-all-workspace edits: the survivors after overlap
@@ -793,6 +818,14 @@ fn workspace_edit_changes(
     changes
 }
 
+/// The command's result message when every fixable file was refused by the
+/// edit boundary. Distinct from the empty-store message: the problems are real
+/// and the user can see them in the panel, they just aren't in a file cwtools
+/// will write to.
+fn outside_workspace_summary(refused: usize) -> String {
+    format!("Skipped {refused} file(s) with auto-fixable problems: they are outside the workspace.")
+}
+
 /// The command's result message on success:
 /// `"Applied N fix(es) across M file(s)"`, with an `"; K skipped
 /// (overlapping)"` suffix when any edit was dropped for overlapping — the
@@ -808,13 +841,30 @@ fn fix_all_workspace_summary(edits_applied: usize, files_changed: usize, skipped
 impl Backend {
     /// `fixAllWorkspace` execute-command handler. Returns the message shown to
     /// the user (no result payload otherwise): a "nothing to do" message when
-    /// the store is empty or every entry resolved to zero edits, an error
+    /// the store is empty or every entry resolved to zero edits, a "skipped"
+    /// message when the only fixable files were outside the workspace, an error
     /// message when the client rejects the `workspace/applyEdit`, else the
     /// summary from [`fix_all_workspace_summary`].
     pub(crate) async fn fix_all_workspace_impl(&self) -> String {
-        let snapshot = self.state.fixable_edits.lock().clone();
+        // Cloned out of the lock before the boundary runs: `publish_filtered`
+        // takes this mutex on the validation hot path, and the boundary stats
+        // and canonicalizes once per URI.
+        let mut snapshot = self.state.fixable_edits.lock().clone();
         if snapshot.is_empty() {
             return "No auto-fixable problems in the workspace.".to_string();
+        }
+        // The store is keyed by every URI that ever published a diagnostic,
+        // which includes files the scan reached through a symlink and anything
+        // the client opened, so the edit boundary decides what may be written
+        // (#160). Filtered here rather than at store time: this is one
+        // `canonicalize` per fixable file on a user-initiated command, where
+        // filtering on publish would be one per file on every scan.
+        let edit_roots = self.state.config.read().editable_roots.clone();
+        let fixable = snapshot.len();
+        snapshot.retain(|uri, _| crate::access::editable_path(uri, &edit_roots).is_ok());
+        let refused = fixable - snapshot.len();
+        if snapshot.is_empty() {
+            return outside_workspace_summary(refused);
         }
         let texts: HashMap<String, String> = snapshot
             .keys()
@@ -1190,69 +1240,160 @@ mod tests {
             .collect()
     }
 
+    /// The edit boundary compares canonical paths, and a tempdir path isn't one
+    /// (macOS hands out `/var/folders/…` for `/private/var/folders/…`), so the
+    /// roots these fixtures pass in go through `canonicalize` exactly as
+    /// `Config::refresh_roots` does for the real ones.
+    fn edit_roots(dirs: [&Path; 1]) -> Vec<PathBuf> {
+        dirs.iter()
+            .map(|d| std::fs::canonicalize(d).expect("canonical root"))
+            .collect()
+    }
+
+    /// A real loc file at `rel` under `root`, returned as the `file://` URI the
+    /// loc scan would have recorded for it.
+    fn write_loc_file(root: &Path, rel: &str) -> (PathBuf, String) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent")).unwrap();
+        std::fs::write(&path, "l_english:\n my_thing:0 \"Thing\"\n").unwrap();
+        let uri = Url::from_file_path(&path)
+            .expect("absolute path")
+            .to_string();
+        (path, uri)
+    }
+
     #[test]
     fn resolve_sibling_site_picks_the_matching_workspace_language_file() {
-        let locs = loc_locations_with(&[(
-            "my_thing",
-            "file:///ws/localisation/things_l_english.yml",
-            4,
-        )]);
+        let ws = tempfile::tempdir().unwrap();
+        let (_, uri) = write_loc_file(ws.path(), "localisation/things_l_english.yml");
+        let locs = loc_locations_with(&[("my_thing", &uri, 4)]);
         let siblings = vec!["my_thing".to_string()];
-        let hit = resolve_sibling_site(&siblings, &locs, "/ws", Lang::English).expect("a hit");
-        assert_eq!(
-            hit.0.as_ref(),
-            "file:///ws/localisation/things_l_english.yml"
-        );
+        let hit = resolve_sibling_site(&siblings, &locs, &edit_roots([ws.path()]), Lang::English)
+            .expect("a hit");
+        assert_eq!(hit.0.as_ref(), uri);
         assert_eq!(hit.1, 4);
     }
 
     #[test]
     fn resolve_sibling_site_rejects_a_vanilla_definition() {
-        let locs = loc_locations_with(&[(
-            "my_thing",
-            "file:///vanilla/localisation/things_l_english.yml",
-            4,
-        )]);
+        let ws = tempfile::tempdir().unwrap();
+        let vanilla = tempfile::tempdir().unwrap();
+        let (_, uri) = write_loc_file(vanilla.path(), "localisation/things_l_english.yml");
+        let locs = loc_locations_with(&[("my_thing", &uri, 4)]);
         let siblings = vec!["my_thing".to_string()];
-        assert!(resolve_sibling_site(&siblings, &locs, "/ws", Lang::English).is_none());
+        assert!(
+            resolve_sibling_site(&siblings, &locs, &edit_roots([ws.path()]), Lang::English)
+                .is_none()
+        );
+    }
+
+    /// The reported bug (#160): workspace `…/mod` and base game `…/mod-vanilla`.
+    /// A string-prefix containment test calls the vanilla file a workspace file
+    /// and the action offers to edit the game install.
+    #[test]
+    fn resolve_sibling_site_rejects_a_sibling_directory_sharing_a_name_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("mod");
+        std::fs::create_dir(&ws).unwrap();
+        let (_, uri) = write_loc_file(
+            &tmp.path().join("mod-vanilla"),
+            "localisation/things_l_english.yml",
+        );
+        let locs = loc_locations_with(&[("my_thing", &uri, 4)]);
+        let siblings = vec!["my_thing".to_string()];
+        assert!(
+            resolve_sibling_site(&siblings, &locs, &edit_roots([&ws]), Lang::English).is_none(),
+            "`mod-vanilla` is not inside `mod`"
+        );
+    }
+
+    /// A hostile workspace can make its loc file a symlink to a file outside.
+    /// The site is skipped, and resolution falls through to the next sibling —
+    /// the gate costs the user nothing when a real site exists.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_sibling_site_skips_a_symlinked_site_and_falls_through() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (target, _) = write_loc_file(outside.path(), "secrets_l_english.yml");
+        let link = ws.path().join("localisation/linked_l_english.yml");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_uri = Url::from_file_path(&link).unwrap().to_string();
+        let (_, real_uri) = write_loc_file(ws.path(), "localisation/real_l_english.yml");
+
+        let locs =
+            loc_locations_with(&[("my_thing", &link_uri, 1), ("my_thing_title", &real_uri, 9)]);
+        let siblings = vec!["my_thing".to_string(), "my_thing_title".to_string()];
+        let hit = resolve_sibling_site(&siblings, &locs, &edit_roots([ws.path()]), Lang::English)
+            .expect("falls through to the real site");
+        assert_eq!(hit.0.as_ref(), real_uri);
+        assert_eq!(hit.1, 9);
     }
 
     #[test]
     fn resolve_sibling_site_rejects_the_wrong_language_file() {
-        let locs =
-            loc_locations_with(&[("my_thing", "file:///ws/localisation/things_l_french.yml", 4)]);
+        let ws = tempfile::tempdir().unwrap();
+        let (_, uri) = write_loc_file(ws.path(), "localisation/things_l_french.yml");
+        let locs = loc_locations_with(&[("my_thing", &uri, 4)]);
         let siblings = vec!["my_thing".to_string()];
-        assert!(resolve_sibling_site(&siblings, &locs, "/ws", Lang::English).is_none());
+        assert!(
+            resolve_sibling_site(&siblings, &locs, &edit_roots([ws.path()]), Lang::English)
+                .is_none()
+        );
     }
 
     #[test]
     fn resolve_sibling_site_tries_siblings_in_order() {
         // The first sibling has no known site; the second does.
-        let locs = loc_locations_with(&[(
-            "my_thing_title",
-            "file:///ws/localisation/things_l_english.yml",
-            9,
-        )]);
+        let ws = tempfile::tempdir().unwrap();
+        let (_, uri) = write_loc_file(ws.path(), "localisation/things_l_english.yml");
+        let locs = loc_locations_with(&[("my_thing_title", &uri, 9)]);
         let siblings = vec!["my_thing".to_string(), "my_thing_title".to_string()];
-        let hit = resolve_sibling_site(&siblings, &locs, "/ws", Lang::English).expect("a hit");
+        let hit = resolve_sibling_site(&siblings, &locs, &edit_roots([ws.path()]), Lang::English)
+            .expect("a hit");
         assert_eq!(hit.1, 9);
     }
 
     #[test]
     fn pick_lang_file_matches_by_name_and_sorts_for_determinism() {
-        let files = vec![
-            PathBuf::from("/ws/localisation/z_l_english.yml"),
-            PathBuf::from("/ws/localisation/a_l_english.yml"),
-            PathBuf::from("/ws/localisation/other_l_french.yml"),
-        ];
-        let picked = pick_lang_file(&files, Lang::English).expect("a match");
-        assert_eq!(picked, PathBuf::from("/ws/localisation/a_l_english.yml"));
+        let ws = tempfile::tempdir().unwrap();
+        let (z, _) = write_loc_file(ws.path(), "localisation/z_l_english.yml");
+        let (a, _) = write_loc_file(ws.path(), "localisation/a_l_english.yml");
+        let (fr, _) = write_loc_file(ws.path(), "localisation/other_l_french.yml");
+        let picked = pick_lang_file(&[z, a.clone(), fr], Lang::English, &edit_roots([ws.path()]))
+            .expect("a match");
+        assert_eq!(picked, a);
     }
 
     #[test]
     fn pick_lang_file_none_when_no_file_matches() {
-        let files = vec![PathBuf::from("/ws/localisation/other_l_french.yml")];
-        assert!(pick_lang_file(&files, Lang::English).is_none());
+        let ws = tempfile::tempdir().unwrap();
+        let (fr, _) = write_loc_file(ws.path(), "localisation/other_l_french.yml");
+        assert!(pick_lang_file(&[fr], Lang::English, &edit_roots([ws.path()])).is_none());
+    }
+
+    /// The loc walk follows symlinks (`walk_folder_inner` stats through them),
+    /// so a discovered path can point outside the workspace. It is skipped even
+    /// though it sorts first.
+    #[cfg(unix)]
+    #[test]
+    fn pick_lang_file_skips_a_symlinked_candidate() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (target, _) = write_loc_file(outside.path(), "secrets_l_english.yml");
+        let link = ws.path().join("localisation/a_l_english.yml");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (real, _) = write_loc_file(ws.path(), "localisation/b_l_english.yml");
+
+        let picked = pick_lang_file(
+            &[link, real.clone()],
+            Lang::English,
+            &edit_roots([ws.path()]),
+        )
+        .expect("the real file");
+        assert_eq!(picked, real);
     }
 
     #[test]
@@ -1358,17 +1499,6 @@ mod tests {
         assert_eq!(insert, "\n my_thing_desc:0 \"TODO\"");
     }
 
-    /// An absolute path spelled the host's way: `Url::from_file_path` needs a
-    /// real absolute path, and on Windows a bare leading `/` isn't one (no
-    /// drive prefix), so it fails where a Unix host would succeed.
-    fn abs(tail: &str) -> String {
-        if cfg!(windows) {
-            format!("C:/{tail}")
-        } else {
-            format!("/{tail}")
-        }
-    }
-
     #[test]
     fn resolve_loc_insert_target_resolves_independently_per_language() {
         // `build_create_loc_key_action` resolves one target per configured
@@ -1380,88 +1510,109 @@ mod tests {
         // needs a running Backend (`file_text_for`, config locks) to exercise
         // — not covered here; the CreateFile-tier integration test covers the
         // NewFile branch end to end for a single language instead.
-        let root = PathBuf::from(abs("ws"));
-        let locs = loc_locations_with(&[(
-            "my_thing",
-            "file:///ws/localisation/things_l_english.yml",
-            4,
-        )]);
+        let ws = tempfile::tempdir().unwrap();
+        let roots = edit_roots([ws.path()]);
+        let (_, uri) = write_loc_file(ws.path(), "localisation/things_l_english.yml");
+        let locs = loc_locations_with(&[("my_thing", &uri, 4)]);
         let siblings = vec!["my_thing".to_string()];
 
-        let en =
-            resolve_loc_insert_target(Lang::English, &siblings, &locs, "/ws", &[], &root).unwrap();
+        let en = resolve_loc_insert_target(Lang::English, &siblings, &locs, &roots, &[], ws.path())
+            .unwrap();
         assert_eq!(
             en,
             LocInsertTarget::ExistingFileAfterLine {
-                uri: "file:///ws/localisation/things_l_english.yml"
-                    .parse()
-                    .unwrap(),
+                uri: uri.parse().unwrap(),
                 after_line0: 4,
             }
         );
 
-        let fr =
-            resolve_loc_insert_target(Lang::French, &siblings, &locs, "/ws", &[], &root).unwrap();
+        let fr = resolve_loc_insert_target(Lang::French, &siblings, &locs, &roots, &[], ws.path())
+            .unwrap();
         assert_eq!(
             fr,
             LocInsertTarget::NewFile {
-                uri: Url::from_file_path(abs("ws/localisation/cwtools_generated_l_french.yml"))
-                    .unwrap(),
+                uri: Url::from_file_path(generated_loc_file_path(ws.path(), Lang::French)).unwrap(),
             }
         );
     }
 
     #[test]
     fn resolve_loc_insert_target_prefers_sibling_over_existing_file_over_new() {
-        let root = PathBuf::from(abs("ws"));
-        // Case 1: a sibling site exists -> ExistingFileAfterLine.
-        let locs = loc_locations_with(&[(
-            "my_thing",
-            "file:///ws/localisation/things_l_english.yml",
-            4,
-        )]);
+        let ws = tempfile::tempdir().unwrap();
+        let roots = edit_roots([ws.path()]);
+        let (path, uri) = write_loc_file(ws.path(), "localisation/things_l_english.yml");
         let siblings = vec!["my_thing".to_string()];
+
+        // Case 1: a sibling site exists -> ExistingFileAfterLine.
+        let locs = loc_locations_with(&[("my_thing", &uri, 4)]);
         let target =
-            resolve_loc_insert_target(Lang::English, &siblings, &locs, "/ws", &[], &root).unwrap();
+            resolve_loc_insert_target(Lang::English, &siblings, &locs, &roots, &[], ws.path())
+                .unwrap();
         assert_eq!(
             target,
             LocInsertTarget::ExistingFileAfterLine {
-                uri: "file:///ws/localisation/things_l_english.yml"
-                    .parse()
-                    .unwrap(),
+                uri: uri.parse().unwrap(),
                 after_line0: 4,
             }
         );
 
         // Case 2: no sibling site, but a discovered loc file for the language.
         let empty_locs = crate::LocLocationMap::default();
-        let discovered = vec![PathBuf::from(abs("ws/localisation/things_l_english.yml"))];
         let target = resolve_loc_insert_target(
             Lang::English,
             &siblings,
             &empty_locs,
-            "/ws",
-            &discovered,
-            &root,
+            &roots,
+            std::slice::from_ref(&path),
+            ws.path(),
         )
         .unwrap();
         assert_eq!(
             target,
             LocInsertTarget::ExistingFileAppend {
-                uri: Url::from_file_path(abs("ws/localisation/things_l_english.yml")).unwrap(),
+                uri: Url::from_file_path(&path).unwrap(),
             }
         );
 
         // Case 3: nothing at all -> a brand new generated file.
-        let target =
-            resolve_loc_insert_target(Lang::English, &siblings, &empty_locs, "/ws", &[], &root)
-                .unwrap();
+        let target = resolve_loc_insert_target(
+            Lang::English,
+            &siblings,
+            &empty_locs,
+            &roots,
+            &[],
+            ws.path(),
+        )
+        .unwrap();
         assert_eq!(
             target,
             LocInsertTarget::NewFile {
-                uri: Url::from_file_path(abs("ws/localisation/cwtools_generated_l_english.yml"))
+                uri: Url::from_file_path(generated_loc_file_path(ws.path(), Lang::English))
                     .unwrap(),
             }
+        );
+    }
+
+    /// The `NewFile` tier writes a file that doesn't exist yet, so no read ever
+    /// checks it. If `<workspace>/localisation` is a symlink out of the
+    /// workspace, the created file lands outside — the action must not be
+    /// offered at all.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_loc_insert_target_refuses_a_new_file_under_a_symlinked_loc_dir() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("localisation")).unwrap();
+        assert_eq!(
+            resolve_loc_insert_target(
+                Lang::English,
+                &[],
+                &crate::LocLocationMap::default(),
+                &edit_roots([ws.path()]),
+                &[],
+                ws.path(),
+            ),
+            None
         );
     }
 
@@ -1550,5 +1701,18 @@ mod tests {
             fix_all_workspace_summary(3, 2, 1),
             "Applied 3 fix(es) across 2 file(s); 1 skipped (overlapping)"
         );
+    }
+
+    /// "Nothing to fix" and "everything fixable is off-limits" are different
+    /// answers: the second leaves problems the user can still see in the panel,
+    /// so saying there are none would read as a bug in the command.
+    #[test]
+    fn outside_workspace_summary_does_not_claim_there_is_nothing_to_fix() {
+        let msg = outside_workspace_summary(2);
+        assert_eq!(
+            msg,
+            "Skipped 2 file(s) with auto-fixable problems: they are outside the workspace."
+        );
+        assert!(!msg.contains("No auto-fixable problems"));
     }
 }

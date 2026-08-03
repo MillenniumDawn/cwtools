@@ -812,8 +812,15 @@ impl Backend {
     /// File-local rename of an `@name` script constant: every comment-aware
     /// whole-token occurrence in this one document. `@` constants are
     /// per-file in the game's scripting, so no cross-file work is needed.
-    fn rename_at_var(&self, uri: &str, name: &str, new_name: &str) -> Option<WorkspaceEdit> {
-        let text = self.file_text_for(uri)?;
+    fn rename_at_var(
+        &self,
+        uri: &str,
+        name: &str,
+        new_name: &str,
+    ) -> Result<Option<WorkspaceEdit>> {
+        let Some(text) = self.file_text_for(uri) else {
+            return Ok(None);
+        };
         let encoding = self.state.config.read().position_encoding.clone();
         let edits: Vec<TextEdit> = text
             .lines()
@@ -830,9 +837,48 @@ impl Backend {
             })
             .collect();
         if edits.is_empty() {
+            return Ok(None);
+        }
+        let by_uri = vec![(uri.to_string(), edits)];
+        if let Some(refused) = self.first_refused_edit_target(&by_uri, uri) {
+            return Err(refused);
+        }
+        Ok(Some(self.build_workspace_edit(by_uri)))
+    }
+
+    /// The refusal for the first URI in `by_uri` a generated edit may not write
+    /// to, if any. `own_uri` is the document the request named.
+    ///
+    /// Rename's edit sites come from the type index, which has the base game's
+    /// instances merged into it, so a rename can reach a definition inside the
+    /// install (#160). Dropping those quietly would apply a rename the user
+    /// only saw half of and leave the other half dangling, so one refused
+    /// target cancels the whole rename — the same stance `rename_impl` already
+    /// takes for a reference it can't locate in text.
+    ///
+    /// An edit set that touches nothing but the request's own document is
+    /// exempt, which is the rule the per-diagnostic quick fixes and
+    /// `source.fixAll` already run on: the URI is the client's own, echoed
+    /// back, so there is no server-derived path to contain. Without the
+    /// exemption a file-local `@const` rename would break in exactly the
+    /// sessions where the boundary has nothing to check against — an
+    /// `untitled:` buffer that has never been on disk, or a window opened on a
+    /// single file with no workspace folder at all.
+    fn first_refused_edit_target(
+        &self,
+        by_uri: &[(String, Vec<TextEdit>)],
+        own_uri: &str,
+    ) -> Option<tower_lsp::jsonrpc::Error> {
+        if let [(only, _)] = by_uri
+            && only == own_uri
+        {
             return None;
         }
-        Some(self.build_workspace_edit(vec![(uri.to_string(), edits)]))
+        let edit_roots = self.state.config.read().editable_roots.clone();
+        by_uri.iter().find_map(|(uri, _)| {
+            let refusal = crate::access::editable_path(uri, &edit_roots).err()?;
+            Some(rename_refused(uri, refusal))
+        })
     }
 
     /// Assemble the `WorkspaceEdit` shape the client negotiated: versioned
@@ -889,7 +935,7 @@ impl Backend {
         // `@` script constant first: the sigil marks it unambiguously, and the
         // rule walk can misclassify an `@` read as a type reference.
         if let Some((name, _)) = self.at_var_rename_target(&uri, pos) {
-            return Ok(self.rename_at_var(&uri, &name, &new_name));
+            return self.rename_at_var(&uri, &name, &new_name);
         }
 
         // Identify what's under the cursor
@@ -960,9 +1006,27 @@ impl Backend {
             by_uri.entry(file_uri).or_default().push(edit);
         }
 
-        Ok(Some(
-            self.build_workspace_edit(by_uri.into_iter().collect()),
-        ))
+        let by_uri: Vec<(String, Vec<TextEdit>)> = by_uri.into_iter().collect();
+        if let Some(refused) = self.first_refused_edit_target(&by_uri, &uri) {
+            return Err(refused);
+        }
+        Ok(Some(self.build_workspace_edit(by_uri)))
+    }
+}
+
+/// The rename-cancelled error for a target the edit boundary refused, naming
+/// the cause it reported. `-32002` is RequestFailed, the same code the
+/// unresolvable-reference refusal uses, so the client shows the reason instead
+/// of applying a partial rename.
+fn rename_refused(uri: &str, refusal: crate::access::EditRefusal) -> tower_lsp::jsonrpc::Error {
+    tower_lsp::jsonrpc::Error {
+        code: tower_lsp::jsonrpc::ErrorCode::ServerError(-32002),
+        message: format!(
+            "Rename cancelled: '{uri}' {}; cwtools only edits files in the workspace folders.",
+            refusal.reason()
+        )
+        .into(),
+        data: None,
     }
 }
 
