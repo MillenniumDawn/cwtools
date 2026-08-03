@@ -1,12 +1,15 @@
 //! Editor hot paths over a real ruleset: the work a keystroke triggers.
 //!
-//! Both cases resolve rules against the full HOI4 `.cwt` set, which is where the
-//! rule trees are big enough for a deep clone to show up:
+//! The rule-resolution cases use the full HOI4 `.cwt` set, where the rule trees
+//! are big enough for a deep clone to show up:
 //!
 //!   `rules_at_pos`        one root descent -> subtype merge -> child rules.
 //!                         Completion and hover each run this per request.
 //!   `value_rules_for_key` per-leaf match + alias-overload expansion. Semantic
 //!                         tokens runs it once per leaf in the document.
+//!
+//! The ScopeRegistry cases exercise the loaded config's name lookup, named-link
+//! resolution, construction paths, and the validation save/restore lifecycle.
 //!
 //! The ruleset comes from a sibling checkout, same inputs as the corpus guard:
 //!
@@ -21,11 +24,12 @@ use std::path::PathBuf;
 use criterion::{Criterion, criterion_group, criterion_main};
 use cwtools_driver::{RulesInput, load_rules};
 use cwtools_game::constants::Game;
+use cwtools_game::scope_engine::{ScopeContext, ScopeResult};
 use cwtools_index::TypeIndex;
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::Prepared;
 use cwtools_validation::position::{rules_at_pos, value_rules_for_key};
+use cwtools_validation::{Prepared, build_scope_registry_arc};
 
 /// A national focus with a deep effect/trigger body: the shape an editor sits
 /// inside while typing. `focus` is a subtype-bearing type, so resolving a
@@ -129,14 +133,37 @@ fn bench_rules_hot(c: &mut Criterion) {
         return;
     };
     let table = StringTable::new();
-    let ruleset = match load_rules(&RulesInput::Dir(dir), &table, None) {
-        Ok(rs) => rs,
-        Err(e) => {
-            eprintln!("rules_hot: could not load rules: {e}");
-            return;
+    let mut warnings = Vec::new();
+    let ruleset = {
+        let mut on_warning = |warning| warnings.push(warning);
+        match load_rules(&RulesInput::Dir(dir), &table, Some(&mut on_warning)) {
+            Ok(rs) => rs,
+            Err(e) => {
+                eprintln!("rules_hot: could not load rules: {e}");
+                return;
+            }
         }
     };
+    assert!(
+        warnings.is_empty(),
+        "rules_hot: load warnings: {warnings:?}"
+    );
     let type_index = TypeIndex::default();
+    let scope_registry =
+        build_scope_registry_arc(&ruleset, Some(Game::Hoi4)).expect("HOI4 scope registry loads");
+    let character = scope_registry.id_of("character").unwrap_or_else(|| {
+        panic!(
+            "character scope resolves; loaded scopes: {:?}",
+            ruleset.scope_inputs
+        )
+    });
+    let scope_base = ScopeContext::from_registry(scope_registry.clone(), character);
+    let mut scope_ctx = scope_base.clone();
+    assert!(matches!(
+        scope_ctx.change_scope("owner"),
+        ScopeResult::NewScope { .. }
+    ));
+
     let prepared = Prepared {
         ruleset: &ruleset,
         table: &table,
@@ -199,6 +226,30 @@ fn bench_rules_hot(c: &mut Criterion) {
                     black_box(key),
                 ));
             }
+        })
+    });
+
+    c.bench_function("scope_registry/config/id_of", |b| {
+        b.iter(|| black_box(scope_registry.id_of(black_box("character"))))
+    });
+    c.bench_function("scope_registry/config/links/get", |b| {
+        b.iter(|| black_box(scope_registry.links.get(black_box("owner"))))
+    });
+    let mut scope_ctx = scope_base.clone();
+    c.bench_function("scope_registry/config/change_scope/owner", |b| {
+        b.iter(|| {
+            let saved = scope_ctx.save();
+            let result = scope_ctx.change_scope(black_box("owner"));
+            scope_ctx.restore(saved);
+            black_box(result)
+        })
+    });
+    c.bench_function("scope_registry/config/build", |b| {
+        b.iter(|| {
+            black_box(build_scope_registry_arc(
+                black_box(&ruleset),
+                black_box(Some(Game::Hoi4)),
+            ))
         })
     });
 }

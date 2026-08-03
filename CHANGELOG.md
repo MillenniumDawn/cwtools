@@ -25,6 +25,7 @@
 
 ## Improvements
 
+- `ScopeRegistry`'s name, scope and link maps now use `FxHashMap` rather than SipHash. Against HOI4 config b5779a1, an `owner` scope transition drops from 79.2ns to 50.4ns (-36%) and registry construction from 25.3µs to 16.1µs (-36%). (#152)
 - **In progress, engine v2.4.0:** remove redundant indexing and path normalization
   work (#86).
   Fuse type/subtype collection, reuse indexed instances for CW100, cache
