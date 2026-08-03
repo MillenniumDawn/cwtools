@@ -9293,3 +9293,185 @@ fn test_rules_config_toast_defers_to_initialized_and_dedupes() {
         "a changed error set must toast exactly once"
     );
 }
+
+// ── #163: the URI access boundary ────────────────────────────────────────────
+// `textDocument/foldingRange` is the cleanest probe: it needs nothing but the
+// file's text, so its answer is a direct read-out of whether the server was
+// willing to read the URI. Ranges = allowed, null = refused.
+
+/// Boot a server rooted at `ws`, optionally open `open` (uri, text) as buffers,
+/// then ask for `uri`'s folding ranges. `None` when the server refused.
+fn folding_ranges_for(
+    ws: &std::path::Path,
+    open: &[(&str, &str)],
+    uri: &str,
+) -> Option<serde_json::Value> {
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let reader = BufReader::new(child.stdout.take().unwrap());
+    let stdin = child.stdin.take().unwrap();
+    let ws_uri = path_uri(ws);
+    let open: Vec<(String, String)> = open
+        .iter()
+        .map(|(u, t)| ((*u).to_string(), (*t).to_string()))
+        .collect();
+    let uri = uri.to_string();
+
+    // Deadline-bounded: before the boundary existed a `/dev/zero` request read
+    // until it ran the machine out of memory rather than answering.
+    let result = run_with_deadline(stdin, reader, 30, move |stdin, reader| {
+        let init = jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": { "language": "hoi4" }
+            }),
+        );
+        write_frame_to(stdin, &init).ok()?;
+        read_response(reader).ok()?;
+        write_frame_to(
+            stdin,
+            &jsonrpc_notification("initialized", serde_json::json!({})),
+        )
+        .ok()?;
+        wait_for_scan_done(reader);
+        for (u, text) in &open {
+            write_frame_to(
+                stdin,
+                &jsonrpc_notification(
+                    "textDocument/didOpen",
+                    serde_json::json!({
+                        "textDocument": {"uri": u, "languageId": "hoi4", "version": 1, "text": text}
+                    }),
+                ),
+            )
+            .ok()?;
+        }
+        // A didOpen and the request after it are dispatched concurrently, so
+        // when a buffer is expected the request is retried until it lands.
+        // Nothing to wait for otherwise: the disk read is immediate.
+        let attempts = if open.is_empty() { 1 } else { 40 };
+        let mut result = serde_json::Value::Null;
+        for attempt in 0..attempts {
+            write_frame_to(
+                stdin,
+                &jsonrpc_request(
+                    2 + attempt,
+                    "textDocument/foldingRange",
+                    serde_json::json!({ "textDocument": { "uri": uri } }),
+                ),
+            )
+            .ok()?;
+            let resp: serde_json::Value =
+                serde_json::from_str(&read_response(reader).ok()?).ok()?;
+            result = resp["result"].clone();
+            if !result.is_null() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Some(result)
+    });
+    child.kill().ok();
+    // Reap it: a server that blew its deadline is still running, and on the
+    // `/dev/zero` path it is still allocating.
+    child.wait().ok();
+    result.flatten()
+}
+
+/// A workspace tempdir holding one foldable script file, plus its URI.
+fn boundary_workspace() -> (tempfile::TempDir, String) {
+    let ws = tempfile::tempdir().unwrap();
+    let file = ws.path().join("common/national_focus/f.txt");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "outer = {\n    inner = {\n        x = 1\n    }\n}\n").unwrap();
+    let uri = path_uri(&file);
+    (ws, uri)
+}
+
+#[test]
+fn test_access_boundary_allows_a_closed_workspace_file() {
+    // The no-regression half: the boundary must not cost the server its ability
+    // to read files it was pointed at but that aren't open in a buffer.
+    let (ws, uri) = boundary_workspace();
+    let result = folding_ranges_for(ws.path(), &[], &uri).expect("server went quiet");
+    let ranges = result
+        .as_array()
+        .expect("folding ranges for a workspace file");
+    assert!(
+        ranges
+            .iter()
+            .any(|r| r["startLine"] == 0 && r["endLine"] == 4),
+        "expected the outer fold, got: {result}"
+    );
+}
+
+#[test]
+fn test_access_boundary_refuses_a_file_outside_the_workspace() {
+    let (ws, _) = boundary_workspace();
+    let outside = tempfile::tempdir().unwrap();
+    let file = outside.path().join("f.txt");
+    std::fs::write(&file, "outer = {\n    inner = {\n        x = 1\n    }\n}\n").unwrap();
+    let result = folding_ranges_for(ws.path(), &[], &path_uri(&file)).expect("server went quiet");
+    assert!(
+        result.is_null(),
+        "a readable file outside every root must still be refused, got: {result}"
+    );
+}
+
+#[test]
+fn test_access_boundary_allows_an_open_buffer_outside_the_workspace() {
+    // The buffer is the client's own content, so opening a scratch file from
+    // anywhere keeps working — the boundary only governs disk reads.
+    let (ws, _) = boundary_workspace();
+    let outside = tempfile::tempdir().unwrap();
+    let file = outside.path().join("f.txt");
+    let text = "outer = {\n    inner = {\n        x = 1\n    }\n}\n";
+    std::fs::write(&file, text).unwrap();
+    let uri = path_uri(&file);
+    let result = folding_ranges_for(ws.path(), &[(&uri, text)], &uri).expect("server went quiet");
+    let ranges = result
+        .as_array()
+        .expect("folding ranges for an open buffer");
+    assert!(
+        ranges
+            .iter()
+            .any(|r| r["startLine"] == 0 && r["endLine"] == 4),
+        "an open out-of-workspace buffer must still fold, got: {result}"
+    );
+}
+
+#[test]
+fn test_access_boundary_refuses_a_non_file_uri() {
+    let (ws, file_uri) = boundary_workspace();
+    // The same in-workspace file under a non-`file` scheme. `Url::to_file_path`
+    // ignores the scheme, so this used to be read exactly like the `file:` form
+    // — pointing it at a file that IS allowed is what makes the scheme the only
+    // thing under test.
+    let http_uri = file_uri.replacen("file://", "http://localhost", 1);
+    for uri in [http_uri.as_str(), "untitled:Untitled-1"] {
+        let result = folding_ranges_for(ws.path(), &[], uri).expect("server went quiet");
+        assert!(result.is_null(), "{uri} must be refused, got: {result}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_access_boundary_refuses_a_character_device() {
+    // The reported crash: `file:///dev/zero` was converted to a path and read to
+    // EOF, which never comes. The server must answer, and answer nothing.
+    if !std::path::Path::new("/dev/zero").exists() {
+        return;
+    }
+    let (ws, _) = boundary_workspace();
+    let result =
+        folding_ranges_for(ws.path(), &[], "file:///dev/zero").expect("server hung on /dev/zero");
+    assert!(result.is_null(), "/dev/zero must be refused, got: {result}");
+}

@@ -421,6 +421,11 @@ impl Backend {
 
     /// The current text of `uri`: the open-doc buffer if open, else read from
     /// disk (encoding-aware). `None` when neither is available.
+    ///
+    /// The buffer is checked first so a document the client opened keeps working
+    /// wherever it lives; only the disk read is subject to the URI access
+    /// boundary (see `crate::access`), which is what every per-file handler
+    /// inherits by going through here.
     pub(crate) fn file_text_for(&self, uri: &str) -> Option<String> {
         {
             let docs = self.state.documents.lock();
@@ -428,8 +433,7 @@ impl Backend {
                 return Some(doc.text.to_string());
             }
         }
-        let path = crate::paths::uri_to_path_str(uri);
-        cwtools_file_manager::file_manager::read_text(std::path::Path::new(&path)).ok()
+        self.read_authorized_text(uri)
     }
 
     fn source_range(&self, uri: &str, loc: cwtools_info::SourceLocation, token: &str) -> Range {

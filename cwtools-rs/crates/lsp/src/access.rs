@@ -1,0 +1,366 @@
+//! The only place a client-supplied URI becomes an opened file.
+//!
+//! Every per-file handler takes a URI straight from the client, and the LSP has
+//! no say in what a client sends. Before this module the URI was converted with
+//! [`crate::paths::uri_to_path_str`] and handed to an unbounded read, which let
+//! a request name `file:///dev/zero`, a device or a file anywhere on the disk.
+//! `uri_to_path_str` stays as-is for the derivations that only ever *display* or
+//! *label* a path (logical paths, loc-dir tests, graph node ids); reads go
+//! through [`Backend::read_authorized_text`] and nothing else.
+//!
+//! A URI is authorized when it is a `file:` URI, resolves to a regular file, and
+//! canonicalizes inside one of the roots the server was configured with (the
+//! workspace folders, the base-game install, the rules dir). Anything else is
+//! refused quietly: requests answer `None`, notifications no-op, no index moves.
+
+use std::path::{Path, PathBuf};
+
+use tower_lsp::lsp_types::Url;
+
+use crate::Backend;
+
+/// Liveness ceiling on a single URI-driven read, not a resource policy: the
+/// largest known legitimate input is a ~20 MB vanilla script.
+pub(crate) const MAX_URI_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The outcome of a URI-driven read.
+///
+/// Most callers only want the text and use [`read_authorized_text`]. `did_close`
+/// needs the other two apart: it clears a file's index entry when the file has
+/// gone from disk, and must not do that merely because the boundary said no.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FileRead {
+    Text(String),
+    /// Authorized, but there is nothing to read — deleted, or unreadable.
+    Missing,
+    /// Outside the boundary: not a `file:` URI, out of every root, not a
+    /// regular file, or over the cap.
+    Refused,
+}
+
+impl Backend {
+    /// The canonical path `uri` names, when the client is allowed to name it.
+    /// `None` (and no state change) for anything else — see the module docs.
+    pub(crate) fn authorized_path(&self, uri: &str) -> Option<PathBuf> {
+        let roots = self.state.config.read().authorized_roots.clone();
+        authorized_path(uri, &roots)
+    }
+
+    /// The text of `uri` read from disk through the access boundary, decoded by
+    /// the shared file-manager rules (UTF-8, else cp1252). `None` when the URI
+    /// is refused, unreadable, or over [`MAX_URI_READ_BYTES`].
+    pub(crate) fn read_authorized_text(&self, uri: &str) -> Option<String> {
+        let roots = self.state.config.read().authorized_roots.clone();
+        read_authorized_text(uri, &roots, MAX_URI_READ_BYTES)
+    }
+}
+
+/// The canonical path `uri` names, when it is a `file:` URI naming a regular
+/// file inside `roots`. `roots` must already be canonical
+/// ([`crate::Config::refresh_authorized_roots`] keeps them that way) — both
+/// sides of the containment test have to come from `canonicalize` or the
+/// Windows verbatim `\\?\` prefix stops them ever matching.
+pub(crate) fn authorized_path(uri: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    let url = Url::parse(uri).ok()?;
+    // `Url::to_file_path` does not look at the scheme: with an empty or
+    // `localhost` host it happily turns `http://localhost/etc/passwd` into
+    // `/etc/passwd`, so the scheme test has to be made here.
+    if url.scheme() != "file" {
+        tracing::debug!(%uri, "access: not a file URI");
+        return None;
+    }
+    // No `uri_to_path_str` fallback: its raw-string branch turns
+    // `file://../../etc/passwd` into a relative path read from the CWD.
+    let path = url.to_file_path().ok()?;
+    let path = canonicalize_for_containment(&path)?;
+    if !roots.iter().any(|root| path.starts_with(root)) {
+        tracing::debug!(path = %path.display(), "access: outside every authorized root");
+        return None;
+    }
+    // Only when it exists: a path that has just been deleted is authorized but
+    // absent, which `did_close` has to tell apart from refused. `is_file` is
+    // regular-files-only, and that is what actually refuses `/dev/zero` — a
+    // character device reports length 0, so a size check alone would wave it
+    // through.
+    if let Ok(meta) = path.metadata()
+        && !meta.is_file()
+    {
+        tracing::debug!(path = %path.display(), "access: not a regular file");
+        return None;
+    }
+    Some(path)
+}
+
+/// Canonical form of `path` for the containment test. Resolving the whole path
+/// also resolves a symlinked *file*, so a link inside a root pointing out of it
+/// is caught. `canonicalize` needs the file to exist, though, and a deleted file
+/// still needs an answer — so fall back to resolving the directory chain and
+/// re-attaching the name.
+fn canonicalize_for_containment(path: &Path) -> Option<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Some(canonical),
+        Err(_) => {
+            let parent = std::fs::canonicalize(path.parent()?).ok()?;
+            Some(parent.join(path.file_name()?))
+        }
+    }
+}
+
+/// [`authorized_path`] followed by a read bounded at `max_bytes`, for the
+/// callers that only need the text.
+pub(crate) fn read_authorized_text(uri: &str, roots: &[PathBuf], max_bytes: u64) -> Option<String> {
+    match read_authorized(uri, roots, max_bytes) {
+        FileRead::Text(text) => Some(text),
+        FileRead::Missing | FileRead::Refused => None,
+    }
+}
+
+/// [`authorized_path`] followed by a read bounded at `max_bytes`, reporting why
+/// there is no text when there isn't any. See [`FileRead`].
+pub(crate) fn read_authorized(uri: &str, roots: &[PathBuf], max_bytes: u64) -> FileRead {
+    let Some(path) = authorized_path(uri, roots) else {
+        return FileRead::Refused;
+    };
+    read_capped(&path, max_bytes)
+}
+
+/// Bounded read of a path that has already cleared [`authorized_path`], for the
+/// watched-file batch — it needs the canonical path in hand anyway, for its
+/// stat-gate.
+pub(crate) fn read_capped_text(path: &Path, max_bytes: u64) -> Option<String> {
+    match read_capped(path, max_bytes) {
+        FileRead::Text(text) => Some(text),
+        FileRead::Missing | FileRead::Refused => None,
+    }
+}
+
+/// Read `path` as text, refusing it outright once it passes `max_bytes` — a
+/// truncated script would parse into garbage, so an over-cap file is no file.
+fn read_capped(path: &Path, max_bytes: u64) -> FileRead {
+    use std::io::Read as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return FileRead::Missing;
+    };
+    let mut bytes = Vec::new();
+    // `take` bounds the allocation as well as the read, so a file that grows
+    // under us or misreports its length still can't outrun the cap.
+    if file
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return FileRead::Missing;
+    }
+    if bytes.len() as u64 > max_bytes {
+        tracing::warn!(path = %path.display(), max_bytes, "access: file over the read cap");
+        return FileRead::Refused;
+    }
+    FileRead::Text(cwtools_file_manager::file_manager::decode_bytes(bytes).0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Roots reach [`authorized_path`] already canonicalized; a raw tempdir path
+    /// is not (macOS hands out `/var/folders/…` for `/private/var/folders/…`).
+    fn roots(dirs: [&Path; 1]) -> Vec<PathBuf> {
+        dirs.iter()
+            .map(|d| std::fs::canonicalize(d).expect("canonical root"))
+            .collect()
+    }
+
+    fn uri(path: &Path) -> String {
+        Url::from_file_path(path)
+            .expect("absolute path")
+            .to_string()
+    }
+
+    #[test]
+    fn accepts_a_regular_file_under_a_root() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, "foo = { }\n").unwrap();
+        assert!(authorized_path(&uri(&file), &roots([tmp.path()])).is_some());
+    }
+
+    #[test]
+    fn rejects_a_file_outside_every_root() {
+        let root = tempfile::TempDir::new().expect("tmpdir");
+        let other = tempfile::TempDir::new().expect("tmpdir");
+        let file = other.path().join("a.txt");
+        std::fs::write(&file, "foo = { }\n").unwrap();
+        assert_eq!(authorized_path(&uri(&file), &roots([root.path()])), None);
+    }
+
+    /// The `url` crate's `to_file_path` ignores the scheme, so a non-`file` URI
+    /// with an empty or `localhost` host converts to a perfectly good absolute
+    /// path. This is the behaviour the explicit scheme check exists to stop;
+    /// asserting it here means a `url` upgrade can't quietly move the goalposts.
+    #[test]
+    fn url_to_file_path_ignores_the_scheme() {
+        let converted = Url::parse("http://localhost/etc/passwd")
+            .expect("parse")
+            .to_file_path();
+        assert!(
+            converted.is_ok(),
+            "to_file_path is scheme-blind; the check in authorized_path is load-bearing"
+        );
+    }
+
+    #[test]
+    fn rejects_a_non_file_scheme() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, "foo = { }\n").unwrap();
+        let roots = roots([tmp.path()]);
+        // Same file, reachable path, wrong scheme.
+        let http = uri(&file).replacen("file://", "http://localhost", 1);
+        assert_eq!(authorized_path(&http, &roots), None);
+        assert_eq!(authorized_path("untitled:Untitled-1", &roots), None);
+        assert_eq!(
+            authorized_path("vscode-vfs://localhost/a.txt", &roots),
+            None
+        );
+    }
+
+    /// `file://../../etc/passwd` parses with `..` as the *host*, which
+    /// `to_file_path` rejects — the old raw-string fallback then produced a
+    /// relative path read against the server's CWD.
+    #[test]
+    fn rejects_a_uri_that_only_the_raw_fallback_could_convert() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        assert_eq!(
+            authorized_path("file://../../etc/passwd", &roots([tmp.path()])),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_a_directory() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let dir = tmp.path().join("sub");
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(authorized_path(&uri(&dir), &roots([tmp.path()])), None);
+    }
+
+    /// Containment is component-wise: a string prefix would let a sibling
+    /// directory whose name merely starts with the root's name through.
+    #[test]
+    fn rejects_a_sibling_root_with_a_shared_name_prefix() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path().join("mod");
+        let sibling = tmp.path().join("mod-evil");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let file = sibling.join("a.txt");
+        std::fs::write(&file, "foo = { }\n").unwrap();
+        assert_eq!(authorized_path(&uri(&file), &roots([&root])), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlink_pointing_out_of_the_root() {
+        let root = tempfile::TempDir::new().expect("tmpdir");
+        let other = tempfile::TempDir::new().expect("tmpdir");
+        let target = other.path().join("secret.txt");
+        std::fs::write(&target, "secret\n").unwrap();
+        let link = root.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(authorized_path(&uri(&link), &roots([root.path()])), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_character_device() {
+        // Rooted at `/dev` so the regular-file gate is what does the refusing,
+        // not containment. `/dev/zero` reads forever; that was the reported bug.
+        let dev = Path::new("/dev");
+        if !dev.is_dir() {
+            return;
+        }
+        assert_eq!(
+            authorized_path("file:///dev/zero", &roots([dev])),
+            None,
+            "a character device is not a readable file"
+        );
+    }
+
+    #[test]
+    fn reads_an_authorized_file() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, "foo = { }\n").unwrap();
+        assert_eq!(
+            read_authorized_text(&uri(&file), &roots([tmp.path()]), MAX_URI_READ_BYTES).as_deref(),
+            Some("foo = { }\n")
+        );
+    }
+
+    /// The cap is a parameter so this doesn't have to write 64 MiB to prove it.
+    #[test]
+    fn refuses_a_file_over_the_cap_instead_of_truncating_it() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("a.txt");
+        let roots = roots([tmp.path()]);
+
+        std::fs::write(&file, "0123456789abcdef").unwrap();
+        assert_eq!(
+            read_authorized_text(&uri(&file), &roots, 16).as_deref(),
+            Some("0123456789abcdef"),
+            "exactly at the cap is still readable"
+        );
+
+        std::fs::write(&file, "0123456789abcdefg").unwrap();
+        assert_eq!(
+            read_authorized_text(&uri(&file), &roots, 16),
+            None,
+            "one byte over the cap is refused, not truncated"
+        );
+    }
+
+    /// The boundary owns the read, so it also owns keeping cp1252 script files
+    /// readable (pre-Jomini mods) rather than dropping them as invalid UTF-8.
+    #[test]
+    fn decodes_cp1252_like_the_file_manager() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, b"caf\xE9\n").unwrap();
+        assert_eq!(
+            read_authorized_text(&uri(&file), &roots([tmp.path()]), MAX_URI_READ_BYTES).as_deref(),
+            Some("caf\u{E9}\n")
+        );
+    }
+
+    /// A deleted file inside a root is `Missing`, not `Refused`: `did_close`
+    /// drops a file's index entry when it has gone from disk, and must not stop
+    /// doing that just because the path no longer resolves.
+    #[test]
+    fn a_deleted_file_under_a_root_reads_as_missing_not_refused() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let gone = tmp.path().join("gone.txt");
+        assert_eq!(
+            read_authorized(&uri(&gone), &roots([tmp.path()]), MAX_URI_READ_BYTES),
+            FileRead::Missing
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_outside_every_root_is_still_refused() {
+        let root = tempfile::TempDir::new().expect("tmpdir");
+        let other = tempfile::TempDir::new().expect("tmpdir");
+        let gone = other.path().join("gone.txt");
+        assert_eq!(
+            read_authorized(&uri(&gone), &roots([root.path()]), MAX_URI_READ_BYTES),
+            FileRead::Refused
+        );
+    }
+
+    #[test]
+    fn refuses_everything_when_no_root_is_configured() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, "foo = { }\n").unwrap();
+        assert_eq!(authorized_path(&uri(&file), &[]), None);
+    }
+}
