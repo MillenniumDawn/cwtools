@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn file_index_case_sensitive_pays_nothing_in_default_mode() {
+    fn file_index_flag_off_skips_exact_case_collection() {
         // With the flag off, no on-disk case is recorded (no memory overhead),
         // and lookup stays case-insensitive.
         let mut idx = FileIndex::new();

@@ -142,7 +142,7 @@ pub(crate) struct FileConfig {
     pub(crate) ignore_files: Vec<String>,
     pub(crate) ignore_dirs: Vec<String>,
     pub(crate) loc_languages: Vec<Lang>,
-    pub(crate) case_sensitive_files: bool,
+    pub(crate) case_sensitive_files: Option<bool>,
     pub(crate) ignore_codes: Vec<String>,
     pub(crate) only_codes: Vec<String>,
     pub(crate) allow_empty: bool,
@@ -260,6 +260,25 @@ pub(crate) fn pick_flag(
     flag || file
 }
 
+/// Resolve a default-true boolean (CW113 case-sensitivity): an explicit CLI
+/// value wins, then an explicit config-file value, then `true`. `flag` is `None`
+/// when the flag wasn't passed; `file` is `None` when the key wasn't set.
+pub(crate) fn pick_flag_default(
+    flag: Option<bool>,
+    file: Option<bool>,
+    key: &'static str,
+    applied: &mut Vec<&'static str>,
+) -> bool {
+    if let Some(v) = flag {
+        return v;
+    }
+    if let Some(v) = file {
+        note(key, applied);
+        return v;
+    }
+    true
+}
+
 // ── Schema ───────────────────────────────────────────────────────────────────
 
 fn from_entries(path: PathBuf, dir: &Path, entries: Vec<Entry>) -> Result<FileConfig, ConfigError> {
@@ -296,7 +315,7 @@ fn from_entries(path: PathBuf, dir: &Path, entries: Vec<Entry>) -> Result<FileCo
             "no-vanilla-cache" => cfg.no_vanilla_cache = boolean(&cfg.path, e)?,
             "refresh-vanilla-cache" => cfg.refresh_vanilla_cache = boolean(&cfg.path, e)?,
             "allow-empty" => cfg.allow_empty = boolean(&cfg.path, e)?,
-            "case-sensitive-files" => cfg.case_sensitive_files = boolean(&cfg.path, e)?,
+            "case-sensitive-files" => cfg.case_sensitive_files = Some(boolean(&cfg.path, e)?),
             "report-type" => {
                 let v = string(&cfg.path, e)?;
                 cfg.report_type = Some(
@@ -1025,5 +1044,45 @@ allow-empty = true
         assert!(pick_flag(false, true, "allow-empty", &mut applied));
         assert_eq!(applied, ["allow-empty"]);
         assert!(!pick_flag(false, false, "allow-empty", &mut applied));
+    }
+
+    #[test]
+    fn case_sensitive_defaults_true() {
+        // Explicit CLI value wins over the config value.
+        let mut applied = Vec::new();
+        assert!(!pick_flag_default(
+            Some(false),
+            Some(true),
+            "case-sensitive-files",
+            &mut applied
+        ));
+        assert!(pick_flag_default(
+            Some(true),
+            Some(false),
+            "case-sensitive-files",
+            &mut applied
+        ));
+        // A config value is used (and noted) only when the CLI flag is absent.
+        let mut applied = Vec::new();
+        assert!(pick_flag_default(
+            None,
+            Some(true),
+            "case-sensitive-files",
+            &mut applied
+        ));
+        assert_eq!(applied, ["case-sensitive-files"]);
+        assert!(!pick_flag_default(
+            None,
+            Some(false),
+            "case-sensitive-files",
+            &mut applied
+        ));
+        // Neither set: the default is true.
+        assert!(pick_flag_default(
+            None,
+            None,
+            "case-sensitive-files",
+            &mut applied
+        ));
     }
 }
