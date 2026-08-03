@@ -8697,6 +8697,300 @@ types = {
     );
 }
 
+/// A hostile workspace ships `localisation/things_l_english.yml` as a symlink to
+/// a file outside it. The loc walk follows the link, so the sibling key it
+/// defines is indexed and CW100 fires for the missing one — but the create-key
+/// action must not offer to write through the link (#160). It falls through to
+/// the new-file tier instead, which lands inside the workspace.
+#[cfg(unix)]
+#[test]
+fn test_create_loc_key_action_refuses_a_symlinked_loc_file() {
+    const RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        localisation = {
+            ## required
+            name = "$"
+            ## required
+            desc = "$_desc"
+        }
+    }
+}
+thing = { x = scalar }
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/things/test.txt";
+    let text = "my_thing = { x = yes }\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    // The real loc file lives outside the workspace; only a link to it is in.
+    let target = outside.path().join("things_l_english.yml");
+    std::fs::write(&target, "l_english:\n my_thing:0 \"My Thing\"\n").unwrap();
+    let link = ws.path().join("localisation/things_l_english.yml");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let doc_uri = path_uri(&file_path);
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    // The link was followed for indexing: `my_thing` resolved (no CW100 for
+    // it), only `my_thing_desc` is missing. Without that this test would pass
+    // vacuously on a workspace where nothing was indexed at all.
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW100")
+        .expect("CW100 diagnostic published for my_thing_desc");
+    assert!(
+        diag["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("my_thing_desc") && !m.contains("my_thing_l")),
+        "the symlinked file's key must have been indexed, got: {diag}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag], "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let resp_str = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    let actions = resp["result"].as_array().expect("array result");
+    assert_eq!(actions.len(), 1, "one create-loc-key action: {resp_str}");
+    let ops = actions[0]["edit"]["documentChanges"]
+        .as_array()
+        .expect("documentChanges carries the cross-file edit");
+    let targets: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| {
+            op["uri"]
+                .as_str()
+                .or_else(|| op["textDocument"]["uri"].as_str())
+        })
+        .collect();
+    assert!(
+        !targets.iter().any(|u| u.ends_with("things_l_english.yml")),
+        "must not edit through the symlink, got: {targets:?}"
+    );
+    let outside_uri = path_uri(outside.path());
+    assert!(
+        !targets.iter().any(|u| u.starts_with(&outside_uri)),
+        "must not edit outside the workspace, got: {targets:?}"
+    );
+    assert!(
+        targets
+            .iter()
+            .all(|u| u.ends_with("localisation/cwtools_generated_l_english.yml")),
+        "falls through to a new in-workspace file, got: {targets:?}"
+    );
+}
+
+/// Which of `rel_paths` published a diagnostic with `code` during the initial
+/// scan, in the order seen. The scan publishes before it clears the loading
+/// bar, so this replaces [`wait_for_scan_done`] rather than following it —
+/// which also means a file the scan never validated shows up as a missing
+/// entry when the bar goes off, instead of blocking on a frame that never
+/// arrives.
+fn scan_diag_paths(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    rel_paths: &[&str],
+    code: &str,
+) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..5000 {
+        let Ok(raw) = read_frame(reader) else {
+            return seen;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v["method"] == "textDocument/publishDiagnostics" {
+            let uri = v["params"]["uri"].as_str().unwrap_or("");
+            let carries_code = v["params"]["diagnostics"]
+                .as_array()
+                .is_some_and(|ds| ds.iter().any(|d| d["code"] == code));
+            if carries_code
+                && let Some(rel) = rel_paths.iter().find(|rel| uri.ends_with(**rel))
+                && !seen.iter().any(|s| s == rel)
+            {
+                seen.push((*rel).to_string());
+            }
+        }
+        if v["method"] == "loadingBar" && v["params"]["enable"] == serde_json::Value::Bool(false) {
+            return seen;
+        }
+    }
+    seen
+}
+
+/// `fixAllWorkspace` collects every URI that published a fixable diagnostic,
+/// and the workspace scan follows symlinks — so a linked file gets diagnostics
+/// like any other. The generated `applyEdit` must still leave it alone (#160).
+///
+/// The link points into the base-game install on purpose. That is the case the
+/// read boundary (#163) cannot catch: the install is a legitimate place to read
+/// from, so the file's text resolves and the edit would be planned. Only a
+/// separate, workspace-only *edit* boundary refuses it.
+#[cfg(unix)]
+#[test]
+fn test_fix_all_workspace_skips_a_symlinked_file() {
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let real_rel = "common/decisions/real.txt";
+    let real = ws.path().join(real_rel);
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(&real, "a = { limit = { } }\n").unwrap();
+
+    // A file in the base-game install, reachable only through a link inside the
+    // workspace — readable, and so plannable, but never writable.
+    let linked_rel = "common/decisions/linked.txt";
+    let target = vanilla.path().join("linked.txt");
+    std::fs::write(&target, "b = { limit = { } }\n").unwrap();
+    std::os::unix::fs::symlink(&target, ws.path().join(linked_rel)).unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    // The scan reached THROUGH the link and published a fixable CW281 for it,
+    // so it is in the fixAllWorkspace store. Without this the assertion below
+    // would hold for the wrong reason: a file that was never validated is
+    // trivially never edited.
+    let validated = scan_diag_paths(&mut reader, &[real_rel, linked_rel], "CW281");
+    assert!(
+        validated.iter().any(|p| p == linked_rel),
+        "the scan must follow the symlink and publish a fixable diagnostic for it, saw: {validated:?}"
+    );
+    assert!(
+        validated.iter().any(|p| p == real_rel),
+        "the real file must be fixable too, saw: {validated:?}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "fixAllWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let (resp_str, applied_edit) =
+        read_response_answering_apply_edit(&mut child, &mut reader).expect("no command response");
+    child.kill().ok();
+
+    let edit = applied_edit.expect("the server must call workspace/applyEdit");
+    let changes = edit["changes"].as_object().expect("changes map");
+    let touched: Vec<&String> = changes.keys().collect();
+    assert!(
+        touched.iter().all(|u| u.ends_with("real.txt")),
+        "only the real in-workspace file may be edited, got: {touched:?}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&resp_str).unwrap()["result"].as_str(),
+        Some("Applied 1 fix(es) across 1 file(s)"),
+        "got: {resp_str}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "b = { limit = { } }\n",
+        "the base-game file is untouched"
+    );
+}
+
 #[test]
 fn test_scan_reports_standard_work_done_progress() {
     // A client that advertises window.workDoneProgress must see the standard

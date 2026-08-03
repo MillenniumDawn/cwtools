@@ -1486,7 +1486,7 @@ impl Backend {
         if !was_explicit {
             let mut cfg = self.state.config.write();
             cfg.vanilla_dir = Some(dir.clone());
-            cfg.refresh_authorized_roots();
+            cfg.refresh_roots();
         }
 
         // We need the ruleset both to key the cache (the fingerprint folds in the

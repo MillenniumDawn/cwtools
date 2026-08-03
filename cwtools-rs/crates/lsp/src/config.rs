@@ -77,7 +77,7 @@ pub(crate) fn extract_u64_setting(opts: &Value, key: &str) -> Option<u64> {
 /// root list. Strict on purpose: a folder URI that isn't a `file:` URI
 /// contributes no root, where the lax converter would turn
 /// `http://localhost/` into `/` and authorize the whole filesystem. One that
-/// doesn't resolve on disk is dropped later, when `refresh_authorized_roots`
+/// doesn't resolve on disk is dropped later, when `refresh_roots`
 /// canonicalizes it.
 fn folders_to_paths(uris: &[String]) -> Vec<std::path::PathBuf> {
     uris.iter()
@@ -286,7 +286,7 @@ impl Backend {
                     {
                         let mut cfg = self.state.config.write();
                         cfg.vanilla_dir = Some(p);
-                        cfg.refresh_authorized_roots();
+                        cfg.refresh_roots();
                     }
                     self.client
                         .log_message(MessageType::INFO, format!("Base-game dir set: {}", vd))
@@ -308,7 +308,7 @@ impl Backend {
                 {
                     let mut cfg = self.state.config.write();
                     cfg.rules_dir = Some(cache_path.clone());
-                    cfg.refresh_authorized_roots();
+                    cfg.refresh_roots();
                 }
                 self.load_rules_config(&cache_path).await;
             }
@@ -330,7 +330,7 @@ impl Backend {
             // list exists so the access boundary doesn't refuse files in a
             // multi-root window's other folders.
             cfg.workspace_roots = folders_to_paths(&folders);
-            cfg.refresh_authorized_roots();
+            cfg.refresh_roots();
         }
 
         // Per-workspace ignore globs from the extension. The extension
@@ -799,7 +799,7 @@ impl Backend {
                     cfg.workspace_roots.push(path);
                 }
             }
-            cfg.refresh_authorized_roots();
+            cfg.refresh_roots();
         }
         self.client
             .log_message(
