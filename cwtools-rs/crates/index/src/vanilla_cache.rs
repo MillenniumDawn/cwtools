@@ -54,7 +54,12 @@ const MAGIC: &[u8; 4] = b"CWV\x00";
 // v9 folds `value_set[array]` names into the cached variable names (arrays are
 // variables to the engine, so `add_to_array` defines a name CW246 must accept).
 // v8 caches were written without them and would flag every vanilla array read.
-const CACHE_VERSION: u8 = 9;
+// v10 stores the cached `file_paths` in their original on-disk case (was
+// lowercased), so a case-sensitive run (--case-sensitive-files) can enforce
+// exact case against base-game files too. v9 caches, whose paths were
+// lowercased, must rebuild or a case-sensitive run would flag every vanilla
+// reference.
+const CACHE_VERSION: u8 = 10;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CachedInstance {
@@ -83,8 +88,8 @@ struct VanillaCacheFile {
     instances: Vec<CachedInstance>,
     /// language name (`english`, `simp_chinese`, …) -> lowercased loc keys.
     loc_keys: Vec<(String, Vec<String>)>,
-    /// Normalized relative paths of every file under the install (the
-    /// `FileIndex` form: lowercased, forward slashes).
+    /// Relative paths of every file under the install, in original on-disk
+    /// case (forward slashes). Lowercased into the file index on restore.
     file_paths: Vec<String>,
     /// Script-variable names defined in vanilla (`VarIndex` form).
     var_names: Vec<String>,
@@ -101,7 +106,7 @@ struct VanillaCacheFile {
 pub struct VanillaCacheAux {
     /// language name -> lowercased loc keys
     pub loc_keys: Vec<(String, Vec<String>)>,
-    /// normalized relative file paths (FileIndex form)
+    /// relative paths in original on-disk case (forward slashes)
     pub file_paths: Vec<String>,
     /// script-variable names
     pub var_names: Vec<String>,
@@ -120,7 +125,7 @@ pub struct VanillaCacheData {
     pub per_type: HashMap<String, Vec<(Arc<str>, TypeInstance)>>,
     /// language name -> lowercased loc keys
     pub loc_keys: Vec<(String, Vec<String>)>,
-    /// normalized relative file paths (FileIndex form)
+    /// relative paths in original on-disk case (forward slashes)
     pub file_paths: Vec<String>,
     /// script-variable names
     pub var_names: Vec<String>,

@@ -57,6 +57,7 @@ const KEYS: &[&str] = &[
     "ignore-files",
     "ignore-dirs",
     "loc-languages",
+    "case-sensitive-files",
     "ignore-codes",
     "only-codes",
     "allow-empty",
@@ -79,6 +80,7 @@ pub(crate) const FIX_KEYS: &[&str] = &[
     "ignore-files",
     "ignore-dirs",
     "loc-languages",
+    "case-sensitive-files",
     "ignore-codes",
     "only-codes",
     "allow-empty",
@@ -140,6 +142,7 @@ pub(crate) struct FileConfig {
     pub(crate) ignore_files: Vec<String>,
     pub(crate) ignore_dirs: Vec<String>,
     pub(crate) loc_languages: Vec<Lang>,
+    pub(crate) case_sensitive_files: bool,
     pub(crate) ignore_codes: Vec<String>,
     pub(crate) only_codes: Vec<String>,
     pub(crate) allow_empty: bool,
@@ -293,6 +296,7 @@ fn from_entries(path: PathBuf, dir: &Path, entries: Vec<Entry>) -> Result<FileCo
             "no-vanilla-cache" => cfg.no_vanilla_cache = boolean(&cfg.path, e)?,
             "refresh-vanilla-cache" => cfg.refresh_vanilla_cache = boolean(&cfg.path, e)?,
             "allow-empty" => cfg.allow_empty = boolean(&cfg.path, e)?,
+            "case-sensitive-files" => cfg.case_sensitive_files = boolean(&cfg.path, e)?,
             "report-type" => {
                 let v = string(&cfg.path, e)?;
                 cfg.report_type = Some(
