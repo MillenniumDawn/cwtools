@@ -366,11 +366,14 @@ fn resolve_sibling_site(
     let marker = format!("l_{lang}").to_ascii_lowercase();
     siblings.iter().find_map(|sib| {
         let (uri, line0) = loc_locations.get(sib.to_ascii_lowercase().as_str())?;
-        crate::access::editable_path(uri, edit_roots)?;
+        // Name first, boundary second: the filename test is free, the boundary
+        // stats the disk.
         let fname = uri.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
-        fname
-            .contains(&marker)
-            .then(|| (std::sync::Arc::clone(uri), *line0))
+        if !fname.contains(&marker) {
+            return None;
+        }
+        crate::access::editable_path(uri, edit_roots).ok()?;
+        Some((std::sync::Arc::clone(uri), *line0))
     })
 }
 
@@ -392,7 +395,7 @@ fn pick_lang_file(discovered: &[PathBuf], lang: Lang, edit_roots: &[PathBuf]) ->
     matches.sort();
     matches
         .into_iter()
-        .find(|p| crate::access::editable_target(p, edit_roots).is_some())
+        .find(|p| crate::access::editable_target(p, edit_roots).is_ok())
         .cloned()
 }
 
@@ -441,7 +444,7 @@ fn resolve_loc_insert_target(
     // is the only gate between a symlinked `localisation/` and a file created
     // outside the workspace.
     let new_path = generated_loc_file_path(workspace_root, lang);
-    crate::access::editable_target(&new_path, edit_roots)?;
+    crate::access::editable_target(&new_path, edit_roots).ok()?;
     Some(LocInsertTarget::NewFile {
         uri: Url::from_file_path(new_path).ok()?,
     })
@@ -815,6 +818,14 @@ fn workspace_edit_changes(
     changes
 }
 
+/// The command's result message when every fixable file was refused by the
+/// edit boundary. Distinct from the empty-store message: the problems are real
+/// and the user can see them in the panel, they just aren't in a file cwtools
+/// will write to.
+fn outside_workspace_summary(refused: usize) -> String {
+    format!("Skipped {refused} file(s) with auto-fixable problems: they are outside the workspace.")
+}
+
 /// The command's result message on success:
 /// `"Applied N fix(es) across M file(s)"`, with an `"; K skipped
 /// (overlapping)"` suffix when any edit was dropped for overlapping — the
@@ -830,10 +841,18 @@ fn fix_all_workspace_summary(edits_applied: usize, files_changed: usize, skipped
 impl Backend {
     /// `fixAllWorkspace` execute-command handler. Returns the message shown to
     /// the user (no result payload otherwise): a "nothing to do" message when
-    /// the store is empty or every entry resolved to zero edits, an error
+    /// the store is empty or every entry resolved to zero edits, a "skipped"
+    /// message when the only fixable files were outside the workspace, an error
     /// message when the client rejects the `workspace/applyEdit`, else the
     /// summary from [`fix_all_workspace_summary`].
     pub(crate) async fn fix_all_workspace_impl(&self) -> String {
+        // Cloned out of the lock before the boundary runs: `publish_filtered`
+        // takes this mutex on the validation hot path, and the boundary stats
+        // and canonicalizes once per URI.
+        let mut snapshot = self.state.fixable_edits.lock().clone();
+        if snapshot.is_empty() {
+            return "No auto-fixable problems in the workspace.".to_string();
+        }
         // The store is keyed by every URI that ever published a diagnostic,
         // which includes files the scan reached through a symlink and anything
         // the client opened, so the edit boundary decides what may be written
@@ -841,16 +860,11 @@ impl Backend {
         // `canonicalize` per fixable file on a user-initiated command, where
         // filtering on publish would be one per file on every scan.
         let edit_roots = self.state.config.read().editable_roots.clone();
-        let snapshot: HashMap<String, Vec<(String, SpanEdit)>> = self
-            .state
-            .fixable_edits
-            .lock()
-            .iter()
-            .filter(|(uri, _)| crate::access::editable_path(uri, &edit_roots).is_some())
-            .map(|(uri, edits)| (uri.clone(), edits.clone()))
-            .collect();
+        let fixable = snapshot.len();
+        snapshot.retain(|uri, _| crate::access::editable_path(uri, &edit_roots).is_ok());
+        let refused = fixable - snapshot.len();
         if snapshot.is_empty() {
-            return "No auto-fixable problems in the workspace.".to_string();
+            return outside_workspace_summary(refused);
         }
         let texts: HashMap<String, String> = snapshot
             .keys()
@@ -1687,5 +1701,18 @@ mod tests {
             fix_all_workspace_summary(3, 2, 1),
             "Applied 3 fix(es) across 2 file(s); 1 skipped (overlapping)"
         );
+    }
+
+    /// "Nothing to fix" and "everything fixable is off-limits" are different
+    /// answers: the second leaves problems the user can still see in the panel,
+    /// so saying there are none would read as a bug in the command.
+    #[test]
+    fn outside_workspace_summary_does_not_claim_there_is_nothing_to_fix() {
+        let msg = outside_workspace_summary(2);
+        assert_eq!(
+            msg,
+            "Skipped 2 file(s) with auto-fixable problems: they are outside the workspace."
+        );
+        assert!(!msg.contains("No auto-fixable problems"));
     }
 }

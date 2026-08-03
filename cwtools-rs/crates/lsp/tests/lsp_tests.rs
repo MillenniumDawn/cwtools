@@ -4079,6 +4079,234 @@ fn test_rename_emits_versioned_document_changes_when_supported() {
     );
 }
 
+/// One `@const` rename in a session with NO workspace folder, driven straight
+/// through the wire so a refusal (`error`) is visible instead of being
+/// flattened into a null `result` the way [`feature_request`] does. Nothing is
+/// scanned and no folder is reported, so `editable_roots` is empty and the edit
+/// boundary would refuse every path — the own-document exemption is the only
+/// reason these renames still work.
+fn at_const_rename_without_workspace(doc_uri: &str, text: &str) -> serde_json::Value {
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {"uri": doc_uri, "languageId": "hoi4", "version": 1, "text": text}
+            }),
+        ),
+    )
+    .unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "position": { "line": 0, "character": 2 },
+                "newName": "@renamed",
+            }),
+        ),
+    )
+    .unwrap();
+    let resp = read_response(&mut reader).expect("no rename response");
+    child.kill().ok();
+    serde_json::from_str(&resp).unwrap()
+}
+
+/// An `untitled:` buffer has never been on disk, so the edit boundary can't
+/// contain it — and doesn't have to. The rename touches only the document the
+/// request named, which the client supplied and will apply to itself (#160).
+#[test]
+fn test_rename_at_constant_succeeds_in_an_untitled_document() {
+    let doc = "@my_const = 5\nadec = {\n    x = @my_const\n}\n";
+    let resp = at_const_rename_without_workspace("untitled:Untitled-1", doc);
+    assert!(
+        resp["error"].is_null(),
+        "an own-document rename must not be refused, got: {resp}"
+    );
+    let changes = resp["result"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("WorkspaceEdit changes, got: {resp}"));
+    let edits = changes["untitled:Untitled-1"]
+        .as_array()
+        .unwrap_or_else(|| panic!("edits for the untitled doc, got: {resp}"));
+    assert_eq!(edits.len(), 2, "definition and read, got: {resp}");
+    assert!(edits.iter().all(|e| e["newText"] == "@renamed"));
+}
+
+/// A window opened on a single file reports no workspace folder at all, so
+/// `editable_roots` is empty. A file-local rename must still work: the request
+/// named the document, and no server-derived path is involved.
+#[test]
+fn test_rename_at_constant_succeeds_without_a_workspace_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loose.txt");
+    let doc = "@my_const = 5\nadec = {\n    x = @my_const\n}\n";
+    std::fs::write(&path, doc).unwrap();
+    let doc_uri = path_uri(&path);
+    let resp = at_const_rename_without_workspace(&doc_uri, doc);
+    assert!(
+        resp["error"].is_null(),
+        "an own-document rename must not be refused, got: {resp}"
+    );
+    let changes = resp["result"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("WorkspaceEdit changes, got: {resp}"));
+    let edits = changes[&doc_uri]
+        .as_array()
+        .unwrap_or_else(|| panic!("edits for the open doc, got: {resp}"));
+    assert_eq!(edits.len(), 2, "definition and read, got: {resp}");
+}
+
+/// A rename whose edit set reaches a second document the edit boundary refuses
+/// is cancelled outright. Here the definition lives in the base-game install
+/// and the workspace only links to it, so the scan indexes it (the link is a
+/// workspace path) but writing it would write through the link into the
+/// install. Applying only the in-workspace half would leave the reference
+/// pointing at a name that no longer matches its definition, so it is the whole
+/// edit set or nothing (#160).
+///
+/// The in-workspace counterpart (a cross-file rename where every target is
+/// inside the workspace, which now runs through the same choke point) is
+/// `test_rename_edits_closed_file`.
+#[cfg(unix)]
+#[test]
+fn test_rename_refuses_when_a_target_is_outside_the_workspace() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    // The focus is defined in the base-game install; the workspace reaches it
+    // only through a link, so its lexical path is a workspace path.
+    let source = vanilla.path().join("f_source.txt");
+    std::fs::write(&source, "MY_FOCUS = { x = yes }\n").unwrap();
+    let linked_def = ws.path().join("common/national_focus/f.txt");
+    std::fs::create_dir_all(linked_def.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&source, &linked_def).unwrap();
+
+    let rel = "common/decisions/a.txt";
+    let text = "adec = {\n    has_focus = MY_FOCUS\n}\n";
+    let path = ws.path().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, text).unwrap();
+    let doc_uri = path_uri(&path);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {"uri": doc_uri, "languageId": "hoi4", "version": 1, "text": text}
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, rel);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "position": { "line": 1, "character": 16 },
+                "newName": "NEW_FOCUS",
+            }),
+        ),
+    )
+    .unwrap();
+    let resp_str = read_response(&mut reader).expect("no rename response");
+    child.kill().ok();
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+
+    let message = resp["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("rename must be refused, got: {resp_str}"));
+    assert!(
+        message.contains("Rename cancelled") && message.contains("is a symbolic link"),
+        "the refusal must name the cause the boundary reported, got: {message}"
+    );
+    assert!(
+        message.contains("national_focus/f.txt"),
+        "the refusal must name the target it refused, got: {message}"
+    );
+    assert!(
+        resp["result"].is_null(),
+        "a refused rename carries no partial edit, got: {resp_str}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        "MY_FOCUS = { x = yes }\n",
+        "the base-game file is untouched"
+    );
+}
+
 #[test]
 fn test_rename_at_constant_renames_file_locally() {
     // `@` script constants are file-local: renaming from the definition
@@ -8240,8 +8468,8 @@ fn test_create_loc_key_code_action_creates_a_new_loc_file_when_the_workspace_has
     // (`append_missing_loc_errors`), so an empty workspace with no loc
     // anywhere would suppress it entirely. The base-game (vanilla) dir is
     // given a loc file instead: it merges into the union (index non-empty,
-    // CW100 fires) but isn't a workspace file (`uri_is_in_workspace` rejects
-    // it), so neither the sibling-site nor the existing-file tier applies and
+    // CW100 fires) but sits outside `editable_roots`, so the edit boundary
+    // refuses it for the sibling-site and existing-file tiers alike and
     // resolution falls through to NewFile.
     const RULES: &str = r#"
 types = {
