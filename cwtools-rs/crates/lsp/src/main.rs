@@ -17,6 +17,7 @@ use cwtools_validation::position::rules_at_pos;
 use cwtools_validation::references;
 
 mod access;
+mod cache_purge;
 mod code_action;
 mod color;
 mod completion;

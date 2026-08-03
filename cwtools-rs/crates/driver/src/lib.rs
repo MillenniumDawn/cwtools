@@ -882,21 +882,11 @@ fn loc_header_language(text: &str, path: &str) -> Option<Lang> {
         .and_then(|f| f.lang)
 }
 
-/// Cache file for `game` at `fingerprint` under `dir`. Filename layout matches
-/// the LSP's writer so a cache warmed by either side is reused by the other.
+/// Cache file for `game` at `fingerprint` under `dir`. The name comes from the
+/// cache module itself, so a cache warmed by either side is reused by the other
+/// and neither drifts from what `clearAllCaches` recognises.
 fn vanilla_cache_path(dir: &Path, game: &str, fingerprint: &str) -> PathBuf {
-    let safe = |s: &str| -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    };
-    dir.join(format!("vanilla-{}-{}.cwv", safe(game), safe(fingerprint)))
+    dir.join(vanilla_cache::cache_file_name(game, fingerprint))
 }
 
 /// Serialize the base-game index to a sibling temp file and rename it into

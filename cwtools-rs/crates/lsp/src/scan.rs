@@ -1680,18 +1680,10 @@ impl Backend {
             .cache_dir
             .clone()
             .or_else(default_cache_dir)?;
-        let safe = |s: &str| -> String {
-            s.chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect()
-        };
-        Some(base.join(format!("vanilla-{}-{}.cwv", safe(game), safe(fingerprint))))
+        Some(base.join(cwtools_info::vanilla_cache::cache_file_name(
+            game,
+            fingerprint,
+        )))
     }
 
     /// Handle external file changes (create, modify, delete) from the file

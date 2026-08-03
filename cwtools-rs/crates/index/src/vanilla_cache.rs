@@ -29,6 +29,11 @@ use crate::{SourceLocation, TypeIndex, TypeInstance};
 /// `.cwb` parse cache magic (`CWB\0`) so the two can never be confused.
 const MAGIC: &[u8; 4] = b"CWV\x00";
 
+/// Filename prefix and extension of a cache file, as [`cache_file_name`] builds
+/// it and [`is_cache_file`] recognises it.
+const FILE_PREFIX: &str = "vanilla-";
+const FILE_EXT: &str = ".cwv";
+
 // v2 adds `fingerprint` (game version) so a cache can be validated against the
 // installed game and shared between users on the same version. v1 files fail the
 // version check and are treated as a cache miss (rebuilt).
@@ -246,6 +251,58 @@ pub fn combined_fingerprint(dir: &Path, ruleset: &RuleSet) -> String {
     format!("{}|rs:{}", fingerprint(dir), ruleset_shape_hash(ruleset))
 }
 
+/// Filename of the cache for `game` at `fingerprint`, versioned in the name so
+/// several game versions coexist in one directory.
+///
+/// One builder, so a writer (the CLI's or the LSP's) and [`is_cache_file`] can
+/// never disagree about what a cache file is called. Both halves are sanitised:
+/// a fingerprint carries the game version verbatim, and a separator in it would
+/// otherwise write the cache somewhere else entirely.
+pub fn cache_file_name(game: &str, fingerprint: &str) -> String {
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    format!(
+        "{FILE_PREFIX}{}-{}{FILE_EXT}",
+        safe(game),
+        safe(fingerprint)
+    )
+}
+
+/// Whether `path` is one of the cache files this module writes: the
+/// [`cache_file_name`] shape, a regular file rather than a symlink or a
+/// directory, carrying the [`MAGIC`] header.
+///
+/// Reach for this before deleting one. `clearAllCaches` clears caches out of a
+/// directory an LSP client chose (#159), so it has to recognise a cache by what
+/// is in it and not by its name. A `.cwv.tmp…` left behind by a killed writer
+/// matches too — same name, same header — but one truncated before its header
+/// was written does not, and is left for its owner.
+pub fn is_cache_file(path: &Path) -> bool {
+    let named_like_a_cache = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(FILE_PREFIX) && name.contains(FILE_EXT));
+    if !named_like_a_cache
+        || !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+    {
+        return false;
+    }
+    let mut header = [0u8; MAGIC.len()];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && &header == MAGIC
+}
+
 fn write_cache(
     instances: Vec<CachedInstance>,
     game: &str,
@@ -391,6 +448,57 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_cache_file_accepts_what_the_writer_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(cache_file_name("hoi4", "v1.16.4"));
+        let empty = HashMap::new();
+        save_per_type(&empty, "hoi4", "v1.16.4", &path, VanillaCacheAux::default()).unwrap();
+
+        assert!(is_cache_file(&path));
+    }
+
+    #[test]
+    fn is_cache_file_rejects_a_lookalike_name() {
+        // `clearAllCaches` deletes what this says yes to, out of a directory an
+        // LSP client chose (#159), so the name alone is never enough.
+        let tmp = tempfile::tempdir().unwrap();
+        let named_right = tmp.path().join("vanilla-holiday.cwv");
+        std::fs::write(&named_right, b"JPEG, not a cache").unwrap();
+        let named_wrong = tmp.path().join("vanilla-notes.txt");
+        std::fs::write(&named_wrong, MAGIC).unwrap();
+        let empty = tmp.path().join("vanilla-truncated.cwv");
+        std::fs::write(&empty, b"").unwrap();
+        let directory = tmp.path().join("vanilla-archive.cwv");
+        std::fs::create_dir(&directory).unwrap();
+
+        assert!(!is_cache_file(&named_right));
+        assert!(!is_cache_file(&named_wrong));
+        assert!(!is_cache_file(&empty));
+        assert!(!is_cache_file(&directory));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_cache_file_rejects_a_symlink_to_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(cache_file_name("hoi4", "v1"));
+        let empty = HashMap::new();
+        save_per_type(&empty, "hoi4", "v1", &target, VanillaCacheAux::default()).unwrap();
+        let link = tmp.path().join(cache_file_name("hoi4", "v2"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(!is_cache_file(&link));
+    }
+
+    #[test]
+    fn cache_file_name_sanitises_both_halves() {
+        assert_eq!(
+            cache_file_name("hoi4", "v1.16.4-rs:9ab/c"),
+            "vanilla-hoi4-v1.16.4-rs_9ab_c.cwv"
+        );
+    }
 
     #[test]
     fn fingerprint_distinguishes_unreadable_installs() {

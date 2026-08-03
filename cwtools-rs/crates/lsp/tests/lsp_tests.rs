@@ -4838,6 +4838,123 @@ fn test_rescan_prunes_deleted_file_from_index() {
     );
 }
 
+/// Read frames until the response to request `id` arrives, returning its
+/// `result`. Notifications and server-initiated requests are skipped.
+fn result_for(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    id: i64,
+) -> Option<serde_json::Value> {
+    for _ in 0..2000 {
+        let raw = read_frame(reader).ok()?;
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v["id"] == serde_json::json!(id) && v.get("result").is_some() {
+            return Some(v["result"].clone());
+        }
+    }
+    None
+}
+
+#[test]
+fn test_clear_all_caches_only_deletes_cwtools_caches() {
+    // #159: `cacheDir` is client input, and the purge used to recursively delete
+    // `<cacheDir>/parse-cache` and every `vanilla-*` child by name. Point it at
+    // a directory holding unrelated entries of both shapes: they must survive
+    // the startup scan (which prunes) and the command (which purges), while the
+    // genuine caches next to them are cleared.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    std::fs::write(ws.path().join("a.txt"), "my_dec = { }\n").unwrap();
+
+    let foreign_dir = cache_dir.path().join("parse-cache").join("important");
+    std::fs::create_dir_all(&foreign_dir).unwrap();
+    let foreign_file = foreign_dir.join("notes.txt");
+    std::fs::write(&foreign_file, b"keep me").unwrap();
+    let foreign_named = cache_dir.path().join("vanilla-notes.txt");
+    std::fs::write(&foreign_named, b"keep me").unwrap();
+    let foreign_cwv = cache_dir.path().join("vanilla-holiday.cwv");
+    std::fs::write(&foreign_cwv, b"keep me").unwrap();
+
+    // Genuine caches, in the on-disk shape the engine writes: a fingerprint-named
+    // directory with its 8-byte signature and an entry, and a `.cwv` carrying the
+    // vanilla-cache header.
+    let owned_dir = cache_dir
+        .path()
+        .join("parse-cache")
+        .join("0123456789abcdef");
+    std::fs::create_dir_all(&owned_dir).unwrap();
+    std::fs::write(owned_dir.join("settings.sig"), 1u64.to_le_bytes()).unwrap();
+    std::fs::write(owned_dir.join("0000000000000001.cwb"), b"CWB\0").unwrap();
+    let owned_cwv = cache_dir.path().join("vanilla-hoi4-test.cwv");
+    std::fs::write(&owned_cwv, b"CWV\0\x0a").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+                "cacheDir": cache_dir.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, "a.txt");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({"command": "clearAllCaches", "arguments": []}),
+        ),
+    )
+    .unwrap();
+    let result = result_for(&mut reader, 2).expect("clearAllCaches result");
+    child.kill().ok();
+
+    let message = result.as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("Caches cleared"),
+        "unexpected result: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&foreign_file).unwrap(),
+        b"keep me",
+        "an unrelated file under a `parse-cache` directory was deleted"
+    );
+    assert!(foreign_named.exists(), "vanilla-notes.txt was deleted");
+    assert!(foreign_cwv.exists(), "a headerless .cwv was deleted");
+    assert!(!owned_dir.exists(), "the real parse cache survived");
+    assert!(!owned_cwv.exists(), "the real vanilla cache survived");
+}
+
 // ── Periodic background reindex ───────────────────────────────────────────
 
 /// Read frames until a `publishDiagnostics` for a URI ending in `suffix`
@@ -5155,9 +5272,11 @@ fn test_clear_all_caches_reports_reindexed_message() {
     child.kill().ok();
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     assert_eq!(resp["id"], 2, "got: {}", resp_str);
-    assert_eq!(
-        resp["result"].as_str(),
-        Some("Caches cleared; workspace re-indexed."),
+    // The file count in the middle depends on what the scan cached, so the two
+    // halves that carry meaning are matched instead.
+    let result = resp["result"].as_str().unwrap_or_default();
+    assert!(
+        result.starts_with("Caches cleared (") && result.ends_with("workspace re-indexed."),
         "clearAllCaches should report a successful re-index, got: {}",
         resp_str
     );
