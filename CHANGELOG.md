@@ -30,6 +30,7 @@
 
 ## Improvements
 
+- `TypeIndex::instances_in_file` and `remove_file` no longer scan a type's whole instance list to find one file's own entries; both now cost proportional to the file, not the type. This is on the hot path for CW100 and the unused-instance check, which run per file on every LSP validate and every CLI run, so a type with thousands of instances spread across many files (state, character, technology) no longer gets rescanned end to end for every file that happens to touch it. Against a synthetic corpus of 400 files sharing three 4,800-instance types, `instances_in_file` drops from ~24µs to ~64ns (-99.7%) and `remove_file` from ~45µs to ~6µs (-87%). (#129)
 - `ScopeRegistry`'s name, scope and link maps now use `FxHashMap` rather than SipHash. Against HOI4 config b5779a1, an `owner` scope transition drops from 79.2ns to 50.4ns (-36%) and registry construction from 25.3µs to 16.1µs (-36%). (#152)
 - **In progress, engine v2.4.0:** remove redundant indexing and path normalization
   work (#86).
