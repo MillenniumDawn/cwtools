@@ -21,7 +21,7 @@ use crate::validate::{
     DocLines, loc_diag_to_validation_error, make_prepared, parse_error_to_diagnostic,
     validate_parsed_with_indexes, validation_error_to_diagnostic,
 };
-use crate::{Backend, LoadingBar, LocLocationMap, LocTextMap, UpdateFileList};
+use crate::{Backend, DocumentState, LoadingBar, LocLocationMap, LocTextMap, UpdateFileList};
 
 /// Trailing window for coalescing `didChangeWatchedFiles` create/modify events.
 /// Fixed (not a sliding reset) so a continuous churn stream still drains.
@@ -1825,25 +1825,27 @@ impl Backend {
                 );
                 return;
             }
+            // Inspect the slot BEFORE spawning the retry: while this window's
+            // own handle is unfinished, it's the one occupying the slot — by
+            // construction, nothing else can install one, since
+            // `arm_watched_batch`'s own gate no-ops against a live handle.
+            // Checking first means the (today unreachable) case where the
+            // slot has already moved on doesn't leak a spawned-but-untracked
+            // retry task.
+            if !watched_batch_slot_is_ours(&state) {
+                tracing::debug!(
+                    "watched-debounce slot was already cleared or re-armed by the time \
+                     this panic was handled; skipping the immediate retry, events stay \
+                     requeued for whatever already owns the slot"
+                );
+                return;
+            }
             let retry = Backend {
                 client,
                 state: state.clone(),
             }
             .spawn_watched_batch_window(true);
-            // The slot should still hold only this now-finishing window's own
-            // handle — nothing else replaces it while a window is running.
-            // Guard the write anyway so a change to that invariant fails
-            // loudly instead of silently dropping a live handle the slot no
-            // longer points at.
-            let mut slot = state.watched_debounce.lock();
-            if slot.as_ref().is_some_and(|h| !h.is_finished()) {
-                tracing::error!(
-                    "watched-debounce slot held an unexpected live handle during panic \
-                     recovery; retry window spawned but not tracked in the slot"
-                );
-            } else {
-                *slot = Some(retry);
-            }
+            *state.watched_debounce.lock() = Some(retry);
         })
     }
 
@@ -2245,6 +2247,24 @@ fn stat_signature_for(files: &[std::path::PathBuf]) -> u64 {
     hasher.finish()
 }
 
+/// Whether `state.watched_debounce` currently holds a live (unfinished)
+/// handle. Split out of `spawn_watched_batch_window`'s panic-recovery path so
+/// the decision is independently unit-testable (#155 fix-round-2): at the
+/// point the recovery path calls this, the slot can only hold either THIS
+/// window's own handle — still unfinished, since we're suspended mid-recovery,
+/// not returned — or nothing/a finished one if some later stage already
+/// cleared or re-armed it (unreachable today; `arm_watched_batch`'s own gate
+/// no-ops against a live handle, so nothing else can install one while ours
+/// is running). `true` means "safe to overwrite with a retry"; `false` means
+/// "something else already moved on, don't spawn a retry at all".
+fn watched_batch_slot_is_ours(state: &DocumentState) -> bool {
+    state
+        .watched_debounce
+        .lock()
+        .as_ref()
+        .is_some_and(|h| !h.is_finished())
+}
+
 /// Drop from `deletes` any URI that also arrived as a CHANGED/CREATED this
 /// window: a delete coincident with a re-create (an atomic save's
 /// remove+rewrite) is a change, not a delete of the index entry.
@@ -2321,6 +2341,51 @@ mod tests {
     async fn test_spawn_logging_panics_reports_true_on_success() {
         let ok = spawn_logging_panics("test task", async {}).await;
         assert!(ok, "a task that returns normally must report true");
+    }
+
+    // ── watched_batch_slot_is_ours (#155 fix-round-2 MINOR-4 regression) ────
+
+    #[tokio::test]
+    async fn test_watched_batch_slot_is_ours_while_handle_unfinished() {
+        // Pins the fix: the first attempt at this fix inverted the check, so
+        // the normal case (the slot holding this window's own still-running
+        // handle, exactly like at the real panic-observation point) read as
+        // "not ours" and skipped installing the retry. A live handle in the
+        // slot must read as ours.
+        let state = DocumentState::new();
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        *state.watched_debounce.lock() = Some(handle);
+        assert!(
+            watched_batch_slot_is_ours(&state),
+            "a live handle in the slot must read as ours"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_watched_batch_slot_is_not_ours_once_finished() {
+        let state = DocumentState::new();
+        let handle = tokio::spawn(async {});
+        // `JoinHandle::await` would consume it; poll `is_finished()` instead
+        // so the (now-finished) handle can still be stored in the slot.
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        *state.watched_debounce.lock() = Some(handle);
+        assert!(
+            !watched_batch_slot_is_ours(&state),
+            "a finished handle must not read as ours"
+        );
+    }
+
+    #[test]
+    fn test_watched_batch_slot_is_not_ours_when_empty() {
+        let state = DocumentState::new();
+        assert!(
+            !watched_batch_slot_is_ours(&state),
+            "an empty slot must not read as ours"
+        );
     }
 
     // ── is_idle (background reindex gating) ────────────────────────────────
