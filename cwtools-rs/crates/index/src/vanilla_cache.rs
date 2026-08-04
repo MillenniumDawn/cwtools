@@ -623,7 +623,7 @@ mod tests {
                         col: 0,
                         end: (12, 1),
                     },
-                    primary_loc_key: None,
+                    primary_loc_key: Some("base_1_title".into()),
                 },
             )],
         );
@@ -641,6 +641,11 @@ mod tests {
         );
         assert_eq!(insts[0].1.location.line, 7);
         assert_eq!(insts[0].1.location.end, (12, 1));
+        assert_eq!(
+            insts[0].1.primary_loc_key.as_deref(),
+            Some("base_1_title"),
+            "primary loc key must round-trip through save_per_type too (#141)"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
