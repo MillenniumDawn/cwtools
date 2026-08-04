@@ -12,6 +12,7 @@ use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_validation::build_scope_registry_arc;
 
 use crate::Backend;
+use crate::cache_purge::purge_caches;
 use crate::paths::default_cache_dir;
 
 /// Pull `ignoreFilePatterns` and `ignoreDirectories` arrays out of a
@@ -983,32 +984,10 @@ impl Backend {
                     .cache_dir
                     .clone()
                     .or_else(default_cache_dir);
-                let mut failures: Vec<String> = Vec::new();
-                if let Some(dir) = &dir {
-                    let dir = dir.clone();
-                    failures = tokio::task::block_in_place(|| {
-                        let mut failures: Vec<String> = Vec::new();
-                        let parse_cache = dir.join("parse-cache");
-                        if let Err(e) = std::fs::remove_dir_all(&parse_cache)
-                            && e.kind() != std::io::ErrorKind::NotFound
-                        {
-                            tracing::warn!(path = %parse_cache.display(), error = %e, "clearAllCaches: remove parse-cache failed");
-                            failures.push(format!("{}: {}", parse_cache.display(), e));
-                        }
-                        if let Ok(entries) = std::fs::read_dir(&dir) {
-                            for e in entries.flatten() {
-                                let name = e.file_name();
-                                if name.to_string_lossy().starts_with("vanilla-")
-                                    && let Err(err) = std::fs::remove_file(e.path())
-                                {
-                                    tracing::warn!(path = %e.path().display(), error = %err, "clearAllCaches: remove vanilla cache failed");
-                                    failures.push(format!("{}: {}", e.path().display(), err));
-                                }
-                            }
-                        }
-                        failures
-                    });
-                }
+                let (removed, failures) = match dir {
+                    Some(dir) => tokio::task::block_in_place(|| purge_caches(&dir)),
+                    None => (0, Vec::new()),
+                };
                 self.state.vanilla_merged.store(false, Ordering::SeqCst);
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
@@ -1032,10 +1011,10 @@ impl Backend {
                     "re-index still pending (another scan is running)"
                 };
                 let msg = if failures.is_empty() {
-                    format!("Caches cleared; {status}.")
+                    format!("Caches cleared ({removed} files); {status}.")
                 } else {
                     format!(
-                        "Caches cleared with {} error(s); {status}. Failed: {}",
+                        "Caches cleared ({removed} files) with {} error(s); {status}. Failed: {}",
                         failures.len(),
                         failures.join("; ")
                     )

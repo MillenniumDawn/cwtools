@@ -441,6 +441,7 @@ dependencies = [
  "rkyv",
  "rustc-hash",
  "serde_json",
+ "tempfile",
  "tracing",
  "zstd",
 ]

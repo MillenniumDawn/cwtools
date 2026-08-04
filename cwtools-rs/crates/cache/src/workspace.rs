@@ -152,6 +152,9 @@ pub fn settings_fingerprint(language: &str, ruleset: &RuleSet, workspace_root: &
 
 // ── Directory layout ────────────────────────────────────────────────────────
 
+/// The one directory this module owns under a cache root.
+const PARSE_CACHE_DIR: &str = "parse-cache";
+
 /// Resolve the workspace parse-cache directory.
 ///
 /// Layout: `<cache_dir>/parse-cache/<workspace-fingerprint-hex>/`
@@ -159,7 +162,7 @@ pub fn settings_fingerprint(language: &str, ruleset: &RuleSet, workspace_root: &
 /// Returns `None` if no base cache dir can be resolved.
 fn workspace_cache_dir(cache_dir: &Path, fingerprint: u64) -> PathBuf {
     cache_dir
-        .join("parse-cache")
+        .join(PARSE_CACHE_DIR)
         .join(format!("{:016x}", fingerprint))
 }
 
@@ -201,6 +204,15 @@ fn write_settings_sig(dir: &Path, sig: u64) -> std::io::Result<()> {
 /// still valid; `false` if the directory was cleared and must be rebuilt.
 pub fn validate_or_clear(cache_dir: &Path, fingerprint: u64) -> std::io::Result<bool> {
     let dir = workspace_cache_dir(cache_dir, fingerprint);
+    // The path is built from a cache root the LSP client chose, and both arms
+    // below write or delete through it. Anything already sitting there that is
+    // not a directory of ours is refused rather than cleared: a symlink here
+    // would send `clear_cache_dir` at its target's files (#159).
+    if fs::symlink_metadata(&dir).is_ok_and(|metadata| !metadata.is_dir()) {
+        return Err(std::io::Error::other(
+            "cannot use a cache directory that is a symlink or a file",
+        ));
+    }
     match read_settings_sig(&dir) {
         Some(stored) if stored == fingerprint => {
             prune(cache_dir, fingerprint);
@@ -220,6 +232,140 @@ pub fn prune(cache_dir: &Path, fingerprint: u64) {
     let dir = workspace_cache_dir(cache_dir, fingerprint);
     prune_cache_dir(&dir);
     prune_all_cache_dirs(cache_dir, &dir);
+}
+
+// ── Ownership-checked removal ───────────────────────────────────────────────
+
+/// What [`remove_all`] managed to do.
+#[derive(Debug, Default)]
+pub struct Removal {
+    /// Cache files removed.
+    pub files: usize,
+    /// Entries that could not be removed, each with the error that stopped it.
+    pub failures: Vec<(PathBuf, std::io::Error)>,
+}
+
+/// Remove every parse cache under `cache_dir`, and nothing else.
+///
+/// Reach for this to clear the caches on demand (the LSP's `clearAllCaches`).
+/// The cache root is whatever an LSP client asked for, so a path is removed
+/// only when it is positively one of ours: a `parse-cache/` holding
+/// fingerprint-named directories, each carrying the `settings.sig` written when
+/// it was created. Nothing here recurses and no symlink is followed, so a
+/// foreign directory that happens to be named `parse-cache` loses nothing.
+pub fn remove_all(cache_dir: &Path) -> Removal {
+    let root = cache_dir.join(PARSE_CACHE_DIR);
+    let mut removal = Removal::default();
+    // No cache yet is the ordinary case and says nothing. Anything else that
+    // stops us reading the root (a file or a symlink in the way, no
+    // permission) has to reach the caller: silence there reads as success.
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            removal
+                .failures
+                .push((root, std::io::Error::other("not a directory")));
+            return removal;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return removal,
+        Err(error) => {
+            removal.failures.push((root, error));
+            return removal;
+        }
+    }
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            removal.failures.push((root, error));
+            return removal;
+        }
+    };
+    let mut owned = 0usize;
+    let mut swept_all = true;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !is_owned_cache_dir(&dir) {
+            tracing::debug!(path = %dir.display(), "not a cwtools cache directory; left alone");
+            swept_all = false;
+            continue;
+        }
+        owned += 1;
+        swept_all &= remove_owned_cache_dir(&dir, &mut removal);
+    }
+    // Cosmetic, and earned only by having cleared something out of it: an
+    // empty `parse-cache` we never wrote to is not ours to remove. The next
+    // scan recreates our own.
+    if swept_all && owned > 0 {
+        let _ = fs::remove_dir(&root);
+    }
+    removal
+}
+
+/// Whether `path` is a directory in its own right, as opposed to a symlink to
+/// one. Every step of a removal asks this before it opens or unlinks anything.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// Whether `dir` is one of the per-fingerprint directories this module writes:
+/// a real directory named by a fingerprint, carrying the `settings.sig` that
+/// [`validate_or_clear`] leaves there. The signature is the ownership marker —
+/// it predates any need for one, because `validate_or_clear` is the only thing
+/// that creates these directories and it writes the signature as it does.
+fn is_owned_cache_dir(dir: &Path) -> bool {
+    if !is_real_dir(dir) {
+        return false;
+    }
+    let named_by_fingerprint = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            // `{:016x}`, as `workspace_cache_dir` formats it.
+            name.len() == 16
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        });
+    named_by_fingerprint
+        && fs::symlink_metadata(settings_sig_path(dir))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 8)
+}
+
+/// Remove the files inside a cache directory that has already cleared
+/// [`is_owned_cache_dir`], then the directory itself. Returns whether it went
+/// completely: a subdirectory (nothing this module writes) is left alone, and
+/// so is its parent.
+fn remove_owned_cache_dir(dir: &Path, removal: &mut Removal) -> bool {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            removal.failures.push((dir.to_path_buf(), error));
+            return false;
+        }
+    };
+    let mut emptied = true;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `remove_file` unlinks the name it is given and never follows a
+        // symlink to its target, so nothing destructive can slip through the
+        // window between this check and that call.
+        if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+            emptied = false;
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removal.files += 1,
+            Err(error) => {
+                removal.failures.push((path, error));
+                emptied = false;
+            }
+        }
+    }
+    if emptied && let Err(error) = fs::remove_dir(dir) {
+        removal.failures.push((dir.to_path_buf(), error));
+        return false;
+    }
+    emptied
 }
 
 // ── Bounded cleanup ───────────────────────────────────────────────────────────
@@ -277,14 +423,17 @@ fn prune_all_cache_dirs_with_caps(
     max_bytes: u64,
     current_dir: Option<&Path>,
 ) {
-    let root = cache_dir.join("parse-cache");
+    let root = cache_dir.join(PARSE_CACHE_DIR);
     let Ok(dirs) = fs::read_dir(root) else {
         return;
     };
+    // Ownership-checked, not just `is_dir`: the cache root comes from the LSP
+    // client, and the sweep below deletes. An unrelated directory that happens
+    // to sit under a `parse-cache` is none of our business (#159).
     let dirs: Vec<PathBuf> = dirs
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
+        .filter(|path| is_owned_cache_dir(path))
         .collect();
     if dirs.len() > 2 {
         let mut entries = Vec::new();
@@ -297,18 +446,19 @@ fn prune_all_cache_dirs_with_caps(
     remove_empty_cache_dirs(&dirs, current_dir);
 }
 
+/// Sweep the cache dirs that no longer hold an entry. `dirs` has already
+/// cleared [`is_owned_cache_dir`] — this deletes, so it is not the place to
+/// meet a path that only looks like ours.
 fn remove_empty_cache_dirs(dirs: &[PathBuf], current_dir: Option<&Path>) {
     for dir in dirs {
         if current_dir.is_some_and(|current| current == dir) || count_cache_entries(dir) != 0 {
             continue;
         }
-        let Ok(files) = fs::read_dir(dir) else {
-            continue;
-        };
-        for file in files.flatten().filter(|entry| entry.path().is_file()) {
-            let _ = fs::remove_file(file.path());
+        let mut removal = Removal::default();
+        remove_owned_cache_dir(dir, &mut removal);
+        for (path, error) in removal.failures {
+            tracing::debug!(path = %path.display(), %error, "could not remove empty cache dir");
         }
-        let _ = fs::remove_dir(dir);
     }
 }
 
@@ -536,6 +686,28 @@ mod tests {
         fs::write(&blocker, b"x").unwrap();
 
         assert!(validate_or_clear(&blocker, 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_or_clear_refuses_a_symlinked_cache_dir() {
+        // A settings change takes the clearing branch, which used to read_dir
+        // and remove_file straight through a symlink sitting at the fingerprint
+        // path: every regular file in its target went (#159). No race needed.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("payroll.csv");
+        fs::write(&victim, b"keep me").unwrap();
+        let dir = workspace_cache_dir(tmp.path(), 42);
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &dir).unwrap();
+
+        assert!(validate_or_clear(tmp.path(), 42).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+        assert!(
+            !settings_sig_path(&dir).exists(),
+            "a signature was written through the link"
+        );
     }
 
     #[test]
@@ -785,12 +957,14 @@ mod tests {
     #[test]
     fn global_prune_bounds_entries_across_fingerprints() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("parse-cache");
         let base = std::time::SystemTime::now() - std::time::Duration::from_secs(20);
         let mut paths = Vec::new();
-        for fingerprint in ["one", "two", "three"] {
-            let dir = root.join(fingerprint);
+        for fingerprint in [1u64, 2, 3] {
+            // A real cache dir, signature and all: the sweep only touches dirs
+            // it can identify as ours (#159).
+            let dir = workspace_cache_dir(tmp.path(), fingerprint);
             fs::create_dir_all(&dir).unwrap();
+            fs::write(settings_sig_path(&dir), fingerprint.to_le_bytes()).unwrap();
             for i in 0..4u64 {
                 let path = dir.join(format!("{fingerprint}-{i}.cwb"));
                 fs::write(&path, b"x").unwrap();
@@ -803,13 +977,126 @@ mod tests {
         }
 
         prune_all_cache_dirs_with_caps(tmp.path(), 5, u64::MAX, None);
-        let remaining: usize = ["one", "two", "three"]
+        let remaining: usize = [1u64, 2, 3]
             .iter()
-            .map(|fingerprint| count_cwb(&root.join(fingerprint)))
+            .map(|fingerprint| count_cwb(&workspace_cache_dir(tmp.path(), *fingerprint)))
             .sum();
         assert!(remaining <= 4);
         assert!(paths.last().unwrap().exists());
         assert!(!paths.first().unwrap().exists());
+    }
+
+    // ── Ownership-checked removal (#159) ────────────────────────────────────
+
+    /// A per-fingerprint cache dir in the shape `validate_or_clear` + `store`
+    /// leave it: the 8-byte `settings.sig` plus one entry.
+    fn owned_cache_dir(root: &Path, fingerprint: u64) -> PathBuf {
+        let dir = workspace_cache_dir(root, fingerprint);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(settings_sig_path(&dir), fingerprint.to_le_bytes()).unwrap();
+        fs::write(file_cache_path(&dir, 1), b"cwb").unwrap();
+        dir
+    }
+
+    #[test]
+    fn remove_all_clears_owned_cache_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = owned_cache_dir(tmp.path(), 0xdead_beef);
+
+        let removal = remove_all(tmp.path());
+
+        assert!(removal.failures.is_empty(), "{:?}", removal.failures);
+        assert_eq!(removal.files, 2, "settings.sig + one entry");
+        assert!(!dir.exists());
+        assert!(!tmp.path().join(PARSE_CACHE_DIR).exists());
+    }
+
+    #[test]
+    fn remove_all_leaves_a_foreign_parse_cache_directory() {
+        // The cache root is client input (#159), so a directory that merely
+        // happens to be named `parse-cache` must come through untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let foreign = tmp.path().join(PARSE_CACHE_DIR).join("important");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("notes.txt"), b"keep me").unwrap();
+        // A fingerprint-shaped name is not ownership on its own, and neither is
+        // a `settings.sig` of the wrong size.
+        let lookalike = tmp.path().join(PARSE_CACHE_DIR).join("deadbeefdeadbeef");
+        fs::create_dir_all(&lookalike).unwrap();
+        fs::write(settings_sig_path(&lookalike), b"no").unwrap();
+        fs::write(lookalike.join("payroll.csv"), b"keep me").unwrap();
+
+        let removal = remove_all(tmp.path());
+
+        assert!(removal.failures.is_empty(), "{:?}", removal.failures);
+        assert_eq!(removal.files, 0);
+        assert!(foreign.join("notes.txt").exists());
+        assert!(lookalike.join("payroll.csv").exists());
+    }
+
+    #[test]
+    fn remove_all_leaves_an_empty_foreign_parse_cache_directory() {
+        // Removing the root is only earned by having cleared something out of
+        // it: an empty directory we never wrote to is not ours to delete.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(PARSE_CACHE_DIR);
+        fs::create_dir_all(&root).unwrap();
+
+        let removal = remove_all(tmp.path());
+
+        assert!(removal.failures.is_empty(), "{:?}", removal.failures);
+        assert!(root.exists());
+    }
+
+    #[test]
+    fn remove_all_reports_a_parse_cache_it_cannot_use() {
+        // "Caches cleared (0 files)" when the root is unusable reads as success
+        // and isn't: the caller has to hear about it.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(PARSE_CACHE_DIR), b"not a cache").unwrap();
+
+        let removal = remove_all(tmp.path());
+
+        assert_eq!(removal.files, 0);
+        assert_eq!(removal.failures.len(), 1, "{:?}", removal.failures);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_all_does_not_follow_a_symlinked_cache_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = owned_cache_dir(outside.path(), 1);
+        fs::create_dir_all(tmp.path().join(PARSE_CACHE_DIR)).unwrap();
+        std::os::unix::fs::symlink(
+            &target,
+            tmp.path().join(PARSE_CACHE_DIR).join("0123456789abcdef"),
+        )
+        .unwrap();
+
+        let removal = remove_all(tmp.path());
+
+        assert_eq!(removal.files, 0);
+        assert!(removal.failures.is_empty(), "{:?}", removal.failures);
+        assert!(settings_sig_path(&target).exists(), "target was followed");
+    }
+
+    #[test]
+    fn global_prune_leaves_a_foreign_directory_under_parse_cache() {
+        // Regression for #159: the empty-dir sweep used to delete every file in
+        // any `parse-cache/<x>/` holding no `.cwb`, whatever `<x>` was — and it
+        // runs on every scan, no command needed.
+        let tmp = tempfile::tempdir().unwrap();
+        let foreign = tmp.path().join(PARSE_CACHE_DIR).join("Documents");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("taxes.pdf"), b"keep me").unwrap();
+        let owned = owned_cache_dir(tmp.path(), 7);
+        fs::remove_file(file_cache_path(&owned, 1)).unwrap();
+
+        prune_all_cache_dirs_with_caps(tmp.path(), 5, u64::MAX, None);
+
+        assert!(foreign.join("taxes.pdf").exists(), "foreign file deleted");
+        assert!(!owned.exists(), "an empty owned cache dir is still swept");
     }
 
     #[test]
