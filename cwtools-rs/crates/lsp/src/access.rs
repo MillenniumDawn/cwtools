@@ -328,9 +328,13 @@ mod tests {
     /// with an empty or `localhost` host converts to a perfectly good absolute
     /// path. This is the behaviour the explicit scheme check exists to stop;
     /// asserting it here means a `url` upgrade can't quietly move the goalposts.
+    ///
+    /// The fixture uses a drive-letter path rather than `/etc/passwd` because
+    /// `to_file_path` only yields a path on Windows when the first segment is a
+    /// drive letter; either host resolves the same scheme-blind conversion.
     #[test]
     fn url_to_file_path_ignores_the_scheme() {
-        let converted = Url::parse("http://localhost/etc/passwd")
+        let converted = Url::parse("http://localhost/C:/Windows")
             .expect("parse")
             .to_file_path();
         assert!(
@@ -508,6 +512,12 @@ mod tests {
     fn a_non_file_folder_uri_contributes_no_root() {
         assert_eq!(file_uri_to_path("http://localhost/"), None);
         assert_eq!(file_uri_to_path("untitled:Untitled-1"), None);
+        // On Windows the url crate turns the `..` host of a `file:` URI into a
+        // UNC path (`\\..\etc`); `refresh_roots` drops it because a bogus
+        // host can't canonicalize, and the authorization boundary refuses it
+        // (`rejects_a_uri_that_only_the_raw_fallback_could_convert`). The
+        // strict converter is `None` only where hosts can't be UNC servers.
+        #[cfg(unix)]
         assert_eq!(file_uri_to_path("file://../../etc"), None);
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         assert_eq!(
@@ -618,17 +628,17 @@ mod tests {
     }
 
     /// A `..` in the not-yet-existing tail can't be resolved against the
-    /// canonical ancestor, so it is refused rather than normalized.
+    /// canonical ancestor, so it is refused rather than normalized. Linux
+    /// `realpath` refuses the `gone/..` pair outright (`Unresolvable`); Windows
+    /// `canonicalize` collapses the pair instead and reports the climb past the
+    /// root (`OutsideWorkspace`). Either way the edit is refused, never written.
     #[test]
     fn rejects_a_new_path_that_climbs_out_with_dot_dot() {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let root = tmp.path().join("mod");
         std::fs::create_dir(&root).unwrap();
         let climbing = root.join("gone/../../escaped.yml");
-        assert_eq!(
-            editable_target(&climbing, &roots([&root])),
-            Err(EditRefusal::Unresolvable)
-        );
+        assert!(editable_target(&climbing, &roots([&root])).is_err());
     }
 
     #[test]
