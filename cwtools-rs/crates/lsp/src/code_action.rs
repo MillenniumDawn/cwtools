@@ -24,7 +24,9 @@
 //! `create_loc_key`. `create_loc_key_actions` builds a dedicated cross-file
 //! QUICKFIX for it instead, inserting a stub line into a loc file (or a new
 //! one) rather than editing the diagnostic's own document. See
-//! `resolve_loc_insert_target` for the three-tier site it picks.
+//! `resolve_loc_insert_target` for the three-tier site it picks, and
+//! `build_create_loc_key_batch` for how a batch of several missing keys
+//! shares one not-yet-existing file instead of each recreating it (#142).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -506,6 +508,209 @@ fn insert_edit_op(uri: Url, pos: Position, new_text: String) -> DocumentChangeOp
     })
 }
 
+/// One create-loc-key candidate with every language's insert site already
+/// resolved — everything `create_loc_key_actions` derives before batching.
+struct LocKeyCandidate<'d> {
+    diag: &'d Diagnostic,
+    title: String,
+    key: String,
+    targets: Vec<(Lang, LocInsertTarget)>,
+}
+
+/// The first candidate (batch order) needing a not-yet-existing loc file, per
+/// language — the one whose action gets the `CreateFile` + header. A later
+/// candidate needing the same language's new file is folded into it instead
+/// of independently re-creating the file (#142): two `NewFile` targets built
+/// from the same file-discovery snapshot both assume an empty file, and
+/// applied together would duplicate the header.
+fn new_file_owners<'a>(
+    all_targets: impl IntoIterator<Item = &'a [(Lang, LocInsertTarget)]>,
+) -> HashMap<Lang, usize> {
+    let mut owners = HashMap::new();
+    for (idx, targets) in all_targets.into_iter().enumerate() {
+        for (lang, target) in targets {
+            if matches!(target, LocInsertTarget::NewFile { .. }) {
+                owners.entry(*lang).or_insert(idx);
+            }
+        }
+    }
+    owners
+}
+
+/// One candidate's own `DocumentChangeOperation`s: a `Create` + BOM/header
+/// insert for each language it owns (per `owners`), a stub-only insert for
+/// each `NewFile` language it doesn't (folded into whoever does, by the
+/// caller), and `existing_file_ops`'s result for the two existing-file
+/// variants. `None` if any language fails to build — a partial fix across a
+/// candidate's own languages is a worse outcome than none, the same
+/// principle the single-language case always followed.
+fn candidate_operations(
+    cand: &LocKeyCandidate<'_>,
+    owners: &HashMap<Lang, usize>,
+    self_idx: usize,
+    existing_file_ops: &mut impl FnMut(&LocInsertTarget, &str) -> Option<Vec<DocumentChangeOperation>>,
+) -> Option<Vec<DocumentChangeOperation>> {
+    let stub = stub_line(&cand.key);
+    let mut operations = Vec::new();
+    for (lang, target) in &cand.targets {
+        let ops = match target {
+            LocInsertTarget::NewFile { uri } if owners.get(lang) == Some(&self_idx) => Some(vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri.clone(),
+                    options: Some(CreateFileOptions {
+                        overwrite: Some(false),
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                })),
+                insert_edit_op(
+                    uri.clone(),
+                    Position::new(0, 0),
+                    format!("\u{FEFF}l_{lang}:\n{stub}\n"),
+                ),
+            ]),
+            // Owned by another candidate in this batch: contribute only the
+            // stub line, at the same (0, 0) start the owner's header uses —
+            // LSP defines array order as the output order for edits sharing
+            // a start position, so `merge_operations` appending this after
+            // the owner's own edit is enough; no position bookkeeping needed.
+            LocInsertTarget::NewFile { uri } => Some(vec![insert_edit_op(
+                uri.clone(),
+                Position::new(0, 0),
+                format!("{stub}\n"),
+            )]),
+            other => existing_file_ops(other, &stub),
+        };
+        operations.extend(ops?);
+    }
+    Some(operations)
+}
+
+/// Fold `new_ops` into `into`. A new `Edit` for a document `into` already has
+/// an `Edit` for joins that document's existing `TextDocumentEdit.edits`
+/// array instead of adding a second operation for the same document — every
+/// edit in a `TextDocumentEdit` applies against the document's original
+/// state, and array order is the spec-defined tiebreak for edits sharing a
+/// start position, so appending here reproduces exactly "the owner's edit,
+/// then the folded one" with no assumption about the order a client applies
+/// separate operations in. Anything else (a document `into` has nothing for
+/// yet, or a `Create`, which a folded candidate never contributes) is
+/// appended as its own operation.
+fn merge_operations(
+    into: &mut Vec<DocumentChangeOperation>,
+    new_ops: Vec<DocumentChangeOperation>,
+) {
+    for new_op in new_ops {
+        let DocumentChangeOperation::Edit(new_edit) = new_op else {
+            into.push(new_op);
+            continue;
+        };
+        let existing = into.iter_mut().find_map(|op| match op {
+            DocumentChangeOperation::Edit(e)
+                if e.text_document.uri == new_edit.text_document.uri =>
+            {
+                Some(e)
+            }
+            _ => None,
+        });
+        match existing {
+            Some(e) => e.edits.extend(new_edit.edits),
+            None => into.push(DocumentChangeOperation::Edit(new_edit)),
+        }
+    }
+}
+
+/// Build one `CodeAction` per `candidates` entry that isn't folded into an
+/// earlier one, deduping `NewFile` targets via [`new_file_owners`] so a batch
+/// never offers two independent actions that would both create the same file
+/// (#142). `existing_file_ops` builds the two existing-file `LocInsertTarget`
+/// variants (needs `Backend::file_text_for` to read the current text, so
+/// it's injected — keeps this function testable without a `Backend`).
+///
+/// Folding is whole-candidate, not per-language: if any of a candidate's
+/// languages is a `NewFile` owned by an earlier one, ALL of its operations —
+/// including its other languages' existing-file edits — join that owner's
+/// action, and its diagnostic is added to the owner's `diagnostics` list.
+/// Splitting a candidate's own fix across two actions would mean applying
+/// either alone leaves it still firing, the same "worse than no fix"
+/// principle [`candidate_operations`] applies within one candidate. This
+/// relies on `NewFile`-ness being the same answer for every candidate per
+/// language — tier 3 only fires when the language has no loc file anywhere,
+/// which every candidate resolves identically — so a candidate never needs
+/// two different owners for two different languages, and the fold target is
+/// unique. If the owner's own action fails to build, every candidate folded
+/// into it is dropped too rather than promoting a new owner.
+fn build_create_loc_key_batch<'d>(
+    candidates: &[LocKeyCandidate<'d>],
+    mut existing_file_ops: impl FnMut(&LocInsertTarget, &str) -> Option<Vec<DocumentChangeOperation>>,
+) -> Vec<CodeAction> {
+    let owners = new_file_owners(candidates.iter().map(|c| c.targets.as_slice()));
+    let fold_into: Vec<Option<usize>> = candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, cand)| {
+            cand.targets.iter().find_map(|(lang, target)| {
+                if !matches!(target, LocInsertTarget::NewFile { .. }) {
+                    return None;
+                }
+                let &owner_idx = owners.get(lang)?;
+                (owner_idx != idx).then_some(owner_idx)
+            })
+        })
+        .collect();
+
+    let mut actions: Vec<CodeAction> = Vec::new();
+    let mut built_index: Vec<Option<usize>> = vec![None; candidates.len()];
+
+    for (idx, cand) in candidates.iter().enumerate() {
+        if fold_into[idx].is_some() {
+            continue;
+        }
+        let Some(operations) = candidate_operations(cand, &owners, idx, &mut existing_file_ops)
+        else {
+            continue;
+        };
+        built_index[idx] = Some(actions.len());
+        actions.push(CodeAction {
+            title: cand.title.clone(),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![cand.diag.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: None,
+                document_changes: Some(DocumentChanges::Operations(operations)),
+                change_annotations: None,
+            }),
+            ..Default::default()
+        });
+    }
+
+    for (idx, cand) in candidates.iter().enumerate() {
+        let Some(owner_idx) = fold_into[idx] else {
+            continue;
+        };
+        let Some(owner_action) = built_index[owner_idx].and_then(|pos| actions.get_mut(pos)) else {
+            continue; // the owner's own action failed to build; drop this too
+        };
+        let Some(folded_ops) = candidate_operations(cand, &owners, idx, &mut existing_file_ops)
+        else {
+            continue; // this candidate's own languages didn't all build
+        };
+        if let Some(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(ops)),
+            ..
+        }) = owner_action.edit.as_mut()
+        {
+            merge_operations(ops, folded_ops);
+        }
+        match owner_action.diagnostics.as_mut() {
+            Some(diags) => diags.push(cand.diag.clone()),
+            None => owner_action.diagnostics = Some(vec![cand.diag.clone()]),
+        }
+    }
+
+    actions
+}
+
 impl Backend {
     pub(crate) async fn code_action_impl(
         &self,
@@ -549,10 +754,12 @@ impl Backend {
 
     /// Build the "Create localisation key" action for every context diagnostic
     /// carrying a `create_loc_key` fix payload (CW100). Thin gatherer: resolves
-    /// the site with the pure functions above, and only reads locks / disk to
-    /// hand them the inputs they need. `None` per diagnostic (silently
-    /// dropped) when there's no workspace to anchor a path in, or a target
-    /// path fails to parse as a URI.
+    /// every candidate's per-language site with the pure functions above, then
+    /// hands the whole batch to [`build_create_loc_key_batch`] so two keys
+    /// that both land in the same not-yet-existing file share one header
+    /// instead of each inserting their own (#142). A candidate is silently
+    /// dropped when there's no workspace to anchor a path in, or any of its
+    /// languages fails to resolve.
     fn create_loc_key_actions(
         &self,
         uri: &Url,
@@ -598,23 +805,44 @@ impl Backend {
         let discovered =
             tokio::task::block_in_place(|| LocService::discover_files(&[workspace_root.as_path()]));
 
-        candidates
+        // Resolve every candidate's per-language target up front so the whole
+        // batch is visible to `build_create_loc_key_batch` before any
+        // operation is built.
+        let loc_locations = self.state.loc_locations.read();
+        let resolved: Vec<LocKeyCandidate<'_>> = candidates
             .into_iter()
             .filter_map(|(diag, title, key)| {
-                self.build_create_loc_key_action(
-                    uri,
+                let siblings = self.sibling_loc_keys_for_diagnostic(uri, diag, &key);
+                let targets = langs
+                    .iter()
+                    .map(|&lang| {
+                        resolve_loc_insert_target(
+                            lang,
+                            &siblings,
+                            &loc_locations,
+                            &edit_roots,
+                            &discovered,
+                            &workspace_root,
+                        )
+                        .map(|target| (lang, target))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(LocKeyCandidate {
                     diag,
-                    &title,
-                    &key,
-                    &langs,
-                    &discovered,
-                    &workspace_root,
-                    &edit_roots,
-                    encoding,
-                )
+                    title,
+                    key,
+                    targets,
+                })
             })
-            .map(CodeActionOrCommand::CodeAction)
-            .collect()
+            .collect();
+        drop(loc_locations);
+
+        build_create_loc_key_batch(&resolved, |target, stub| {
+            self.loc_insert_operations(target, stub, encoding)
+        })
+        .into_iter()
+        .map(CodeActionOrCommand::CodeAction)
+        .collect()
     }
 
     /// The other required, name-derived loc keys the diagnostic's own instance
@@ -656,89 +884,32 @@ impl Backend {
             .unwrap_or_default()
     }
 
-    /// Build one `CodeAction` inserting `create_loc_key`'s stub line for every
-    /// language in `langs`. `None` when any language's target can't be
-    /// resolved or its file's text can't be read — offering a partial fix
-    /// (some languages stubbed, some not) would be a worse outcome than none.
-    #[allow(clippy::too_many_arguments)]
-    fn build_create_loc_key_action(
-        &self,
-        uri: &Url,
-        diag: &Diagnostic,
-        title: &str,
-        create_loc_key: &str,
-        langs: &[Lang],
-        discovered: &[PathBuf],
-        workspace_root: &Path,
-        edit_roots: &[PathBuf],
-        encoding: &PositionEncodingKind,
-    ) -> Option<CodeAction> {
-        let siblings = self.sibling_loc_keys_for_diagnostic(uri, diag, create_loc_key);
-        let loc_locations = self.state.loc_locations.read();
-        let stub = stub_line(create_loc_key);
-        let mut operations = Vec::new();
-        for &lang in langs {
-            let target = resolve_loc_insert_target(
-                lang,
-                &siblings,
-                &loc_locations,
-                edit_roots,
-                discovered,
-                workspace_root,
-            )?;
-            operations.extend(self.loc_insert_operations(target, &stub, lang, encoding)?);
-        }
-        drop(loc_locations);
-        Some(CodeAction {
-            title: title.to_string(),
-            kind: Some(CodeActionKind::QUICKFIX),
-            diagnostics: Some(vec![diag.clone()]),
-            edit: Some(WorkspaceEdit {
-                changes: None,
-                document_changes: Some(DocumentChanges::Operations(operations)),
-                change_annotations: None,
-            }),
-            ..Default::default()
-        })
-    }
-
-    /// The one or two `DocumentChangeOperation`s (`Create` + `Edit`, or just
-    /// `Edit`) that realize `target`. Reads the target file's current text via
-    /// `file_text_for` (open-doc buffer or disk) for the two existing-file
-    /// variants; `NewFile` needs no read since the content is built whole.
+    /// The `Edit` operations for the two existing-file `LocInsertTarget`
+    /// variants: reads the target's current text via `file_text_for`
+    /// (open-doc buffer or disk) to find the insertion point. `NewFile` is
+    /// `None` here — `build_create_loc_key_batch` builds and dedupes it
+    /// directly instead, since it needs no file read and several candidates
+    /// in a batch can share one (#142).
     fn loc_insert_operations(
         &self,
-        target: LocInsertTarget,
+        target: &LocInsertTarget,
         stub: &str,
-        lang: Lang,
         encoding: &PositionEncodingKind,
     ) -> Option<Vec<DocumentChangeOperation>> {
         match target {
             LocInsertTarget::ExistingFileAfterLine { uri, after_line0 } => {
                 let text = self.file_text_for(uri.as_str())?;
-                let (pos, insert_text) = insert_stub_after_line(&text, after_line0, stub, encoding);
-                Some(vec![insert_edit_op(uri, pos, insert_text)])
+                let (pos, insert_text) =
+                    insert_stub_after_line(&text, *after_line0, stub, encoding);
+                Some(vec![insert_edit_op(uri.clone(), pos, insert_text)])
             }
             LocInsertTarget::ExistingFileAppend { uri } => {
                 let text = self.file_text_for(uri.as_str())?;
                 let last_line0 = text.lines().count().saturating_sub(1) as u32;
                 let (pos, insert_text) = insert_stub_after_line(&text, last_line0, stub, encoding);
-                Some(vec![insert_edit_op(uri, pos, insert_text)])
+                Some(vec![insert_edit_op(uri.clone(), pos, insert_text)])
             }
-            LocInsertTarget::NewFile { uri } => {
-                let content = format!("\u{FEFF}l_{lang}:\n{stub}\n");
-                Some(vec![
-                    DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
-                        uri: uri.clone(),
-                        options: Some(CreateFileOptions {
-                            overwrite: Some(false),
-                            ignore_if_exists: Some(true),
-                        }),
-                        annotation_id: None,
-                    })),
-                    insert_edit_op(uri, Position::new(0, 0), content),
-                ])
-            }
+            LocInsertTarget::NewFile { .. } => None,
         }
     }
 }
@@ -1501,15 +1672,16 @@ mod tests {
 
     #[test]
     fn resolve_loc_insert_target_resolves_independently_per_language() {
-        // `build_create_loc_key_action` resolves one target per configured
-        // language and requires every one of them to succeed (`?` inside its
-        // loop) before it commits to an action. This pins the pure
-        // per-language piece that loop depends on: English has a sibling
-        // site, French has none of the first two tiers and falls through to
-        // NewFile. The Backend-level all-or-nothing short-circuit itself
-        // needs a running Backend (`file_text_for`, config locks) to exercise
-        // — not covered here; the CreateFile-tier integration test covers the
-        // NewFile branch end to end for a single language instead.
+        // `create_loc_key_actions` resolves one target per configured
+        // language and requires every one of them to succeed (`collect::<Option<_>>`
+        // over its per-language map) before a candidate joins the batch. This
+        // pins the pure per-language piece that resolution depends on:
+        // English has a sibling site, French has none of the first two tiers
+        // and falls through to NewFile. The Backend-level all-or-nothing
+        // short-circuit itself needs a running Backend (`file_text_for`,
+        // config locks) to exercise — not covered here; the CreateFile-tier
+        // integration test covers the NewFile branch end to end for a single
+        // language instead.
         let ws = tempfile::tempdir().unwrap();
         let roots = edit_roots([ws.path()]);
         let (_, uri) = write_loc_file(ws.path(), "localisation/things_l_english.yml");
@@ -1613,6 +1785,265 @@ mod tests {
                 ws.path(),
             ),
             None
+        );
+    }
+
+    // ── Batch dedup (#142): pure-function coverage ─────────────────────────────
+
+    #[test]
+    fn new_file_owners_assigns_the_first_candidate_per_language() {
+        let en_uri: Url = "file:///ws/localisation/cwtools_generated_l_english.yml"
+            .parse()
+            .unwrap();
+        let fr_uri: Url = "file:///ws/localisation/cwtools_generated_l_french.yml"
+            .parse()
+            .unwrap();
+        let targets = [
+            vec![(Lang::English, LocInsertTarget::NewFile { uri: en_uri })],
+            vec![
+                (
+                    Lang::English,
+                    LocInsertTarget::NewFile {
+                        uri: "file:///ws/localisation/cwtools_generated_l_english.yml"
+                            .parse()
+                            .unwrap(),
+                    },
+                ),
+                (Lang::French, LocInsertTarget::NewFile { uri: fr_uri }),
+            ],
+        ];
+        let owners = new_file_owners(targets.iter().map(Vec::as_slice));
+        assert_eq!(
+            owners.get(&Lang::English),
+            Some(&0),
+            "the first candidate claims english"
+        );
+        assert_eq!(
+            owners.get(&Lang::French),
+            Some(&1),
+            "only the second candidate needs french at all"
+        );
+    }
+
+    /// The `newText` of every `TextEdit` a `DocumentChangeOperation::Edit`
+    /// targeting `uri` carries, in array order — for edits that share a start
+    /// position (as every insert this module builds does), LSP defines array
+    /// order as the order they appear in the resulting text, so concatenating
+    /// them reproduces exactly what a client applying the edit would see.
+    fn edit_texts<'a>(ops: &'a [DocumentChangeOperation], uri: &Url) -> Vec<&'a str> {
+        ops.iter()
+            .filter_map(|op| match op {
+                DocumentChangeOperation::Edit(e) if &e.text_document.uri == uri => Some(e),
+                _ => None,
+            })
+            .flat_map(|e| &e.edits)
+            .filter_map(|c| match c {
+                OneOf::Left(t) => Some(t.new_text.as_str()),
+                OneOf::Right(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_create_loc_key_batch_dedupes_a_shared_new_file() {
+        // #142: two candidates resolving to the identical not-yet-existing
+        // `NewFile` target in one batch must not each carry their own
+        // `CreateFile` + header — the merged action must open the file once,
+        // with both stubs.
+        let uri: Url = "file:///ws/localisation/cwtools_generated_l_english.yml"
+            .parse()
+            .unwrap();
+        let diag_a = create_loc_key_diag();
+        let diag_b = create_loc_key_diag();
+        let candidates = vec![
+            LocKeyCandidate {
+                diag: &diag_a,
+                title: "Create localisation key my_thing_desc".to_string(),
+                key: "my_thing_desc".to_string(),
+                targets: vec![(Lang::English, LocInsertTarget::NewFile { uri: uri.clone() })],
+            },
+            LocKeyCandidate {
+                diag: &diag_b,
+                title: "Create localisation key my_thing_title".to_string(),
+                key: "my_thing_title".to_string(),
+                targets: vec![(Lang::English, LocInsertTarget::NewFile { uri: uri.clone() })],
+            },
+        ];
+
+        let actions = build_create_loc_key_batch(&candidates, |_, _| {
+            panic!("no existing-file target in this batch")
+        });
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "the second candidate must join the first's action, not get its own"
+        );
+        assert_eq!(
+            actions[0].diagnostics.as_ref().map(Vec::len),
+            Some(2),
+            "both diagnostics must be attributed to the merged action"
+        );
+
+        let Some(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(ops)),
+            ..
+        }) = &actions[0].edit
+        else {
+            panic!("expected document_changes operations");
+        };
+        assert_eq!(
+            ops.len(),
+            2,
+            "one Create plus a SINGLE TextDocumentEdit for the file, not one per key: {ops:?}"
+        );
+        assert!(matches!(
+            ops[0],
+            DocumentChangeOperation::Op(ResourceOp::Create(_))
+        ));
+
+        let texts = edit_texts(ops, &uri);
+        assert_eq!(
+            texts.len(),
+            2,
+            "the header edit and the folded stub, as two edits in one TextDocumentEdit: {texts:?}"
+        );
+        let combined = texts.concat();
+        assert_eq!(
+            combined.matches("l_english:").count(),
+            1,
+            "the header must appear exactly once: {combined:?}"
+        );
+        assert!(combined.contains(" my_thing_desc:0 "), "got: {combined:?}");
+        assert!(combined.contains(" my_thing_title:0 "), "got: {combined:?}");
+    }
+
+    #[test]
+    fn build_create_loc_key_batch_folds_a_whole_candidate_across_mixed_tiers() {
+        // #142 follow-up: English already has a loc file but French does
+        // not, so every candidate resolves English to an existing-file
+        // insert and French to the identical not-yet-existing file. A
+        // candidate whose French half folds into another's action must not
+        // keep an independent action for its English half — that would
+        // split its own fix across two actions, and applying only one would
+        // leave its diagnostic still firing.
+        let en_uri: Url = "file:///ws/localisation/things_l_english.yml"
+            .parse()
+            .unwrap();
+        let fr_uri: Url = "file:///ws/localisation/cwtools_generated_l_french.yml"
+            .parse()
+            .unwrap();
+        let diag_a = create_loc_key_diag();
+        let diag_b = create_loc_key_diag();
+        let candidates = vec![
+            LocKeyCandidate {
+                diag: &diag_a,
+                title: "Create localisation key my_thing_desc".to_string(),
+                key: "my_thing_desc".to_string(),
+                targets: vec![
+                    (
+                        Lang::English,
+                        LocInsertTarget::ExistingFileAppend {
+                            uri: en_uri.clone(),
+                        },
+                    ),
+                    (
+                        Lang::French,
+                        LocInsertTarget::NewFile {
+                            uri: fr_uri.clone(),
+                        },
+                    ),
+                ],
+            },
+            LocKeyCandidate {
+                diag: &diag_b,
+                title: "Create localisation key my_thing_title".to_string(),
+                key: "my_thing_title".to_string(),
+                targets: vec![
+                    (
+                        Lang::English,
+                        LocInsertTarget::ExistingFileAppend {
+                            uri: en_uri.clone(),
+                        },
+                    ),
+                    (
+                        Lang::French,
+                        LocInsertTarget::NewFile {
+                            uri: fr_uri.clone(),
+                        },
+                    ),
+                ],
+            },
+        ];
+
+        let actions = build_create_loc_key_batch(&candidates, |target, stub| {
+            let LocInsertTarget::ExistingFileAppend { uri } = target else {
+                panic!("no other existing-file target in this batch: {target:?}");
+            };
+            Some(vec![insert_edit_op(
+                uri.clone(),
+                Position::new(3, 0),
+                format!("{stub}\n"),
+            )])
+        });
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "the second candidate's whole fix must fold into the first's action, \
+             not split across two: got {} actions",
+            actions.len()
+        );
+        assert_eq!(
+            actions[0].diagnostics.as_ref().map(Vec::len),
+            Some(2),
+            "both diagnostics must be attributed to the merged action"
+        );
+
+        let Some(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(ops)),
+            ..
+        }) = &actions[0].edit
+        else {
+            panic!("expected document_changes operations");
+        };
+        let creates = ops
+            .iter()
+            .filter(|op| matches!(op, DocumentChangeOperation::Op(ResourceOp::Create(_))))
+            .count();
+        assert_eq!(
+            creates, 1,
+            "exactly one Create for the shared file: {ops:?}"
+        );
+
+        let en_texts = edit_texts(ops, &en_uri);
+        assert_eq!(
+            en_texts.len(),
+            2,
+            "both candidates' English edits must land in the merged action: {ops:?}"
+        );
+        assert!(en_texts.iter().any(|t| t.contains(" my_thing_desc:0 ")));
+        assert!(en_texts.iter().any(|t| t.contains(" my_thing_title:0 ")));
+
+        let fr_texts = edit_texts(ops, &fr_uri);
+        assert_eq!(
+            fr_texts.len(),
+            2,
+            "the header edit and the folded stub, as two edits in one TextDocumentEdit: {fr_texts:?}"
+        );
+        let fr_combined = fr_texts.concat();
+        assert_eq!(
+            fr_combined.matches("l_french:").count(),
+            1,
+            "the French header must appear exactly once: {fr_combined:?}"
+        );
+        assert!(
+            fr_combined.contains(" my_thing_desc:0 "),
+            "got: {fr_combined:?}"
+        );
+        assert!(
+            fr_combined.contains(" my_thing_title:0 "),
+            "got: {fr_combined:?}"
         );
     }
 

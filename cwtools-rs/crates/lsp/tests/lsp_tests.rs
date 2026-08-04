@@ -8931,6 +8931,336 @@ thing = { x = scalar }
 }
 
 #[test]
+fn test_create_loc_key_code_action_batch_dedupes_a_shared_new_file() {
+    // #142: `name` and `desc` are BOTH missing (unlike the two tests above,
+    // where one sibling already has a definition), and no loc file for the
+    // language exists anywhere the edit boundary would accept — so both
+    // diagnostics resolve to the identical generated `NewFile` target. One
+    // codeAction request returning both diagnostics at once (an "instance
+    // missing both title and desc" batch, no diagnostics round trip between
+    // them) must not offer two independent actions that would each insert
+    // their own BOM + header: applying the response must produce the header
+    // exactly once, with both stubs.
+    const RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        localisation = {
+            ## required
+            name = "$"
+            ## required
+            desc = "$_desc"
+        }
+    }
+}
+thing = { x = scalar }
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/things/test.txt";
+    let text = "my_thing = { x = yes }\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    // An unrelated vanilla key only: the merged loc index is non-empty (CW100's
+    // gate) but neither `my_thing` nor `my_thing_desc` resolves anywhere.
+    let vanilla_loc_path = vanilla.path().join("localisation/other_l_english.yml");
+    std::fs::create_dir_all(vanilla_loc_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &vanilla_loc_path,
+        "l_english:\n unrelated_key:0 \"Unrelated\"\n",
+    )
+    .unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    let diagnostics = wait_for_diags(&mut reader, rel_path).expect("diagnostics for the document");
+    let cw100: Vec<serde_json::Value> = diagnostics
+        .into_iter()
+        .filter(|d| d["code"] == "CW100")
+        .collect();
+    assert_eq!(
+        cw100.len(),
+        2,
+        "both name and desc must be missing: {cw100:#?}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 1, "character": 0 },
+                },
+                "context": { "diagnostics": cw100, "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let resp_str = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    let actions = resp["result"].as_array().expect("array result");
+    assert_eq!(
+        actions.len(),
+        1,
+        "the second key must be absorbed into the first's action, not offered \
+         as a second independent NewFile action: {resp_str}"
+    );
+
+    let ops = actions[0]["edit"]["documentChanges"]
+        .as_array()
+        .expect("documentChanges carries the cross-file edit");
+    assert_eq!(
+        ops.len(),
+        2,
+        "one Create plus a SINGLE TextDocumentEdit for the file, not one per key: {resp_str}"
+    );
+    assert_eq!(ops[0]["kind"], "create");
+
+    // Both inserts share the (0,0) start position within the one
+    // TextDocumentEdit: per the LSP spec, array order (not sequential
+    // mutation) decides the order they appear in the resulting text, so
+    // concatenating `newText` in array order reproduces what a client
+    // applying this edit would see.
+    let edits = ops[1]["edits"].as_array().expect("edits array");
+    assert_eq!(
+        edits.len(),
+        2,
+        "the header edit and the folded stub, as two edits in one TextDocumentEdit: {resp_str}"
+    );
+    let applied: String = edits
+        .iter()
+        .map(|e| e["newText"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        applied.matches("l_english:").count(),
+        1,
+        "the header must appear exactly once: {applied:?}"
+    );
+    assert!(applied.contains(" my_thing:0 "), "got: {applied:?}");
+    assert!(applied.contains(" my_thing_desc:0 "), "got: {applied:?}");
+}
+
+#[test]
+fn test_create_loc_key_code_action_reresolves_once_the_new_file_exists() {
+    // Step 4 of #142: the SAFE one-at-a-time flow. Applying the first action
+    // creates the generated file; a FRESH codeAction request afterward (a
+    // real diagnostics round trip, unlike the in-batch case above) must
+    // resolve via `ExistingFileAppend`, not `NewFile` again — no second
+    // header, even for the exact same diagnostic re-requested.
+    const RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        localisation = {
+            ## required
+            name = "$"
+            ## required
+            desc = "$_desc"
+        }
+    }
+}
+thing = { x = scalar }
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/things/test.txt";
+    let text = "my_thing = { x = yes }\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let vanilla_loc_path = vanilla.path().join("localisation/things_l_english.yml");
+    std::fs::create_dir_all(vanilla_loc_path.parent().unwrap()).unwrap();
+    std::fs::write(&vanilla_loc_path, "l_english:\n my_thing:0 \"My Thing\"\n").unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW100")
+        .expect("CW100 diagnostic published for my_thing_desc");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag.clone()], "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let first_resp_str = read_response(&mut reader).expect("no codeAction response");
+    let first_resp: serde_json::Value = serde_json::from_str(&first_resp_str).unwrap();
+    let first_actions = first_resp["result"].as_array().expect("array result");
+    assert_eq!(first_actions.len(), 1);
+    let first_ops = first_actions[0]["edit"]["documentChanges"]
+        .as_array()
+        .expect("documentChanges");
+    assert_eq!(
+        first_ops.len(),
+        2,
+        "Create + header insert: {first_resp_str}"
+    );
+    let generated_uri = first_ops[0]["uri"]
+        .as_str()
+        .expect("create uri")
+        .to_string();
+    let generated_new_text = first_ops[1]["edits"][0]["newText"]
+        .as_str()
+        .expect("insert text")
+        .to_string();
+
+    // Simulate the client applying that first action: write the file exactly
+    // as the edit describes.
+    let generated_path = tower_lsp::lsp_types::Url::parse(&generated_uri)
+        .unwrap()
+        .to_file_path()
+        .unwrap();
+    std::fs::create_dir_all(generated_path.parent().unwrap()).unwrap();
+    std::fs::write(&generated_path, &generated_new_text).unwrap();
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            3,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag], "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let second_resp_str = read_response(&mut reader).expect("no second codeAction response");
+    child.kill().ok();
+
+    let second_resp: serde_json::Value = serde_json::from_str(&second_resp_str).unwrap();
+    let second_actions = second_resp["result"].as_array().expect("array result");
+    assert_eq!(second_actions.len(), 1);
+    let second_ops = second_actions[0]["edit"]["documentChanges"]
+        .as_array()
+        .expect("documentChanges");
+    assert_eq!(
+        second_ops.len(),
+        1,
+        "the file exists now, so no Create op and no second header: {second_resp_str}"
+    );
+    let second_edit = &second_ops[0]["edits"][0];
+    assert!(
+        !second_edit["newText"]
+            .as_str()
+            .unwrap()
+            .contains("l_english:"),
+        "re-resolving after the file exists must not re-emit the header: {second_resp_str}"
+    );
+}
+
+#[test]
 fn test_fix_all_workspace_applies_every_fixable_diagnostic() {
     // Two empty `limit = { }` blocks -> two CW281 diagnostics, each carrying a
     // fix. `fixAllWorkspace` must send one `workspace/applyEdit` covering both,
