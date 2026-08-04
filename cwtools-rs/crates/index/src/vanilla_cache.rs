@@ -64,7 +64,11 @@ const FILE_EXT: &str = ".cwv";
 // exact case against base-game files too. v9 caches, whose paths were
 // lowercased, must rebuild or a case-sensitive run would flag every vanilla
 // reference.
-const CACHE_VERSION: u8 = 10;
+// v11 adds `CachedInstance.p`, the explicit-field primary loc key (e.g. an
+// event's `title`), so cached-path hover shows the same localised title as a
+// live vanilla scan instead of falling back to a name-derived key. v10 caches
+// lack it and restore it as `None` (#141).
+const CACHE_VERSION: u8 = 11;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CachedInstance {
@@ -82,6 +86,8 @@ struct CachedInstance {
     el: u32,
     /// end column
     ec: u16,
+    /// explicit-field primary loc key (e.g. an event's `title`), if any
+    p: Option<String>,
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -355,6 +361,7 @@ pub fn save(
                 c: inst.location.col,
                 el: inst.location.end.0,
                 ec: inst.location.end.1,
+                p: inst.primary_loc_key.clone(),
             })
         })
         .collect();
@@ -382,6 +389,7 @@ pub fn save_per_type(
                 c: inst.location.col,
                 el: inst.location.end.0,
                 ec: inst.location.end.1,
+                p: inst.primary_loc_key.clone(),
             })
         })
         .collect();
@@ -425,9 +433,7 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
                     col: ci.c,
                     end: (ci.el, ci.ec),
                 },
-                // The vanilla cache doesn't store primary loc keys; hover for
-                // vanilla instances falls back to name-derived keys.
-                primary_loc_key: None,
+                primary_loc_key: ci.p,
             },
         ));
     }
@@ -527,7 +533,7 @@ mod tests {
                         col: 1,
                         end: (4, 1),
                     },
-                    primary_loc_key: None,
+                    primary_loc_key: Some("GFX_A_TITLE".into()),
                 },
                 TypeInstance {
                     name: "GFX_b".into(),
@@ -575,6 +581,17 @@ mod tests {
         assert_eq!((a.line, a.col, a.end), (2, 1, (4, 1)));
         let b = by_name("GFX_b");
         assert_eq!((b.line, b.col, b.end), (5, 3, (9, 4)));
+        // Explicit-field primary loc key survives the round trip (#141); an
+        // instance with none stays None rather than picking up a stray value.
+        let primary_loc_key = |n: &str| {
+            sprite
+                .iter()
+                .find(|(_, i)| i.name.as_str() == n)
+                .map(|(_, i)| i.primary_loc_key.clone())
+                .unwrap()
+        };
+        assert_eq!(primary_loc_key("GFX_a"), Some("GFX_A_TITLE".to_string()));
+        assert_eq!(primary_loc_key("GFX_b"), None);
         assert_eq!(loaded.loc_keys.len(), 1);
         assert_eq!(loaded.loc_keys[0].0, "english");
         assert_eq!(loaded.file_paths, vec!["gfx/interface/icon.dds"]);
