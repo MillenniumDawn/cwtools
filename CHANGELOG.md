@@ -30,6 +30,7 @@
 ## Improvements
 
 - `ScopeRegistry`'s name, scope and link maps now use `FxHashMap` rather than SipHash. Against HOI4 config b5779a1, an `owner` scope transition drops from 79.2ns to 50.4ns (-36%) and registry construction from 25.3µs to 16.1µs (-36%). (#152)
+- CW246's checked `value[variable]` read no longer pays a linear scan of the config's builtin variable list (~480 entries for HOI4) plus an allocation on every read: the builtin list is now a lowercased lookup set built once when the ruleset loads, and the loop-variable check normalizes into a reusable buffer instead of allocating a `String` per call. Against a HOI4-sized synthetic builtin list, 800 checked reads drop from 3.15ms to 189µs (-94%). Diagnostics are unchanged; on the Kaiserreich corpus, where this is one check among many per leaf, `cwtools validate` itself runs about 3% faster (0.774s to 0.753s, minimum of interleaved runs). (#135)
 - **In progress, engine v2.4.0:** remove redundant indexing and path normalization
   work (#86).
   Fuse type/subtype collection, reuse indexed instances for CW100, cache

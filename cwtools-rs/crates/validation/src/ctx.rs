@@ -66,9 +66,17 @@ impl ValidationCtx<'_> {
     }
 
     /// Whether `name`, normalized the same way the variable index is, currently
-    /// names a loop-local variable in scope.
+    /// names a loop-local variable in scope. Normalizes into a reusable
+    /// thread-local buffer (like `VarIndex::contains`) instead of allocating a
+    /// fresh `String` on every checked variable read.
     pub(crate) fn is_loop_var(&self, name: &str) -> bool {
-        let norm = cwtools_index::VarIndex::normalize(name);
-        self.loop_vars.borrow().contains(&norm)
+        thread_local! {
+            static NORM_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        NORM_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            cwtools_index::VarIndex::normalize_into(name, &mut buf);
+            self.loop_vars.borrow().iter().any(|v| v == buf.as_str())
+        })
     }
 }
