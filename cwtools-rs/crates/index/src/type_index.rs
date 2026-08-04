@@ -347,15 +347,18 @@ pub struct TypeIndex {
     /// country_event). The refcount lets `remove_file` drop a name only when its
     /// last definition in that type goes.
     instance_sets: FxHashMap<String, FxHashMap<Arc<str>, usize>>,
-    /// file_uri → the set of `map` bucket keys (type names) that file contributes
-    /// instances to. Lets [`remove_file`](Self::remove_file) visit only the
-    /// buckets the file actually touched (O(the file's own entries)) instead of
-    /// scanning every bucket of `self.map` (O(total instances)). Kept in sync by
-    /// every insertion (`merge`, `merge_with_uris`) and removal (`remove_file`,
-    /// `remove_files`) path. Not serialized: the vanilla cache reloads through
-    /// `merge_with_uris`, which rebuilds this map (same as `name_counts` /
-    /// `instance_sets`).
-    file_buckets: FxHashMap<Arc<str>, FxHashSet<String>>,
+    /// file_uri → type_name → this file's own positions within `map[type_name]`.
+    /// Lets [`instances_in_file`](Self::instances_in_file) and
+    /// [`remove_file`](Self::remove_file) both cost O(the file's own entries)
+    /// instead of scanning a type's whole instance vec looking for this file's
+    /// matches. `remove_file` drops entries via `swap_remove`, which relocates
+    /// the vec's last element into the freed slot, so every swap repairs the
+    /// position recorded for whichever other file owned that relocated entry
+    /// (see `swap_remove_instance`). Kept in sync by every insertion (`merge`,
+    /// `merge_with_uris`) and removal (`remove_file`, `remove_files`) path. Not
+    /// serialized: the vanilla cache reloads through `merge_with_uris`, which
+    /// rebuilds this map (same as `name_counts` / `instance_sets`).
+    file_positions: FxHashMap<Arc<str>, FxHashMap<String, Vec<usize>>>,
     /// Index of every asset/file path under the game roots, for `filepath`
     /// reference checks (CW113). Empty unless the CLI populated it.
     pub file_index: FileIndex,
@@ -460,17 +463,18 @@ impl TypeIndex {
     }
 
     /// Every `(type_name, instance)` defined in `file_uri`. Used by
-    /// document-symbol/outline, which is on-demand and infrequent. Lets
-    /// `FileInfo` avoid a second per-file copy. Visits only the buckets the
-    /// reverse map (`file_buckets`) records for this file, so the cost is
-    /// proportional to the file's own entries rather than the whole index
-    /// (same narrowing as `remove_file`).
+    /// document-symbol/outline, which is on-demand and infrequent, and by the
+    /// per-file CW100/unused-instance validation passes, which run on every
+    /// file every time. Reads straight off the reverse map (`file_positions`),
+    /// so the cost is proportional to the file's own entries rather than the
+    /// whole index, even for a type with thousands of instances spread across
+    /// many other files (same narrowing as `remove_file`).
     pub fn instances_in_file<'a>(&'a self, file_uri: &str) -> Vec<(&'a str, &'a TypeInstance)> {
-        let Some(type_names) = self.file_buckets.get(file_uri) else {
+        let Some(type_positions) = self.file_positions.get(file_uri) else {
             return Vec::new();
         };
-        let mut out = Vec::new();
-        for type_name in type_names {
+        let mut out = Vec::with_capacity(type_positions.values().map(Vec::len).sum());
+        for (type_name, positions) in type_positions {
             // Skip subtype-qualified membership keys: the instance already
             // appears under its base `type`, so listing it again would duplicate
             // the outline / document-symbol entry.
@@ -480,10 +484,9 @@ impl TypeIndex {
             let Some(entries) = self.map.get(type_name.as_str()) else {
                 continue;
             };
-            for (uri, inst) in entries {
-                if uri.as_ref() == file_uri {
-                    out.push((type_name.as_str(), inst));
-                }
+            for &pos in positions {
+                let (_, inst) = &entries[pos];
+                out.push((type_name.as_str(), inst));
             }
         }
         out
@@ -502,14 +505,14 @@ impl TypeIndex {
         let uri: Arc<str> = Arc::from(file_uri);
         for (type_name, instances) in per_type {
             let subtype_key = is_subtype_key(&type_name);
-            // All of this file's instances share the one `uri`, so a single
-            // reverse-map insert per type covers them.
-            self.file_buckets
+            let set = self.instance_sets.entry(type_name.clone()).or_default();
+            let entry = self.map.entry(type_name.clone()).or_default();
+            let positions = self
+                .file_positions
                 .entry(Arc::clone(&uri))
                 .or_default()
-                .insert(type_name.clone());
-            let set = self.instance_sets.entry(type_name.clone()).or_default();
-            let entry = self.map.entry(type_name).or_default();
+                .entry(type_name)
+                .or_default();
             for inst in instances {
                 let lower = Arc::<str>::from(inst.name.to_ascii_lowercase());
                 let lower = if subtype_key {
@@ -528,6 +531,7 @@ impl TypeIndex {
                     }
                 };
                 *set.entry(lower).or_insert(0) += 1;
+                positions.push(entry.len());
                 entry.push((Arc::clone(&uri), inst));
             }
         }
@@ -566,9 +570,13 @@ impl TypeIndex {
                 *set.entry(lower).or_insert(0) += 1;
                 // Each instance can come from a different file, so key on its own
                 // uri; clone the type name only the first time it's seen per uri.
-                let bucket = self.file_buckets.entry(Arc::clone(&uri)).or_default();
-                if !bucket.contains(type_name.as_str()) {
-                    bucket.insert(type_name.clone());
+                let pos = entry.len();
+                let type_positions = self.file_positions.entry(Arc::clone(&uri)).or_default();
+                match type_positions.get_mut(type_name.as_str()) {
+                    Some(positions) => positions.push(pos),
+                    None => {
+                        type_positions.insert(type_name.clone(), vec![pos]);
+                    }
                 }
                 entry.push((uri, inst));
             }
@@ -577,10 +585,11 @@ impl TypeIndex {
 
     /// Remove every instance contributed by any file in `file_uris`, in a single
     /// pass over the index. Use this to drop a large multi-file contribution (the
-    /// whole vanilla index) at once: [`remove_file`](Self::remove_file) re-scans
-    /// the map on every call, so removing thousands of files one at a time would
-    /// be quadratic. Only touches the type instances; the dynamic-value indexes
-    /// are keyed separately and untouched.
+    /// whole vanilla index) at once: a plain linear pass over every bucket beats
+    /// calling [`remove_file`](Self::remove_file) once per file, whose per-file
+    /// bookkeeping overhead adds up across thousands of files even though each
+    /// individual call is cheap. Only touches the type instances; the
+    /// dynamic-value indexes are keyed separately and untouched.
     pub fn remove_files(&mut self, file_uris: &HashSet<Arc<str>>) {
         if file_uris.is_empty() {
             return;
@@ -603,51 +612,94 @@ impl TypeIndex {
         }
         self.map.retain(|_, v| !v.is_empty());
         self.instance_sets.retain(|_, names| !names.is_empty());
-        // Surviving files' buckets are untouched, so dropping just the removed
-        // files' entries keeps the reverse map a faithful inverse of `map`.
-        for uri in file_uris {
-            self.file_buckets.remove(uri);
+        // `retain` shifted every surviving entry's position within its type's
+        // vec, so `file_positions` (which records those positions) can't be
+        // patched incrementally; rebuild it wholesale. Still O(total surviving
+        // instances), matching the rest of this bulk pass.
+        self.file_positions.clear();
+        for (type_name, entries) in &self.map {
+            for (i, (uri, _)) in entries.iter().enumerate() {
+                self.file_positions
+                    .entry(Arc::clone(uri))
+                    .or_default()
+                    .entry(type_name.clone())
+                    .or_default()
+                    .push(i);
+            }
         }
     }
 
     /// Remove all instances contributed by `file_uri`.
     ///
-    /// Visits only the `map` buckets the reverse map (`file_buckets`) records for
-    /// this file, so the cost is proportional to the file's own entries rather
-    /// than the whole index. A bucket empties only when its last contributor is
-    /// removed, and that contributor always has the bucket in its `file_buckets`
-    /// set, so every emptied bucket is still visited and pruned here.
+    /// Drops each of the file's own entries from `map` via `swap_remove`
+    /// (constant time), guided by the positions the reverse map
+    /// (`file_positions`) recorded for this file, so the cost is proportional to
+    /// the file's own entries rather than the type's whole instance vec. A
+    /// bucket empties only when its last contributor is removed, and that
+    /// contributor always has the bucket in its `file_positions` entry, so every
+    /// emptied bucket is still visited and pruned here.
     pub fn remove_file(&mut self, file_uri: &str) {
         self.complex_enum_values.remove_file(file_uri);
         self.value_set_values.remove_file(file_uri);
         // No entry means the file contributed no type instances.
-        let Some(buckets) = self.file_buckets.remove(file_uri) else {
+        let Some(type_positions) = self.file_positions.remove(file_uri) else {
             return;
         };
-        for type_name in &buckets {
+        for (type_name, mut positions) in type_positions {
             // Subtype-qualified keys never contributed to `name_counts` (see
             // `merge`), so they must not decrement it here.
-            let subtype_key = is_subtype_key(type_name);
-            let Some(v) = self.map.get_mut(type_name) else {
-                continue;
-            };
-            v.retain(|(uri, inst)| {
-                let keep = uri.as_ref() != file_uri;
-                if !keep {
-                    let lower = inst.name.to_ascii_lowercase();
-                    if !subtype_key {
-                        dec_ref(&mut self.name_counts, lower.as_str());
-                    }
-                    if let Some(set) = self.instance_sets.get_mut(type_name) {
-                        dec_ref(set, lower.as_str());
-                    }
+            let subtype_key = is_subtype_key(&type_name);
+            // Largest index first: each `swap_remove` only ever displaces the
+            // vec's current last element, whose index is always >= every
+            // position still queued for this file (they're all distinct indices
+            // into the same original vec), so earlier removals never invalidate
+            // a later one in this loop.
+            positions.sort_unstable_by(|a, b| b.cmp(a));
+            for index in positions {
+                let Some(v) = self.map.get(type_name.as_str()) else {
+                    continue;
+                };
+                let lower = v[index].1.name.to_ascii_lowercase();
+                if !subtype_key {
+                    dec_ref(&mut self.name_counts, lower.as_str());
                 }
-                keep
-            });
-            if v.is_empty() {
-                self.map.remove(type_name);
-                self.instance_sets.remove(type_name);
+                if let Some(set) = self.instance_sets.get_mut(&type_name) {
+                    dec_ref(set, lower.as_str());
+                }
+                self.swap_remove_instance(&type_name, index);
             }
+            if self.map.get(type_name.as_str()).is_some_and(Vec::is_empty) {
+                self.map.remove(&type_name);
+                self.instance_sets.remove(&type_name);
+            }
+        }
+    }
+
+    /// Drop `map[type_name][index]` via `swap_remove`. When the removed slot
+    /// wasn't already the vec's last element, the element that used to be last
+    /// now lives at `index`; repair the position [`remove_file`](Self::remove_file)
+    /// recorded for whichever other file owns it so `file_positions` stays a
+    /// faithful inverse of `map`. `remove_file` only ever calls this with an
+    /// `index` at or before the current last element (see its own ordering
+    /// invariant), so the relocated entry is never one of that same file's
+    /// still-pending positions.
+    fn swap_remove_instance(&mut self, type_name: &str, index: usize) {
+        let Some(v) = self.map.get_mut(type_name) else {
+            return;
+        };
+        let last = v.len() - 1;
+        v.swap_remove(index);
+        if index == last {
+            return;
+        }
+        let moved_uri = Arc::clone(&v[index].0);
+        if let Some(slot) = self
+            .file_positions
+            .get_mut(&moved_uri)
+            .and_then(|by_type| by_type.get_mut(type_name))
+            .and_then(|positions| positions.iter_mut().find(|p| **p == last))
+        {
+            *slot = index;
         }
     }
 }
@@ -1015,6 +1067,74 @@ mod tests {
         idx.remove_file("file://never-merged.txt");
         assert_eq!(before, snapshot(&idx));
         assert!(idx.contains("event", "ev"));
+    }
+
+    /// Removing a file merged early in a shared type's vec relocates a later
+    /// file's entries into the freed slots, exercising the repair
+    /// `swap_remove_instance` does for whichever other file owns the entry a
+    /// swap displaces: 20 files each contribute 3 `state` instances in merge
+    /// order f0..f19, so removing f5 (positions 15..18 of 60) drains the vec's
+    /// tail (f19's 3 entries) into f5's freed slots. `instances_in_file`
+    /// checked right after proves those relocations produced the right
+    /// answer for every survivor, including f19 whose positions just got
+    /// rewritten. That alone doesn't prove the rewritten position values
+    /// themselves are right, only that reading through them still lands on
+    /// the correct instances (a read is order-agnostic; `instances_in_file`
+    /// doesn't care which position a name is filed under, just that it maps
+    /// to the right one), so the test then removes f19, which consumes its
+    /// just-repaired positions as indices into `map`. A wrong repair there
+    /// would make this second removal panic (an out-of-bounds index) or
+    /// silently remove the wrong instances, either of which the final
+    /// snapshot-parity and survivor checks catch.
+    #[test]
+    fn removing_early_file_relocates_and_repairs_a_later_files_positions() {
+        let build = |skip: &[usize]| -> TypeIndex {
+            let mut idx = TypeIndex::new();
+            for f in 0..20 {
+                if skip.contains(&f) {
+                    continue;
+                }
+                let uri = format!("file://f{f}.txt");
+                let instances = (0..3).map(|n| inst(&format!("f{f}_s{n}"), n)).collect();
+                idx.merge(&uri, HashMap::from([("state".to_string(), instances)]));
+            }
+            idx
+        };
+        let assert_survivors_intact = |idx: &TypeIndex, removed: &[usize]| {
+            for f in (0..20).filter(|f| !removed.contains(f)) {
+                let uri = format!("file://f{f}.txt");
+                let mut got: Vec<String> = idx
+                    .instances_in_file(&uri)
+                    .into_iter()
+                    .map(|(_, i)| i.name.clone())
+                    .collect();
+                got.sort();
+                let mut want = vec![format!("f{f}_s0"), format!("f{f}_s1"), format!("f{f}_s2")];
+                want.sort();
+                assert_eq!(
+                    got, want,
+                    "file {uri} lost or gained instances after removing {removed:?}"
+                );
+            }
+            for f in removed {
+                assert!(
+                    idx.instances_in_file(&format!("file://f{f}.txt"))
+                        .is_empty()
+                );
+            }
+        };
+
+        let mut idx = build(&[]);
+        idx.remove_file("file://f5.txt");
+        assert_eq!(snapshot(&idx), snapshot(&build(&[5])));
+        assert_survivors_intact(&idx, &[5]);
+
+        // f19's positions were just rewritten by the relocations above; if the
+        // rewrite were wrong, consuming them as indices here would panic or
+        // remove the wrong entries instead of f19's own.
+        idx.remove_file("file://f19.txt");
+        assert_eq!(snapshot(&idx), snapshot(&build(&[5, 19])));
+        assert_survivors_intact(&idx, &[5, 19]);
     }
 
     /// A subtype-qualified membership key never feeds `name_counts`, so removing

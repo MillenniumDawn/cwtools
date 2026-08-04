@@ -116,6 +116,17 @@ instrumentation.
   Windows, so CI fails there even though Linux/macOS are fine. Build the
   fixture with the `abs()` helper already in `crates/cli/src/report.rs` /
   `crates/cli/src/config.rs` (or add an equivalent local one).
+- Don't assert an exact result from `Url::to_file_path` or `std::fs::canonicalize`
+  without checking it holds on Windows. `to_file_path` yields a path only when
+  the first segment is a drive letter (`http://localhost/etc/passwd` converts
+  on Unix, not Windows; `http://localhost/C:/Windows` converts on both), and
+  `canonicalize` collapses a `dir/..` pair even when `dir` doesn't exist, so
+  a climbing `..` reports `OutsideWorkspace` there where Linux reports
+  `Unresolvable`. Pick a fixture that converts on both platforms, assert the
+  shared guarantee (`is_err()`, containment) rather than a platform-specific
+  variant, or gate the assert `#[cfg(unix)]` with a comment saying why (see
+  `crates/lsp/src/access.rs`). CI runs the full test suite on
+  `windows-latest`, so a Unix-only assumption here turns every PR red.
 - Don't change a type that gets serialized into a cache without bumping the
   format version next to it (`FORMAT_VERSION` in `crates/cache/src/io.rs` for
   `.cwb`, `CACHE_VERSION` in `crates/index/src/vanilla_cache.rs`). The bump is
