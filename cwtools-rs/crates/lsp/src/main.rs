@@ -1382,11 +1382,22 @@ impl LanguageServer for Backend {
         let reindex_client = self.client.clone();
         let reindex_state = self.state.clone();
         tokio::spawn(async move {
-            let backend = Backend {
-                client: reindex_client,
-                state: reindex_state,
-            };
-            backend.background_reindex_loop().await;
+            // Each pass is already panic-safe on its own
+            // (`crate::scan::Backend::run_reindex_pass`); this additionally
+            // wraps the loop's own task, so a panic in its scaffolding
+            // (interval/idle-window bookkeeping) is logged instead of
+            // silently ending periodic reindexing with no trace (#155).
+            // Log-only — unlike the per-pass wrapper, there's no single bad
+            // pass to retry here, just the loop itself dying.
+            crate::scan::spawn_logging_panics("background reindex loop", async move {
+                Backend {
+                    client: reindex_client,
+                    state: reindex_state,
+                }
+                .background_reindex_loop()
+                .await;
+            })
+            .await;
         });
     }
 

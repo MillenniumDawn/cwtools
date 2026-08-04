@@ -5003,6 +5003,56 @@ fn wait_for_cleared_diag_quiet(
     ))
 }
 
+/// [`wait_for_cleared_diag_quiet`], but pulls frames from a
+/// `spawn_frame_collector` channel under an explicit `budget` instead of
+/// blocking a raw reader for an unbounded (but not time-bounded) number of
+/// frames. Used where a test also wants `fetch_profiling_log` afterward
+/// (which needs the same channel) and where a stuck condition should read as
+/// a test failure, not a hung CI job.
+fn wait_for_cleared_diag_with_deadline(
+    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
+    suffix: &str,
+    missing_code: &str,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out waiting for {suffix} diagnostics without {missing_code}"
+            ));
+        }
+        let Ok(v) = rx.recv_timeout(remaining) else {
+            return Err(format!(
+                "timed out waiting for {suffix} diagnostics without {missing_code}"
+            ));
+        };
+        if v["method"] == "loadingBar" {
+            return Err(format!(
+                "unexpected loadingBar notification during quiet background pass: {v}"
+            ));
+        }
+        if v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(suffix))
+        {
+            let codes: Vec<String> = v["params"]["diagnostics"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|d| d["code"].as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !codes.iter().any(|c| c == missing_code) {
+                return Ok(());
+            }
+        }
+    }
+}
+
 #[test]
 fn test_background_reindex_picks_up_new_file_quietly() {
     // The periodic background pass (CWTOOLS_REINDEX_INTERVAL_SECS=1,
@@ -5096,6 +5146,96 @@ fn test_background_reindex_picks_up_new_file_quietly() {
     if let Err(e) = result {
         panic!("{e}");
     }
+}
+
+#[test]
+fn test_background_reindex_survives_a_panicking_pass() {
+    // #155: CWTOOLS_REINDEX_PANIC_ONCE makes the FIRST background pass panic
+    // before it ever scans. `run_reindex_pass`'s wrapper must log-and-swallow
+    // that panic and let `background_reindex_loop`'s own task keep going, so
+    // the SECOND pass (one interval later) still discovers the file — same
+    // setup as test_background_reindex_picks_up_new_file_quietly, but this
+    // proves the loop survives one bad pass instead of just that it works.
+    // Goes through `storm_server_env` (CWTOOLS_PROFILE=1) and asserts on the
+    // profiling log so a build where the injection never actually fired
+    // (env var drift, the injection point moved) fails here instead of
+    // passing for the wrong reason — every other assertion below is equally
+    // true of a pass that never panicked.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    // Only the caller exists on disk at first; the definition is added later,
+    // directly on disk, simulating a watcher-missed change.
+    let b_rel = "common/decisions/b.txt";
+    let b_path = ws.path().join(b_rel);
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &b_path,
+        "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n",
+    )
+    .unwrap();
+
+    let (mut child, mut reader) = storm_server_env(
+        ws.path(),
+        rules_dir.path(),
+        vanilla.path(),
+        &[
+            ("CWTOOLS_REINDEX_INTERVAL_SECS", "1"),
+            ("CWTOOLS_REINDEX_IDLE_SECS", "0"),
+            ("CWTOOLS_REINDEX_PANIC_ONCE", "1"),
+        ],
+    );
+
+    // Open the caller; the definition is absent, so B shows CW263.
+    let b_uri = path_uri(&b_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text":"my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n"}}),
+        ),
+    )
+    .unwrap();
+    let before = diags_for(&mut reader, "b.txt", 1).expect("B diagnostics before background pass");
+    assert!(
+        before.contains(&"CW263".to_string()),
+        "expected CW263 before the definition exists, got: {:?}",
+        before
+    );
+
+    // Create the defining file directly on disk — no didOpen, no
+    // didChangeWatchedFiles notification. Only the periodic background
+    // pass's own filesystem walk can find it.
+    let a_rel = "common/scripted_effects/a.txt";
+    let a_path = ws.path().join(a_rel);
+    std::fs::create_dir_all(a_path.parent().unwrap()).unwrap();
+    std::fs::write(&a_path, "my_se = { log = \"hi\" }\n").unwrap();
+
+    let rx = spawn_frame_collector(reader);
+
+    // The first pass (interval #1) panics and is swallowed; only the second
+    // pass (interval #2, ~1s later) actually scans and finds a.txt. A 15s
+    // budget comfortably covers both 1s intervals plus scan time — and turns
+    // a stuck condition into a test failure instead of a hung CI job.
+    let result = wait_for_cleared_diag_with_deadline(
+        &rx,
+        "b.txt",
+        "CW263",
+        std::time::Duration::from_secs(15),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 2001);
+    child.kill().ok();
+
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+    assert!(
+        log.contains("background reindex pass panicked"),
+        "expected the swallowed panic to be logged, got: {log}"
+    );
 }
 
 #[test]
@@ -5526,6 +5666,60 @@ fn test_watched_repeated_change_coalesces_to_one_validate() {
         count_publishes(&frames, "a.txt"),
         1,
         "should publish diagnostics for a.txt exactly once"
+    );
+}
+
+#[test]
+fn test_watched_batch_panic_is_recovered_and_retried() {
+    // #155: CWTOOLS_WATCHED_BATCH_PANIC_ONCE makes the FIRST watched batch
+    // panic before it validates anything. spawn_watched_batch_window's
+    // recovery path must log-and-swallow that panic, put the drained change
+    // back on the queue, and arm a fresh window directly (not through
+    // arm_watched_batch's is_finished() gate, which would see its own
+    // not-yet-returned handle as still running and skip the retry) — so the
+    // file still validates and publishes exactly once, just one debounce
+    // window late, instead of being silently dropped.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server_env(
+        ws.path(),
+        rules_dir.path(),
+        vanilla.path(),
+        &[("CWTOOLS_WATCHED_BATCH_PANIC_ONCE", "1")],
+    );
+    let uri = write_disk_file(ws.path(), "common/decisions/a.txt", STORM_FILE);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(&mut child, &watched_changes(std::slice::from_ref(&uri))).unwrap();
+
+    let frames = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1010);
+    child.kill().ok();
+
+    // Pin the precondition: without this, the test would pass just as well on
+    // a build where the injection never actually fired (env var drift, the
+    // injection point moved, the one-shot AtomicBool already consumed), since
+    // every other assertion here is also true of a batch that never panicked.
+    assert!(
+        log.contains("watched batch panicked"),
+        "expected the injected panic to be logged, got: {log}"
+    );
+    assert_eq!(
+        count_validate_log(&log, "watched"),
+        1,
+        "the panicking first attempt must not double- or zero-validate after retry"
+    );
+    assert_eq!(
+        count_publishes(&frames, "a.txt"),
+        1,
+        "a.txt should still be published exactly once despite the first batch panicking"
     );
 }
 
