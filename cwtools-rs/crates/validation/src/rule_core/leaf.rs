@@ -28,12 +28,7 @@ use super::children::validate_math_clause;
 /// (`party_popularity@social_democrat`) — so match on the base before the `@`.
 fn is_builtin_variable(ruleset: &RuleSet, token: &str) -> bool {
     let token_base = token.split('@').next().unwrap_or(token);
-    ruleset.values.get("variable").is_some_and(|members| {
-        members.iter().any(|m| {
-            let base = m.split('@').next().unwrap_or(m);
-            base.eq_ignore_ascii_case(token_base)
-        })
-    })
+    ruleset.is_builtin_variable_base(token_base)
 }
 
 pub(super) fn check_variable_get(

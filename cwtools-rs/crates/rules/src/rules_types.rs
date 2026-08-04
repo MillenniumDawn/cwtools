@@ -93,6 +93,13 @@ pub struct RuleSet {
     /// Built by `reindex()`, keyed like `values`: each `value[name]` set as a
     /// `FxHashSet` for O(1) exact membership. Empty until reindex.
     pub value_sets: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>,
+    /// Built by `reindex()`: the lowercased base names (before any `@` scope
+    /// suffix) of `values["variable"]` — the config's built-in variable reads
+    /// (`faction_leader`, `party_popularity@<ideology>`, …). Lets
+    /// [`Self::is_builtin_variable_base`] answer a CW246 candidate in O(1)
+    /// instead of scanning the list (~480 entries for HOI4) per checked read.
+    /// Empty until reindex.
+    pub builtin_variable_bases: rustc_hash::FxHashSet<String>,
     /// Built by `reindex()` from `alias[<scope>_pre_trigger:<name>] = bool`
     /// declarations: lowercased scope prefix -> lowercased trigger names. CW120 queries this.
     pub pretriggers: rustc_hash::FxHashMap<String, rustc_hash::FxHashSet<String>>,
@@ -280,6 +287,7 @@ impl RuleSet {
             enum_values_lower: Vec::new(),
             enum_has_at: Vec::new(),
             value_sets: rustc_hash::FxHashMap::default(),
+            builtin_variable_bases: rustc_hash::FxHashSet::default(),
             pretriggers: rustc_hash::FxHashMap::default(),
             def_positions: Vec::new(),
         }
@@ -426,6 +434,19 @@ impl RuleSet {
             .iter()
             .map(|(k, vs)| (k.clone(), vs.iter().cloned().collect()))
             .collect();
+        self.builtin_variable_bases = self
+            .values
+            .get("variable")
+            .map(|members| {
+                members
+                    .iter()
+                    .map(|m| {
+                        let base = m.split('@').next().unwrap_or(m);
+                        base.to_ascii_lowercase()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.type_rules_idx.clear();
         self.type_reference_rules.clear();
         for (i, root_rule) in self.root_rules.iter().enumerate() {
@@ -515,6 +536,78 @@ impl RuleSet {
             Some(vs) if !vs.is_empty() => Some(vs.iter().any(|v| v == value)),
             _ => None,
         }
+    }
+
+    /// Whether `base` (a variable token already split on its own `@` suffix)
+    /// names a config-declared built-in variable: a member of the
+    /// `value[variable]` set, matched by base name before its own `@` suffix
+    /// (a declared `party_popularity@<ideology>` covers a read of
+    /// `party_popularity@social_democrat`; see #92). Uses the precomputed
+    /// `builtin_variable_bases` set built by `reindex()` with a reusable
+    /// lowercase buffer, so a checked read pays no allocation. Falls back to
+    /// scanning the source `values` list when the set isn't built yet (e.g. a
+    /// hand-built ruleset that skipped `reindex()`).
+    pub fn is_builtin_variable_base(&self, base: &str) -> bool {
+        if self.builtin_variable_bases.is_empty() {
+            return match self.values.get("variable") {
+                Some(members) => members.iter().any(|m| {
+                    let b = m.split('@').next().unwrap_or(m);
+                    b.eq_ignore_ascii_case(base)
+                }),
+                None => false,
+            };
+        }
+        thread_local! {
+            static LOWER_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+        }
+        LOWER_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            buf.extend(base.chars().map(|c| c.to_ascii_lowercase()));
+            self.builtin_variable_bases.contains(buf.as_str())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A builtin declared with a scope suffix (`party_popularity@<ideology>`)
+    /// matches a base name split from a read carrying its own suffix
+    /// (`party_popularity@social_democrat` -> `party_popularity`),
+    /// case-insensitively, via the precomputed `builtin_variable_bases` set
+    /// built by `reindex()` (#135, preserving the #92 base-name semantics).
+    #[test]
+    fn builtin_variable_base_matches_across_suffixes() {
+        let mut ruleset = RuleSet::new();
+        ruleset.values.insert(
+            "variable".to_string(),
+            vec![
+                "party_popularity@<ideology>".to_string(),
+                "Faction_Leader".to_string(),
+            ],
+        );
+        ruleset.reindex();
+
+        assert!(ruleset.is_builtin_variable_base("party_popularity"));
+        assert!(ruleset.is_builtin_variable_base("faction_leader"));
+        assert!(ruleset.is_builtin_variable_base("FACTION_LEADER"));
+        assert!(!ruleset.is_builtin_variable_base("party_popularity@social_democrat"));
+        assert!(!ruleset.is_builtin_variable_base("unrelated_var"));
+    }
+
+    /// Same base-name matching, without calling `reindex()` first, to pin the
+    /// scan fallback a hand-built ruleset relies on.
+    #[test]
+    fn builtin_variable_base_fallback_without_reindex() {
+        let mut ruleset = RuleSet::new();
+        ruleset.values.insert(
+            "variable".to_string(),
+            vec!["party_popularity@<ideology>".to_string()],
+        );
+        assert!(ruleset.is_builtin_variable_base("party_popularity"));
+        assert!(!ruleset.is_builtin_variable_base("unrelated_var"));
     }
 }
 

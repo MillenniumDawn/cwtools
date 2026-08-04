@@ -279,8 +279,9 @@ impl VarIndex {
 
     /// Like [`normalize`](Self::normalize) but writes the canonical key into a
     /// reusable buffer (cleared first), avoiding a per-call allocation on the hot
-    /// `contains` path. Identifiers are ASCII, so the lowercase fold is ASCII.
-    pub(crate) fn normalize_into(raw: &str, buf: &mut String) {
+    /// `contains` path (and the validation crate's loop-var check). Identifiers
+    /// are ASCII, so the lowercase fold is ASCII.
+    pub fn normalize_into(raw: &str, buf: &mut String) {
         let s = raw.trim().trim_matches('"');
         let before_amp = s.split('@').next().unwrap_or(s);
         let last_seg = before_amp.rsplit('.').next().unwrap_or(before_amp);

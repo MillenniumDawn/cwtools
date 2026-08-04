@@ -543,6 +543,7 @@ dependencies = [
 name = "cwtools_validation"
 version = "2.4.0"
 dependencies = [
+ "criterion",
  "cwtools_error_codes",
  "cwtools_game",
  "cwtools_index",
