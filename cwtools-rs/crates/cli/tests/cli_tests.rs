@@ -8,9 +8,22 @@ fn fixtures_dir() -> PathBuf {
         .join("fixtures")
 }
 
+/// Scratch home for every CLI this binary spawns. It has to outlive the
+/// children, so it is a static: leaking the dir at process exit is the point,
+/// the OS temp cleaner takes it from there.
+static SCRATCH_HOME: std::sync::LazyLock<tempfile::TempDir> =
+    std::sync::LazyLock::new(|| tempfile::tempdir().expect("failed to create scratch home"));
+
 fn cwtools() -> Command {
     let mut cmd = Command::cargo_bin("cwtools").unwrap();
     cmd.env("RUST_LOG", "");
+    // Pin HOME and the cache dirs at a scratch tree so a run never picks up a
+    // locally installed base game and never writes into the developer's real
+    // cwtools cache.
+    let home = SCRATCH_HOME.path();
+    cmd.env("HOME", home);
+    cmd.env("XDG_CACHE_HOME", home.join("cache"));
+    cmd.env("LOCALAPPDATA", home.join("localappdata"));
     cmd
 }
 
