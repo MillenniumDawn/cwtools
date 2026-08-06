@@ -9,7 +9,8 @@ use crate::commands::{Lang, LocFile};
 use crate::csv_parser::parse_csv_loc_per_lang;
 use crate::yaml_parser::parse_loc_text;
 use cwtools_file_manager::{
-    FileEncoding, is_excluded_dir, is_excluded_root_dir, is_loc_ext, read_text_with_encoding,
+    FileEncoding, ScanBudget, ScanBytes, is_excluded_dir, is_excluded_root_dir, is_loc_ext,
+    read_text_capped_with_encoding,
 };
 use std::path::{Path, PathBuf};
 
@@ -66,15 +67,15 @@ impl LocService {
     }
 
     /// Load from a directory tree (recursively).
-    pub fn from_folder(folder: &Path) -> Self {
-        Self::from_paths(walk_folder(folder))
+    pub fn from_folder(folder: &Path, budget: ScanBudget) -> Self {
+        Self::from_paths(walk_folder(folder, budget), budget)
     }
 
     /// Load from several directory trees (e.g. a mod dir plus the vanilla
     /// install). Later folders' keys join the union; duplicate keys keep the
     /// first-seen entry per language.
-    pub fn from_folders(folders: &[&Path]) -> Self {
-        Self::from_paths(Self::discover_files(folders))
+    pub fn from_folders(folders: &[&Path], budget: ScanBudget) -> Self {
+        Self::from_paths(Self::discover_files(folders, budget), budget)
     }
 
     /// Discover the on-disk loc file paths `from_folders` would parse,
@@ -83,10 +84,10 @@ impl LocService {
     /// background rescan deciding whether to skip a full loc rebuild) —
     /// sharing this walk with `from_folders` means the two can't disagree on
     /// what counts as a loc file.
-    pub fn discover_files(folders: &[&Path]) -> Vec<PathBuf> {
+    pub fn discover_files(folders: &[&Path], budget: ScanBudget) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for folder in folders {
-            paths.extend(walk_folder(folder));
+            paths.extend(walk_folder(folder, budget));
         }
         paths
     }
@@ -95,14 +96,20 @@ impl LocService {
     /// inside the parallel map alongside parsing — mirroring the CLI's
     /// `discover_and_parse` — so a large loc tree isn't read sequentially before
     /// the parse fans out.
-    fn from_paths(paths: Vec<PathBuf>) -> Self {
+    fn from_paths(paths: Vec<PathBuf>, budget: ScanBudget) -> Self {
         use rayon::prelude::*;
+        let bytes = ScanBytes::new();
         let results: Vec<Result<Vec<LocFile>, (String, String)>> = paths
             .into_par_iter()
             .map(|path| {
                 let path_str = path.to_string_lossy().to_string();
-                match read_text_with_encoding(&path) {
-                    Ok((text, enc)) => parse_loc_file_entry(path_str, text, Some(enc)),
+                match read_text_capped_with_encoding(&path, budget.max_file_size) {
+                    Ok((text, enc, n)) => {
+                        if !bytes.try_reserve(n, budget.max_bytes) {
+                            return Err((path_str, "scan byte budget exceeded".to_string()));
+                        }
+                        parse_loc_file_entry(path_str, text, Some(enc))
+                    }
                     Err(e) => Err((path_str, format!("IO error: {}", e))),
                 }
             })
@@ -207,35 +214,57 @@ fn is_excluded_loc_dir(name: &str, at_root: bool) -> bool {
     name.starts_with('.') || is_excluded_dir(name) || (at_root && is_excluded_root_dir(name))
 }
 
-fn walk_folder(folder: &Path) -> Vec<PathBuf> {
+fn walk_folder(folder: &Path, budget: ScanBudget) -> Vec<PathBuf> {
     // Only files under a `localisation` (or `localization`) directory are loc —
     // that's what the game and F# load. Scanning every `.yml` in the tree pulls
     // in CI workflows, editor caches, and staging copies as bogus loc files
     // (false CW254/CW268) and wastes memory on data the game never reads.
-    walk_folder_inner(folder, false, true)
+    let mut remaining = budget.max_files;
+    walk_folder_inner(folder, false, true, &mut remaining)
 }
 
-fn walk_folder_inner(folder: &Path, in_loc: bool, at_root: bool) -> Vec<PathBuf> {
+fn walk_folder_inner(
+    folder: &Path,
+    in_loc: bool,
+    at_root: bool,
+    remaining_files: &mut usize,
+) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(entries) = std::fs::read_dir(folder) else {
         return files;
     };
 
     for entry in entries.flatten() {
+        if *remaining_files == 0 {
+            break;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
         let path = entry.path();
-        if path.is_dir() {
+        // Reject symlinks and non-regular files outright (see
+        // `file_manager::walk_dir_generic`): a symlink can point outside the
+        // root or into a cycle, and a special file can report length 0.
+        if ft.is_symlink() || !(ft.is_dir() || ft.is_file()) {
+            continue;
+        }
+        if ft.is_dir() {
             let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if is_excluded_loc_dir(dir_name, at_root) {
                 continue;
             }
             let child_in_loc = in_loc || is_loc_dir_name(dir_name);
-            files.extend(walk_folder_inner(&path, child_in_loc, false));
+            files.extend(walk_folder_inner(
+                &path,
+                child_in_loc,
+                false,
+                remaining_files,
+            ));
         } else if in_loc
             && path
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(is_loc_ext)
         {
+            *remaining_files -= 1;
             files.push(path);
         }
     }
@@ -396,7 +425,7 @@ mod tests {
         )
         .unwrap();
 
-        let svc = LocService::from_folder(tmp.path());
+        let svc = LocService::from_folder(tmp.path(), ScanBudget::default());
         assert_eq!(svc.files().len(), 1);
         // Windows walks yield `\`-separated paths; compare normalised.
         assert!(
@@ -423,7 +452,7 @@ mod tests {
         )
         .unwrap();
 
-        let svc = LocService::from_folder(tmp.path());
+        let svc = LocService::from_folder(tmp.path(), ScanBudget::default());
         assert_eq!(svc.files().len(), 1);
         assert!(
             svc.files()[0]
@@ -456,7 +485,7 @@ mod tests {
         )
         .unwrap();
 
-        let svc = LocService::from_folder(tmp.path());
+        let svc = LocService::from_folder(tmp.path(), ScanBudget::default());
         assert_eq!(svc.files().len(), 1);
         assert!(
             svc.files()[0]
@@ -511,7 +540,7 @@ mod tests {
         )
         .unwrap();
 
-        let svc = LocService::from_folders(&[a.path(), b.path()]);
+        let svc = LocService::from_folders(&[a.path(), b.path()], ScanBudget::default());
         let paths: Vec<&str> = svc.files().iter().map(|f| f.path.as_str()).collect();
         assert!(
             paths.iter().any(|p| p.contains("a_l_english.yml")),
@@ -553,5 +582,76 @@ mod tests {
         let mut langs = svc.languages();
         langs.sort_by_key(|l| format!("{l}"));
         assert_eq!(langs, vec![Lang::English, Lang::French]);
+    }
+
+    // ── symlink / over-limit hardening (#161) ──────────────────────────────────
+
+    /// The loc walker must reject symlinks: a dir symlink can point outside the
+    /// root or into a cycle, and a file symlink can point at a special file.
+    #[cfg(unix)]
+    #[test]
+    fn from_folder_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("localisation")).unwrap();
+        std::fs::write(
+            tmp.path().join("localisation").join("good_l_english.yml"),
+            r#"l_english:
+ key:0 "v"
+"#,
+        )
+        .unwrap();
+        symlink(
+            tmp.path().join("localisation").join("good_l_english.yml"),
+            tmp.path().join("localisation").join("link_l_english.yml"),
+        )
+        .unwrap();
+
+        let svc = LocService::from_folder(tmp.path(), ScanBudget::default());
+        assert_eq!(svc.files().len(), 1, "symlinked loc file must be rejected");
+        assert!(
+            svc.files()[0]
+                .path
+                .replace('\\', "/")
+                .ends_with("good_l_english.yml")
+        );
+    }
+
+    /// A loc file over the per-file read cap must be skipped, not read to EOF.
+    #[test]
+    fn from_folder_skips_over_limit_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("localisation")).unwrap();
+        std::fs::write(
+            tmp.path().join("localisation").join("good_l_english.yml"),
+            r#"l_english:
+ key:0 "v"
+"#,
+        )
+        .unwrap();
+        // A file over the per-file cap must be skipped, not read to EOF.
+        std::fs::write(
+            tmp.path().join("localisation").join("huge_l_english.yml"),
+            "l_english:\n".to_string() + &"x".repeat(200),
+        )
+        .unwrap();
+
+        let budget = ScanBudget {
+            max_file_size: 50,
+            ..ScanBudget::default()
+        };
+        let svc = LocService::from_folder(tmp.path(), budget);
+        assert!(
+            svc.files()
+                .iter()
+                .any(|f| f.path.ends_with("good_l_english.yml")),
+            "good file must load"
+        );
+        assert!(
+            !svc.files()
+                .iter()
+                .any(|f| f.path.ends_with("huge_l_english.yml")),
+            "over-cap file must not load"
+        );
     }
 }

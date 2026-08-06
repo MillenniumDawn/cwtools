@@ -4203,14 +4203,16 @@ fn test_rename_at_constant_succeeds_without_a_workspace_folder() {
 /// `test_rename_edits_closed_file`.
 #[cfg(unix)]
 #[test]
-fn test_rename_refuses_when_a_target_is_outside_the_workspace() {
+fn test_rename_does_not_edit_through_a_symlink() {
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     let vanilla = tempfile::tempdir().unwrap();
     std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
 
     // The focus is defined in the base-game install; the workspace reaches it
-    // only through a link, so its lexical path is a workspace path.
+    // only through a link. The scan rejects the symlink (#161), so the
+    // definition is never indexed and rename only edits the in-workspace
+    // reference, never the base-game file.
     let source = vanilla.path().join("f_source.txt");
     std::fs::write(&source, "MY_FOCUS = { x = yes }\n").unwrap();
     let linked_def = ws.path().join("common/national_focus/f.txt");
@@ -4285,20 +4287,16 @@ fn test_rename_refuses_when_a_target_is_outside_the_workspace() {
     child.kill().ok();
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
 
-    let message = resp["error"]["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("rename must be refused, got: {resp_str}"));
+    // The symlinked definition is rejected by the scan, so rename only edits
+    // the in-workspace reference and never touches the base-game file.
+    let changes = resp["result"]["changes"]
+        .as_object()
+        .unwrap_or_else(|| panic!("rename must carry edits, got: {resp_str}"));
     assert!(
-        message.contains("Rename cancelled") && message.contains("is a symbolic link"),
-        "the refusal must name the cause the boundary reported, got: {message}"
-    );
-    assert!(
-        message.contains("national_focus/f.txt"),
-        "the refusal must name the target it refused, got: {message}"
-    );
-    assert!(
-        resp["result"].is_null(),
-        "a refused rename carries no partial edit, got: {resp_str}"
+        changes
+            .keys()
+            .all(|u| u.ends_with("common/decisions/a.txt")),
+        "rename must only edit the in-workspace file, got: {resp_str}"
     );
     assert_eq!(
         std::fs::read_to_string(&source).unwrap(),
@@ -8958,6 +8956,7 @@ thing = { x = scalar }
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     let vanilla = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
     std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
 
     let rel_path = "common/things/test.txt";
@@ -9000,6 +8999,7 @@ thing = { x = scalar }
                     "language": "hoi4",
                     "rulesCache": rules_dir.path().to_string_lossy(),
                     "vanilla": vanilla.path().to_string_lossy(),
+                    "cacheDir": cache_dir.path().to_string_lossy(),
                 }
             }),
         ),
@@ -9569,10 +9569,11 @@ types = {
 }
 
 /// A hostile workspace ships `localisation/things_l_english.yml` as a symlink to
-/// a file outside it. The loc walk follows the link, so the sibling key it
-/// defines is indexed and CW100 fires for the missing one — but the create-key
-/// action must not offer to write through the link (#160). It falls through to
-/// the new-file tier instead, which lands inside the workspace.
+/// a file outside it. The loc walk rejects the symlink (#161), so the sibling
+/// key it defines is never indexed and CW100 fires for both `name` and `desc`
+/// — and the create-key action must not offer to write through the link
+/// (#160). It falls through to the new-file tier instead, which lands inside
+/// the workspace.
 #[cfg(unix)]
 #[test]
 fn test_create_loc_key_action_refuses_a_symlinked_loc_file() {
@@ -9594,6 +9595,7 @@ thing = { x = scalar }
     let outside = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     let vanilla = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
     std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
 
     let rel_path = "common/things/test.txt";
@@ -9608,6 +9610,12 @@ thing = { x = scalar }
     let link = ws.path().join("localisation/things_l_english.yml");
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    // A real vanilla loc file keeps the loc index non-empty so CW100's gate
+    // fires; the symlinked file is rejected and contributes nothing.
+    let vanilla_loc = vanilla.path().join("localisation/other_l_english.yml");
+    std::fs::create_dir_all(vanilla_loc.parent().unwrap()).unwrap();
+    std::fs::write(&vanilla_loc, "l_english:\n unrelated_key:0 \"Unrelated\"\n").unwrap();
 
     let doc_uri = path_uri(&file_path);
     let mut child = cwtools_server_cmd()
@@ -9630,6 +9638,7 @@ thing = { x = scalar }
                     "language": "hoi4",
                     "rulesCache": rules_dir.path().to_string_lossy(),
                     "vanilla": vanilla.path().to_string_lossy(),
+                    "cacheDir": cache_dir.path().to_string_lossy(),
                 }
             }),
         ),
@@ -9651,17 +9660,26 @@ thing = { x = scalar }
     )
     .unwrap();
 
-    // The link was followed for indexing: `my_thing` resolved (no CW100 for
-    // it), only `my_thing_desc` is missing. Without that this test would pass
-    // vacuously on a workspace where nothing was indexed at all.
-    let diag = wait_for_diag_object(&mut reader, rel_path, "CW100")
-        .expect("CW100 diagnostic published for my_thing_desc");
-    assert!(
-        diag["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("my_thing_desc") && !m.contains("my_thing_l")),
-        "the symlinked file's key must have been indexed, got: {diag}"
+    // The symlinked loc file is rejected by the scan (#161), so neither
+    // `my_thing` nor `my_thing_desc` resolves — both are missing. Without that
+    // this test would pass vacuously on a workspace where nothing was indexed.
+    let diags = wait_for_diags(&mut reader, rel_path).expect("diagnostics for the document");
+    let cw100: Vec<serde_json::Value> =
+        diags.into_iter().filter(|d| d["code"] == "CW100").collect();
+    assert_eq!(
+        cw100.len(),
+        2,
+        "both name and desc must be missing (the symlinked loc file is not indexed): {cw100:#?}"
     );
+    let diag = cw100
+        .iter()
+        .find(|d| {
+            d["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("my_thing_desc"))
+        })
+        .cloned()
+        .expect("CW100 for my_thing_desc");
 
     write_frame(
         &mut child,
@@ -9751,9 +9769,10 @@ fn scan_diag_paths(
     seen
 }
 
-/// `fixAllWorkspace` collects every URI that published a fixable diagnostic,
-/// and the workspace scan follows symlinks — so a linked file gets diagnostics
-/// like any other. The generated `applyEdit` must still leave it alone (#160).
+/// `fixAllWorkspace` collects every URI that published a fixable diagnostic.
+/// The workspace scan rejects symlinks (#161), so a linked file is never
+/// validated and never enters the fixAllWorkspace store; the generated
+/// `applyEdit` must only touch the real in-workspace file.
 ///
 /// The link points into the base-game install on purpose. That is the case the
 /// read boundary (#163) cannot catch: the install is a legitimate place to read
@@ -9816,18 +9835,17 @@ types = {
     )
     .unwrap();
 
-    // The scan reached THROUGH the link and published a fixable CW281 for it,
-    // so it is in the fixAllWorkspace store. Without this the assertion below
-    // would hold for the wrong reason: a file that was never validated is
-    // trivially never edited.
+    // The scan rejects the symlink (#161), so the linked file is never
+    // validated and never enters the fixAllWorkspace store. The real file is
+    // still fixable.
     let validated = scan_diag_paths(&mut reader, &[real_rel, linked_rel], "CW281");
-    assert!(
-        validated.iter().any(|p| p == linked_rel),
-        "the scan must follow the symlink and publish a fixable diagnostic for it, saw: {validated:?}"
-    );
     assert!(
         validated.iter().any(|p| p == real_rel),
         "the real file must be fixable too, saw: {validated:?}"
+    );
+    assert!(
+        !validated.iter().any(|p| p == linked_rel),
+        "the scan must reject the symlink and not publish a diagnostic for it, saw: {validated:?}"
     );
 
     write_frame(

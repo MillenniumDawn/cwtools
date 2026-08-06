@@ -99,7 +99,11 @@ fn search_config_subfolders_only_uses_default() {
 #[test]
 fn index_game_dir_is_populated_and_stable() {
     let table = StringTable::new();
-    let (ruleset, _errors) = load_ruleset_from_dir(&perf_rules(), &table);
+    let (ruleset, _errors) = load_ruleset_from_dir(
+        &perf_rules(),
+        &table,
+        cwtools_file_manager::file_manager::ScanBudget::default(),
+    );
     let var_effects = variable_defining_effects(&ruleset);
 
     let first = index_game_dir(&perf_mod(), &ruleset, &table, &var_effects);

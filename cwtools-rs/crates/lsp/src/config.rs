@@ -577,8 +577,11 @@ impl Backend {
                 )
                 .await;
         }
-        let (combined_ruleset, parse_errors) =
-            load_ruleset_from_dir(cache_path, &self.state.string_table);
+        let (combined_ruleset, parse_errors) = load_ruleset_from_dir(
+            cache_path,
+            &self.state.string_table,
+            cwtools_file_manager::file_manager::ScanBudget::default(),
+        );
 
         // Broken .cwt rules silently degrade every downstream check, so they are
         // reported three ways: the log, a popup, and a diagnostic per file. All

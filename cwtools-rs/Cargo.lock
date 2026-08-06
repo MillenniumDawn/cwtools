@@ -523,10 +523,12 @@ name = "cwtools_rules"
 version = "2.4.0"
 dependencies = [
  "cwtools_error_codes",
+ "cwtools_file_manager",
  "cwtools_game",
  "cwtools_parser",
  "cwtools_string_table",
  "rustc-hash",
+ "tempfile",
  "tracing",
 ]
 
@@ -545,6 +547,7 @@ version = "2.4.0"
 dependencies = [
  "criterion",
  "cwtools_error_codes",
+ "cwtools_file_manager",
  "cwtools_game",
  "cwtools_index",
  "cwtools_localization",

@@ -25,7 +25,11 @@ fn fixture_dir() -> PathBuf {
 
 fn load_stellaris_ruleset() -> cwtools_rules::rules_types::RuleSet {
     let table = StringTable::new();
-    let (ruleset, _errors) = load_ruleset_from_dir(&fixture_dir(), &table);
+    let (ruleset, _errors) = load_ruleset_from_dir(
+        &fixture_dir(),
+        &table,
+        cwtools_file_manager::file_manager::ScanBudget::default(),
+    );
     // The fixture only carries scopes.cwt, links.cwt, pre_triggers.cwt; other
     // cross-file type references surface as config-validation warnings about
     // unrelated type definitions. The scope and link inputs we test against

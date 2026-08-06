@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use cwtools_driver::{index_game_dir, search_config_for};
-use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig};
+use cwtools_file_manager::file_manager::{FileManager, FileManagerConfig, ScanBudget};
 use cwtools_localization::Lang;
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_types::RuleSet;
@@ -807,7 +807,7 @@ fn main() {
             if file.is_dir() {
                 // Treat as a directory of .cwt rule files
                 let table = StringTable::new();
-                let (ruleset, errors) = load_ruleset_from_dir(&file, &table);
+                let (ruleset, errors) = load_ruleset_from_dir(&file, &table, ScanBudget::default());
                 for err in &errors {
                     eprintln!("warn: {}", err);
                 }
@@ -1533,7 +1533,7 @@ fn main() {
                 format!("Scanning localisation in {}", directory.display()),
                 divert,
             );
-            let service = LocService::from_folder(&directory);
+            let service = LocService::from_folder(&directory, ScanBudget::default());
             exit_if_empty(
                 service.files().len(),
                 allow_empty,
