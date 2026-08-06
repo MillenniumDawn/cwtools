@@ -609,6 +609,31 @@ mod tests {
         assert!(ruleset.is_builtin_variable_base("party_popularity"));
         assert!(!ruleset.is_builtin_variable_base("unrelated_var"));
     }
+
+    /// `base_name` drops the subtype qualifier and nothing else, for both
+    /// reference forms. An unqualified name has to come back untouched, or every
+    /// ordinary `<type>` reference would resolve against a truncated name.
+    #[test]
+    fn base_name_strips_only_the_subtype_qualifier() {
+        let simple = |n: &str| TypeType::Simple(n.to_string()).base_name().to_string();
+        assert_eq!(simple("equipment"), "equipment");
+        assert_eq!(simple("equipment.naval_equip"), "equipment");
+        // Only the first `.` separates; anything after it stays part of the
+        // qualifier rather than becoming a second base name.
+        assert_eq!(simple("a.b.c"), "a");
+
+        let complex = |n: &str| {
+            TypeType::Complex {
+                prefix: "GFX_".to_string(),
+                name: n.to_string(),
+                suffix: "_icon".to_string(),
+            }
+            .base_name()
+            .to_string()
+        };
+        assert_eq!(complex("thing"), "thing");
+        assert_eq!(complex("thing.fancy"), "thing");
+    }
 }
 
 impl From<&Severity> for cwtools_error_codes::ErrorSeverity {

@@ -398,6 +398,80 @@ user = { uses = <thing.fancy> }
         assert!(found.is_empty(), "got: {found:?}");
     }
 
+    /// The affixed form carrying a qualifier too (`GFX_<thing.fancy>_icon`).
+    /// This is the other arm of the strip: the qualifier comes off the type name
+    /// while the affixes still come off the value, and the two must not
+    /// interfere.
+    #[test]
+    fn affixed_subtype_qualified_reference_counts_as_a_use() {
+        const AFFIX_SUBTYPE_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        should_be_used = yes
+        subtype[fancy] = {
+            fancy = yes
+        }
+    }
+    type[user] = {
+        path = "game/common/users"
+    }
+}
+thing = {
+    ## cardinality = 0..1
+    fancy = bool
+}
+user = { uses = GFX_<thing.fancy>_icon }
+"#;
+        let found = unused_in(
+            AFFIX_SUBTYPE_RULES,
+            &[
+                ("common/things/test.txt", "my_thing = { fancy = yes }\n"),
+                (
+                    "common/users/test.txt",
+                    "a_user = { uses = GFX_my_thing_icon }\n",
+                ),
+            ],
+        );
+        assert!(found.is_empty(), "got: {found:?}");
+    }
+
+    /// A qualifier on a rule keyed by `<type>` (`<thing.fancy> = int`). This
+    /// records from `rule_core/children.rs` rather than `leaf.rs`, so it is a
+    /// separate route to the same recording call.
+    #[test]
+    fn subtype_qualified_keyed_rule_records_its_key_as_a_use() {
+        const KEYED_SUBTYPE_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        should_be_used = yes
+        subtype[fancy] = {
+            fancy = yes
+        }
+    }
+    type[user] = {
+        path = "game/common/users"
+    }
+}
+thing = {
+    ## cardinality = 0..1
+    fancy = bool
+}
+user = {
+    <thing.fancy> = int
+}
+"#;
+        let found = unused_in(
+            KEYED_SUBTYPE_RULES,
+            &[
+                ("common/things/test.txt", "my_thing = { fancy = yes }\n"),
+                ("common/users/test.txt", "a_user = { my_thing = 3 }\n"),
+            ],
+        );
+        assert!(found.is_empty(), "got: {found:?}");
+    }
+
     /// A reference written inside an effect/trigger alias body still counts.
     /// Those leaves reach `validate_leaf` through the alias overload loop
     /// (`rule_core/alias.rs`) rather than the plain child walk, and most real
@@ -679,6 +753,48 @@ building = {
             ],
         );
         assert!(found.is_empty(), "got: {found:?}");
+    }
+
+    /// CW231's half of the subtype-qualifier fix. `is_tracked_technology`
+    /// compares against the bare type name, so a prerequisite written
+    /// `<technology.tier_one>` was not tracked at all and every technology
+    /// required only that way reported unused. The tech nothing requires still
+    /// reports, so the fix cannot be silencing the check wholesale.
+    #[test]
+    fn subtype_qualified_technology_reference_counts_as_a_use() {
+        const SUBTYPE_TECH_RULES: &str = r#"
+types = {
+    type[technology] = {
+        path = "game/common/technology"
+        subtype[tier_one] = {
+            tier = 1
+        }
+    }
+}
+technology = {
+    ## cardinality = 0..1
+    tier = int
+    ## cardinality = 0..1
+    weight = int
+    ## cardinality = 0..1
+    prerequisites = {
+        ## cardinality = 0..100
+        <technology.tier_one>
+    }
+}
+"#;
+        let found = unused_for(
+            Some(Game::Stellaris),
+            SUBTYPE_TECH_RULES,
+            &[(
+                "common/technology/test.txt",
+                "tech_root = { tier = 1 weight = 10 }\n\
+                 tech_leaf = { weight = 10 prerequisites = { tech_root } }\n",
+            )],
+        );
+        assert_eq!(found.len(), 1, "only tech_leaf is unused, got: {found:?}");
+        assert_eq!(found[0].0, "CW231");
+        assert!(found[0].1.contains("tech_leaf"), "got: {found:?}");
     }
 
     /// F# matches `weight_modifier`'s factor against a decimal zero, so the
