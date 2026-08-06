@@ -11,10 +11,24 @@ fn path_uri(path: impl AsRef<std::path::Path>) -> String {
         .unwrap_or_else(|_| format!("file://{}", path.display()))
 }
 
+/// Scratch home for every server this binary spawns. It has to outlive the
+/// children, so it is a static: leaking the dir at process exit is the point,
+/// the OS temp cleaner takes it from there.
+static SCRATCH_HOME: std::sync::LazyLock<tempfile::TempDir> =
+    std::sync::LazyLock::new(|| tempfile::tempdir().expect("failed to create scratch home"));
+
 fn cwtools_server_cmd() -> Command {
     let bin = assert_cmd::cargo::cargo_bin("cwtools-server");
     let mut cmd = Command::new(bin);
     cmd.env("RUST_LOG", "");
+    // Pin HOME and the cache dirs at a scratch tree so a server never discovers
+    // a locally installed base game (and spends the test scanning it), and never
+    // writes into the developer's real cwtools cache. A test that wants
+    // discovery sets its own HOME afterwards; the later `.env` wins.
+    let home = SCRATCH_HOME.path();
+    cmd.env("HOME", home);
+    cmd.env("XDG_CACHE_HOME", home.join("cache"));
+    cmd.env("LOCALAPPDATA", home.join("localappdata"));
     cmd
 }
 
