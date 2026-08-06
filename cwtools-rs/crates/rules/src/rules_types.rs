@@ -854,6 +854,21 @@ pub enum TypeType {
     },
 }
 
+impl TypeType {
+    /// The type a `<type>` / `<type.subtype>` reference resolves against, with
+    /// any subtype qualifier dropped (`equipment.naval_equip` -> `equipment`).
+    /// The qualifier constrains which instances match, but the definition is
+    /// keyed by the base type, so anything looking the type up in a ruleset or
+    /// an index wants this rather than the name as written.
+    pub fn base_name(&self) -> &str {
+        let name = match self {
+            TypeType::Simple(n) => n.as_str(),
+            TypeType::Complex { name, .. } => name.as_str(),
+        };
+        name.split_once('.').map_or(name, |(base, _)| base)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Marker {
     ColourField,

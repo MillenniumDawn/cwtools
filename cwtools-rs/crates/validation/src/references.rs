@@ -128,11 +128,13 @@ pub fn needs_use_tracking(ruleset: &RuleSet, game: Option<Game>) -> bool {
 /// as `TypeDefFuzzy` and then ignores them, which reports an instance referenced
 /// only through an affixed field as unused; resolving the affixes here is what
 /// the rest of the engine already does for CW500.
+///
+/// A subtype-qualified field (`<equipment.naval_equip>`) is recorded against its
+/// base type. The qualifier narrows which instances the reference accepts, but
+/// the definition it points at is a plain `equipment`, which is how both the
+/// tracking gate and the unused check key their lookups.
 pub(crate) fn mark_type_field_use(ctx: &ValidationCtx, field: &TypeType, value: &str) {
-    let type_name = match field {
-        TypeType::Simple(n) => n.as_str(),
-        TypeType::Complex { name, .. } => name.as_str(),
-    };
+    let type_name = field.base_name();
     if !ctx.tracks_type_uses(type_name) {
         return;
     }
@@ -355,6 +357,42 @@ user = { uses = GFX_<thing>_icon }
                     "common/users/test.txt",
                     "a_user = { uses = GFX_my_thing_icon }\n",
                 ),
+            ],
+        );
+        assert!(found.is_empty(), "got: {found:?}");
+    }
+
+    /// A subtype-qualified reference (`<thing.fancy>`) still points at a plain
+    /// `thing` definition, so it has to count the same as a bare `<thing>` one.
+    /// The qualifier is not a type of its own: nothing is ever defined under
+    /// `thing.fancy`, and recording the use there reported every instance
+    /// referenced only this way as unused.
+    #[test]
+    fn subtype_qualified_reference_counts_as_a_use() {
+        const SUBTYPE_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        should_be_used = yes
+        subtype[fancy] = {
+            fancy = yes
+        }
+    }
+    type[user] = {
+        path = "game/common/users"
+    }
+}
+thing = {
+    ## cardinality = 0..1
+    fancy = bool
+}
+user = { uses = <thing.fancy> }
+"#;
+        let found = unused_in(
+            SUBTYPE_RULES,
+            &[
+                ("common/things/test.txt", "my_thing = { fancy = yes }\n"),
+                ("common/users/test.txt", "a_user = { uses = my_thing }\n"),
             ],
         );
         assert!(found.is_empty(), "got: {found:?}");
