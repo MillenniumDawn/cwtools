@@ -24,7 +24,7 @@ use cwtools_string_table::string_table::StringTable;
 
 use crate::rules_converter::field_parser::field_from_string;
 use crate::rules_converter::value_to_string;
-use crate::rules_types::{CwtDefKind, CwtDefPosition, NewField, RuleSet, TypeType, ValueType};
+use crate::rules_types::{CwtDefKind, CwtDefPosition, NewField, RuleSet, ValueType};
 use crate::ruleset_loader::RuleParseError;
 
 /// A single reference made by a `.cwt` rule, classified and positioned but not
@@ -248,19 +248,11 @@ fn referenced_name(field: &NewField) -> Option<(RefKind, String)> {
     match field {
         // `<type>` / `<type.subtype>`: the subtype qualifier constrains the
         // match but the definition is keyed by the base type, so check that.
-        NewField::TypeField(TypeType::Simple(n)) => Some((RefKind::Type, base_type(n).to_string())),
-        NewField::TypeField(TypeType::Complex { name, .. }) => {
-            Some((RefKind::Type, base_type(name).to_string()))
-        }
+        NewField::TypeField(t) => Some((RefKind::Type, t.base_name().to_string())),
         NewField::ValueField(ValueType::Enum(n)) => Some((RefKind::Enum, n.clone())),
         NewField::SingleAliasField(n) => Some((RefKind::SingleAlias, n.clone())),
         _ => None,
     }
-}
-
-/// The base type of a `type.subtype` reference (everything before the first `.`).
-fn base_type(name: &str) -> &str {
-    name.split('.').next().unwrap_or(name)
 }
 
 fn is_defined(
