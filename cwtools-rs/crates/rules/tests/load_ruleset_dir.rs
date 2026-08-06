@@ -17,7 +17,11 @@ fn fixture_dir() -> PathBuf {
 #[test]
 fn load_ruleset_dir_merges_every_cwt_file() {
     let table = StringTable::new();
-    let (ruleset, errors) = load_ruleset_from_dir(&fixture_dir(), &table);
+    let (ruleset, errors) = load_ruleset_from_dir(
+        &fixture_dir(),
+        &table,
+        cwtools_file_manager::file_manager::ScanBudget::default(),
+    );
 
     assert!(
         errors.is_empty(),
@@ -104,7 +108,11 @@ fn load_ruleset_dir_merges_every_cwt_file() {
 fn load_ruleset_dir_reports_directory_read_error() {
     let path = fixture_dir().join("nested/notes.txt");
     let table = StringTable::new();
-    let (ruleset, errors) = load_ruleset_from_dir(&path, &table);
+    let (ruleset, errors) = load_ruleset_from_dir(
+        &path,
+        &table,
+        cwtools_file_manager::file_manager::ScanBudget::default(),
+    );
 
     assert!(ruleset.types.is_empty());
     assert_eq!(errors.len(), 1, "errors: {errors:?}");
@@ -142,7 +150,11 @@ fn load_hoi4_config_dir() {
     );
 
     let table = StringTable::new();
-    let (ruleset, errors) = load_ruleset_from_dir(&config_dir, &table);
+    let (ruleset, errors) = load_ruleset_from_dir(
+        &config_dir,
+        &table,
+        cwtools_file_manager::file_manager::ScanBudget::default(),
+    );
 
     // Report parse errors but don't fail on them — some .cwt files may use
     // features the Rust loader doesn't implement yet.

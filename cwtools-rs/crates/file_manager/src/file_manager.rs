@@ -87,6 +87,42 @@ pub fn read_text_with_encoding(path: &Path) -> Result<(String, FileEncoding), Fi
     Ok(decode_bytes(std::fs::read(path)?))
 }
 
+/// Read a file as text through a hard byte cap. Opens once and reads at most
+/// `max_bytes`; a file that reports a larger length, grows under us, or is a
+/// special file that reports length 0 is refused rather than truncated (a
+/// truncated script would parse into garbage). Returns the raw byte count read
+/// so callers can enforce a per-scan total-byte budget.
+///
+/// This is the bounded read used by every bulk discovery/scan path. The
+/// unbounded [`read_text`] stays for single-file explicit reads (a file the
+/// user opened by name), which aren't fed by symlink-following discovery.
+pub fn read_text_capped(path: &Path, max_bytes: u64) -> Result<(String, u64), FileError> {
+    read_text_capped_with_encoding(path, max_bytes).map(|(s, _, n)| (s, n))
+}
+
+/// Like [`read_text_capped`], but also reports the detected encoding.
+pub fn read_text_capped_with_encoding(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(String, FileEncoding, u64), FileError> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    // `take` bounds the allocation as well as the read, so a file that grows
+    // under us or misreports its length still can't outrun the cap.
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let n = bytes.len() as u64;
+    if n > max_bytes {
+        return Err(FileError::OverLimit {
+            path: path.to_path_buf(),
+            limit: max_bytes,
+        });
+    }
+    let (text, enc) = decode_bytes(bytes);
+    Ok((text, enc, n))
+}
+
 /// Decode already-read file bytes by the same rules as [`read_text`], for
 /// callers that must own the read itself (the LSP's URI access boundary reads
 /// through a cap) but still need script files to decode identically.
@@ -235,6 +271,11 @@ pub enum FileError {
     /// path that doesn't resolve must not read as "this mod has no files".
     #[error("directory does not exist: {0}")]
     MissingRoot(PathBuf),
+    /// A file exceeded the hard read cap for a scan. Distinct from a parse
+    /// error: the file was refused before reading, so a special file that
+    /// reports length 0 (e.g. `/dev/zero`) can't be read to EOF.
+    #[error("file exceeds the {limit} byte read cap: {path}")]
+    OverLimit { path: PathBuf, limit: u64 },
 }
 
 /// A discovered script file before its source is read or parsed.
@@ -297,6 +338,68 @@ pub struct FileManagerConfig {
     pub exclude_root_dirs: Vec<String>,
     /// Skip files larger than this (bytes). 0 = no limit.
     pub max_file_size: u64,
+    /// Per-scan resource budget (file count and total bytes).
+    pub scan_budget: ScanBudget,
+}
+
+/// Per-scan resource budget. Guards one discovery/read pass against a
+/// pathological tree (a symlink to `/`, a special file that reports length 0,
+/// or a huge number of files) so startup and CLI validation can't allocate
+/// without bound. A limit of 0 disables it.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanBudget {
+    /// Maximum number of files accepted by one discovery walk.
+    pub max_files: usize,
+    /// Maximum total bytes read across all files in one scan.
+    pub max_bytes: u64,
+    /// Hard per-file read cap (bytes). 0 = no per-file cap.
+    pub max_file_size: u64,
+}
+
+impl Default for ScanBudget {
+    fn default() -> Self {
+        Self {
+            max_files: 100_000,
+            max_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
+            // Loc and rules files can legitimately run to a few MB; the CLI's
+            // script cap (2 MB) is separate (`FileManagerConfig::max_file_size`).
+            max_file_size: 64 * 1024 * 1024, // 64 MB
+        }
+    }
+}
+
+/// Atomic running total of bytes read in one scan, shared across the parallel
+/// read fan-out so the whole scan stops adding files once the total-byte budget
+/// is exhausted.
+#[derive(Debug, Default)]
+pub struct ScanBytes(std::sync::atomic::AtomicU64);
+
+impl ScanBytes {
+    pub fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// Reserve `n` bytes against `max_bytes` (0 = unlimited). Returns true if
+    /// the reservation is accepted, false if it would exceed the budget.
+    pub fn try_reserve(&self, n: u64, max_bytes: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        if max_bytes == 0 {
+            return true;
+        }
+        let mut cur = self.0.load(Ordering::Relaxed);
+        loop {
+            if cur.saturating_add(n) > max_bytes {
+                return false;
+            }
+            match self
+                .0
+                .compare_exchange_weak(cur, cur + n, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
 
 impl Default for FileManagerConfig {
@@ -330,6 +433,7 @@ impl Default for FileManagerConfig {
             exclude_dir_patterns: vec![],
             exclude_root_dirs: EXCLUDED_ROOT_DIRS.iter().map(|s| s.to_string()).collect(),
             max_file_size: 2 * 1024 * 1024, // 2 MB
+            scan_budget: ScanBudget::default(),
         }
     }
 }
@@ -387,12 +491,24 @@ impl FileManager {
         use rayon::prelude::*;
 
         let table = &self.string_table;
+        let max_file_size = self.config.max_file_size;
+        let max_bytes = self.config.scan_budget.max_bytes;
+        let bytes = ScanBytes::new();
         let files = self
             .discover_files()?
             .into_par_iter()
             .filter_map(|file| {
-                let content = match read_text(&file.path) {
-                    Ok(content) => content,
+                let content = match read_text_capped(&file.path, max_file_size) {
+                    Ok((content, n)) => {
+                        if !bytes.try_reserve(n, max_bytes) {
+                            eprintln!(
+                                "warn: skipping {}: scan byte budget exceeded",
+                                file.path.display()
+                            );
+                            return None;
+                        }
+                        content
+                    }
                     Err(e) => {
                         eprintln!("warn: skipping {}: {}", file.path.display(), e);
                         return None;
@@ -436,8 +552,22 @@ impl FileManager {
         let mut on_err = |path: &Path, e: std::io::Error| {
             eprintln!("warn: skipping {}: {}", path.display(), FileError::from(e));
         };
-        walk_dir_generic(dir, is_root_level, cfg, &[], &mut accept, &mut on_err, out)
-            .map_err(FileError::from)
+        let mut state = WalkState {
+            out: Vec::new(),
+            remaining_files: self.config.scan_budget.max_files,
+        };
+        walk_dir_generic(
+            dir,
+            is_root_level,
+            cfg,
+            &[],
+            &mut accept,
+            &mut on_err,
+            &mut state,
+        )
+        .map_err(FileError::from)?;
+        out.extend(state.out);
+        Ok(())
     }
 
     /// Discover and parse the script files of a `MultipleMod` workspace: a
@@ -452,11 +582,16 @@ impl FileManager {
     /// the driver indexes the base game separately for reference only.
     pub fn discover_files_multi_mod(&self) -> Vec<DiscoveredFile> {
         let mods = expand_multiple_mods(&self.config.root);
-        discover_files_multi_mod(None, &mods, &self.config.include_dirs)
-            .into_iter()
-            .filter(|(path, _)| accept_script_file(&self.config, path))
-            .map(|(path, logical_path)| DiscoveredFile { path, logical_path })
-            .collect()
+        discover_files_multi_mod(
+            None,
+            &mods,
+            &self.config.include_dirs,
+            self.config.scan_budget,
+        )
+        .into_iter()
+        .filter(|(path, _)| accept_script_file(&self.config, path))
+        .map(|(path, logical_path)| DiscoveredFile { path, logical_path })
+        .collect()
     }
 
     /// Discover and parse the script files of a `MultipleMod` workspace.
@@ -464,12 +599,24 @@ impl FileManager {
         use rayon::prelude::*;
 
         let table = &self.string_table;
+        let max_file_size = self.config.max_file_size;
+        let max_bytes = self.config.scan_budget.max_bytes;
+        let bytes = ScanBytes::new();
         let files = self
             .discover_files_multi_mod()
             .into_par_iter()
             .filter_map(|file| {
-                let content = match read_text(&file.path) {
-                    Ok(content) => content,
+                let content = match read_text_capped(&file.path, max_file_size) {
+                    Ok((content, n)) => {
+                        if !bytes.try_reserve(n, max_bytes) {
+                            eprintln!(
+                                "warn: skipping {}: scan byte budget exceeded",
+                                file.path.display()
+                            );
+                            return None;
+                        }
+                        content
+                    }
                     Err(e) => {
                         eprintln!("warn: skipping {}: {}", file.path.display(), e);
                         return None;
@@ -689,12 +836,14 @@ pub fn discover_files_multi_mod(
     vanilla_root: Option<&Path>,
     mods: &[ResolvedMod],
     include_dirs: &[String],
+    budget: ScanBudget,
 ) -> Vec<(PathBuf, String)> {
     // Collect (logical_path, absolute_path, source_priority) triples.
     // Higher priority index wins.
     use std::collections::HashMap;
 
     let mut best: HashMap<String, (PathBuf, usize)> = HashMap::new();
+    let mut remaining = budget.max_files;
 
     // Build ordered list: vanilla is priority 0, mods are 1..=n
     let mut sources: Vec<(usize, &Path, &[String])> = Vec::new();
@@ -718,7 +867,7 @@ pub fn discover_files_multi_mod(
             if !dir.is_dir() {
                 continue;
             }
-            collect_files_recursive(&dir, &root_prefix, *priority, &mut best);
+            collect_files_recursive(&dir, &root_prefix, *priority, &mut best, &mut remaining);
         }
     }
 
@@ -763,22 +912,32 @@ fn collect_files_recursive(
     root_prefix: &str,
     priority: usize,
     out: &mut std::collections::HashMap<String, (PathBuf, usize)>,
+    remaining_files: &mut usize,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
     for entry in entries.flatten() {
+        if *remaining_files == 0 {
+            break;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
         let path = entry.path();
-        if path.is_dir() {
+        // Reject symlinks and non-regular files outright (see `walk_dir_generic`).
+        if ft.is_symlink() || !(ft.is_dir() || ft.is_file()) {
+            continue;
+        }
+        if ft.is_dir() {
             // Skip VCS/build/editor dirs, same as the single-root walk, so a
             // mod's nested `.git`/`target`/… never contributes files.
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if is_excluded_dir(name) {
                 continue;
             }
-            collect_files_recursive(&path, root_prefix, priority, out);
+            collect_files_recursive(&path, root_prefix, priority, out, remaining_files);
         } else {
+            *remaining_files -= 1;
             let logical = compute_logical_path_with_root(&path, root_prefix);
             // Higher priority wins
             let entry = out.entry(logical).or_insert((path.clone(), priority));
@@ -805,11 +964,12 @@ pub fn walk_workspace_files(
     extensions: &[&str],
     extra_file_globs: &[String],
     extra_dir_globs: &[String],
+    budget: ScanBudget,
 ) -> Vec<PathBuf> {
     let cfg = FileManagerConfig::default();
-    let mut out = Vec::new();
     // Accept any file whose extension is requested and which isn't a free-form
-    // excluded filename. No size guard (unlike the CLI walker).
+    // excluded filename. No per-file size guard (unlike the CLI walker); the
+    // read cap and byte budget are enforced when the LSP reads each file.
     let mut accept = |path: &Path| -> Option<PathBuf> {
         let ext = path.extension().and_then(|e| e.to_str())?;
         if !extensions.contains(&ext) {
@@ -830,6 +990,10 @@ pub fn walk_workspace_files(
     };
     // The LSP walk silently ignores unreadable directories.
     let mut on_err = |_: &Path, _: std::io::Error| {};
+    let mut state = WalkState {
+        out: Vec::new(),
+        remaining_files: budget.max_files,
+    };
     let _ = walk_dir_generic(
         root,
         true,
@@ -837,21 +1001,32 @@ pub fn walk_workspace_files(
         extra_dir_globs,
         &mut accept,
         &mut on_err,
-        &mut out,
+        &mut state,
     );
-    out
+    state.out
 }
 
 /// Shared directory traversal for both discovery walkers. Sorts each
 /// directory's entries for deterministic order, applies the config's
 /// directory-exclusion lists (plus `extra_dir_globs`), and passes every
-/// non-directory path to `accept`; whatever `accept` returns is collected into
-/// `out`. Symlinked directories are followed (matching the previous
-/// `path.is_dir()` behaviour); regular entries reuse the `file_type` from
-/// `read_dir` to avoid a second stat. Read errors on child directories go to
-/// `on_dir_err`; the top-level read error is returned. `is_root_level` is true
-/// only when `dir` itself is the walk root, so its direct children are the
-/// ones `exclude_root_dirs` applies to; every recursive call passes `false`.
+/// regular file to `accept`; whatever `accept` returns is collected into
+/// `state.out`. Symlinks and non-regular files (fifos, sockets, devices) are
+/// rejected outright: a symlink can point outside the root or into a cycle,
+/// and a special file can report length 0 and be read to EOF. Regular entries
+/// reuse the `file_type` from `read_dir` to avoid a second stat. Read errors on
+/// child directories go to `on_dir_err`; the top-level read error is returned.
+/// `is_root_level` is true only when `dir` itself is the walk root, so its
+/// direct children are the ones `exclude_root_dirs` applies to; every
+/// recursive call passes `false`. The walk stops once `state.remaining_files`
+/// reaches 0.
+///
+/// Mutable state threaded through [`walk_dir_generic`]: the collected output
+/// and the remaining per-scan file budget.
+struct WalkState<T> {
+    out: Vec<T>,
+    remaining_files: usize,
+}
+
 fn walk_dir_generic<T>(
     dir: &Path,
     is_root_level: bool,
@@ -859,7 +1034,7 @@ fn walk_dir_generic<T>(
     extra_dir_globs: &[String],
     accept: &mut dyn FnMut(&Path) -> Option<T>,
     on_dir_err: &mut dyn FnMut(&Path, std::io::Error),
-    out: &mut Vec<T>,
+    state: &mut WalkState<T>,
 ) -> std::io::Result<()> {
     // Collect (sort-key, path, file_type) once so sorting doesn't re-allocate an
     // OsString per comparison and directory tests reuse the readdir file type.
@@ -872,14 +1047,15 @@ fn walk_dir_generic<T>(
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (_name, path, ft) in entries {
-        // `file_type()` from `read_dir` doesn't follow symlinks; stat only those
-        // to preserve the previous symlink-following discovery.
-        let is_dir = if ft.is_symlink() {
-            path.is_dir()
-        } else {
-            ft.is_dir()
-        };
-        if is_dir {
+        if state.remaining_files == 0 {
+            break;
+        }
+        // `file_type()` from `read_dir` doesn't follow symlinks, so this is a
+        // single stat-free check that rejects symlinks and special files.
+        if ft.is_symlink() || !(ft.is_dir() || ft.is_file()) {
+            continue;
+        }
+        if ft.is_dir() {
             let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // Root-anchored excludes apply only to direct children of the root.
             let skip = cfg
@@ -897,8 +1073,15 @@ fn walk_dir_generic<T>(
                         .iter()
                         .any(|ex| dir_name.eq_ignore_ascii_case(ex)));
             if !skip
-                && let Err(e) =
-                    walk_dir_generic(&path, false, cfg, extra_dir_globs, accept, on_dir_err, out)
+                && let Err(e) = walk_dir_generic(
+                    &path,
+                    false,
+                    cfg,
+                    extra_dir_globs,
+                    accept,
+                    on_dir_err,
+                    state,
+                )
             {
                 on_dir_err(&path, e);
             }
@@ -906,7 +1089,8 @@ fn walk_dir_generic<T>(
         }
 
         if let Some(item) = accept(&path) {
-            out.push(item);
+            state.remaining_files -= 1;
+            state.out.push(item);
         }
     }
     Ok(())
@@ -1193,7 +1377,7 @@ mod tests {
         );
 
         // LSP whole-tree path.
-        let lsp = walk_workspace_files(root, &["txt"], &[], &[]);
+        let lsp = walk_workspace_files(root, &["txt"], &[], &[], ScanBudget::default());
         let lsp: Vec<String> = lsp
             .iter()
             .map(|p| normalize_slashes(p.to_string_lossy()).into_owned())
@@ -1321,7 +1505,8 @@ mod tests {
         ];
 
         let include_dirs = vec!["common".to_string(), "events".to_string()];
-        let files = discover_files_multi_mod(Some(&vanilla), &mods, &include_dirs);
+        let files =
+            discover_files_multi_mod(Some(&vanilla), &mods, &include_dirs, ScanBudget::default());
 
         // Build logical_path → content map
         let by_logical: HashMap<String, String> = files
@@ -1471,7 +1656,7 @@ mod tests {
         std::fs::create_dir(root.join("sub")).unwrap();
         std::fs::write(root.join("sub").join("aaa.txt"), "").unwrap();
 
-        let files = walk_workspace_files(root, &["txt"], &[], &[]);
+        let files = walk_workspace_files(root, &["txt"], &[], &[], ScanBudget::default());
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -1510,5 +1695,170 @@ mod tests {
             ..Default::default()
         });
         assert!(fm.discover_and_parse().expect("empty root").is_empty());
+    }
+
+    // ── symlink / special-file / budget hardening (#161) ───────────────────────
+
+    /// A symlinked directory or file must not be walked: a dir symlink can point
+    /// outside the root or into a cycle, and a file symlink can point at a
+    /// special file (e.g. `/dev/zero`) that reports length 0 and reads to EOF.
+    #[cfg(unix)]
+    #[test]
+    fn walk_workspace_files_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+
+        // A real file that must be found, plus a dir symlink and a file symlink
+        // that must be ignored.
+        std::fs::write(root.join("real.txt"), "x").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("inside.txt"), "x").unwrap();
+        symlink(root.join("sub"), root.join("dir_link")).unwrap();
+        symlink(root.join("real.txt"), root.join("file_link.txt")).unwrap();
+        // A symlink to a special file that reports length 0 and would read to EOF.
+        symlink("/dev/zero", root.join("zero.txt")).unwrap();
+
+        let files = walk_workspace_files(root, &["txt"], &[], &[], ScanBudget::default());
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"real.txt".to_string()));
+        assert!(names.contains(&"inside.txt".to_string()));
+        assert!(
+            !names.iter().any(|n| n.contains("dir_link")),
+            "dir symlink must not be followed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("file_link")),
+            "file symlink must be rejected: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("zero")),
+            "symlink to /dev/zero must be rejected: {names:?}"
+        );
+    }
+
+    /// The CLI discovery path must apply the same symlink policy as the LSP walk.
+    #[cfg(unix)]
+    #[test]
+    fn collect_paths_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        std::fs::write(root.join("real.txt"), "x").unwrap();
+        symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+
+        let fm = FileManager::new(FileManagerConfig {
+            root: root.to_path_buf(),
+            include_dirs: vec![".".into()],
+            ..Default::default()
+        });
+        let mut paths = Vec::new();
+        fm.collect_paths(root, &mut paths).unwrap();
+        let names: Vec<String> = paths.iter().map(|(_, lp)| lp.clone()).collect();
+        assert!(names.iter().any(|n| n.ends_with("real.txt")));
+        assert!(
+            !names.iter().any(|n| n.ends_with("link.txt")),
+            "file symlink must be rejected: {names:?}"
+        );
+    }
+
+    /// The per-scan file-count budget stops a pathological tree from being
+    /// walked to exhaustion.
+    #[test]
+    fn walk_workspace_files_enforces_file_budget() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        for i in 0..10 {
+            std::fs::write(root.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let budget = ScanBudget {
+            max_files: 3,
+            max_bytes: 0,
+            max_file_size: 0,
+        };
+        let files = walk_workspace_files(root, &["txt"], &[], &[], budget);
+        assert_eq!(files.len(), 3, "walk must stop at the file budget");
+    }
+
+    /// The multi-mod walk must reject symlinks too.
+    #[cfg(unix)]
+    #[test]
+    fn multi_mod_walk_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("moda/common")).unwrap();
+        std::fs::write(root.join("moda/common/real.txt"), "x").unwrap();
+        symlink(
+            root.join("moda/common/real.txt"),
+            root.join("moda/common/link.txt"),
+        )
+        .unwrap();
+
+        let mods = vec![ResolvedMod {
+            descriptor: ModDescriptor {
+                name: "ModA".into(),
+                path: Some(root.join("moda").to_str().unwrap().to_string()),
+                replace_paths: vec![],
+            },
+            root: root.join("moda"),
+        }];
+        let files =
+            discover_files_multi_mod(None, &mods, &["common".to_string()], ScanBudget::default());
+        let names: Vec<String> = files.iter().map(|(_, lp)| lp.clone()).collect();
+        assert!(names.iter().any(|n| n.ends_with("real.txt")));
+        assert!(
+            !names.iter().any(|n| n.ends_with("link.txt")),
+            "multi-mod walk must reject file symlinks: {names:?}"
+        );
+    }
+
+    /// `read_text_capped` refuses a file over the cap rather than truncating it,
+    /// so a special file that reports length 0 can't be read to EOF.
+    #[test]
+    fn read_text_capped_refuses_over_limit() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let file = tmp.path().join("big.txt");
+        std::fs::write(&file, "x".repeat(100)).unwrap();
+
+        let ok = read_text_capped(&file, 1000).expect("under cap reads");
+        assert_eq!(ok.0, "x".repeat(100));
+        assert_eq!(ok.1, 100);
+
+        let Err(err) = read_text_capped(&file, 50) else {
+            panic!("over-cap file must be refused");
+        };
+        assert!(
+            err.to_string().contains("read cap"),
+            "error must name the cap, got: {err}"
+        );
+    }
+
+    /// `discover_and_parse` must skip a file over the per-file cap instead of
+    /// reading it to EOF (the CLI's metadata-only check didn't protect special
+    /// files that report length 0).
+    #[test]
+    fn discover_and_parse_skips_over_limit_file() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        std::fs::write(root.join("ok.txt"), "x = 1").unwrap();
+        std::fs::write(root.join("big.txt"), "x = 1".repeat(1000)).unwrap();
+
+        let mut fm = FileManager::new(FileManagerConfig {
+            root: root.to_path_buf(),
+            include_dirs: vec![".".into()],
+            max_file_size: 100,
+            ..Default::default()
+        });
+        let files = fm.discover_and_parse().expect("discover");
+        let names: Vec<String> = files.iter().map(|f| f.logical_path.clone()).collect();
+        assert!(names.iter().any(|n| n.ends_with("ok.txt")));
+        assert!(
+            !names.iter().any(|n| n.ends_with("big.txt")),
+            "over-cap file must be skipped: {names:?}"
+        );
     }
 }

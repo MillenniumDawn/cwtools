@@ -504,6 +504,7 @@ impl Backend {
                 extensions,
                 &extra_file_globs,
                 &extra_dir_globs,
+                cwtools_file_manager::file_manager::ScanBudget::default(),
             )
         });
 
@@ -631,6 +632,7 @@ impl Backend {
         // block_in_place tells tokio this thread is about to do synchronous
         // blocking I/O; the runtime shifts its remaining tasks to other workers
         // so the LSP request loop is not starved while rayon parses.
+        let scan_bytes = cwtools_file_manager::file_manager::ScanBytes::new();
         let outcomes: Vec<Option<ParseOutcome>> = tokio::task::block_in_place(|| {
             scan_files
                 .par_iter()
@@ -658,8 +660,24 @@ impl Backend {
                         !workspace_cache::PATH_METADATA_CACHE_SUPPORTED || source_key.is_none();
                     // Read via the file manager so cp1252-encoded script files
                     // (pre-Jomini mods) are indexed instead of silently dropped.
-                    let text = match cwtools_file_manager::file_manager::read_text(&file.path) {
-                        Ok(t) => t,
+                    // The read is capped and counted against the scan byte budget.
+                    let text = match cwtools_file_manager::file_manager::read_text_capped(
+                        &file.path,
+                        crate::access::MAX_URI_READ_BYTES,
+                    ) {
+                        Ok((t, n)) => {
+                            if !scan_bytes.try_reserve(
+                                n,
+                                cwtools_file_manager::file_manager::ScanBudget::default().max_bytes,
+                            ) {
+                                tracing::warn!(
+                                    path = %file.path.display(),
+                                    "scan: skipping file, byte budget exceeded"
+                                );
+                                return None;
+                            }
+                            t
+                        }
                         Err(e) => {
                             tracing::warn!(path = %file.path.display(), error = %e, "scan: skipping unreadable file");
                             return None;
@@ -1276,7 +1294,10 @@ impl Backend {
     /// would only cost time. Blocking (stats every discovered file); call from
     /// within `block_in_place`.
     pub(crate) fn compute_loc_signature(&self, root_path: &std::path::Path) -> u64 {
-        let files = cwtools_localization::LocService::discover_files(&[root_path]);
+        let files = cwtools_localization::LocService::discover_files(
+            &[root_path],
+            cwtools_file_manager::file_manager::ScanBudget::default(),
+        );
         stat_signature_for(&files)
     }
 
@@ -1308,7 +1329,10 @@ impl Backend {
         {
             return Some(Arc::clone(loc));
         }
-        let service = cwtools_localization::LocService::from_folder(&key.0);
+        let service = cwtools_localization::LocService::from_folder(
+            &key.0,
+            cwtools_file_manager::file_manager::ScanBudget::default(),
+        );
         if service.files().is_empty() {
             tracing::warn!(dir = %key.0.display(), "base-game dir holds no localisation files");
             return None;
@@ -1381,7 +1405,10 @@ impl Backend {
                 } else {
                     self.state.vanilla_loc_keys.lock().clone()
                 };
-                let service = cwtools_localization::LocService::from_folder(root_path);
+                let service = cwtools_localization::LocService::from_folder(
+                    root_path,
+                    cwtools_file_manager::file_manager::ScanBudget::default(),
+                );
                 let mut idx = cwtools_localization::LocIndex::build_scoped(
                     &service,
                     loc_languages.as_deref(),

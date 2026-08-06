@@ -1751,8 +1751,11 @@ mod perf_bench {
         }
 
         let table = cwtools_string_table::string_table::StringTable::new();
-        let (ruleset, _errors) =
-            cwtools_rules::ruleset_loader::load_ruleset_from_dir(&rules_dir, &table);
+        let (ruleset, _errors) = cwtools_rules::ruleset_loader::load_ruleset_from_dir(
+            &rules_dir,
+            &table,
+            cwtools_file_manager::file_manager::ScanBudget::default(),
+        );
         eprintln!(
             "ruleset: {} types / {} aliases from {}",
             ruleset.types.len(),

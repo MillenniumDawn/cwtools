@@ -3,6 +3,7 @@ use crate::post_process::post_process;
 use crate::rules_converter::ast_to_ruleset;
 use crate::rules_converter::{ast_to_ruleset_raw, validate_comment_directives};
 use crate::rules_types::RuleSet;
+use cwtools_file_manager::file_manager::{ScanBudget, ScanBytes, read_text_capped};
 use cwtools_parser::ast::ParseError;
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::StringTable;
@@ -42,11 +43,14 @@ fn directory_read_error(dir: &Path, error: std::io::Error) -> RuleParseError {
     }
 }
 
-/// Recursively collect all `*.cwt` files under `dir`.
+/// Recursively collect all `*.cwt` files under `dir`. Symlinks and non-regular
+/// files are rejected outright (see `file_manager::walk_dir_generic`), and the
+/// walk stops once `remaining_files` reaches 0.
 fn collect_cwt_files(
     dir: &Path,
     out: &mut Vec<std::path::PathBuf>,
     errors: &mut Vec<RuleParseError>,
+    remaining_files: &mut usize,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -57,6 +61,9 @@ fn collect_cwt_files(
     };
 
     for entry in entries {
+        if *remaining_files == 0 {
+            break;
+        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -64,14 +71,19 @@ fn collect_cwt_files(
                 continue;
             }
         };
+        let Ok(ft) = entry.file_type() else { continue };
         let path = entry.path();
-        if path.is_dir() {
-            collect_cwt_files(&path, out, errors);
+        if ft.is_symlink() || !(ft.is_dir() || ft.is_file()) {
+            continue;
+        }
+        if ft.is_dir() {
+            collect_cwt_files(&path, out, errors, remaining_files);
         } else if path
             .extension()
             .map(|e| e.eq_ignore_ascii_case("cwt"))
             .unwrap_or(false)
         {
+            *remaining_files -= 1;
             out.push(path);
         }
     }
@@ -113,10 +125,15 @@ fn parse_folders_list(content: &str) -> Vec<String> {
 ///
 /// Returns `(ruleset, errors)`. Errors are non-fatal: files that fail to read
 /// or parse are skipped and their messages collected.
-pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<RuleParseError>) {
+pub fn load_ruleset_from_dir(
+    dir: &Path,
+    table: &StringTable,
+    budget: ScanBudget,
+) -> (RuleSet, Vec<RuleParseError>) {
     let mut cwt_files = Vec::new();
     let mut errors = Vec::new();
-    collect_cwt_files(dir, &mut cwt_files, &mut errors);
+    let mut remaining = budget.max_files;
+    collect_cwt_files(dir, &mut cwt_files, &mut errors, &mut remaining);
 
     let mut combined = RuleSet::new();
     // Lightweight reference candidates collected from each AST while it is alive.
@@ -124,47 +141,59 @@ pub fn load_ruleset_from_dir(dir: &Path, table: &StringTable) -> (RuleSet, Vec<R
     // (kind, name) records are retained for the post-merge resolution pass, so we
     // no longer pin every parsed `.cwt` file simultaneously.
     let mut ref_candidates: Vec<crate::config_validation::RefCandidate> = Vec::new();
+    let bytes = ScanBytes::new();
 
     for path in &cwt_files {
-        match std::fs::read_to_string(path) {
-            Ok(content)
-                if path
-                    .file_name()
-                    .is_some_and(|n| n.eq_ignore_ascii_case("folders.cwt")) =>
-            {
-                combined.folders.extend(parse_folders_list(&content));
-            }
-            Ok(content) => match parse_string(&content, table) {
-                Ok(parsed) => {
-                    errors.extend(validate_comment_directives(&parsed, path));
-                    let ruleset = ast_to_ruleset_raw(&parsed, table);
-                    merge_ruleset(&mut combined, ruleset);
-                    crate::config_validation::collect_reference_candidates(
-                        path,
-                        &parsed,
-                        table,
-                        &mut ref_candidates,
-                    );
-                    crate::config_validation::collect_definition_positions(
-                        path,
-                        &parsed,
-                        table,
-                        &mut combined.def_positions,
-                    );
-                }
-                Err(e) => {
-                    let (line, col, message) = match e {
-                        ParseError::Pos(l, c, m) => (l, c, m),
-                        ParseError::General(m) => (1, 0, m),
-                    };
+        match read_text_capped(path, budget.max_file_size) {
+            Ok((content, n)) => {
+                if !bytes.try_reserve(n, budget.max_bytes) {
                     errors.push(RuleParseError {
                         file: path.clone(),
-                        line,
-                        col,
-                        message: format!("parse error: {}", message),
+                        line: 1,
+                        col: 0,
+                        message: "scan byte budget exceeded".to_string(),
                     });
+                    continue;
                 }
-            },
+                if path
+                    .file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("folders.cwt"))
+                {
+                    combined.folders.extend(parse_folders_list(&content));
+                } else {
+                    match parse_string(&content, table) {
+                        Ok(parsed) => {
+                            errors.extend(validate_comment_directives(&parsed, path));
+                            let ruleset = ast_to_ruleset_raw(&parsed, table);
+                            merge_ruleset(&mut combined, ruleset);
+                            crate::config_validation::collect_reference_candidates(
+                                path,
+                                &parsed,
+                                table,
+                                &mut ref_candidates,
+                            );
+                            crate::config_validation::collect_definition_positions(
+                                path,
+                                &parsed,
+                                table,
+                                &mut combined.def_positions,
+                            );
+                        }
+                        Err(e) => {
+                            let (line, col, message) = match e {
+                                ParseError::Pos(l, c, m) => (l, c, m),
+                                ParseError::General(m) => (1, 0, m),
+                            };
+                            errors.push(RuleParseError {
+                                file: path.clone(),
+                                line,
+                                col,
+                                message: format!("parse error: {}", message),
+                            });
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 errors.push(RuleParseError {
                     file: path.clone(),
@@ -217,5 +246,55 @@ mod tests {
             a.scope_links.contains("character"),
             "scope_links lost during merge"
         );
+    }
+
+    /// The rules walk must reject symlinks: a symlink can point outside the
+    /// rules dir or into a cycle.
+    #[cfg(unix)]
+    #[test]
+    fn collect_cwt_files_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.cwt"), "types = { }\n").unwrap();
+        symlink(tmp.path().join("real.cwt"), tmp.path().join("link.cwt")).unwrap();
+
+        let mut files = Vec::new();
+        let mut errors = Vec::new();
+        let mut remaining = ScanBudget::default().max_files;
+        collect_cwt_files(tmp.path(), &mut files, &mut errors, &mut remaining);
+        assert!(errors.is_empty());
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"real.cwt".to_string()));
+        assert!(
+            !names.contains(&"link.cwt".to_string()),
+            "symlinked .cwt file must be rejected: {names:?}"
+        );
+    }
+
+    /// A `.cwt` file over the per-file cap must be skipped, not read to EOF.
+    #[test]
+    fn load_ruleset_from_dir_skips_over_limit_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ok.cwt"), "types = { }\n").unwrap();
+        std::fs::write(tmp.path().join("huge.cwt"), "x".repeat(200)).unwrap();
+
+        let table = StringTable::new();
+        let budget = ScanBudget {
+            max_file_size: 50,
+            ..ScanBudget::default()
+        };
+        let (ruleset, errors) = load_ruleset_from_dir(tmp.path(), &table, budget);
+        assert!(
+            !errors.iter().any(|e| e.file.ends_with("ok.cwt")),
+            "ok.cwt must parse clean: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.file.ends_with("huge.cwt")),
+            "over-cap file must be reported as a read error: {errors:?}"
+        );
+        let _ = ruleset;
     }
 }

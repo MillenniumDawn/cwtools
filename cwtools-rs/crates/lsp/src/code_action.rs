@@ -802,8 +802,12 @@ impl Backend {
         // One walk of the loc tree serves every candidate diagnostic and every
         // language — cheap next to the disk read, and shared instead of
         // repeated per candidate.
-        let discovered =
-            tokio::task::block_in_place(|| LocService::discover_files(&[workspace_root.as_path()]));
+        let discovered = tokio::task::block_in_place(|| {
+            LocService::discover_files(
+                &[workspace_root.as_path()],
+                cwtools_file_manager::file_manager::ScanBudget::default(),
+            )
+        });
 
         // Resolve every candidate's per-language target up front so the whole
         // batch is visible to `build_create_loc_key_batch` before any

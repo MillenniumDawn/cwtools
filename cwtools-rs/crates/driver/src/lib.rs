@@ -28,7 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use cwtools_cache::workspace::{self as workspace_cache, SourceCacheKey};
 use cwtools_file_manager::file_manager::{
-    DirectoryType, DiscoveredFile, FileError, FileManager, FileManagerConfig, classify_directory,
+    DirectoryType, DiscoveredFile, FileError, FileManager, FileManagerConfig, ScanBudget,
+    classify_directory,
 };
 use cwtools_file_manager::{FileEncoding, read_text, read_text_with_encoding};
 use cwtools_game::constants::Game;
@@ -840,28 +841,29 @@ fn parse_errors_to_validation(
 /// scopes its own per-file pass.
 fn load_loc_service(dirs: &[&Path], langs: Option<&[Lang]>) -> LocService {
     let Some(langs) = langs else {
-        return LocService::from_folders(dirs);
+        return LocService::from_folders(dirs, ScanBudget::default());
     };
     use rayon::prelude::*;
-    let files: Vec<(String, String, Option<FileEncoding>)> = LocService::discover_files(dirs)
-        .into_par_iter()
-        .filter_map(|path| {
-            // CSV loc (CK2/VIC2) carries every language in one file, keyed by
-            // column, so there is no single header language to filter on.
-            let is_csv = path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
-            let path_str = path.to_string_lossy().into_owned();
-            let (text, encoding) = read_text_with_encoding(&path).ok()?;
-            if !is_csv
-                && let Some(lang) = loc_header_language(&text, &path_str)
-                && !langs.contains(&lang)
-            {
-                return None;
-            }
-            Some((path_str, text, Some(encoding)))
-        })
-        .collect();
+    let files: Vec<(String, String, Option<FileEncoding>)> =
+        LocService::discover_files(dirs, ScanBudget::default())
+            .into_par_iter()
+            .filter_map(|path| {
+                // CSV loc (CK2/VIC2) carries every language in one file, keyed by
+                // column, so there is no single header language to filter on.
+                let is_csv = path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+                let path_str = path.to_string_lossy().into_owned();
+                let (text, encoding) = read_text_with_encoding(&path).ok()?;
+                if !is_csv
+                    && let Some(lang) = loc_header_language(&text, &path_str)
+                    && !langs.contains(&lang)
+                {
+                    return None;
+                }
+                Some((path_str, text, Some(encoding)))
+            })
+            .collect();
     LocService::from_files_with_encoding(files)
 }
 
@@ -994,7 +996,7 @@ pub fn build_vanilla_cache_aux(
     vanilla_dir: &Path,
     index: &TypeIndex,
 ) -> cwtools_index::vanilla_cache::VanillaCacheAux {
-    let loc_service = LocService::from_folders(&[vanilla_dir]);
+    let loc_service = LocService::from_folders(&[vanilla_dir], ScanBudget::default());
     let loc_keys = cwtools_localization::loc_index::per_language_keys(&loc_service);
     let mut file_index = cwtools_index::FileIndex::new();
     // Collect on-disk case so a later case-sensitive run can case-check vanilla
@@ -1156,7 +1158,7 @@ pub fn load_rules(
 ) -> Result<RuleSet, String> {
     match rules {
         RulesInput::Dir(dir) => {
-            let (ruleset, errors) = load_ruleset_from_dir(dir, table);
+            let (ruleset, errors) = load_ruleset_from_dir(dir, table, ScanBudget::default());
             if let Some(sink) = on_warning {
                 for err in &errors {
                     sink(err.to_string());
