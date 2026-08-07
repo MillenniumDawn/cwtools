@@ -729,6 +729,7 @@ impl Backend {
         uri: tower_lsp::lsp_types::Url,
         mut diagnostics: Vec<Diagnostic>,
         version: Option<i32>,
+        source_hash: Option<u64>,
     ) {
         {
             let cfg = self.state.config.read();
@@ -739,18 +740,32 @@ impl Backend {
         }
         // Keep the `fixAllWorkspace` store in lockstep with what's about to be
         // published, so a snapshot of it always matches the Problems panel.
+        // Open documents are guarded by their version; closed-file entries use
+        // the source hash captured by the validation path.
         // CW100's create-key fix has no span edit (`fixable_span_edits`
         // returns nothing for it), so it never lands here.
         let entries: Vec<(String, cwtools_parser::fix::SpanEdit)> = diagnostics
             .iter()
             .flat_map(crate::code_action::fixable_span_edits)
             .collect();
+        let content_hash = if entries.is_empty() || version.is_some() {
+            None
+        } else {
+            source_hash
+        };
         {
             let mut store = self.state.fixable_edits.lock();
-            if entries.is_empty() {
+            if entries.is_empty() || (version.is_none() && content_hash.is_none()) {
                 store.remove(uri.as_str());
             } else {
-                store.insert(uri.as_str().to_string(), entries);
+                store.insert(
+                    uri.as_str().to_string(),
+                    crate::FixableEdits {
+                        entries,
+                        version,
+                        content_hash,
+                    },
+                );
             }
         }
         self.client
@@ -767,13 +782,15 @@ impl Backend {
         uri: tower_lsp::lsp_types::Url,
         diagnostics: Vec<Diagnostic>,
         version: Option<i32>,
+        source_hash: Option<u64>,
     ) {
         let ready = self
             .state
             .index_ready
             .load(std::sync::atomic::Ordering::Relaxed);
         let diags = if ready { diagnostics } else { Vec::new() };
-        self.publish_filtered(uri, diags, version).await;
+        self.publish_filtered(uri, diags, version, source_hash)
+            .await;
     }
 
     /// Parse and validate a single document.
@@ -844,8 +861,13 @@ impl Backend {
         // race its empty publish and leave a stale diagnostic behind.
         let still_open = self.state.documents.lock().contains_key(&uri);
         if still_open && let Ok(uri_obj) = Url::parse(&uri) {
-            self.publish_gated(uri_obj, diagnostics, Some(expected_version))
-                .await;
+            self.publish_gated(
+                uri_obj,
+                diagnostics,
+                Some(expected_version),
+                Some(cwtools_cache::workspace::content_hash(&text)),
+            )
+            .await;
         }
 
         // Only sweep the other open files if this edit actually changed what the
@@ -980,7 +1002,7 @@ impl Backend {
         // the sweep). Do NOT lock documents inside this block (ABBA: request
         // handlers take documents then rules; we must take rules then
         // nothing-or-documents-after).
-        let validated: Vec<(String, i32, Vec<Diagnostic>)> = {
+        let validated: Vec<(String, i32, Vec<Diagnostic>, u64)> = {
             let rules_guard = self.state.rules.read();
             let mut out = Vec::with_capacity(others.len());
             for (uri, snapshot_version, ast, text) in others {
@@ -1016,15 +1038,20 @@ impl Backend {
                         .map(|e| parse_error_to_diagnostic(e, &lines))
                         .collect(),
                 };
-                out.push((uri, snapshot_version, diagnostics));
+                out.push((
+                    uri,
+                    snapshot_version,
+                    diagnostics,
+                    cwtools_cache::workspace::content_hash(&text),
+                ));
             }
             out
         };
         // Now check still_current without holding ruleset (documents first is
         // the order used by request handlers, so this is safe).
-        let to_publish: Vec<(String, i32, Vec<Diagnostic>)> = validated
+        let to_publish: Vec<(String, i32, Vec<Diagnostic>, u64)> = validated
             .into_iter()
-            .filter(|(uri, snapshot_version, _)| {
+            .filter(|(uri, snapshot_version, _, _)| {
                 // Skip if this dependent was itself edited while we validated it —
                 // its own debounced pass owns the fresher result.
                 let docs = self.state.documents.lock();
@@ -1033,10 +1060,15 @@ impl Backend {
                     .unwrap_or(false)
             })
             .collect();
-        for (uri, snapshot_version, diagnostics) in to_publish {
+        for (uri, snapshot_version, diagnostics, source_hash) in to_publish {
             if let Ok(uri_obj) = Url::parse(&uri) {
-                self.publish_filtered(uri_obj, diagnostics, Some(snapshot_version))
-                    .await;
+                self.publish_filtered(
+                    uri_obj,
+                    diagnostics,
+                    Some(snapshot_version),
+                    Some(source_hash),
+                )
+                .await;
             }
         }
     }
@@ -1247,7 +1279,13 @@ impl Backend {
             let lines = DocLines::new(&text, encoding.clone());
             let diags = self.validate_loc_text(&path, &text, &lines, extra);
             if let Ok(obj) = Url::parse(&u) {
-                self.publish_gated(obj, diags, None).await;
+                self.publish_gated(
+                    obj,
+                    diags,
+                    None,
+                    Some(cwtools_cache::workspace::content_hash(&text)),
+                )
+                .await;
             }
         }
     }

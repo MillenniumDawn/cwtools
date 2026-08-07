@@ -65,7 +65,7 @@ impl Backend {
         let Some(ast) = self.ast_for(&uri) else {
             return Ok(None);
         };
-        let Some(text) = self.file_text_for(&uri) else {
+        let Some(text) = self.file_text_for(&uri).await else {
             return Ok(None);
         };
         let encoding = self.state.config.read().position_encoding.clone();

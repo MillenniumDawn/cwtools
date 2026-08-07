@@ -6,7 +6,7 @@
 //! a request name `file:///dev/zero`, a device or a file anywhere on the disk.
 //! `uri_to_path_str` stays as-is for the derivations that only ever *display* or
 //! *label* a path (logical paths, loc-dir tests, graph node ids); reads go
-//! through [`Backend::read_authorized_text`] and nothing else.
+//! through [`read_authorized_text`] and nothing else.
 //!
 //! A URI is authorized when it is a `file:` URI, resolves to a regular file, and
 //! canonicalizes inside one of the roots the server was configured with (the
@@ -56,14 +56,6 @@ impl Backend {
     pub(crate) fn authorized_path(&self, uri: &str) -> Option<PathBuf> {
         let roots = self.state.config.read().authorized_roots.clone();
         authorized_path(uri, &roots)
-    }
-
-    /// The text of `uri` read from disk through the access boundary, decoded by
-    /// the shared file-manager rules (UTF-8, else cp1252). `None` when the URI
-    /// is refused, unreadable, or over [`MAX_URI_READ_BYTES`].
-    pub(crate) fn read_authorized_text(&self, uri: &str) -> Option<String> {
-        let roots = self.state.config.read().authorized_roots.clone();
-        read_authorized_text(uri, &roots, MAX_URI_READ_BYTES)
     }
 }
 

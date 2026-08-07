@@ -28,7 +28,7 @@ impl Backend {
         // `.cwt` rule file: describe the type/enum/single_alias the construct
         // under the cursor references (no game rule walk).
         if crate::paths::is_cwt_file(&uri) {
-            return Ok(self.cwt_hover(&uri, pos));
+            return Ok(self.cwt_hover(&uri, pos).await);
         }
 
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
@@ -152,9 +152,9 @@ impl Backend {
 
     /// Hover inside a `.cwt` rule file: describe the type/enum/single_alias
     /// the construct under the cursor references, plus where it is defined.
-    fn cwt_hover(&self, uri: &str, pos: Position) -> Option<Hover> {
+    async fn cwt_hover(&self, uri: &str, pos: Position) -> Option<Hover> {
         use cwtools_rules::rules_types::CwtDefKind;
-        let (kind, name) = self.cwt_ref_at_cursor(uri, pos)?;
+        let (kind, name) = self.cwt_ref_at_cursor(uri, pos).await?;
         let rules = self.state.rules.read();
         let rs = rules.ruleset.as_ref()?;
         let mut md = match kind {

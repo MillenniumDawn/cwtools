@@ -632,7 +632,7 @@ impl Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri.to_string();
-        Ok(self.tokens_for(&uri, None).map(|data| {
+        Ok(self.tokens_for(&uri, None).await.map(|data| {
             SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data,
@@ -657,7 +657,7 @@ impl Backend {
             end.line
         };
         let span = (params.range.start.line + 1, last + 1);
-        Ok(self.tokens_for(&uri, Some(span)).map(|data| {
+        Ok(self.tokens_for(&uri, Some(span)).await.map(|data| {
             SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data,
@@ -667,7 +667,7 @@ impl Backend {
 
     /// Shared body of both semantic-token requests: resolve the document, build
     /// `Prepared` if a ruleset is loaded, and encode the walk's tokens.
-    fn tokens_for(&self, uri: &str, span: Option<LineSpan>) -> Option<Vec<SemanticToken>> {
+    async fn tokens_for(&self, uri: &str, span: Option<LineSpan>) -> Option<Vec<SemanticToken>> {
         // Loc (`.yml`) and rule (`.cwt`) files aren't game ASTs; the parser's
         // script grammar doesn't describe them, so highlighting them here would
         // be worse than the client's own grammar.
@@ -675,7 +675,7 @@ impl Backend {
             return None;
         }
         let ast = self.ast_for(uri)?;
-        let text = self.file_text_for(uri)?;
+        let text = self.file_text_for(uri).await?;
         let (game, scope_checks, var_checks, encoding, ws_prefix) = {
             let cfg = self.state.config.read();
             (

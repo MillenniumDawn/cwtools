@@ -9390,6 +9390,81 @@ types = {
 }
 
 #[test]
+fn test_fix_all_workspace_skips_stale_closed_file_edits() {
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel = "common/decisions/test.txt";
+    let path = ws.path().join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "a = { limit = { } }\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    // Change a closed file after its diagnostic was published. The old fix range
+    // must not be applied to the new contents.
+    std::fs::write(&path, "a = { limit = { x = 1 } }\n").unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "fixAllWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let (resp_str, applied_edit) =
+        read_response_answering_apply_edit(&mut child, &mut reader).expect("no command response");
+    child.kill().ok();
+
+    assert!(applied_edit.is_none(), "stale fixes must not be applied");
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(
+        resp["result"].as_str(),
+        Some("Applied 0 fix(es) across 0 file(s); 1 skipped (stale)"),
+        "got: {resp_str}"
+    );
+}
+
+#[test]
 fn test_fix_all_workspace_reports_nothing_to_fix() {
     // No diagnostics ever published -> the store is empty -> the command must
     // say so without sending a `workspace/applyEdit` at all.

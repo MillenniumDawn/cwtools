@@ -11,7 +11,7 @@ use crate::paths::{
     current_token_range_with_encoding, encoded_position_len, logical_path_from_uri,
     lsp_pos_to_source_in_text, parse_uri, source_position_to_lsp,
 };
-use crate::{Backend, ParsedDoc, RuleCursorInfo};
+use crate::{Backend, FileTextSnapshot, ParsedDoc, RuleCursorInfo};
 use cwtools_info::ReferenceHint;
 
 impl Backend {
@@ -36,20 +36,28 @@ impl Backend {
 
     /// Goto for a `$KEY$` reference in a `.yml` loc file: jump to the entry the
     /// key names. `None` when the cursor isn't on a known loc-key reference.
-    fn loc_ref_goto(
+    async fn loc_ref_goto(
         &self,
         uri: &str,
         pos: Position,
         fallback: &Url,
     ) -> Option<GotoDefinitionResponse> {
         let (key, _, _) = self.loc_ref_at_cursor_doc(uri, pos)?;
+        let key = key.to_lowercase();
         let target = {
             let map = self.state.loc_locations.read();
-            let key = key.to_lowercase();
             map.get(key.as_str()).cloned()
         }?;
+        let text = self.file_text_for(target.0.as_ref()).await;
         Some(GotoDefinitionResponse::Array(vec![
-            self.source_location_at(target.0.as_ref(), target.1, 0, &key, fallback),
+            self.source_location_with_text(
+                target.0.as_ref(),
+                target.1,
+                0,
+                &key,
+                fallback,
+                text.as_deref(),
+            ),
         ]))
     }
 
@@ -71,13 +79,13 @@ impl Backend {
         // Localisation file: goto on a `$KEY$` reference jumps to the loc entry
         // it names. .yml isn't a game AST, so handle it before the rule walk.
         if crate::paths::is_loc_file(&uri) {
-            return Ok(self.loc_ref_goto(&uri, pos, fallback));
+            return Ok(self.loc_ref_goto(&uri, pos, fallback).await);
         }
 
         // `.cwt` rule file: a `<type>` / `enum[..]` / `single_alias_right[..]`
         // reference jumps to its definition in the loaded rules folder.
         if crate::paths::is_cwt_file(&uri) {
-            return Ok(self.cwt_goto(&uri, pos, fallback));
+            return Ok(self.cwt_goto(&uri, pos, fallback).await);
         }
 
         // Rule-aware lookup via the position resolver. The classified hint tells
@@ -95,26 +103,34 @@ impl Backend {
                             .map(|(file_uri, inst)| (file_uri.to_string(), inst.location))
                             .collect::<Vec<_>>()
                     };
-                    locations_at(self, defs, value, fallback)
+                    locations_at(self, defs, value, fallback).await
                 }
                 ReferenceHint::Variable { name, .. } => {
                     let defs = {
                         let svc = self.state.info_service.read();
                         svc.find_variable_definitions(name)
                     };
-                    locations_at(self, defs, name, fallback)
+                    locations_at(self, defs, name, fallback).await
                 }
                 ReferenceHint::LocRef { key } => {
+                    let key = key.to_lowercase();
                     let target = {
                         let map = self.state.loc_locations.read();
-                        let key = key.to_lowercase();
                         map.get(key.as_str()).cloned()
                     };
-                    target
-                        .map(|(file_uri, line)| {
-                            vec![self.source_location_at(file_uri.as_ref(), line, 0, key, fallback)]
-                        })
-                        .unwrap_or_default()
+                    if let Some((file_uri, line)) = target {
+                        let text = self.file_text_for(file_uri.as_ref()).await;
+                        vec![self.source_location_with_text(
+                            file_uri.as_ref(),
+                            line,
+                            0,
+                            &key,
+                            fallback,
+                            text.as_deref(),
+                        )]
+                    } else {
+                        Vec::new()
+                    }
                 }
                 ReferenceHint::FileRef { path } => self.file_ref_locations(path, fallback).await,
                 _ => Vec::new(),
@@ -166,7 +182,7 @@ impl Backend {
                 } else {
                     instances
                 };
-                let locations = dedup_locations(locations_at(self, pairs, &symbol, fallback));
+                let locations = dedup_locations(locations_at(self, pairs, &symbol, fallback).await);
                 if !locations.is_empty() {
                     return Ok(Some(GotoDefinitionResponse::Array(locations)));
                 }
@@ -183,7 +199,20 @@ impl Backend {
         if path.is_empty() {
             return Vec::new();
         }
-        let rel = std::path::Path::new(path.trim_start_matches('/'));
+        let rel = path.trim_start_matches(['/', '\\']);
+        let rel = std::path::Path::new(rel);
+        if rel.is_absolute()
+            || rel.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Vec::new();
+        }
         for root in self.search_roots() {
             let candidate = root.join(rel);
             // Async stat: a goto request must not block the runtime on a sync
@@ -200,12 +229,12 @@ impl Backend {
 
     /// The classified `.cwt` reference under the cursor, read from the line
     /// text (rule files aren't game ASTs, so no rule walk).
-    pub(crate) fn cwt_ref_at_cursor(
+    pub(crate) async fn cwt_ref_at_cursor(
         &self,
         uri: &str,
         pos: Position,
     ) -> Option<(cwtools_rules::rules_types::CwtDefKind, String)> {
-        let text = self.file_text_for(uri)?;
+        let text = self.file_text_for(uri).await?;
         let encoding = self.state.config.read().position_encoding.clone();
         let (_, col) = lsp_pos_to_source_in_text(&text, pos, &encoding);
         let line = text.lines().nth(pos.line as usize)?;
@@ -214,8 +243,13 @@ impl Backend {
 
     /// Goto inside a `.cwt`: jump to the referenced definition recorded by the
     /// ruleset loader. `None` when the cursor isn't on a resolvable reference.
-    fn cwt_goto(&self, uri: &str, pos: Position, fallback: &Url) -> Option<GotoDefinitionResponse> {
-        let (kind, name) = self.cwt_ref_at_cursor(uri, pos)?;
+    async fn cwt_goto(
+        &self,
+        uri: &str,
+        pos: Position,
+        fallback: &Url,
+    ) -> Option<GotoDefinitionResponse> {
+        let (kind, name) = self.cwt_ref_at_cursor(uri, pos).await?;
         let def = {
             let rules = self.state.rules.read();
             let rs = rules.ruleset.as_ref()?;
@@ -225,13 +259,15 @@ impl Backend {
                 .cloned()
         }?;
         let target_uri = crate::paths::path_to_uri(&def.file);
+        let text = self.file_text_for(&target_uri).await;
         Some(GotoDefinitionResponse::Array(vec![
-            self.source_location_at(
+            self.source_location_with_text(
                 &target_uri,
                 def.line.saturating_sub(1),
                 def.col as u32,
                 &name,
                 fallback,
+                text.as_deref(),
             ),
         ]))
     }
@@ -244,8 +280,12 @@ impl Backend {
             (cfg.workspace_uri.clone(), cfg.vanilla_dir.clone())
         };
         let mut roots: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(ws) = &ws_uri {
-            roots.push(std::path::PathBuf::from(crate::paths::uri_to_path_str(ws)));
+        if let Some(ws) = ws_uri
+            && let Ok(url) = Url::parse(&ws)
+            && url.scheme() == "file"
+            && let Ok(path) = url.to_file_path()
+        {
+            roots.push(path);
         }
         if let Some(v) = vanilla_dir {
             roots.push(v);
@@ -274,29 +314,39 @@ impl Backend {
 
         if let Some((type_name, instance_name)) = type_ref {
             let fallback = &params.text_document_position.text_document.uri;
-            let mut all_locs: Vec<Location> = Vec::new();
-
-            // 1. Definition location(s) from TypeIndex, unless the client asked
-            //    for use sites only.
-            if include_declaration {
-                let definitions = {
-                    let info = self.state.info_service.read();
-                    info.type_index
-                        .instances(&type_name)
-                        .iter()
-                        .filter(|(_, inst)| inst.name == instance_name)
-                        .map(|(file_uri, inst)| (file_uri.to_string(), inst.location))
-                        .collect::<Vec<_>>()
-                };
-                all_locs.extend(locations_at(self, definitions, &instance_name, fallback));
-            }
+            let definitions = if include_declaration {
+                let info = self.state.info_service.read();
+                info.type_index
+                    .instances(&type_name)
+                    .iter()
+                    .filter(|(_, inst)| inst.name == instance_name)
+                    .map(|(file_uri, inst)| (file_uri.to_string(), inst.location))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
 
             // 2. Use-sites (open docs via live AST + closed files via index).
             let sites = self.collect_use_sites(&type_name, &instance_name);
-            for (file_uri, line0, col, _) in self.resolve_value_sites(&sites, &instance_name) {
+            let mut text_uris: Vec<String> = definitions
+                .iter()
+                .map(|(file_uri, _)| file_uri.clone())
+                .collect();
+            text_uris.extend(sites.iter().map(|(file_uri, _)| file_uri.clone()));
+            let texts = self.file_text_snapshots_for(&text_uris).await;
+            let mut all_locs: Vec<Location> =
+                locations_at_with_texts(self, definitions, &instance_name, fallback, &texts);
+            for (file_uri, line0, col, _) in
+                self.resolve_value_sites(&sites, &instance_name, &texts)
+            {
                 all_locs.push(Location {
                     uri: parse_uri(&file_uri, fallback),
-                    range: self.source_range_at(&file_uri, line0, col, &instance_name),
+                    range: self.source_range_with_text(
+                        texts.get(&file_uri).map(|snapshot| snapshot.text.as_str()),
+                        line0,
+                        col,
+                        &instance_name,
+                    ),
                 });
             }
 
@@ -324,8 +374,12 @@ impl Backend {
                     info.find_references(&symbol).unwrap_or_default(),
                 )
             };
-            let mut all_locs = locations_at(self, definitions, &symbol, fallback);
-            all_locs.extend(locations_at(self, references, &symbol, fallback));
+            let mut pairs = definitions;
+            pairs.extend(references);
+            let text_uris: Vec<String> =
+                pairs.iter().map(|(file_uri, _)| file_uri.clone()).collect();
+            let texts = self.file_text_snapshots_for(&text_uris).await;
+            let all_locs = locations_at_with_texts(self, pairs, &symbol, fallback, &texts);
             if !all_locs.is_empty() {
                 return Ok(Some(all_locs));
             }
@@ -380,6 +434,7 @@ impl Backend {
         &self,
         sites: &[(String, cwtools_info::SourceLocation)],
         name: &str,
+        texts: &HashMap<String, FileTextSnapshot>,
     ) -> Vec<(String, u32, u32, bool)> {
         let mut by_file: HashMap<&str, Vec<cwtools_info::SourceLocation>> = HashMap::new();
         for (uri, loc) in sites {
@@ -387,9 +442,9 @@ impl Backend {
         }
         let mut out = Vec::new();
         for (uri, locs) in by_file {
-            let lines: Option<Vec<String>> = self
-                .file_text_for(uri)
-                .map(|t| t.lines().map(str::to_string).collect());
+            let lines: Option<Vec<&str>> = texts
+                .get(uri)
+                .map(|snapshot| snapshot.text.lines().collect());
             for loc in locs {
                 let key_line0 = loc.line.saturating_sub(1);
                 let key_col = loc.col as u32;
@@ -420,61 +475,106 @@ impl Backend {
     }
 
     /// The current text of `uri`: the open-doc buffer if open, else read from
-    /// disk (encoding-aware). `None` when neither is available.
-    ///
-    /// The buffer is checked first so a document the client opened keeps working
-    /// wherever it lives; only the disk read is subject to the URI access
-    /// boundary (see `crate::access`), which is what every per-file handler
-    /// inherits by going through here.
-    pub(crate) fn file_text_for(&self, uri: &str) -> Option<String> {
+    /// disk through the access boundary on Tokio's blocking pool.
+    pub(crate) async fn file_text_for(&self, uri: &str) -> Option<String> {
         {
             let docs = self.state.documents.lock();
             if let Some(doc) = docs.get(uri) {
                 return Some(doc.text.to_string());
             }
         }
-        self.read_authorized_text(uri)
+        let roots = self.state.config.read().authorized_roots.clone();
+        let uri = uri.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::access::read_authorized_text(&uri, &roots, crate::access::MAX_URI_READ_BYTES)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
-    fn source_range(&self, uri: &str, loc: cwtools_info::SourceLocation, token: &str) -> Range {
-        self.source_range_at(uri, loc.line.saturating_sub(1), loc.col as u32, token)
-    }
-
-    fn source_range_at(&self, uri: &str, line: u32, column: u32, token: &str) -> Range {
-        let encoding = self.state.config.read().position_encoding.clone();
-        self.file_text_for(uri).map_or_else(
-            || source_range_without_text(line, column, token, &encoding),
-            |text| source_range_in_text(&text, line, column, token, &encoding),
-        )
-    }
-
-    fn source_location(
+    pub(crate) async fn file_text_snapshots_for(
         &self,
-        uri: &str,
-        loc: cwtools_info::SourceLocation,
+        uris: &[String],
+    ) -> HashMap<String, FileTextSnapshot> {
+        let mut snapshots = HashMap::new();
+        let mut closed = Vec::new();
+        let mut seen_closed = HashSet::new();
+        {
+            let docs = self.state.documents.lock();
+            for uri in uris {
+                if let Some(doc) = docs.get(uri) {
+                    let text = doc.text.to_string();
+                    snapshots.insert(
+                        uri.clone(),
+                        FileTextSnapshot {
+                            content_hash: cwtools_cache::workspace::content_hash(&text),
+                            text,
+                            version: Some(doc.version),
+                        },
+                    );
+                } else if seen_closed.insert(uri.clone()) {
+                    closed.push(uri.clone());
+                }
+            }
+        }
+        if closed.is_empty() {
+            return snapshots;
+        }
+        let roots = self.state.config.read().authorized_roots.clone();
+        if let Ok(read) = tokio::task::spawn_blocking(move || {
+            closed
+                .into_iter()
+                .filter_map(|uri| {
+                    let text = crate::access::read_authorized_text(
+                        &uri,
+                        &roots,
+                        crate::access::MAX_URI_READ_BYTES,
+                    )?;
+                    Some((
+                        uri,
+                        FileTextSnapshot {
+                            content_hash: cwtools_cache::workspace::content_hash(&text),
+                            text,
+                            version: None,
+                        },
+                    ))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .await
+        {
+            snapshots.extend(read);
+        }
+        snapshots
+    }
+
+    fn source_range_with_text(
+        &self,
+        text: Option<&str>,
+        line: u32,
+        column: u32,
         token: &str,
-        fallback: &Url,
-    ) -> Location {
-        self.source_location_at(
-            uri,
-            loc.line.saturating_sub(1),
-            loc.col as u32,
-            token,
-            fallback,
+    ) -> Range {
+        let encoding = self.state.config.read().position_encoding.clone();
+        text.map_or_else(
+            || source_range_without_text(line, column, token, &encoding),
+            |text| source_range_in_text(text, line, column, token, &encoding),
         )
     }
 
-    fn source_location_at(
+    fn source_location_with_text(
         &self,
         uri: &str,
         line: u32,
         column: u32,
         token: &str,
         fallback: &Url,
+        text: Option<&str>,
     ) -> Location {
         Location {
             uri: parse_uri(uri, fallback),
-            range: self.source_range_at(uri, line, column, token),
+            range: self.source_range_with_text(text, line, column, token),
         }
     }
 
@@ -483,7 +583,7 @@ impl Backend {
         params: FoldingRangeParams,
     ) -> Result<Option<Vec<FoldingRange>>> {
         let uri = params.text_document.uri.to_string();
-        let Some(text) = self.file_text_for(&uri) else {
+        let Some(text) = self.file_text_for(&uri).await else {
             return Ok(None);
         };
         // Brace-matched folding over the text: the parser drops the exact `}`
@@ -503,7 +603,7 @@ impl Backend {
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
         let uri = params.text_document.uri.to_string();
-        let Some(text) = self.file_text_for(&uri) else {
+        let Some(text) = self.file_text_for(&uri).await else {
             return Ok(None);
         };
         let encoding = self.state.config.read().position_encoding.clone();
@@ -552,7 +652,7 @@ impl Backend {
             .uri
             .to_string();
         let pos = params.text_document_position_params.position;
-        let Some(text) = self.file_text_for(&uri) else {
+        let Some(text) = self.file_text_for(&uri).await else {
             return Ok(None);
         };
         // The identifier under the cursor: prefer the rule-resolved type-ref
@@ -614,7 +714,7 @@ impl Backend {
             .load(std::sync::atomic::Ordering::Relaxed)
             && let Some(ast) = self.ast_for(&uri)
         {
-            let text = self.file_text_for(&uri).unwrap_or_default();
+            let text = self.file_text_for(&uri).await.unwrap_or_default();
             let position_encoding = self.state.config.read().position_encoding.clone();
             let syms = build_doc_symbols(
                 &ast.root_children,
@@ -644,6 +744,8 @@ impl Backend {
             (instances, variables)
         };
 
+        let text = self.file_text_for(&uri).await;
+
         // Emit type instances as document symbols (one per named instance),
         // derived from the cross-file index — `FileInfo` no longer keeps a
         // per-file copy of these.
@@ -655,7 +757,12 @@ impl Backend {
                     SymbolKind::STRUCT,
                     Location {
                         uri: params.text_document.uri.clone(),
-                        range: self.source_range(&uri, loc, &name),
+                        range: self.source_range_with_text(
+                            text.as_deref(),
+                            loc.line.saturating_sub(1),
+                            loc.col as u32,
+                            &name,
+                        ),
                     },
                     Some(type_name),
                 )
@@ -669,7 +776,12 @@ impl Backend {
                 SymbolKind::CONSTANT,
                 Location {
                     uri: params.text_document.uri.clone(),
-                    range: self.source_range(&uri, loc, &name),
+                    range: self.source_range_with_text(
+                        text.as_deref(),
+                        loc.line.saturating_sub(1),
+                        loc.col as u32,
+                        &name,
+                    ),
                 },
                 None,
             ));
@@ -746,6 +858,8 @@ impl Backend {
         cands.sort_by(|a, b| (a.rank, &a.name, &a.file_uri).cmp(&(b.rank, &b.name, &b.file_uri)));
         cands.truncate(500);
 
+        let text_uris: Vec<String> = cands.iter().map(|c| c.file_uri.clone()).collect();
+        let texts = self.file_text_snapshots_for(&text_uris).await;
         let mut symbols: Vec<SymbolInformation> = Vec::with_capacity(cands.len());
         // No request document to fall back to for a workspace-wide query.
         let fallback = Url::parse("file:///unknown").expect("static URI");
@@ -753,7 +867,16 @@ impl Backend {
             symbols.push(make_symbol(
                 c.name.clone(),
                 c.kind,
-                self.source_location_at(&c.file_uri, c.line0, c.col, &c.name, &fallback),
+                self.source_location_with_text(
+                    &c.file_uri,
+                    c.line0,
+                    c.col,
+                    &c.name,
+                    &fallback,
+                    texts
+                        .get(&c.file_uri)
+                        .map(|snapshot| snapshot.text.as_str()),
+                ),
                 c.container,
             ));
         }
@@ -776,7 +899,11 @@ impl Backend {
 
         // `@` script constant first: the sigil marks it unambiguously, and the
         // rule walk can misclassify an `@` read as a type reference.
-        if let Some((_, range)) = self.at_var_rename_target(&uri, pos) {
+        let text = self.file_text_for(&uri).await;
+        let position_encoding = self.state.config.read().position_encoding.clone();
+        if let Some(text) = text.as_deref()
+            && let Some((_, range)) = Self::at_var_rename_target(text, pos, &position_encoding)
+        {
             return Ok(Some(PrepareRenameResponse::Range(range)));
         }
 
@@ -786,27 +913,11 @@ impl Backend {
             // Return a range covering the whole instance-name token. Anchor the
             // start at the token's beginning (so a mid-token cursor doesn't
             // rename a shifted span) and extend by the name's length.
-            let text = {
-                let docs = self.state.documents.lock();
-                docs.get(&uri).map(|d| d.text.clone())
-            };
-            let position_encoding = self.state.config.read().position_encoding.clone();
             let range =
                 prepare_rename_range(text.as_deref(), pos, &instance_name, &position_encoding);
             return Ok(Some(PrepareRenameResponse::Range(range)));
         }
         Ok(None)
-    }
-
-    /// The `@name` constant under the cursor in `uri`, as (token, LSP range
-    /// over it). `None` when the cursor isn't on one or the text is missing.
-    fn at_var_rename_target(&self, uri: &str, pos: Position) -> Option<(String, Range)> {
-        let text = self.file_text_for(uri)?;
-        let encoding = self.state.config.read().position_encoding.clone();
-        let (_, col) = lsp_pos_to_source_in_text(&text, pos, &encoding);
-        let (name, start_col) = at_var_at_cursor(&text, pos.line, col as u32)?;
-        let range = source_range_in_text(&text, pos.line, start_col, &name, &encoding);
-        Some((name, range))
     }
 
     /// File-local rename of an `@name` script constant: every comment-aware
@@ -815,18 +926,15 @@ impl Backend {
     fn rename_at_var(
         &self,
         uri: &str,
+        text: &str,
         name: &str,
         new_name: &str,
     ) -> Result<Option<WorkspaceEdit>> {
-        let Some(text) = self.file_text_for(uri) else {
-            return Ok(None);
-        };
         let encoding = self.state.config.read().position_encoding.clone();
         let edits: Vec<TextEdit> = text
             .lines()
             .enumerate()
             .flat_map(|(line0, line)| {
-                let text = &text;
                 let encoding = &encoding;
                 code_token_cols_in_line(line, name)
                     .into_iter()
@@ -844,6 +952,17 @@ impl Backend {
             return Err(refused);
         }
         Ok(Some(self.build_workspace_edit(by_uri)))
+    }
+
+    fn at_var_rename_target(
+        text: &str,
+        pos: Position,
+        encoding: &PositionEncodingKind,
+    ) -> Option<(String, Range)> {
+        let (_, col) = lsp_pos_to_source_in_text(text, pos, encoding);
+        let (name, start_col) = at_var_at_cursor(text, pos.line, col as u32)?;
+        let range = source_range_in_text(text, pos.line, start_col, &name, encoding);
+        Some((name, range))
     }
 
     /// The refusal for the first URI in `by_uri` a generated edit may not write
@@ -934,8 +1053,12 @@ impl Backend {
 
         // `@` script constant first: the sigil marks it unambiguously, and the
         // rule walk can misclassify an `@` read as a type reference.
-        if let Some((name, _)) = self.at_var_rename_target(&uri, pos) {
-            return self.rename_at_var(&uri, &name, &new_name);
+        let position_encoding = self.state.config.read().position_encoding.clone();
+        let source_text = self.file_text_for(&uri).await;
+        if let Some(text) = source_text.as_deref()
+            && let Some((name, _)) = Self::at_var_rename_target(text, pos, &position_encoding)
+        {
+            return self.rename_at_var(&uri, text, &name, &new_name);
         }
 
         // Identify what's under the cursor
@@ -968,7 +1091,10 @@ impl Backend {
         // Use sites: resolve each value column from text. Refuse (rather than
         // corrupt) if any recorded reference can't be located in text.
         let sites = self.collect_use_sites(&type_name, &instance_name);
-        let resolved = self.resolve_value_sites(&sites, &instance_name);
+        let mut text_uris: Vec<String> = edits.iter().map(|(uri, _, _)| uri.clone()).collect();
+        text_uris.extend(sites.iter().map(|(uri, _)| uri.clone()));
+        let texts = self.file_text_snapshots_for(&text_uris).await;
+        let resolved = self.resolve_value_sites(&sites, &instance_name, &texts);
         let unresolved = resolved.iter().filter(|(_, _, _, ok)| !ok).count();
         if unresolved > 0 {
             return Err(tower_lsp::jsonrpc::Error {
@@ -1000,7 +1126,12 @@ impl Backend {
                 continue;
             }
             let edit = TextEdit {
-                range: self.source_range_at(&file_uri, line0, col, &instance_name),
+                range: self.source_range_with_text(
+                    texts.get(&file_uri).map(|snapshot| snapshot.text.as_str()),
+                    line0,
+                    col,
+                    &instance_name,
+                ),
                 new_text: new_name.clone(),
             };
             by_uri.entry(file_uri).or_default().push(edit);
@@ -1816,17 +1947,38 @@ pub(crate) fn unquote(s: &str) -> &str {
 }
 
 /// Build Locations from `(file_uri, location)` pairs, each highlighting a token
-/// of `name`'s length. Callers snapshot indexed data before invoking this helper
-/// so range conversion never runs while an index guard is held.
-fn locations_at(
+/// of `name`'s length. Text is fetched in one batch before the pure conversion.
+async fn locations_at(
     backend: &Backend,
     pairs: impl IntoIterator<Item = (String, cwtools_info::SourceLocation)>,
     name: &str,
     fallback: &Url,
 ) -> Vec<Location> {
+    let pairs: Vec<_> = pairs.into_iter().collect();
+    let uris: Vec<String> = pairs.iter().map(|(file_uri, _)| file_uri.clone()).collect();
+    let texts = backend.file_text_snapshots_for(&uris).await;
+    locations_at_with_texts(backend, pairs, name, fallback, &texts)
+}
+
+fn locations_at_with_texts(
+    backend: &Backend,
+    pairs: impl IntoIterator<Item = (String, cwtools_info::SourceLocation)>,
+    name: &str,
+    fallback: &Url,
+    texts: &HashMap<String, FileTextSnapshot>,
+) -> Vec<Location> {
     pairs
         .into_iter()
-        .map(|(file_uri, loc)| backend.source_location(&file_uri, loc, name, fallback))
+        .map(|(file_uri, loc)| {
+            backend.source_location_with_text(
+                &file_uri,
+                loc.line.saturating_sub(1),
+                loc.col as u32,
+                name,
+                fallback,
+                texts.get(&file_uri).map(|snapshot| snapshot.text.as_str()),
+            )
+        })
         .collect()
 }
 
