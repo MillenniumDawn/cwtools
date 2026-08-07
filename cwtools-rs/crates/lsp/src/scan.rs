@@ -627,8 +627,9 @@ impl Backend {
         // `par_iter().collect()` preserves file order, so `outcomes[i]`
         // corresponds to `scan_files[i]`.
         use rayon::prelude::*;
-        // (cache_hit, parsed) per file; None = open doc, parse failure, or read error.
-        type ParseOutcome = (bool, cwtools_parser::ast::ParsedFile);
+        // (cache_hit, parsed, source_hash) per file; None = open doc, parse
+        // failure, or read error.
+        type ParseOutcome = (bool, cwtools_parser::ast::ParsedFile, Option<u64>);
         // block_in_place tells tokio this thread is about to do synchronous
         // blocking I/O; the runtime shifts its remaining tasks to other workers
         // so the LSP request loop is not starved while rayon parses.
@@ -644,14 +645,24 @@ impl Backend {
                         return None;
                     }
                     if let Some((ref cd, fp)) = cache_info
-                        && let Some((parsed, _)) = workspace_cache::load_path(
+                        && let Some((parsed, source_key)) = workspace_cache::load_path(
                             cd,
                             fp,
                             &file.path,
                             &self.state.string_table,
                         )
                     {
-                        return Some((true, parsed));
+                        let source_hash = cwtools_file_manager::file_manager::read_text_capped(
+                            &file.path,
+                            crate::access::MAX_URI_READ_BYTES,
+                        )
+                        .ok()
+                        .and_then(|(text, _)| {
+                            (workspace_cache::source_cache_key(&file.path).as_ref()
+                                == Some(&source_key))
+                                .then(|| cwtools_cache::workspace::content_hash(&text))
+                        });
+                        return Some((true, parsed, source_hash));
                     }
                     let source_key = (workspace_cache::PATH_METADATA_CACHE_SUPPORTED)
                         .then(|| workspace_cache::source_cache_key(&file.path))
@@ -692,7 +703,11 @@ impl Backend {
                             &self.state.string_table,
                         )
                     {
-                        return Some((true, parsed));
+                        return Some((
+                            true,
+                            parsed,
+                            Some(cwtools_cache::workspace::content_hash(&text)),
+                        ));
                     }
                     let parsed =
                         parse_string_without_comments(&text, &self.state.string_table).ok()?;
@@ -716,13 +731,17 @@ impl Backend {
                             );
                         }
                     }
-                    Some((false, parsed))
+                    Some((
+                        false,
+                        parsed,
+                        Some(cwtools_cache::workspace::content_hash(&text)),
+                    ))
                 })
                 .collect()
         });
         let wrote_cache = outcomes
             .iter()
-            .any(|outcome| outcome.as_ref().is_some_and(|(hit, _)| !hit));
+            .any(|outcome| outcome.as_ref().is_some_and(|(hit, _, _)| !hit));
         if wrote_cache && let Some((cache_dir, fingerprint)) = cache_info.as_ref() {
             workspace_cache::prune(cache_dir, *fingerprint);
         }
@@ -730,18 +749,23 @@ impl Backend {
         // Serial index phase, in file order.
         let mut parsed_files: Vec<Option<cwtools_parser::ast::ParsedFile>> =
             Vec::with_capacity(scan_files.len());
+        let mut source_hashes: Vec<Option<u64>> = Vec::with_capacity(scan_files.len());
         for (i, (file, outcome)) in scan_files.iter().zip(outcomes).enumerate() {
             let parsed = match outcome {
-                Some((cache_hit, parsed)) => {
+                Some((cache_hit, parsed, source_hash)) => {
                     self.index_parsed_file(&file.uri, &parsed, None);
                     if cache_hit {
                         cache_hits += 1;
                     } else {
                         cache_misses += 1;
                     }
+                    source_hashes.push(source_hash);
                     Some(parsed)
                 }
-                None => None,
+                None => {
+                    source_hashes.push(None);
+                    None
+                }
             };
             parsed_files.push(parsed);
             // A quiet background pass shares the runtime with live requests
@@ -944,7 +968,8 @@ impl Backend {
         } else {
             Vec::new()
         };
-        let results: Vec<(String, Vec<Diagnostic>)> = {
+        type ValidationOutcome = (String, Vec<Diagnostic>, Option<UsedInstances>, Option<u64>);
+        let results: Vec<(String, Vec<Diagnostic>, Option<u64>)> = {
             let info_guard = self.state.info_service.read();
             let loc_guard = self.state.loc_index.read();
             let type_index = &info_guard.type_index;
@@ -969,10 +994,11 @@ impl Backend {
                 )
             });
 
-            let mut results: Vec<(String, Vec<Diagnostic>, Option<UsedInstances>)> = scan_files
+            let mut results: Vec<ValidationOutcome> = scan_files
                 .par_iter()
                 .zip(parsed_files.par_iter())
-                .filter_map(|(file, parsed_opt)| {
+                .zip(source_hashes.par_iter())
+                .filter_map(|((file, parsed_opt), source_hash)| {
                     // Skip files that failed to parse in pass 1, and open docs
                     // whose fresher in-memory diagnostics must not be overwritten.
                     let parsed = parsed_opt.as_ref()?;
@@ -997,7 +1023,7 @@ impl Backend {
                             None,
                         ),
                     };
-                    Some((file.uri.clone(), diagnostics, used))
+                    Some((file.uri.clone(), diagnostics, used, *source_hash))
                 })
                 .collect();
 
@@ -1030,7 +1056,7 @@ impl Backend {
                 let merged = {
                     let mut store = self.state.type_uses.write();
                     store.retain(|uri, _| open_uris.contains(uri));
-                    for (uri, _, used) in &mut results {
+                    for (uri, _, used, _) in &mut results {
                         store.insert(uri.clone(), used.take().unwrap_or_default());
                     }
                     for (uri, used) in open_uses {
@@ -1051,7 +1077,7 @@ impl Backend {
                 // Open docs get the same check from the post-scan
                 // `revalidate_all_open_docs`, which reads the store just built.
                 let no_lines = DocLines::none();
-                for (uri, diagnostics, _) in &mut results {
+                for (uri, diagnostics, _, _) in &mut results {
                     let file: cwtools_validation::FilePath = uri.as_str().into();
                     for err in check_unused_instances(
                         prepared.ruleset,
@@ -1067,19 +1093,20 @@ impl Backend {
 
             results
                 .into_iter()
-                .map(|(uri, diagnostics, _)| (uri, diagnostics))
+                .map(|(uri, diagnostics, _, source_hash)| (uri, diagnostics, source_hash))
                 .collect()
             // info_guard / loc_guard dropped here, before any await.
         };
 
-        for (i, (uri, diagnostics)) in results.into_iter().enumerate() {
+        for (i, (uri, diagnostics, source_hash)) in results.into_iter().enumerate() {
             total_errors += diagnostics
                 .iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
                 .count();
 
             if let Ok(uri_obj) = Url::parse(&uri) {
-                self.publish_filtered(uri_obj, diagnostics, None).await;
+                self.publish_filtered(uri_obj, diagnostics, None, source_hash)
+                    .await;
             }
             if i % 50 == 49 {
                 tokio::task::yield_now().await;
@@ -1276,8 +1303,13 @@ impl Backend {
                 continue;
             }
             if let Ok(uri_obj) = Url::parse(&uri) {
-                self.publish_filtered(uri_obj, diagnostics, Some(version))
-                    .await;
+                self.publish_filtered(
+                    uri_obj,
+                    diagnostics,
+                    Some(version),
+                    Some(cwtools_cache::workspace::content_hash(&text)),
+                )
+                .await;
             }
         }
     }
@@ -1390,7 +1422,7 @@ impl Backend {
 
         // block_in_place: the loc service reads and parses hundreds of loc files
         // from disk — synchronous I/O that must not starve the async executor.
-        let (loc_index, mut by_file, loc_text_map, loc_loc_map) =
+        let (loc_index, mut by_file, loc_text_map, loc_loc_map, source_hashes) =
             tokio::task::block_in_place(|| {
                 // The base game is read once per session and reused; only the
                 // workspace is walked again (#89).
@@ -1454,6 +1486,23 @@ impl Backend {
                     by_file.entry(file.path.clone()).or_default();
                 }
                 collect_loc_display(&service, &idx, primary_lang, hover_all, &mut lt, &mut ll);
+                let source_hashes = by_file
+                    .iter()
+                    .filter_map(|(file, diagnostics)| {
+                        let has_fix = diagnostics
+                            .iter()
+                            .any(|d| !crate::code_action::fixable_span_edits(d).is_empty());
+                        if !has_fix {
+                            return None;
+                        }
+                        let (text, _) = cwtools_file_manager::file_manager::read_text_capped(
+                            std::path::Path::new(file),
+                            crate::access::MAX_URI_READ_BYTES,
+                        )
+                        .ok()?;
+                        Some((file.clone(), cwtools_cache::workspace::content_hash(&text)))
+                    })
+                    .collect::<HashMap<_, _>>();
                 // Fold the base game in under the workspace: a key the mod
                 // redefines keeps the mod's definition site, and its hover shows
                 // the mod's text first.
@@ -1467,7 +1516,7 @@ impl Backend {
                         ll.entry(Arc::clone(key)).or_insert_with(|| loc.clone());
                     }
                 }
-                (idx, by_file, lt, ll)
+                (idx, by_file, lt, ll, source_hashes)
             });
         // Prefix-searchable companion for loc completion, built here so the
         // per-keystroke path never pays for it. block_in_place: sorting ~400K
@@ -1483,11 +1532,18 @@ impl Backend {
         *self.state.loc_locations.write() = loc_loc_map;
 
         // Publish per-file loc diagnostics, but only for workspace loc files
-        // (not vanilla). Group by file so each gets a complete diagnostic set.
+        // (not vanilla). Open loc documents are revalidated from their live
+        // buffers after the index is installed, so disk diagnostics must not
+        // overwrite them here.
+        let open_uris: HashSet<String> = self.state.documents.lock().keys().cloned().collect();
         for (file, diags) in by_file.drain() {
             let uri = path_to_uri(std::path::Path::new(&file));
+            if open_uris.contains(&uri) {
+                continue;
+            }
             if let Ok(uri_obj) = Url::parse(&uri) {
-                self.publish_filtered(uri_obj, diags, None).await;
+                self.publish_filtered(uri_obj, diags, None, source_hashes.get(&file).copied())
+                    .await;
             }
         }
         cwtools_profiling::log_rss("loc_rebuild_done");
@@ -1962,7 +2018,13 @@ impl Backend {
                                 .insert(uri.clone(), sig);
                         }
                         if let Ok(uri_obj) = Url::parse(&uri) {
-                            self.publish_gated(uri_obj, diagnostics, None).await;
+                            self.publish_gated(
+                                uri_obj,
+                                diagnostics,
+                                None,
+                                Some(cwtools_cache::workspace::content_hash(&text)),
+                            )
+                            .await;
                         }
                     }
                     Ok(None) => {

@@ -527,16 +527,17 @@ struct DocumentState {
     watched_signatures: Mutex<HashMap<String, (u64, u128)>>,
     /// Per-URI span edits of the diagnostics currently published for that file
     /// (parser-convention ranges — the same `SpanEdit` shape a `SuggestedFix`
-    /// carries), tagged with the diagnostic's code. Replaced wholesale on
+    /// carries), tagged with the diagnostic's code and the source version or
+    /// content hash the edits were computed against. Replaced wholesale on
     /// every `publish_filtered` call (scan, keystroke, loc rebuild), so it
     /// always matches what the client's Problems panel shows; a URI with
     /// nothing fixable has no entry. Backs the `fixAllWorkspace` command: it
     /// snapshots this store instead of re-running validation, so "fix all in
-    /// the workspace" fixes exactly the diagnostics currently visible. CW100's
-    /// create-key fix is excluded by construction (its payload carries no span
-    /// edits, see `SuggestedFix::create_loc_key`) — `genlocall` covers mass
-    /// stub generation instead.
-    fixable_edits: Mutex<HashMap<String, Vec<(String, cwtools_parser::fix::SpanEdit)>>>,
+    /// the workspace" fixes exactly the diagnostics currently visible and
+    /// drops stale entries. CW100's create-key fix is excluded by construction
+    /// (its payload carries no span edits, see `SuggestedFix::create_loc_key`) —
+    /// `genlocall` covers mass stub generation instead.
+    fixable_edits: Mutex<HashMap<String, FixableEdits>>,
 }
 
 /// Write access to a loc overlay that bumps `loc_overlay_revision` on drop,
@@ -597,6 +598,19 @@ pub(crate) struct ParsedDoc {
     pub(crate) ast_version: Option<i32>,
 }
 
+pub(crate) struct FileTextSnapshot {
+    pub(crate) text: String,
+    pub(crate) version: Option<i32>,
+    pub(crate) content_hash: u64,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct FixableEdits {
+    pub(crate) entries: Vec<(String, cwtools_parser::fix::SpanEdit)>,
+    pub(crate) version: Option<i32>,
+    pub(crate) content_hash: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AstSource {
     StoredCurrent,
@@ -639,6 +653,7 @@ pub(crate) enum DeferredRulesMessage {
 pub(crate) enum ValidateTrigger {
     DidOpen,
     DidSave,
+    DidClose,
     Watched,
     DidChange,
     ConfigChange,
@@ -650,6 +665,7 @@ impl ValidateTrigger {
         match self {
             ValidateTrigger::DidOpen => "didOpen",
             ValidateTrigger::DidSave => "didSave",
+            ValidateTrigger::DidClose => "didClose",
             ValidateTrigger::Watched => "watched",
             ValidateTrigger::DidChange => "didChange",
             ValidateTrigger::ConfigChange => "configChange",
@@ -1538,6 +1554,23 @@ impl LanguageServer for Backend {
             return;
         }
 
+        let disk_loc_text = if crate::paths::is_loc_file(&uri) {
+            let roots = self.state.config.read().authorized_roots.clone();
+            let uri_for_read = uri.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::access::read_authorized_text(
+                    &uri_for_read,
+                    &roots,
+                    crate::access::MAX_URI_READ_BYTES,
+                )
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
         let (exports_before, names_before) = {
             let info = self.state.info_service.read();
             (info.export_fingerprint(&uri), info.export_names(&uri))
@@ -1625,6 +1658,24 @@ impl LanguageServer for Backend {
             self.client
                 .publish_diagnostics(params.text_document.uri, vec![], None)
                 .await;
+            if let Some(text) = disk_loc_text
+                && !self.state.documents.lock().contains_key(&uri)
+            {
+                let (diagnostics, _) = self
+                    .parse_and_validate(&uri, &text, ValidateTrigger::DidClose, None)
+                    .await;
+                if !self.state.documents.lock().contains_key(&uri)
+                    && let Ok(uri_obj) = Url::parse(&uri)
+                {
+                    self.publish_gated(
+                        uri_obj,
+                        diagnostics,
+                        None,
+                        Some(cwtools_cache::workspace::content_hash(&text)),
+                    )
+                    .await;
+                }
+            }
         }
 
         let mut changed_names: HashSet<String> = names_before

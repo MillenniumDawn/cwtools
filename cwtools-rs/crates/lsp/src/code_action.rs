@@ -720,7 +720,7 @@ impl Backend {
         // The document text is needed for the encoding-aware column conversion.
         // Without it (doc neither open nor readable) no correct edit can be
         // produced, so offer no action rather than a mis-ranged one.
-        let Some(text) = self.file_text_for(uri.as_str()) else {
+        let Some(text) = self.file_text_for(uri.as_str()).await else {
             return Ok(None);
         };
         let encoding = self.state.config.read().position_encoding.clone();
@@ -733,11 +733,10 @@ impl Backend {
                 &text,
                 &encoding,
             ));
-            actions.extend(self.create_loc_key_actions(
-                &uri,
-                &params.context.diagnostics,
-                &encoding,
-            ));
+            actions.extend(
+                self.create_loc_key_actions(&uri, &params.context.diagnostics, &encoding)
+                    .await,
+            );
         }
         if wants(only, &CodeActionKind::SOURCE_FIX_ALL)
             && let Some(action) =
@@ -760,7 +759,7 @@ impl Backend {
     /// instead of each inserting their own (#142). A candidate is silently
     /// dropped when there's no workspace to anchor a path in, or any of its
     /// languages fails to resolve.
-    fn create_loc_key_actions(
+    async fn create_loc_key_actions(
         &self,
         uri: &Url,
         diagnostics: &[Diagnostic],
@@ -802,47 +801,63 @@ impl Backend {
         // One walk of the loc tree serves every candidate diagnostic and every
         // language — cheap next to the disk read, and shared instead of
         // repeated per candidate.
-        let discovered = tokio::task::block_in_place(|| {
+        let discovered_root = workspace_root.clone();
+        let discovered = tokio::task::spawn_blocking(move || {
+            let roots = [discovered_root.as_path()];
             LocService::discover_files(
-                &[workspace_root.as_path()],
+                &roots,
                 cwtools_file_manager::file_manager::ScanBudget::default(),
             )
-        });
+        })
+        .await
+        .unwrap_or_default();
 
         // Resolve every candidate's per-language target up front so the whole
         // batch is visible to `build_create_loc_key_batch` before any
         // operation is built.
-        let loc_locations = self.state.loc_locations.read();
-        let resolved: Vec<LocKeyCandidate<'_>> = candidates
-            .into_iter()
-            .filter_map(|(diag, title, key)| {
-                let siblings = self.sibling_loc_keys_for_diagnostic(uri, diag, &key);
-                let targets = langs
-                    .iter()
-                    .map(|&lang| {
-                        resolve_loc_insert_target(
-                            lang,
-                            &siblings,
-                            &loc_locations,
-                            &edit_roots,
-                            &discovered,
-                            &workspace_root,
-                        )
-                        .map(|target| (lang, target))
+        let resolved: Vec<LocKeyCandidate<'_>> = {
+            let loc_locations = self.state.loc_locations.read();
+            candidates
+                .into_iter()
+                .filter_map(|(diag, title, key)| {
+                    let siblings = self.sibling_loc_keys_for_diagnostic(uri, diag, &key);
+                    let targets = langs
+                        .iter()
+                        .map(|&lang| {
+                            resolve_loc_insert_target(
+                                lang,
+                                &siblings,
+                                &loc_locations,
+                                &edit_roots,
+                                &discovered,
+                                &workspace_root,
+                            )
+                            .map(|target| (lang, target))
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    Some(LocKeyCandidate {
+                        diag,
+                        title,
+                        key,
+                        targets,
                     })
-                    .collect::<Option<Vec<_>>>()?;
-                Some(LocKeyCandidate {
-                    diag,
-                    title,
-                    key,
-                    targets,
                 })
+                .collect()
+        };
+
+        let target_uris: Vec<String> = resolved
+            .iter()
+            .flat_map(|candidate| candidate.targets.iter())
+            .map(|(_, target)| match target {
+                LocInsertTarget::ExistingFileAfterLine { uri, .. }
+                | LocInsertTarget::ExistingFileAppend { uri }
+                | LocInsertTarget::NewFile { uri } => uri.to_string(),
             })
             .collect();
-        drop(loc_locations);
+        let texts = self.file_text_snapshots_for(&target_uris).await;
 
         build_create_loc_key_batch(&resolved, |target, stub| {
-            self.loc_insert_operations(target, stub, encoding)
+            self.loc_insert_operations(target, stub, encoding, &texts)
         })
         .into_iter()
         .map(CodeActionOrCommand::CodeAction)
@@ -889,28 +904,25 @@ impl Backend {
     }
 
     /// The `Edit` operations for the two existing-file `LocInsertTarget`
-    /// variants: reads the target's current text via `file_text_for`
-    /// (open-doc buffer or disk) to find the insertion point. `NewFile` is
-    /// `None` here — `build_create_loc_key_batch` builds and dedupes it
-    /// directly instead, since it needs no file read and several candidates
-    /// in a batch can share one (#142).
+    /// variants. `NewFile` is `None` here — `build_create_loc_key_batch` builds
+    /// and dedupes it directly instead, since it needs no file read (#142).
     fn loc_insert_operations(
         &self,
         target: &LocInsertTarget,
         stub: &str,
         encoding: &PositionEncodingKind,
+        texts: &HashMap<String, crate::FileTextSnapshot>,
     ) -> Option<Vec<DocumentChangeOperation>> {
         match target {
             LocInsertTarget::ExistingFileAfterLine { uri, after_line0 } => {
-                let text = self.file_text_for(uri.as_str())?;
-                let (pos, insert_text) =
-                    insert_stub_after_line(&text, *after_line0, stub, encoding);
+                let text = texts.get(uri.as_str())?.text.as_str();
+                let (pos, insert_text) = insert_stub_after_line(text, *after_line0, stub, encoding);
                 Some(vec![insert_edit_op(uri.clone(), pos, insert_text)])
             }
             LocInsertTarget::ExistingFileAppend { uri } => {
-                let text = self.file_text_for(uri.as_str())?;
+                let text = texts.get(uri.as_str())?.text.as_str();
                 let last_line0 = text.lines().count().saturating_sub(1) as u32;
-                let (pos, insert_text) = insert_stub_after_line(&text, last_line0, stub, encoding);
+                let (pos, insert_text) = insert_stub_after_line(text, last_line0, stub, encoding);
                 Some(vec![insert_edit_op(uri.clone(), pos, insert_text)])
             }
             LocInsertTarget::NewFile { .. } => None,
@@ -993,6 +1005,39 @@ fn workspace_edit_changes(
     changes
 }
 
+/// Build the negotiated workspace edit from the exact snapshots used to
+/// calculate its ranges. Versioned document changes prevent a supported client
+/// from applying edits to a newer open-document version.
+fn workspace_edit_for_snapshots(
+    changes: HashMap<Url, Vec<TextEdit>>,
+    snapshots: &HashMap<String, crate::FileTextSnapshot>,
+    document_changes: bool,
+) -> WorkspaceEdit {
+    if document_changes {
+        let edits = changes
+            .into_iter()
+            .map(|(uri, edits)| TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    version: snapshots.get(uri.as_str()).and_then(|s| s.version),
+                    uri,
+                },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            })
+            .collect();
+        WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Edits(edits)),
+            change_annotations: None,
+        }
+    } else {
+        WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }
+    }
+}
+
 /// The command's result message when every fixable file was refused by the
 /// edit boundary. Distinct from the empty-store message: the problems are real
 /// and the user can see them in the panel, they just aren't in a file cwtools
@@ -1001,14 +1046,47 @@ fn outside_workspace_summary(refused: usize) -> String {
     format!("Skipped {refused} file(s) with auto-fixable problems: they are outside the workspace.")
 }
 
-/// The command's result message on success:
-/// `"Applied N fix(es) across M file(s)"`, with an `"; K skipped
-/// (overlapping)"` suffix when any edit was dropped for overlapping — the
-/// same wording the CLI `fix --apply` subcommand uses.
-fn fix_all_workspace_summary(edits_applied: usize, files_changed: usize, skipped: usize) -> String {
+fn fixable_edits_match(
+    expected: &crate::FixableEdits,
+    current: Option<&crate::FileTextSnapshot>,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    expected.version.map_or_else(
+        || {
+            expected
+                .content_hash
+                .is_some_and(|hash| hash == current.content_hash)
+        },
+        |version| current.version == Some(version),
+    )
+}
+
+/// The command's result message on success. Stale and overlapping edits are
+/// reported separately from files refused by the workspace edit boundary.
+fn fix_all_workspace_summary(
+    edits_applied: usize,
+    files_changed: usize,
+    skipped_stale: usize,
+    skipped_overlapping: usize,
+    skipped_outside: usize,
+) -> String {
     let mut msg = format!("Applied {edits_applied} fix(es) across {files_changed} file(s)");
+    let skipped = skipped_stale + skipped_overlapping;
     if skipped > 0 {
-        msg.push_str(&format!("; {skipped} skipped (overlapping)"));
+        let reason = match (skipped_stale > 0, skipped_overlapping > 0) {
+            (true, true) => format!("{skipped_stale} stale, {skipped_overlapping} overlapping"),
+            (true, false) => "stale".to_string(),
+            (false, true) => "overlapping".to_string(),
+            (false, false) => unreachable!(),
+        };
+        msg.push_str(&format!("; {skipped} skipped ({reason})"));
+    }
+    if skipped_outside > 0 {
+        msg.push_str(&format!(
+            "; {skipped_outside} file(s) skipped (outside workspace)"
+        ));
     }
     msg
 }
@@ -1017,52 +1095,101 @@ impl Backend {
     /// `fixAllWorkspace` execute-command handler. Returns the message shown to
     /// the user (no result payload otherwise): a "nothing to do" message when
     /// the store is empty or every entry resolved to zero edits, a "skipped"
-    /// message when the only fixable files were outside the workspace, an error
-    /// message when the client rejects the `workspace/applyEdit`, else the
-    /// summary from [`fix_all_workspace_summary`].
+    /// message when the only fixable files were outside the workspace, stale
+    /// edits are dropped and counted, an error message when the client rejects
+    /// the `workspace/applyEdit`, else the summary from
+    /// [`fix_all_workspace_summary`].
     pub(crate) async fn fix_all_workspace_impl(&self) -> String {
-        // Cloned out of the lock before the boundary runs: `publish_filtered`
-        // takes this mutex on the validation hot path, and the boundary stats
-        // and canonicalizes once per URI.
         let mut snapshot = self.state.fixable_edits.lock().clone();
         if snapshot.is_empty() {
             return "No auto-fixable problems in the workspace.".to_string();
         }
-        // The store is keyed by every URI that ever published a diagnostic,
-        // which includes files the scan reached through a symlink and anything
-        // the client opened, so the edit boundary decides what may be written
-        // (#160). Filtered here rather than at store time: this is one
-        // `canonicalize` per fixable file on a user-initiated command, where
-        // filtering on publish would be one per file on every scan.
+
+        // The edit boundary is workspace-only and performs synchronous
+        // canonicalization, so keep it off the request worker too (#160).
         let edit_roots = self.state.config.read().editable_roots.clone();
+        let candidate_uris: Vec<String> = snapshot.keys().cloned().collect();
+        let editable = tokio::task::spawn_blocking(move || {
+            candidate_uris
+                .into_iter()
+                .filter(|uri| crate::access::editable_path(uri, &edit_roots).is_ok())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .await
+        .unwrap_or_default();
         let fixable = snapshot.len();
-        snapshot.retain(|uri, _| crate::access::editable_path(uri, &edit_roots).is_ok());
+        snapshot.retain(|uri, _| editable.contains(uri));
         let refused = fixable - snapshot.len();
         if snapshot.is_empty() {
             return outside_workspace_summary(refused);
         }
-        let texts: HashMap<String, String> = snapshot
-            .keys()
-            .filter_map(|uri| self.file_text_for(uri).map(|t| (uri.clone(), t)))
+
+        let uris: Vec<String> = snapshot.keys().cloned().collect();
+        let current = self.file_text_snapshots_for(&uris).await;
+        let mut stale_entries = Vec::new();
+        snapshot.retain(|uri, expected| {
+            let matches = fixable_edits_match(expected, current.get(uri));
+            if !matches {
+                stale_entries.push((uri.clone(), expected.clone()));
+            }
+            matches
+        });
+        let skipped_stale: usize = stale_entries
+            .iter()
+            .map(|(_, entry)| entry.entries.len())
+            .sum();
+        if !stale_entries.is_empty() {
+            let mut store = self.state.fixable_edits.lock();
+            for (uri, expected) in stale_entries {
+                if store.get(&uri) == Some(&expected) {
+                    store.remove(&uri);
+                }
+            }
+        }
+        if snapshot.is_empty() {
+            return fix_all_workspace_summary(0, 0, skipped_stale, 0, refused);
+        }
+
+        let edits_snapshot: HashMap<String, Vec<(String, SpanEdit)>> = snapshot
+            .into_iter()
+            .map(|(uri, entry)| (uri, entry.entries))
             .collect();
-        let planned = plan_workspace_fixes(&snapshot, &texts);
+        let texts: HashMap<String, String> = current
+            .iter()
+            .filter(|(uri, _)| edits_snapshot.contains_key(*uri))
+            .map(|(uri, snapshot)| (uri.clone(), snapshot.text.clone()))
+            .collect();
+        let planned = plan_workspace_fixes(&edits_snapshot, &texts);
         let encoding = self.state.config.read().position_encoding.clone();
+        let skipped_overlapping: usize = planned.iter().map(|pf| pf.skipped).sum();
         let changes = workspace_edit_changes(&planned, &texts, &encoding);
         if changes.is_empty() {
+            if skipped_stale > 0 || skipped_overlapping > 0 {
+                return fix_all_workspace_summary(
+                    0,
+                    0,
+                    skipped_stale,
+                    skipped_overlapping,
+                    refused,
+                );
+            }
             return "No auto-fixable problems in the workspace.".to_string();
         }
         let edits_applied: usize = changes.values().map(Vec::len).sum();
         let files_changed = changes.len();
-        let skipped: usize = planned.iter().map(|pf| pf.skipped).sum();
-        let edit = WorkspaceEdit {
-            changes: Some(changes),
-            document_changes: None,
-            change_annotations: None,
-        };
+        let document_changes = self
+            .state
+            .workspace_edit_document_changes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let edit = workspace_edit_for_snapshots(changes, &current, document_changes);
         match self.client.apply_edit(edit).await {
-            Ok(resp) if resp.applied => {
-                fix_all_workspace_summary(edits_applied, files_changed, skipped)
-            }
+            Ok(resp) if resp.applied => fix_all_workspace_summary(
+                edits_applied,
+                files_changed,
+                skipped_stale,
+                skipped_overlapping,
+                refused,
+            ),
             Ok(resp) => format!(
                 "The client rejected the workspace edit{}.",
                 resp.failure_reason
@@ -2127,15 +2254,86 @@ mod tests {
     }
 
     #[test]
+    fn workspace_edit_for_snapshots_uses_captured_versions() {
+        let uri: Url = "file:///a.txt".parse().unwrap();
+        let mut changes = HashMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+                new_text: "X".to_string(),
+            }],
+        );
+        let mut snapshots = HashMap::new();
+        snapshots.insert(
+            uri.to_string(),
+            crate::FileTextSnapshot {
+                text: "aaaa\n".to_string(),
+                version: Some(7),
+                content_hash: 0,
+            },
+        );
+
+        let edit = workspace_edit_for_snapshots(changes, &snapshots, true);
+        let Some(DocumentChanges::Edits(edits)) = edit.document_changes else {
+            panic!("expected versioned document changes");
+        };
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].text_document.uri, uri);
+        assert_eq!(edits[0].text_document.version, Some(7));
+        assert!(edit.changes.is_none());
+    }
+
+    #[test]
     fn fix_all_workspace_summary_wording() {
         assert_eq!(
-            fix_all_workspace_summary(3, 2, 0),
+            fix_all_workspace_summary(3, 2, 0, 0, 0),
             "Applied 3 fix(es) across 2 file(s)"
         );
         assert_eq!(
-            fix_all_workspace_summary(3, 2, 1),
+            fix_all_workspace_summary(3, 2, 0, 1, 0),
             "Applied 3 fix(es) across 2 file(s); 1 skipped (overlapping)"
         );
+        assert_eq!(
+            fix_all_workspace_summary(3, 2, 0, 0, 1),
+            "Applied 3 fix(es) across 2 file(s); 1 file(s) skipped (outside workspace)"
+        );
+    }
+
+    #[test]
+    fn fix_all_workspace_rejects_stale_versions_and_content() {
+        let edit = SpanEdit {
+            range: range(1, 0, 1, 4),
+            replacement: "X".to_string(),
+        };
+        let versioned = crate::FixableEdits {
+            entries: vec![("CW281".to_string(), edit.clone())],
+            version: Some(1),
+            content_hash: None,
+        };
+        let open_v2 = crate::FileTextSnapshot {
+            text: "aaaa\n".to_string(),
+            version: Some(2),
+            content_hash: 1,
+        };
+        assert!(!fixable_edits_match(&versioned, Some(&open_v2)));
+
+        let closed = crate::FixableEdits {
+            entries: vec![("CW281".to_string(), edit)],
+            version: None,
+            content_hash: Some(7),
+        };
+        let changed = crate::FileTextSnapshot {
+            text: "bbbb\n".to_string(),
+            version: None,
+            content_hash: 8,
+        };
+        assert!(!fixable_edits_match(&closed, Some(&changed)));
+        let unchanged = crate::FileTextSnapshot {
+            content_hash: 7,
+            ..changed
+        };
+        assert!(fixable_edits_match(&closed, Some(&unchanged)));
     }
 
     /// "Nothing to fix" and "everything fixable is off-limits" are different

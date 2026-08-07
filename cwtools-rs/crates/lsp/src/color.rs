@@ -487,7 +487,10 @@ impl Backend {
         if crate::paths::has_loc_ext(&uri) || crate::paths::is_cwt_file(&uri) {
             return Ok(Vec::new());
         }
-        let (Some(ast), Some(text)) = (self.ast_for(&uri), self.file_text_for(&uri)) else {
+        let Some(ast) = self.ast_for(&uri) else {
+            return Ok(Vec::new());
+        };
+        let Some(text) = self.file_text_for(&uri).await else {
             return Ok(Vec::new());
         };
         let (game, scope_checks, var_checks, encoding, ws_prefix) = {
@@ -550,7 +553,7 @@ impl Backend {
         params: ColorPresentationParams,
     ) -> Result<Vec<ColorPresentation>> {
         let uri = params.text_document.uri.to_string();
-        let Some(text) = self.file_text_for(&uri) else {
+        let Some(text) = self.file_text_for(&uri).await else {
             return Ok(Vec::new());
         };
         let encoding = self.state.config.read().position_encoding.clone();

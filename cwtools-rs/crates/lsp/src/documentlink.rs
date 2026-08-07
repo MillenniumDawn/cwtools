@@ -44,7 +44,7 @@ impl Backend {
         let Some(ast) = self.ast_for(&uri) else {
             return Ok(None);
         };
-        let Some(text) = self.file_text_for(&uri) else {
+        let Some(text) = self.file_text_for(&uri).await else {
             return Ok(None);
         };
         let (game, scope_checks, var_checks, encoding, ws_prefix) = {

@@ -577,11 +577,28 @@ impl Backend {
                 )
                 .await;
         }
-        let (combined_ruleset, parse_errors) = load_ruleset_from_dir(
-            cache_path,
-            &self.state.string_table,
-            cwtools_file_manager::file_manager::ScanBudget::default(),
-        );
+        let dir = cache_path.to_path_buf();
+        let table = self.state.string_table.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            load_ruleset_from_dir(
+                &dir,
+                &table,
+                cwtools_file_manager::file_manager::ScanBudget::default(),
+            )
+        })
+        .await;
+        let (combined_ruleset, parse_errors) = match loaded {
+            Ok(result) => result,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Rules config load failed: {error}"),
+                    )
+                    .await;
+                return false;
+            }
+        };
 
         // Broken .cwt rules silently degrade every downstream check, so they are
         // reported three ways: the log, a popup, and a diagnostic per file. All
