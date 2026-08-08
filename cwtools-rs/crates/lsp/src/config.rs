@@ -86,6 +86,24 @@ fn folders_to_paths(uris: &[String]) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// The user-visible `reloadrulesconfig` status. The client toasts this string
+/// verbatim, so the wording is the contract: each half (rules loaded or not,
+/// revalidation ran / queued / still pending) must report honestly.
+fn reload_status_message(loaded: bool, revalidated: bool, dir: &std::path::Path) -> String {
+    let status = if revalidated {
+        "workspace re-validated"
+    } else if loaded {
+        "re-validation queued behind the running scan"
+    } else {
+        "re-validation still pending (a scan is running)"
+    };
+    if loaded {
+        format!("Rules config reloaded; {status}.")
+    } else {
+        format!("No rules loaded from {}; {status}.", dir.display())
+    }
+}
+
 /// Render one localisation stub file for `lang` covering every `missing` key,
 /// as `{language, filename_suggestion, content}`. Standard Paradox loc shape:
 /// an `l_<lang>:` header then ` KEY:0 "TODO"` entries. The file needs a UTF-8
@@ -1048,15 +1066,40 @@ impl Backend {
                 match dir {
                     Some(dir) => {
                         let loaded = self.load_rules_config(&dir).await;
-                        self.validate_entire_workspace(false).await;
-                        let msg = if loaded {
-                            "Rules config reloaded; workspace re-validated.".to_string()
-                        } else {
-                            format!(
-                                "No rules loaded from {}; workspace re-validated.",
-                                dir.display()
-                            )
-                        };
+                        // validate_entire_workspace's CAS guard returns false when
+                        // a scan is already running. The client fires this command
+                        // right after the startup scan's loading bar ends, but the
+                        // bar-off notification is sent before the guard drops, so
+                        // the reload races the tail of that scan — whose diagnostics
+                        // were produced with no rules loaded. Retry until we win the
+                        // CAS, bounded so a perpetually-busy server reports honestly
+                        // instead of spinning.
+                        // `CWTOOLS_RETRY_DEADLINE_MS` test override (like
+                        // `CWTOOLS_SCAN_HOLD_MS`): shorten the bound so a test can
+                        // prove the give-up path without waiting out 60s.
+                        let deadline = std::time::Instant::now()
+                            + std::env::var("CWTOOLS_RETRY_DEADLINE_MS")
+                                .ok()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .map_or(
+                                    std::time::Duration::from_secs(60),
+                                    std::time::Duration::from_millis,
+                                );
+                        let mut revalidated = self.validate_entire_workspace(false).await;
+                        while !revalidated && std::time::Instant::now() < deadline {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            revalidated = self.validate_entire_workspace(false).await;
+                        }
+                        // The competing scan outlived the response bound. Rules
+                        // are already live, so hand the revalidation to a bounded
+                        // background retry that lands it once the scan releases,
+                        // instead of leaving the stale no-rules diagnostics until
+                        // the next edit. A failed rules load changes nothing, so
+                        // there is nothing to defer then.
+                        if !revalidated && loaded {
+                            self.spawn_deferred_revalidation();
+                        }
+                        let msg = reload_status_message(loaded, revalidated, &dir);
                         Ok(Some(Value::String(msg)))
                     }
                     None => Ok(Some(Value::String(
@@ -1243,6 +1286,29 @@ mod tests {
         for v in [json!("30"), json!(1.5), json!(-5), json!(null), json!([30])] {
             assert_eq!(extract_u64_setting(&json!({ "k": v }), "k"), None);
         }
+    }
+
+    #[test]
+    fn reload_status_message_reports_every_state_combination() {
+        // The client displays this string verbatim, so the exact wording is
+        // the contract and each combination must stay honest.
+        let dir = std::path::Path::new("my/rules/dir");
+        assert_eq!(
+            reload_status_message(true, true, dir),
+            "Rules config reloaded; workspace re-validated."
+        );
+        assert_eq!(
+            reload_status_message(true, false, dir),
+            "Rules config reloaded; re-validation queued behind the running scan."
+        );
+        assert_eq!(
+            reload_status_message(false, true, dir),
+            "No rules loaded from my/rules/dir; workspace re-validated."
+        );
+        assert_eq!(
+            reload_status_message(false, false, dir),
+            "No rules loaded from my/rules/dir; re-validation still pending (a scan is running)."
+        );
     }
 
     #[test]

@@ -445,6 +445,40 @@ impl Backend {
         true
     }
 
+    /// Retry a revalidation in the background, bounded, for a caller that gave
+    /// up on winning the scan CAS itself. `reloadrulesconfig` uses this when a
+    /// scan holds the guard past the command's response bound: the rules are
+    /// already live, so the revalidation only needs to land once the competing
+    /// scan releases. Bounded at 180s (the `clearAllCaches` bound); if a scan
+    /// still holds the guard that long, the retry stops and says so in the
+    /// output channel instead of spinning forever.
+    pub(crate) fn spawn_deferred_revalidation(&self) {
+        let client = self.client.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            spawn_logging_panics("reloadrulesconfig deferred revalidation", async move {
+                let backend = Backend { client, state };
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(180);
+                let mut revalidated = backend.validate_entire_workspace(false).await;
+                while !revalidated && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    revalidated = backend.validate_entire_workspace(false).await;
+                }
+                if !revalidated {
+                    backend
+                        .client
+                        .log_message(
+                            MessageType::WARNING,
+                            "reloadrulesconfig: deferred re-validation gave up; a scan held the workspace the whole time",
+                        )
+                        .await;
+                }
+            })
+            .await;
+        });
+    }
+
     /// Scan the entire workspace for relevant game files and validate them all.
     #[tracing::instrument(skip_all)]
     async fn validate_entire_workspace_inner(&self, quiet: bool) {
