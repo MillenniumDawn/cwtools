@@ -103,7 +103,8 @@ The `build-bench` workflow (`.github/workflows/build-bench.yml`) measures clean
 release-build time across all three platforms. Run it manually from the Actions
 tab or push to the `perf/build-time-improvements` branch.
 
-The `release` workflow (`.github/workflows/release.yml`) builds, archives, and
-publishes binaries for all three platforms when a `v*` tag is pushed.
-`workflow_dispatch` is a manual re-run: off a tag ref it builds the archives but
-skips the publish step.
+The `release` workflow (`.github/workflows/release.yml`) builds and archives
+binaries for all three platforms and runs the release-profile workspace tests
+in parallel when a `v*` tag is pushed. Publishing waits for every build and the
+test suite. `workflow_dispatch` is a manual re-run: off a tag ref it builds the
+archives and runs the tests but skips the publish step.
