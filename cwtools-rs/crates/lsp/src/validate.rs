@@ -806,7 +806,11 @@ impl Backend {
         generation: u64,
         trigger: crate::ValidateTrigger,
     ) {
-        // A newer change landed during the debounce — let that one validate.
+        let Ok(_permit) = self.state.validation_permits.acquire().await else {
+            return;
+        };
+        // A newer change landed during the debounce or permit wait — let that
+        // one validate without retaining a stale text snapshot in the queue.
         let text = {
             let docs = self.state.documents.lock();
             match docs.get(&uri) {
@@ -838,22 +842,20 @@ impl Backend {
             // was running. Only store the AST if the document is still open at
             // the same version; if it closed, the index was already cleaned up by
             // did_close and we must not re-populate or re-publish it.
-            if let Some(d) = docs.get_mut(&uri)
-                && d.version == expected_version
-            {
-                // Preserve the last good AST on a transient parse failure (None):
-                // a fatal mid-edit syntax error shouldn't wipe the tree that
-                // completion/hover/goto resolve context from, or they collapse to
-                // a generic word list until the next clean parse. The parse error
-                // is still published. (#41) Loc/.cwt files always parse to None
-                // here, so their (absent) AST is unaffected.
-                if ast.is_some() {
-                    d.ast = ast;
-                    d.ast_version = Some(expected_version);
-                }
-            } else {
-                // Doc closed (or version changed) — discard results entirely.
+            let still_current = docs
+                .get(&uri)
+                .is_some_and(|document| document.version == expected_version);
+            if !still_current {
                 return;
+            }
+            // Preserve the last good AST on a transient parse failure (None):
+            // a fatal mid-edit syntax error shouldn't wipe the tree that
+            // completion/hover/goto resolve context from, or they collapse to
+            // a generic word list until the next clean parse. The parse error
+            // is still published. (#41) Loc/.cwt files always parse to None
+            // here, so their (absent) AST is unaffected.
+            if let Some(ast) = ast {
+                docs.set_ast(&uri, expected_version, ast);
             }
         }
         // Re-check the doc is still open right before publishing: did_close may

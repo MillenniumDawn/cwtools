@@ -30,6 +30,7 @@ mod navigation;
 mod paths;
 mod scan;
 mod semantic;
+mod transport;
 mod validate;
 
 pub(crate) type LocTextMap = FxHashMap<Arc<str>, Vec<(cwtools_localization::Lang, String)>>;
@@ -237,11 +238,12 @@ impl RuleData {
 /// (`rules` -> `info_service` -> `loc_index`). Never acquire an earlier lock
 /// while holding a later one.
 struct DocumentState {
-    /// file URI -> parsed document
-    documents: Mutex<HashMap<String, ParsedDoc>>,
+    /// Open documents plus exact retained-text accounting under the same lock.
+    documents: Mutex<DocumentStore>,
     /// Settings set at init / didChangeConfiguration, read-clone-dropped
     /// elsewhere. See [`Config`].
     config: parking_lot::RwLock<Config>,
+    workspace_roots_generation: AtomicU64,
     /// Ruleset + scope registry + modifier keys, rebuilt together on ruleset
     /// load. See [`RuleData`].
     rules: parking_lot::RwLock<RuleData>,
@@ -451,10 +453,13 @@ struct DocumentState {
     /// `compare_exchange`-guarded on entry; a losing caller logs and returns
     /// immediately instead of queueing behind the running scan.
     scan_in_progress: AtomicBool,
-    /// Per-URI debounce task handle. `did_change` aborts the previous sleeper for
-    /// the same file before spawning a new one, so a burst of keystrokes coalesces
-    /// to a single pending task instead of stacking hundreds of sleepers.
-    debounce_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Per-URI validation task. A unique id lets a completed predecessor remove
+    /// itself without deleting the replacement a newer edit installed.
+    debounce_handles: Mutex<HashMap<String, DebounceTask>>,
+    next_debounce_id: AtomicU64,
+    /// Detached per-document validation is outside tower-lsp's request limit.
+    /// This semaphore bounds the parser/validator work a burst can start.
+    validation_permits: tokio::sync::Semaphore,
     /// Monotonic counter bumped on every mutation of `info_service` or
     /// `rules` (the two state sources the fallback completion cache depends
     /// on). The completion handler reads this on each request; when
@@ -474,13 +479,13 @@ struct DocumentState {
     /// enough: they are all for the focused document. Dropped on `did_close`.
     #[allow(clippy::type_complexity)]
     fresh_ast_cache: parking_lot::Mutex<Option<(String, i32, Arc<ParsedFile>)>>,
-    /// Per-URI generation counter for in-flight completion requests. Each new
-    /// `completion` request for a URI increments this and captures the value;
-    /// the request checks the counter before doing any heavy work and bails
-    /// if a newer request for the same URI has already started. Avoids
+    /// Per-URI marker for in-flight completion requests. Each new
+    /// `completion` request stores a unique id; the request checks the marker
+    /// before doing any heavy work and bails if it was replaced or removed. Avoids
     /// stacking N parallel AST walks when the user types fast — only the
     /// latest one matters, the rest are wasted work.
     completion_generation: parking_lot::Mutex<HashMap<String, u64>>,
+    next_completion_id: AtomicU64,
     /// Stat-only signature (path, size, mtime) over the loc files a scan last
     /// rebuilt, so the periodic background pass can skip
     /// `rebuild_and_publish_loc` (the biggest transient cost of a scan) when
@@ -583,6 +588,145 @@ pub(crate) struct CompletionCacheEntry {
     pub(crate) items: Vec<CompletionItem>,
 }
 
+const MAX_DOCUMENT_URI_BYTES: usize = 8 * 1024;
+const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_OPEN_DOCUMENTS: usize = 128;
+const MAX_RETAINED_DOCUMENT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_CONCURRENT_VALIDATIONS: usize = 2;
+
+struct DocumentStore {
+    documents: HashMap<String, ParsedDoc>,
+    retained_text_bytes: usize,
+}
+
+impl DocumentStore {
+    fn new() -> Self {
+        Self {
+            documents: HashMap::new(),
+            retained_text_bytes: 0,
+        }
+    }
+
+    fn open(
+        &mut self,
+        uri: String,
+        document: ParsedDoc,
+    ) -> std::result::Result<(), DocumentRejection> {
+        let old_len = self
+            .documents
+            .get(&uri)
+            .map_or(0, ParsedDoc::retained_bytes);
+        if !self.documents.contains_key(&uri) && self.documents.len() >= MAX_OPEN_DOCUMENTS {
+            return Err(DocumentRejection::TooManyOpen);
+        }
+        let retained = self.replacement_total(old_len, document.retained_bytes())?;
+        self.documents.insert(uri, document);
+        self.retained_text_bytes = retained;
+        Ok(())
+    }
+
+    fn change(
+        &mut self,
+        uri: &str,
+        version: i32,
+        text: Arc<str>,
+    ) -> std::result::Result<(), DocumentRejection> {
+        let Some(document) = self.documents.get(uri) else {
+            return Err(DocumentRejection::NotOpen);
+        };
+        let old_len = document.retained_bytes();
+        let new_len = text.len().max(document.ast_source_bytes);
+        let retained = self.replacement_total(old_len, new_len)?;
+        let Some(document) = self.documents.get_mut(uri) else {
+            return Err(DocumentRejection::NotOpen);
+        };
+        document.version = version;
+        document.text = text;
+        self.retained_text_bytes = retained;
+        Ok(())
+    }
+
+    fn set_ast(&mut self, uri: &str, version: i32, ast: Arc<ParsedFile>) -> bool {
+        let Some(document) = self.documents.get_mut(uri) else {
+            return false;
+        };
+        if document.version != version {
+            return false;
+        }
+        let old_len = document.retained_bytes();
+        document.ast = Some(ast);
+        document.ast_version = Some(version);
+        document.ast_source_bytes = document.text.len();
+        let new_len = document.retained_bytes();
+        self.retained_text_bytes = self.retained_text_bytes - old_len + new_len;
+        true
+    }
+
+    fn remove(&mut self, uri: &str) -> Option<ParsedDoc> {
+        let document = self.documents.remove(uri)?;
+        self.retained_text_bytes -= document.retained_bytes();
+        Some(document)
+    }
+
+    fn replacement_total(
+        &self,
+        old_len: usize,
+        new_len: usize,
+    ) -> std::result::Result<usize, DocumentRejection> {
+        if new_len > MAX_DOCUMENT_BYTES {
+            return Err(DocumentRejection::TooLarge);
+        }
+        let retained = self
+            .retained_text_bytes
+            .checked_sub(old_len)
+            .and_then(|bytes| bytes.checked_add(new_len))
+            .ok_or(DocumentRejection::RetainedTextLimit)?;
+        if retained > MAX_RETAINED_DOCUMENT_BYTES {
+            return Err(DocumentRejection::RetainedTextLimit);
+        }
+        Ok(retained)
+    }
+}
+
+impl std::ops::Deref for DocumentStore {
+    type Target = HashMap<String, ParsedDoc>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.documents
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentRejection {
+    NotOpen,
+    TooLarge,
+    TooManyOpen,
+    RetainedTextLimit,
+}
+
+impl DocumentRejection {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NotOpen => "the document is not open",
+            Self::TooLarge => "the document exceeds the per-document byte limit",
+            Self::TooManyOpen => "the open-document count limit was reached",
+            Self::RetainedTextLimit => "the retained open-document byte limit was reached",
+        }
+    }
+}
+
+struct DebounceTask {
+    id: u64,
+    abort: tokio::task::AbortHandle,
+    finished: tokio::sync::oneshot::Receiver<()>,
+}
+
+fn remove_debounce_task(tasks: &mut HashMap<String, DebounceTask>, uri: &str, completed_id: u64) {
+    if tasks.get(uri).is_some_and(|task| task.id == completed_id) {
+        tasks.remove(uri);
+    }
+}
+
 pub(crate) struct ParsedDoc {
     pub(crate) version: i32,
     /// `Arc` so every reader that only needs to look at the text (completion,
@@ -596,6 +740,15 @@ pub(crate) struct ParsedDoc {
     /// no cached AST; a value different from `version` means completion/hover
     /// are looking at the last good parse while debounce validation catches up.
     pub(crate) ast_version: Option<i32>,
+    /// Source size represented by the cached AST. A stale AST keeps this much
+    /// of the aggregate document budget charged after a smaller broken edit.
+    ast_source_bytes: usize,
+}
+
+impl ParsedDoc {
+    fn retained_bytes(&self) -> usize {
+        self.text.len().max(self.ast_source_bytes)
+    }
 }
 
 pub(crate) struct FileTextSnapshot {
@@ -679,18 +832,16 @@ impl ValidateTrigger {
 /// may drop the file's index entry.
 enum DiskState {
     Parsed(ParsedFile),
-    /// Nothing to index — deleted, unreadable, or it no longer parses.
+    /// Nothing safe to index: deleted, unreadable, refused, or no longer parses.
     Absent,
-    /// The URI access boundary refused the re-read, so what is on disk is
-    /// unknown and the index must not move.
-    Denied,
 }
 
 impl DocumentState {
     fn new() -> Self {
         Self {
-            documents: Mutex::new(HashMap::new()),
+            documents: Mutex::new(DocumentStore::new()),
             config: parking_lot::RwLock::new(Config::new()),
+            workspace_roots_generation: AtomicU64::new(0),
             rules: parking_lot::RwLock::new(RuleData::new()),
             string_table: StringTable::new(),
             info_service: parking_lot::RwLock::new(cwtools_info::InfoService::new()),
@@ -732,10 +883,13 @@ impl DocumentState {
             vanilla_merged: std::sync::atomic::AtomicBool::new(false),
             scan_in_progress: AtomicBool::new(false),
             debounce_handles: Mutex::new(HashMap::new()),
+            next_debounce_id: AtomicU64::new(0),
+            validation_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_VALIDATIONS),
             info_revision: AtomicU64::new(0),
             fallback_cache: parking_lot::Mutex::new(None),
             fresh_ast_cache: parking_lot::Mutex::new(None),
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
+            next_completion_id: AtomicU64::new(0),
             last_loc_signature: parking_lot::Mutex::new(None),
             last_scan_fingerprint: parking_lot::Mutex::new(None),
             settings_generation: AtomicU64::new(0),
@@ -787,10 +941,16 @@ impl Backend {
         trigger: ValidateTrigger,
         delay_ms: u64,
     ) {
+        let id = self.state.next_debounce_id.fetch_add(1, Ordering::Relaxed);
         let client = self.client.clone();
         let state = self.state.clone();
         let key = uri.clone();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
@@ -798,8 +958,33 @@ impl Backend {
                 .debounced_validate(uri, version, generation, trigger)
                 .await;
         });
-        if let Some(prev) = self.state.debounce_handles.lock().insert(key, handle) {
-            prev.abort();
+        let abort = handle.abort_handle();
+        let cleanup_state = self.state.clone();
+        let cleanup_key = key.clone();
+        tokio::spawn(async move {
+            match handle.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    tracing::error!(%error, uri = %cleanup_key, "document validation task panicked")
+                }
+            }
+            let mut tasks = cleanup_state.debounce_handles.lock();
+            remove_debounce_task(&mut tasks, &cleanup_key, id);
+            drop(tasks);
+            let _ = finished_tx.send(());
+        });
+        let previous = self.state.debounce_handles.lock().insert(
+            key,
+            DebounceTask {
+                id,
+                abort,
+                finished: finished_rx,
+            },
+        );
+        let _ = start_tx.send(());
+        if let Some(previous) = previous {
+            previous.abort.abort();
         }
     }
 
@@ -1434,21 +1619,49 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
         tracing::debug!(%uri, version, bytes = text.len(), "did_open");
 
-        // Insert synchronously (no `.await` before the mutation) so a request in
-        // the gap sees the new text; `ast: None` is filled in by the spawned
-        // validate, and requests before then fresh-parse via `ast_snapshot_for`.
-        {
-            let mut docs = self.state.documents.lock();
-            docs.insert(
+        if uri.len() > MAX_DOCUMENT_URI_BYTES {
+            tracing::warn!(bytes = uri.len(), "ignoring didOpen with an oversized URI");
+            return;
+        }
+        if text.len() > MAX_DOCUMENT_BYTES {
+            tracing::warn!(%uri, bytes = text.len(), "ignoring oversized didOpen document");
+            return;
+        }
+        let text: Arc<str> = Arc::from(text);
+        let admission = loop {
+            let roots_generation = self
+                .state
+                .workspace_roots_generation
+                .load(Ordering::Acquire);
+            if !self.is_workspace_document(&uri) {
+                tracing::warn!(%uri, "ignoring didOpen outside the workspace folders");
+                return;
+            }
+            let mut documents = self.state.documents.lock();
+            if roots_generation
+                != self
+                    .state
+                    .workspace_roots_generation
+                    .load(Ordering::Acquire)
+            {
+                continue;
+            }
+            break documents.open(
                 uri.clone(),
                 ParsedDoc {
                     version,
-                    text: Arc::from(text),
+                    text: text.clone(),
                     ast: None,
                     ast_version: None,
+                    ast_source_bytes: 0,
                 },
             );
+        };
+        if let Err(rejection) = admission {
+            tracing::warn!(%uri, reason = rejection.reason(), "ignoring didOpen");
+            return;
         }
+
         // The open overlay owns this file's keys from here; a stale watched
         // entry left behind could resurrect keys the buffer removed.
         if crate::paths::is_loc_file(&uri) {
@@ -1471,6 +1684,13 @@ impl LanguageServer for Backend {
         self.mark_activity();
         let uri = params.text_document.uri.to_string();
         let version = params.text_document.version;
+        if uri.len() > MAX_DOCUMENT_URI_BYTES {
+            tracing::warn!(
+                bytes = uri.len(),
+                "ignoring didChange with an oversized URI"
+            );
+            return;
+        }
 
         // FULL-sync spec requires last-wins; use the last change in the batch.
         let Some(change) = params.content_changes.into_iter().last() else {
@@ -1478,30 +1698,23 @@ impl LanguageServer for Backend {
         };
         let text = change.text;
         tracing::debug!(%uri, version, bytes = text.len(), "did_change");
-        let text: Arc<str> = Arc::from(text);
+        if text.len() > MAX_DOCUMENT_BYTES {
+            tracing::warn!(%uri, bytes = text.len(), "ignoring oversized didChange document");
+            return;
+        }
 
         // Store the new text+version immediately (keep the prior AST until we
         // revalidate). The debounced task checks the version to know whether this
-        // is still the latest edit.
-        {
-            let mut docs = self.state.documents.lock();
-            // Update the text+version in place, preserving the prior AST (kept
-            // until the debounced task revalidates). get_mut avoids a
-            // remove+reinsert and the uri clone the insert would need.
-            if let Some(d) = docs.get_mut(&uri) {
-                d.version = version;
-                d.text = text;
-            } else {
-                docs.insert(
-                    uri.clone(),
-                    ParsedDoc {
-                        version,
-                        text,
-                        ast: None,
-                        ast_version: None,
-                    },
-                );
-            }
+        // is still the latest edit. An unsolicited didChange cannot create a new
+        // retained document.
+        let admission = self
+            .state
+            .documents
+            .lock()
+            .change(&uri, version, Arc::from(text));
+        if let Err(rejection) = admission {
+            tracing::warn!(%uri, reason = rejection.reason(), "ignoring didChange");
+            return;
         }
 
         // Bump the global edit counter so any in-flight dependent sweep from an
@@ -1543,16 +1756,21 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         tracing::debug!(%uri, "did_close");
-        self.state.documents.lock().remove(&uri);
+        if self.state.documents.lock().remove(&uri).is_none() {
+            return;
+        }
         let pending_validation = self.state.debounce_handles.lock().remove(&uri);
-        if let Some(handle) = pending_validation {
-            handle.abort();
-            let _ = handle.await;
+        if let Some(validation) = pending_validation {
+            validation.abort.abort();
+            let _ = validation.finished.await;
         }
 
         if self.state.documents.lock().contains_key(&uri) {
             return;
         }
+        let Ok(_validation_permit) = self.state.validation_permits.acquire().await else {
+            return;
+        };
 
         let disk_loc_text = if crate::paths::is_loc_file(&uri) {
             let roots = self.state.config.read().authorized_roots.clone();
@@ -1588,14 +1806,11 @@ impl LanguageServer for Backend {
                             Err(_) => DiskState::Absent,
                         }
                     }
-                    FileRead::Missing => DiskState::Absent,
-                    // Refused is not gone: a file the boundary turned away keeps
-                    // whatever index entry it already has.
-                    FileRead::Refused => DiskState::Denied,
+                    FileRead::Missing | FileRead::Refused => DiskState::Absent,
                 }
             })
             .await
-            .unwrap_or(DiskState::Denied)
+            .unwrap_or(DiskState::Absent)
         } else {
             DiskState::Absent
         };
@@ -1631,9 +1846,6 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
-                // The boundary refused the re-read, which says nothing about
-                // what is on disk — leave the index exactly as it is.
-                DiskState::Denied => {}
             }
             doc_tokens.remove(&uri);
             self.loc_live_overlay_mut().remove(&uri);
@@ -1863,7 +2075,10 @@ fn main() {
         .expect("failed to build tokio runtime")
         .block_on(async {
             let state = Arc::new(DocumentState::new());
-            let (stdin, stdout) = (tokio::io::stdin(), tokio::io::stdout());
+            let (stdin, stdout) = (
+                transport::BoundedLspReader::new(tokio::io::stdin()),
+                tokio::io::stdout(),
+            );
             // Use LspService::build to register the custom didFocusFile notification
             // so tower-lsp doesn't reject it with an error response.
             let (service, socket) = LspService::build(|client| Backend {
@@ -1916,6 +2131,106 @@ mod tests {
                 root.display()
             );
         }
+    }
+
+    fn document(text: &str) -> ParsedDoc {
+        ParsedDoc {
+            version: 1,
+            text: Arc::from(text),
+            ast: None,
+            ast_version: None,
+            ast_source_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn document_store_bounds_a_burst_of_distinct_opens() {
+        let mut store = DocumentStore::new();
+        for i in 0..MAX_OPEN_DOCUMENTS {
+            store
+                .open(format!("file:///doc-{i}"), document(""))
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.open("file:///one-too-many".to_string(), document("")),
+            Err(DocumentRejection::TooManyOpen)
+        );
+        assert_eq!(store.len(), MAX_OPEN_DOCUMENTS);
+    }
+
+    #[test]
+    fn document_store_accounts_for_replace_and_close() {
+        let mut store = DocumentStore::new();
+        store
+            .open("file:///doc".to_string(), document("old"))
+            .unwrap();
+        store
+            .change("file:///doc", 2, Arc::from("replacement"))
+            .unwrap();
+        assert_eq!(store.retained_text_bytes, "replacement".len());
+
+        store.remove("file:///doc");
+        assert_eq!(store.retained_text_bytes, 0);
+    }
+
+    #[test]
+    fn document_store_keeps_stale_ast_source_in_the_budget() {
+        let mut doc = document("large source");
+        doc.ast_source_bytes = doc.text.len();
+        let mut store = DocumentStore::new();
+        store.open("file:///doc".to_string(), doc).unwrap();
+
+        store.change("file:///doc", 2, Arc::from("x")).unwrap();
+
+        assert_eq!(store.retained_text_bytes, "large source".len());
+    }
+
+    #[test]
+    fn live_document_validation_permits_are_bounded() {
+        let state = DocumentState::new();
+        let _first = state.validation_permits.try_acquire().unwrap();
+        let _second = state.validation_permits.try_acquire().unwrap();
+        assert!(state.validation_permits.try_acquire().is_err());
+    }
+
+    #[tokio::test]
+    async fn completed_debounce_task_does_not_remove_its_replacement() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let abort = handle.abort_handle();
+        let (_finished_tx, finished) = tokio::sync::oneshot::channel();
+        let mut tasks = HashMap::from([(
+            "file:///doc".to_string(),
+            DebounceTask {
+                id: 2,
+                abort,
+                finished,
+            },
+        )]);
+
+        remove_debounce_task(&mut tasks, "file:///doc", 1);
+        assert_eq!(tasks.len(), 1);
+        remove_debounce_task(&mut tasks, "file:///doc", 2);
+        assert!(tasks.is_empty());
+        handle.abort();
+    }
+
+    #[test]
+    fn document_store_rejects_unsolicited_changes_and_byte_overflow() {
+        let mut store = DocumentStore::new();
+        assert_eq!(
+            store.change("file:///missing", 1, Arc::from("text")),
+            Err(DocumentRejection::NotOpen)
+        );
+        assert_eq!(
+            store.replacement_total(0, MAX_DOCUMENT_BYTES + 1),
+            Err(DocumentRejection::TooLarge)
+        );
+        store.retained_text_bytes = MAX_RETAINED_DOCUMENT_BYTES;
+        assert_eq!(
+            store.replacement_total(0, 1),
+            Err(DocumentRejection::RetainedTextLimit)
+        );
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -2258,6 +2573,7 @@ mod tests {
                 text: Arc::from(source),
                 ast: Some(Arc::new(parsed)),
                 ast_version: Some(0),
+                ast_source_bytes: source.len(),
             },
         );
 

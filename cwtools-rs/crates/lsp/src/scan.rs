@@ -1236,6 +1236,9 @@ impl Backend {
     /// index don't keep stale cross-file diagnostics, and on a live
     /// `didChangeConfiguration` so a changed suppression list re-filters at once.
     pub(crate) async fn revalidate_all_open_docs(&self, trigger: crate::ValidateTrigger) {
+        let Ok(_validation_permit) = self.state.validation_permits.acquire().await else {
+            return;
+        };
         // Snapshot each open doc's uri/text/version, plus its cached AST *only
         // when that AST matches the current version*. A current AST lets us
         // re-validate against the now-complete index via the prebuilt path — no
@@ -1991,6 +1994,9 @@ impl Backend {
                 lost_scan_cas = true;
             }
         } else {
+            let Ok(_validation_permit) = self.state.validation_permits.acquire().await else {
+                return;
+            };
             // Deletions first, so a re-created file's later change validates
             // against an index that already forgot the stale entry.
             if !deletes.is_empty() {
