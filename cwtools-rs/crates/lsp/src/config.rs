@@ -1056,8 +1056,17 @@ impl Backend {
                         // were produced with no rules loaded. Retry until we win the
                         // CAS, bounded so a perpetually-busy server reports honestly
                         // instead of spinning.
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        // `CWTOOLS_RETRY_DEADLINE_MS` test override (like
+                        // `CWTOOLS_SCAN_HOLD_MS`): shorten the bound so a test can
+                        // prove the give-up path without waiting out 60s.
+                        let deadline = std::time::Instant::now()
+                            + std::env::var("CWTOOLS_RETRY_DEADLINE_MS")
+                                .ok()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .map_or(
+                                    std::time::Duration::from_secs(60),
+                                    std::time::Duration::from_millis,
+                                );
                         let mut revalidated = self.validate_entire_workspace(false).await;
                         while !revalidated && std::time::Instant::now() < deadline {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
