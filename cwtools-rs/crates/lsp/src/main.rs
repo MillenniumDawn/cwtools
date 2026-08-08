@@ -699,6 +699,7 @@ impl std::ops::Deref for DocumentStore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DocumentRejection {
     NotOpen,
+    OutsideWorkspace,
     TooLarge,
     TooManyOpen,
     RetainedTextLimit,
@@ -708,6 +709,7 @@ impl DocumentRejection {
     fn reason(self) -> &'static str {
         match self {
             Self::NotOpen => "the document is not open",
+            Self::OutsideWorkspace => "the document is outside the workspace folders",
             Self::TooLarge => "the document exceeds the per-document byte limit",
             Self::TooManyOpen => "the open-document count limit was reached",
             Self::RetainedTextLimit => "the retained open-document byte limit was reached",
@@ -900,6 +902,25 @@ impl DocumentState {
             watched_debounce: Mutex::new(None),
             watched_signatures: Mutex::new(HashMap::new()),
             fixable_edits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn open_workspace_document(
+        &self,
+        uri: String,
+        document: ParsedDoc,
+        mut is_workspace_document: impl FnMut() -> bool,
+    ) -> std::result::Result<(), DocumentRejection> {
+        loop {
+            let roots_generation = self.workspace_roots_generation.load(Ordering::Acquire);
+            if !is_workspace_document() {
+                return Err(DocumentRejection::OutsideWorkspace);
+            }
+            let mut documents = self.documents.lock();
+            if roots_generation != self.workspace_roots_generation.load(Ordering::Acquire) {
+                continue;
+            }
+            return documents.open(uri, document);
         }
     }
 }
@@ -1628,35 +1649,17 @@ impl LanguageServer for Backend {
             return;
         }
         let text: Arc<str> = Arc::from(text);
-        let admission = loop {
-            let roots_generation = self
-                .state
-                .workspace_roots_generation
-                .load(Ordering::Acquire);
-            if !self.is_workspace_document(&uri) {
-                tracing::warn!(%uri, "ignoring didOpen outside the workspace folders");
-                return;
-            }
-            let mut documents = self.state.documents.lock();
-            if roots_generation
-                != self
-                    .state
-                    .workspace_roots_generation
-                    .load(Ordering::Acquire)
-            {
-                continue;
-            }
-            break documents.open(
-                uri.clone(),
-                ParsedDoc {
-                    version,
-                    text: text.clone(),
-                    ast: None,
-                    ast_version: None,
-                    ast_source_bytes: 0,
-                },
-            );
-        };
+        let admission = self.state.open_workspace_document(
+            uri.clone(),
+            ParsedDoc {
+                version,
+                text,
+                ast: None,
+                ast_version: None,
+                ast_source_bytes: 0,
+            },
+            || self.is_workspace_document(&uri),
+        );
         if let Err(rejection) = admission {
             tracing::warn!(%uri, reason = rejection.reason(), "ignoring didOpen");
             return;
@@ -2176,18 +2179,43 @@ mod tests {
 
     #[test]
     fn document_store_keeps_stale_ast_source_in_the_budget() {
-        let mut doc = document("large source");
-        doc.ast_source_bytes = doc.text.len();
+        let source = "root = { value = 1 }";
+        let ast = Arc::new(parse_string(source, &StringTable::new()).unwrap());
         let mut store = DocumentStore::new();
-        store.open("file:///doc".to_string(), doc).unwrap();
+        store
+            .open("file:///doc".to_string(), document(source))
+            .unwrap();
+        assert!(store.set_ast("file:///doc", 1, ast));
 
         store.change("file:///doc", 2, Arc::from("x")).unwrap();
 
-        assert_eq!(store.retained_text_bytes, "large source".len());
+        assert_eq!(store.retained_text_bytes, source.len());
     }
 
     #[test]
-    fn live_document_validation_permits_are_bounded() {
+    fn workspace_change_during_admission_rechecks_authorization() {
+        let state = DocumentState::new();
+        let mut checks = 0;
+
+        let result =
+            state.open_workspace_document("file:///doc".to_string(), document("text"), || {
+                checks += 1;
+                if checks == 1 {
+                    state
+                        .workspace_roots_generation
+                        .fetch_add(1, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            });
+
+        assert_eq!(result, Err(DocumentRejection::OutsideWorkspace));
+        assert!(state.documents.lock().is_empty());
+    }
+
+    #[test]
+    fn document_state_configures_two_validation_permits() {
         let state = DocumentState::new();
         let _first = state.validation_permits.try_acquire().unwrap();
         let _second = state.validation_permits.try_acquire().unwrap();
@@ -2216,19 +2244,76 @@ mod tests {
     }
 
     #[test]
-    fn document_store_rejects_unsolicited_changes_and_byte_overflow() {
+    fn document_store_rejects_unsolicited_changes() {
         let mut store = DocumentStore::new();
+
         assert_eq!(
             store.change("file:///missing", 1, Arc::from("text")),
             Err(DocumentRejection::NotOpen)
+        );
+    }
+
+    #[tokio::test]
+    async fn did_change_cannot_create_document_or_validation_state() {
+        let state = Arc::new(DocumentState::new());
+        let captured_client = Arc::new(Mutex::new(None));
+        let client_slot = captured_client.clone();
+        let server_state = state.clone();
+        let (_service, _socket) = LspService::new(move |client| {
+            *client_slot.lock() = Some(client.clone());
+            Backend {
+                client,
+                state: server_state.clone(),
+            }
+        });
+        let backend = Backend {
+            client: captured_client.lock().take().unwrap(),
+            state: state.clone(),
+        };
+
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: Url::parse("file:///not-open.txt").unwrap(),
+                    version: 1,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "root = { value = 1 }".to_string(),
+                }],
+            })
+            .await;
+
+        assert!(state.documents.lock().is_empty());
+        assert!(state.debounce_handles.lock().is_empty());
+    }
+
+    #[test]
+    fn document_store_enforces_the_per_document_boundary() {
+        let store = DocumentStore::new();
+
+        assert_eq!(
+            store.replacement_total(0, MAX_DOCUMENT_BYTES),
+            Ok(MAX_DOCUMENT_BYTES)
         );
         assert_eq!(
             store.replacement_total(0, MAX_DOCUMENT_BYTES + 1),
             Err(DocumentRejection::TooLarge)
         );
-        store.retained_text_bytes = MAX_RETAINED_DOCUMENT_BYTES;
+    }
+
+    #[test]
+    fn document_store_enforces_the_aggregate_boundary() {
+        let mut store = DocumentStore::new();
+        store.retained_text_bytes = MAX_RETAINED_DOCUMENT_BYTES - 1;
+
         assert_eq!(
             store.replacement_total(0, 1),
+            Ok(MAX_RETAINED_DOCUMENT_BYTES)
+        );
+        assert_eq!(
+            store.replacement_total(0, 2),
             Err(DocumentRejection::RetainedTextLimit)
         );
     }

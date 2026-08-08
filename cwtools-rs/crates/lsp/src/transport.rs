@@ -258,6 +258,86 @@ mod tests {
         assert!(output.is_empty());
     }
 
+    #[tokio::test]
+    async fn accepts_a_header_at_the_limit() {
+        let prefix = b"Content-Length: 0\r\nX-Pad: ";
+        let suffix = b"\r\n\r\n";
+        let padding = MAX_LSP_HEADER_BYTES - prefix.len() - suffix.len();
+        let mut input = prefix.to_vec();
+        input.extend(vec![b'x'; padding]);
+        input.extend(suffix);
+        let mut reader = BoundedLspReader::new(input.as_slice());
+        let mut output = Vec::new();
+
+        reader.read_to_end(&mut output).await.unwrap();
+
+        assert_eq!(output, input);
+    }
+
+    #[tokio::test]
+    async fn accepts_a_declared_body_at_the_limit() {
+        let input = format!("Content-Length: {MAX_LSP_FRAME_BYTES}\r\n\r\n");
+        let mut reader = BoundedLspReader::new(input.as_bytes());
+        let mut output = Vec::new();
+
+        let error = reader.read_to_end(&mut output).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(output, input.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn passes_a_zero_length_frame_before_the_next_frame() {
+        let mut input = frame("");
+        input.extend(frame("next"));
+        let mut reader = BoundedLspReader::with_capacity(input.as_slice(), 2);
+        let mut output = Vec::new();
+
+        reader.read_to_end(&mut output).await.unwrap();
+
+        assert_eq!(output, input);
+    }
+
+    #[tokio::test]
+    async fn rejects_input_ending_inside_a_header() {
+        let input = b"Content-Length: 4\r\n";
+        let mut reader = BoundedLspReader::new(input.as_slice());
+        let mut output = Vec::new();
+
+        let error = reader.read_to_end(&mut output).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(output.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_input_ending_inside_a_body() {
+        let input = b"Content-Length: 4\r\n\r\nab";
+        let mut reader = BoundedLspReader::new(input.as_slice());
+        let mut output = Vec::new();
+
+        let error = reader.read_to_end(&mut output).await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn rejects_missing_duplicate_and_invalid_content_lengths() {
+        for header in [
+            b"Content-Type: application/json\r\n\r\n".as_slice(),
+            b"Content-Length: 1\r\nContent-Length: 2\r\n\r\n".as_slice(),
+            b"Content-Length: nope\r\n\r\n".as_slice(),
+            b"Content-Length 1\r\n\r\n".as_slice(),
+            b"Content-Length: \xff\r\n\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                content_length(header).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
     #[test]
     fn parses_content_length_case_insensitively() {
         assert_eq!(content_length(b"content-length: 12\r\n\r\n").unwrap(), 12);
