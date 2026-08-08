@@ -10679,11 +10679,11 @@ fn test_reloadrulesconfig_retries_until_it_wins_the_scan_guard() {
 }
 
 /// #193: when the scan guard never gives way before the retry deadline, the
-/// reload must answer honestly that re-validation is still pending — it must
-/// not claim a revalidation it skipped, and it must give up on time instead of
+/// reload must answer honestly that re-validation is queued — it must not
+/// claim a revalidation it skipped, and it must give up on time instead of
 /// hanging the command behind the competing scan.
 #[test]
-fn test_reloadrulesconfig_reports_pending_when_scan_never_releases() {
+fn test_reloadrulesconfig_reports_queued_revalidation_when_scan_never_releases() {
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     let vanilla = tempfile::tempdir().unwrap();
@@ -10770,8 +10770,109 @@ fn test_reloadrulesconfig_reports_pending_when_scan_never_releases() {
     );
     let msg = response["result"].as_str().expect("string result");
     assert!(
-        msg.contains("re-validation still pending"),
-        "the reload must report the pending revalidation: {msg}"
+        msg.contains("re-validation queued behind the running scan"),
+        "the reload must report the queued revalidation: {msg}"
+    );
+}
+
+/// #193: when the reload gives up on the guard before its deadline, the
+/// revalidation must still land once the competing scan releases — the
+/// give-up hands off to a bounded background retry instead of leaving the
+/// stale no-rules diagnostics until the next edit.
+#[test]
+fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    // The reload's 1s deadline expires while the competing scan still holds
+    // the guard (5s hold), so it must answer queued — and then the deferred
+    // retry must run a revalidation once the scan releases.
+    let (mut child, reader) = storm_server_env(
+        ws.path(),
+        rules_dir.path(),
+        vanilla.path(),
+        &[
+            ("CWTOOLS_SCAN_HOLD_MS", "5000"),
+            ("CWTOOLS_RETRY_DEADLINE_MS", "1000"),
+        ],
+    );
+    let rx = spawn_frame_collector(reader);
+
+    // Start a competing scan and wait for the scan-started signal, so the
+    // hold is definitely active for the reload's whole deadline.
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            900,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no loadingBar(true) after reindexWorkspace"
+        );
+        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
+            && v["method"] == "loadingBar"
+            && v["params"]["enable"] == serde_json::Value::Bool(true)
+        {
+            break;
+        }
+    }
+
+    // The give-up response arrives ~1s in, well before the 5s hold releases.
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            901,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "reloadrulesconfig", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let response = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut response = None;
+        while std::time::Instant::now() < deadline {
+            let v = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v["id"] == 901 {
+                response = Some(v);
+                break;
+            }
+        }
+        response
+    };
+    let response = response.expect("reloadrulesconfig never answered its deadline");
+    let msg = response["result"].as_str().expect("string result");
+    assert!(
+        msg.contains("re-validation queued"),
+        "the reload must report the queued revalidation: {msg}"
+    );
+
+    // The deferred retry wins the CAS once the 5s hold releases and runs a
+    // full revalidation (a bar-on after the response).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut queued_scan_ran = false;
+    while !queued_scan_ran && std::time::Instant::now() < deadline {
+        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
+            && v["method"] == "loadingBar"
+            && v["params"]["enable"] == serde_json::Value::Bool(true)
+        {
+            queued_scan_ran = true;
+        }
+    }
+    child.kill().ok();
+    assert!(
+        queued_scan_ran,
+        "the queued revalidation never ran after the reload gave up"
     );
 }
 
