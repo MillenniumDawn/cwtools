@@ -5640,6 +5640,20 @@ fn watched_changes(uris: &[String]) -> String {
     )
 }
 
+/// A `workspace/didChangeWatchedFiles` notification marking the URIs as newly
+/// created (type 1). Distinct from `watched_changes` (type 2, CHANGED): the
+/// loc-discovery cache is invalidated on create/delete but not on change.
+fn watched_created(uris: &[String]) -> String {
+    let changes: Vec<serde_json::Value> = uris
+        .iter()
+        .map(|u| serde_json::json!({ "uri": u, "type": 1 }))
+        .collect();
+    jsonrpc_notification(
+        "workspace/didChangeWatchedFiles",
+        serde_json::json!({ "changes": changes }),
+    )
+}
+
 /// Write a decision file on disk (not opened) and return its `file://` URI.
 fn write_disk_file(ws: &std::path::Path, rel: &str, content: &str) -> String {
     let path = ws.join(rel);
@@ -9299,6 +9313,15 @@ thing = { x = scalar }
         .unwrap();
     std::fs::create_dir_all(generated_path.parent().unwrap()).unwrap();
     std::fs::write(&generated_path, &generated_new_text).unwrap();
+
+    // A real client's file watcher (which covers loc `*.yml`) fires a CREATED
+    // event when the action's file lands on disk; that invalidates the
+    // loc-discovery cache so the next request re-walks and sees the file.
+    write_frame(
+        &mut child,
+        &watched_created(std::slice::from_ref(&generated_uri)),
+    )
+    .unwrap();
 
     write_frame(
         &mut child,

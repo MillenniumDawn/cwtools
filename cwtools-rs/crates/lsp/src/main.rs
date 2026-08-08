@@ -492,6 +492,21 @@ struct DocumentState {
     /// nothing loc-related has changed on disk. `None` until the first scan
     /// runs.
     last_loc_signature: parking_lot::Mutex<Option<u64>>,
+    /// Cached `LocService::discover_files` result for the workspace root, so a
+    /// code-action request (fired on cursor movement) doesn't re-walk the whole
+    /// tree when nothing loc-related changed on disk. `(root, files, sig)` where
+    /// `sig` is the scan's `last_loc_signature` value at population time: the
+    /// cache is valid only while that still matches the scan's current value
+    /// (a cheap read, no walk), which catches `.yaml`/`.csv` loc changes the
+    /// client watcher misses (it only watches `*.yml`) and clients that send no
+    /// watched events. Watched create/delete events invalidate immediately.
+    /// `sig` stores the scan's value, NOT a freshly-computed signature, so a
+    /// watched-event re-walk doesn't leave the cache permanently mismatched
+    /// against the scan's stale value. `None` until the first code-action
+    /// request populates it.
+    #[allow(clippy::type_complexity)]
+    loc_discovery_cache:
+        parking_lot::Mutex<Option<(std::path::PathBuf, Vec<std::path::PathBuf>, Option<u64>)>>,
     /// `(stat_signature_for(walked files), settings_generation)` stored after
     /// the last successful full pass. A QUIET pass whose freshly-computed pair
     /// matches this short-circuits the whole reindex. `None` until the first
@@ -893,6 +908,7 @@ impl DocumentState {
             completion_generation: parking_lot::Mutex::new(HashMap::new()),
             next_completion_id: AtomicU64::new(0),
             last_loc_signature: parking_lot::Mutex::new(None),
+            loc_discovery_cache: parking_lot::Mutex::new(None),
             last_scan_fingerprint: parking_lot::Mutex::new(None),
             settings_generation: AtomicU64::new(0),
             start: std::time::Instant::now(),

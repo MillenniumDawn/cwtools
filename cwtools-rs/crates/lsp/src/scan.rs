@@ -1843,11 +1843,26 @@ impl Backend {
                 FileChangeType::DELETED => {
                     tracing::debug!(%uri, "watched file deleted; queued");
                     self.state.watched_deleted.lock().insert(uri);
+                    // A file's existence changed, so the cached loc discovery
+                    // may be stale; drop it so the next code-action request
+                    // re-walks (#134). Clearing on any create/delete (not just
+                    // loc) is fine: a spurious clear costs one re-walk, and
+                    // checking whether the path is loc would need the very
+                    // discovery we're caching.
+                    *self.state.loc_discovery_cache.lock() = None;
                     enqueued = true;
                 }
-                FileChangeType::CHANGED | FileChangeType::CREATED => {
+                FileChangeType::CREATED => {
+                    tracing::debug!(%uri, "watched file created; queued");
+                    self.state.watched_pending.lock().insert(uri);
+                    *self.state.loc_discovery_cache.lock() = None;
+                    enqueued = true;
+                }
+                FileChangeType::CHANGED => {
                     // Open state is re-checked at drain time (an open editor
                     // buffer is authoritative), so just queue every event here.
+                    // A CHANGED event doesn't alter which loc files exist, so
+                    // the discovery cache stays valid.
                     self.state.watched_pending.lock().insert(uri);
                     enqueued = true;
                 }

@@ -800,17 +800,40 @@ impl Backend {
         };
         // One walk of the loc tree serves every candidate diagnostic and every
         // language — cheap next to the disk read, and shared instead of
-        // repeated per candidate.
-        let discovered_root = workspace_root.clone();
-        let discovered = tokio::task::spawn_blocking(move || {
-            let roots = [discovered_root.as_path()];
-            LocService::discover_files(
-                &roots,
-                cwtools_file_manager::file_manager::ScanBudget::default(),
-            )
-        })
-        .await
-        .unwrap_or_default();
+        // repeated per candidate. The walk is memoized per workspace root
+        // (#134): a code-action request fires on cursor movement, so without a
+        // cache every request re-walked the whole tree. The cache is valid only
+        // while the scan's `last_loc_signature` still matches the value stored
+        // at population time (a cheap read, no walk) — that catches `.yaml`/
+        // `.csv` loc changes the client watcher misses (it only watches
+        // `*.yml`) and clients that send no watched events — and watched
+        // create/delete events invalidate it immediately. `sig` stores the
+        // scan's value, not a freshly-computed signature, so a watched-event
+        // re-walk doesn't leave the cache permanently mismatched against the
+        // scan's stale value.
+        let discovered = {
+            let cur_sig = *self.state.last_loc_signature.lock();
+            // Clone into owned data so no lock guard crosses the await below.
+            let cached = self.state.loc_discovery_cache.lock().clone();
+            match cached {
+                Some((root, files, sig)) if root == workspace_root && sig == cur_sig => files,
+                _ => {
+                    let discovered_root = workspace_root.clone();
+                    let files = tokio::task::spawn_blocking(move || {
+                        let roots = [discovered_root.as_path()];
+                        LocService::discover_files(
+                            &roots,
+                            cwtools_file_manager::file_manager::ScanBudget::default(),
+                        )
+                    })
+                    .await
+                    .unwrap_or_default();
+                    *self.state.loc_discovery_cache.lock() =
+                        Some((workspace_root.clone(), files.clone(), cur_sig));
+                    files
+                }
+            }
+        };
 
         // Resolve every candidate's per-language target up front so the whole
         // batch is visible to `build_create_loc_key_batch` before any
