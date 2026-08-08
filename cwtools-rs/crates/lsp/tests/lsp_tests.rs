@@ -10566,6 +10566,118 @@ fn test_rules_config_toast_defers_to_initialized_and_dedupes() {
     );
 }
 
+/// #193: `reloadrulesconfig` arriving while another scan holds the scan guard
+/// must not skip the revalidation. The client fires this command right after
+/// the startup scan's loading bar ends, but the bar-off notification is sent
+/// before the guard drops, so the reload races the tail of that scan — whose
+/// diagnostics were produced with no rules loaded. The command must retry
+/// until it wins the CAS and run one full revalidation before answering, and
+/// the response must report that a revalidation actually ran.
+#[test]
+fn test_reloadrulesconfig_retries_until_it_wins_the_scan_guard() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    // Hold every scan open for 4s so the reload reliably lands mid-scan. The
+    // startup scan's own hold is waited out by storm_server_env.
+    let (mut child, reader) = storm_server_env(
+        ws.path(),
+        rules_dir.path(),
+        vanilla.path(),
+        &[("CWTOOLS_SCAN_HOLD_MS", "4000")],
+    );
+    let rx = spawn_frame_collector(reader);
+
+    // Start a competing scan and wait for the scan-started signal, so the hold
+    // is definitely active when the reload arrives.
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            900,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no loadingBar(true) after reindexWorkspace"
+        );
+        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
+            && v["method"] == "loadingBar"
+            && v["params"]["enable"] == serde_json::Value::Bool(true)
+        {
+            break;
+        }
+    }
+
+    // Fire the reload while the scan holds the CAS: it must not answer until
+    // the competing scan is gone and a revalidation has run.
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            901,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "reloadrulesconfig", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut early_answer = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
+            && v["id"] == 901
+        {
+            early_answer = Some(v);
+            break;
+        }
+    }
+    assert!(
+        early_answer.is_none(),
+        "reloadrulesconfig answered while the competing scan held the guard: {early_answer:?}"
+    );
+
+    // The competing scan releases after its hold, the retry wins the CAS, and
+    // one full revalidation (a second loadingBar on→off cycle) must complete
+    // before the success response.
+    let mut saw_revalidation = false;
+    let response = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut response = None;
+        while std::time::Instant::now() < deadline {
+            let v = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if v["id"] == 901 {
+                response = Some(v);
+                break;
+            }
+            if v["method"] == "loadingBar" && v["params"]["enable"] == serde_json::Value::Bool(true)
+            {
+                saw_revalidation = true;
+            }
+        }
+        response
+    };
+    child.kill().ok();
+
+    let response = response.expect("reloadrulesconfig never answered");
+    assert!(
+        saw_revalidation,
+        "no revalidation ran between the reload and its response"
+    );
+    let msg = response["result"].as_str().expect("string result");
+    assert!(
+        msg.contains("workspace re-validated"),
+        "the reload must report the revalidation it ran: {msg}"
+    );
+}
+
 // ── #163: the URI access boundary ────────────────────────────────────────────
 // `textDocument/foldingRange` is the cleanest probe: it needs nothing but the
 // file's text, so its answer is a direct read-out of whether the server was

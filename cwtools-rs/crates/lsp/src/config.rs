@@ -1048,14 +1048,30 @@ impl Backend {
                 match dir {
                     Some(dir) => {
                         let loaded = self.load_rules_config(&dir).await;
-                        self.validate_entire_workspace(false).await;
-                        let msg = if loaded {
-                            "Rules config reloaded; workspace re-validated.".to_string()
+                        // validate_entire_workspace's CAS guard returns false when
+                        // a scan is already running. The client fires this command
+                        // right after the startup scan's loading bar ends, but the
+                        // bar-off notification is sent before the guard drops, so
+                        // the reload races the tail of that scan — whose diagnostics
+                        // were produced with no rules loaded. Retry until we win the
+                        // CAS, bounded so a perpetually-busy server reports honestly
+                        // instead of spinning.
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(60);
+                        let mut revalidated = self.validate_entire_workspace(false).await;
+                        while !revalidated && std::time::Instant::now() < deadline {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            revalidated = self.validate_entire_workspace(false).await;
+                        }
+                        let status = if revalidated {
+                            "workspace re-validated"
                         } else {
-                            format!(
-                                "No rules loaded from {}; workspace re-validated.",
-                                dir.display()
-                            )
+                            "re-validation still pending (another scan is running)"
+                        };
+                        let msg = if loaded {
+                            format!("Rules config reloaded; {status}.")
+                        } else {
+                            format!("No rules loaded from {}; {status}.", dir.display())
                         };
                         Ok(Some(Value::String(msg)))
                     }
