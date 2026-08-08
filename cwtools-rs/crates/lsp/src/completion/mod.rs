@@ -28,6 +28,14 @@ pub(crate) use builders::{
 };
 pub(crate) use loc_keys::LocKeyIndex;
 pub(crate) use scope_names::loc_completions;
+
+fn completion_request_is_current(
+    generations: &HashMap<String, u64>,
+    uri: &str,
+    request_id: u64,
+) -> bool {
+    generations.get(uri).copied() == Some(request_id)
+}
 pub(crate) use snippets::generate_node_snippet;
 
 /// Build a `sortText` so the most relevant items surface first as the user
@@ -381,21 +389,34 @@ impl Backend {
             );
             return Ok(None);
         }
-
-        // Fast-typing cancel: each new request for the same URI bumps the
-        // per-URI generation. The request captures the value at entry and
+        // Fast-typing cancel: each new request stores a unique per-URI id.
+        // The request captures the value at entry and
         // re-checks it before doing any heavy work; if a newer request has
         // already started, this one returns `None` so the runtime can drop
         // the work. Stops a burst of N keystrokes from stacking N parallel
         // AST walks when only the latest one matters.
         let my_generation = {
-            let mut gens = self.state.completion_generation.lock();
-            let g = gens.entry(uri.clone()).or_insert(0);
-            *g += 1;
-            *g
+            let documents = self.state.documents.lock();
+            if !documents.contains_key(&uri) {
+                return Ok(None);
+            }
+            let request_id = self
+                .state
+                .next_completion_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.state
+                .completion_generation
+                .lock()
+                .insert(uri.clone(), request_id);
+            request_id
         };
-        let is_stale =
-            || self.state.completion_generation.lock().get(&uri).copied() > Some(my_generation);
+        let is_stale = || {
+            !completion_request_is_current(
+                &self.state.completion_generation.lock(),
+                &uri,
+                my_generation,
+            )
+        };
         if is_stale() {
             log_completion_summary(
                 t_start.elapsed(),
@@ -916,6 +937,29 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn completion_generation_rejects_closed_and_replaced_requests() {
+        let mut generations = HashMap::from([("file:///doc".to_string(), 1)]);
+        assert!(completion_request_is_current(
+            &generations,
+            "file:///doc",
+            1
+        ));
+
+        generations.remove("file:///doc");
+        assert!(!completion_request_is_current(
+            &generations,
+            "file:///doc",
+            1
+        ));
+        generations.insert("file:///doc".to_string(), 2);
+        assert!(!completion_request_is_current(
+            &generations,
+            "file:///doc",
+            1
+        ));
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

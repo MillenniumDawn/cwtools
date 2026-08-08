@@ -150,6 +150,34 @@ fn jsonrpc_notification(method: &str, params: serde_json::Value) -> String {
 // ── Full lifecycle: initialize → initialized → shutdown ──────────────────────
 
 #[test]
+fn test_lsp_rejects_an_oversized_frame_without_waiting_for_the_body() {
+    const MAX_LSP_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        write!(stdin, "Content-Length: {}\r\n\r\n", MAX_LSP_FRAME_BYTES + 1).unwrap();
+        stdin.flush().unwrap();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    child.kill().ok();
+    child.wait().ok();
+    panic!("server waited for the oversized frame body");
+}
+
+#[test]
 fn test_lsp_full_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let uri = path_uri(tmp.path());
@@ -4159,32 +4187,22 @@ fn at_const_rename_without_workspace(doc_uri: &str, text: &str) -> serde_json::V
     serde_json::from_str(&resp).unwrap()
 }
 
-/// An `untitled:` buffer has never been on disk, so the edit boundary can't
-/// contain it — and doesn't have to. The rename touches only the document the
-/// request named, which the client supplied and will apply to itself (#160).
 #[test]
-fn test_rename_at_constant_succeeds_in_an_untitled_document() {
+fn test_rename_at_constant_refuses_an_untitled_document() {
     let doc = "@my_const = 5\nadec = {\n    x = @my_const\n}\n";
     let resp = at_const_rename_without_workspace("untitled:Untitled-1", doc);
     assert!(
         resp["error"].is_null(),
-        "an own-document rename must not be refused, got: {resp}"
+        "rename must answer cleanly: {resp}"
     );
-    let changes = resp["result"]["changes"]
-        .as_object()
-        .unwrap_or_else(|| panic!("WorkspaceEdit changes, got: {resp}"));
-    let edits = changes["untitled:Untitled-1"]
-        .as_array()
-        .unwrap_or_else(|| panic!("edits for the untitled doc, got: {resp}"));
-    assert_eq!(edits.len(), 2, "definition and read, got: {resp}");
-    assert!(edits.iter().all(|e| e["newText"] == "@renamed"));
+    assert!(
+        resp["result"].is_null(),
+        "an untitled buffer must not enter open-document state: {resp}"
+    );
 }
 
-/// A window opened on a single file reports no workspace folder at all, so
-/// `editable_roots` is empty. A file-local rename must still work: the request
-/// named the document, and no server-derived path is involved.
 #[test]
-fn test_rename_at_constant_succeeds_without_a_workspace_folder() {
+fn test_rename_at_constant_refuses_a_file_without_a_workspace_folder() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("loose.txt");
     let doc = "@my_const = 5\nadec = {\n    x = @my_const\n}\n";
@@ -4193,15 +4211,12 @@ fn test_rename_at_constant_succeeds_without_a_workspace_folder() {
     let resp = at_const_rename_without_workspace(&doc_uri, doc);
     assert!(
         resp["error"].is_null(),
-        "an own-document rename must not be refused, got: {resp}"
+        "rename must answer cleanly: {resp}"
     );
-    let changes = resp["result"]["changes"]
-        .as_object()
-        .unwrap_or_else(|| panic!("WorkspaceEdit changes, got: {resp}"));
-    let edits = changes[&doc_uri]
-        .as_array()
-        .unwrap_or_else(|| panic!("edits for the open doc, got: {resp}"));
-    assert_eq!(edits.len(), 2, "definition and read, got: {resp}");
+    assert!(
+        resp["result"].is_null(),
+        "a buffer without a workspace root must not enter open-document state: {resp}"
+    );
 }
 
 /// A rename whose edit set reaches a second document the edit boundary refuses
@@ -6590,6 +6605,54 @@ fn test_unknown_execute_command_returns_error() {
         "the error should name the offending command, got: {}",
         v["error"]
     );
+}
+
+#[test]
+fn test_did_open_burst_stops_at_the_document_count_limit() {
+    const MAX_OPEN_DOCUMENTS: usize = 128;
+
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let rx = spawn_frame_collector(reader);
+
+    for i in 0..=MAX_OPEN_DOCUMENTS {
+        let uri = path_uri(ws.path().join(format!("common/decisions/{i}.txt")));
+        write_frame(
+            &mut child,
+            &jsonrpc_notification(
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "hoi4",
+                        "version": 1,
+                        "text": "x = 1\n"
+                    }
+                }),
+            ),
+        )
+        .unwrap();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut validations = 0;
+    let mut request_id = 2000;
+    while std::time::Instant::now() < deadline {
+        let log = fetch_profiling_log(&mut child, &rx, request_id);
+        validations = count_validate_log(&log, "didOpen");
+        if validations >= MAX_OPEN_DOCUMENTS {
+            break;
+        }
+        request_id += 1;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    child.kill().ok();
+    child.wait().ok();
+
+    assert_eq!(validations, MAX_OPEN_DOCUMENTS);
 }
 
 #[test]
@@ -10078,6 +10141,9 @@ fn test_did_change_workspace_folders_repoints_and_rescans() {
     let second = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     std::fs::write(rules_dir.path().join("editor_rules.cwt"), EDITOR_RULES).unwrap();
+    let old = first.path().join("events/old.txt");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, "old_event = { id = old_event }\n").unwrap();
     let p = second.path().join("common/national_focus/tree.txt");
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(&p, "moved_focus = {\n    id = moved_focus\n}\n").unwrap();
@@ -10113,6 +10179,21 @@ fn test_did_change_workspace_folders_repoints_and_rescans() {
         &jsonrpc_notification("initialized", serde_json::json!({})),
     )
     .unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": path_uri(&old),
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": "old_event = { id = old_event }\n",
+                }
+            }),
+        ),
+    )
+    .unwrap();
 
     // Swap the primary folder for one that holds a focus file.
     write_frame(
@@ -10131,7 +10212,9 @@ fn test_did_change_workspace_folders_repoints_and_rescans() {
 
     // The re-scan must index the new root: its file gets diagnostics published.
     let stdin = child.stdin.take().unwrap();
-    let saw = run_with_deadline(stdin, reader, 90, |_stdin, reader| {
+    let old_uri = path_uri(&old);
+    let result = run_with_deadline(stdin, reader, 90, move |stdin, reader| {
+        let mut requested_old_symbols = false;
         for _ in 0..2000 {
             let Ok(raw) = read_frame(reader) else { break };
             if raw.is_empty() {
@@ -10142,18 +10225,31 @@ fn test_did_change_workspace_folders_repoints_and_rescans() {
                 && v["params"]["uri"]
                     .as_str()
                     .is_some_and(|u| u.ends_with("common/national_focus/tree.txt"))
+                && !requested_old_symbols
             {
                 println!("rescan published diagnostics for {}", v["params"]["uri"]);
-                return true;
+                write_frame_to(
+                    stdin,
+                    &jsonrpc_request(
+                        99,
+                        "textDocument/documentSymbol",
+                        serde_json::json!({ "textDocument": { "uri": old_uri } }),
+                    ),
+                )
+                .unwrap();
+                requested_old_symbols = true;
+            }
+            if v["id"] == 99 {
+                return requested_old_symbols && v["result"].is_null();
             }
         }
         false
     });
     child.kill().ok();
     assert_eq!(
-        saw,
+        result,
         Some(true),
-        "the new workspace folder was never scanned"
+        "the new workspace was not scanned or the removed workspace document stayed open"
     );
 }
 
@@ -11025,9 +11121,7 @@ fn test_access_boundary_refuses_a_file_outside_the_workspace() {
 }
 
 #[test]
-fn test_access_boundary_allows_an_open_buffer_outside_the_workspace() {
-    // The buffer is the client's own content, so opening a scratch file from
-    // anywhere keeps working — the boundary only governs disk reads.
+fn test_access_boundary_refuses_an_open_buffer_outside_the_workspace() {
     let (ws, _) = boundary_workspace();
     let outside = tempfile::tempdir().unwrap();
     let file = outside.path().join("f.txt");
@@ -11035,13 +11129,7 @@ fn test_access_boundary_allows_an_open_buffer_outside_the_workspace() {
     std::fs::write(&file, text).unwrap();
     let uri = path_uri(&file);
     let response = folding_ranges_for(ws.path(), &[(&uri, text)], &uri).expect("server went quiet");
-    let ranges = expect_ranges(&response);
-    assert!(
-        ranges
-            .iter()
-            .any(|r| r["startLine"] == 0 && r["endLine"] == 4),
-        "an open out-of-workspace buffer must still fold, got: {response}"
-    );
+    assert_refused(&response, "an open buffer outside every workspace folder");
 }
 
 #[test]
@@ -11070,119 +11158,6 @@ fn test_access_boundary_refuses_a_character_device() {
     let response =
         folding_ranges_for(ws.path(), &[], "file:///dev/zero").expect("server hung on /dev/zero");
     assert_refused(&response, "/dev/zero");
-}
-
-/// Whether `workspace/symbol` still reports `name`. The index-backed observer
-/// for the `didClose` test below: `@` constants are tracked per file whatever
-/// the file's logical path, so an out-of-workspace buffer produces one.
-fn workspace_symbol_has(
-    child: &mut std::process::Child,
-    reader: &mut BufReader<std::process::ChildStdout>,
-    id: i64,
-    name: &str,
-) -> bool {
-    write_frame(
-        child,
-        &jsonrpc_request(id, "workspace/symbol", serde_json::json!({ "query": name })),
-    )
-    .unwrap();
-    let resp: serde_json::Value =
-        serde_json::from_str(&read_response(reader).expect("no symbol response")).unwrap();
-    resp["result"]
-        .as_array()
-        .is_some_and(|syms| syms.iter().any(|s| s["name"] == format!("@{name}")))
-}
-
-#[test]
-fn test_access_boundary_denied_did_close_leaves_the_index_alone() {
-    // `didClose` re-reads the file to re-index it from disk, and clears the
-    // file's index entry when there is nothing to read. A refused URI says
-    // nothing about what is on disk, so it must clear nothing — a rejection
-    // that quietly mutates the index is the failure mode hardest to notice.
-    let ws = tempfile::tempdir().unwrap();
-    let rules_dir = tempfile::tempdir().unwrap();
-    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
-    let outside = tempfile::tempdir().unwrap();
-    let file = outside.path().join("scratch.txt");
-    let text = "@boundary_probe = 5\n";
-    std::fs::write(&file, text).unwrap();
-    let uri = path_uri(&file);
-
-    let mut child = cwtools_server_cmd()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn");
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    write_frame(
-        &mut child,
-        &jsonrpc_request(
-            1,
-            "initialize",
-            serde_json::json!({
-                "processId": std::process::id(),
-                "rootUri": path_uri(ws.path()),
-                "capabilities": {},
-                "initializationOptions": {
-                    "language": "hoi4",
-                    "rulesCache": rules_dir.path().to_string_lossy(),
-                }
-            }),
-        ),
-    )
-    .unwrap();
-    read_response(&mut reader).expect("no init response");
-    write_frame(
-        &mut child,
-        &jsonrpc_notification("initialized", serde_json::json!({})),
-    )
-    .unwrap();
-    wait_for_scan_done(&mut reader);
-
-    // The buffer is the client's own text, so opening an out-of-root file still
-    // indexes it — the boundary governs disk reads only.
-    write_frame(
-        &mut child,
-        &jsonrpc_notification(
-            "textDocument/didOpen",
-            serde_json::json!({
-                "textDocument": {"uri": uri, "languageId": "hoi4", "version": 1, "text": text}
-            }),
-        ),
-    )
-    .unwrap();
-    let indexed = (0..40).any(|i| {
-        if workspace_symbol_has(&mut child, &mut reader, 100 + i, "boundary_probe") {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        false
-    });
-    assert!(indexed, "didOpen must index the buffer's @-constant");
-
-    // Delete it, so a `didClose` that got to read the path would find nothing
-    // and clear the entry. The boundary refuses before that, so the entry stays.
-    std::fs::remove_file(&file).unwrap();
-    write_frame(
-        &mut child,
-        &jsonrpc_notification(
-            "textDocument/didClose",
-            serde_json::json!({ "textDocument": { "uri": uri } }),
-        ),
-    )
-    .unwrap();
-
-    for i in 0..15 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if !workspace_symbol_has(&mut child, &mut reader, 200 + i, "boundary_probe") {
-            child.kill().ok();
-            child.wait().ok();
-            panic!("a refused didClose cleared the file's index entry");
-        }
-    }
-    child.kill().ok();
-    child.wait().ok();
 }
 
 #[cfg(unix)]

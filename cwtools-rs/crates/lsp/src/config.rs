@@ -839,6 +839,27 @@ impl Backend {
                 }
             }
             cfg.refresh_roots();
+            self.state
+                .workspace_roots_generation
+                .fetch_add(1, Ordering::Release);
+        }
+        let open_uris: Vec<String> = {
+            let documents = self.state.documents.lock();
+            documents.keys().cloned().collect()
+        };
+        for uri in open_uris {
+            if self.is_workspace_document(&uri) {
+                continue;
+            }
+            if let Ok(uri) = Url::parse(&uri) {
+                tower_lsp::LanguageServer::did_close(
+                    self,
+                    DidCloseTextDocumentParams {
+                        text_document: TextDocumentIdentifier { uri },
+                    },
+                )
+                .await;
+            }
         }
         self.client
             .log_message(

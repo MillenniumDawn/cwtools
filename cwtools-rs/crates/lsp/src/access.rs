@@ -57,6 +57,11 @@ impl Backend {
         let roots = self.state.config.read().authorized_roots.clone();
         authorized_path(uri, &roots)
     }
+
+    pub(crate) fn is_workspace_document(&self, uri: &str) -> bool {
+        let roots = self.state.config.read().editable_roots.clone();
+        tokio::task::block_in_place(|| workspace_document_path(uri, &roots).is_some())
+    }
 }
 
 /// The canonical path `uri` names, when it is a `file:` URI naming a regular
@@ -86,6 +91,28 @@ pub(crate) fn authorized_path(uri: &str, roots: &[PathBuf]) -> Option<PathBuf> {
         return None;
     }
     Some(path)
+}
+
+/// Resolve a client-owned document URI inside a configured workspace folder.
+/// Unlike [`authorized_path`], this excludes the base-game and rules roots and
+/// accepts a not-yet-created file whose deepest existing ancestor is in the
+/// workspace.
+pub(crate) fn workspace_document_path(uri: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    let path = file_uri_to_path(uri)?;
+    let resolved = std::fs::canonicalize(&path)
+        .ok()
+        .or_else(|| canonicalize_new_path(&path))?;
+    if !roots.iter().any(|root| resolved.starts_with(root)) {
+        tracing::debug!(path = %resolved.display(), "access: document outside every workspace root");
+        return None;
+    }
+    if let Ok(meta) = path.metadata()
+        && !meta.is_file()
+    {
+        tracing::debug!(path = %path.display(), "access: document is not a regular file");
+        return None;
+    }
+    Some(resolved)
 }
 
 /// The path a `file:` URI names, unresolved. `None` for any other scheme.
@@ -220,6 +247,10 @@ fn canonicalize_new_path(path: &Path) -> Option<PathBuf> {
         if let Ok(base) = std::fs::canonicalize(cursor) {
             return Some(base.join(tail.iter().rev().collect::<PathBuf>()));
         }
+        // Do not reinterpret a dangling symlink as a new plain component.
+        if std::fs::symlink_metadata(cursor).is_ok() {
+            return None;
+        }
         let std::path::Component::Normal(name) = cursor.components().next_back()? else {
             tracing::debug!(path = %path.display(), "access: edit target is not a plain path");
             return None;
@@ -314,6 +345,41 @@ mod tests {
         let file = other.path().join("a.txt");
         std::fs::write(&file, "foo = { }\n").unwrap();
         assert_eq!(authorized_path(&uri(&file), &roots([root.path()])), None);
+    }
+
+    #[test]
+    fn workspace_document_accepts_a_new_nested_file() {
+        let root = tempfile::TempDir::new().expect("tmpdir");
+        let file = root.path().join("new/nested/a.txt");
+        assert!(workspace_document_path(&uri(&file), &roots([root.path()])).is_some());
+    }
+
+    #[test]
+    fn workspace_document_rejects_an_authorized_read_only_root() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let rules = tempfile::TempDir::new().expect("rules");
+        let file = rules.path().join("a.cwt");
+        std::fs::write(&file, "foo = { }\n").unwrap();
+        assert_eq!(
+            workspace_document_path(&uri(&file), &roots([workspace.path()])),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_document_rejects_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let outside = tempfile::TempDir::new().expect("outside");
+        let link = workspace.path().join("link");
+        symlink(outside.path().join("missing"), &link).unwrap();
+
+        assert_eq!(
+            workspace_document_path(&uri(&link), &roots([workspace.path()])),
+            None
+        );
     }
 
     /// The `url` crate's `to_file_path` ignores the scheme, so a non-`file` URI
