@@ -15,50 +15,93 @@ use crate::Backend;
 use crate::cache_purge::purge_caches;
 use crate::paths::default_cache_dir;
 
+/// Maximum entries accepted from a single ignore array in the init/didChange
+/// payload, and maximum length of one glob, in chars. Longer input is cut at
+/// the boundary so a hostile or accidental config can't grow the per-scan
+/// matcher work without bound (#169).
+const MAX_IGNORE_ENTRIES: usize = 200;
+const MAX_IGNORE_PATTERN_LEN: usize = 1024;
+const MAX_IGNORED_ERROR_CODES: usize = 200;
+
 /// Pull `ignoreFilePatterns` and `ignoreDirectories` arrays out of a
 /// `serde_json::Value` (the `initializationOptions` payload and the
 /// `workspace/didChangeConfiguration` payload share the same shape).
-/// Returns the two lists. Filters non-string and empty entries.
+/// Returns the two lists. Filters non-string and empty entries; truncates
+/// past [`MAX_IGNORE_ENTRIES`] per list and drops globs longer than
+/// [`MAX_IGNORE_PATTERN_LEN`], with a warning naming the key.
 pub(crate) fn extract_ignore_patterns(opts: &Value) -> (Vec<String>, Vec<String>) {
-    let mut files = Vec::new();
-    let mut dirs = Vec::new();
-    if let Some(arr) = opts.get("ignoreFilePatterns").and_then(|v| v.as_array()) {
-        for v in arr {
-            if let Some(s) = v.as_str()
-                && !s.is_empty()
-            {
-                files.push(s.to_string());
-            }
-        }
+    (
+        extract_bounded_string_list(
+            opts,
+            "ignoreFilePatterns",
+            MAX_IGNORE_ENTRIES,
+            MAX_IGNORE_PATTERN_LEN,
+        ),
+        extract_bounded_string_list(
+            opts,
+            "ignoreDirectories",
+            MAX_IGNORE_ENTRIES,
+            MAX_IGNORE_PATTERN_LEN,
+        ),
+    )
+}
+
+/// Shared bounded extraction for the string-array settings. Non-string and
+/// empty entries are filtered; a list longer than `max_entries` keeps its
+/// first `max_entries`, and an entry longer than `max_entry_len` chars is
+/// dropped. Both cuts log a warning naming the key.
+fn extract_bounded_string_list(
+    opts: &Value,
+    key: &str,
+    max_entries: usize,
+    max_entry_len: usize,
+) -> Vec<String> {
+    let Some(arr) = opts.get(key).and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    if arr.len() > max_entries {
+        tracing::warn!(
+            key,
+            count = arr.len(),
+            max = max_entries,
+            "truncating list to the first {} entries",
+            max_entries
+        );
     }
-    if let Some(arr) = opts.get("ignoreDirectories").and_then(|v| v.as_array()) {
-        for v in arr {
-            if let Some(s) = v.as_str()
-                && !s.is_empty()
-            {
-                dirs.push(s.to_string());
-            }
+    let mut out = Vec::new();
+    for v in arr.iter().take(max_entries) {
+        let Some(s) = v.as_str() else { continue };
+        if s.is_empty() {
+            continue;
         }
+        if s.chars().count() > max_entry_len {
+            tracing::warn!(
+                key,
+                len = s.chars().count(),
+                max = max_entry_len,
+                "dropping entry over length limit"
+            );
+            continue;
+        }
+        out.push(s.to_string());
     }
-    (files, dirs)
+    out
 }
 
 /// Pull `ignoredErrorCodes` (diagnostic codes the user suppressed via
 /// `errors.ignore`) out of the shared init/didChange payload. Lowercased so the
 /// publish-time filter compares case-insensitively; non-string and empty
-/// entries are dropped.
+/// entries are dropped, and the list is truncated past [`MAX_IGNORED_ERROR_CODES`].
 pub(crate) fn extract_ignored_error_codes(opts: &Value) -> Vec<String> {
-    let mut codes = Vec::new();
-    if let Some(arr) = opts.get("ignoredErrorCodes").and_then(|v| v.as_array()) {
-        for v in arr {
-            if let Some(s) = v.as_str()
-                && !s.is_empty()
-            {
-                codes.push(s.to_ascii_lowercase());
-            }
-        }
-    }
-    codes
+    extract_bounded_string_list(
+        opts,
+        "ignoredErrorCodes",
+        MAX_IGNORED_ERROR_CODES,
+        MAX_IGNORE_PATTERN_LEN,
+    )
+    .into_iter()
+    .map(|s| s.to_ascii_lowercase())
+    .collect()
 }
 
 /// Read an optional non-negative integer setting from the shared
@@ -1274,6 +1317,62 @@ mod tests {
         let opts = json!({ "ignoredErrorCodes": ["CW100", "cw246", "", 5] });
         let codes = extract_ignored_error_codes(&opts);
         assert_eq!(codes, vec!["cw100".to_string(), "cw246".to_string()]);
+    }
+
+    #[test]
+    fn extract_ignore_patterns_bounds_count_per_list() {
+        // #169: a hostile config must not be able to grow the per-scan matcher
+        // work without bound. Only the first MAX_IGNORE_ENTRIES survive.
+        let files: Vec<String> = (0..MAX_IGNORE_ENTRIES + 50)
+            .map(|i| format!("file{i}.txt"))
+            .collect();
+        let dirs: Vec<String> = (0..MAX_IGNORE_ENTRIES + 50)
+            .map(|i| format!("dir{i}"))
+            .collect();
+        let opts = json!({ "ignoreFilePatterns": files, "ignoreDirectories": dirs });
+        let (files, dirs) = extract_ignore_patterns(&opts);
+        assert_eq!(files.len(), MAX_IGNORE_ENTRIES);
+        assert_eq!(dirs.len(), MAX_IGNORE_ENTRIES);
+        assert_eq!(files[0], "file0.txt");
+        assert_eq!(
+            files[MAX_IGNORE_ENTRIES - 1],
+            format!("file{}.txt", MAX_IGNORE_ENTRIES - 1)
+        );
+        assert_eq!(dirs[0], "dir0");
+        assert_eq!(
+            dirs[MAX_IGNORE_ENTRIES - 1],
+            format!("dir{}", MAX_IGNORE_ENTRIES - 1)
+        );
+    }
+
+    #[test]
+    fn extract_ignore_patterns_drops_overlength_globs() {
+        // A 1 MB '?'-heavy glob used to force ~255M DP iterations per filename
+        // (#169). Over-limit entries are dropped; valid ones pass through.
+        let opts = json!({
+            "ignoreFilePatterns": ["*.tmp", "x".repeat(MAX_IGNORE_PATTERN_LEN + 1), "**/skip.txt"],
+        });
+        let (files, _) = extract_ignore_patterns(&opts);
+        assert_eq!(files, vec!["*.tmp".to_string(), "**/skip.txt".to_string()]);
+        // At the cap exactly: kept.
+        let at_cap = "?".repeat(MAX_IGNORE_PATTERN_LEN);
+        let (files, _) = extract_ignore_patterns(&json!({ "ignoreFilePatterns": [at_cap] }));
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn extract_ignored_error_codes_bounds_count() {
+        let codes: Vec<String> = (0..MAX_IGNORED_ERROR_CODES + 50)
+            .map(|i| format!("CW{i}"))
+            .collect();
+        let opts = json!({ "ignoredErrorCodes": codes });
+        let codes = extract_ignored_error_codes(&opts);
+        assert_eq!(codes.len(), MAX_IGNORED_ERROR_CODES);
+        assert_eq!(codes[0], "cw0");
+        assert_eq!(
+            codes[MAX_IGNORED_ERROR_CODES - 1],
+            format!("cw{}", MAX_IGNORED_ERROR_CODES - 1)
+        );
     }
 
     #[test]

@@ -3,7 +3,8 @@ use cwtools_file_manager::file_manager::glob_match;
 use std::hint::black_box;
 
 // Patterns with embedded wildcards bypass the *.ext / prefix* fast paths and
-// hit the general DP (#17). Mix of matching and non-matching, realistic lengths.
+// hit the general greedy matcher. Mix of matching and non-matching, realistic
+// lengths.
 const CASES: &[(&str, &str)] = &[
     (
         "common/*/scripted_effects/*.txt",
@@ -21,7 +22,7 @@ const CASES: &[(&str, &str)] = &[
 ];
 
 fn bench_glob(c: &mut Criterion) {
-    c.bench_function("glob_match/general_dp", |b| {
+    c.bench_function("glob_match/general", |b| {
         b.iter(|| {
             for (pat, text) in CASES {
                 black_box(glob_match(black_box(pat), black_box(text)));
