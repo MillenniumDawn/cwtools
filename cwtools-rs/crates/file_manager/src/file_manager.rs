@@ -1187,37 +1187,46 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     glob_match_general(pattern, text)
 }
 
+/// Greedy two-pointer wildcard match (`*` = any run, `?` = one char). The
+/// classic backtracking algorithm: amortized O(m+n) with O(1) scratch, no
+/// per-call allocations beyond the two char vectors. Worst case is O(m*n)
+/// (a long literal segment after a `*` re-scanned against a near-miss text),
+/// which the callers' pattern-length caps keep bounded (#169).
 fn glob_match_general(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    glob_dp(&p, &t)
+    glob_greedy(&p, &t)
 }
 
-fn glob_dp(p: &[char], t: &[char]) -> bool {
-    let m = p.len();
-    let n = t.len();
-    // Single rolling row instead of an (m+1)x(n+1) `Vec<Vec<bool>>` per call
-    // (#17): dp[j] holds whether p[0..i] matches t[0..j]; `prev_diag` carries the
-    // dp[i-1][j-1] value as we sweep j left-to-right.
-    let mut dp = vec![false; n + 1];
-    dp[0] = true; // empty pattern matches empty text
-    for i in 1..=m {
-        let mut prev_diag = dp[0]; // dp[i-1][0]
-        // dp[i][0] is true only if every pattern char so far is '*'.
-        dp[0] = dp[0] && p[i - 1] == '*';
-        for j in 1..=n {
-            let above = dp[j]; // dp[i-1][j], before overwrite
-            if p[i - 1] == '*' {
-                dp[j] = dp[j] || dp[j - 1]; // dp[i-1][j] || dp[i][j-1]
-            } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
-                dp[j] = prev_diag; // dp[i-1][j-1]
-            } else {
-                dp[j] = false;
-            }
-            prev_diag = above;
+fn glob_greedy(p: &[char], t: &[char]) -> bool {
+    let (m, n) = (p.len(), t.len());
+    let mut i = 0; // position in t
+    let mut j = 0; // position in p
+    let mut star: Option<usize> = None; // most recent '*'
+    let mut mark = 0; // t position the star segment restarts from
+    while i < n {
+        if j < m && p[j] == '*' {
+            // Star before equality: a literal '*' in the text must not
+            // consume the pattern's star and lose the backtrack point.
+            star = Some(j);
+            j += 1;
+            mark = i;
+        } else if j < m && (p[j] == '?' || p[j] == t[i]) {
+            i += 1;
+            j += 1;
+        } else if let Some(s) = star {
+            // The star matches one more char and the segment re-tries.
+            j = s + 1;
+            mark += 1;
+            i = mark;
+        } else {
+            return false;
         }
     }
-    dp[n]
+    while j < m && p[j] == '*' {
+        j += 1;
+    }
+    j == m
 }
 
 #[cfg(test)]
@@ -1284,6 +1293,112 @@ mod tests {
         // prefix* fast path must not trigger when the prefix itself contains ?.
         assert!(glob_match("fo?*", "foobar"));
         assert!(!glob_match("fo?*", "fo")); // needs at least one char after "fo"
+    }
+
+    /// The pre-#169 DP matcher, kept as the reference for the greedy
+    /// matcher's equivalence tests.
+    fn glob_dp_reference(p: &[char], t: &[char]) -> bool {
+        let m = p.len();
+        let n = t.len();
+        let mut dp = vec![false; n + 1];
+        dp[0] = true;
+        for i in 1..=m {
+            let mut prev_diag = dp[0];
+            dp[0] = dp[0] && p[i - 1] == '*';
+            for j in 1..=n {
+                let above = dp[j];
+                if p[i - 1] == '*' {
+                    dp[j] = dp[j] || dp[j - 1];
+                } else if p[i - 1] == '?' || p[i - 1] == t[j - 1] {
+                    dp[j] = prev_diag;
+                } else {
+                    dp[j] = false;
+                }
+                prev_diag = above;
+            }
+        }
+        dp[n]
+    }
+
+    fn reference_match(pattern: &str, text: &str) -> bool {
+        let p: Vec<char> = pattern.chars().collect();
+        let t: Vec<char> = text.chars().collect();
+        glob_dp_reference(&p, &t)
+    }
+
+    #[test]
+    fn glob_greedy_agrees_with_reference_dp_exhaustive() {
+        // Every pattern/text pair over {a, b, *, ?} up to length 4 (341
+        // strings each) must agree with the reference DP, fast paths included.
+        let alphabet = ['a', 'b', '*', '?'];
+        let mut strings: Vec<String> = vec![String::new()];
+        for _ in 1..=4 {
+            let prev: Vec<String> = strings.clone();
+            for s in &prev {
+                for &c in &alphabet {
+                    let mut next = s.clone();
+                    next.push(c);
+                    strings.push(next);
+                }
+            }
+        }
+        for p in &strings {
+            for t in &strings {
+                assert_eq!(
+                    glob_match(p, t),
+                    reference_match(p, t),
+                    "mismatch for pattern {p:?} text {t:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn glob_greedy_agrees_with_reference_dp_randomized() {
+        // Longer randomized cases; a fixed LCG so a failure reproduces.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let alphabet = ['a', 'b', 'c', 'x', 'y', '*', '?'];
+        for _ in 0..5000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let plen = (state % 12) as usize;
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let tlen = (state % 20) as usize;
+            let p: String = (0..plen)
+                .map(|_| alphabet[((state >> 32) % 7) as usize])
+                .collect();
+            let t: String = (0..tlen)
+                .map(|_| alphabet[((state >> 16) % 7) as usize])
+                .collect();
+            assert_eq!(
+                glob_match(&p, &t),
+                reference_match(&p, &t),
+                "mismatch for pattern {p:?} text {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn glob_worst_case_pattern_completes() {
+        // #169 regression: a 1 MB '?'-heavy pattern used to force ~255M DP
+        // iterations per maximum-length filename, repeated across the walk.
+        // The greedy matcher is linear here (milliseconds); the DP would run
+        // tens of seconds in debug and time the suite out.
+        let pat = "?".repeat(1024 * 1024);
+        let text = "a".repeat(255);
+        assert!(!glob_match(&pat, &text));
+        // Star-segment worst case at the config length cap. The '?' keeps the
+        // pattern off the *.ext fast path so the backtracking runs.
+        let pat = format!("*{}?{}b", "a".repeat(512), "a".repeat(511));
+        let text = format!("{}c", "a".repeat(255));
+        assert!(!glob_match(&pat, &text));
+        assert!(glob_match(
+            &format!("*{}", "a".repeat(1024)),
+            &"a".repeat(3000)
+        ));
     }
 
     #[test]

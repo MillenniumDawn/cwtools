@@ -6521,6 +6521,94 @@ fn test_config_partial_payload_keeps_ignore_lists() {
 }
 
 #[test]
+fn test_init_ignore_pattern_caps_cut_hostile_payload() {
+    // #169: initializationOptions carrying a 1 MB glob and over-count lists
+    // must be cut at the boundary. The startup summary (window/logMessage)
+    // reports the capped counts: the 1 MB glob is dropped, the dir and code
+    // lists truncated. A reverted cap would report 300 dirs and 250 codes
+    // and feed the 1 MB pattern to the matcher for every walked entry.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    for rel in [
+        "common/decisions/a.txt",
+        "common/decisions/b.txt",
+        "events/e.txt",
+    ] {
+        let path = ws.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, STORM_FILE).unwrap();
+    }
+
+    let ws_uri = path_uri(ws.path());
+    let mut cmd = cwtools_server_cmd();
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let huge = "?".repeat(1024 * 1024);
+    let over_count_dirs: Vec<String> = (0..300).map(|i| format!("dir{i}")).collect();
+    let over_count_codes: Vec<String> = (0..250).map(|i| format!("CW{i}")).collect();
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+                "ignoreFilePatterns": ["**/skip.txt", huge],
+                "ignoreDirectories": over_count_dirs,
+                "ignoredErrorCodes": over_count_codes,
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+
+    // The summary is logged during initialize, before the response. Reading
+    // the response first would skip it, so scan frames in order.
+    let mut summary: Option<String> = None;
+    for _ in 0..2000 {
+        let raw = read_frame(&mut reader).unwrap_or_default();
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v["method"] == "window/logMessage"
+            && let Some(m) = v["params"]["message"].as_str()
+            && m.contains("ignore patterns:")
+        {
+            summary = Some(m.to_string());
+            break;
+        }
+    }
+    let summary = summary.expect("startup summary logMessage");
+    assert!(
+        summary.contains("1 files, 200 dirs, 200 suppressed codes"),
+        "caps must truncate the hostile payload; got: {summary}"
+    );
+
+    // The startup scan must still complete with the capped patterns in place.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    child.kill().ok();
+}
+
+#[test]
 fn test_get_file_types_answers_during_watched_flood() {
     // The direct #90 regression: a large watched flood must not starve a cheap
     // getFileTypes request. With validation off the message future, the request
