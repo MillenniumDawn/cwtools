@@ -337,6 +337,13 @@ pub const CW276_LOC_KEY_INVALID_CHARS: ErrorCode = ErrorCode {
     message_template: "Localisation key {} contains invalid characters (spaces or special characters are not allowed)",
 };
 
+/// Validation stopped after an alias-overload branch budget was exhausted.
+pub const CW277_ALIAS_BRANCH_LIMIT: ErrorCode = ErrorCode {
+    id: "CW277",
+    severity: ErrorSeverity::Warning,
+    message_template: "Validation stopped after reaching the alias branch limit",
+};
+
 /// Event may fire every tick (performance hint). F# `EventEveryTick`.
 ///
 /// Reconciliation: cwtools-rs originally emitted this as the Rust-invented

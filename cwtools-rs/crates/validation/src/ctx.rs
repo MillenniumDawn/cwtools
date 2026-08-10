@@ -9,11 +9,46 @@
 
 use cwtools_game::constants::Game;
 use cwtools_localization::LocIndex;
-use cwtools_parser::ast::ParsedFile;
+use cwtools_parser::ast::{ParsedFile, SourcePos};
 use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 use std::cell::RefCell;
 use std::collections::HashSet;
+
+const ALIAS_BRANCH_BUDGET: usize = 65_536;
+
+#[derive(Clone, Copy)]
+pub(crate) struct AliasBranchBudgetExhaustion {
+    pub(crate) pos: SourcePos,
+    pub(crate) end: Option<SourcePos>,
+}
+
+pub(crate) struct AliasBranchBudget {
+    remaining: usize,
+    exhaustion: Option<AliasBranchBudgetExhaustion>,
+}
+
+impl Default for AliasBranchBudget {
+    fn default() -> Self {
+        Self {
+            remaining: ALIAS_BRANCH_BUDGET,
+            exhaustion: None,
+        }
+    }
+}
+
+impl AliasBranchBudget {
+    fn reserve(&mut self, branches: usize, pos: SourcePos, end: Option<SourcePos>) -> bool {
+        if branches <= self.remaining {
+            self.remaining -= branches;
+            true
+        } else {
+            self.exhaustion
+                .get_or_insert(AliasBranchBudgetExhaustion { pos, end });
+            false
+        }
+    }
+}
 
 /// Immutable shared context for one file's validation pass. Holds only borrows,
 /// so it is cheap to copy a `&ValidationCtx` into every recursive call.
@@ -41,6 +76,9 @@ pub(crate) struct ValidationCtx<'a> {
     /// sibling/parent blocks. The single `ValidationCtx` is shared by `&`, so
     /// this uses interior mutability.
     pub(crate) loop_vars: RefCell<Vec<String>>,
+    /// Per-file cap on candidate branches from overloaded aliases. The first
+    /// branch over the cap records the one diagnostic emitted after validation.
+    pub(crate) alias_branch_budget: RefCell<AliasBranchBudget>,
     /// Sink for the project-wide unused check (CW239/CW231): the instances of
     /// reference-tracked types this file uses. `None` on every path that didn't
     /// ask for the tracking, which is all of them but the batch driver's, so the
@@ -63,6 +101,47 @@ impl ValidationCtx<'_> {
         if let Some(sink) = self.type_uses {
             sink.borrow_mut().mark(type_name, instance);
         }
+    }
+
+    pub(crate) fn reserve_alias_branches(
+        &self,
+        branches: usize,
+        pos: SourcePos,
+        end: Option<SourcePos>,
+    ) -> bool {
+        let mut budget = self.alias_branch_budget.borrow_mut();
+        let was_exhausted = budget.exhaustion.is_some();
+        let accepted = budget.reserve(branches, pos, end);
+        let newly_exhausted = !accepted && !was_exhausted;
+        drop(budget);
+        if newly_exhausted {
+            self.mark_all_tracked_type_uses();
+        }
+        accepted
+    }
+
+    /// A capped file cannot establish every use, so suppress false unused-instance errors.
+    fn mark_all_tracked_type_uses(&self) {
+        let (Some(type_index), Some(sink)) = (self.type_index, self.type_uses) else {
+            return;
+        };
+        let mut uses = sink.borrow_mut();
+        for type_def in &self.ruleset.types {
+            if !crate::references::is_tracked(self.ruleset, self.game, &type_def.name) {
+                continue;
+            }
+            for (_, instance) in type_index.instances(&type_def.name) {
+                uses.mark(&type_def.name, &instance.name);
+            }
+        }
+    }
+
+    pub(crate) fn alias_branch_budget_exhaustion(&self) -> Option<AliasBranchBudgetExhaustion> {
+        self.alias_branch_budget.borrow().exhaustion
+    }
+
+    pub(crate) fn alias_branch_budget_exhausted(&self) -> bool {
+        self.alias_branch_budget_exhaustion().is_some()
     }
 
     /// Whether `name`, normalized the same way the variable index is, currently

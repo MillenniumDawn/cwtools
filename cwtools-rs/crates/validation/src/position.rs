@@ -15,7 +15,7 @@ use cwtools_parser::ast::{Child, ParsedFile, SourcePos, SourceRange, Value};
 use cwtools_rules::rules_types::*;
 
 use crate::common::{leaf_value_to_string, unquote_key};
-use crate::ctx::ValidationCtx;
+use crate::ctx::{AliasBranchBudget, ValidationCtx};
 use crate::resolve::{
     DispatchInput, PathCandidate, ResolvedType, find_rules_by_name, find_type_from_candidates,
     grandchild_candidates_for_wrapper, path_candidates_for_file, refine_grandchild_type,
@@ -112,6 +112,7 @@ pub fn rules_at_pos(
         scope_checks: prepared.scope_checks,
         var_checks: prepared.var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),
+        alias_branch_budget: std::cell::RefCell::new(AliasBranchBudget::default()),
         // The resolver is a read-only navigation walk; it never contributes to
         // the project-wide unused check.
         type_uses: None,

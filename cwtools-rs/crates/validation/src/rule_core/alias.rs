@@ -19,20 +19,38 @@ use super::matching::{PatternMatch, classify_pattern_match, is_scope_key};
 /// The overload set a single alias usage resolves to, each tagged `confident`.
 type Overloads<'a> = SmallVec<[(&'a (RuleType, Options), bool); 4]>;
 
+const EQUIVALENT_OVERLOAD_SCAN_CAP: usize = 32;
+
+fn push_overload<'a>(
+    overloads: &mut Overloads<'a>,
+    rule: &'a (RuleType, Options),
+    confident: bool,
+    coalesce_equivalent: bool,
+) {
+    if coalesce_equivalent
+        && overloads.len() < EQUIVALENT_OVERLOAD_SCAN_CAP
+        && let Some((_, existing_confident)) =
+            overloads.iter_mut().find(|(existing, _)| *existing == rule)
+    {
+        *existing_confident |= confident;
+        return;
+    }
+    overloads.push((rule, confident));
+}
+
 /// Gather every alias overload `alias[cat:key]` that the usage `key` resolves
 /// to: exact name, lowercase retry, `<type>`/`value[..]`/`enum[..]` patterns,
 /// and the category's `scope_field` entry for scope-switching keys.
 ///
 /// Shared between alias validation (below) and the position resolver
-/// (`crate::position`) so completion/hover resolve aliases exactly like the
-/// validator does.
+/// (`crate::position`) so both resolve aliases in the same priority order.
 pub(crate) fn alias_overloads<'a>(
     ruleset: &'a RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
     category: &str,
     key: &str,
 ) -> Vec<&'a (RuleType, Options)> {
-    alias_overloads_with_confidence(ruleset, type_index, category, key)
+    alias_overloads_with_confidence(ruleset, type_index, category, key, false)
         .into_iter()
         .map(|(rule, _)| rule)
         .collect()
@@ -49,9 +67,10 @@ pub(crate) fn alias_overloads<'a>(
 /// indexed) doesn't drag in that alias's unrelated `## scope` and flag a false
 /// CW104. Exact, lowercase-retry and `scope_field` overloads are always confident.
 ///
-/// Push order is exact → lowercase → patterns → scope_field; [`alias_overloads`]
-/// keeps all, the scope check filters to the confident subset, preserving that
-/// order. Order feeds `pick_best`'s tie-break.
+/// Push order is exact → lowercase → patterns → scope_field. Validation
+/// coalesces fully equivalent candidates while the set is small; navigation
+/// retains every candidate. The scope check filters to the confident subset,
+/// preserving order for `pick_best`'s tie-break.
 ///
 /// A usage resolves to a handful of overloads at most, and this runs for every
 /// effect/trigger in the corpus, so the set is inline until it doesn't fit.
@@ -60,13 +79,19 @@ fn alias_overloads_with_confidence<'a>(
     type_index: Option<&cwtools_index::TypeIndex>,
     category: &str,
     key: &str,
+    coalesce_equivalent: bool,
 ) -> Overloads<'a> {
     // Gather candidate overloads via the precomputed alias index (O(1) exact +
     // O(patterns)) rather than scanning every alias.
     let mut overloads: Overloads<'a> = SmallVec::new();
     if let Some(idxs) = ruleset.alias_exact.get(category).and_then(|m| m.get(key)) {
         for &i in idxs {
-            overloads.push((&ruleset.aliases[i].1, true));
+            push_overload(
+                &mut overloads,
+                &ruleset.aliases[i].1,
+                true,
+                coalesce_equivalent,
+            );
         }
     }
     // Case-insensitive retry: usages like `IF`, `Country_event` resolve to the
@@ -81,7 +106,12 @@ fn alias_overloads_with_confidence<'a>(
             .and_then(|m| m.get(lower.as_str()))
         {
             for &i in idxs {
-                overloads.push((&ruleset.aliases[i].1, true));
+                push_overload(
+                    &mut overloads,
+                    &ruleset.aliases[i].1,
+                    true,
+                    coalesce_equivalent,
+                );
             }
         }
     }
@@ -90,19 +120,30 @@ fn alias_overloads_with_confidence<'a>(
             // Classify once: a `Confident` match is included in both sets, a
             // `PermissiveOnly` match only in the permissive (all) set.
             match classify_pattern_match(pat, key, ruleset, type_index) {
-                PatternMatch::Confident => {
-                    overloads.push((&ruleset.aliases[pat.alias_idx].1, true))
-                }
-                PatternMatch::PermissiveOnly => {
-                    overloads.push((&ruleset.aliases[pat.alias_idx].1, false))
-                }
+                PatternMatch::Confident => push_overload(
+                    &mut overloads,
+                    &ruleset.aliases[pat.alias_idx].1,
+                    true,
+                    coalesce_equivalent,
+                ),
+                PatternMatch::PermissiveOnly => push_overload(
+                    &mut overloads,
+                    &ruleset.aliases[pat.alias_idx].1,
+                    false,
+                    coalesce_equivalent,
+                ),
                 PatternMatch::No => {}
             }
         }
         if let Some(sf_idx) = cat.scope_field_idx
             && is_scope_key(key, ruleset, type_index)
         {
-            overloads.push((&ruleset.aliases[sf_idx].1, true));
+            push_overload(
+                &mut overloads,
+                &ruleset.aliases[sf_idx].1,
+                true,
+                coalesce_equivalent,
+            );
         }
     }
     overloads
@@ -195,12 +236,16 @@ pub(super) fn validate_alias_usage(
     scope_context: &mut Option<ScopeContext>,
     errors: &mut Vec<ValidationError>,
 ) {
+    if ctx.alias_branch_budget_exhausted() {
+        return;
+    }
     let table = ctx.table;
     let file_path = ctx.file_path;
     let ruleset = ctx.ruleset;
     // Compute the overload set (with per-overload confidence) ONCE; the scope
     // check below reuses the confident subset instead of re-walking the aliases.
-    let overloads_conf = alias_overloads_with_confidence(ruleset, ctx.type_index, category, key);
+    let overloads_conf =
+        alias_overloads_with_confidence(ruleset, ctx.type_index, category, key, true);
     if overloads_conf.is_empty() {
         // Category unloaded or no such alias key — accept silently, matching the
         // permissive key-match in field_matches_key.
@@ -210,6 +255,15 @@ pub(super) fn validate_alias_usage(
     // error) squiggle the key token, not the whole usage. Node-form usages
     // have no leaf and keep the whole-line fallback.
     let key_end = leaf.map(|l| key_token_end(l, key, table));
+    if overloads_conf.len() > 1 {
+        let branch_pos = leaf.map(|leaf| leaf.pos.start).unwrap_or(SourcePos {
+            line: fallback_pos.0,
+            col: fallback_pos.1,
+        });
+        if !ctx.reserve_alias_branches(overloads_conf.len(), branch_pos, key_end) {
+            return;
+        }
+    }
 
     // CW248: an invalid scope command in a chain. Restricted to dotted lower-case
     // chains (`owner.capital`): a bare command that's missing from this config's
