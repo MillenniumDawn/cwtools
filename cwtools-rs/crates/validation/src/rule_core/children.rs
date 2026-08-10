@@ -42,6 +42,9 @@ fn validate_leaf_against_rule(
     scope_context: &mut Option<ScopeContext>,
     errors: &mut Vec<ValidationError>,
 ) {
+    if ctx.alias_branch_budget_exhausted() {
+        return;
+    }
     // `key = ignore_field`: the field's value is accepted unvalidated.
     if rule_left_is_ignore(rule_type) {
         return;
@@ -198,6 +201,7 @@ fn validate_leaf_against_rule(
 /// cleanly (a later clean, directive-free match still wins). Mirrors F#
 /// `errorIfOnlyMatch`, gated by `lazyErrorMerge` on the absence of a clean match.
 fn pick_best_candidate<F, G>(
+    ctx: &ValidationCtx,
     mut validate_one: F,
     mut only_match_error: G,
     errors: &mut Vec<ValidationError>,
@@ -210,8 +214,14 @@ fn pick_best_candidate<F, G>(
     let mut only_match: Option<ValidationError> = None;
     let mut temp: Vec<ValidationError> = Vec::new();
     for i in 0..n {
+        if ctx.alias_branch_budget_exhausted() {
+            return;
+        }
         temp.clear();
         validate_one(i, &mut temp);
+        if ctx.alias_branch_budget_exhausted() {
+            return;
+        }
         if temp.is_empty() {
             match only_match_error(i) {
                 // Clean match, but the rule says "error if this is the only match":
@@ -252,6 +262,9 @@ pub(crate) fn validate_children(
     block_pos: (u32, u16),
     errors: &mut Vec<ValidationError>,
 ) {
+    if ctx.alias_branch_budget_exhausted() {
+        return;
+    }
     // Nested subtype blocks (a `subtype[x] = {...}` not at the entity root) carry
     // their fields inside SubtypeRule entries that the candidate matcher below
     // doesn't see. Flatten them in — but only pay the clone when any are present,
@@ -277,6 +290,9 @@ pub(crate) fn validate_children(
     // passes collapse into one with identical output.
     let (leafvalue_counts, valueclause_counts) =
         count_and_validate_children(ctx, children, rules, &mut block, scope_context, errors);
+    if ctx.alias_branch_budget_exhausted() {
+        return;
+    }
 
     // Phase 3: cardinality enforcement against the phase-1 counts.
     enforce_cardinality(
@@ -484,6 +500,9 @@ fn count_and_validate_children<'r>(
     };
 
     for child in children {
+        if ctx.alias_branch_budget_exhausted() {
+            break;
+        }
         match child {
             Child::Leaf(idx) => {
                 let leaf = &ast.arena.leaves[*idx as usize];
@@ -609,6 +628,7 @@ fn count_and_validate_children<'r>(
                     // candidate validates cleanly.
                     let n = candidates.len();
                     pick_best_candidate(
+                        ctx,
                         |i, out| {
                             let (rt, opts) = candidates[i];
                             validate_leaf_against_rule(

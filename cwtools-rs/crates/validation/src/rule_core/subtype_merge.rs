@@ -34,6 +34,9 @@ pub(crate) fn validate_with_type(
     node_pos: (u32, u16),
     errors: &mut Vec<ValidationError>,
 ) {
+    if ctx.alias_branch_budget_exhausted() {
+        return;
+    }
     let game = ctx.game;
     let ruleset = ctx.ruleset;
     if type_def.subtypes.is_empty() {

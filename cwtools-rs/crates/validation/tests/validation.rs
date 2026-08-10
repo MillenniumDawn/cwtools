@@ -732,6 +732,76 @@ my_strat = {
     );
 }
 
+const RECURSIVE_ALIAS_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+"#;
+
+const RECURSIVE_DISTINCT_ALIAS_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+## severity = warning
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+"#;
+
+fn recursive_alias_script(depth: usize) -> String {
+    let mut script = String::from("foo = {\n");
+    for _ in 0..depth {
+        script.push_str("recurse = {\n");
+    }
+    script.push_str("bad = nope\n");
+    for _ in 0..=depth {
+        script.push_str("}\n");
+    }
+    script
+}
+
+fn validate_recursive_aliases(
+    rules: &str,
+    depth: usize,
+) -> Vec<cwtools_validation::ValidationError> {
+    let table = StringTable::new();
+    let parsed_rules = parse_string(rules, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parsed_rules, &table);
+    let parsed_script = parse_string(&recursive_alias_script(depth), &table).unwrap();
+    validate_ast(
+        &parsed_script,
+        &ruleset,
+        &table,
+        "game/common/foo/test.txt",
+        None,
+        None,
+        None,
+    )
+}
+
+#[test]
+fn duplicate_recursive_aliases_reuse_one_candidate() {
+    let errors = validate_recursive_aliases(RECURSIVE_ALIAS_RULES, 20);
+    assert!(
+        errors.iter().any(|error| error.code == Some("CW263")),
+        "expected the deepest invalid field, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().all(|error| error.code != Some("CW277")),
+        "equivalent candidates must not exhaust the branch budget: {errors:?}"
+    );
+}
+
+#[test]
+fn distinct_recursive_aliases_stop_at_the_branch_budget() {
+    let errors = validate_recursive_aliases(RECURSIVE_DISTINCT_ALIAS_RULES, 20);
+    let capped: Vec<_> = errors
+        .iter()
+        .filter(|error| error.code == Some("CW277"))
+        .collect();
+    assert_eq!(capped.len(), 1, "expected one limit diagnostic: {errors:?}");
+    assert_eq!(capped[0].severity, ErrorSeverity::Warning);
+}
+
 #[test]
 fn test_alias_value_mismatch_is_cw267() {
     // An alias with only a block overload, used as a scalar value, doesn't match

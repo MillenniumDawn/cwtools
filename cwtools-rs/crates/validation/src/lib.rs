@@ -28,7 +28,7 @@ pub use scope::scope_matches_required;
 pub use subtype::{collect_subtype_instances, subtype_membership_for_instance};
 
 use common::{leaf_value_to_string, path_contains_segment};
-use ctx::ValidationCtx;
+use ctx::{AliasBranchBudget, ValidationCtx};
 use resolve::{
     DispatchInput, PathCandidate, ResolvedType, find_rules_by_name, find_type_from_candidates,
     grandchild_candidates_for_wrapper, path_candidates_for_file, refine_grandchild_type,
@@ -55,12 +55,18 @@ fn validate_wrapper_grandchildren(
     scope_context: &mut Option<ScopeContext>,
     errors: &mut Vec<ValidationError>,
 ) {
+    if ctx.alias_branch_budget_exhausted() {
+        return;
+    }
     let ast = ctx.ast;
     let table = ctx.table;
     let file_path = ctx.file_path;
     let ruleset = ctx.ruleset;
     let candidates = grandchild_candidates_for_wrapper(path_candidates, wrapper_root_key);
     for grandchild in grandchildren {
+        if ctx.alias_branch_budget_exhausted() {
+            break;
+        }
         let (gc_key, gc_children, gc_pos): (String, &[Child], (u32, u16)) = match grandchild {
             Child::Leaf(gc_idx) => {
                 let gc_leaf = &ast.arena.leaves[*gc_idx as usize];
@@ -309,6 +315,23 @@ pub fn validate_prepared_tracking_uses(
     (errors, used.into_inner())
 }
 
+fn append_alias_branch_budget_error(ctx: &ValidationCtx, errors: &mut Vec<ValidationError>) {
+    let Some(exhaustion) = ctx.alias_branch_budget_exhaustion() else {
+        return;
+    };
+    let mut error = ValidationError::from_code(
+        &error_codes::CW277_ALIAS_BRANCH_LIMIT,
+        ctx.file_path,
+        exhaustion.pos.line,
+        exhaustion.pos.col,
+        &[] as &[&str],
+    );
+    if let Some(end) = exhaustion.end {
+        error = error.with_end(end);
+    }
+    errors.push(error);
+}
+
 fn validate_prepared_inner(
     ast: &ParsedFile,
     file_path: &str,
@@ -348,6 +371,7 @@ fn validate_prepared_inner(
         scope_checks,
         var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),
+        alias_branch_budget: std::cell::RefCell::new(AliasBranchBudget::default()),
         type_uses,
     };
 
@@ -378,9 +402,12 @@ fn validate_prepared_inner(
                 &mut errors,
             );
         }
-        if let Some(g) = game {
+        if !ctx.alias_branch_budget_exhausted()
+            && let Some(g) = game
+        {
             errors.extend(per_game::run_game_validators(&ctx, g));
         }
+        append_alias_branch_budget_error(&ctx, &mut errors);
         return errors;
     }
 
@@ -396,6 +423,9 @@ fn validate_prepared_inner(
         allow_content_fallback: false,
     };
     for child in &ast.root_children {
+        if ctx.alias_branch_budget_exhausted() {
+            break;
+        }
         let Child::Leaf(leaf_idx) = child else {
             continue;
         };
@@ -437,11 +467,14 @@ fn validate_prepared_inner(
         }
     }
 
-    // Run game-specific validators if game is provided
-    if let Some(g) = game {
+    // Run game-specific validators if game is provided.
+    if !ctx.alias_branch_budget_exhausted()
+        && let Some(g) = game
+    {
         let game_errors = per_game::run_game_validators(&ctx, g);
         errors.extend(game_errors);
     }
 
+    append_alias_branch_budget_error(&ctx, &mut errors);
     errors
 }

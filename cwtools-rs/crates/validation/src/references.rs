@@ -508,6 +508,45 @@ alias[trigger:has_thing] = <thing>
         assert!(found.is_empty(), "got: {found:?}");
     }
 
+    #[test]
+    fn capped_alias_validation_does_not_emit_unused_errors() {
+        const CAPPED_ALIAS_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        should_be_used = yes
+    }
+    type[user] = {
+        path = "game/common/users"
+    }
+}
+thing = { x = scalar }
+user = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+## severity = warning
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+"#;
+        let mut user = String::from("a_user = {\n");
+        for _ in 0..20 {
+            user.push_str("recurse = {\n");
+        }
+        user.push_str("bad = nope\n");
+        for _ in 0..=20 {
+            user.push_str("}\n");
+        }
+        let found = unused_in(
+            CAPPED_ALIAS_RULES,
+            &[
+                ("common/things/test.txt", "my_thing = { x = a }\n"),
+                ("common/users/test.txt", &user),
+            ],
+        );
+        assert!(
+            found.is_empty(),
+            "capped validation must not emit CW239: {found:?}"
+        );
+    }
+
     /// A rule keyed by `<type>` makes the KEY the reference, not the value.
     #[test]
     fn type_keyed_rule_records_its_key_as_a_use() {
