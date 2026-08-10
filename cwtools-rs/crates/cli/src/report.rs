@@ -1,9 +1,9 @@
 //! The CI report formats: GitHub Actions workflow commands and SARIF 2.1.0.
-//! The `cli`/`csv`/`json` renderers stay in `main.rs` next to the row helpers
+//! The `cli`/`csv`/`json` renderers stay in `diag.rs` next to the row helpers
 //! they share.
 
-use crate::Diag;
 use crate::codes;
+use crate::diag::Diag;
 use cwtools_error_codes::ErrorCode;
 use cwtools_validation::ErrorSeverity;
 use std::path::{Path, PathBuf};
@@ -183,7 +183,7 @@ fn file_uri(path: &str) -> String {
 
 /// A JSON string literal, quotes included.
 fn s(value: &str) -> String {
-    format!("\"{}\"", crate::json_escape(value))
+    format!("\"{}\"", crate::diag::json_escape(value))
 }
 
 /// The SARIF 2.1.0 document for `diags` (trailing newline included). `base` is
