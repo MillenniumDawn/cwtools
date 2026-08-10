@@ -2365,6 +2365,9 @@ mod tests {
             symbol_rank("x_İstanbul", &"İstanbul".to_lowercase()),
             Some(2)
         );
+        // A query longer than the name must miss, not panic: the ASCII prefix
+        // arm slices `name[..query.len()]` behind the containment precheck.
+        assert_eq!(symbol_rank("abc", "abcdef"), None);
     }
 
     fn cand(rank: u8, name: &str, uri: &str, line0: u32, col: u32) -> SymbolCandidate {
@@ -2382,6 +2385,11 @@ mod tests {
     #[test]
     fn top_symbols_matches_sort_and_truncate() {
         // The heap must keep exactly what sort-everything-then-truncate kept.
+        // The key is written out independently of SymbolCandidate::sort_key so
+        // a field dropped from the impl fails here instead of agreeing with
+        // itself on both sides.
+        let key =
+            |c: &SymbolCandidate| (c.rank, c.name.clone(), c.file_uri.clone(), c.line0, c.col);
         let mut all = Vec::new();
         for (i, rank) in [2u8, 0, 1, 2, 0, 1, 2, 2].into_iter().enumerate() {
             all.push(cand(
@@ -2399,21 +2407,22 @@ mod tests {
                 7,
             ));
         }
-        for limit in [1, 3, 5, all.len(), all.len() + 10] {
+        // Exact duplicates of a front-ranked and a mid-ranked entry, so ties
+        // sit on the truncation boundary at the small limits.
+        all.push(cand(0, "name_1", "file:///a", 1, 0));
+        all.push(cand(2, "name_3", "file:///a", 3, 0));
+        for limit in [0, 1, 2, 3, 5, all.len(), all.len() + 10] {
             let mut top = TopSymbols::new(limit);
             for c in &all {
                 if top.accepts(c.rank, &c.name, &c.file_uri, c.line0, c.col) {
                     top.push(cand(c.rank, &c.name, &c.file_uri, c.line0, c.col));
                 }
             }
-            let mut expected: Vec<_> = all.iter().map(|c| c.sort_key()).collect();
+            let mut expected: Vec<_> = all.iter().map(&key).collect();
             expected.sort();
             expected.truncate(limit);
-            let got: Vec<_> = top.into_sorted_vec();
-            assert_eq!(
-                got.iter().map(|c| c.sort_key()).collect::<Vec<_>>(),
-                expected
-            );
+            let got: Vec<_> = top.into_sorted_vec().iter().map(&key).collect();
+            assert_eq!(got, expected, "limit {limit}");
         }
     }
 

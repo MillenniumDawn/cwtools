@@ -4164,6 +4164,43 @@ fn test_workspace_symbols_rank_and_cover_all_sources() {
 }
 
 #[test]
+fn test_workspace_symbols_empty_query_caps_at_limit_best_by_name() {
+    // The picker's initial request carries an empty query, which admits every
+    // symbol at substring rank. With 511 symbols in the workspace the answer
+    // must be exactly the 500 lexicographically-first names, not an arbitrary
+    // subset and not the whole universe.
+    let mut loc = String::from("l_english:\n");
+    for i in 0..510 {
+        loc.push_str(&format!(" key_{i:03}:0 \"T\"\n"));
+    }
+    let files = &[
+        ("common/national_focus/f.txt", "MY_FOCUS = { x = yes }\n"),
+        ("localisation/english/big_l_english.yml", loc.as_str()),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &[],
+        serde_json::json!({}),
+        "common/national_focus/f.txt",
+        "workspace/symbol",
+        serde_json::json!({ "query": "" }),
+    );
+    let syms = result.as_array().expect("symbols array");
+    let names: Vec<&str> = syms.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert_eq!(names.len(), 500, "capped at 500, got {}", names.len());
+    // All ranks tie for the empty query, so order is by name: "MY_FOCUS"
+    // (uppercase sorts before lowercase) then key_000..key_498; the last
+    // eleven keys fall past the cap.
+    assert_eq!(names[0], "MY_FOCUS");
+    assert_eq!(names[1], "key_000");
+    assert_eq!(names[499], "key_498");
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "response is name-ordered");
+}
+
+#[test]
 fn test_references_finds_closed_file() {
     // A (open) and B (never opened) both reference focus MY_FOCUS. Find-refs from
     // A must reach B via the workspace reverse index.
