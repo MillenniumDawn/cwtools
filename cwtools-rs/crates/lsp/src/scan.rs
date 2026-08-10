@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tower_lsp::Client;
 use tower_lsp::lsp_types::*;
 
 use cwtools_cache::workspace as workspace_cache;
@@ -188,15 +189,100 @@ fn collect_loc_display(
     }
 }
 
-/// RAII guard for `DocumentState::scan_in_progress`. Resets the flag to
-/// `false` on drop so a panicked scan can't wedge every later scan out
-/// forever — the guard lives inside the scanning future, so a panic
-/// unwinding through `validate_entire_workspace` still runs `Drop`.
-struct ScanGuard<'a>(&'a AtomicBool);
+/// RAII guard for the loading indicator and, for a full scan, the
+/// `scan_in_progress` flag. The guard lives inside the awaiting future, so a
+/// panic unwinding through it and a dropped future both still run `Drop`: a
+/// scan can't wedge every later scan out forever, and the bar can't be left
+/// spinning.
+///
+/// The dropped-future case is a client cancelling a long
+/// `workspace/executeCommand` (#204). `tower-lsp` answers `$/cancelRequest` by
+/// dropping the handler, so the work never reaches the bar-off its normal exit
+/// sends. Cancellation stays best-effort otherwise: indexing already done is
+/// kept, not rolled back.
+///
+/// [`ScanGuard::finish`] is the normal exit and does the same work inline.
+pub(crate) struct ScanGuard {
+    client: Client,
+    state: Arc<DocumentState>,
+    /// Whether this guard also holds `scan_in_progress`. `cacheVanilla` drives
+    /// the bar without taking the scan flag, and must not release someone
+    /// else's.
+    owns_scan: bool,
+    /// A quiet scan sends no progress at all, so there is nothing to close.
+    quiet: bool,
+    finished: bool,
+}
 
-impl Drop for ScanGuard<'_> {
+impl ScanGuard {
+    fn for_scan(backend: &Backend, quiet: bool) -> Self {
+        Self {
+            client: backend.client.clone(),
+            state: backend.state.clone(),
+            owns_scan: true,
+            quiet,
+            finished: false,
+        }
+    }
+
+    /// For a command that drives the bar outside the scan guard.
+    pub(crate) fn for_command(backend: &Backend) -> Self {
+        Self {
+            client: backend.client.clone(),
+            state: backend.state.clone(),
+            owns_scan: false,
+            quiet: false,
+            finished: false,
+        }
+    }
+
+    /// Close the indicator, then release the scan flag — in that order, so the
+    /// next scan's `begin` can't be overtaken by this one's `end`.
+    pub(crate) async fn finish(mut self) {
+        self.finished = true;
+        if !self.quiet {
+            Backend {
+                client: self.client.clone(),
+                state: self.state.clone(),
+            }
+            .send_loading_bar(false, "")
+            .await;
+        }
+        if self.owns_scan {
+            self.state.scan_in_progress.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for ScanGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        if self.finished {
+            return;
+        }
+        // `Drop` can't await, so the close goes out on its own task, which then
+        // releases the scan flag to keep `finish`'s ordering. `try_current`
+        // because a guard dropped as the runtime tears down has no executor to
+        // spawn on — release the flag and let the process exit.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if !self.quiet => {
+                let backend = Backend {
+                    client: self.client.clone(),
+                    state: self.state.clone(),
+                };
+                let owns_scan = self.owns_scan;
+                handle.spawn(async move {
+                    backend.send_loading_bar(false, "").await;
+                    if owns_scan {
+                        backend
+                            .state
+                            .scan_in_progress
+                            .store(false, Ordering::SeqCst);
+                    }
+                });
+            }
+            _ if self.owns_scan => self.state.scan_in_progress.store(false, Ordering::SeqCst),
+            _ => {}
+        }
     }
 }
 
@@ -217,7 +303,16 @@ impl Backend {
     /// the initial index looks like a hang.
     ///
     /// Both go out from the one place so the phase strings can't drift apart.
+    ///
+    /// Closing what was never opened is dropped rather than sent: several
+    /// callers clear the bar defensively (a cancelled scan's [`ScanGuard`], a
+    /// `cacheVanilla` that hit a fresh cache and indexed nothing), and a client
+    /// should see one close per open, not one per caller that thought about it.
     pub(crate) async fn send_loading_bar(&self, enable: bool, value: &str) {
+        let was_active = self.state.loading_bar_active.swap(enable, Ordering::SeqCst);
+        if !enable && !was_active {
+            return;
+        }
         let payload = serde_json::json!({ "enable": enable, "value": value });
         self.client.send_notification::<LoadingBar>(payload).await;
         self.send_work_done_progress(enable, value).await;
@@ -234,10 +329,7 @@ impl Backend {
             return;
         }
         let token = ProgressToken::String(SCAN_PROGRESS_TOKEN.to_string());
-        let was_active = self
-            .state
-            .scan_progress_active
-            .swap(enable, Ordering::SeqCst);
+        let was_active = self.state.scan_progress_active.load(Ordering::SeqCst);
         let progress = match (enable, was_active) {
             (false, false) => return, // nothing live to end
             (false, true) => WorkDoneProgress::End(WorkDoneProgressEnd { message: None }),
@@ -247,9 +339,9 @@ impl Backend {
                 percentage: None,
             }),
             (true, false) => {
-                // The client may refuse the token; if it does, roll the flag back
-                // so a later phase tries to create it again instead of reporting
-                // against a token that was never registered.
+                // The client may refuse the token; leave the stream closed so a
+                // later phase creates it again instead of reporting against a
+                // token that was never registered.
                 if self
                     .client
                     .send_request::<WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
@@ -258,9 +350,6 @@ impl Backend {
                     .await
                     .is_err()
                 {
-                    self.state
-                        .scan_progress_active
-                        .store(false, Ordering::SeqCst);
                     return;
                 }
                 WorkDoneProgress::Begin(WorkDoneProgressBegin {
@@ -277,6 +366,12 @@ impl Backend {
                 value: ProgressParamsValue::WorkDone(progress),
             })
             .await;
+        // Only now is the stream open (or closed). A future dropped partway
+        // through the create round-trip — a cancelled command — must not leave
+        // an `end` owing on a token the client never saw begin.
+        self.state
+            .scan_progress_active
+            .store(enable, Ordering::SeqCst);
     }
 
     /// Send the `updateFileList` server→client notification so the VS Code
@@ -398,9 +493,9 @@ impl Backend {
     /// Public entry to the workspace scan. Runs the scan and ALWAYS clears the
     /// status-bar loading indicator on return, regardless of which internal path
     /// exited — including the early returns for an absent/empty workspace, which
-    /// previously left the bar spinning on "Indexing workspace…" forever. A
-    /// panic inside the scan is handled separately by the watcher in
-    /// `initialized`, which clears the bar too.
+    /// previously left the bar spinning on "Indexing workspace…" forever, a
+    /// panic inside the scan, and a client cancelling the command that started
+    /// it. See [`ScanGuard`].
     ///
     /// Re-entrancy guarded: the startup scan, `clearAllCaches`, `reindexWorkspace`,
     /// and the periodic background pass can all land here, and two overlapping
@@ -425,13 +520,9 @@ impl Backend {
             tracing::debug!("workspace scan already in progress; skipping");
             return false;
         }
-        {
-            let _guard = ScanGuard(&self.state.scan_in_progress);
-            self.validate_entire_workspace_inner(quiet).await;
-            if !quiet {
-                self.send_loading_bar(false, "").await;
-            }
-        }
+        let guard = ScanGuard::for_scan(self, quiet);
+        self.validate_entire_workspace_inner(quiet).await;
+        guard.finish().await;
         // Drain any watched events an over-cap batch requeued after losing the
         // CAS to this scan — the loser suppresses its own re-arm so it doesn't
         // retry against the flag every window for the scan's whole duration.
@@ -2836,20 +2927,105 @@ mod tests {
 
     // ── ScanGuard (B1 re-entrancy guard) ──────────────────────────────────
 
-    #[test]
-    fn test_scan_guard_resets_flag_on_drop() {
-        let flag = AtomicBool::new(false);
+    /// A `Backend` over a real (never-initialized) `Client`, so guard tests can
+    /// run the notification path — the client suppresses every message before
+    /// the handshake, which is exactly what these tests want.
+    fn test_backend() -> Backend {
+        let state = Arc::new(DocumentState::new());
+        let captured = Arc::new(parking_lot::Mutex::new(None));
+        let slot = captured.clone();
+        let server_state = state.clone();
+        let (_service, _socket) = tower_lsp::LspService::new(move |client| {
+            *slot.lock() = Some(client.clone());
+            Backend {
+                client,
+                state: server_state.clone(),
+            }
+        });
+        let client = captured.lock().take().unwrap();
+        Backend { client, state }
+    }
+
+    /// Wait for `flag` to clear, or give up. The cancelled path releases from a
+    /// spawned task, so the release is not observable on return from `drop`.
+    async fn wait_for_clear(flag: &AtomicBool) -> bool {
+        for _ in 0..200 {
+            if !flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn test_scan_guard_releases_flag_on_finish() {
+        let backend = test_backend();
         assert!(
-            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            backend
+                .state
+                .scan_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         );
-        {
-            let _guard = ScanGuard(&flag);
-            assert!(flag.load(Ordering::SeqCst));
-        }
+        let guard = ScanGuard::for_scan(&backend, false);
+        assert!(backend.state.scan_in_progress.load(Ordering::SeqCst));
+        guard.finish().await;
         assert!(
-            !flag.load(Ordering::SeqCst),
-            "guard must reset the flag on drop"
+            !backend.state.scan_in_progress.load(Ordering::SeqCst),
+            "finish must release the flag"
+        );
+    }
+
+    /// #204: a cancelled `workspace/executeCommand` drops the scanning future
+    /// without ever reaching `finish`.
+    #[tokio::test]
+    async fn test_scan_guard_releases_flag_when_dropped_unfinished() {
+        let backend = test_backend();
+        assert!(
+            backend
+                .state
+                .scan_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        );
+        drop(ScanGuard::for_scan(&backend, false));
+        assert!(
+            wait_for_clear(&backend.state.scan_in_progress).await,
+            "a dropped guard must release the flag"
+        );
+    }
+
+    /// A quiet background pass opens no progress, so its guard releases inline
+    /// rather than waiting on a task that has nothing to send.
+    #[tokio::test]
+    async fn test_quiet_scan_guard_releases_flag_inline_on_drop() {
+        let backend = test_backend();
+        assert!(
+            backend
+                .state
+                .scan_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        );
+        drop(ScanGuard::for_scan(&backend, true));
+        assert!(
+            !backend.state.scan_in_progress.load(Ordering::SeqCst),
+            "a quiet scan's guard must release the flag without a spawn"
+        );
+    }
+
+    /// `cacheVanilla` drives the bar without holding the scan flag; its guard
+    /// must leave a concurrent scan's flag alone.
+    #[tokio::test]
+    async fn test_command_guard_leaves_the_scan_flag_alone() {
+        let backend = test_backend();
+        backend.state.scan_in_progress.store(true, Ordering::SeqCst);
+        drop(ScanGuard::for_command(&backend));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            backend.state.scan_in_progress.load(Ordering::SeqCst),
+            "a command guard must not release a scan it never took"
         );
     }
 
@@ -2870,19 +3046,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_scan_guard_drop_then_reacquire_succeeds() {
-        let flag = AtomicBool::new(false);
-        {
-            assert!(
-                flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-            );
-            let _guard = ScanGuard(&flag);
-        }
-        // Guard dropped (scan finished, or panicked) — a later scan can acquire.
+    #[tokio::test]
+    async fn test_scan_guard_drop_then_reacquire_succeeds() {
+        let backend = test_backend();
         assert!(
-            flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            backend
+                .state
+                .scan_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        );
+        drop(ScanGuard::for_scan(&backend, false));
+        assert!(wait_for_clear(&backend.state.scan_in_progress).await);
+        // Guard dropped (scan finished, cancelled, or panicked) — a later scan
+        // can acquire.
+        assert!(
+            backend
+                .state
+                .scan_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok(),
             "flag should be free again once the guard is dropped"
         );

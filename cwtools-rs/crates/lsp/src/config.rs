@@ -1067,13 +1067,15 @@ impl Backend {
                 *self.state.vanilla_index.lock() = None;
                 *self.state.vanilla_loc_keys.lock() = None;
                 *self.state.vanilla_loc.lock() = None;
+                // ensure_vanilla_index turns the loading bar on but, unlike a full
+                // workspace scan, this command never reaches the code that turns
+                // it off. The guard covers both exits: the normal one below, and
+                // the client cancelling the command mid-index (#204).
+                let guard = crate::scan::ScanGuard::for_command(self);
                 self.ensure_vanilla_index(true, false).await;
                 self.merge_pending_vanilla_index();
                 self.rebuild_modifier_keys();
-                // ensure_vanilla_index turns the loading bar on but, unlike a full
-                // workspace scan, this command never reaches the code that turns it
-                // off; do it here so the status bar doesn't spin forever.
-                self.send_loading_bar(false, "").await;
+                guard.finish().await;
                 Ok(Some(Value::String("Vanilla cache rebuilt.".to_string())))
             }
             // Purge every on-disk cache (parse cache + vanilla caches), drop the

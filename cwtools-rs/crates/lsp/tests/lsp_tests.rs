@@ -10506,6 +10506,187 @@ fn test_scan_reports_standard_work_done_progress() {
     );
 }
 
+/// #204: the client cancels a long `workspace/executeCommand` while its scan is
+/// running. `tower-lsp` answers `$/cancelRequest` by dropping the handler, so
+/// nothing on the normal exit path runs — both progress channels have to be
+/// closed by the scan guard's `Drop`, and the guard has to release the scan so
+/// the next command can index.
+#[test]
+fn test_cancelling_a_scan_command_closes_progress_and_frees_the_scan() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("editor_rules.cwt"), EDITOR_RULES).unwrap();
+    let p = ws.path().join("common/national_focus/tree.txt");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "my_focus = {\n    id = my_focus\n}\n").unwrap();
+
+    // Hold every scan open for 3s so the cancel reliably lands mid-scan.
+    let mut child = cwtools_server_cmd()
+        .env("CWTOOLS_SCAN_HOLD_MS", "3000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": { "window": { "workDoneProgress": true } },
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    let rx = spawn_frame_collector(reader);
+
+    // The server blocks its `begin` on this response, so every wait below has to
+    // answer it. Returns the first frame matching `want`.
+    let pump = |child: &mut std::process::Child,
+                secs: u64,
+                want: &dyn Fn(&serde_json::Value) -> bool|
+     -> Option<serde_json::Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200)) else {
+                continue;
+            };
+            if v["method"] == "window/workDoneProgress/create" {
+                write_frame(
+                    child,
+                    &serde_json::json!({ "jsonrpc": "2.0", "id": v["id"], "result": null })
+                        .to_string(),
+                )
+                .unwrap();
+                continue;
+            }
+            if want(&v) {
+                return Some(v);
+            }
+        }
+        None
+    };
+    let bar_off = |v: &serde_json::Value| {
+        v["method"] == "loadingBar" && v["params"]["enable"] == serde_json::Value::Bool(false)
+    };
+
+    // Wait out the startup scan, which holds too.
+    assert!(
+        pump(&mut child, 30, &bar_off).is_some(),
+        "the startup scan never closed its loading bar"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            900,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    // Cancel once the scan has both channels open — the `begin` is the last of
+    // the two, so it also proves the create round-trip finished.
+    assert!(
+        pump(&mut child, 30, &|v| v["method"] == "$/progress"
+            && v["params"]["value"]["kind"] == "begin")
+        .is_some(),
+        "no $/progress begin after reindexWorkspace"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("$/cancelRequest", serde_json::json!({ "id": 900 })),
+    )
+    .unwrap();
+
+    let mut saw_bar_off = false;
+    let mut saw_progress_end = false;
+    let mut response = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline && !(saw_bar_off && saw_progress_end) {
+        let Some(v) = pump(&mut child, 5, &|v| {
+            v["id"] == 900
+                || (v["method"] == "loadingBar"
+                    && v["params"]["enable"] == serde_json::Value::Bool(false))
+                || (v["method"] == "$/progress" && v["params"]["value"]["kind"] == "end")
+        }) else {
+            continue;
+        };
+        if v["id"] == 900 {
+            response = Some(v);
+        } else if v["method"] == "loadingBar" {
+            assert!(
+                !saw_bar_off,
+                "duplicate loadingBar close after cancellation"
+            );
+            saw_bar_off = true;
+        } else {
+            assert!(
+                !saw_progress_end,
+                "duplicate $/progress end after cancellation"
+            );
+            saw_progress_end = true;
+        }
+    }
+    assert!(
+        saw_bar_off,
+        "the cancelled scan left the loading bar spinning"
+    );
+    assert!(
+        saw_progress_end,
+        "the cancelled scan left its $/progress token open"
+    );
+
+    let response = response
+        .or_else(|| pump(&mut child, 10, &|v| v["id"] == 900))
+        .expect("the cancelled request never answered");
+    assert_eq!(
+        response["error"]["code"], -32800,
+        "a cancelled request answers RequestCancelled: {response}"
+    );
+
+    // The guard releases the scan flag only once the close has gone out, so the
+    // first retry can still lose the CAS — the point is that one of them wins.
+    let mut reindexed = None;
+    for id in 901..906 {
+        write_frame(
+            &mut child,
+            &jsonrpc_request(
+                id,
+                "workspace/executeCommand",
+                serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
+            ),
+        )
+        .unwrap();
+        let answer = pump(&mut child, 30, &|v| v["id"] == id)
+            .unwrap_or_else(|| panic!("reindexWorkspace {id} never answered"));
+        if answer["result"] == "Workspace re-indexed." {
+            reindexed = Some(answer);
+            break;
+        }
+    }
+    child.kill().ok();
+    assert!(
+        reindexed.is_some(),
+        "no scan could start after the cancelled one released the guard"
+    );
+}
+
 #[test]
 fn test_did_change_workspace_folders_repoints_and_rescans() {
     let first = tempfile::tempdir().unwrap();
