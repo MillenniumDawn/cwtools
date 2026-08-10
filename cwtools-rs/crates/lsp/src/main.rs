@@ -381,6 +381,11 @@ struct DocumentState {
     /// Whether the scan's `$/progress` token is currently live, so the phase
     /// updates pair one `begin` with one `end` on a token that exists.
     scan_progress_active: std::sync::atomic::AtomicBool,
+    /// Whether a scan has the loading indicator open, over both channels. The
+    /// close is sent defensively from several places (a cancelled or panicked
+    /// scan's `ScanGuard`, `cacheVanilla` after an index that may have been a
+    /// cache hit), so it is gated on this to stay one close per open.
+    loading_bar_active: std::sync::atomic::AtomicBool,
     /// `false` until the first full workspace scan has finished building the
     /// index. While `false`, per-file validation still parses and indexes, but
     /// suppresses published diagnostics (clears instead) so the user never sees
@@ -885,6 +890,7 @@ impl DocumentState {
             completion_label_details: std::sync::atomic::AtomicBool::new(false),
             client_work_done_progress: std::sync::atomic::AtomicBool::new(false),
             scan_progress_active: std::sync::atomic::AtomicBool::new(false),
+            loading_bar_active: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             handshake_complete: std::sync::atomic::AtomicBool::new(false),
             deferred_rule_diagnostics: parking_lot::Mutex::new(Vec::new()),
@@ -1589,7 +1595,6 @@ impl LanguageServer for Backend {
         let client = self.client.clone();
         let state = self.state.clone();
         let watch_state = self.state.clone();
-        let watch_client = self.client.clone();
         let handle = tokio::spawn(async move {
             let backend = Backend { client, state };
             backend.validate_entire_workspace(false).await;
@@ -1606,10 +1611,8 @@ impl LanguageServer for Backend {
                 watch_state
                     .index_ready
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-                // The panic also skipped the wrapper's bar-off, so the status bar
-                // would spin on "Indexing workspace…" forever. Clear it here.
-                let payload = serde_json::json!({ "enable": false, "value": "" });
-                watch_client.send_notification::<LoadingBar>(payload).await;
+                // The bar-off the panic skipped is `ScanGuard`'s job — it
+                // unwinds with the scan and closes both progress channels.
             }
         });
 
