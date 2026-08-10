@@ -759,14 +759,11 @@ fn recursive_alias_script(depth: usize) -> String {
     script
 }
 
-fn validate_recursive_aliases(
-    rules: &str,
-    depth: usize,
-) -> Vec<cwtools_validation::ValidationError> {
+fn validate_aliases(rules: &str, script: &str) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
     let parsed_rules = parse_string(rules, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_rules, &table);
-    let parsed_script = parse_string(&recursive_alias_script(depth), &table).unwrap();
+    let parsed_script = parse_string(script, &table).unwrap();
     validate_ast(
         &parsed_script,
         &ruleset,
@@ -776,6 +773,22 @@ fn validate_recursive_aliases(
         None,
         None,
     )
+}
+
+fn validate_recursive_aliases(
+    rules: &str,
+    depth: usize,
+) -> Vec<cwtools_validation::ValidationError> {
+    validate_aliases(rules, &recursive_alias_script(depth))
+}
+
+fn sibling_alias_script(count: usize) -> String {
+    let mut script = String::from("foo = {\n");
+    for _ in 0..count {
+        script.push_str("recurse = { }\n");
+    }
+    script.push_str("}\n");
+    script
 }
 
 #[test]
@@ -792,6 +805,30 @@ fn duplicate_recursive_aliases_reuse_one_candidate() {
 }
 
 #[test]
+fn alias_branch_budget_accepts_exact_capacity() {
+    // 32,768 two-overload usages reserve exactly the 65,536-branch budget.
+    let errors = validate_aliases(
+        RECURSIVE_DISTINCT_ALIAS_RULES,
+        &sibling_alias_script(32_768),
+    );
+    assert!(
+        errors.is_empty(),
+        "the last fully funded alias usage must remain valid: {errors:?}"
+    );
+}
+
+#[test]
+fn alias_branch_budget_rejects_the_next_usage() {
+    let errors = validate_aliases(
+        RECURSIVE_DISTINCT_ALIAS_RULES,
+        &sibling_alias_script(32_769),
+    );
+    assert_eq!(errors.len(), 1, "expected one limit diagnostic: {errors:?}");
+    assert_eq!(errors[0].code, Some("CW277"));
+    assert_eq!(errors[0].severity, ErrorSeverity::Warning);
+}
+
+#[test]
 fn distinct_recursive_aliases_stop_at_the_branch_budget() {
     let errors = validate_recursive_aliases(RECURSIVE_DISTINCT_ALIAS_RULES, 20);
     let capped: Vec<_> = errors
@@ -800,6 +837,12 @@ fn distinct_recursive_aliases_stop_at_the_branch_budget() {
         .collect();
     assert_eq!(capped.len(), 1, "expected one limit diagnostic: {errors:?}");
     assert_eq!(capped[0].severity, ErrorSeverity::Warning);
+    assert_eq!((capped[0].line, capped[0].col), (21, 0));
+    assert_eq!(capped[0].end, Some((21, 7)));
+    assert!(
+        errors.iter().all(|error| error.code != Some("CW263")),
+        "the cap must stop before validating the deepest invalid field: {errors:?}"
+    );
 }
 
 #[test]

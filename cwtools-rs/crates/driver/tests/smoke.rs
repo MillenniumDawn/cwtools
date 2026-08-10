@@ -434,6 +434,23 @@ thing = { }
 user = { uses = <thing> }
 "#;
 
+const CAPPED_ALIAS_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        should_be_used = yes
+    }
+    type[user] = {
+        path = "game/common/users"
+    }
+}
+thing = { x = scalar }
+user = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+## severity = warning
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+"#;
+
 /// A temp workspace holding two `thing` instances, only one of which `a_user`
 /// references. `armed` controls whether the config asks for the check at all.
 fn unused_workspace(armed: bool) -> tempfile::TempDir {
@@ -452,6 +469,30 @@ fn unused_workspace(armed: bool) -> tempfile::TempDir {
     let users = tmp.path().join("mod").join("common").join("users");
     std::fs::create_dir_all(&users).unwrap();
     std::fs::write(users.join("u.txt"), "a_user = { uses = used_thing }\n").unwrap();
+    tmp
+}
+
+fn capped_alias_workspace() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let rules = tmp.path().join("rules");
+    std::fs::create_dir_all(&rules).unwrap();
+    std::fs::write(rules.join("aliases.cwt"), CAPPED_ALIAS_RULES).unwrap();
+
+    let things = tmp.path().join("mod").join("common").join("things");
+    std::fs::create_dir_all(&things).unwrap();
+    std::fs::write(things.join("x.txt"), "my_thing = { x = a }\n").unwrap();
+
+    let users = tmp.path().join("mod").join("common").join("users");
+    std::fs::create_dir_all(&users).unwrap();
+    let mut user = String::from("a_user = {\n");
+    for _ in 0..20 {
+        user.push_str("recurse = {\n");
+    }
+    user.push_str("bad = nope\n");
+    for _ in 0..=20 {
+        user.push_str("}\n");
+    }
+    std::fs::write(users.join("u.txt"), user).unwrap();
     tmp
 }
 
@@ -505,6 +546,34 @@ fn validate_all_reports_the_unreferenced_instance() {
         path.ends_with("common/things/x.txt"),
         "CW239 belongs to the file that defines the instance, got {}",
         path.display()
+    );
+}
+
+#[test]
+fn validate_all_reports_capped_alias_without_unused_errors() {
+    let tmp = capped_alias_workspace();
+    let results = unused_session(tmp.path()).validate_all();
+    let capped: Vec<_> = results
+        .iter()
+        .flat_map(|(path, errors)| {
+            errors
+                .iter()
+                .filter(|error| error.code == Some("CW277"))
+                .map(move |error| (path, error))
+        })
+        .collect();
+    assert_eq!(capped.len(), 1, "expected one CW277: {results:?}");
+    assert!(
+        capped[0].0.ends_with("common/users/u.txt"),
+        "the capped file should carry CW277, got {}",
+        capped[0].0.display()
+    );
+    assert!(
+        results
+            .iter()
+            .flat_map(|(_, errors)| errors)
+            .all(|error| error.code != Some("CW239")),
+        "a capped file must not create false unused-instance errors: {results:?}"
     );
 }
 

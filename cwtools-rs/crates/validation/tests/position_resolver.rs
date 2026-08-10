@@ -188,6 +188,37 @@ decision = {
     );
 }
 
+#[test]
+fn navigation_keeps_equivalent_alias_overloads() {
+    let cwt = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+decision = {
+    allowed = {
+        alias_name[trigger] = alias_match_left[trigger]
+    }
+}
+alias[trigger:duplicate] = bool
+alias[trigger:duplicate] = bool
+"#;
+    let script = r#"
+decision = {
+    allowed = {
+        duplicate = yes
+    }
+}
+"#;
+    let ctx =
+        resolve(cwt, script, "game/common/decisions/test.txt", "yes\n", None).expect("context");
+    assert_eq!(
+        ctx.value_rules.len(),
+        2,
+        "navigation must retain both raw alias overloads: {:?}",
+        ctx.value_rules
+    );
+}
+
 /// Two trigger overloads match `oil`: the `<resource>` type pattern (scope
 /// country/state) and an empty game-derived `enum[equipment_category]` that only
 /// matches via the permissive fallback. When the resource IS indexed, the

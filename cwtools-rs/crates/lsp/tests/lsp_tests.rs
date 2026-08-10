@@ -3356,6 +3356,16 @@ fn spawn_unused_workspace() -> (
 const A_TEXT: &str = "used_thing = { x = a }\nlone_thing = { x = b }\n";
 const B_TEXT: &str = "a_user = { uses = used_thing }\n";
 
+const ALIAS_BRANCH_LIMIT_RULES: &str = r#"
+types = {
+    type[user] = { path = "game/common/users" }
+}
+user = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+## severity = warning
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+"#;
+
 #[test]
 fn test_scan_reports_unused_should_be_used_instance() {
     // The workspace scan runs the batch-style two-phase pass, so a definition
@@ -3366,6 +3376,70 @@ fn test_scan_reports_unused_should_be_used_instance() {
     assert!(
         a_diags.contains(&"CW239".to_string()),
         "lone_thing is referenced nowhere, expected CW239, got: {a_diags:?}"
+    );
+}
+
+#[test]
+fn test_scan_reports_alias_branch_limit() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), ALIAS_BRANCH_LIMIT_RULES).unwrap();
+
+    let rel_path = "common/users/capped.txt";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    let mut text = String::from("a_user = {\n");
+    for _ in 0..20 {
+        text.push_str("recurse = {\n");
+    }
+    text.push_str("bad = nope\n");
+    for _ in 0..=20 {
+        text.push_str("}\n");
+    }
+    std::fs::write(&file_path, text).unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    let diagnostics = diags_for(&mut reader, rel_path, 1).expect("capped-file diagnostics");
+    child.kill().ok();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|code| code.as_str() == "CW277")
+            .count(),
+        1,
+        "the LSP scan must publish one alias branch-limit diagnostic: {diagnostics:?}"
     );
 }
 

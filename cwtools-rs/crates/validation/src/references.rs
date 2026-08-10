@@ -534,6 +534,27 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
         for _ in 0..=20 {
             user.push_str("}\n");
         }
+        let table = StringTable::new();
+        let ruleset = ast_to_ruleset(&parse_string(CAPPED_ALIAS_RULES, &table).unwrap(), &table);
+        let parsed = parse_string(&user, &table).unwrap();
+        let errors = crate::validate_ast(
+            &parsed,
+            &ruleset,
+            &table,
+            "common/users/test.txt",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.code == Some("CW277"))
+                .count(),
+            1,
+            "the fixture must reach the alias branch cap: {errors:?}"
+        );
+
         let found = unused_in(
             CAPPED_ALIAS_RULES,
             &[
