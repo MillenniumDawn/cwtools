@@ -139,18 +139,28 @@ fn loc_change_candidate_names(
 /// Cap a file's validation errors at [`MAX_FILE_ERRORS`], appending a summary
 /// marker for the remainder. Returns the pre-truncation total (for logging).
 /// Shared by the batch and single-file paths so the cap stays consistent.
+///
+/// CW277 is held out of the cap. It is emitted last (validation stopped, so the
+/// rest of the file was never looked at) and says the diagnostics that ARE here
+/// are incomplete — dropping it with the tail turns a truncated file into one
+/// that merely flooded.
 pub(crate) fn truncate_validation_errors(
     errs: &mut Vec<cwtools_validation::ValidationError>,
     uri: &str,
 ) -> usize {
     let total = errs.len();
-    if total > MAX_FILE_ERRORS {
+    if total <= MAX_FILE_ERRORS {
+        return total;
+    }
+    let limit = errs
+        .iter()
+        .position(|e| e.code == Some(cwtools_error_codes::CW277_ALIAS_BRANCH_LIMIT.id))
+        .map(|i| errs.remove(i));
+    if errs.len() > MAX_FILE_ERRORS {
+        let dropped = errs.len() - MAX_FILE_ERRORS;
         errs.truncate(MAX_FILE_ERRORS);
         errs.push(cwtools_validation::ValidationError {
-            message: format!(
-                "... {} additional errors truncated",
-                total - MAX_FILE_ERRORS
-            ),
+            message: format!("... {dropped} additional errors truncated"),
             severity: cwtools_validation::ErrorSeverity::Information,
             line: 0,
             col: 0,
@@ -160,6 +170,7 @@ pub(crate) fn truncate_validation_errors(
             end: None,
         });
     }
+    errs.extend(limit);
     total
 }
 
@@ -1892,6 +1903,100 @@ mod perf_bench {
                 .len()
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+    use cwtools_validation::ErrorSeverity;
+
+    fn error(code: Option<&'static str>) -> ValidationError {
+        ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Error,
+            line: 1,
+            col: 0,
+            file: "f".into(),
+            code,
+            fix: None,
+            end: None,
+        }
+    }
+
+    /// The last few codes, which is where the marker and CW277 land. Printing
+    /// all 100+ on a failure buries the interesting end of the list.
+    fn tail_codes(errs: &[ValidationError]) -> Vec<Option<&'static str>> {
+        errs.iter().rev().take(3).rev().map(|e| e.code).collect()
+    }
+
+    #[test]
+    fn under_the_cap_nothing_is_touched() {
+        let mut errs: Vec<_> = (0..MAX_FILE_ERRORS).map(|_| error(Some("CW240"))).collect();
+        assert_eq!(truncate_validation_errors(&mut errs, "f"), MAX_FILE_ERRORS);
+        assert_eq!(errs.len(), MAX_FILE_ERRORS);
+        assert!(errs.iter().all(|e| e.code == Some("CW240")));
+    }
+
+    #[test]
+    fn over_the_cap_truncates_and_counts_the_remainder() {
+        let mut errs: Vec<_> = (0..MAX_FILE_ERRORS + 5)
+            .map(|_| error(Some("CW240")))
+            .collect();
+        assert_eq!(
+            truncate_validation_errors(&mut errs, "f"),
+            MAX_FILE_ERRORS + 5
+        );
+        assert_eq!(errs.len(), MAX_FILE_ERRORS + 1);
+        let marker = errs.last().expect("summary marker");
+        assert_eq!(marker.code, None);
+        assert!(
+            marker.message.contains("5 additional"),
+            "got: {}",
+            marker.message
+        );
+    }
+
+    /// CW277 says the file's remaining diagnostics were never produced. It is
+    /// emitted last, so a plain `truncate` to the cap dropped exactly the
+    /// diagnostic that explains the truncation.
+    #[test]
+    fn the_branch_limit_survives_a_flood() {
+        let mut errs: Vec<_> = (0..MAX_FILE_ERRORS + 5)
+            .map(|_| error(Some("CW240")))
+            .collect();
+        errs.push(error(Some("CW277")));
+        let total = truncate_validation_errors(&mut errs, "f");
+        assert_eq!(total, MAX_FILE_ERRORS + 6);
+        assert_eq!(
+            errs.last().map(|e| e.code),
+            Some(Some("CW277")),
+            "the branch-limit diagnostic must still be published: {:?}",
+            tail_codes(&errs)
+        );
+        let marker = &errs[errs.len() - 2];
+        assert_eq!(marker.code, None);
+        assert!(
+            marker.message.contains("5 additional"),
+            "the remainder count must exclude the held-back CW277, got: {}",
+            marker.message
+        );
+    }
+
+    /// The held-back CW277 must not create a summary marker of its own when the
+    /// rest of the file fits under the cap exactly.
+    #[test]
+    fn the_branch_limit_alone_does_not_trip_the_cap() {
+        let mut errs: Vec<_> = (0..MAX_FILE_ERRORS).map(|_| error(Some("CW240"))).collect();
+        errs.push(error(Some("CW277")));
+        truncate_validation_errors(&mut errs, "f");
+        assert_eq!(errs.len(), MAX_FILE_ERRORS + 1);
+        assert!(
+            errs.iter().all(|e| e.code.is_some()),
+            "no summary marker expected: {:?}",
+            tail_codes(&errs)
+        );
+        assert_eq!(errs.last().map(|e| e.code), Some(Some("CW277")));
     }
 }
 

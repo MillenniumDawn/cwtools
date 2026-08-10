@@ -3364,32 +3364,18 @@ user = { alias_name[effect] = alias_match_left[effect] }
 alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 ## severity = warning
 alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:needs_int] = int
 "#;
 
-#[test]
-fn test_scan_reports_unused_should_be_used_instance() {
-    // The workspace scan runs the batch-style two-phase pass, so a definition
-    // nothing in the workspace references gets CW239 without any file open.
-    let (_ws, mut child, mut reader, _a, _b) = spawn_unused_workspace();
-    let a_diags = diags_for(&mut reader, "a.txt", 1).expect("a.txt scan diagnostics");
-    child.kill().ok();
-    assert!(
-        a_diags.contains(&"CW239".to_string()),
-        "lone_thing is referenced nowhere, expected CW239, got: {a_diags:?}"
-    );
-}
-
-#[test]
-fn test_scan_reports_alias_branch_limit() {
-    let ws = tempfile::tempdir().unwrap();
-    let rules_dir = tempfile::tempdir().unwrap();
-    let vanilla = tempfile::tempdir().unwrap();
-    std::fs::write(rules_dir.path().join("r.cwt"), ALIAS_BRANCH_LIMIT_RULES).unwrap();
-
-    let rel_path = "common/users/capped.txt";
-    let file_path = ws.path().join(rel_path);
-    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+/// A `common/users` file whose recursive alias exhausts the branch budget,
+/// preceded by `noise` single-overload value errors. Those cost no budget, so
+/// the caller can push the file past the server's per-file diagnostic cap
+/// without changing where the cap falls.
+fn capped_alias_file(noise: usize) -> String {
     let mut text = String::from("a_user = {\n");
+    for _ in 0..noise {
+        text.push_str("needs_int = nope\n");
+    }
     for _ in 0..20 {
         text.push_str("recurse = {\n");
     }
@@ -3397,7 +3383,32 @@ fn test_scan_reports_alias_branch_limit() {
     for _ in 0..=20 {
         text.push_str("}\n");
     }
-    std::fs::write(&file_path, text).unwrap();
+    text
+}
+
+/// Write `files` into a fresh workspace under `rules` and return the
+/// initialized server. The temp dirs come back so the caller keeps them alive
+/// for the duration of the scan.
+fn spawn_alias_workspace(
+    rules: &str,
+    files: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::process::Child,
+    BufReader<std::process::ChildStdout>,
+) {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), rules).unwrap();
+
+    for (rel, text) in files {
+        let file_path = ws.path().join(rel);
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, text).unwrap();
+    }
 
     let mut child = cwtools_server_cmd()
         .stdin(Stdio::piped())
@@ -3430,8 +3441,50 @@ fn test_scan_reports_alias_branch_limit() {
         &jsonrpc_notification("initialized", serde_json::json!({})),
     )
     .unwrap();
+    (ws, rules_dir, vanilla, child, reader)
+}
 
-    let diagnostics = diags_for(&mut reader, rel_path, 1).expect("capped-file diagnostics");
+const CAPPED_ALIAS_REL_PATH: &str = "common/users/capped.txt";
+
+/// [`ALIAS_BRANCH_LIMIT_RULES`] plus a `should_be_used` type, so the same capped
+/// file also decides whether the unused-instance check can run.
+const CAPPED_UNUSED_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        should_be_used = yes
+    }
+    type[user] = { path = "game/common/users" }
+}
+thing = { x = scalar }
+user = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+## severity = warning
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:needs_int] = int
+"#;
+
+#[test]
+fn test_scan_reports_unused_should_be_used_instance() {
+    // The workspace scan runs the batch-style two-phase pass, so a definition
+    // nothing in the workspace references gets CW239 without any file open.
+    let (_ws, mut child, mut reader, _a, _b) = spawn_unused_workspace();
+    let a_diags = diags_for(&mut reader, "a.txt", 1).expect("a.txt scan diagnostics");
+    child.kill().ok();
+    assert!(
+        a_diags.contains(&"CW239".to_string()),
+        "lone_thing is referenced nowhere, expected CW239, got: {a_diags:?}"
+    );
+}
+
+#[test]
+fn test_scan_reports_alias_branch_limit() {
+    let (_ws, _rules, _vanilla, mut child, mut reader) = spawn_alias_workspace(
+        ALIAS_BRANCH_LIMIT_RULES,
+        &[(CAPPED_ALIAS_REL_PATH, capped_alias_file(0).as_str())],
+    );
+    let diagnostics =
+        diags_for(&mut reader, CAPPED_ALIAS_REL_PATH, 1).expect("capped-file diagnostics");
     child.kill().ok();
     assert_eq!(
         diagnostics
@@ -3440,6 +3493,102 @@ fn test_scan_reports_alias_branch_limit() {
             .count(),
         1,
         "the LSP scan must publish one alias branch-limit diagnostic: {diagnostics:?}"
+    );
+}
+
+/// The branch-limit diagnostic is emitted last, and a capped file is exactly the
+/// kind that also floods. It has to survive the server's per-file diagnostic cap
+/// (`MAX_FILE_ERRORS`), or the editor shows a truncated list with no sign that
+/// validation stopped early.
+#[test]
+fn test_alias_branch_limit_survives_the_per_file_diagnostic_cap() {
+    let (_ws, _rules, _vanilla, mut child, mut reader) = spawn_alias_workspace(
+        ALIAS_BRANCH_LIMIT_RULES,
+        &[(CAPPED_ALIAS_REL_PATH, capped_alias_file(150).as_str())],
+    );
+    let diagnostics =
+        diags_for(&mut reader, CAPPED_ALIAS_REL_PATH, 1).expect("capped-file diagnostics");
+    child.kill().ok();
+    let (limit, rest): (Vec<_>, Vec<_>) = diagnostics.iter().partition(|c| c.as_str() == "CW277");
+    assert_eq!(
+        limit.len(),
+        1,
+        "the branch limit must survive truncation: {diagnostics:?}"
+    );
+    // MAX_FILE_ERRORS is 100 and is not visible from an integration test. The
+    // count pins that the flood really did trip the cap, so the assertion above
+    // can't pass just because the file stayed small.
+    assert_eq!(
+        rest.len(),
+        100,
+        "the rest of the file should be truncated at the cap: {} diagnostics",
+        rest.len()
+    );
+}
+
+/// A capped file cannot establish every use, so the server marks every tracked
+/// instance used rather than reporting definitions as unused on incomplete
+/// evidence. That suppression must lift once the file validates fully again —
+/// the server keeps its per-file use store across edits, so a stale "everything
+/// is used" entry would silence CW239 for the whole workspace for good.
+#[test]
+fn test_capped_file_suppresses_cw239_until_it_validates_again() {
+    const LONE: &str = "lone_thing = { x = a }\n";
+    let (ws, _rules, _vanilla, mut child, mut reader) = spawn_alias_workspace(
+        CAPPED_UNUSED_RULES,
+        &[
+            ("common/things/a.txt", LONE),
+            (CAPPED_ALIAS_REL_PATH, capped_alias_file(0).as_str()),
+        ],
+    );
+    wait_for_scan_done(&mut reader);
+
+    let a_uri = path_uri(ws.path().join("common/things/a.txt"));
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":a_uri,"languageId":"hoi4","version":1,
+                "text": LONE}}),
+        ),
+    )
+    .unwrap();
+    let while_capped = diags_for(&mut reader, "a.txt", 1).expect("a.txt diagnostics");
+    assert!(
+        !while_capped.contains(&"CW239".to_string()),
+        "a capped file can't prove nothing uses lone_thing: {while_capped:?}"
+    );
+
+    // Same file without the recursion: it validates fully, records no uses, and
+    // lone_thing really is referenced nowhere.
+    let capped_uri = path_uri(ws.path().join(CAPPED_ALIAS_REL_PATH));
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":capped_uri,"languageId":"hoi4","version":1,
+                "text": capped_alias_file(0)}}),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, "capped.txt", 1).expect("capped.txt diagnostics");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": capped_uri, "version": 2 },
+                "contentChanges": [{ "text": "a_user = { }\n" }]
+            }),
+        ),
+    )
+    .unwrap();
+    let after_fix = diags_for(&mut reader, "a.txt", 1).expect("a.txt re-validated after the fix");
+    child.kill().ok();
+    drop(ws);
+    assert!(
+        after_fix.contains(&"CW239".to_string()),
+        "with the cap lifted lone_thing is unreferenced and must report: {after_fix:?}"
     );
 }
 

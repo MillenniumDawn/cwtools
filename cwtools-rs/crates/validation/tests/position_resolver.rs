@@ -219,6 +219,58 @@ decision = {
     );
 }
 
+/// The branch budget belongs to one validation pass, and the resolver follows
+/// only the branch under the cursor rather than every candidate. A file deep
+/// enough to stop validation must still answer hover and goto inside it.
+#[test]
+fn navigation_resolves_inside_a_file_that_caps_validation() {
+    let cwt = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+## severity = warning
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:needs_int] = int
+"#;
+    let mut script = String::from("foo = {\n");
+    for _ in 0..20 {
+        script.push_str("recurse = {\n");
+    }
+    // `bad` matches no overload, so no candidate ever comes back clean and the
+    // disjunction explores every branch — which is what exhausts the budget.
+    script.push_str("needs_int = 3\nbad = nope\n");
+    for _ in 0..=20 {
+        script.push_str("}\n");
+    }
+
+    // The fixture has to be one validation actually gives up on, or the
+    // resolution below proves nothing.
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(cwt, &table).unwrap(), &table);
+    let parsed = parse_string(&script, &table).unwrap();
+    let errors = cwtools_validation::validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/common/foo/test.txt",
+        None,
+        None,
+        None,
+    );
+    assert!(
+        errors.iter().any(|e| e.code == Some("CW277")),
+        "the fixture must reach the alias branch cap: {errors:?}"
+    );
+
+    let ctx = resolve(cwt, &script, "game/common/foo/test.txt", "3\n", None)
+        .expect("the innermost leaf should still resolve");
+    assert!(
+        !ctx.value_rules.is_empty(),
+        "expected the `needs_int` overload at the cursor, got: {:?}",
+        ctx.value_rules
+    );
+}
+
 /// Two trigger overloads match `oil`: the `<resource>` type pattern (scope
 /// country/state) and an empty game-derived `enum[equipment_category]` that only
 /// matches via the permissive fallback. When the resource IS indexed, the

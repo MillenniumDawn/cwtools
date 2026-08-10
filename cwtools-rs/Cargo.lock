@@ -479,6 +479,7 @@ dependencies = [
  "assert_cmd",
  "cwtools_cache",
  "cwtools_driver",
+ "cwtools_error_codes",
  "cwtools_file_manager",
  "cwtools_game",
  "cwtools_info",

@@ -449,6 +449,7 @@ user = { alias_name[effect] = alias_match_left[effect] }
 alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 ## severity = warning
 alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:needs_int] = int
 "#;
 
 /// A temp workspace holding two `thing` instances, only one of which `a_user`
@@ -493,6 +494,9 @@ fn capped_alias_workspace() -> tempfile::TempDir {
         user.push_str("}\n");
     }
     std::fs::write(users.join("u.txt"), user).unwrap();
+    // A neighbour with one ordinary error. The budget is per file, so the capped
+    // file must not take this one's diagnostic down with it.
+    std::fs::write(users.join("v.txt"), "b_user = { needs_int = nope }\n").unwrap();
     tmp
 }
 
@@ -574,6 +578,23 @@ fn validate_all_reports_capped_alias_without_unused_errors() {
             .flat_map(|(_, errors)| errors)
             .all(|error| error.code != Some("CW239")),
         "a capped file must not create false unused-instance errors: {results:?}"
+    );
+    let neighbour = results
+        .iter()
+        .find(|(path, _)| path.ends_with("common/users/v.txt"))
+        .expect("v.txt should be validated");
+    assert_eq!(
+        neighbour.1.len(),
+        1,
+        "the budget is per file; the neighbour keeps its own diagnostic: {:?}",
+        neighbour.1
+    );
+    // Files are validated in parallel. A budget shared across them would move
+    // the cap (and everything downstream of it) from run to run.
+    assert_eq!(
+        results,
+        unused_session(tmp.path()).validate_all(),
+        "a capped run must be repeatable"
     );
 }
 

@@ -759,7 +759,11 @@ fn recursive_alias_script(depth: usize) -> String {
     script
 }
 
-fn validate_aliases(rules: &str, script: &str) -> Vec<cwtools_validation::ValidationError> {
+fn validate_aliases_at(
+    rules: &str,
+    script: &str,
+    file_path: &str,
+) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
     let parsed_rules = parse_string(rules, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_rules, &table);
@@ -768,11 +772,15 @@ fn validate_aliases(rules: &str, script: &str) -> Vec<cwtools_validation::Valida
         &parsed_script,
         &ruleset,
         &table,
-        "game/common/foo/test.txt",
+        file_path,
         None,
         None,
         None,
     )
+}
+
+fn validate_aliases(rules: &str, script: &str) -> Vec<cwtools_validation::ValidationError> {
+    validate_aliases_at(rules, script, "game/common/foo/test.txt")
 }
 
 fn validate_recursive_aliases(
@@ -842,6 +850,105 @@ fn distinct_recursive_aliases_stop_at_the_branch_budget() {
     assert!(
         errors.iter().all(|error| error.code != Some("CW263")),
         "the cap must stop before validating the deepest invalid field: {errors:?}"
+    );
+}
+
+/// The disjunction accepts on the first clean candidate, so a file that is
+/// actually valid never opens the second overload and never spends the budget.
+/// That is what keeps the cap off legitimate script: depth alone is not what
+/// exhausts it, unresolvable depth is — the same shape that caps at 20 levels
+/// in [`distinct_recursive_aliases_stop_at_the_branch_budget`] validates clean
+/// at 40 once the innermost block resolves.
+///
+/// Kept to 40 deliberately. The deepest nesting in real content is 24, the
+/// parser refuses to descend past `MAX_CLAUSE_DEPTH`, and a debug-build walk
+/// this deep is already spending real stack on a 1-2 MiB test thread.
+#[test]
+fn valid_deep_recursion_is_never_capped() {
+    let mut script = String::from("foo = {\n");
+    for _ in 0..40 {
+        script.push_str("recurse = {\n");
+    }
+    for _ in 0..=40 {
+        script.push_str("}\n");
+    }
+    let errors = validate_aliases(RECURSIVE_DISTINCT_ALIAS_RULES, &script);
+    assert!(
+        errors.is_empty(),
+        "40 levels of valid recursion must validate clean: {errors:?}"
+    );
+}
+
+const RECURSIVE_PER_FILE_ALIAS_RULES: &str = r#"
+types = {
+    type[oob] = {
+        path = "game/history/units"
+        type_per_file = yes
+    }
+}
+oob = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+## severity = warning
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+"#;
+
+/// A `type_per_file` file is validated and returned from its own branch, before
+/// the root-child dispatch every other cap test goes through. That branch has to
+/// report the limit too, or an OOB-shaped file stops validating in silence.
+#[test]
+fn type_per_file_recursion_stops_at_the_branch_budget() {
+    let mut script = String::new();
+    for _ in 0..20 {
+        script.push_str("recurse = {\n");
+    }
+    script.push_str("bad = nope\n");
+    for _ in 0..20 {
+        script.push_str("}\n");
+    }
+    let errors = validate_aliases_at(
+        RECURSIVE_PER_FILE_ALIAS_RULES,
+        &script,
+        "history/units/test.txt",
+    );
+    let capped: Vec<_> = errors
+        .iter()
+        .filter(|error| error.code == Some("CW277"))
+        .collect();
+    assert_eq!(capped.len(), 1, "expected one limit diagnostic: {errors:?}");
+    assert_eq!(capped[0].severity, ErrorSeverity::Warning);
+}
+
+/// The same file under a single overload never branches, so it validates to the
+/// bottom and reports the invalid field instead of the limit. Without this the
+/// test above could pass on a rule set that caps everything.
+#[test]
+fn type_per_file_recursion_without_overloads_is_not_capped() {
+    const SINGLE: &str = r#"
+types = {
+    type[oob] = {
+        path = "game/history/units"
+        type_per_file = yes
+    }
+}
+oob = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+"#;
+    let mut script = String::new();
+    for _ in 0..20 {
+        script.push_str("recurse = {\n");
+    }
+    script.push_str("bad = nope\n");
+    for _ in 0..20 {
+        script.push_str("}\n");
+    }
+    let errors = validate_aliases_at(SINGLE, &script, "history/units/test.txt");
+    assert!(
+        errors.iter().all(|error| error.code != Some("CW277")),
+        "a single overload never reserves a branch: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| error.code == Some("CW263")),
+        "the deepest invalid field should still be reported: {errors:?}"
     );
 }
 

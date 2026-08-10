@@ -19,7 +19,7 @@ use super::matching::{PatternMatch, classify_pattern_match, is_scope_key};
 /// The overload set a single alias usage resolves to, each tagged `confident`.
 type Overloads<'a> = SmallVec<[(&'a (RuleType, Options), bool); 4]>;
 
-const EQUIVALENT_OVERLOAD_CACHE_CAP: usize = 32;
+const EQUIVALENT_OVERLOAD_SCAN_CAP: usize = 32;
 
 fn push_overload<'a>(
     overloads: &mut Overloads<'a>,
@@ -28,7 +28,7 @@ fn push_overload<'a>(
     coalesce_equivalent: bool,
 ) {
     if coalesce_equivalent
-        && overloads.len() < EQUIVALENT_OVERLOAD_CACHE_CAP
+        && overloads.len() < EQUIVALENT_OVERLOAD_SCAN_CAP
         && let Some((_, existing_confident)) =
             overloads.iter_mut().find(|(existing, _)| *existing == rule)
     {
@@ -255,13 +255,14 @@ pub(super) fn validate_alias_usage(
     // error) squiggle the key token, not the whole usage. Node-form usages
     // have no leaf and keep the whole-line fallback.
     let key_end = leaf.map(|l| key_token_end(l, key, table));
-    let is_branching = overloads_conf.len() > 1;
-    let branch_pos = leaf.map(|leaf| leaf.pos.start).unwrap_or(SourcePos {
-        line: fallback_pos.0,
-        col: fallback_pos.1,
-    });
-    if is_branching && !ctx.reserve_alias_branches(overloads_conf.len(), branch_pos, key_end) {
-        return;
+    if overloads_conf.len() > 1 {
+        let branch_pos = leaf.map(|leaf| leaf.pos.start).unwrap_or(SourcePos {
+            line: fallback_pos.0,
+            col: fallback_pos.1,
+        });
+        if !ctx.reserve_alias_branches(overloads_conf.len(), branch_pos, key_end) {
+            return;
+        }
     }
 
     // CW248: an invalid scope command in a chain. Restricted to dotted lower-case
