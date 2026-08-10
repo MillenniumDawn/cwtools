@@ -326,7 +326,7 @@ fn from_entries(path: PathBuf, dir: &Path, entries: Vec<Entry>) -> Result<FileCo
             "min-severity" => {
                 let v = string(&cfg.path, e)?;
                 cfg.min_severity = Some(
-                    crate::parse_min_severity(&v)
+                    crate::cli::parse_min_severity(&v)
                         .map_err(|m| ConfigError::at(&cfg.path, e.line, m))?,
                 );
             }
@@ -336,7 +336,7 @@ fn from_entries(path: PathBuf, dir: &Path, entries: Vec<Entry>) -> Result<FileCo
                 cfg.loc_languages = list(&cfg.path, e)?
                     .iter()
                     .map(|v| {
-                        crate::parse_lang(&v.value)
+                        crate::cli::parse_lang(&v.value)
                             .map_err(|m| ConfigError::at(&cfg.path, v.line, m))
                     })
                     .collect::<Result<_, _>>()?;
