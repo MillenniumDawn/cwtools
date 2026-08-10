@@ -799,23 +799,31 @@ impl Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
-        // All matches are collected, sorted deterministically by (rank, name,
-        // uri), then truncated — the old early break while iterating a HashMap
-        // returned an arbitrary hash-order 500.
-        let mut cands: Vec<SymbolCandidate> = Vec::new();
+        // Bounded top-k on the deterministic (rank, name, uri, line, col)
+        // order: a max-heap whose root is the worst kept candidate, so a
+        // non-improving match is rejected by one borrowed comparison before
+        // any string is cloned. The old collect-then-sort materialized every
+        // matching symbol — the whole workspace for an empty query (the
+        // picker's initial list) — just to keep 500.
+        let mut top = TopSymbols::new(WORKSPACE_SYMBOL_LIMIT);
         {
             let info = self.state.info_service.read();
             for (type_name, instances) in &info.type_index.map {
                 for (file_uri, inst) in instances {
-                    if let Some(rank) = symbol_rank(&inst.name, &query) {
-                        cands.push(SymbolCandidate {
+                    let Some(rank) = symbol_rank(&inst.name, &query) else {
+                        continue;
+                    };
+                    let line0 = inst.location.line.saturating_sub(1);
+                    let col = inst.location.col as u32;
+                    if top.accepts(rank, &inst.name, file_uri, line0, col) {
+                        top.push(SymbolCandidate {
                             rank,
                             name: inst.name.clone(),
                             container: Some(type_name.clone()),
                             kind: SymbolKind::STRUCT,
                             file_uri: file_uri.to_string(),
-                            line0: inst.location.line.saturating_sub(1),
-                            col: inst.location.col as u32,
+                            line0,
+                            col,
                         });
                     }
                 }
@@ -823,15 +831,20 @@ impl Backend {
             // `@`-constants, still tracked per-file (as in the document outline).
             for (file_uri, fi) in &info.files {
                 for (name, loc) in &fi.defined_variables {
-                    if let Some(rank) = symbol_rank(name, &query) {
-                        cands.push(SymbolCandidate {
+                    let Some(rank) = symbol_rank(name, &query) else {
+                        continue;
+                    };
+                    let line0 = loc.line.saturating_sub(1);
+                    let col = loc.col as u32;
+                    if top.accepts(rank, name, file_uri, line0, col) {
+                        top.push(SymbolCandidate {
                             rank,
                             name: name.clone(),
                             container: None,
                             kind: SymbolKind::CONSTANT,
                             file_uri: file_uri.clone(),
-                            line0: loc.line.saturating_sub(1),
-                            col: loc.col as u32,
+                            line0,
+                            col,
                         });
                     }
                 }
@@ -842,8 +855,11 @@ impl Backend {
         {
             let ll = self.state.loc_locations.read();
             for (key, (file_uri, line0)) in ll.iter() {
-                if let Some(rank) = symbol_rank(key, &query) {
-                    cands.push(SymbolCandidate {
+                let Some(rank) = symbol_rank(key, &query) else {
+                    continue;
+                };
+                if top.accepts(rank, key, file_uri, *line0, 0) {
+                    top.push(SymbolCandidate {
                         rank,
                         name: key.to_string(),
                         container: None,
@@ -855,8 +871,7 @@ impl Backend {
                 }
             }
         }
-        cands.sort_by(|a, b| (a.rank, &a.name, &a.file_uri).cmp(&(b.rank, &b.name, &b.file_uri)));
-        cands.truncate(500);
+        let cands = top.into_sorted_vec();
 
         let text_uris: Vec<String> = cands.iter().map(|c| c.file_uri.clone()).collect();
         let texts = self.file_text_snapshots_for(&text_uris).await;
@@ -1382,7 +1397,8 @@ fn name_contains_ignore_case(name: &str, query: &str) -> bool {
 }
 
 /// One `workspace/symbol` match before range conversion: where it lives
-/// (0-based line, char col) plus how it sorts (`rank`, then name, then uri).
+/// (0-based line, char col) plus how it sorts (`rank`, then name, then uri,
+/// then position — the `Ord` impl below).
 struct SymbolCandidate {
     rank: u8,
     name: String,
@@ -1393,15 +1409,98 @@ struct SymbolCandidate {
     col: u32,
 }
 
+impl SymbolCandidate {
+    fn sort_key(&self) -> (u8, &str, &str, u32, u32) {
+        (self.rank, &self.name, &self.file_uri, self.line0, self.col)
+    }
+}
+
+impl Ord for SymbolCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key().cmp(&other.sort_key())
+    }
+}
+
+impl PartialOrd for SymbolCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SymbolCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.sort_key() == other.sort_key()
+    }
+}
+
+impl Eq for SymbolCandidate {}
+
+/// Response cap for `workspace/symbol`, matching what symbol pickers show.
+const WORKSPACE_SYMBOL_LIMIT: usize = 500;
+
+/// Bounded top-k accumulator for `workspace/symbol`: a max-heap of at most
+/// `limit` candidates whose root is the worst one kept. [`accepts`](Self::accepts)
+/// compares an incoming candidate's borrowed sort key against that root, so
+/// callers only clone name/uri strings for candidates that make the cut.
+struct TopSymbols {
+    limit: usize,
+    heap: std::collections::BinaryHeap<SymbolCandidate>,
+}
+
+impl TopSymbols {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: std::collections::BinaryHeap::with_capacity(limit + 1),
+        }
+    }
+
+    /// Whether a candidate with this sort key would be kept. Equal-to-worst is
+    /// rejected: it could only displace an identically-ordered entry.
+    fn accepts(&self, rank: u8, name: &str, file_uri: &str, line0: u32, col: u32) -> bool {
+        if self.heap.len() < self.limit {
+            return true;
+        }
+        let Some(worst) = self.heap.peek() else {
+            return true;
+        };
+        (rank, name, file_uri, line0, col) < worst.sort_key()
+    }
+
+    fn push(&mut self, cand: SymbolCandidate) {
+        self.heap.push(cand);
+        if self.heap.len() > self.limit {
+            self.heap.pop();
+        }
+    }
+
+    /// The kept candidates, best first.
+    fn into_sorted_vec(self) -> Vec<SymbolCandidate> {
+        self.heap.into_sorted_vec()
+    }
+}
+
 /// Rank of a workspace-symbol candidate against the (already lowercased)
 /// query: 0 exact, 1 prefix, 2 substring, `None` when it doesn't match. The
 /// empty query admits everything (the picker's initial, unfiltered list).
+/// ASCII names (the dominant case) rank with no allocation; non-ASCII names
+/// take the same `to_lowercase` fallback as `name_contains_ignore_case`.
 fn symbol_rank(name: &str, query: &str) -> Option<u8> {
     if query.is_empty() {
         return Some(2);
     }
     if !name_contains_ignore_case(name, query) {
         return None;
+    }
+    if name.is_ascii() {
+        let (n, q) = (name.as_bytes(), query.as_bytes());
+        return if n.eq_ignore_ascii_case(q) {
+            Some(0)
+        } else if q.len() <= n.len() && n[..q.len()].eq_ignore_ascii_case(q) {
+            Some(1)
+        } else {
+            Some(2)
+        };
     }
     let lower = name.to_lowercase();
     if lower == query {
@@ -2256,6 +2355,82 @@ mod tests {
         assert_eq!(symbol_rank("unrelated", "my_focus"), None);
         // Empty query admits everything (the picker's initial list).
         assert_eq!(symbol_rank("anything", ""), Some(2));
+        // Non-ASCII names take the to_lowercase fallback, same tiers.
+        assert_eq!(symbol_rank("İstanbul", &"İstanbul".to_lowercase()), Some(0));
+        assert_eq!(
+            symbol_rank("İstanbul_x", &"İstanbul".to_lowercase()),
+            Some(1)
+        );
+        assert_eq!(
+            symbol_rank("x_İstanbul", &"İstanbul".to_lowercase()),
+            Some(2)
+        );
+    }
+
+    fn cand(rank: u8, name: &str, uri: &str, line0: u32, col: u32) -> SymbolCandidate {
+        SymbolCandidate {
+            rank,
+            name: name.to_string(),
+            container: None,
+            kind: SymbolKind::STRUCT,
+            file_uri: uri.to_string(),
+            line0,
+            col,
+        }
+    }
+
+    #[test]
+    fn top_symbols_matches_sort_and_truncate() {
+        // The heap must keep exactly what sort-everything-then-truncate kept.
+        let mut all = Vec::new();
+        for (i, rank) in [2u8, 0, 1, 2, 0, 1, 2, 2].into_iter().enumerate() {
+            all.push(cand(
+                rank,
+                &format!("name_{}", i % 5),
+                "file:///a",
+                i as u32,
+                0,
+            ));
+            all.push(cand(
+                rank,
+                &format!("name_{}", i % 3),
+                "file:///b",
+                i as u32,
+                7,
+            ));
+        }
+        for limit in [1, 3, 5, all.len(), all.len() + 10] {
+            let mut top = TopSymbols::new(limit);
+            for c in &all {
+                if top.accepts(c.rank, &c.name, &c.file_uri, c.line0, c.col) {
+                    top.push(cand(c.rank, &c.name, &c.file_uri, c.line0, c.col));
+                }
+            }
+            let mut expected: Vec<_> = all.iter().map(|c| c.sort_key()).collect();
+            expected.sort();
+            expected.truncate(limit);
+            let got: Vec<_> = top.into_sorted_vec();
+            assert_eq!(
+                got.iter().map(|c| c.sort_key()).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn top_symbols_accepts_only_improving_candidates_when_full() {
+        let mut top = TopSymbols::new(2);
+        top.push(cand(0, "aaa", "file:///a", 0, 0));
+        top.push(cand(1, "bbb", "file:///a", 1, 0));
+        // Worse than the kept worst: rejected without displacing anything.
+        assert!(!top.accepts(2, "ccc", "file:///a", 2, 0));
+        // Equal to the kept worst: rejected (could only swap an identical key).
+        assert!(!top.accepts(1, "bbb", "file:///a", 1, 0));
+        // Better than the kept worst: accepted, and pushing evicts it.
+        assert!(top.accepts(0, "aab", "file:///a", 3, 0));
+        top.push(cand(0, "aab", "file:///a", 3, 0));
+        let names: Vec<_> = top.into_sorted_vec().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["aaa", "aab"]);
     }
 
     #[test]
