@@ -128,7 +128,10 @@ pub(crate) fn validate_scope_target(
 ///    state-history `state` object uses `replace_scope = { this = state ... }`);
 /// 3. the instance's own key when that's a scope link / data ref (`state = {…}`).
 ///
-/// Caller must `save()` first and `restore()` after.
+/// A `## push_scope` becomes the instance's ROOT too (F# `{ Root = ps;
+/// Scopes = [ps] }`), so `ROOT = { … }` blocks inside resolve to the instance's
+/// scope rather than the file default. Caller must `save()` first and
+/// `restore()` after.
 pub(crate) fn seed_root_scope(
     ctx: &mut ScopeContext,
     type_def: &TypeDefinition,
@@ -138,12 +141,12 @@ pub(crate) fn seed_root_scope(
     game: Option<Game>,
 ) {
     if let Some(ps) = subtype_push {
-        push_named_scope(ctx, ps);
+        seed_root_from_push(ctx, ps);
         return;
     }
     let root_opts = find_type_rule_opts(&type_def.name, ruleset);
     if let Some(push) = root_opts.and_then(|o| o.push_scope.as_deref()) {
-        push_named_scope(ctx, push);
+        seed_root_from_push(ctx, push);
     } else if let Some(replace) = root_opts.and_then(|o| o.replace_scopes.as_ref()) {
         apply_replace_scopes(ctx, replace, game);
     } else if let Some(k) = node_key {
@@ -151,6 +154,32 @@ pub(crate) fn seed_root_scope(
         ctx.change_scope(k);
         if ctx.scope_depth() == before && looks_like_data_ref(k) {
             ctx.push_scope(SCOPE_ANY);
+        }
+    }
+}
+
+/// Seed an instance's scope from a `## push_scope` value: the scope becomes
+/// both the current scope and ROOT, matching the F# original (which built a
+/// fresh `{ Root = ps; Scopes = [ps] }` context). Without the ROOT update,
+/// `ROOT = { … }` blocks inside a type instance resolve to the file-default
+/// scope instead of the instance's, so a lenient event type (`unit_leader_event`,
+/// `state_event` — both `push_scope = any` for HOI4's hybrid event scopes) gets
+/// its ROOT falsely scope-checked against country. The stack reset also makes
+/// `prev` inside the instance match F# (it can't fall through to the file root).
+fn seed_root_from_push(ctx: &mut ScopeContext, push: &str) {
+    let first = push
+        .trim_matches(|c: char| c == '{' || c == '}' || c.is_whitespace())
+        .split_whitespace()
+        .next()
+        .unwrap_or(push);
+    match ctx.registry.id_of(first) {
+        Some(id) => {
+            ctx.root = id;
+            ctx.scopes.clear();
+            ctx.scopes.push(id);
+        }
+        None => {
+            ctx.change_scope(push);
         }
     }
 }

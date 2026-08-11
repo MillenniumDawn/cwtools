@@ -731,6 +731,34 @@ mod tests {
     }
 
     #[test]
+    fn an_over_cap_entry_misses_instead_of_failing_the_caller() {
+        // The whole degradation contract behind the input bounds (#162): a
+        // refused entry has to look like a cold cache, so the caller re-parses
+        // the source, rather than surfacing as an error nobody handles.
+        let tmp = tempfile::tempdir().unwrap();
+        let table = StringTable::new();
+        let fp = 162;
+        validate_or_clear(tmp.path(), fp).unwrap();
+        let text = "a = 1\n";
+        let parsed = parse_string(text, &table).unwrap();
+        store(tmp.path(), fp, text, &parsed, &table);
+        assert!(load(tmp.path(), fp, text, &table).is_some());
+
+        // Sparsely extended past the read cap, so the entry keeps its valid
+        // header and is refused on size alone.
+        let dir = workspace_cache_dir(tmp.path(), fp);
+        let path = file_cache_path(&dir, content_hash(text));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(crate::io::MAX_ARCHIVE_FILE_BYTES + 1)
+            .unwrap();
+
+        assert!(load(tmp.path(), fp, text, &table).is_none());
+    }
+
+    #[test]
     fn load_misses_on_changed_text() {
         let tmp = tempfile::tempdir().unwrap();
         let table = StringTable::new();

@@ -171,6 +171,11 @@ fn load_hoi4_config_dir() {
     println!("  values:        {}", ruleset.values.len());
 
     assert!(
+        !errors.iter().any(|e| e.message.contains("unexpanded")),
+        "the real config must resolve every single_alias within the expansion budget: {errors:?}"
+    );
+
+    assert!(
         ruleset.types.len() > 20,
         "expected > 20 types, got {}",
         ruleset.types.len()

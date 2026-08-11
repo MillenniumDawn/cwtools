@@ -853,7 +853,13 @@ impl ValidateTrigger {
 /// released. Three states, not two: only `Absent` means "gone", and only "gone"
 /// may drop the file's index entry.
 enum DiskState {
-    Parsed(ParsedFile),
+    /// `discarded_edits` is set when the disk text differs from the buffer that
+    /// just closed, i.e. the user closed it with unsaved changes. Anything
+    /// derived from that buffer describes content that never hit disk.
+    Parsed {
+        parsed: ParsedFile,
+        discarded_edits: bool,
+    },
     /// Nothing safe to index: deleted, unreadable, refused, or no longer parses.
     Absent,
 }
@@ -1778,9 +1784,9 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
         tracing::debug!(%uri, "did_close");
-        if self.state.documents.lock().remove(&uri).is_none() {
+        let Some(closed_doc) = self.state.documents.lock().remove(&uri) else {
             return;
-        }
+        };
         let pending_validation = self.state.debounce_handles.lock().remove(&uri);
         if let Some(validation) = pending_validation {
             validation.abort.abort();
@@ -1819,12 +1825,16 @@ impl LanguageServer for Backend {
             let roots = self.state.config.read().authorized_roots.clone();
             let table = self.state.string_table.clone();
             let uri = uri.clone();
+            let buffer_text = Arc::clone(&closed_doc.text);
             tokio::task::spawn_blocking(move || {
                 use crate::access::{FileRead, MAX_URI_READ_BYTES, read_authorized};
                 match read_authorized(&uri, &roots, MAX_URI_READ_BYTES) {
                     FileRead::Text(text) => {
                         match cwtools_parser::parser::parse_string(&text, &table) {
-                            Ok(parsed) => DiskState::Parsed(parsed),
+                            Ok(parsed) => DiskState::Parsed {
+                                parsed,
+                                discarded_edits: text != *buffer_text,
+                            },
                             Err(_) => DiskState::Absent,
                         }
                     }
@@ -1845,16 +1855,16 @@ impl LanguageServer for Backend {
             }
 
             match &disk_ast {
-                DiskState::Parsed(parsed) => self.index_parsed_file(&uri, parsed, None),
+                DiskState::Parsed { parsed, .. } => self.index_parsed_file(&uri, parsed, None),
                 DiskState::Absent => {
                     self.state.info_service.write().clear_file(&uri);
                     self.bump_info_revision();
                     // The file is gone from disk too, so its recorded `<type>` uses
                     // must not keep suppressing CW239 on the instances it referenced.
                     // Queue those names so the sweep below revalidates their
-                    // definition files. (A file that still exists keeps its
-                    // last-validated entry: the buffer just closed normally matches
-                    // the disk content it was saved from.)
+                    // definition files. (A file that still exists keeps its entry,
+                    // refreshed from the disk AST below when the close discarded
+                    // unsaved edits.)
                     if let Some(uses) = self.state.type_uses.write().remove(&uri) {
                         let dropped = uses.changed_names(&Default::default());
                         if !dropped.is_empty() {
@@ -1887,10 +1897,26 @@ impl LanguageServer for Backend {
             )
         };
 
+        // A close that discarded unsaved edits leaves `type_uses` describing text
+        // that never reached disk, and nothing else refreshes it: no watched event
+        // fires for a file that didn't change. The index was just rebuilt from the
+        // disk AST, so rebuild the recorded uses from it too, or a reference the
+        // discard restored keeps a false CW239 on its definition until the next
+        // full scan (#133). Queued names land in the sweep below.
+        if let DiskState::Parsed {
+            parsed,
+            discarded_edits: true,
+        } = &disk_ast
+            && !self.state.documents.lock().contains_key(&uri)
+        {
+            // block_in_place: a whole-file validate, the same sync CPU work the
+            // keystroke path fences (#87).
+            tokio::task::block_in_place(|| self.refresh_type_uses_from_parsed(&uri, parsed));
+        }
+
         cwtools_profiling::log_rss("did_close");
         if !self.state.documents.lock().contains_key(&uri) {
-            self.client
-                .publish_diagnostics(params.text_document.uri, vec![], None)
+            self.publish_filtered(params.text_document.uri, vec![], None, None)
                 .await;
             if let Some(text) = disk_loc_text
                 && !self.state.documents.lock().contains_key(&uri)

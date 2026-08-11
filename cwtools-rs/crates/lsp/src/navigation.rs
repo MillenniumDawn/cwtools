@@ -133,6 +133,19 @@ impl Backend {
                     }
                 }
                 ReferenceHint::FileRef { path } => self.file_ref_locations(path, fallback).await,
+                // An enum member has no definition of its own in the game
+                // files; the config is where it comes from, so jump to the
+                // member inside its `enum[..]` block.
+                ReferenceHint::EnumRef { enum_name, value } => self
+                    .cwt_def_location(
+                        cwtools_rules::rules_types::CwtDefKind::Enum,
+                        enum_name,
+                        Some(unquote(value)),
+                        fallback,
+                    )
+                    .await
+                    .into_iter()
+                    .collect(),
                 _ => Vec::new(),
             };
             let locations = dedup_locations(locations);
@@ -250,6 +263,22 @@ impl Backend {
         fallback: &Url,
     ) -> Option<GotoDefinitionResponse> {
         let (kind, name) = self.cwt_ref_at_cursor(uri, pos).await?;
+        let loc = self.cwt_def_location(kind, &name, None, fallback).await?;
+        Some(GotoDefinitionResponse::Array(vec![loc]))
+    }
+
+    /// Where the ruleset loader recorded `name`'s definition, as a Location.
+    /// `member` anchors on that token inside the definition's block (an enum
+    /// value in its `enum[..]` body), falling back to the defining key when the
+    /// block doesn't spell it out — a complex enum's members come from the game
+    /// files, not the config. `None` when nothing defines `name`.
+    async fn cwt_def_location(
+        &self,
+        kind: cwtools_rules::rules_types::CwtDefKind,
+        name: &str,
+        member: Option<&str>,
+        fallback: &Url,
+    ) -> Option<Location> {
         let def = {
             let rules = self.state.rules.read();
             let rs = rules.ruleset.as_ref()?;
@@ -260,16 +289,22 @@ impl Backend {
         }?;
         let target_uri = crate::paths::path_to_uri(&def.file);
         let text = self.file_text_for(&target_uri).await;
-        Some(GotoDefinitionResponse::Array(vec![
-            self.source_location_with_text(
-                &target_uri,
-                def.line.saturating_sub(1),
-                def.col as u32,
-                &name,
-                fallback,
-                text.as_deref(),
-            ),
-        ]))
+        let line0 = def.line.saturating_sub(1);
+        let (line0, col, token) = member
+            .zip(text.as_deref())
+            .and_then(|(m, text)| {
+                let (line, col) = member_pos_in_block(text, line0, def.col as u32, m)?;
+                Some((line, col, m))
+            })
+            .unwrap_or((line0, def.col as u32, name));
+        Some(self.source_location_with_text(
+            &target_uri,
+            line0,
+            col,
+            token,
+            fallback,
+            text.as_deref(),
+        ))
     }
 
     /// The roots a game-relative path resolves against, in probe order: the
@@ -522,9 +557,12 @@ impl Backend {
             return snapshots;
         }
         let roots = self.state.config.read().authorized_roots.clone();
+        // Parallel because rename and references batch one read per file naming
+        // the symbol, which is hundreds of files for a widely-used one.
+        use rayon::prelude::*;
         if let Ok(read) = tokio::task::spawn_blocking(move || {
             closed
-                .into_iter()
+                .into_par_iter()
                 .filter_map(|uri| {
                     let text = crate::access::read_authorized_text(
                         &uri,
@@ -1822,6 +1860,30 @@ fn brace_pairs(text: &str) -> Vec<CharSpan> {
     pairs
 }
 
+/// The position of `member` inside the `{ … }` block a definition at
+/// (`def_line0`, `def_col`) opens — the first whole-token, non-comment
+/// occurrence between its braces. `None` when the definition opens no block or
+/// doesn't list `member`.
+fn member_pos_in_block(
+    text: &str,
+    def_line0: u32,
+    def_col: u32,
+    member: &str,
+) -> Option<(u32, u32)> {
+    let (open, close) = brace_pairs(text)
+        .into_iter()
+        .filter(|(open, _)| *open >= (def_line0, def_col))
+        .min()?;
+    let lines: Vec<&str> = text.lines().collect();
+    (open.0..=close.0).find_map(|line0| {
+        let line = lines.get(line0 as usize)?;
+        code_token_cols_in_line(line, member)
+            .into_iter()
+            .find(|col| (line0 != open.0 || *col > open.1) && (line0 != close.0 || *col < close.1))
+            .map(|col| (line0, col))
+    })
+}
+
 /// The innermost-first selection chain at (line0, col): the identifier token
 /// under the cursor, then for each enclosing brace pair its content span
 /// (inside the braces) followed by the full span (including them). Every span
@@ -2299,6 +2361,28 @@ mod tests {
         // Cursor on the indent whitespace: no token, chain starts at the block.
         let spans = selection_spans(text, &pairs, 1, 2);
         assert_eq!(spans, vec![((0, 5), (2, 0)), ((0, 4), (2, 1))]);
+    }
+
+    #[test]
+    fn member_pos_in_block_finds_enum_value() {
+        // One value per line, the shape a large enum is written in.
+        let text = "enums = {\n    enum[terrain] = {\n        plains\n        forest\n    }\n}\n";
+        assert_eq!(member_pos_in_block(text, 1, 4, "forest"), Some((3, 8)));
+        // A single-line body: the value sits on the defining line itself.
+        let text = "enums = {\n    enum[terrain] = { plains forest }\n}\n";
+        assert_eq!(member_pos_in_block(text, 1, 4, "forest"), Some((1, 29)));
+    }
+
+    #[test]
+    fn member_pos_in_block_skips_what_isnt_a_member() {
+        // A complex enum's members come from the game files, not the block.
+        let text =
+            "enums = {\n    complex_enum[tags] = {\n        path = \"game/common\"\n    }\n}\n";
+        assert_eq!(member_pos_in_block(text, 1, 4, "USA"), None);
+        // A commented-out value is not a member, and neither is a substring of one.
+        let text =
+            "enums = {\n    enum[terrain] = {\n        # forest\n        forestry\n    }\n}\n";
+        assert_eq!(member_pos_in_block(text, 1, 4, "forest"), None);
     }
 
     #[test]
