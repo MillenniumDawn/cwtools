@@ -522,9 +522,12 @@ impl Backend {
             return snapshots;
         }
         let roots = self.state.config.read().authorized_roots.clone();
+        // Parallel because rename and references batch one read per file naming
+        // the symbol, which is hundreds of files for a widely-used one.
+        use rayon::prelude::*;
         if let Ok(read) = tokio::task::spawn_blocking(move || {
             closed
-                .into_iter()
+                .into_par_iter()
                 .filter_map(|uri| {
                     let text = crate::access::read_authorized_text(
                         &uri,
