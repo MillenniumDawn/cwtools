@@ -1183,16 +1183,38 @@ impl Backend {
             "fixAllWorkspace" => Ok(Some(Value::String(self.fix_all_workspace_impl().await))),
             // User-triggered re-index (no cache purge, unlike clearAllCaches).
             // validate_entire_workspace's CAS guard returns false when a scan
-            // (foreground or the periodic background pass) is already
-            // running; surface that instead of silently no-oping.
+            // (the startup scan's tail, another reindex, the periodic background
+            // pass) is already running. The same race the startup scan's closing
+            // `loadingBar(false)` notification creates for `reloadrulesconfig`
+            // hits this command too: the bar-off goes out before the guard drops
+            // (`ScanGuard::finish`), so a reindex sent right after the bar-off
+            // can land in the gap, lose the CAS, and answer immediately without
+            // ever sending `loadingBar(true)`. Retry until we win the CAS so the
+            // user's reindex actually runs, bounded so a perpetually-busy
+            // server reports honestly instead of spinning.
+            // `CWTOOLS_RETRY_DEADLINE_MS` test override (like
+            // `CWTOOLS_SCAN_HOLD_MS`): shorten the bound so a test can prove
+            // the give-up path without waiting out 60s. (#220)
             "reindexWorkspace" => {
-                let ran = self.validate_entire_workspace(false).await;
-                let msg = if ran {
-                    "Workspace re-indexed."
+                let deadline = std::time::Instant::now()
+                    + std::env::var("CWTOOLS_RETRY_DEADLINE_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map_or(
+                            std::time::Duration::from_secs(60),
+                            std::time::Duration::from_millis,
+                        );
+                let mut reindexed = self.validate_entire_workspace(false).await;
+                while !reindexed && std::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    reindexed = self.validate_entire_workspace(false).await;
+                }
+                let msg = if reindexed {
+                    "Workspace re-indexed.".to_string()
                 } else {
-                    "Re-index already in progress."
+                    "Re-index still pending (another scan is running).".to_string()
                 };
-                Ok(Some(Value::String(msg.to_string())))
+                Ok(Some(Value::String(msg)))
             }
             // `getGraphData(entityType, depth)` — the entity graph the webview
             // renders. See `graph.rs` for the wire format and the bounds.
