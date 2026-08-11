@@ -3213,6 +3213,35 @@ fn wait_for_scan_done(reader: &mut BufReader<std::process::ChildStdout>) {
     }
 }
 
+/// Wait for the scan-started signal — `loadingBar` with `enable=true` — on a
+/// [`spawn_frame_collector`] channel, panicking if it does not arrive within
+/// `budget`.
+///
+/// `CWTOOLS_SCAN_HOLD_MS` sleeps the scan open *after* this signal fires (see
+/// `scan::validate_entire_workspace_inner`), so the wait for the started signal
+/// is a measure of server command-processing latency under load, not of the
+/// hold. Size `budget` to that latency (a generous fixed value), not to the
+/// hold magnitude: the hold cannot expire before the signal it follows, so a
+/// larger budget never lets the scan finish first (#212).
+fn wait_for_scan_started(
+    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
+    budget: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no loadingBar(true) scan-started signal"
+        );
+        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
+            && v["method"] == "loadingBar"
+            && v["params"]["enable"] == serde_json::Value::Bool(true)
+        {
+            break;
+        }
+    }
+}
+
 #[test]
 fn test_did_open_definition_clears_open_caller_stale_error() {
     // Caller B references scripted_effect my_se; the defining file A is opened
@@ -6326,19 +6355,7 @@ fn test_watched_overcap_batch_does_not_spin_against_running_scan() {
     .unwrap();
     // Wait for the scan-started signal (the hold begins after the bar-on), so
     // the flood's debounce window can't slip past the scan and win the CAS.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no loadingBar(true) after reindexWorkspace"
-        );
-        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
-            && v["method"] == "loadingBar"
-            && v["params"]["enable"] == serde_json::Value::Bool(true)
-        {
-            break;
-        }
-    }
+    wait_for_scan_started(&rx, std::time::Duration::from_secs(30));
     write_frame(&mut child, &watched_changes(&uris)).unwrap();
 
     // Quiet must outlast the held rescan so the whole story is observed.
@@ -11776,19 +11793,7 @@ fn test_reloadrulesconfig_retries_until_it_wins_the_scan_guard() {
         ),
     )
     .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no loadingBar(true) after reindexWorkspace"
-        );
-        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
-            && v["method"] == "loadingBar"
-            && v["params"]["enable"] == serde_json::Value::Bool(true)
-        {
-            break;
-        }
-    }
+    wait_for_scan_started(&rx, std::time::Duration::from_secs(30));
 
     // Fire the reload while the scan holds the CAS: it must not answer until
     // the competing scan is gone and a revalidation has run.
@@ -11888,19 +11893,7 @@ fn test_reloadrulesconfig_reports_queued_revalidation_when_scan_never_releases()
         ),
     )
     .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no loadingBar(true) after reindexWorkspace"
-        );
-        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
-            && v["method"] == "loadingBar"
-            && v["params"]["enable"] == serde_json::Value::Bool(true)
-        {
-            break;
-        }
-    }
+    wait_for_scan_started(&rx, std::time::Duration::from_secs(30));
 
     // Fire the reload. Its 1s deadline expires while the 10s hold is still
     // active, so the answer must arrive promptly, report the pending state,
@@ -11986,19 +11979,7 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
         ),
     )
     .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no loadingBar(true) after reindexWorkspace"
-        );
-        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
-            && v["method"] == "loadingBar"
-            && v["params"]["enable"] == serde_json::Value::Bool(true)
-        {
-            break;
-        }
-    }
+    wait_for_scan_started(&rx, std::time::Duration::from_secs(30));
 
     // The give-up response arrives ~1s in, well before the 5s hold releases.
     write_frame(
