@@ -5949,7 +5949,15 @@ fn spawn_frame_collector(
     std::thread::spawn(move || {
         loop {
             match read_frame(&mut reader) {
-                Ok(raw) if raw.is_empty() => continue,
+                // An empty frame is EOF, not a frame to skip: `read_frame`
+                // breaks its header loop on the empty line `read_line` returns
+                // at end of stream, then returns early because it never saw a
+                // Content-Length. `Err` is therefore never reached once the
+                // server exits — and every one of these tests ends by killing
+                // it. Continuing here spun the thread at 100% for the rest of
+                // the process, and with 25 collector tests that saturated the
+                // machine and starved whatever ran last.
+                Ok(raw) if raw.is_empty() => break,
                 Ok(raw) => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
                         && tx.send(v).is_err()
@@ -10880,6 +10888,363 @@ fn test_scan_reports_standard_work_done_progress() {
     assert!(
         saw_loading_bar,
         "the custom loadingBar notification must still fire for the VS Code client"
+    );
+}
+
+/// #145: a command that carries a `workDoneToken` gets its progress reported
+/// against *that* token — one bar for the operation, driven by the client's own
+/// notification — rather than the server opening its `cwtools/scan` stream
+/// alongside it.
+#[test]
+fn test_execute_command_reports_progress_against_the_client_token() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("editor_rules.cwt"), EDITOR_RULES).unwrap();
+    let p = ws.path().join("common/national_focus/tree.txt");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "my_focus = {\n    id = my_focus\n}\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": { "window": { "workDoneProgress": true } },
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let init = read_response(&mut reader).expect("no init response");
+    let init: serde_json::Value = serde_json::from_str(&init).unwrap();
+    assert_eq!(
+        init["result"]["capabilities"]["executeCommandProvider"]["workDoneProgress"],
+        serde_json::json!(true),
+        "the client feature-detects command progress on this flag"
+    );
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // Everything from here runs inside the deadline closure, because it owns
+    // stdin and the wait for the startup scan has to *answer*
+    // `window/workDoneProgress/create`. This client advertises
+    // `window.workDoneProgress`, and the server blocks on that request before
+    // it opens its own stream — draining frames without replying wedges the
+    // scan and the test with it.
+    let stdin = child.stdin.take().unwrap();
+    let collected = run_with_deadline(stdin, reader, 120, |stdin, reader| {
+        let mut kinds: Vec<String> = Vec::new();
+        let mut percentages: Vec<u64> = Vec::new();
+        let mut foreign_during_command: Vec<String> = Vec::new();
+        let mut created_for_command = false;
+        let mut result: Option<serde_json::Value> = None;
+        // `ScanGuard::finish` sends the bar-off *before* it releases the scan
+        // flag, deliberately, so the next scan's `begin` can't be overtaken by
+        // this one's `end`. A command fired the instant that notification
+        // arrives therefore races the release and can lose the CAS — rarely
+        // when the suite runs alone, reliably under a loaded `cargo test`. So
+        // retry until one actually re-indexes, each attempt on its own id and
+        // token so the frames stay attributable.
+        let mut attempt = 0i64;
+        let mut token = String::new();
+        let send_attempt = |stdin: &mut std::process::ChildStdin, attempt: i64| -> String {
+            let token = format!("cwtools/command/1/{attempt}");
+            write_frame_to(
+                stdin,
+                &jsonrpc_request(
+                    100 + attempt,
+                    "workspace/executeCommand",
+                    serde_json::json!({
+                        "command": "reindexWorkspace",
+                        "arguments": [],
+                        "workDoneToken": token,
+                    }),
+                ),
+            )
+            .unwrap();
+            token
+        };
+        for _ in 0..20_000 {
+            let Ok(raw) = read_frame(reader) else { break };
+            if raw.is_empty() {
+                break; // EOF
+            }
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if v["id"] == serde_json::json!(100 + attempt) && v.get("result").is_some() {
+                if v["result"] == serde_json::json!("Re-index already in progress.") {
+                    // Lost the CAS to the tail of the startup scan. Drop what
+                    // that attempt reported and try again.
+                    attempt += 1;
+                    kinds.clear();
+                    percentages.clear();
+                    foreign_during_command.clear();
+                    created_for_command = false;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    token = send_attempt(stdin, attempt);
+                    continue;
+                }
+                // Recorded rather than returned: `end` is sent before the
+                // handler returns, but tower-lsp merges notifications and
+                // responses onto one output with no ordering between them, so
+                // the response can arrive first. Keep reading for the `end`.
+                result = Some(v["result"].clone());
+                if kinds.last().map(String::as_str) == Some("end") {
+                    break;
+                }
+                continue;
+            }
+            match v["method"].as_str() {
+                Some("window/workDoneProgress/create") => {
+                    if !token.is_empty() {
+                        created_for_command = true;
+                    }
+                    write_frame_to(
+                        stdin,
+                        &serde_json::json!({ "jsonrpc": "2.0", "id": v["id"], "result": null })
+                            .to_string(),
+                    )
+                    .unwrap();
+                }
+                Some("$/progress") => {
+                    let seen = v["params"]["token"].as_str().unwrap_or_default();
+                    if seen != token {
+                        // Only from the command's own `begin` onward. The
+                        // startup scan closes its `cwtools/scan` stream just
+                        // *after* the `loadingBar(false)` that tells us it
+                        // finished, and that trailing `end` is its own, not a
+                        // second stream opened alongside the command.
+                        if !kinds.is_empty() {
+                            foreign_during_command.push(seen.to_string());
+                        }
+                        continue;
+                    }
+                    kinds.push(v["params"]["value"]["kind"].as_str().unwrap().to_string());
+                    if let Some(pct) = v["params"]["value"]["percentage"].as_u64() {
+                        percentages.push(pct);
+                    }
+                    if result.is_some() && kinds.last().map(String::as_str) == Some("end") {
+                        break;
+                    }
+                }
+                // The startup scan is done; run the command it was blocking.
+                Some("loadingBar")
+                    if token.is_empty()
+                        && v["params"]["enable"] == serde_json::Value::Bool(false) =>
+                {
+                    token = send_attempt(stdin, attempt);
+                }
+                _ => {}
+            }
+        }
+        (
+            kinds,
+            percentages,
+            foreign_during_command,
+            created_for_command,
+            result,
+        )
+    });
+    child.kill().ok();
+
+    let (kinds, percentages, foreign_during_command, created_for_command, result) =
+        collected.expect("timed out waiting for the command to finish");
+    assert_eq!(
+        result.and_then(|r| r.as_str().map(str::to_string)),
+        Some("Workspace re-indexed.".to_string())
+    );
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("begin"),
+        "progress must open with begin: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some("end"),
+        "progress must be closed: {kinds:?}"
+    );
+    // The client advertised `window.workDoneProgress`, so the server *would*
+    // have opened `cwtools/scan` for this scan had the command not owned the
+    // indicator — which is what makes both of these meaningful rather than
+    // vacuous.
+    assert!(
+        foreign_during_command.is_empty(),
+        "a command with its own token must not also open the server's stream, saw {foreign_during_command:?}"
+    );
+    assert!(
+        !created_for_command,
+        "a client-supplied token is already registered; window/workDoneProgress/create is for server-initiated ones"
+    );
+    // Determinate, and never rewinding: the client turns these into increments.
+    assert!(
+        percentages.len() >= 2,
+        "expected a moving percentage, got {percentages:?}"
+    );
+    assert!(
+        percentages.windows(2).all(|w| w[0] <= w[1]),
+        "percentage went backwards: {percentages:?}"
+    );
+    assert!(
+        percentages.iter().all(|&p| p <= 100),
+        "percentage out of range: {percentages:?}"
+    );
+}
+
+/// #145: the Cancel button. `window/workDoneProgress/cancel` is a notification,
+/// so the server handles it while the scan is still running — unlike
+/// `$/cancelRequest`, which tower-lsp answers by dropping the handler and which
+/// therefore cannot produce a reply at all. The command has to come back
+/// promptly *and* say it was cancelled.
+#[test]
+fn test_work_done_progress_cancel_stops_a_command() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("editor_rules.cwt"), EDITOR_RULES).unwrap();
+    let p = ws.path().join("common/national_focus/tree.txt");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "my_focus = {\n    id = my_focus\n}\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        // Holds every scan open at its start, which is how the cancel lands
+        // mid-scan deterministically instead of racing a workspace big enough
+        // to take a measurable time.
+        .env("CWTOOLS_SCAN_HOLD_MS", "3000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": { "window": { "workDoneProgress": true } },
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // As in the token test above, the whole exchange runs inside the deadline
+    // closure so it can answer `window/workDoneProgress/create` while waiting
+    // out the startup scan.
+    let stdin = child.stdin.take().unwrap();
+    let collected = run_with_deadline(stdin, reader, 120, |stdin, reader| {
+        let mut saw_cancellable_begin = false;
+        // Same scan-guard race as the token test above: the bar-off notification
+        // precedes the flag release, so a command sent on it can lose the CAS.
+        // Retry until one actually starts a scan to cancel.
+        let mut attempt = 0i64;
+        let mut token = String::new();
+        let send_attempt = |stdin: &mut std::process::ChildStdin, attempt: i64| -> String {
+            let token = format!("cwtools/command/7/{attempt}");
+            write_frame_to(
+                stdin,
+                &jsonrpc_request(
+                    100 + attempt,
+                    "workspace/executeCommand",
+                    serde_json::json!({
+                        "command": "reindexWorkspace",
+                        "arguments": [],
+                        "workDoneToken": token,
+                    }),
+                ),
+            )
+            .unwrap();
+            token
+        };
+        for _ in 0..20_000 {
+            let Ok(raw) = read_frame(reader) else { break };
+            if raw.is_empty() {
+                break; // EOF
+            }
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if v["id"] == serde_json::json!(100 + attempt) && v.get("result").is_some() {
+                if v["result"] == serde_json::json!("Re-index already in progress.") {
+                    attempt += 1;
+                    saw_cancellable_begin = false;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    token = send_attempt(stdin, attempt);
+                    continue;
+                }
+                return (saw_cancellable_begin, Some(v["result"].clone()));
+            }
+            match v["method"].as_str() {
+                Some("window/workDoneProgress/create") => write_frame_to(
+                    stdin,
+                    &serde_json::json!({ "jsonrpc": "2.0", "id": v["id"], "result": null })
+                        .to_string(),
+                )
+                .unwrap(),
+                // The startup scan is done; run the command it was blocking.
+                Some("loadingBar")
+                    if token.is_empty()
+                        && v["params"]["enable"] == serde_json::Value::Bool(false) =>
+                {
+                    token = send_attempt(stdin, attempt);
+                }
+                // Cancel only once `begin` has landed: the token isn't in the
+                // server's registry until then, and a cancel naming a token it
+                // doesn't know is dropped.
+                Some("$/progress")
+                    if v["params"]["token"] == token.as_str()
+                        && v["params"]["value"]["kind"] == "begin" =>
+                {
+                    saw_cancellable_begin =
+                        v["params"]["value"]["cancellable"] == serde_json::Value::Bool(true);
+                    write_frame_to(
+                        stdin,
+                        &jsonrpc_notification(
+                            "window/workDoneProgress/cancel",
+                            serde_json::json!({ "token": token }),
+                        ),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+        }
+        (saw_cancellable_begin, None)
+    });
+    child.kill().ok();
+
+    let (saw_cancellable_begin, result) = collected.expect("timed out; the command never answered");
+    assert!(
+        saw_cancellable_begin,
+        "a command bar must advertise itself as cancellable"
+    );
+    let result = result.expect("cancelled command never answered");
+    assert_eq!(
+        result.as_str(),
+        Some("Re-index cancelled."),
+        "a cancelled command must return, and say so"
     );
 }
 

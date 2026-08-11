@@ -13,6 +13,7 @@ use cwtools_validation::build_scope_registry_arc;
 
 use crate::Backend;
 use crate::cache_purge::purge_caches;
+use crate::command_progress::{CommandProgress, Phase, ScanOutcome};
 use crate::paths::default_cache_dir;
 
 /// Maximum entries accepted from a single ignore array in the init/didChange
@@ -132,13 +133,15 @@ fn folders_to_paths(uris: &[String]) -> Vec<std::path::PathBuf> {
 /// The user-visible `reloadrulesconfig` status. The client toasts this string
 /// verbatim, so the wording is the contract: each half (rules loaded or not,
 /// revalidation ran / queued / still pending) must report honestly.
-fn reload_status_message(loaded: bool, revalidated: bool, dir: &std::path::Path) -> String {
-    let status = if revalidated {
-        "workspace re-validated"
-    } else if loaded {
-        "re-validation queued behind the running scan"
-    } else {
-        "re-validation still pending (a scan is running)"
+fn reload_status_message(loaded: bool, outcome: ScanOutcome, dir: &std::path::Path) -> String {
+    let status = match outcome {
+        ScanOutcome::Ran => "workspace re-validated",
+        // The rules themselves are live either way; only the re-validation
+        // against them is outstanding, and the two wordings say whether
+        // anything is still going to land.
+        ScanOutcome::Cancelled => "re-validation cancelled",
+        ScanOutcome::Busy if loaded => "re-validation queued behind the running scan",
+        ScanOutcome::Busy => "re-validation still pending (a scan is running)",
     };
     if loaded {
         format!("Rules config reloaded; {status}.")
@@ -541,7 +544,16 @@ impl Backend {
                         // finds this name here (`graphAvailability.ts`).
                         "getGraphData".to_string(),
                     ],
-                    work_done_progress_options: Default::default(),
+                    // Tells the client it may pass a `workDoneToken` with
+                    // `workspace/executeCommand` and get phase + percentage
+                    // reports against it, plus a Cancel button that actually
+                    // stops the work (`window/workDoneProgress/cancel`). The
+                    // extension feature-detects on this before threading a
+                    // token, so against an older server it keeps its own
+                    // indeterminate indicator instead.
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(true),
+                    },
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
@@ -1047,6 +1059,12 @@ impl Backend {
         &self,
         params: ExecuteCommandParams,
     ) -> Result<Option<Value>> {
+        // A client that wants a progress bar and a Cancel button passes a
+        // `workDoneToken`; every long command below opens its stream against
+        // that token. `None` (an older extension, or an editor that doesn't
+        // bother) falls through to the server's own `loadingBar` indicator and
+        // uncancellable behaviour, exactly as before.
+        let token = params.work_done_progress_params.work_done_token.clone();
         match params.command.as_str() {
             "getFileTypes" => {
                 if let Some(uri_val) = params.arguments.first() {
@@ -1062,121 +1080,27 @@ impl Backend {
             ))),
             // Re-index the base-game install and re-write the vanilla cache,
             // even when a fresh-looking cache exists.
-            "cacheVanilla" => {
-                self.state.vanilla_merged.store(false, Ordering::SeqCst);
-                *self.state.vanilla_index.lock() = None;
-                *self.state.vanilla_loc_keys.lock() = None;
-                *self.state.vanilla_loc.lock() = None;
-                // ensure_vanilla_index turns the loading bar on but, unlike a full
-                // workspace scan, this command never reaches the code that turns
-                // it off. The guard covers both exits: the normal one below, and
-                // the client cancelling the command mid-index (#204).
-                let guard = crate::scan::ScanGuard::for_command(self);
-                self.ensure_vanilla_index(true, false).await;
-                self.merge_pending_vanilla_index();
-                self.rebuild_modifier_keys();
-                guard.finish().await;
-                Ok(Some(Value::String("Vanilla cache rebuilt.".to_string())))
-            }
+            "cacheVanilla" => self.cache_vanilla_command(token).await,
             // Purge every on-disk cache (parse cache + vanilla caches), drop the
             // in-memory vanilla state, and re-scan the workspace from scratch.
-            "clearAllCaches" => {
-                let dir = self
-                    .state
-                    .config
-                    .read()
-                    .cache_dir
-                    .clone()
-                    .or_else(default_cache_dir);
-                let (removed, failures) = match dir {
-                    Some(dir) => tokio::task::block_in_place(|| purge_caches(&dir)),
-                    None => (0, Vec::new()),
-                };
-                self.state.vanilla_merged.store(false, Ordering::SeqCst);
-                *self.state.vanilla_index.lock() = None;
-                *self.state.vanilla_loc_keys.lock() = None;
-                *self.state.vanilla_loc.lock() = None;
-                // validate_entire_workspace's CAS guard returns false when a scan
-                // (e.g. the periodic background pass) is already running. That
-                // scan started before this purge and may already be past its
-                // vanilla-index phase, so it can't be trusted to rebuild what we
-                // just dropped — retry until we win the CAS and actually
-                // re-index, bounded so a perpetually-busy server reports honestly
-                // instead of hanging forever.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-                let mut reindexed = self.validate_entire_workspace(false).await;
-                while !reindexed && std::time::Instant::now() < deadline {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    reindexed = self.validate_entire_workspace(false).await;
-                }
-                let status = if reindexed {
-                    "workspace re-indexed"
-                } else {
-                    "re-index still pending (another scan is running)"
-                };
-                let msg = if failures.is_empty() {
-                    format!("Caches cleared ({removed} files); {status}.")
-                } else {
-                    format!(
-                        "Caches cleared ({removed} files) with {} error(s); {status}. Failed: {}",
-                        failures.len(),
-                        failures.join("; ")
-                    )
-                };
-                Ok(Some(Value::String(msg)))
-            }
+            "clearAllCaches" => self.clear_all_caches_command(token).await,
             // Re-read the rules-config dir from disk, rebuild the ruleset, and
             // re-validate the whole workspace against it — no server restart.
-            "reloadrulesconfig" => {
-                let dir = self.state.config.read().rules_dir.clone();
-                match dir {
-                    Some(dir) => {
-                        let loaded = self.load_rules_config(&dir).await;
-                        // validate_entire_workspace's CAS guard returns false when
-                        // a scan is already running. The client fires this command
-                        // right after the startup scan's loading bar ends, but the
-                        // bar-off notification is sent before the guard drops, so
-                        // the reload races the tail of that scan — whose diagnostics
-                        // were produced with no rules loaded. Retry until we win the
-                        // CAS, bounded so a perpetually-busy server reports honestly
-                        // instead of spinning.
-                        // `CWTOOLS_RETRY_DEADLINE_MS` test override (like
-                        // `CWTOOLS_SCAN_HOLD_MS`): shorten the bound so a test can
-                        // prove the give-up path without waiting out 60s.
-                        let deadline = std::time::Instant::now()
-                            + std::env::var("CWTOOLS_RETRY_DEADLINE_MS")
-                                .ok()
-                                .and_then(|v| v.parse::<u64>().ok())
-                                .map_or(
-                                    std::time::Duration::from_secs(60),
-                                    std::time::Duration::from_millis,
-                                );
-                        let mut revalidated = self.validate_entire_workspace(false).await;
-                        while !revalidated && std::time::Instant::now() < deadline {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            revalidated = self.validate_entire_workspace(false).await;
-                        }
-                        // The competing scan outlived the response bound. Rules
-                        // are already live, so hand the revalidation to a bounded
-                        // background retry that lands it once the scan releases,
-                        // instead of leaving the stale no-rules diagnostics until
-                        // the next edit. A failed rules load changes nothing, so
-                        // there is nothing to defer then.
-                        if !revalidated && loaded {
-                            self.spawn_deferred_revalidation();
-                        }
-                        let msg = reload_status_message(loaded, revalidated, &dir);
-                        Ok(Some(Value::String(msg)))
-                    }
-                    None => Ok(Some(Value::String(
-                        "No rules directory configured; nothing to reload.".to_string(),
-                    ))),
-                }
-            }
+            "reloadrulesconfig" => self.reload_rules_config_command(token).await,
             // Generate localisation stubs for every missing `## required` loc key
             // and hand them back to the client to open for review (no files are
             // written server-side).
-            "genlocall" => Ok(Some(Value::Array(self.generate_missing_loc()))),
+            // Not cancellable: this is one synchronous sweep of indexes already
+            // in memory, with no seam to stop at and nothing long enough to
+            // want one.
+            "genlocall" => {
+                let progress =
+                    CommandProgress::begin(self, token, "CWTools: Generate missing loc", false)
+                        .await;
+                let stubs = self.generate_missing_loc();
+                progress.finish(None).await;
+                Ok(Some(Value::Array(stubs)))
+            }
             // Apply every currently-fixable diagnostic across the workspace in
             // one `workspace/applyEdit`, mirroring `cwtools fix --apply`. See
             // `code_action::fix_all_workspace_impl`.
@@ -1216,6 +1140,8 @@ impl Backend {
                 };
                 Ok(Some(Value::String(msg)))
             }
+            // User-triggered re-index (no cache purge, unlike clearAllCaches).
+            "reindexWorkspace" => self.reindex_workspace_command(token).await,
             // `getGraphData(entityType, depth)` — the entity graph the webview
             // renders. See `graph.rs` for the wire format and the bounds.
             "getGraphData" => self.get_graph_data(&params.arguments).await,
@@ -1225,6 +1151,211 @@ impl Backend {
                 "unknown command: {other}"
             ))),
         }
+    }
+
+    /// `cacheVanilla`: re-index the base-game install and re-write the vanilla
+    /// cache, even when a fresh-looking cache exists.
+    ///
+    /// The in-memory base-game state is dropped only once the rebuild is
+    /// actually about to start, so a cancel that lands before then leaves the
+    /// server exactly as it found it.
+    ///
+    /// The bar is not cancellable: the rebuild is a single engine call over the
+    /// whole base game with no per-file seam to poll at, so once it is under
+    /// way there is nothing a Cancel button could do.
+    async fn cache_vanilla_command(&self, token: Option<ProgressToken>) -> Result<Option<Value>> {
+        let progress =
+            CommandProgress::begin(self, token, "CWTools: Rebuild base-game cache", false).await;
+        if progress.is_cancelled() {
+            let msg = "Cancelled before the rebuild started.".to_string();
+            progress.finish(Some(msg.clone())).await;
+            return Ok(Some(Value::String(msg)));
+        }
+        progress.report_phase(Phase::Vanilla).await;
+        self.state.vanilla_merged.store(false, Ordering::SeqCst);
+        *self.state.vanilla_index.lock() = None;
+        *self.state.vanilla_loc_keys.lock() = None;
+        *self.state.vanilla_loc.lock() = None;
+        // ensure_vanilla_index turns the loading bar on but, unlike a full
+        // workspace scan, this command never reaches the code that turns
+        // it off. The guard covers both exits: the normal one below, and
+        // the client cancelling the command mid-index (#204).
+        let guard = crate::scan::ScanGuard::for_command(self);
+        self.ensure_vanilla_index(true, false).await;
+        self.merge_pending_vanilla_index();
+        self.rebuild_modifier_keys();
+        guard.finish().await;
+        // The base-game index is one opaque engine call with no per-file seam,
+        // so a cancel raised during it is only observable now — and by now the
+        // rebuild it would have stopped has already finished. Report what
+        // actually happened rather than the cancel the user asked for.
+        let msg = "Vanilla cache rebuilt.".to_string();
+        progress.finish(Some(msg.clone())).await;
+        Ok(Some(Value::String(msg)))
+    }
+
+    /// `clearAllCaches`: purge every on-disk cache, drop the in-memory
+    /// base-game state, and re-scan the workspace from scratch.
+    async fn clear_all_caches_command(
+        &self,
+        token: Option<ProgressToken>,
+    ) -> Result<Option<Value>> {
+        let progress =
+            CommandProgress::begin(self, token, "CWTools: Clear all caches and reindex", true)
+                .await;
+        if progress.is_cancelled() {
+            let msg = "Cancelled; no caches were cleared.".to_string();
+            progress.finish(Some(msg.clone())).await;
+            return Ok(Some(Value::String(msg)));
+        }
+        progress.report_phase(Phase::Discover).await;
+        let dir = self
+            .state
+            .config
+            .read()
+            .cache_dir
+            .clone()
+            .or_else(default_cache_dir);
+        let (removed, failures) = match dir {
+            Some(dir) => tokio::task::block_in_place(|| purge_caches(&dir)),
+            None => (0, Vec::new()),
+        };
+        // Dropped here rather than before the purge: from this line until the
+        // re-index rebuilds it the server resolves no base-game reference, so
+        // the window a cancel could strand it in is as narrow as it can be.
+        self.state.vanilla_merged.store(false, Ordering::SeqCst);
+        *self.state.vanilla_index.lock() = None;
+        *self.state.vanilla_loc_keys.lock() = None;
+        *self.state.vanilla_loc.lock() = None;
+        // A `Busy` scan (e.g. the periodic background pass) started before this
+        // purge and may already be past its vanilla-index phase, so it can't be
+        // trusted to rebuild what we just dropped — retry until we win the CAS
+        // and actually re-index, bounded so a perpetually-busy server reports
+        // honestly instead of hanging forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut outcome = self
+            .validate_entire_workspace_tracked(false, Some(&progress))
+            .await;
+        while outcome == ScanOutcome::Busy && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Cancel has to break the retry too: this loop can spin for three
+            // minutes, and a user watching a progress bar that long is exactly
+            // the one reaching for the button.
+            if progress.is_cancelled() {
+                outcome = ScanOutcome::Cancelled;
+                break;
+            }
+            outcome = self
+                .validate_entire_workspace_tracked(false, Some(&progress))
+                .await;
+        }
+        let status = match outcome {
+            ScanOutcome::Ran => "workspace re-indexed",
+            ScanOutcome::Busy => "re-index still pending (another scan is running)",
+            ScanOutcome::Cancelled => {
+                // The purge already happened and the in-memory base-game index
+                // is gone with it, so stopping here would serve "not found" for
+                // every vanilla reference until the next background pass. Hand
+                // the rebuild to the same bounded background retry
+                // `reloadrulesconfig` uses: cancelling should cost the user
+                // their wait, not their diagnostics.
+                self.spawn_deferred_revalidation("clearAllCaches");
+                "re-index cancelled, rebuilding in the background"
+            }
+        };
+        let msg = if failures.is_empty() {
+            format!("Caches cleared ({removed} files); {status}.")
+        } else {
+            format!(
+                "Caches cleared ({removed} files) with {} error(s); {status}. Failed: {}",
+                failures.len(),
+                failures.join("; ")
+            )
+        };
+        progress.finish(Some(msg.clone())).await;
+        Ok(Some(Value::String(msg)))
+    }
+
+    /// `reloadrulesconfig`: re-read the rules-config dir from disk, rebuild the
+    /// ruleset, and re-validate the whole workspace against it.
+    async fn reload_rules_config_command(
+        &self,
+        token: Option<ProgressToken>,
+    ) -> Result<Option<Value>> {
+        let dir = self.state.config.read().rules_dir.clone();
+        let Some(dir) = dir else {
+            return Ok(Some(Value::String(
+                "No rules directory configured; nothing to reload.".to_string(),
+            )));
+        };
+        let progress =
+            CommandProgress::begin(self, token, "CWTools: Reload config rules", true).await;
+        let loaded = self.load_rules_config(&dir).await;
+        // The client fires this command right after the startup scan's loading
+        // bar ends, but the bar-off notification is sent before the guard
+        // drops, so the reload races the tail of that scan — whose diagnostics
+        // were produced with no rules loaded. Retry until we win the CAS,
+        // bounded so a perpetually-busy server reports honestly rather than
+        // spinning.
+        // `CWTOOLS_RETRY_DEADLINE_MS` test override (like `CWTOOLS_SCAN_HOLD_MS`):
+        // shorten the bound so a test can prove the give-up path without
+        // waiting out 60s.
+        let deadline = std::time::Instant::now()
+            + std::env::var("CWTOOLS_RETRY_DEADLINE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_millis,
+                );
+        let mut outcome = self
+            .validate_entire_workspace_tracked(false, Some(&progress))
+            .await;
+        while outcome == ScanOutcome::Busy && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if progress.is_cancelled() {
+                outcome = ScanOutcome::Cancelled;
+                break;
+            }
+            outcome = self
+                .validate_entire_workspace_tracked(false, Some(&progress))
+                .await;
+        }
+        // The competing scan outlived the response bound. Rules are already
+        // live, so hand the revalidation to a bounded background retry that
+        // lands it once the scan releases, instead of leaving the stale
+        // no-rules diagnostics until the next edit. A failed rules load changes
+        // nothing, so there is nothing to defer then — and a cancel is the user
+        // saying stop, which a background retry would ignore.
+        if outcome == ScanOutcome::Busy && loaded {
+            self.spawn_deferred_revalidation("reloadrulesconfig");
+        }
+        let msg = reload_status_message(loaded, outcome, &dir);
+        progress.finish(Some(msg.clone())).await;
+        Ok(Some(Value::String(msg)))
+    }
+
+    /// `reindexWorkspace`: user-triggered re-index, no cache purge.
+    async fn reindex_workspace_command(
+        &self,
+        token: Option<ProgressToken>,
+    ) -> Result<Option<Value>> {
+        let progress =
+            CommandProgress::begin(self, token, "CWTools: Re-index workspace", true).await;
+        // `Busy` is surfaced rather than retried: unlike `clearAllCaches` this
+        // command destroyed nothing, so the scan already running produces the
+        // same result the user asked for.
+        let msg = match self
+            .validate_entire_workspace_tracked(false, Some(&progress))
+            .await
+        {
+            ScanOutcome::Ran => "Workspace re-indexed.",
+            ScanOutcome::Busy => "Re-index already in progress.",
+            ScanOutcome::Cancelled => "Re-index cancelled.",
+        }
+        .to_string();
+        progress.finish(Some(msg.clone())).await;
+        Ok(Some(Value::String(msg)))
     }
 
     /// Aggregate every `## required` localisation key that no loc file provides
@@ -1438,20 +1569,30 @@ mod tests {
         // the contract and each combination must stay honest.
         let dir = std::path::Path::new("my/rules/dir");
         assert_eq!(
-            reload_status_message(true, true, dir),
+            reload_status_message(true, ScanOutcome::Ran, dir),
             "Rules config reloaded; workspace re-validated."
         );
         assert_eq!(
-            reload_status_message(true, false, dir),
+            reload_status_message(true, ScanOutcome::Busy, dir),
             "Rules config reloaded; re-validation queued behind the running scan."
         );
         assert_eq!(
-            reload_status_message(false, true, dir),
+            reload_status_message(false, ScanOutcome::Ran, dir),
             "No rules loaded from my/rules/dir; workspace re-validated."
         );
         assert_eq!(
-            reload_status_message(false, false, dir),
+            reload_status_message(false, ScanOutcome::Busy, dir),
             "No rules loaded from my/rules/dir; re-validation still pending (a scan is running)."
+        );
+        // Cancelled reads the same either way: the rules load already happened
+        // or already failed, and neither leaves a re-validation coming.
+        assert_eq!(
+            reload_status_message(true, ScanOutcome::Cancelled, dir),
+            "Rules config reloaded; re-validation cancelled."
+        );
+        assert_eq!(
+            reload_status_message(false, ScanOutcome::Cancelled, dir),
+            "No rules loaded from my/rules/dir; re-validation cancelled."
         );
     }
 
