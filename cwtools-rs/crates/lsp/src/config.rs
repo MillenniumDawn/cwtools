@@ -1104,17 +1104,18 @@ impl Backend {
             // Apply every currently-fixable diagnostic across the workspace in
             // one `workspace/applyEdit`, mirroring `cwtools fix --apply`. See
             // `code_action::fix_all_workspace_impl`.
-            // Not cancellable either: it works from an already-computed edit
-            // snapshot and lands as a single `workspace/applyEdit`, so there is
-            // no half-way point that stopping could leave the workspace in.
-            "fixAllWorkspace" => {
-                let progress =
-                    CommandProgress::begin(self, token, "CWTools: Fix all in workspace", false)
-                        .await;
-                let msg = self.fix_all_workspace_impl().await;
-                progress.finish(Some(msg.clone())).await;
-                Ok(Some(Value::String(msg)))
-            }
+            "fixAllWorkspace" => Ok(Some(Value::String(self.fix_all_workspace_impl().await))),
+            // User-triggered re-index (no cache purge, unlike clearAllCaches).
+            // validate_entire_workspace's CAS guard returns false when a scan
+            // (the startup scan's tail, another reindex, the periodic background
+            // pass) is already running. The same race the startup scan's closing
+            // `loadingBar(false)` notification creates for `reloadrulesconfig`
+            // hits this command too: the bar-off goes out before the guard drops
+            // (`ScanGuard::finish`), so a reindex sent right after the bar-off
+            // can land in the gap, lose the CAS, and answer immediately without
+            // ever sending `loadingBar(true)`. Retry until we win the CAS so the
+            // user's reindex actually runs, bounded so a perpetually-busy
+            // server reports honestly instead of spinning.
             // User-triggered re-index (no cache purge, unlike clearAllCaches).
             "reindexWorkspace" => self.reindex_workspace_command(token).await,
             // `getGraphData(entityType, depth)` — the entity graph the webview
@@ -1317,13 +1318,31 @@ impl Backend {
     ) -> Result<Option<Value>> {
         let progress =
             CommandProgress::begin(self, token, "CWTools: Re-index workspace", true).await;
-        // `Busy` is surfaced rather than retried: unlike `clearAllCaches` this
-        // command destroyed nothing, so the scan already running produces the
-        // same result the user asked for.
-        let msg = match self
+        // `Busy` is surfaced unless we win the CAS within the give-up window:
+        // unlike `clearAllCaches`, this command changes no state that must stay
+        // coherent, so once the current scan runs the user can retry.
+        let deadline = std::time::Instant::now()
+            + std::env::var("CWTOOLS_RETRY_DEADLINE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_millis,
+                );
+        let mut outcome = self
             .validate_entire_workspace_tracked(false, Some(&progress))
-            .await
-        {
+            .await;
+        while outcome == ScanOutcome::Busy && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if progress.is_cancelled() {
+                outcome = ScanOutcome::Cancelled;
+                break;
+            }
+            outcome = self
+                .validate_entire_workspace_tracked(false, Some(&progress))
+                .await;
+        }
+        let msg = match outcome {
             ScanOutcome::Ran => "Workspace re-indexed.",
             ScanOutcome::Busy => "Re-index already in progress.",
             ScanOutcome::Cancelled => "Re-index cancelled.",
