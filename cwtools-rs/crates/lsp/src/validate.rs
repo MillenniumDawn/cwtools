@@ -113,7 +113,7 @@ fn loc_change_candidate_names(
     for td in &rs.types {
         let subtype_locs = td.subtypes.iter().flat_map(|st| st.localisation.iter());
         for loc in td.localisation.iter().chain(subtype_locs) {
-            if !loc.required || loc.optional || loc.explicit_field.is_some() {
+            if !loc.is_required_name_derived() {
                 continue;
             }
             if loc.prefix.is_empty() && loc.suffix.is_empty() {

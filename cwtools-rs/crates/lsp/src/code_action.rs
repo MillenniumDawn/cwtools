@@ -345,8 +345,8 @@ fn sibling_loc_keys(
     create_loc_key: &str,
 ) -> Vec<String> {
     defs.iter()
-        .filter(|loc| loc.required && !loc.optional && loc.explicit_field.is_none())
-        .map(|loc| format!("{}{}{}", loc.prefix, instance_name, loc.suffix))
+        .filter(|loc| loc.is_required_name_derived())
+        .map(|loc| loc.derived_key(instance_name))
         .filter(|k| k != create_loc_key)
         .collect()
 }
@@ -916,10 +916,7 @@ impl Backend {
                 }
                 let td = ruleset.types.iter().find(|td| td.name == type_name)?;
                 let owns_key = td.localisation.iter().any(|loc| {
-                    loc.required
-                        && !loc.optional
-                        && loc.explicit_field.is_none()
-                        && format!("{}{}{}", loc.prefix, inst.name, loc.suffix) == create_loc_key
+                    loc.is_required_name_derived() && loc.derived_key(&inst.name) == create_loc_key
                 });
                 owns_key.then(|| sibling_loc_keys(&td.localisation, &inst.name, create_loc_key))
             })
