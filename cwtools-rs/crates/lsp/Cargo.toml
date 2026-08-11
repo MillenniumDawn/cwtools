@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "cwtools-server"
@@ -31,5 +35,5 @@ rayon = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = "2"
-tempfile = "3"
+assert_cmd = { workspace = true }
+tempfile = { workspace = true }

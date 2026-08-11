@@ -89,6 +89,7 @@
 
 ## Developer
 
+- Workspace manifests inherit clippy/rustc deny-warnings via `[workspace.lints]`, every crate sets `repository.workspace = true`, and `tempfile`/`assert_cmd`/`predicates` live under `[workspace.dependencies]`. Release.yml documents why Windows skips the post-build `strip` pass (cargo's `[profile.release] strip = true` already covers it). (#157)
 - `index_parsed_file`, `merged_rules_for_type`, `semantic_tokens_full_impl`, `TypeIndex::merge` and `vanilla_cache::load` carry tracing spans, so `CWTOOLS_PROFILE` ranks them against the paths that were already instrumented. PROFILING.md lists the full set. (#87)
 - Every write to a localisation overlay goes through a guard whose `Drop` bumps the revision the derived key-set caches are keyed on, so a new write site cannot leave those caches serving a key set that predates it. (#87)
 - `cargo bench -p cwtools_driver --bench rules_hot` measures the editor hot paths (`rules_at_pos` for completion and hover, `value_rules_for_key` per leaf) against a real ruleset. It needs a `cwtools-hoi4-config/Config` checkout, found via `CWTOOLS_RULES` or `CWTOOLS_PROJECTS` the way the corpus guard finds its inputs, and reports why it measured nothing when there isn't one. (#84)
