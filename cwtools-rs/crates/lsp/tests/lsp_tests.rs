@@ -11349,6 +11349,166 @@ fn test_published_diagnostic_range_stays_on_its_own_line() {
     assert_eq!(range["end"]["character"], 7, "range: {range}");
 }
 
+/// The workspace scan and the didOpen re-validate both publish for a file
+/// opened mid-scan, and the range test above depends on which frame it picks.
+/// This pins both shapes deterministically: e.txt is left unopened until the
+/// scan has already published it, so the scan's frame is guaranteed to arrive
+/// first. The scan holds no document text, so its CW223 is a single-char span
+/// at the raw parser column and the frame carries no `version`; the didOpen
+/// re-validate then republishes the precise columns with the document version
+/// tagged on the frame. The version-less scan frame is what the range test's
+/// filter skips (#179).
+#[test]
+fn test_scan_publish_falls_back_and_did_open_republishes_precise_range() {
+    let ws = tempfile::tempdir().unwrap();
+    let rel = "common/scripted_effects/e.txt";
+    let text = "my_effect = {\n    NOT = { a = 1 b = 2 }\n    x = yes\n}\n";
+    let p = ws.path().join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, text).unwrap();
+
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        rules_dir.path().join("types.cwt"),
+        "types = {\n    type[scripted_effect] = {\n        path = \"game/common/scripted_effects\"\n    }\n}\n",
+    )
+    .unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let body = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": path_uri(ws.path()),
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+            },
+        }),
+    );
+    write_frame(&mut child, &body).unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    let stdin = child.stdin.take().unwrap();
+    let found = run_with_deadline(stdin, reader, 60, move |stdin, reader| {
+        // Phase 1: the scan's publish. e.txt is on disk and not open yet, so
+        // the scan validates it with no document text and publishes the
+        // version-less fallback range.
+        let (scan_version, scan_range) = loop {
+            let Ok(raw) = read_frame(reader) else {
+                return None;
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("e.txt"))
+                && let Some(d) = v["params"]["diagnostics"]
+                    .as_array()
+                    .and_then(|ds| ds.iter().find(|d| d["code"] == "CW223"))
+            {
+                break (v["params"]["version"].clone(), d["range"].clone());
+            }
+        };
+
+        // Phase 2: open the doc, then wait for the open-doc re-validate's
+        // publish. The scan's version-less frame is already in the pipe, so
+        // skipping it is exactly what the range test's filter must do; the
+        // first version-tagged CW223 is always the precise range.
+        let doc_uri = path_uri(&p);
+        let body = jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri, "languageId": "hoi4", "version": 1, "text": text }
+            }),
+        );
+        write_frame_to(stdin, &body).ok()?;
+        loop {
+            let Ok(raw) = read_frame(reader) else {
+                return None;
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            if v["method"] != "textDocument/publishDiagnostics"
+                || !v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("e.txt"))
+                || v["params"]["version"].as_i64().is_none()
+            {
+                continue;
+            }
+            if let Some(d) = v["params"]["diagnostics"]
+                .as_array()
+                .and_then(|ds| ds.iter().find(|d| d["code"] == "CW223"))
+            {
+                return Some((
+                    scan_version,
+                    scan_range,
+                    v["params"]["version"].clone(),
+                    d["range"].clone(),
+                ));
+            }
+        }
+    });
+    child.kill().ok();
+
+    let (scan_version, scan_range, open_version, open_range) = found
+        .flatten()
+        .expect("the scan's CW223 frame or the open-doc republish never arrived");
+    // The scan's fallback: no version tag, single-char span at the raw column.
+    assert!(
+        scan_version.is_null(),
+        "the scan's publish must carry no version: {scan_version}"
+    );
+    assert_eq!(scan_range["start"]["line"], 1, "range: {scan_range}");
+    assert_eq!(scan_range["start"]["character"], 4, "range: {scan_range}");
+    assert_eq!(
+        scan_range["end"]["line"], 1,
+        "must not spill onto a later line: {scan_range}"
+    );
+    assert_eq!(
+        scan_range["end"]["character"],
+        scan_range["start"]["character"].as_i64().unwrap() + 1,
+        "no document text means a one-character squiggle: {scan_range}"
+    );
+    // The open-doc re-validate: version-tagged, precise columns.
+    assert_eq!(
+        open_version.as_i64(),
+        Some(1),
+        "the open-doc publish must carry the document version: {open_version}"
+    );
+    assert_eq!(open_range["start"]["line"], 1, "range: {open_range}");
+    assert_eq!(open_range["start"]["character"], 4, "range: {open_range}");
+    assert_eq!(
+        open_range["end"]["line"], 1,
+        "must not spill onto a later line: {open_range}"
+    );
+    assert_eq!(open_range["end"]["character"], 7, "range: {open_range}");
+}
+
 /// A `.cwt` that parsed badly and then parses cleanly has to have its squiggle
 /// taken back. Only files *with* errors are published, so without an explicit
 /// clear the stale diagnostic sits in the Problems panel forever.
