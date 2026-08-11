@@ -981,7 +981,7 @@ impl Backend {
                 .await;
             for uri in &removed_uris {
                 if let Ok(uri_obj) = Url::parse(uri) {
-                    self.client.publish_diagnostics(uri_obj, vec![], None).await;
+                    self.publish_filtered(uri_obj, vec![], None, None).await;
                 }
             }
         }
@@ -2222,7 +2222,9 @@ impl Backend {
     /// Apply a coalesced batch of DELETE events off the message future: forget
     /// each URI from the info service (one write scope), both loc overlays, and
     /// the watched-signature record, bump the info revision once for the whole
-    /// batch, then publish empty diagnostics per URI outside every lock.
+    /// batch, then publish empty diagnostics per URI outside every lock. The
+    /// empty publish goes through `publish_filtered` so the deleted file's
+    /// `fixAllWorkspace` entry is dropped with its diagnostics (#133).
     async fn process_watched_deletes(&self, deletes: &[String]) {
         {
             let mut info = self.state.info_service.write();
@@ -2271,7 +2273,7 @@ impl Backend {
         self.bump_info_revision();
         for uri in deletes {
             if let Ok(uri_obj) = Url::parse(uri) {
-                self.client.publish_diagnostics(uri_obj, vec![], None).await;
+                self.publish_filtered(uri_obj, vec![], None, None).await;
             }
         }
     }
