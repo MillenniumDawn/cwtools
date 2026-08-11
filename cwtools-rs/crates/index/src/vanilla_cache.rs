@@ -14,8 +14,8 @@
 //! NOT cached: the only consumer is the scope-aware command check on vanilla's
 //! own content, which we never validate.
 
-// zstd level for the cache body — shared with the `.cwb` parse cache.
-use cwtools_cache::io::ZSTD_LEVEL;
+// zstd level and the bounded read/decode used by the `.cwb` parse cache too.
+use cwtools_cache::io::{ZSTD_LEVEL, decode_capped, read_capped};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -69,6 +69,15 @@ const FILE_EXT: &str = ".cwv";
 // live vanilla scan instead of falling back to a name-derived key. v10 caches
 // lack it and restore it as `None` (#141).
 const CACHE_VERSION: u8 = 11;
+
+/// Hard caps on a `.cwv` read and on what its body may decompress to. The path
+/// comes from `--vanilla-cache` or an LSP client's `vanillaCache` (#162), so a
+/// few kilobytes of `CWV`-prefixed zstd must not be able to expand until the
+/// process dies. A cache of a full HOI4 install is 20 MiB compressed / 81 MiB
+/// decoded, so these leave several times that; going over reads as a miss and
+/// the install is re-indexed.
+const MAX_CACHE_FILE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CACHE_DECODED_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct CachedInstance {
@@ -401,8 +410,7 @@ pub fn save_per_type(
 /// fresh. Old JSON caches (pre-v4) fail the magic check and read as a miss.
 #[tracing::instrument(skip_all, fields(path = %path.display()))]
 pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> {
-    let mut data = Vec::new();
-    std::fs::File::open(path)?.read_to_end(&mut data)?;
+    let data = read_capped(path, MAX_CACHE_FILE_BYTES)?;
     if data.len() < MAGIC.len() + 1 || &data[..MAGIC.len()] != MAGIC {
         return Err(std::io::Error::other(
             "not a vanilla cache file (old JSON format or wrong file); rebuild with cache-vanilla",
@@ -415,7 +423,12 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
             CACHE_VERSION
         )));
     }
-    let bytes = zstd::decode_all(&data[MAGIC.len() + 1..])?;
+    let mut bytes = Vec::new();
+    decode_capped(
+        &data[MAGIC.len() + 1..],
+        MAX_CACHE_DECODED_BYTES,
+        &mut bytes,
+    )?;
     let cache: VanillaCacheFile = rkyv::from_bytes::<VanillaCacheFile, rkyv::rancor::Error>(&bytes)
         .map_err(std::io::Error::other)?;
     let mut per_type: HashMap<String, Vec<(Arc<str>, TypeInstance)>> = HashMap::new();
@@ -657,6 +670,57 @@ mod tests {
         let err = load(&path).unwrap_err();
         assert!(err.to_string().contains("not a vanilla cache file"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn oversized_cache_is_refused_without_reading_it() {
+        // The path comes from `--vanilla-cache` or an LSP client's
+        // `vanillaCache` (#162), so an over-cap file has to read as a miss
+        // rather than as an unbounded read. Sparse, so the test costs no disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(cache_file_name("hoi4", "huge"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(MAGIC).unwrap();
+        file.write_all(&[CACHE_VERSION]).unwrap();
+        file.set_len(MAX_CACHE_FILE_BYTES + 1).unwrap();
+        drop(file);
+
+        let err = load(&path).unwrap_err();
+        assert!(err.to_string().contains("cache read cap"), "{err}");
+    }
+
+    #[test]
+    fn cache_declaring_an_over_cap_body_is_refused() {
+        // Proves `load` hands `decode_capped` its own cap rather than letting
+        // anything through. zstd will not close a frame that lies about its
+        // size, so the body is the prefix the encoder already emitted: enough
+        // for the header check, and a truncated-frame error if the cap were not
+        // applied.
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), ZSTD_LEVEL).unwrap();
+        encoder
+            .set_pledged_src_size(Some(MAX_CACHE_DECODED_BYTES + 1))
+            .unwrap();
+        encoder.write_all(b"nowhere near that many bytes").unwrap();
+        encoder.flush().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(cache_file_name("hoi4", "bomb"));
+        let mut body = MAGIC.to_vec();
+        body.push(CACHE_VERSION);
+        body.extend_from_slice(encoder.get_ref());
+        std::fs::write(&path, &body).unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(err.to_string().contains("decompresses past"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn character_device_is_refused() {
+        // `/dev/zero` reports length 0, so a size check alone waves it through
+        // and then reads to EOF.
+        let err = load(Path::new("/dev/zero")).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     #[test]

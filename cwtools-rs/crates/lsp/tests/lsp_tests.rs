@@ -11853,6 +11853,75 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
     );
 }
 
+// ── #162: the cache path the client names ────────────────────────────────────
+
+/// `initializationOptions.vanillaCache` is a client-chosen path read inside
+/// `initialize` itself. Pointed at a character device it read to EOF there, so
+/// the handshake never came back and the window sat dead with no diagnostics.
+/// The server must refuse the input and finish the handshake, then still be
+/// answering afterwards rather than wedged behind the same read.
+#[cfg(unix)]
+#[test]
+fn a_vanilla_cache_naming_a_character_device_does_not_stall_initialize() {
+    let ws = tempfile::tempdir().unwrap();
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let reader = BufReader::new(child.stdout.take().unwrap());
+    let stdin = child.stdin.take().unwrap();
+    let ws_uri = path_uri(ws.path());
+    let script = ws.path().join("probe.txt");
+    std::fs::write(&script, "a = { b = 1 }\n").unwrap();
+    let script_uri = path_uri(&script);
+
+    let answered = run_with_deadline(stdin, reader, 30, move |stdin, reader| {
+        let init = jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "vanillaCache": "/dev/zero",
+                }
+            }),
+        );
+        write_frame_to(stdin, &init).ok()?;
+        read_response(reader).ok()?;
+        write_frame_to(
+            stdin,
+            &jsonrpc_notification("initialized", serde_json::json!({})),
+        )
+        .ok()?;
+        write_frame_to(
+            stdin,
+            &jsonrpc_request(
+                2,
+                "textDocument/foldingRange",
+                serde_json::json!({ "textDocument": { "uri": script_uri } }),
+            ),
+        )
+        .ok()?;
+        serde_json::from_str::<serde_json::Value>(&read_response(reader).ok()?).ok()
+    });
+    child.kill().ok();
+    // Reap it: a server that blew its deadline is still reading the device.
+    child.wait().ok();
+
+    let response = answered
+        .flatten()
+        .expect("initialize never came back with vanillaCache = /dev/zero");
+    assert!(
+        response.get("error").is_none(),
+        "the server stopped answering after refusing the cache: {response}"
+    );
+}
+
 // ── #163: the URI access boundary ────────────────────────────────────────────
 // `textDocument/foldingRange` is the cleanest probe: it needs nothing but the
 // file's text, so its answer is a direct read-out of whether the server was
