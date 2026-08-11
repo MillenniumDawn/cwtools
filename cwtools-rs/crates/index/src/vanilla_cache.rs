@@ -689,6 +689,31 @@ mod tests {
         assert!(err.to_string().contains("cache read cap"), "{err}");
     }
 
+    #[test]
+    fn cache_declaring_an_over_cap_body_is_refused() {
+        // Proves `load` hands `decode_capped` its own cap rather than letting
+        // anything through. zstd will not close a frame that lies about its
+        // size, so the body is the prefix the encoder already emitted: enough
+        // for the header check, and a truncated-frame error if the cap were not
+        // applied.
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), ZSTD_LEVEL).unwrap();
+        encoder
+            .set_pledged_src_size(Some(MAX_CACHE_DECODED_BYTES + 1))
+            .unwrap();
+        encoder.write_all(b"nowhere near that many bytes").unwrap();
+        encoder.flush().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(cache_file_name("hoi4", "bomb"));
+        let mut body = MAGIC.to_vec();
+        body.push(CACHE_VERSION);
+        body.extend_from_slice(encoder.get_ref());
+        std::fs::write(&path, &body).unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(err.to_string().contains("decompresses past"), "{err}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn character_device_is_refused() {

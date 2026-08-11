@@ -99,7 +99,7 @@ pub fn read_capped(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
 /// The frame's declared content size gets a look first, so an honestly-labelled
 /// oversized body is rejected before any work. That field is optional and comes
 /// from whoever wrote the file, though, so it only ever short-circuits: the
-/// bound that holds is [`CappedWriter`], which errors on the first chunk that
+/// bound that holds is the write side, which errors on the first chunk that
 /// would cross the cap, before `out` grows to hold it.
 pub fn decode_capped<W: Write>(compressed: &[u8], max_bytes: u64, out: W) -> std::io::Result<()> {
     if let Ok(Some(declared)) = zstd::zstd_safe::get_frame_content_size(compressed)
