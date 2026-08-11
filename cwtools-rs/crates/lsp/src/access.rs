@@ -8,16 +8,29 @@
 //! *label* a path (logical paths, loc-dir tests, graph node ids); reads go
 //! through [`read_authorized_text`] and nothing else.
 //!
-//! A URI is authorized when it is a `file:` URI, resolves to a regular file, and
-//! canonicalizes inside one of the roots the server was configured with (the
-//! workspace folders, the base-game install, the rules dir). Anything else is
-//! refused quietly: requests answer `None`, notifications no-op, no index moves.
+//! A URI is authorized when it is a `file:` URI, names a regular file that is
+//! not a symlink, and canonicalizes inside one of the roots the server was
+//! configured with (the workspace folders, the base-game install, the rules
+//! dir). Anything else is refused quietly: requests answer `None`,
+//! notifications no-op, no index moves.
 //!
-//! Containment is canonical, so a workspace subtree reached through a directory
-//! symlink canonicalizes outside the roots and is refused here even though the
-//! workspace scan (which follows symlinked directories) indexes it. That
-//! disagreement is deliberate for now; issue #161 owns the symlink policy and
-//! is where the two sides get reconciled.
+//! The symlink half is the discovery walks' rule (#161), applied to reads so
+//! the two agree: nothing a scan refuses to index can be pulled in later by a
+//! URI naming it. Without that, a `didChangeWatchedFiles` event on a symlinked
+//! file read, parsed, indexed and published diagnostics for a file the scan had
+//! deliberately skipped. Two consequences are deliberate rather than overlooked:
+//!
+//! - A symlinked *ancestor* directory still resolves. Containment refuses one
+//!   pointing out of a root; one resolving back inside lands on the real file
+//!   the scan already indexed under its canonical path. Catching those needs a
+//!   per-component `lstat` on every read (hundreds per rename) for a case that
+//!   reaches the right bytes anyway.
+//! - Open buffers are admitted on containment alone
+//!   ([`workspace_document_path`]), so a symlinked file can still be edited with
+//!   live diagnostics. Its exports enter the index when the buffer opens and
+//!   leave when it closes, because this boundary then refuses the disk read.
+//!   Not-indexed is the resting state #161 chose; the flip is the price of
+//!   editing such a file at all.
 //!
 //! Edits get their own, stricter boundary in [`editable_path`]: a generated
 //! `WorkspaceEdit` may only name a path inside a *workspace* root, and may not
@@ -64,8 +77,8 @@ impl Backend {
     }
 }
 
-/// The canonical path `uri` names, when it is a `file:` URI naming a regular
-/// file inside `roots`. `roots` must already be canonical
+/// The canonical path `uri` names, when it is a `file:` URI naming a regular,
+/// non-symlink file inside `roots`. `roots` must already be canonical
 /// ([`crate::Config::refresh_roots`] keeps them that way) — both
 /// sides of the containment test have to come from `canonicalize` or the
 /// Windows verbatim `\\?\` prefix stops them ever matching.
@@ -74,23 +87,28 @@ pub(crate) fn authorized_path(uri: &str, roots: &[PathBuf]) -> Option<PathBuf> {
         tracing::debug!(%uri, "access: not a usable file URI");
         return None;
     };
-    let path = canonicalize_for_containment(&path)?;
-    if !roots.iter().any(|root| path.starts_with(root)) {
-        tracing::debug!(path = %path.display(), "access: outside every authorized root");
+    let canonical = canonicalize_for_containment(&path)?;
+    if !roots.iter().any(|root| canonical.starts_with(root)) {
+        tracing::debug!(path = %canonical.display(), "access: outside every authorized root");
         return None;
     }
     // Only when it exists: a path that has just been deleted is authorized but
-    // absent, which `did_close` has to tell apart from refused. `is_file` is
-    // regular-files-only, and that is what actually refuses `/dev/zero` — a
-    // character device reports length 0, so a size check alone would wave it
-    // through.
-    if let Ok(meta) = path.metadata()
-        && !meta.is_file()
-    {
-        tracing::debug!(path = %path.display(), "access: not a regular file");
-        return None;
+    // absent, which `did_close` has to tell apart from refused. Taken on the
+    // unresolved path so the leaf's own type is what gets tested. `is_file` is
+    // false both for a symlink (the discovery walks' rule, #177) and for
+    // `/dev/zero`, whose length-0 report a size check alone would wave through;
+    // the explicit symlink branch is only there to name the cause in the log.
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            tracing::debug!(path = %path.display(), "access: symlink");
+            return None;
+        }
+        if !meta.is_file() {
+            tracing::debug!(path = %path.display(), "access: not a regular file");
+            return None;
+        }
     }
-    Some(path)
+    Some(canonical)
 }
 
 /// Resolve a client-owned document URI inside a configured workspace folder.
@@ -451,6 +469,9 @@ mod tests {
         assert_eq!(authorized_path(&uri(&file), &roots([&root])), None);
     }
 
+    /// Containment alone already refuses this one; the pin is that both sides
+    /// of the #177 stance agree on it, since the discovery walks skip the link
+    /// too.
     #[cfg(unix)]
     #[test]
     fn rejects_a_symlink_pointing_out_of_the_root() {
@@ -461,6 +482,25 @@ mod tests {
         let link = root.path().join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert_eq!(authorized_path(&uri(&link), &roots([root.path()])), None);
+    }
+
+    /// The half containment can't reach: the link resolves back inside the root,
+    /// so only the leaf's own type refuses it. The discovery walks never index
+    /// this file, so a URI naming it must not read it either (#177).
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlink_that_resolves_inside_the_root() {
+        let root = tempfile::TempDir::new().expect("tmpdir");
+        let target = root.path().join("real.txt");
+        std::fs::write(&target, "foo = { }\n").unwrap();
+        let link = root.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let roots = roots([root.path()]);
+        assert!(
+            authorized_path(&uri(&target), &roots).is_some(),
+            "the real file behind the link stays readable"
+        );
+        assert_eq!(authorized_path(&uri(&link), &roots), None);
     }
 
     #[cfg(unix)]

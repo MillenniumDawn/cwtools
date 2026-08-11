@@ -3667,6 +3667,107 @@ fn test_edit_toggling_reference_updates_open_cw239() {
     );
 }
 
+#[test]
+fn test_closing_a_buffer_with_discarded_edits_restores_disk_uses() {
+    // Close b.txt with unsaved edits that dropped its reference to used_thing.
+    // Disk still has the reference, and did_close re-indexes from disk, so the
+    // recorded uses must come from disk too, or a.txt keeps the CW239 the
+    // discarded buffer earned with nothing to clear it (#133).
+    let (ws, mut child, mut reader, a_path, b_path) = spawn_unused_workspace();
+    wait_for_scan_done(&mut reader);
+
+    let a_uri = path_uri(&a_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":a_uri,"languageId":"hoi4","version":1,
+                "text": A_TEXT}}),
+        ),
+    )
+    .unwrap();
+    let before = diags_for(&mut reader, "a.txt", 1).expect("a.txt diagnostics");
+    assert_eq!(
+        before.iter().filter(|c| *c == "CW239").count(),
+        1,
+        "only lone_thing is unreferenced at rest, got: {before:?}"
+    );
+
+    let b_uri = path_uri(&b_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text": B_TEXT}}),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, "b.txt", 1).expect("b.txt diagnostics");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": b_uri, "version": 2 },
+                "contentChanges": [{ "text": "a_user = { }\n" }]
+            }),
+        ),
+    )
+    .unwrap();
+    let while_edited = diags_for(&mut reader, "a.txt", 1).expect("a.txt re-validated after edit");
+    assert_eq!(
+        while_edited.iter().filter(|c| *c == "CW239").count(),
+        2,
+        "the unsaved edit drops used_thing's only reference, got: {while_edited:?}"
+    );
+
+    // Close without saving: b.txt on disk still references used_thing.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didClose",
+            serde_json::json!({"textDocument":{"uri":b_uri}}),
+        ),
+    )
+    .unwrap();
+    // Collected with a budget rather than read straight off the pipe: without
+    // the refresh nothing republishes a.txt at all, which must fail the test
+    // rather than block it.
+    let rx = spawn_frame_collector(reader);
+    let frames = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(800),
+        std::time::Duration::from_secs(6),
+    );
+    child.kill().ok();
+    drop(ws);
+
+    let republished = frames
+        .iter()
+        .rev()
+        .find(|v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("a.txt"))
+        })
+        .expect("closing b.txt must re-validate a.txt");
+    let codes: Vec<&str> = republished["params"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert_eq!(
+        codes.iter().filter(|c| **c == "CW239").count(),
+        1,
+        "discarding the edit restores the reference, so only lone_thing stays \
+         unused, got: {codes:?}"
+    );
+}
+
 // ── B5/B7: document symbols, folding, highlight, cross-file references/rename ──
 
 /// Spawn a server with `rules`, write `files` to disk, initialize with
@@ -6062,6 +6163,57 @@ fn test_watched_distinct_files_each_validate_once() {
             "f{i}.txt should be published exactly once"
         );
     }
+}
+
+/// #177: a watched event is client-supplied, so it goes through the same access
+/// boundary as a request URI, and that boundary now applies the discovery walks'
+/// symlink rule. The link here resolves back inside the workspace, so canonical
+/// containment alone would wave it through: before the boundary tested the leaf
+/// itself, touching it read, parsed, INDEXED and published diagnostics for a
+/// file the startup scan had deliberately skipped (#161), which is also the file
+/// `fixAllWorkspace` refuses to touch.
+#[cfg(unix)]
+#[test]
+fn test_watched_change_on_a_symlink_neither_validates_nor_publishes() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let real_uri = write_disk_file(ws.path(), "common/decisions/real.txt", STORM_FILE);
+    let link = ws.path().join("common/decisions/linked.txt");
+    std::os::unix::fs::symlink(link.with_file_name("real.txt"), &link).unwrap();
+    let link_uri = path_uri(&link);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(&mut child, &watched_changes(&[real_uri, link_uri])).unwrap();
+
+    let frames = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(10),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1003);
+    child.kill().ok();
+
+    // The real file is the precondition: without it a boundary that refused
+    // everything would pass this test too.
+    assert_eq!(
+        count_publishes(&frames, "real.txt"),
+        1,
+        "the real file behind the link must still validate and publish"
+    );
+    assert_eq!(
+        count_validate_log(&log, "watched"),
+        1,
+        "only the real file may validate, got: {log}"
+    );
+    assert_eq!(
+        count_publishes(&frames, "linked.txt"),
+        0,
+        "the symlink must publish nothing, got: {frames:?}"
+    );
 }
 
 #[test]
@@ -9894,6 +10046,183 @@ types = {
     assert_eq!(
         resp["result"].as_str(),
         Some("Applied 0 fix(es) across 0 file(s); 1 skipped (stale)"),
+        "got: {resp_str}"
+    );
+}
+
+/// A workspace whose one decision file carries a fixable CW281, initialized and
+/// scanned. Returns the temp dirs (the caller keeps them alive), the child, the
+/// reader, and the file's path. The scan's diagnostics for the file are asserted
+/// on the way past: they are what puts it in the `fixAllWorkspace` store, so a
+/// test that never saw them would pass on an empty store for the wrong reason.
+/// They are read before `wait_for_scan_done` because the scan publishes them
+/// before closing its loading bar, and that drain would swallow them.
+#[allow(clippy::type_complexity)]
+fn spawn_fixable_workspace() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::process::Child,
+    BufReader<std::process::ChildStdout>,
+    std::path::PathBuf,
+) {
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let path = ws.path().join("common/decisions/test.txt");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "a = { limit = { } }\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    let scanned = wait_for_diags(&mut reader, "test.txt").expect("scan diagnostics");
+    assert!(
+        scanned.iter().any(|d| d["code"] == "CW281"),
+        "the fixture must publish a fixable CW281, got: {scanned:?}"
+    );
+    wait_for_scan_done(&mut reader);
+    (ws, rules_dir, vanilla, child, reader, path)
+}
+
+/// The `fixAllWorkspace` result for a server whose only fixable file is gone
+/// from the Problems panel: the store must be empty, not merely stale.
+const NOTHING_FIXABLE: &str = "No auto-fixable problems in the workspace.";
+
+#[test]
+fn test_deleting_a_watched_file_drops_its_fixable_edits() {
+    // The DELETE batch publishes empty diagnostics for the file. That publish
+    // owns the `fixAllWorkspace` store too, or the deleted file's fixes outlive
+    // the diagnostics they came from (#133).
+    let (ws, _rules, _vanilla, mut child, mut reader, path) = spawn_fixable_workspace();
+    let uri = path_uri(&path);
+
+    std::fs::remove_file(&path).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeWatchedFiles",
+            serde_json::json!({ "changes": [{ "uri": uri, "type": 3 }] }),
+        ),
+    )
+    .unwrap();
+    let cleared = wait_for_diags(&mut reader, "test.txt").expect("empty publish for the delete");
+    assert!(cleared.is_empty(), "the delete must clear the panel");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "fixAllWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let (resp_str, applied_edit) =
+        read_response_answering_apply_edit(&mut child, &mut reader).expect("no command response");
+    child.kill().ok();
+    drop(ws);
+
+    assert!(applied_edit.is_none(), "a deleted file has nothing to fix");
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(
+        resp["result"].as_str(),
+        Some(NOTHING_FIXABLE),
+        "got: {resp_str}"
+    );
+}
+
+#[test]
+fn test_closing_a_document_drops_its_fixable_edits() {
+    // did_close's empty publish must take the store entry with it. The entry is
+    // keyed by the open buffer's version, so leaving it behind survives until
+    // some later reopen matches that version against different content (#133).
+    let (ws, _rules, _vanilla, mut child, mut reader, path) = spawn_fixable_workspace();
+    let uri = path_uri(&path);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":uri,"languageId":"hoi4","version":7,
+                "text": "a = { limit = { } }\n"}}),
+        ),
+    )
+    .unwrap();
+    let open_diags = wait_for_diags(&mut reader, "test.txt").expect("didOpen diagnostics");
+    assert!(
+        open_diags.iter().any(|d| d["code"] == "CW281"),
+        "expected a fixable CW281 while open, got: {open_diags:?}"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didClose",
+            serde_json::json!({"textDocument":{"uri":uri}}),
+        ),
+    )
+    .unwrap();
+    let cleared = wait_for_diags(&mut reader, "test.txt").expect("empty publish for the close");
+    assert!(cleared.is_empty(), "the close must clear the panel");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "workspace/executeCommand",
+            serde_json::json!({ "command": "fixAllWorkspace", "arguments": [] }),
+        ),
+    )
+    .unwrap();
+    let (resp_str, applied_edit) =
+        read_response_answering_apply_edit(&mut child, &mut reader).expect("no command response");
+    child.kill().ok();
+    drop(ws);
+
+    assert!(
+        applied_edit.is_none(),
+        "a closed file's diagnostics were cleared, so nothing may be applied"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(
+        resp["result"].as_str(),
+        Some(NOTHING_FIXABLE),
         "got: {resp_str}"
     );
 }
