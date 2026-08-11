@@ -11318,6 +11318,13 @@ fn test_published_diagnostic_range_stays_on_its_own_line() {
                 || !v["params"]["uri"]
                     .as_str()
                     .is_some_and(|u| u.ends_with("e.txt"))
+                // The workspace scan publishes without a `version` and with the
+                // whole-line fallback range (no doc text at hand). The open-doc
+                // publishers (didOpen re-validate, post-scan refresh) tag the
+                // frame with the document version and publish precise columns.
+                // Skip the scan's frame so the race can't hand this test the
+                // imprecise range (#179).
+                || v["params"]["version"].as_i64().is_none()
             {
                 continue;
             }
