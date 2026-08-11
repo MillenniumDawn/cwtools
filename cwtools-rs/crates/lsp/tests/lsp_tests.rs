@@ -62,11 +62,26 @@ fn run_with_deadline<T: Send + 'static>(
     rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
 }
 
+/// Read one LSP frame, or `Err` once the server closes its stdout.
+///
+/// `read_line` reports EOF as `Ok(0)`, which used to fall through the empty
+/// header line into `Ok(String::new())` — indistinguishable from a frame with
+/// no body. Every caller here branches on `Err` to stop and skips an empty
+/// `Ok`, so a dead server produced an endless run of empty frames instead:
+/// [`spawn_frame_collector`]'s thread span at 100% of a core for the rest of
+/// the binary's run rather than dropping its sender, and the waits built on it
+/// timed out blaming a missing notification. Reporting EOF as the error the
+/// callers already handle is what makes a server exit visible (#198).
 fn read_frame(reader: &mut BufReader<std::process::ChildStdout>) -> std::io::Result<String> {
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        if reader.read_line(&mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the server closed its stdout",
+            ));
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
@@ -3198,9 +3213,18 @@ fn diags_for(
 
 /// Read frames until the `loadingBar` notification with `enable=false` arrives,
 /// i.e. the workspace scan finished (index_ready is now set).
+///
+/// Panics if the scan never finishes, naming the reason. This used to return
+/// quietly on a read error and on running out of frames, so a server that died
+/// during startup was handed back to the caller as a ready one; the test then
+/// failed much later, on whatever it waited for next, blaming that instead
+/// (#198). Report a server exit here, where it happened.
 fn wait_for_scan_done(reader: &mut BufReader<std::process::ChildStdout>) {
     for _ in 0..5000 {
-        let Ok(raw) = read_frame(reader) else { return };
+        let raw = match read_frame(reader) {
+            Ok(raw) => raw,
+            Err(e) => panic!("the server exited before its scan finished: {e}"),
+        };
         if raw.is_empty() {
             continue;
         }
@@ -3211,11 +3235,56 @@ fn wait_for_scan_done(reader: &mut BufReader<std::process::ChildStdout>) {
             return;
         }
     }
+    panic!("no loadingBar(false) scan-finished signal in the first 5000 frames");
 }
 
-/// Wait for the scan-started signal — `loadingBar` with `enable=true` — on a
-/// [`spawn_frame_collector`] channel, panicking if it does not arrive within
-/// `budget`.
+/// Read frames from a [`spawn_frame_collector`] channel until one satisfies
+/// `want`, handing every frame passed over to `saw`. Returns the match.
+///
+/// The single bounded wait the progress and response waits are built from, and
+/// the one place that tells the two ways of not getting a frame apart. The
+/// collector drops its sender the moment the server's stdout hits EOF, so a
+/// server that exited comes back as `Disconnected` and fails immediately with
+/// that as the reason; only a server that is alive but slow can spend the whole
+/// `budget`. Waits that treated the two alike reported a dead server as a
+/// missing notification and blamed the scan for it (#198).
+///
+/// `what` completes "waiting for …", so phrase it as the thing awaited.
+fn recv_frame_until(
+    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
+    budget: std::time::Duration,
+    what: &str,
+    mut saw: impl FnMut(&serde_json::Value),
+    mut want: impl FnMut(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let start = std::time::Instant::now();
+    let deadline = start + budget;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out after {budget:?} waiting for {what}; the server was still running"
+        );
+        match rx.recv_timeout(remaining) {
+            Ok(v) if want(&v) => return v,
+            Ok(v) => saw(&v),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "the server exited after {:?} without sending {what}",
+                start.elapsed()
+            ),
+        }
+    }
+}
+
+/// A `loadingBar` with `enable=true`: a scan has started.
+fn is_scan_started(v: &serde_json::Value) -> bool {
+    v["method"] == "loadingBar" && v["params"]["enable"] == serde_json::Value::Bool(true)
+}
+
+/// Wait for a scan-started signal — `loadingBar` with `enable=true` — on a
+/// [`spawn_frame_collector`] channel. `what` names the scan awaited, so a
+/// failure says which one never started.
 ///
 /// `CWTOOLS_SCAN_HOLD_MS` sleeps the scan open *after* this signal fires (see
 /// `scan::validate_entire_workspace_inner`), so the wait for the started signal
@@ -3226,18 +3295,101 @@ fn wait_for_scan_done(reader: &mut BufReader<std::process::ChildStdout>) {
 fn wait_for_scan_started(
     rx: &std::sync::mpsc::Receiver<serde_json::Value>,
     budget: std::time::Duration,
+    what: &str,
 ) {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no loadingBar(true) scan-started signal"
+    recv_frame_until(rx, budget, what, |_| {}, is_scan_started);
+}
+
+/// Send `reindexWorkspace` until it actually starts a scan, returning once the
+/// scan-started signal is in hand. The gate for every test that needs a scan
+/// running — and holding, under `CWTOOLS_SCAN_HOLD_MS` — before it acts.
+///
+/// Waiting on the bar-on alone is not enough, because the command is allowed to
+/// do nothing: `Backend::validate_entire_workspace` returns `false` and sends no
+/// `loadingBar` at all when it loses the re-entrancy CAS, and the previous
+/// scan's bar-off goes out *before* that guard drops. `storm_server_env`
+/// returns on the startup scan's bar-off, so a `reindexWorkspace` sent straight
+/// afterwards can land in exactly that window, skip, and leave the test waiting
+/// for a signal that is never coming. No budget fixes that; the test has to
+/// notice the command answered without scanning and ask again (#198).
+///
+/// A skipped command answers immediately, whereas a scan that runs sends its
+/// bar-on before the hold and answers only after — so "answered with no bar-on
+/// yet" identifies the skip without depending on the message text. The ids come
+/// from a private range so they cannot collide with a caller's own requests.
+fn reindex_until_scan_starts(
+    child: &mut std::process::Child,
+    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
+) {
+    for attempt in 0..20 {
+        let id = 7900 + attempt;
+        write_frame(
+            child,
+            &jsonrpc_request(
+                id,
+                "workspace/executeCommand",
+                serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
+            ),
+        )
+        .unwrap();
+        let v = recv_frame_until(
+            rx,
+            std::time::Duration::from_secs(30),
+            "the reindex scan to start, or the command to answer without starting one",
+            |_| {},
+            |v| is_scan_started(v) || v["id"] == id,
         );
-        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
-            && v["method"] == "loadingBar"
-            && v["params"]["enable"] == serde_json::Value::Bool(true)
-        {
-            break;
+        if is_scan_started(&v) {
+            return;
+        }
+        // Answered with no bar: it lost the CAS to the tail of the previous
+        // scan. That scan is on its way out, so give the guard a moment to drop
+        // rather than spending the retries inside the same window.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    panic!("reindexWorkspace answered without starting a scan 20 times running");
+}
+
+/// Wait for the response to request `id`, reporting whether any scan started
+/// before it arrived. Pairs with [`wait_for_scan_started`] for the commands
+/// whose contract is about *which* side of a scan the answer lands on.
+fn wait_for_response_watching_scans(
+    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
+    id: i64,
+    budget: std::time::Duration,
+    what: &str,
+) -> (serde_json::Value, bool) {
+    let mut saw_scan = false;
+    let response = recv_frame_until(
+        rx,
+        budget,
+        what,
+        |v| saw_scan |= is_scan_started(v),
+        |v| v["id"] == id,
+    );
+    (response, saw_scan)
+}
+
+/// Assert no response to `id` arrives for `quiet`. A server that exited would
+/// satisfy that vacuously, so a closed channel fails rather than passes.
+fn assert_no_response_within(
+    rx: &std::sync::mpsc::Receiver<serde_json::Value>,
+    id: i64,
+    quiet: std::time::Duration,
+    what: &str,
+) {
+    let deadline = std::time::Instant::now() + quiet;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(v) => assert!(v["id"] != id, "{what}: {v}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the server exited during the window in which {what}")
+            }
         }
     }
 }
@@ -6351,19 +6503,10 @@ fn test_watched_overcap_batch_does_not_spin_against_running_scan() {
         .collect();
     let rx = spawn_frame_collector(reader);
 
-    // Start a scan, then flood while it holds the CAS.
-    write_frame(
-        &mut child,
-        &jsonrpc_request(
-            900,
-            "workspace/executeCommand",
-            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
-        ),
-    )
-    .unwrap();
-    // Wait for the scan-started signal (the hold begins after the bar-on), so
-    // the flood's debounce window can't slip past the scan and win the CAS.
-    wait_for_scan_started(&rx, std::time::Duration::from_secs(30));
+    // Start a scan, then flood while it holds the CAS. The hold begins after
+    // the bar-on, so waiting for that signal keeps the flood's debounce window
+    // from slipping past the scan and winning the CAS.
+    reindex_until_scan_starts(&mut child, &rx);
     write_frame(&mut child, &watched_changes(&uris)).unwrap();
 
     // Quiet must outlast the held rescan so the whole story is observed.
@@ -12149,16 +12292,7 @@ fn test_reloadrulesconfig_retries_until_it_wins_the_scan_guard() {
 
     // Start a competing scan and wait for the scan-started signal, so the hold
     // is definitely active when the reload arrives.
-    write_frame(
-        &mut child,
-        &jsonrpc_request(
-            900,
-            "workspace/executeCommand",
-            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
-        ),
-    )
-    .unwrap();
-    wait_for_scan_started(&rx, std::time::Duration::from_secs(30));
+    reindex_until_scan_starts(&mut child, &rx);
 
     // Fire the reload while the scan holds the CAS: it must not answer until
     // the competing scan is gone and a revalidation has run.
@@ -12171,47 +12305,24 @@ fn test_reloadrulesconfig_retries_until_it_wins_the_scan_guard() {
         ),
     )
     .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let mut early_answer = None;
-    while std::time::Instant::now() < deadline {
-        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
-            && v["id"] == 901
-        {
-            early_answer = Some(v);
-            break;
-        }
-    }
-    assert!(
-        early_answer.is_none(),
-        "reloadrulesconfig answered while the competing scan held the guard: {early_answer:?}"
+    assert_no_response_within(
+        &rx,
+        901,
+        std::time::Duration::from_secs(2),
+        "reloadrulesconfig must not answer while the competing scan holds the guard",
     );
 
     // The competing scan releases after its hold, the retry wins the CAS, and
     // one full revalidation (a second loadingBar on→off cycle) must complete
     // before the success response.
-    let mut saw_revalidation = false;
-    let response = {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut response = None;
-        while std::time::Instant::now() < deadline {
-            let v = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if v["id"] == 901 {
-                response = Some(v);
-                break;
-            }
-            if v["method"] == "loadingBar" && v["params"]["enable"] == serde_json::Value::Bool(true)
-            {
-                saw_revalidation = true;
-            }
-        }
-        response
-    };
+    let (response, saw_revalidation) = wait_for_response_watching_scans(
+        &rx,
+        901,
+        std::time::Duration::from_secs(30),
+        "reloadrulesconfig to answer once it won the guard",
+    );
     child.kill().ok();
 
-    let response = response.expect("reloadrulesconfig never answered");
     assert!(
         saw_revalidation,
         "no revalidation ran between the reload and its response"
@@ -12249,16 +12360,7 @@ fn test_reloadrulesconfig_reports_queued_revalidation_when_scan_never_releases()
 
     // Start a competing scan and wait for the scan-started signal, so the hold
     // is definitely active for the reload's whole deadline.
-    write_frame(
-        &mut child,
-        &jsonrpc_request(
-            900,
-            "workspace/executeCommand",
-            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
-        ),
-    )
-    .unwrap();
-    wait_for_scan_started(&rx, std::time::Duration::from_secs(30));
+    reindex_until_scan_starts(&mut child, &rx);
 
     // Fire the reload. Its 1s deadline expires while the 10s hold is still
     // active, so the answer must arrive promptly, report the pending state,
@@ -12272,31 +12374,16 @@ fn test_reloadrulesconfig_reports_queued_revalidation_when_scan_never_releases()
         ),
     )
     .unwrap();
-    let mut saw_revalidation = false;
-    let response = {
-        // The competing scan releases only after 10s, so any answer inside
-        // this window must be the reload's own give-up response.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut response = None;
-        while std::time::Instant::now() < deadline {
-            let v = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if v["id"] == 901 {
-                response = Some(v);
-                break;
-            }
-            if v["method"] == "loadingBar" && v["params"]["enable"] == serde_json::Value::Bool(true)
-            {
-                saw_revalidation = true;
-            }
-        }
-        response
-    };
+    // The competing scan releases only after 10s, so any answer inside this
+    // window must be the reload's own give-up response.
+    let (response, saw_revalidation) = wait_for_response_watching_scans(
+        &rx,
+        901,
+        std::time::Duration::from_secs(5),
+        "reloadrulesconfig to give up on its 1s deadline",
+    );
     child.kill().ok();
 
-    let response = response.expect("reloadrulesconfig never answered its deadline");
     assert!(
         !saw_revalidation,
         "a revalidation ran after the reload gave up"
@@ -12335,16 +12422,7 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
 
     // Start a competing scan and wait for the scan-started signal, so the
     // hold is definitely active for the reload's whole deadline.
-    write_frame(
-        &mut child,
-        &jsonrpc_request(
-            900,
-            "workspace/executeCommand",
-            serde_json::json!({ "command": "reindexWorkspace", "arguments": [] }),
-        ),
-    )
-    .unwrap();
-    wait_for_scan_started(&rx, std::time::Duration::from_secs(30));
+    reindex_until_scan_starts(&mut child, &rx);
 
     // The give-up response arrives ~1s in, well before the 5s hold releases.
     write_frame(
@@ -12356,22 +12434,12 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
         ),
     )
     .unwrap();
-    let response = {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut response = None;
-        while std::time::Instant::now() < deadline {
-            let v = match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if v["id"] == 901 {
-                response = Some(v);
-                break;
-            }
-        }
-        response
-    };
-    let response = response.expect("reloadrulesconfig never answered its deadline");
+    let (response, _) = wait_for_response_watching_scans(
+        &rx,
+        901,
+        std::time::Duration::from_secs(5),
+        "reloadrulesconfig to give up on its 1s deadline",
+    );
     let msg = response["result"].as_str().expect("string result");
     assert!(
         msg.contains("re-validation queued"),
@@ -12379,22 +12447,15 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
     );
 
     // The deferred retry wins the CAS once the 5s hold releases and runs a
-    // full revalidation (a bar-on after the response).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut queued_scan_ran = false;
-    while !queued_scan_ran && std::time::Instant::now() < deadline {
-        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
-            && v["method"] == "loadingBar"
-            && v["params"]["enable"] == serde_json::Value::Bool(true)
-        {
-            queued_scan_ran = true;
-        }
-    }
-    child.kill().ok();
-    assert!(
-        queued_scan_ran,
-        "the queued revalidation never ran after the reload gave up"
+    // full revalidation (a bar-on after the response). The budget only has to
+    // outlast the rest of the hold plus a 500ms retry poll; keep it well clear
+    // of that, since waiting longer cannot change what the test observes.
+    wait_for_scan_started(
+        &rx,
+        std::time::Duration::from_secs(30),
+        "the deferred revalidation to run after the reload gave up",
     );
+    child.kill().ok();
 }
 
 // ── #162: the cache path the client names ────────────────────────────────────
