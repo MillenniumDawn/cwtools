@@ -14,6 +14,9 @@ use cwtools_validation::build_modifier_keys;
 use cwtools_validation::references::{UsedInstances, check_unused_instances, needs_use_tracking};
 use cwtools_validation::validate_prepared_tracking_uses;
 
+use crate::command_progress::{
+    CommandProgress, Phase, ScanOutcome, cancel_flag_of, phase_percentage, start_phase,
+};
 use crate::paths::{
     default_cache_dir, discover_vanilla_dir, loc_display_text, logical_path_from_uri, path_to_uri,
     uri_to_path_str,
@@ -309,13 +312,35 @@ impl Backend {
     /// `cacheVanilla` that hit a fresh cache and indexed nothing), and a client
     /// should see one close per open, not one per caller that thought about it.
     pub(crate) async fn send_loading_bar(&self, enable: bool, value: &str) {
+        self.send_loading_bar_pct(enable, value, None).await;
+    }
+
+    /// [`send_loading_bar`] with a known position on the 0-100 bar.
+    ///
+    /// The percentage rides the `loadingBar` payload too (as an optional
+    /// `percentage` field) so the extension's status bar can show it; a client
+    /// on an older build just ignores the extra key.
+    ///
+    /// [`send_loading_bar`]: Backend::send_loading_bar
+    pub(crate) async fn send_loading_bar_pct(
+        &self,
+        enable: bool,
+        value: &str,
+        percentage: Option<u32>,
+    ) {
         let was_active = self.state.loading_bar_active.swap(enable, Ordering::SeqCst);
         if !enable && !was_active {
             return;
         }
-        let payload = serde_json::json!({ "enable": enable, "value": value });
+        let payload = match percentage {
+            Some(pct) => {
+                serde_json::json!({ "enable": enable, "value": value, "percentage": pct })
+            }
+            None => serde_json::json!({ "enable": enable, "value": value }),
+        };
         self.client.send_notification::<LoadingBar>(payload).await;
-        self.send_work_done_progress(enable, value).await;
+        self.send_work_done_progress(enable, value, percentage)
+            .await;
     }
 
     /// The `$/progress` half of [`send_loading_bar`]. The first `enable` creates
@@ -323,8 +348,43 @@ impl Backend {
     /// ends it. Silent unless the client advertised `window.workDoneProgress` —
     /// a server-initiated progress needs `window/workDoneProgress/create`, and a
     /// client that didn't advertise support isn't required to answer it.
-    async fn send_work_done_progress(&self, enable: bool, value: &str) {
+    async fn send_work_done_progress(&self, enable: bool, value: &str, percentage: Option<u32>) {
         use tower_lsp::lsp_types::request::WorkDoneProgressCreate;
+        // A command that passed its own `workDoneToken` owns the indicator:
+        // its phases report against that token and its `end` is sent by
+        // `CommandProgress`, so opening the server's stream on top would show
+        // two bars for one operation. Cloned out of the lock first — the guard
+        // is `parking_lot`'s and must not be held across the await.
+        let command_token = self.state.active_command_progress.lock().clone();
+        if let Some(token) = command_token
+            && enable
+        {
+            // Phase updates only. `begin`/`end` belong to the command, which
+            // outlives any single scan it triggers.
+            //
+            // The close deliberately falls through instead: a scan whose stream
+            // was opened *before* this command latched (the startup scan, still
+            // finishing when the user hits Re-index) still owes that stream an
+            // `end`, and swallowing it here would leave the client spinning on
+            // `cwtools/scan` forever. Below, an unopened stream is a no-op, so
+            // falling through costs a command-owned scan nothing.
+            self.client
+                .send_notification::<tower_lsp::lsp_types::notification::Progress>(ProgressParams {
+                    token,
+                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                        WorkDoneProgressReport {
+                            // Unset: the command's `begin` already said whether
+                            // it can be cancelled, and a report that omits this
+                            // keeps that answer.
+                            cancellable: None,
+                            message: Some(value.to_string()),
+                            percentage,
+                        },
+                    )),
+                })
+                .await;
+            return;
+        }
         if !self.state.client_work_done_progress.load(Ordering::Relaxed) {
             return;
         }
@@ -336,7 +396,7 @@ impl Backend {
             (true, true) => WorkDoneProgress::Report(WorkDoneProgressReport {
                 cancellable: Some(false),
                 message: Some(value.to_string()),
-                percentage: None,
+                percentage,
             }),
             (true, false) => {
                 // The client may refuse the token; leave the stream closed so a
@@ -356,7 +416,7 @@ impl Backend {
                     title: "CWTools".to_string(),
                     cancellable: Some(false),
                     message: Some(value.to_string()),
-                    percentage: None,
+                    percentage,
                 })
             }
         };
@@ -511,6 +571,31 @@ impl Backend {
     /// except when the quiet short-circuit returns early: the file set is
     /// unchanged by definition, so the list it would send is identical.
     pub(crate) async fn validate_entire_workspace(&self, quiet: bool) -> bool {
+        matches!(
+            self.validate_entire_workspace_tracked(quiet, None).await,
+            ScanOutcome::Ran
+        )
+    }
+
+    /// [`validate_entire_workspace`] under a client-cancellable command.
+    ///
+    /// `progress` supplies the cancel flag the scan polls and the sink its
+    /// phase samplers report to; `None` is the startup scan and the periodic
+    /// background pass, which nobody can cancel and which report over the
+    /// server's own indicator.
+    ///
+    /// Cancellation is best-effort in one direction only: the scan stops
+    /// promptly, but indexing it already did is kept rather than rolled back.
+    /// What it must not do is *record* a partial pass — the walk fingerprint
+    /// and loc signature are written at the end, past every cancel check, so a
+    /// later quiet pass can't short-circuit on work that never finished.
+    ///
+    /// [`validate_entire_workspace`]: Backend::validate_entire_workspace
+    pub(crate) async fn validate_entire_workspace_tracked(
+        &self,
+        quiet: bool,
+        progress: Option<&CommandProgress>,
+    ) -> ScanOutcome {
         if self
             .state
             .scan_in_progress
@@ -518,10 +603,10 @@ impl Backend {
             .is_err()
         {
             tracing::debug!("workspace scan already in progress; skipping");
-            return false;
+            return ScanOutcome::Busy;
         }
         let guard = ScanGuard::for_scan(self, quiet);
-        self.validate_entire_workspace_inner(quiet).await;
+        let completed = self.validate_entire_workspace_inner(quiet, progress).await;
         guard.finish().await;
         // Drain any watched events an over-cap batch requeued after losing the
         // CAS to this scan — the loser suppresses its own re-arm so it doesn't
@@ -533,21 +618,30 @@ impl Backend {
         if requeued_pending || requeued_deleted {
             self.arm_watched_batch();
         }
-        true
+        if completed {
+            ScanOutcome::Ran
+        } else {
+            ScanOutcome::Cancelled
+        }
     }
 
     /// Retry a revalidation in the background, bounded, for a caller that gave
-    /// up on winning the scan CAS itself. `reloadrulesconfig` uses this when a
-    /// scan holds the guard past the command's response bound: the rules are
-    /// already live, so the revalidation only needs to land once the competing
-    /// scan releases. Bounded at 180s (the `clearAllCaches` bound); if a scan
-    /// still holds the guard that long, the retry stops and says so in the
-    /// output channel instead of spinning forever.
-    pub(crate) fn spawn_deferred_revalidation(&self) {
+    /// up on landing one itself.
+    ///
+    /// Two callers, both leaving the index in a state that has to be repaired
+    /// even though the command is over: `reloadrulesconfig` when a scan holds
+    /// the guard past its response bound (the rules are live, so only the
+    /// re-validation is outstanding), and `clearAllCaches` when the user
+    /// cancels after the purge already dropped the base-game index.
+    ///
+    /// `context` names the caller in the give-up log line. Bounded at 180s; if
+    /// a scan still holds the guard that long, the retry stops and says so in
+    /// the output channel instead of spinning forever.
+    pub(crate) fn spawn_deferred_revalidation(&self, context: &'static str) {
         let client = self.client.clone();
         let state = self.state.clone();
         tokio::spawn(async move {
-            spawn_logging_panics("reloadrulesconfig deferred revalidation", async move {
+            spawn_logging_panics("deferred revalidation", async move {
                 let backend = Backend { client, state };
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(180);
@@ -561,7 +655,9 @@ impl Backend {
                         .client
                         .log_message(
                             MessageType::WARNING,
-                            "reloadrulesconfig: deferred re-validation gave up; a scan held the workspace the whole time",
+                            format!(
+                                "{context}: deferred re-validation gave up; a scan held the workspace the whole time"
+                            ),
                         )
                         .await;
                 }
@@ -571,11 +667,21 @@ impl Backend {
     }
 
     /// Scan the entire workspace for relevant game files and validate them all.
+    ///
+    /// Returns `false` when the user cancelled partway. Every `return false`
+    /// below sits before the fingerprint/signature writes at the end, so a
+    /// cancelled pass records nothing and the next scan redoes it in full.
     #[tracing::instrument(skip_all)]
-    async fn validate_entire_workspace_inner(&self, quiet: bool) {
+    async fn validate_entire_workspace_inner(
+        &self,
+        quiet: bool,
+        progress: Option<&CommandProgress>,
+    ) -> bool {
+        let cancel = cancel_flag_of(progress);
         cwtools_profiling::log_rss("workspace_scan_start");
         if !quiet {
-            self.send_loading_bar(true, "Indexing workspace…").await;
+            self.send_loading_bar_pct(true, Phase::Discover.label(), Some(0))
+                .await;
         }
         // `CWTOOLS_SCAN_HOLD_MS` test override: hold the scan open (after the
         // loading bar, which doubles as the scan-started signal) so the tests
@@ -602,7 +708,7 @@ impl Backend {
                 self.state
                     .index_ready
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
+                return true;
             }
         };
 
@@ -653,7 +759,14 @@ impl Backend {
                 files = files_to_validate.len(),
                 "quiet scan: workspace fingerprint unchanged, skipping reindex"
             );
-            return;
+            return true;
+        }
+
+        // First cancel check: the walk is one uninterruptible `block_in_place`,
+        // so this is the earliest point the flag can be observed. Nothing has
+        // been mutated yet, so bailing here is a true no-op.
+        if cancel.is_cancelled() {
+            return false;
         }
 
         let scan_files: Vec<ScannedFile> = files_to_validate
@@ -726,7 +839,12 @@ impl Backend {
         // across restarts; keeping the AST resident avoids a pass-2 re-parse
         // within a single scan.
         if !quiet {
-            self.send_loading_bar(true, "Indexing workspace…").await;
+            self.send_loading_bar_pct(
+                true,
+                Phase::Parse.label(),
+                Some(phase_percentage(Phase::Parse, 0, 1)),
+            )
+            .await;
         }
         // Snapshot the set of currently-open document URIs so both passes can
         // skip them: open docs were already indexed by did_open/did_change and
@@ -759,10 +877,20 @@ impl Backend {
         // blocking I/O; the runtime shifts its remaining tasks to other workers
         // so the LSP request loop is not starved while rayon parses.
         let scan_bytes = cwtools_file_manager::file_manager::ScanBytes::new();
+        // The rayon section can neither await nor reach the client, so progress
+        // rides an atomic the closure bumps and a sampler task turns into
+        // `$/progress` traffic. The cancel check is the same shape: a latch the
+        // closure polls, so a cancelled pass drains through the remaining files
+        // at one atomic load each instead of parsing them.
+        let parse_ticker = start_phase(progress, Phase::Parse, scan_files.len());
         let outcomes: Vec<Option<ParseOutcome>> = tokio::task::block_in_place(|| {
             scan_files
                 .par_iter()
                 .map(|file| {
+                    if cancel.is_cancelled() {
+                        return None;
+                    }
+                    parse_ticker.tick();
                     // Open docs are already indexed from their in-memory text;
                     // skip so we don't re-index stale disk content on top of the
                     // live version.
@@ -864,6 +992,13 @@ impl Backend {
                 })
                 .collect()
         });
+        parse_ticker.stop();
+        // A cancelled parse pass produced a hole-ridden `outcomes`, and every
+        // later phase (the index merge, the prune, validation) would read it as
+        // "these files have nothing in them". Stop before any of that lands.
+        if cancel.is_cancelled() {
+            return false;
+        }
         let wrote_cache = outcomes
             .iter()
             .any(|outcome| outcome.as_ref().is_some_and(|(hit, _, _)| !hit));
@@ -899,6 +1034,12 @@ impl Backend {
             // index phase. Mirrors pass 2's yield-every-50 below.
             if quiet && i % 64 == 63 {
                 tokio::task::yield_now().await;
+            }
+            // Same cadence for the cancel check. The merge is cheap next to
+            // parsing, so this rarely fires — but on a mod big enough that the
+            // user reached for Cancel, "cheap" is still seconds.
+            if i % 64 == 63 && cancel.is_cancelled() {
+                return false;
             }
         }
 
@@ -986,9 +1127,29 @@ impl Backend {
             }
         }
 
+        if cancel.is_cancelled() {
+            return false;
+        }
+
         // Build the base-game index from a `vanilla` dir (or auto-discovery) if
         // we have one and haven't indexed it yet. Populates `vanilla_index`.
+        //
+        // This phase is the one that can't be interrupted mid-flight: the base
+        // game is indexed by a single `spawn_blocking` call into the engine, so
+        // there is no per-file seam to poll the flag at. Cancelling during it
+        // takes effect when it returns.
+        if !quiet {
+            self.send_loading_bar_pct(
+                true,
+                Phase::Vanilla.label(),
+                Some(phase_percentage(Phase::Vanilla, 0, 1)),
+            )
+            .await;
+        }
         self.ensure_vanilla_index(false, quiet).await;
+        if cancel.is_cancelled() {
+            return false;
+        }
 
         // Merge the pre-generated vanilla index (if loaded) so base-game
         // references resolve.
@@ -1009,12 +1170,27 @@ impl Backend {
         // rebuilds, so a user-triggered rescan never serves stale loc
         // diagnostics — it just also records the signature for the next
         // quiet pass to compare against.
+        if !quiet {
+            self.send_loading_bar_pct(
+                true,
+                Phase::Localisation.label(),
+                Some(phase_percentage(Phase::Localisation, 0, 1)),
+            )
+            .await;
+        }
         let loc_signature = tokio::task::block_in_place(|| self.compute_loc_signature(&root_path));
         let loc_unchanged = *self.state.last_loc_signature.lock() == Some(loc_signature);
         if quiet && loc_unchanged {
             tracing::info!("quiet scan: loc signature unchanged, skipping loc rebuild");
         } else {
             self.rebuild_and_publish_loc(&root_path).await;
+        }
+        // Recorded only on a pass that got this far. A cancel between the
+        // rebuild and here would otherwise pin a signature for an index the
+        // scan never finished assembling, and the next quiet pass would trust
+        // it and skip the rebuild.
+        if cancel.is_cancelled() {
+            return false;
         }
         *self.state.last_loc_signature.lock() = Some(loc_signature);
 
@@ -1034,7 +1210,12 @@ impl Backend {
         // workspace file there, pinning all texts+ASTs in memory for the
         // whole session.
         if !quiet {
-            self.send_loading_bar(true, "Validating workspace…").await;
+            self.send_loading_bar_pct(
+                true,
+                Phase::Validate.label(),
+                Some(phase_percentage(Phase::Validate, 0, 1)),
+            )
+            .await;
         }
         let mut total_errors = 0usize;
         let total_files = scan_files.len();
@@ -1094,6 +1275,11 @@ impl Backend {
             Vec::new()
         };
         type ValidationOutcome = (String, Vec<Diagnostic>, Option<UsedInstances>, Option<u64>);
+        // Same sampler/latch pair as pass 1. Pass 2 additionally holds the
+        // index and loc read guards for its whole parallel section — it must
+        // see one consistent snapshot — which is the other reason progress
+        // can't be reported from inside it directly.
+        let validate_ticker = start_phase(progress, Phase::Validate, scan_files.len());
         let results: Vec<(String, Vec<Diagnostic>, Option<u64>)> = {
             let info_guard = self.state.info_service.read();
             let loc_guard = self.state.loc_index.read();
@@ -1124,6 +1310,10 @@ impl Backend {
                 .zip(parsed_files.par_iter())
                 .zip(source_hashes.par_iter())
                 .filter_map(|((file, parsed_opt), source_hash)| {
+                    if cancel.is_cancelled() {
+                        return None;
+                    }
+                    validate_ticker.tick();
                     // Skip files that failed to parse in pass 1, and open docs
                     // whose fresher in-memory diagnostics must not be overwritten.
                     let parsed = parsed_opt.as_ref()?;
@@ -1152,7 +1342,15 @@ impl Backend {
                 })
                 .collect();
 
-            if track_uses && let Some(prepared) = &prepared {
+            // Skipped on cancel: this rebuilds the `type_uses` store from
+            // `results`, and a cancelled pass 2 filled only part of it. Letting
+            // it run would prune every unscanned file's recorded uses and then
+            // report their definitions as unused (CW239/CW231) — diagnostics
+            // invented by the cancellation itself.
+            if track_uses
+                && !cancel.is_cancelled()
+                && let Some(prepared) = &prepared
+            {
                 // Open docs whose uses aren't recorded yet (opened before the
                 // rules loaded, so their validates couldn't track): compute
                 // from the cached AST. The rest carry their stored entry
@@ -1223,6 +1421,11 @@ impl Backend {
             // info_guard / loc_guard dropped here, before any await.
         };
 
+        validate_ticker.stop();
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let publish_total = results.len();
         for (i, (uri, diagnostics, source_hash)) in results.into_iter().enumerate() {
             total_errors += diagnostics
                 .iter()
@@ -1235,6 +1438,19 @@ impl Backend {
             }
             if i % 50 == 49 {
                 tokio::task::yield_now().await;
+                // Publishing is serial and async, so unlike the rayon passes it
+                // reports for itself rather than through a sampler.
+                if cancel.is_cancelled() {
+                    return false;
+                }
+                if !quiet {
+                    self.send_loading_bar_pct(
+                        true,
+                        Phase::Publish.label(),
+                        Some(phase_percentage(Phase::Publish, i + 1, publish_total)),
+                    )
+                    .await;
+                }
             }
         }
         // Pass 2 is done. Drop the per-file ASTs before the file-list / profile
@@ -1319,6 +1535,7 @@ impl Backend {
         // The status bar is cleared by the `validate_entire_workspace` wrapper on
         // return, so every exit path (this one and the early returns above) clears
         // it uniformly.
+        true
     }
 
     /// Re-validate every currently-open document against the current (complete)
