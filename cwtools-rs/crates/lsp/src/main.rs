@@ -20,6 +20,7 @@ mod access;
 mod cache_purge;
 mod code_action;
 mod color;
+mod command_progress;
 mod completion;
 mod config;
 mod documentlink;
@@ -381,6 +382,16 @@ struct DocumentState {
     /// Whether the scan's `$/progress` token is currently live, so the phase
     /// updates pair one `begin` with one `end` on a token that exists.
     scan_progress_active: std::sync::atomic::AtomicBool,
+    /// Cancel latches for the in-flight `workspace/executeCommand` calls that
+    /// carried a `workDoneToken`, keyed by `command_progress::token_key`.
+    /// `window/workDoneProgress/cancel` sets one; the scan polls it. Entries
+    /// live exactly as long as their command.
+    pub(crate) command_cancels: parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The `workDoneToken` of the command currently owning the progress
+    /// indicator, if any. While this is set, the scan's phase updates report
+    /// against it instead of opening the server's own `cwtools/scan` stream,
+    /// so one operation shows the user one progress bar.
+    pub(crate) active_command_progress: parking_lot::Mutex<Option<ProgressToken>>,
     /// Whether a scan has the loading indicator open, over both channels. The
     /// close is sent defensively from several places (a cancelled or panicked
     /// scan's `ScanGuard`, `cacheVanilla` after an index that may have been a
@@ -896,6 +907,8 @@ impl DocumentState {
             completion_label_details: std::sync::atomic::AtomicBool::new(false),
             client_work_done_progress: std::sync::atomic::AtomicBool::new(false),
             scan_progress_active: std::sync::atomic::AtomicBool::new(false),
+            command_cancels: parking_lot::Mutex::new(HashMap::new()),
+            active_command_progress: parking_lot::Mutex::new(None),
             loading_bar_active: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             handshake_complete: std::sync::atomic::AtomicBool::new(false),
@@ -2134,6 +2147,16 @@ fn main() {
                 state: state.clone(),
             })
             .custom_method("didFocusFile", Backend::on_did_focus_file)
+            // `window/workDoneProgress/cancel` is the Cancel button on a
+            // client-driven progress notification. tower-lsp 0.20 has no slot
+            // for it on the `LanguageServer` trait (its lib.rs carries a TODO
+            // to add one), so it is registered as a custom method — without
+            // this the notification comes back as a "method not found" error
+            // and Cancel does nothing. See `command_progress`.
+            .custom_method(
+                "window/workDoneProgress/cancel",
+                Backend::on_work_done_progress_cancel,
+            )
             .finish();
             Server::new(stdin, stdout, socket).serve(service).await;
             tracing::info!("LSP server shut down (stdin closed)");
