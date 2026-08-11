@@ -17,6 +17,15 @@ use crate::commands::{Lang, LocEntry, LocFile, LocParseError, Position, key_to_l
 use crate::loc_string::parse_loc_elements;
 use std::sync::Arc;
 
+/// Longest loc value the `$ref$` / `[command]` scanner looks at, in bytes.
+///
+/// The longest value in the HOI4 base game, Millennium Dawn and Kaiserreich is
+/// under 8 KiB, so nothing real comes near this. Past it the entry still defines
+/// its key with its text and position intact; only the refs and commands it
+/// would have contributed are skipped, which is the work that scales with the
+/// value's length.
+pub const MAX_LOC_VALUE_BYTES: usize = 64 * 1024;
+
 // ---- UTF-8 BOM check -------------------------------------------------------
 
 /// UTF-8 byte-order mark bytes.
@@ -308,20 +317,28 @@ fn parse_entry(
     // elements extends all three collections instead of three filter_map
     // passes. The JominiCommand clone stays — it bridges the loc_string and
     // commands type boundary, which is unified separately.
-    let elements = parse_loc_elements(desc);
     let mut refs: Vec<String> = Vec::new();
     let mut commands: Vec<String> = Vec::new();
     let mut jomini_commands: Vec<Vec<crate::loc_string::JominiCommand>> = Vec::new();
-    for e in &elements {
-        match e {
-            crate::loc_string::LocElement::Ref(s) => refs.push(s.to_string()),
-            crate::loc_string::LocElement::Command(s) => commands.push(s.to_string()),
-            // Store the parsed chain directly — one JominiCommand type now, so
-            // nested command params are preserved rather than flattened away.
-            crate::loc_string::LocElement::JominiCommand(cmds) => {
-                jomini_commands.push(cmds.clone())
+    if desc.len() > MAX_LOC_VALUE_BYTES {
+        tracing::warn!(
+            key,
+            bytes = desc.len(),
+            cap = MAX_LOC_VALUE_BYTES,
+            "localisation value past the length cap; its refs and commands are not read"
+        );
+    } else {
+        for e in &parse_loc_elements(desc) {
+            match e {
+                crate::loc_string::LocElement::Ref(s) => refs.push(s.to_string()),
+                crate::loc_string::LocElement::Command(s) => commands.push(s.to_string()),
+                // Store the parsed chain directly — one JominiCommand type now, so
+                // nested command params are preserved rather than flattened away.
+                crate::loc_string::LocElement::JominiCommand(cmds) => {
+                    jomini_commands.push(cmds.clone())
+                }
+                crate::loc_string::LocElement::Chars(_) => {}
             }
-            crate::loc_string::LocElement::Chars(_) => {}
         }
     }
 
@@ -729,5 +746,33 @@ mod tests {
         let text = "l_english:\n key: \"[?my_var]\"\n";
         let file = parse_loc_text(text, "test.yml").unwrap();
         assert_eq!(file.entries[0].commands, vec!["?my_var"]);
+    }
+
+    #[test]
+    fn value_past_the_cap_keeps_its_key_and_skips_command_parsing() {
+        let long = "[GetName]".repeat(MAX_LOC_VALUE_BYTES / 9 + 1);
+        assert!(long.len() > MAX_LOC_VALUE_BYTES);
+        let text = format!("l_english:\n KEY_LONG: \"{long}\"\n");
+        let file = parse_loc_text(&text, "test_l_english.yml").unwrap();
+
+        // The key is still defined — dropping the entry would report every use
+        // of it as missing localisation.
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(file.entries[0].key, "KEY_LONG");
+        assert!(file.entries[0].desc.len() > MAX_LOC_VALUE_BYTES);
+        assert!(file.entries[0].commands.is_empty());
+        assert!(
+            file.parse_errors.is_empty(),
+            "the cap is not a parse error: {:?}",
+            file.parse_errors
+        );
+    }
+
+    #[test]
+    fn value_under_the_cap_still_reads_its_commands() {
+        let filler = "x".repeat(MAX_LOC_VALUE_BYTES - 32);
+        let text = format!("l_english:\n KEY_BIG: \"{filler}[GetName]\"\n");
+        let file = parse_loc_text(&text, "test_l_english.yml").unwrap();
+        assert_eq!(file.entries[0].commands, vec!["GetName"]);
     }
 }
