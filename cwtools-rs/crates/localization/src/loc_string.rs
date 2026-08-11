@@ -60,51 +60,75 @@ pub fn parse_loc_elements(s: &str) -> Vec<LocElement<'_>> {
     let mut elements = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0; // byte offset; always lands on a char boundary
+    // Start of the literal run being accumulated. Everything that is not a ref
+    // or a command joins it, so a line of stray brackets costs one element
+    // rather than one per bracket.
+    let mut literal_start: Option<usize> = None;
+    // Offsets of every `[` that never closes, descending, built the first time a
+    // bracket fails to parse. Retrying those is what made a run of `[`
+    // quadratic: each attempt scans to the end of the string before giving up.
+    // A value with balanced brackets never builds this and never allocates.
+    let mut unmatched: Option<Vec<usize>> = None;
 
     while i < bytes.len() {
-        match bytes[i] {
-            b'$' => {
-                if let Some((elem, new_i)) = parse_ref(s, i) {
-                    elements.push(elem);
-                    i = new_i;
-                } else {
-                    let end = next_special(s, i + 1);
-                    elements.push(LocElement::Chars(&s[i..end]));
-                    i = end;
+        let parsed = match bytes[i] {
+            b'$' => parse_ref(s, i),
+            b'[' if unmatched.as_ref().is_none_or(|u| u.last() != Some(&i)) => parse_bracket(s, i),
+            _ => None,
+        };
+
+        match parsed {
+            Some((elem, new_i)) => {
+                if let Some(start) = literal_start.take() {
+                    elements.push(LocElement::Chars(&s[start..i]));
                 }
+                elements.push(elem);
+                i = new_i;
             }
-            b'[' => {
-                if let Some((elem, new_i)) = parse_bracket(s, i) {
-                    elements.push(elem);
-                    i = new_i;
-                } else {
-                    let end = next_special(s, i + 1);
-                    elements.push(LocElement::Chars(&s[i..end]));
-                    i = end;
+            None => {
+                if bytes[i] == b'[' {
+                    let u = unmatched.get_or_insert_with(|| unmatched_opens(bytes));
+                    while u.last().is_some_and(|&p| p <= i) {
+                        u.pop();
+                    }
                 }
-            }
-            b']' => {
-                // A closing bracket with no matching open is literal text.
-                // It is special (so `next_special` stops on it); consume the
-                // single ASCII byte explicitly, otherwise the `_` arm below
-                // would make no progress and loop forever (OOM).
-                elements.push(LocElement::Chars("]"));
-                i += 1;
-            }
-            _ => {
-                // `bytes[i]` is a non-special byte at a char boundary, so
-                // `next_special(s, i)` returns a position strictly greater than
-                // `i` (it can't match at `i`) — the loop always advances, and
-                // `i` stays on a char boundary. Searching from `i + 1` would be
-                // unsafe: `i + 1` may fall inside a multi-byte UTF-8 sequence.
-                let end = next_special(s, i);
-                elements.push(LocElement::Chars(&s[i..end]));
-                i = end;
+                literal_start.get_or_insert(i);
+                // `next_special` only ever stops on an ASCII byte, so its result
+                // is a char boundary even when `i + 1` lands mid-sequence, and
+                // it is always past `i` — the loop cannot stall on a lone `]`.
+                i = next_special(s, i + 1);
             }
         }
     }
 
+    if let Some(start) = literal_start {
+        elements.push(LocElement::Chars(&s[start..]));
+    }
+
     elements
+}
+
+/// Byte offsets of every `[` with no matching `]`, in descending order.
+///
+/// One reverse pass: a `]` makes a closer available and a `[` takes one when it
+/// can, which pairs brackets exactly the way [`parse_bracket`]'s depth count
+/// does. So an offset listed here is one where `parse_bracket` would scan to the
+/// end of the string and fail. Descending order lets the caller pop from the
+/// back as it advances.
+fn unmatched_opens(bytes: &[u8]) -> Vec<usize> {
+    let mut unmatched = Vec::new();
+    let mut closers = 0usize;
+
+    for (i, &b) in bytes.iter().enumerate().rev() {
+        match b {
+            b']' => closers += 1,
+            b'[' if closers > 0 => closers -= 1,
+            b'[' => unmatched.push(i),
+            _ => {}
+        }
+    }
+
+    unmatched
 }
 
 /// Return the byte offset of the next `$`, `[`, or `]` at or after `start`,
@@ -494,6 +518,55 @@ mod tests {
     fn test_stray_currency_dollars_not_refs() {
         assert!(refs("$5 and $10").is_empty(), "{:?}", refs("$5 and $10"));
         assert!(refs("costs 100$ total").is_empty());
+    }
+
+    #[test]
+    fn test_unmatched_open_still_finds_the_command_after_it() {
+        // The `[` at 0 never closes, so it is text; the bracket at 2 does close
+        // and must still parse. Skipping a known-unmatched open must not skip
+        // the matched one that follows it.
+        let elems = parse_loc_elements("[[[GetName] tail");
+        assert_eq!(
+            elems,
+            vec![
+                LocElement::Chars("[["),
+                LocElement::Command("GetName"),
+                LocElement::Chars(" tail"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_literal_run_is_one_element() {
+        // Stray brackets and dollars are text. They used to be split into one
+        // element per byte, so a value of them cost 32 bytes of `LocElement` per
+        // character; they now join the run around them.
+        let elems = parse_loc_elements("a]]b[[c$$d");
+        assert_eq!(elems, vec![LocElement::Chars("a]]b[[c$$d")]);
+    }
+
+    #[test]
+    fn test_unmatched_bracket_run_parses_in_linear_time() {
+        // One mebibyte of `[`. Every one of them fails to parse, and each
+        // failure used to scan to the end of the string first: ~5.5e11 byte
+        // reads, minutes of CPU. Linear parsing is two passes over the bytes, a
+        // few milliseconds even unoptimised, so a five-second ceiling separates
+        // the two by ~100x on either side rather than racing the machine.
+        let s = "[".repeat(1 << 20);
+        let start = std::time::Instant::now();
+        let elems = parse_loc_elements(&s);
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            elems,
+            vec![LocElement::Chars(s.as_str())],
+            "the whole run is one literal"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "parsing {} unmatched brackets took {elapsed:?}",
+            s.len()
+        );
     }
 
     #[test]
