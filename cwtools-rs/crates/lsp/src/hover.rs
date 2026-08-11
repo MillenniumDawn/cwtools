@@ -452,7 +452,7 @@ pub(crate) fn append_type_localisation(
     if let Some(&i) = ruleset.type_by_name.get(type_name) {
         for loc in &ruleset.types[i].localisation {
             if loc.explicit_field.is_none() && (loc.primary || loc.required) {
-                keys.push(format!("{}{}{}", loc.prefix, value, loc.suffix).to_ascii_lowercase());
+                keys.push(loc.derived_key(value).to_ascii_lowercase());
             }
         }
     }

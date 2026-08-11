@@ -743,6 +743,24 @@ pub struct TypeLocalisation {
     pub primary: bool,
 }
 
+impl TypeLocalisation {
+    /// Whether this declares a key CW100 can flag: `## required`, not
+    /// `## optional`, and derived from the instance name rather than a child
+    /// field. This is what "missing localisation" means; the loc-display paths
+    /// (hover, graph labels) use a wider `primary || required` test instead.
+    pub fn is_required_name_derived(&self) -> bool {
+        self.required && !self.optional && self.explicit_field.is_none()
+    }
+
+    /// The key this definition derives for an instance called `name`. Only
+    /// meaningful when `explicit_field` is unset, where the key comes from a
+    /// child field's value instead. Case is left alone; the loc index is
+    /// lowercased, so callers comparing against it lowercase the result.
+    pub fn derived_key(&self, name: &str) -> String {
+        format!("{}{}{}", self.prefix, name, self.suffix)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeModifier {
     pub prefix: String,
