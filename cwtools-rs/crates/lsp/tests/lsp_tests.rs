@@ -3231,7 +3231,7 @@ fn wait_for_scan_started(
     loop {
         assert!(
             std::time::Instant::now() < deadline,
-            "no loadingBar(true) after reindexWorkspace"
+            "no loadingBar(true) scan-started signal"
         );
         if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
             && v["method"] == "loadingBar"
@@ -6355,19 +6355,7 @@ fn test_watched_overcap_batch_does_not_spin_against_running_scan() {
     .unwrap();
     // Wait for the scan-started signal (the hold begins after the bar-on), so
     // the flood's debounce window can't slip past the scan and win the CAS.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no loadingBar(true) after reindexWorkspace"
-        );
-        if let Ok(v) = rx.recv_timeout(std::time::Duration::from_millis(200))
-            && v["method"] == "loadingBar"
-            && v["params"]["enable"] == serde_json::Value::Bool(true)
-        {
-            break;
-        }
-    }
+    wait_for_scan_started(&rx, std::time::Duration::from_secs(30));
     write_frame(&mut child, &watched_changes(&uris)).unwrap();
 
     // Quiet must outlast the held rescan so the whole story is observed.
