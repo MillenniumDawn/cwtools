@@ -724,9 +724,7 @@ impl Backend {
             if let Some(&i) = ruleset.type_by_name.get(&node.entity_type) {
                 for loc in &ruleset.types[i].localisation {
                     if loc.explicit_field.is_none() && (loc.primary || loc.required) {
-                        keys.push(
-                            format!("{}{}{}", loc.prefix, node.id, loc.suffix).to_ascii_lowercase(),
-                        );
+                        keys.push(loc.derived_key(&node.id).to_ascii_lowercase());
                     }
                 }
             }

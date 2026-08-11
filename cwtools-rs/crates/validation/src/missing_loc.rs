@@ -19,7 +19,7 @@ use cwtools_error_codes as error_codes;
 fn has_required_name_loc(td: &TypeDefinition) -> bool {
     td.localisation
         .iter()
-        .any(|loc| loc.required && !loc.optional && loc.explicit_field.is_none())
+        .any(|loc| loc.is_required_name_derived())
 }
 
 /// Flag indexed instances whose `## required` localisation keys are not
@@ -55,12 +55,10 @@ pub fn check_missing_localisation(
                 continue;
             }
             for loc in &td.localisation {
-                // Only required, name-derived keys (`prefix$suffix`). `optional`
-                // and field-derived (`explicit_field`) forms are not flagged.
-                if !loc.required || loc.optional || loc.explicit_field.is_some() {
+                if !loc.is_required_name_derived() {
                     continue;
                 }
-                let expected = format!("{}{}{}", loc.prefix, inst.name, loc.suffix);
+                let expected = loc.derived_key(&inst.name);
                 if !loc_exists(&expected.to_ascii_lowercase()) {
                     let fix = SuggestedFix::create_loc_key(
                         format!("Create localisation key {expected}"),

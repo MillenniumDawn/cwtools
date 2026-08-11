@@ -1244,11 +1244,11 @@ impl Backend {
             }
             for (_uri, inst) in info.type_index.instances(&td.name) {
                 for locdef in &td.localisation {
-                    // Only required, name-derived keys — mirrors check_missing_localisation.
-                    if !locdef.required || locdef.optional || locdef.explicit_field.is_some() {
+                    // Mirrors check_missing_localisation.
+                    if !locdef.is_required_name_derived() {
                         continue;
                     }
-                    let expected = format!("{}{}{}", locdef.prefix, inst.name, locdef.suffix);
+                    let expected = locdef.derived_key(&inst.name);
                     if !exists(&expected.to_ascii_lowercase()) {
                         missing.insert(expected);
                     }
