@@ -2422,6 +2422,8 @@ decision = {
     ## cardinality = 0..1
     complete_special_project = scope[special_project]
     ## cardinality = 0..1
+    terrain = enum[terrain]
+    ## cardinality = 0..1
     available = {
         alias_name[trigger] = alias_match_left[trigger]
     }
@@ -2449,6 +2451,12 @@ single_alias[country_event_effect] = {
     ## cardinality = 0..inf
     effect = {
         alias_name[effect] = alias_match_left[effect]
+    }
+}
+enums = {
+    enum[terrain] = {
+        plains
+        forest
     }
 }
 "#;
@@ -2604,6 +2612,29 @@ fn test_goto_quoted_oob_value() {
     assert!(
         locs.iter().any(|(u, _)| u.ends_with("units/o.txt")),
         "goto should resolve quoted oob def, got: {:?}",
+        locs
+    );
+}
+
+#[test]
+fn test_goto_enum_value_lands_on_the_config_member() {
+    // terrain = forest — an enum member has no definition in the game files,
+    // so goto jumps to the member inside `enum[terrain]` in the rules folder.
+    let files = &[(
+        "common/decisions/d.txt",
+        "my_dec = {\n    terrain = forest\n}\n",
+    )];
+    // Cursor on `forest` (line 1, col 15).
+    let locs = goto_def(GOTO_RULES, &[], files, "common/decisions/d.txt", 1, 15);
+    let member_line = GOTO_RULES
+        .lines()
+        .position(|l| l.trim() == "forest")
+        .expect("the enum member") as u32;
+    assert!(
+        locs.iter()
+            .any(|(u, l)| u.ends_with("test_rules.cwt") && *l == member_line),
+        "goto should land on the enum member at line {}, got: {:?}",
+        member_line,
         locs
     );
 }
