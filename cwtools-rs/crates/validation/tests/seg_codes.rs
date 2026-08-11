@@ -21,6 +21,15 @@ fn errors_hoi4_with_index(
     script: &str,
     type_index: Option<&TypeIndex>,
 ) -> Vec<cwtools_validation::ValidationError> {
+    errors_hoi4_at(cwt, "game/common/foo/test.txt", script, type_index)
+}
+
+fn errors_hoi4_at(
+    cwt: &str,
+    path: &str,
+    script: &str,
+    type_index: Option<&TypeIndex>,
+) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
     let parsed_cwt = parse_string(cwt, &table).unwrap();
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
@@ -28,7 +37,7 @@ fn errors_hoi4_with_index(
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     validate_prepared(
         &parsed,
-        "game/common/foo/test.txt",
+        path,
         &Prepared {
             ruleset: &ruleset,
             table: &table,
@@ -46,6 +55,13 @@ fn errors_hoi4_with_index(
 
 fn codes_hoi4(cwt: &str, script: &str) -> Vec<String> {
     errors_hoi4(cwt, script)
+        .into_iter()
+        .filter_map(|e| e.code.map(String::from))
+        .collect()
+}
+
+fn codes_hoi4_at(cwt: &str, path: &str, script: &str) -> Vec<String> {
+    errors_hoi4_at(cwt, path, script, None)
         .into_iter()
         .filter_map(|e| e.code.map(String::from))
         .collect()
@@ -561,4 +577,116 @@ fn random_list_weight_keeps_current_scope() {
         "country_only in random_list weight should be clean: {:?}",
         c
     );
+}
+
+/// An event's `## push_scope` must seed ROOT, not just the current scope: a
+/// `ROOT = { … }` block inside a `unit_leader_event` (push_scope = any, for
+/// HOI4's hybrid country/leader event scope) must not be scope-checked against
+/// the country default. Regression for the CW105 false positive on
+/// `ROOT = { add_max_trait = 1 }` (issue #152); `state_event` shares the hybrid
+/// and the bug.
+const EVENT_ROOT_SCOPE_RULES: &str = r#"
+scopes = {
+    Country = { aliases = { country } }
+    State = { aliases = { state } }
+    Character = { aliases = { character } }
+    "Unit Leader" = { aliases = { unit_leader } }
+}
+types = {
+    type[event] = {
+        path = "game/events"
+        name_field = "id"
+        ## type_key_filter = country_event
+        ## push_scope = country
+        subtype[country_event] = {
+        }
+        ## type_key_filter = unit_leader_event
+        ## push_scope = any
+        subtype[unit_leader_event] = {
+        }
+        ## type_key_filter = state_event
+        ## push_scope = any
+        subtype[state_event] = {
+        }
+        subtype[hidden] = {
+            hidden = yes
+        }
+        ## only_if_not = hidden
+        subtype[visible] = {
+        }
+    }
+}
+event = {
+    id = scalar
+    subtype[hidden] = {
+        title = scalar
+        desc = scalar
+    }
+    subtype[visible] = {
+        title = localisation
+        desc = localisation
+    }
+    ## cardinality = 0..1
+    is_triggered_only = yes
+    ## cardinality = 0..inf
+    option = {
+        alias_name[effect] = alias_match_left[effect]
+    }
+}
+## scope = { character unit_leader }
+alias[effect:add_max_trait] = int
+## scope = country
+alias[effect:country_effect] = bool
+## scope = state
+alias[effect:state_effect] = bool
+alias[effect:scope_field] = {
+    alias_name[effect] = alias_match_left[effect]
+}
+"#;
+
+#[test]
+fn unit_leader_event_root_is_lenient() {
+    // unit_leader_event: push_scope = any -> ROOT is the wildcard, so a
+    // unit_leader-only effect inside ROOT must stay clean (was "In country").
+    let c = codes_hoi4_at(
+        EVENT_ROOT_SCOPE_RULES,
+        "game/events/test.txt",
+        "unit_leader_event = {\n\tid = evt.1\n\tis_triggered_only = yes\n\toption = {\n\t\tROOT = {\n\t\t\tadd_max_trait = 1\n\t\t}\n\t}\n}\n",
+    );
+    assert!(!c.contains(&"CW105".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn state_event_root_is_lenient() {
+    // state_event shares the hybrid: ROOT must be the wildcard, not country.
+    let c = codes_hoi4_at(
+        EVENT_ROOT_SCOPE_RULES,
+        "game/events/test.txt",
+        "state_event = {\n\tid = evt.2\n\tis_triggered_only = yes\n\toption = {\n\t\tROOT = {\n\t\t\tstate_effect = yes\n\t\t}\n\t}\n}\n",
+    );
+    assert!(!c.contains(&"CW105".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn country_event_root_still_checked() {
+    // country_event: push_scope = country -> ROOT = country, so a
+    // unit_leader-only effect inside ROOT must still fire CW105.
+    let c = codes_hoi4_at(
+        EVENT_ROOT_SCOPE_RULES,
+        "game/events/test.txt",
+        "country_event = {\n\tid = evt.3\n\tis_triggered_only = yes\n\toption = {\n\t\tROOT = {\n\t\t\tadd_max_trait = 1\n\t\t}\n\t}\n}\n",
+    );
+    assert!(c.contains(&"CW105".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn hybrid_event_accepts_country_effects_at_root() {
+    // The hybrid event scope is lenient both ways: a country-only effect inside
+    // ROOT of a unit_leader_event is valid too.
+    let c = codes_hoi4_at(
+        EVENT_ROOT_SCOPE_RULES,
+        "game/events/test.txt",
+        "unit_leader_event = {\n\tid = evt.4\n\tis_triggered_only = yes\n\toption = {\n\t\tcountry_effect = yes\n\t\tROOT = {\n\t\t\tcountry_effect = yes\n\t\t}\n\t}\n}\n",
+    );
+    assert!(!c.contains(&"CW105".to_string()), "got: {:?}", c);
 }
