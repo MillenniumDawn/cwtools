@@ -2,7 +2,7 @@ use crate::post_process::post_process;
 #[cfg(test)]
 use crate::rules_converter::ast_to_ruleset;
 use crate::rules_converter::{ast_to_ruleset_raw, validate_comment_directives};
-use crate::rules_types::RuleSet;
+use crate::rules_types::{CwtDefKind, RuleSet};
 use cwtools_file_manager::file_manager::{ScanBudget, ScanBytes, read_text_capped};
 use cwtools_parser::ast::ParseError;
 use cwtools_parser::parser::parse_string;
@@ -40,6 +40,27 @@ fn directory_read_error(dir: &Path, error: std::io::Error) -> RuleParseError {
         line: 1,
         col: 0,
         message: format!("read directory error: {error}"),
+    }
+}
+
+/// Place an unexpanded `single_alias` reference on its own definition, so the
+/// diagnostic lands where the fix goes. Falls back to the rules directory when
+/// the definition has no recorded position (nothing defines it, or the ruleset
+/// was built by hand).
+fn alias_expansion_error(
+    dir: &Path,
+    ruleset: &RuleSet,
+    error: crate::post_process::AliasExpansionError,
+) -> RuleParseError {
+    let position = ruleset
+        .def_positions
+        .iter()
+        .find(|p| p.kind == CwtDefKind::SingleAlias && p.name == error.name);
+    RuleParseError {
+        file: position.map_or_else(|| dir.to_path_buf(), |p| p.file.clone()),
+        line: position.map_or(1, |p| p.line),
+        col: position.map_or(0, |p| p.col),
+        message: error.message,
     }
 }
 
@@ -206,8 +227,15 @@ pub fn load_ruleset_from_dir(
     }
 
     // Run the post-processing pipeline once all files have been merged so that
-    // cross-file single_alias references are fully resolved.
-    post_process(&mut combined);
+    // cross-file single_alias references are fully resolved. Anything expansion
+    // refused (a cycle, a chain past the depth limit, the node budget) comes
+    // back as a diagnostic on the definition it names.
+    let refused = post_process(&mut combined);
+    errors.extend(
+        refused
+            .into_iter()
+            .map(|error| alias_expansion_error(dir, &combined, error)),
+    );
 
     // Build alias lookup indexes last — alias names/order are stable after this.
     combined.reindex();
@@ -272,6 +300,30 @@ mod tests {
             !names.contains(&"link.cwt".to_string()),
             "symlinked .cwt file must be rejected: {names:?}"
         );
+    }
+
+    /// A `single_alias` expansion the post-processor refuses has to reach the
+    /// caller like any other rules problem, on the definition it names rather
+    /// than on the directory, so the editor can point at the line to fix.
+    #[test]
+    fn load_ruleset_from_dir_reports_unexpanded_single_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("cycle.cwt"),
+            "single_alias[loop_a] = {\n    x = single_alias_right[loop_b]\n}\n\
+             single_alias[loop_b] = {\n    y = single_alias_right[loop_a]\n}\n",
+        )
+        .unwrap();
+
+        let table = StringTable::new();
+        let (_, errors) = load_ruleset_from_dir(tmp.path(), &table, ScanBudget::default());
+
+        let cycle = errors
+            .iter()
+            .find(|e| e.message.contains("reference cycle"))
+            .unwrap_or_else(|| panic!("no cycle diagnostic in {errors:?}"));
+        assert!(cycle.file.ends_with("cycle.cwt"), "error: {cycle}");
+        assert_eq!(cycle.line, 1, "error: {cycle}");
     }
 
     /// A `.cwt` file over the per-file cap must be skipped, not read to EOF.
