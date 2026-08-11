@@ -5,15 +5,13 @@
 //! surface as a `CacheError`, which is what `cwtools_cache::workspace::load`
 //! collapses to a re-parse.
 
-use cwtools_cache::io::{self, decode_capped, read_capped};
+use cwtools_cache::io::{
+    self, MAX_ARCHIVE_DECODED_BYTES, MAX_ARCHIVE_FILE_BYTES, MAX_ERRORS_FILE_BYTES, decode_capped,
+    read_capped,
+};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-
-// Mirrors of the caps in `cwtools_cache::io`, which are private to it.
-const MAX_ARCHIVE_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_ARCHIVE_DECODED_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_ERRORS_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 const MAGIC: [u8; 4] = *b"CWB\x00";
 const FORMAT_VERSION: u8 = 3;
@@ -117,6 +115,41 @@ fn a_directory_is_refused() {
     assert!(io::with_archived_file(tmp.path(), |_| ()).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn a_symlink_is_followed_to_whatever_it_points_at() {
+    // Deliberately unlike `vanilla_cache::is_cache_file`, which refuses a
+    // symlink because it guards a delete. This guards a read, and a cache kept
+    // outside the cache dir and linked in is a reasonable thing to do, so the
+    // gate has to judge the target rather than the link.
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("real");
+    std::fs::write(&target, b"cache bytes").unwrap();
+    let to_file = tmp.path().join("to-file");
+    let to_device = tmp.path().join("to-device");
+    std::os::unix::fs::symlink(&target, &to_file).unwrap();
+    std::os::unix::fs::symlink("/dev/zero", &to_device).unwrap();
+
+    assert_eq!(read_capped(&to_file, 1024).unwrap(), b"cache bytes");
+    let err = read_capped(&to_device, 1024).unwrap_err();
+    assert!(err.to_string().contains("not a regular file"), "{err}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_whose_length_reads_as_zero_is_still_capped() {
+    // The cap is judged on the bytes that arrive, never on the reported length,
+    // which is what holds when a file grows between the stat and the read. A
+    // procfs entry is the deterministic version of that: a regular file that
+    // reports zero bytes and then hands over real content.
+    let status = Path::new("/proc/self/status");
+    assert_eq!(std::fs::metadata(status).unwrap().len(), 0);
+
+    let err = read_capped(status, 16).unwrap_err();
+    assert!(err.to_string().contains("cache read cap"), "{err}");
+    assert!(read_capped(status, 1024 * 1024).unwrap().len() > 16);
+}
+
 #[test]
 fn read_capped_accepts_a_file_exactly_at_the_cap() {
     // The cap is inclusive. Nothing else here would notice `>` turning into
@@ -205,6 +238,26 @@ fn decode_capped_accepts_a_body_declaring_exactly_the_cap() {
     decode_capped(&declared_frame(CAP as usize), CAP, &mut out)
         .expect("a declared body of exactly the cap must decode");
     assert_eq!(out.len() as u64, CAP);
+}
+
+#[test]
+fn decode_capped_bounds_frames_the_header_check_never_saw() {
+    // The declared size covers the first frame only, and zstd decodes a
+    // concatenation of them. A small honest frame in front of a bomb therefore
+    // walks straight past the header check, and the streaming bound is all
+    // that is left. This is why that check can only ever short-circuit.
+    const CAP: u64 = 64 * 1024;
+    let mut stacked = declared_frame(16);
+    stacked.extend_from_slice(&undeclared_frame(CAP as usize));
+
+    let mut out = Vec::new();
+    let err = decode_capped(&stacked, CAP, &mut out).unwrap_err();
+    assert!(err.to_string().contains("decompresses past"), "{err}");
+    assert!(
+        out.len() as u64 <= CAP,
+        "the buffer must never grow past the cap, got {}",
+        out.len()
+    );
 }
 
 #[test]

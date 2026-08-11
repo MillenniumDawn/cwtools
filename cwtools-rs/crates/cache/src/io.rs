@@ -56,13 +56,13 @@ const ERRORS_FORMAT_VERSION: u8 = 1;
 /// produces is 5 MiB compressed / 21 MiB decoded (Kaiserreich's 11 MB
 /// `map/unitstacks.txt`), so these leave an order of magnitude of headroom, and
 /// going over is a cache miss, which the caller answers by re-parsing.
-const MAX_ARCHIVE_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_ARCHIVE_DECODED_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_ARCHIVE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_ARCHIVE_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Cap on a `.cwe` sidecar. Uncompressed rkyv, and it only ever holds one file's
 /// recovered parse errors. The largest in a full Millennium Dawn cache is 81
 /// bytes.
-const MAX_ERRORS_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_ERRORS_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Read `path` into memory, refusing anything that is not a regular file or that
 /// runs past `max_bytes`.
