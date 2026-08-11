@@ -670,6 +670,53 @@ impl Backend {
         changed
     }
 
+    /// Re-record `uri`'s `<type>` uses from an AST the caller holds, queueing the
+    /// names whose used-status moved for the dependent sweep. For a path that
+    /// replaces a file's content without validating it (`did_close` restoring the
+    /// disk AST over a discarded buffer), where the stored entry would otherwise
+    /// keep describing text that never reached disk (#133).
+    ///
+    /// The diagnostics this pass produces are dropped: the file isn't open, so
+    /// nothing publishes them, and only the uses are wanted. The unsaved-loc-key
+    /// overlay is left out for the same reason. It steers the loc checks alone,
+    /// not which instances a file references.
+    pub(crate) fn refresh_type_uses_from_parsed(&self, uri: &str, parsed: &ParsedFile) {
+        let game = self.state.config.read().game();
+        let rules_guard = self.state.rules.read();
+        let Some(ruleset) = rules_guard.ruleset.as_ref() else {
+            return;
+        };
+        if !needs_use_tracking(ruleset, game) {
+            return;
+        }
+        let info_guard = self.state.info_service.read();
+        let loc_guard = self.state.loc_index.read();
+        let (scope_checks, var_checks) = {
+            let cfg = self.state.config.read();
+            (cfg.scope_checks, cfg.var_checks)
+        };
+        let prepared = make_prepared(
+            ruleset,
+            &self.state.string_table,
+            game,
+            &info_guard.type_index,
+            &rules_guard.modifier_keys,
+            loc_guard.as_ref(),
+            None,
+            rules_guard.scope_registry.as_ref(),
+            scope_checks,
+            var_checks,
+        );
+        let (_, used) = validate_prepared_tracking_uses(parsed, uri, &prepared);
+        drop(loc_guard);
+        drop(info_guard);
+        drop(rules_guard);
+        let changed = self.refresh_type_uses(uri, used);
+        if !changed.is_empty() {
+            self.state.pending_changed_names.lock().extend(changed);
+        }
+    }
+
     /// The union of every file's recorded uses — what the batch driver folds
     /// per run, kept as a cache keyed on `type_uses_revision` here because the
     /// LSP needs it per validated file rather than once.
