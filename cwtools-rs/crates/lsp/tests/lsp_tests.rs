@@ -6165,6 +6165,57 @@ fn test_watched_distinct_files_each_validate_once() {
     }
 }
 
+/// #177: a watched event is client-supplied, so it goes through the same access
+/// boundary as a request URI, and that boundary now applies the discovery walks'
+/// symlink rule. The link here resolves back inside the workspace, so canonical
+/// containment alone would wave it through: before the boundary tested the leaf
+/// itself, touching it read, parsed, INDEXED and published diagnostics for a
+/// file the startup scan had deliberately skipped (#161), which is also the file
+/// `fixAllWorkspace` refuses to touch.
+#[cfg(unix)]
+#[test]
+fn test_watched_change_on_a_symlink_neither_validates_nor_publishes() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let real_uri = write_disk_file(ws.path(), "common/decisions/real.txt", STORM_FILE);
+    let link = ws.path().join("common/decisions/linked.txt");
+    std::os::unix::fs::symlink(link.with_file_name("real.txt"), &link).unwrap();
+    let link_uri = path_uri(&link);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(&mut child, &watched_changes(&[real_uri, link_uri])).unwrap();
+
+    let frames = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(10),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1003);
+    child.kill().ok();
+
+    // The real file is the precondition: without it a boundary that refused
+    // everything would pass this test too.
+    assert_eq!(
+        count_publishes(&frames, "real.txt"),
+        1,
+        "the real file behind the link must still validate and publish"
+    );
+    assert_eq!(
+        count_validate_log(&log, "watched"),
+        1,
+        "only the real file may validate, got: {log}"
+    );
+    assert_eq!(
+        count_publishes(&frames, "linked.txt"),
+        0,
+        "the symlink must publish nothing, got: {frames:?}"
+    );
+}
+
 #[test]
 fn test_watched_bulk_flood_uses_rescan_not_per_file() {
     // More than WATCHED_BULK_CAP (200) distinct CHANGED events collapse into a
