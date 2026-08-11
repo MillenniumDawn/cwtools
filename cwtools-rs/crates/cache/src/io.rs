@@ -49,6 +49,102 @@ const FORMAT_VERSION: u8 = 3;
 const ERRORS_MAGIC: &[u8; 4] = b"CWE\x00";
 const ERRORS_FORMAT_VERSION: u8 = 1;
 
+/// Hard caps on a `.cwb` read and on what its body may decompress to. A cache
+/// path is chosen by a CLI flag or an LSP client (#162), so neither the read nor
+/// the decode may run unbounded: a few kilobytes of magic-prefixed zstd can
+/// otherwise expand until the process dies. The biggest `.cwb` the pinned corpus
+/// produces is 5 MiB compressed / 21 MiB decoded (Kaiserreich's 11 MB
+/// `map/unitstacks.txt`), so these leave an order of magnitude of headroom, and
+/// going over is a cache miss, which the caller answers by re-parsing.
+pub const MAX_ARCHIVE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_ARCHIVE_DECODED_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Cap on a `.cwe` sidecar. Uncompressed rkyv, and it only ever holds one file's
+/// recovered parse errors. The largest in a full Millennium Dawn cache is 81
+/// bytes.
+pub const MAX_ERRORS_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read `path` into memory, refusing anything that is not a regular file or that
+/// runs past `max_bytes`.
+///
+/// The `is_file` gate is what actually refuses `/dev/zero`: a character device
+/// reports length 0, so a size check alone waves it through and then reads to
+/// EOF. `take` bounds the allocation as well as the read, so a file that grows
+/// between the stat and the read still cannot outrun the cap.
+pub fn read_capped(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut data = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut data)?;
+    if data.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is over the {max_bytes} byte cache read cap",
+                path.display()
+            ),
+        ));
+    }
+    Ok(data)
+}
+
+/// Decompress `compressed` into `out`, refusing to write past `max_bytes`.
+///
+/// The frame's declared content size gets a look first, so an honestly-labelled
+/// oversized body is rejected before any work. That field is optional and comes
+/// from whoever wrote the file, though, so it only ever short-circuits: the
+/// bound that holds is the write side, which errors on the first chunk that
+/// would cross the cap, before `out` grows to hold it.
+pub fn decode_capped<W: Write>(compressed: &[u8], max_bytes: u64, out: W) -> std::io::Result<()> {
+    if let Ok(Some(declared)) = zstd::zstd_safe::get_frame_content_size(compressed)
+        && declared > max_bytes
+    {
+        return Err(over_decode_cap(max_bytes));
+    }
+    zstd::stream::copy_decode(
+        compressed,
+        CappedWriter {
+            inner: out,
+            remaining: max_bytes,
+            max: max_bytes,
+        },
+    )
+}
+
+fn over_decode_cap(max_bytes: u64) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("cache body decompresses past the {max_bytes} byte cap"),
+    )
+}
+
+struct CappedWriter<W> {
+    inner: W,
+    remaining: u64,
+    max: u64,
+}
+
+impl<W: Write> Write for CappedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() as u64 > self.remaining {
+            return Err(over_decode_cap(self.max));
+        }
+        let written = self.inner.write(buf)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -119,9 +215,7 @@ pub fn serialize_to_file(cached: &CachedFile, path: &Path) -> Result<(), CacheEr
 /// Read a `.cwb` file, validate its header, and return the decompressed rkyv
 /// bytes in an aligned buffer suitable for archived access.
 fn read_archive_bytes(path: &Path) -> Result<rkyv::util::AlignedVec, CacheError> {
-    let mut file = File::open(path)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    let data = read_capped(path, MAX_ARCHIVE_FILE_BYTES)?;
 
     // Validate magic + version header. Reject anything written before this
     // header was added (or by a future incompatible version) rather than
@@ -138,7 +232,8 @@ fn read_archive_bytes(path: &Path) -> Result<rkyv::util::AlignedVec, CacheError>
     let compressed = &data[MAGIC.len() + 1..];
 
     let mut aligned = rkyv::util::AlignedVec::new();
-    zstd::stream::copy_decode(compressed, &mut aligned).map_err(CacheError::Compression)?;
+    decode_capped(compressed, MAX_ARCHIVE_DECODED_BYTES, &mut aligned)
+        .map_err(CacheError::Compression)?;
     Ok(aligned)
 }
 
@@ -173,7 +268,7 @@ pub fn serialize_errors_to_file(cached: &CachedErrors, path: &Path) -> Result<()
 
 /// Read and validate a recovered-parse-error sidecar.
 pub fn read_errors_from_file(path: &Path) -> Result<CachedErrors, CacheError> {
-    let data = std::fs::read(path)?;
+    let data = read_capped(path, MAX_ERRORS_FILE_BYTES)?;
     if data.len() < ERRORS_MAGIC.len() + 1
         || &data[..ERRORS_MAGIC.len()] != ERRORS_MAGIC
         || data[ERRORS_MAGIC.len()] != ERRORS_FORMAT_VERSION
