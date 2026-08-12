@@ -5,7 +5,7 @@ on:
   # manual fallback for re-runs (off a tag ref it builds but skips publish).
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 # Never cancel an in-flight release; queue instead.
@@ -39,6 +39,9 @@ jobs:
             label: macOS arm64
             artifact: cwtools-rs-macos-arm64
             strip: true
+          # Windows is already stripped by [profile.release] strip = true
+          # (rustc/LLVM). The post-build `strip` binary is a Unix-only extra
+          # pass, so the matrix flag stays false here.
           - os: windows-latest
             label: Windows x86_64
             artifact: cwtools-rs-windows-x86_64
@@ -105,7 +108,8 @@ jobs:
               )
             }
             if ('${{ matrix.strip }}' -eq 'true') {
-              # strip on Linux/macOS
+              # Extra Unix pass on top of cargo's release strip. Skipped on
+              # Windows: no GNU strip on the runner; cargo already stripped.
               & strip $src
             }
             Copy-Item $src "dist/${bin}${ext}"
