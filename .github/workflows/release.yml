@@ -25,12 +25,13 @@ env:
 jobs:
   # -------------------------------------------------------------------------
   # A v* tag is the only authorization this workflow gets, so check that the
-  # tag actually points into protected main before anything builds or ships.
+  # tag points into protected main and carries a tagger (annotated, not a bare
+  # ref) before anything builds or ships.
   # Defense in depth only: the real control is a ruleset on refs/tags/v* that
   # stops an unauthorized tag from being created in the first place (#158).
   # -------------------------------------------------------------------------
   verify-tag-ancestry:
-    name: Verify tag is on main
+    name: Verify release tag
     runs-on: ubuntu-latest
     steps:
       # fetch-depth: 0 is load-bearing. merge-base --is-ancestor on a shallow
@@ -71,6 +72,25 @@ jobs:
             exit 1
           fi
           echo "tag ${TAG} -> ${commit} is an ancestor of origin/main"
+
+      # A lightweight tag is a bare ref: no tagger, no date, nothing to sign.
+      # Requiring the annotated form is what makes the signing policy possible
+      # at all (`git tag -s -a vX.Y.Z`). Whether a signature is *trusted* is
+      # the ruleset's call, not this job's: the runner has no key material.
+      - name: Tag must be annotated
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          objtype="$(git cat-file -t "refs/tags/${TAG}")"
+          if [ "$objtype" != "tag" ]; then
+            echo "::error::tag ${TAG} is a ${objtype}, not an annotated tag;" \
+              "cut release tags with git tag -s -a ${TAG} -m ${TAG}"
+            exit 1
+          fi
+          echo "tag ${TAG} is an annotated tag object"
 
   # -------------------------------------------------------------------------
   # Rust — matrix across all three platforms
