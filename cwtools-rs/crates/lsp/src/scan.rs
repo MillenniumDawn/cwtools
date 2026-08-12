@@ -518,7 +518,7 @@ impl Backend {
             // checks fire (they're gated on `complete` to avoid false
             // positives during mod-only validation). The driver's Session
             // sets this for the CLI path; the LSP merges vanilla directly and
-            // must set it here too. See rule_core.rs gate on `idx.complete`.
+            // must set it here too. See rule_core/leaf.rs gate on `idx.complete`.
             info_guard.type_index.complete = true;
             // `vanilla_index` is now None — mark it merged so
             // ensure_vanilla_index does not re-run on the next scan.

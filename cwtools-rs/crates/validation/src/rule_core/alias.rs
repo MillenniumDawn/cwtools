@@ -70,7 +70,7 @@ pub(crate) fn alias_overloads<'a>(
 /// Push order is exact → lowercase → patterns → scope_field. Validation
 /// coalesces fully equivalent candidates while the set is small; navigation
 /// retains every candidate. The scope check filters to the confident subset,
-/// preserving order for `pick_best`'s tie-break.
+/// preserving order for `pick_best_candidate`'s tie-break.
 ///
 /// A usage resolves to a handful of overloads at most, and this runs for every
 /// effect/trigger in the corpus, so the set is inline until it doesn't fit.
@@ -624,8 +624,8 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
     /// branches evaluated to produce them.
     fn branches_for(depth: usize) -> (Vec<ValidationError>, usize) {
         let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(RECURSIVE_RULES, &table).unwrap(), &table);
-        let parsed = parse_string(&recursive_script(depth), &table).unwrap();
+        let ruleset = ast_to_ruleset(&parse_string(RECURSIVE_RULES, &table), &table);
+        let parsed = parse_string(&recursive_script(depth), &table);
         let registry = build_scope_registry_arc(&ruleset, None);
         let prepared = Prepared {
             ruleset: &ruleset,

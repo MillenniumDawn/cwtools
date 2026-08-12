@@ -36,7 +36,7 @@ pub fn path_contains_segment(haystack: &str, needle: &str) -> bool {
 }
 
 /// The one per-pattern directory test shared by the indexer (`check_path_dir`)
-/// and the validator (`find_type_by_path_and_key` / `type_path_matches`).
+/// and the validator (`find_type_by_path_and_key`).
 /// `path_strict` means the file sits DIRECTLY in the pattern directory: the dir
 /// must equal the pattern or end with `/<pattern>` (so base-game content nested
 /// under `dlc/<id>/…` still matches). Non-strict allows the pattern anywhere as
