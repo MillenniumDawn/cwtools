@@ -172,17 +172,32 @@ There is no central registry to update. Three edits:
 
 ## Module layouts (the split god-files)
 
-The four largest areas are directory modules, each a thin `mod`/`lib` over focused files:
+The largest areas are directory modules, each a thin `mod`/`lib` over focused files:
 
 - `validation/src/rule_core/`: the `.cwt` rule engine (`matching`, `children`,
-  `leaf`, `alias`, `subtype_merge`, `suggest`, `mod`). The biggest of the four.
+  `leaf`, `alias`, `subtype_merge`, `suggest`, `mod`). The biggest of the set.
 - `game/src/scope_engine/`: `engine` (`ScopeId`/`ScopeContext`/transitions) vs
   `links` (per-game hardcoded link tables), over `mod`.
-- `lsp/src/completion/`: `builders` (item construction), `snippets`, `scope_names`,
-  `cwt` (completion inside the rules files themselves), `loc_keys` (the
-  prefix-searchable view of the loc-key union), `resolve` (lazy
-  `completionItem/resolve`: documentation and detail filled in for the one item
-  the editor focuses, kept out of the initial list), over `mod`.
+- `lsp/src/completion/`: `request` (the `textDocument/completion` handler),
+  `builders` (item construction), `filter` (ranking and subsequence prefilter),
+  `snippets`, `scope_names`, `cwt` (completion inside the rules files
+  themselves), `loc_keys` (the prefix-searchable view of the loc-key union),
+  `resolve` (lazy `completionItem/resolve`), over `mod`.
+- `lsp/src/code_action/`: `payload` (Diagnostic.data codec + document quickfix),
+  `create_loc_key` (CW100), `fix_all` (`fixAllWorkspace`), over `mod`.
+- `lsp/src/scan/`: `workspace` (the full scan), `reindex` (the quiet background
+  pass), `loc` (loc rebuild + display collection), `vanilla` (base-game indexing
+  and its loc memo), `watched` (`didChangeWatchedFiles` coalescing), over a `mod`
+  that keeps the shared guards, constants and stat-signature helpers.
+- `lsp/src/navigation/`: `goto`, `references`, `rename`, `symbols`, `structure`
+  (folding/selection), `use_sites` (the use-site scan) and `helpers` (the shared
+  range/symbol utilities), over a thin `mod`.
+- `lsp/src/state.rs`: `Backend`, `DocumentState` and the document store — the
+  server-wide state `main` used to carry inline.
+- `lsp/src/cursor.rs`: cursor resolution types and rule→hint mapping (shared by
+  hover, goto, rename).
+- `info/src/`: `position` (element-at-cursor), `references` (reverse type-ref
+  index), `lib` (InfoService + FileInfo).
 - `index/src/`: `type_index`, `path_match`, `collect`, `variables`, `dynamic_values`,
   `vanilla_cache`, behind a thin `lib.rs` that re-exports the public surface.
 
