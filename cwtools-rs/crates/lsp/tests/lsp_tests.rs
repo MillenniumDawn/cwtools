@@ -7995,6 +7995,219 @@ types = {
 }
 
 #[test]
+fn test_cw240_quickfix_replaces_only_the_enum_value() {
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+
+enums = {
+    enum[mode] = { historic fantasy sandbox }
+}
+
+decision = {
+    mode = enum[mode]
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/decisions/test.txt";
+    let text = "decision = {\n    mode = histroic  # typo\n}\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW240")
+        .expect("CW240 diagnostic published for the misspelled enum value");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag], "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let response = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let actions = response["result"].as_array().expect("array result");
+    assert_eq!(actions.len(), 1, "one quickfix expected: {response}");
+    assert_eq!(actions[0]["title"], "Did you mean 'historic'?");
+    let edits = actions[0]["edit"]["changes"]
+        .get(&doc_uri)
+        .and_then(serde_json::Value::as_array)
+        .expect("edits for the document");
+    assert_eq!(edits.len(), 1, "one text edit expected: {response}");
+    assert_eq!(edits[0]["range"]["start"]["line"], 1);
+    assert_eq!(edits[0]["range"]["start"]["character"], 11);
+    assert_eq!(edits[0]["range"]["end"]["line"], 1);
+    assert_eq!(edits[0]["range"]["end"]["character"], 19);
+    assert_eq!(edits[0]["newText"], "\"historic\"");
+}
+
+#[test]
+fn test_cw122_quickfix_removes_only_the_quotes() {
+    const RULES: &str = r#"
+types = {
+    type[thing] = { path = "game/common/things" }
+}
+
+thing = {
+    iname = localisation_inline
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+    let loc_dir = ws.path().join("localisation");
+    std::fs::create_dir_all(&loc_dir).unwrap();
+    std::fs::write(
+        loc_dir.join("test_l_english.yml"),
+        b"\xEF\xBB\xBFl_english:\n my_key: \"My key\"\n",
+    )
+    .unwrap();
+
+    let rel_path = "common/things/test.txt";
+    let text = "thing = {\n    iname = \"my_key\"  # unnecessary\n}\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW122")
+        .expect("CW122 diagnostic published for the quoted inline key");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag], "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let response = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let actions = response["result"].as_array().expect("array result");
+    assert_eq!(actions.len(), 1, "one quickfix expected: {response}");
+    assert_eq!(actions[0]["title"], "Remove unnecessary quotes");
+    let edits = actions[0]["edit"]["changes"]
+        .get(&doc_uri)
+        .and_then(serde_json::Value::as_array)
+        .expect("edits for the document");
+    assert_eq!(edits.len(), 1, "one text edit expected: {response}");
+    assert_eq!(edits[0]["range"]["start"]["line"], 1);
+    assert_eq!(edits[0]["range"]["start"]["character"], 12);
+    assert_eq!(edits[0]["range"]["end"]["line"], 1);
+    assert_eq!(edits[0]["range"]["end"]["character"], 20);
+    assert_eq!(edits[0]["newText"], "my_key");
+}
+
+#[test]
 fn test_code_action_and_diagnostic_agree_on_non_bmp_line() {
     // The published diagnostic and the quick fix hanging off it must speak the
     // same position encoding. A non-BMP char earlier on the line makes the

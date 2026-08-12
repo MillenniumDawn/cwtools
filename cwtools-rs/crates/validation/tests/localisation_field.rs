@@ -96,13 +96,17 @@ fn inline_quoted_existing_key_warns_cw122() {
 }
 
 #[test]
-fn inline_quoted_key_that_cannot_be_unquoted_is_accepted() {
+fn inline_quoted_key_that_cannot_be_unquoted_has_no_fix() {
     let idx = loc_index(&[("a_l_english.yml", "l_english:\n foo=bar: \"hi\"\n")]);
     let errs = run("mytype = { iname = \"foo=bar\" }", &idx);
+    let cw122 = errs
+        .iter()
+        .find(|e| e.code == Some("CW122"))
+        .expect("quoted inline key warns CW122");
     assert!(
-        !errs.iter().any(|e| e.code == Some("CW122")),
-        "a key that needs quotes must not warn: {:?}",
-        errs
+        cw122.fix.is_none(),
+        "a key that needs quotes must not offer a fix: {:?}",
+        cw122
     );
 }
 

@@ -150,26 +150,26 @@ fn check_loc_key(
     if is_inline {
         // F# four-way logic for inline loc keys.
         match (was_quoted, exists) {
-            (true, true) if cwtools_parser::parser::is_bare_string_value(key_raw) => {
+            (true, true) => {
                 let code = &error_codes::CW122_LOC_KEY_IN_INLINE;
-                let fix = cwtools_parser::fix::SuggestedFix::replace(
-                    "Remove unnecessary quotes",
-                    leaf.value_pos,
-                    key_raw,
-                );
-                errors.push(
-                    ValidationError::from_code(
-                        code,
-                        file_path,
-                        leaf.pos.start.line,
-                        leaf.pos.start.col,
-                        &[key_raw],
-                    )
-                    .with_fix(fix)
-                    .with_end(leaf.pos.end),
-                );
+                let mut err = ValidationError::from_code(
+                    code,
+                    file_path,
+                    leaf.pos.start.line,
+                    leaf.pos.start.col,
+                    &[key_raw],
+                )
+                .with_end(leaf.pos.end);
+                if cwtools_parser::parser::is_bare_string_value(key_raw) {
+                    err = err.with_fix(cwtools_parser::fix::SuggestedFix::replace(
+                        "Remove unnecessary quotes",
+                        leaf.value_pos,
+                        key_raw,
+                    ));
+                }
+                errors.push(err);
             }
-            (true, _) => {} // Quoted values that cannot be safely unquoted stay quoted.
+            (true, false) => {} // quoted + missing → skip (lenient, matches F#)
             (false, true) => {} // unquoted + exists → ok
             (false, false) => push_missing(errors, "any language"),
         }
