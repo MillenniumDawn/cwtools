@@ -625,6 +625,37 @@ fn value_token_span(line: &[char], from: usize) -> Option<(usize, usize)> {
     Some((start, i))
 }
 
+fn compute_semantic_delta(
+    prev: &[SemanticToken],
+    next: &[SemanticToken],
+) -> Vec<SemanticTokensEdit> {
+    if prev == next {
+        return Vec::new();
+    }
+    // Flat u32 length: 5 per token. Find common prefix/suffix on token level,
+    // then express the edit in integer offsets.
+    let mut prefix = 0usize;
+    while prefix < prev.len() && prefix < next.len() && prev[prefix] == next[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < prev.len() - prefix
+        && suffix < next.len() - prefix
+        && prev[prev.len() - 1 - suffix] == next[next.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let start = (prefix * 5) as u32;
+    let delete_count = ((prev.len() - prefix - suffix) * 5) as u32;
+    let data = next[prefix..next.len() - suffix].to_vec();
+    let data_opt = if data.is_empty() { None } else { Some(data) };
+    vec![SemanticTokensEdit {
+        start,
+        delete_count,
+        data: data_opt,
+    }]
+}
+
 impl Backend {
     #[tracing::instrument(skip_all)]
     pub(crate) async fn semantic_tokens_full_impl(
@@ -632,12 +663,150 @@ impl Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri.to_string();
-        Ok(self.tokens_for(&uri, None).await.map(|data| {
-            SemanticTokensResult::Tokens(SemanticTokens {
-                result_id: None,
-                data,
-            })
-        }))
+        // Fast path: if content hash matches cache, reuse tokens without walking.
+        if let Some(text) = self.file_text_for(&uri).await {
+            let hash = cwtools_cache::workspace::content_hash(&text);
+            if let Some(entry) = self.state.semantic_tokens_cache.lock().get(&uri).cloned()
+                && entry.hash == hash
+            {
+                let result_id = self
+                    .state
+                    .semantic_tokens_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let data = entry.data.clone();
+                self.state.semantic_tokens_cache.lock().insert(
+                    uri.clone(),
+                    crate::SemanticCacheEntry {
+                        result_id: result_id.clone(),
+                        data: data.clone(),
+                        hash,
+                    },
+                );
+                return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                    result_id: Some(result_id),
+                    data,
+                })));
+            }
+        }
+        let Some(data) = self.tokens_for(&uri, None).await else {
+            return Ok(None);
+        };
+        let hash = self
+            .file_text_for(&uri)
+            .await
+            .map(|t| cwtools_cache::workspace::content_hash(&t))
+            .unwrap_or(0);
+        let result_id = self
+            .state
+            .semantic_tokens_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string();
+        self.state.semantic_tokens_cache.lock().insert(
+            uri.clone(),
+            crate::SemanticCacheEntry {
+                result_id: result_id.clone(),
+                data: data.clone(),
+                hash,
+            },
+        );
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: Some(result_id),
+            data,
+        })))
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub(crate) async fn semantic_tokens_full_delta_impl(
+        &self,
+        params: SemanticTokensDeltaParams,
+    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
+        let uri = params.text_document.uri.to_string();
+        // If content hash unchanged and previous_id matches cache, we can answer
+        // without walking at all (hash memoization makes repeated range/full
+        // polls during idle ~free).
+        if let Some(text) = self.file_text_for(&uri).await {
+            let hash = cwtools_cache::workspace::content_hash(&text);
+            if let Some(entry) = self.state.semantic_tokens_cache.lock().get(&uri).cloned()
+                && entry.hash == hash
+                && entry.result_id == params.previous_result_id
+            {
+                // Content unchanged: delta is empty, just bump result_id.
+                let result_id = self
+                    .state
+                    .semantic_tokens_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                self.state.semantic_tokens_cache.lock().insert(
+                    uri.clone(),
+                    crate::SemanticCacheEntry {
+                        result_id: result_id.clone(),
+                        data: entry.data.clone(),
+                        hash,
+                    },
+                );
+                return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+                    SemanticTokensDelta {
+                        result_id: Some(result_id),
+                        edits: Vec::new(),
+                    },
+                )));
+            }
+        }
+        let Some(new_data) = self.tokens_for(&uri, None).await else {
+            return Ok(None);
+        };
+        let hash = self
+            .file_text_for(&uri)
+            .await
+            .map(|t| cwtools_cache::workspace::content_hash(&t))
+            .unwrap_or(0);
+        let previous_id = params.previous_result_id;
+        let cached = self.state.semantic_tokens_cache.lock().get(&uri).cloned();
+        if let Some(entry) = cached
+            && entry.result_id == previous_id
+        {
+            let edits = compute_semantic_delta(&entry.data, &new_data);
+            let result_id = self
+                .state
+                .semantic_tokens_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_string();
+            self.state.semantic_tokens_cache.lock().insert(
+                uri.clone(),
+                crate::SemanticCacheEntry {
+                    result_id: result_id.clone(),
+                    data: new_data.clone(),
+                    hash,
+                },
+            );
+            return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+                SemanticTokensDelta {
+                    result_id: Some(result_id),
+                    edits,
+                },
+            )));
+        }
+        // No matching previous result: fall back to full.
+        let result_id = self
+            .state
+            .semantic_tokens_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string();
+        self.state.semantic_tokens_cache.lock().insert(
+            uri.clone(),
+            crate::SemanticCacheEntry {
+                result_id: result_id.clone(),
+                data: new_data.clone(),
+                hash,
+            },
+        );
+        Ok(Some(SemanticTokensFullDeltaResult::Tokens(
+            SemanticTokens {
+                result_id: Some(result_id),
+                data: new_data,
+            },
+        )))
     }
 
     /// `textDocument/semanticTokens/range`: the same walk bounded to the

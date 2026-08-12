@@ -625,16 +625,17 @@ impl Backend {
                 // The handler gates each kind on its setting and returns nothing
                 // when both are off, so a client always-on capability is harmless.
                 inlay_hint_provider: Some(OneOf::Left(true)),
-                // Semantic tokens: `full` and `range`. `range` runs the same walk
-                // with root children outside the viewport skipped, so an edit in
-                // a 300-entity file re-resolves the entities on screen instead of
-                // all of them. `full/delta` stays off: it needs server-side result
-                // caching we have no invalidation story for.
+                // Semantic tokens: `full` (with delta) and `range`. `range` skips
+                // entities outside the viewport; `delta` sends only the changed
+                // integer slice after a large edit, with a per-URI result cache
+                // invalidated on file change, rename, rules reload, and full
+                // reindex (#184). A `workspace/semanticTokens/refresh` is sent
+                // after bulk index changes so the client re-requests visible files.
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
                             legend: crate::semantic::legend(),
-                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                             range: Some(true),
                             work_done_progress_options: Default::default(),
                         },
@@ -651,7 +652,41 @@ impl Backend {
                         supported: Some(true),
                         change_notifications: Some(OneOf::Left(true)),
                     }),
-                    file_operations: None,
+                    file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                        did_create: Some(FileOperationRegistrationOptions {
+                            filters: vec![FileOperationFilter {
+                                scheme: Some("file".to_string()),
+                                pattern: FileOperationPattern {
+                                    glob: "**/*.{txt,gui,gfx,asset,yml,cwt}".to_string(),
+                                    matches: None,
+                                    options: None,
+                                },
+                            }],
+                        }),
+                        will_create: None,
+                        did_rename: Some(FileOperationRegistrationOptions {
+                            filters: vec![FileOperationFilter {
+                                scheme: Some("file".to_string()),
+                                pattern: FileOperationPattern {
+                                    glob: "**/*.{txt,gui,gfx,asset,yml,cwt}".to_string(),
+                                    matches: None,
+                                    options: None,
+                                },
+                            }],
+                        }),
+                        will_rename: None,
+                        did_delete: Some(FileOperationRegistrationOptions {
+                            filters: vec![FileOperationFilter {
+                                scheme: Some("file".to_string()),
+                                pattern: FileOperationPattern {
+                                    glob: "**/*.{txt,gui,gfx,asset,yml,cwt}".to_string(),
+                                    matches: None,
+                                    options: None,
+                                },
+                            }],
+                        }),
+                        will_delete: None,
+                    }),
                 }),
                 // `position_encoding` (above): utf-32 when the client supports
                 // it, else the LSP default (utf-16). The parser counts chars,
@@ -852,6 +887,11 @@ impl Backend {
             // The type index is empty at this point; it will be rebuilt
             // again after validate_entire_workspace with the full index.
             self.rebuild_modifier_keys();
+            // Rule-driven semantic tokens change globally; invalidate the delta
+            // cache so edits do not patch stale data and tell the client to
+            // re-request tokens for visible files (#184).
+            self.invalidate_all_semantic_tokens();
+            self.request_semantic_refresh().await;
         } else {
             self.client
                 .log_message(

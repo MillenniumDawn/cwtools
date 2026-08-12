@@ -558,6 +558,11 @@ struct DocumentState {
     /// rewriting identical content) matches and skips the revalidate. A DELETE
     /// drops the entry; a URI with no entry always validates.
     watched_signatures: Mutex<HashMap<String, (u64, u128)>>,
+    /// Per-URI cached semantic tokens for `full/delta` support. `None` when never
+    /// requested or after invalidation (file change, rename, encoding switch,
+    /// rules reload). Bounded by distinct URIs that requested tokens.
+    semantic_tokens_cache: Mutex<HashMap<String, SemanticCacheEntry>>,
+    semantic_tokens_seq: AtomicU64,
     /// Per-URI span edits of the diagnostics currently published for that file
     /// (parser-convention ranges — the same `SpanEdit` shape a `SuggestedFix`
     /// carries), tagged with the diagnostic's code and the source version or
@@ -757,6 +762,13 @@ fn remove_debounce_task(tasks: &mut HashMap<String, DebounceTask>, uri: &str, co
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SemanticCacheEntry {
+    pub(crate) result_id: String,
+    pub(crate) data: Vec<SemanticToken>,
+    pub(crate) hash: u64,
+}
+
 pub(crate) struct ParsedDoc {
     pub(crate) version: i32,
     /// `Arc` so every reader that only needs to look at the text (completion,
@@ -938,6 +950,8 @@ impl DocumentState {
             watched_deleted: Mutex::new(HashSet::new()),
             watched_debounce: Mutex::new(None),
             watched_signatures: Mutex::new(HashMap::new()),
+            semantic_tokens_cache: Mutex::new(HashMap::new()),
+            semantic_tokens_seq: AtomicU64::new(0),
             fixable_edits: Mutex::new(HashMap::new()),
         }
     }
@@ -1089,6 +1103,20 @@ impl Backend {
             guard: self.state.loc_watched_overlay.write(),
             revision: &self.state.loc_overlay_revision,
         }
+    }
+
+    pub(crate) fn invalidate_semantic_tokens(&self, uri: &str) {
+        self.state.semantic_tokens_cache.lock().remove(uri);
+    }
+
+    pub(crate) fn invalidate_all_semantic_tokens(&self) {
+        self.state.semantic_tokens_cache.lock().clear();
+    }
+
+    pub(crate) async fn request_semantic_refresh(&self) {
+        // `workspace/semanticTokens/refresh` tells the client to re-request tokens
+        // for visible editors. Ignore errors: old clients may not support it.
+        let _ = self.client.semantic_tokens_refresh().await;
     }
 
     /// Called when the VS Code extension tells us the user switched to a file.
@@ -1724,6 +1752,7 @@ impl LanguageServer for Backend {
         // Bump the edit counter so that sweep is tagged and a later edit
         // supersedes it.
         let generation = self.state.edit_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.invalidate_semantic_tokens(&uri);
         self.spawn_debounced_validate(uri, version, generation, ValidateTrigger::DidOpen, 0);
     }
 
@@ -1768,6 +1797,7 @@ impl LanguageServer for Backend {
         // Bump the global edit counter so any in-flight dependent sweep from an
         // earlier edit knows it has been superseded and can stop early.
         let generation = self.state.edit_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.invalidate_semantic_tokens(&uri);
 
         // Validate in the background after a short debounce so a burst of
         // keystrokes coalesces into one validation and the handler returns
@@ -1785,6 +1815,7 @@ impl LanguageServer for Backend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
+        self.invalidate_semantic_tokens(&uri);
         // A save isn't an edit, so don't bump the edit counter, just re-read the
         // current version and generation. Offload the validation like did_change
         // (#90); the entry version guard in `debounced_validate` makes a racing
@@ -1803,6 +1834,7 @@ impl LanguageServer for Backend {
     #[tracing::instrument(skip_all)]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri.to_string();
+        self.invalidate_semantic_tokens(&uri);
         tracing::debug!(%uri, "did_close");
         let Some(closed_doc) = self.state.documents.lock().remove(&uri) else {
             return;
@@ -2077,6 +2109,13 @@ impl LanguageServer for Backend {
         self.semantic_tokens_full_impl(params).await
     }
 
+    async fn semantic_tokens_full_delta(
+        &self,
+        params: SemanticTokensDeltaParams,
+    ) -> Result<Option<SemanticTokensFullDeltaResult>> {
+        self.semantic_tokens_full_delta_impl(params).await
+    }
+
     async fn semantic_tokens_range(
         &self,
         params: SemanticTokensRangeParams,
@@ -2101,6 +2140,50 @@ impl LanguageServer for Backend {
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         self.did_change_watched_files_impl(params).await;
+    }
+
+    async fn did_create_files(&self, params: CreateFilesParams) {
+        for f in &params.files {
+            self.invalidate_semantic_tokens(f.uri.as_str());
+        }
+        self.request_semantic_refresh().await;
+    }
+
+    async fn did_rename_files(&self, params: RenameFilesParams) {
+        for f in &params.files {
+            let old = f.old_uri.as_str();
+            let new = f.new_uri.as_str();
+            // Move open-document state if the renamed file was open.
+            let moved = {
+                let mut docs = self.state.documents.lock();
+                docs.remove(old)
+                    .map(|doc| (old.to_string(), new.to_string(), doc))
+            };
+            if let Some((old_uri, new_uri, doc)) = moved {
+                let _ = self.state.documents.lock().open(new_uri.clone(), doc);
+                // Move cached tokens to the new URI so delta resumes.
+                if let Some(entry) = self.state.semantic_tokens_cache.lock().remove(&old_uri) {
+                    self.state
+                        .semantic_tokens_cache
+                        .lock()
+                        .insert(new_uri, entry);
+                } else {
+                    self.invalidate_semantic_tokens(&new_uri);
+                }
+                self.invalidate_semantic_tokens(&old_uri);
+            } else {
+                self.invalidate_semantic_tokens(old);
+                self.invalidate_semantic_tokens(new);
+            }
+        }
+        self.request_semantic_refresh().await;
+    }
+
+    async fn did_delete_files(&self, params: DeleteFilesParams) {
+        for f in &params.files {
+            self.invalidate_semantic_tokens(f.uri.as_str());
+        }
+        self.request_semantic_refresh().await;
     }
 
     async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
