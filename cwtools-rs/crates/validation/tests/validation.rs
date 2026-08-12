@@ -25,7 +25,7 @@ types = {
 "#;
 
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // Valid file matching the ethos type
@@ -35,7 +35,7 @@ ethos = {
     category = "materialist"
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         errors.is_empty(),
@@ -50,7 +50,7 @@ ethos = {
     category = "materialist"
 }
 "#;
-    let parsed_bad = parse_string(bad_script, &table).unwrap();
+    let parsed_bad = parse_string(bad_script, &table);
     let errors = validate_ast(&parsed_bad, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         !errors.is_empty(),
@@ -76,7 +76,7 @@ types = {
 "#;
 
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // Valid: max_speed appears once
@@ -86,7 +86,7 @@ ship_size = {
     is_civilian = no
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         errors.is_empty(),
@@ -173,7 +173,7 @@ types = {
 "#;
 
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // country_event has is_triggered_only - should match country_event subtype
@@ -183,7 +183,7 @@ event = {
     id = my_event
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         errors.is_empty(),
@@ -198,7 +198,7 @@ event = {
     id = news_event
 }
 "#;
-    let parsed2 = parse_string(script2, &table).unwrap();
+    let parsed2 = parse_string(script2, &table);
     let errors2 = validate_ast(&parsed2, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         errors2.is_empty(),
@@ -212,7 +212,7 @@ event = {
     id = generic_event
 }
 "#;
-    let parsed3 = parse_string(script3, &table).unwrap();
+    let parsed3 = parse_string(script3, &table);
     let errors3 = validate_ast(&parsed3, &ruleset, &table, "test.txt", None, None, None);
     // No subtype matches, so no subtype rules apply, no errors expected
     assert!(
@@ -242,7 +242,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let mut idx = TypeIndex::new();
@@ -267,7 +267,7 @@ event = {
     requires_technology = ""
 }
 "#;
-    let parsed = parse_string(script_empty, &table).unwrap();
+    let parsed = parse_string(script_empty, &table);
     let errs = validate_ast(
         &parsed,
         &ruleset,
@@ -303,7 +303,7 @@ fn texture_reference_resolves_via_sibling_extension() {
     // shipped `.dds` and vice versa (vanilla `core.gfx` points at `.tga` files
     // while only the `.dds` ships). CW113 must not fire when the sibling exists.
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table).unwrap(), &table);
+    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table), &table);
 
     let mut idx = TypeIndex::new();
     idx.file_index.add_paths([
@@ -317,7 +317,7 @@ spriteType = {
     secondfile = "gfx/test/icon.dds"
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errs = validate_ast(
         &parsed,
         &ruleset,
@@ -340,7 +340,7 @@ fn missing_texture_with_no_sibling_still_flagged() {
     // Regression guard against blanket-suppressing texture CW113: a reference with
     // neither extension present on disk (genuinely missing asset) must still flag.
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table).unwrap(), &table);
+    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table), &table);
 
     let mut idx = TypeIndex::new();
     idx.file_index
@@ -351,7 +351,7 @@ spriteType = {
     texturefile = "gfx/test/ghost.tga"
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errs = validate_ast(
         &parsed,
         &ruleset,
@@ -386,7 +386,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(cwt, &table).unwrap(), &table);
+    let ruleset = ast_to_ruleset(&parse_string(cwt, &table), &table);
 
     let mut idx = TypeIndex::new();
     // The .asset itself is indexed (so its root-relative dir can be recovered)
@@ -402,7 +402,7 @@ sound = {
     file = "zom_idle_001.wav"
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errs = validate_ast(
         &parsed,
         &ruleset,
@@ -436,11 +436,11 @@ types = {
 
 fn filepath_errors(script: &str, indexed: &[&str]) -> Vec<(Option<&'static str>, String)> {
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(PREFIX_EXT_CWT, &table).unwrap(), &table);
+    let ruleset = ast_to_ruleset(&parse_string(PREFIX_EXT_CWT, &table), &table);
     let mut idx = TypeIndex::new();
     idx.file_index
         .add_paths(indexed.iter().map(|s| s.to_string()));
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     validate_ast(
         &parsed,
         &ruleset,
@@ -526,15 +526,14 @@ fn texture_sibling_lookup_handles_a_mixed_case_non_ascii_path() {
     // No configured extension here: with one, the field appends it before the
     // sibling swap is ever reached.
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table).unwrap(), &table);
+    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table), &table);
     let mut idx = TypeIndex::new();
     idx.file_index.add_paths(["gfx/café.dds".to_string()]);
 
     let parsed = parse_string(
         "spriteType = {\n    texturefile = \"gfx/café.TGA\"\n}\n",
         &table,
-    )
-    .unwrap();
+    );
     let errs = validate_ast(
         &parsed,
         &ruleset,
@@ -569,7 +568,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let script_valid = r#"
@@ -602,7 +601,7 @@ event = {
     idx.complete = true;
 
     // Valid reference: no error
-    let parsed_v = parse_string(script_valid, &table).unwrap();
+    let parsed_v = parse_string(script_valid, &table);
     let errs_v = validate_ast(
         &parsed_v,
         &ruleset,
@@ -619,7 +618,7 @@ event = {
     );
 
     // Bogus reference: should produce CW500
-    let parsed_b = parse_string(script_bogus, &table).unwrap();
+    let parsed_b = parse_string(script_bogus, &table);
     let errs_b = validate_ast(
         &parsed_b,
         &ruleset,
@@ -696,7 +695,7 @@ enums = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // original_tag = AFG matches the 2nd trigger overload (enum[country_tags]).
@@ -715,7 +714,7 @@ my_strat = {
     }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -765,9 +764,9 @@ fn validate_aliases_at(
     file_path: &str,
 ) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
-    let parsed_rules = parse_string(rules, &table).unwrap();
+    let parsed_rules = parse_string(rules, &table);
     let ruleset = ast_to_ruleset(&parsed_rules, &table);
-    let parsed_script = parse_string(script, &table).unwrap();
+    let parsed_script = parse_string(script, &table);
     validate_ast(
         &parsed_script,
         &ruleset,
@@ -825,6 +824,8 @@ fn alias_branch_budget_accepts_exact_capacity() {
     );
 }
 
+/// The budget is the fallback guarantee: distinct usages have nothing to reuse,
+/// so 32,769 of them still stop the file one usage past capacity.
 #[test]
 fn alias_branch_budget_rejects_the_next_usage() {
     let errors = validate_aliases(
@@ -834,31 +835,32 @@ fn alias_branch_budget_rejects_the_next_usage() {
     assert_eq!(errors.len(), 1, "expected one limit diagnostic: {errors:?}");
     assert_eq!(errors[0].code, Some("CW277"));
     assert_eq!(errors[0].severity, ErrorSeverity::Warning);
+    // The usage that could not be funded, squiggling its key.
+    assert_eq!((errors[0].line, errors[0].col), (32_770, 0));
+    assert_eq!(errors[0].end, Some((32_770, 7)));
 }
 
+/// Distinct overloads (only the severity differs, so the equivalent-candidate
+/// coalescing cannot collapse them) recurse into the same subtree in the same
+/// state at every level. The memo answers the repeat, so a depth that used to
+/// spend the whole budget validates to the bottom instead.
 #[test]
-fn distinct_recursive_aliases_stop_at_the_branch_budget() {
+fn distinct_recursive_aliases_are_memoized_not_capped() {
     let errors = validate_recursive_aliases(RECURSIVE_DISTINCT_ALIAS_RULES, 20);
-    let capped: Vec<_> = errors
-        .iter()
-        .filter(|error| error.code == Some("CW277"))
-        .collect();
-    assert_eq!(capped.len(), 1, "expected one limit diagnostic: {errors:?}");
-    assert_eq!(capped[0].severity, ErrorSeverity::Warning);
-    assert_eq!((capped[0].line, capped[0].col), (21, 0));
-    assert_eq!(capped[0].end, Some((21, 7)));
     assert!(
-        errors.iter().all(|error| error.code != Some("CW263")),
-        "the cap must stop before validating the deepest invalid field: {errors:?}"
+        errors.iter().all(|error| error.code != Some("CW277")),
+        "an equivalent repeated subtree must not exhaust the budget: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| error.code == Some("CW263")),
+        "the deepest invalid field should be reported: {errors:?}"
     );
 }
 
 /// The disjunction accepts on the first clean candidate, so a file that is
 /// actually valid never opens the second overload and never spends the budget.
 /// That is what keeps the cap off legitimate script: depth alone is not what
-/// exhausts it, unresolvable depth is — the same shape that caps at 20 levels
-/// in [`distinct_recursive_aliases_stop_at_the_branch_budget`] validates clean
-/// at 40 once the innermost block resolves.
+/// exhausts it, unresolvable depth is.
 ///
 /// Kept to 40 deliberately. The deepest nesting in real content is 24, the
 /// parser refuses to descend past `MAX_CLAUSE_DEPTH`, and a debug-build walk
@@ -897,13 +899,11 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 /// report the limit too, or an OOB-shaped file stops validating in silence.
 #[test]
 fn type_per_file_recursion_stops_at_the_branch_budget() {
+    // One usage past capacity, all of them distinct, so there is nothing for the
+    // memo to reuse and the budget is what stops the file.
     let mut script = String::new();
-    for _ in 0..20 {
-        script.push_str("recurse = {\n");
-    }
-    script.push_str("bad = nope\n");
-    for _ in 0..20 {
-        script.push_str("}\n");
+    for _ in 0..32_769 {
+        script.push_str("recurse = { }\n");
     }
     let errors = validate_aliases_at(
         RECURSIVE_PER_FILE_ALIAS_RULES,
@@ -974,7 +974,7 @@ alias[ai_strategy_rule:ai_strategy] = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // `ai_strategy` is a block-only overload, but it's used as a bare scalar.
@@ -982,7 +982,7 @@ alias[ai_strategy_rule:ai_strategy] = {
     ai_strategy = oops
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -1040,7 +1040,7 @@ enums = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let script = r#"
@@ -1050,7 +1050,7 @@ my_plan = {
     }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -1093,7 +1093,7 @@ enums = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // Both quoted and unquoted tag keys must validate cleanly.
@@ -1103,7 +1103,7 @@ diplo = {
     LOG = { value = 2 }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -1126,7 +1126,7 @@ diplo = {
     "XYZ" = { value = 1 }
 }
 "#;
-    let parsed_bad = parse_string(bad, &table).unwrap();
+    let parsed_bad = parse_string(bad, &table);
     let errors = validate_ast(
         &parsed_bad,
         &ruleset,
@@ -1179,7 +1179,7 @@ alias[effect:scope_field] = {
 alias[effect:add_attack] = int
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     assert!(
         ruleset.scope_links.contains("character"),
@@ -1195,7 +1195,7 @@ evt = {
     }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -1238,7 +1238,7 @@ spriteType = {
 "#;
 
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // Valid .gfx file: a spriteType wrapped in spriteTypes { }
@@ -1250,7 +1250,7 @@ spriteTypes = {
     }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     // Path must match the type's path (interface/) and extension (.gfx)
     let errors = validate_ast(
         &parsed,
@@ -1311,7 +1311,7 @@ widget = {
 "#;
 
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // Build a TypeIndex that includes a known sprite (as if collected from a .gfx file)
@@ -1341,7 +1341,7 @@ guiTypes = {
     }
 }
 "#;
-    let parsed_valid = parse_string(gui_valid, &table).unwrap();
+    let parsed_valid = parse_string(gui_valid, &table);
     let errs_valid = validate_ast(
         &parsed_valid,
         &ruleset,
@@ -1370,7 +1370,7 @@ guiTypes = {
     }
 }
 "#;
-    let parsed_bad = parse_string(gui_bad, &table).unwrap();
+    let parsed_bad = parse_string(gui_bad, &table);
     let errs_bad = validate_ast(
         &parsed_bad,
         &ruleset,
@@ -1413,7 +1413,7 @@ containerWindowType = {
 "#;
 
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // Valid .gui file
@@ -1425,7 +1425,7 @@ guiTypes = {
     }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -1450,7 +1450,7 @@ guiTypes = {
     }
 }
 "#;
-    let parsed_bad = parse_string(bad_script, &table).unwrap();
+    let parsed_bad = parse_string(bad_script, &table);
     let errors_bad = validate_ast(
         &parsed_bad,
         &ruleset,
@@ -1481,7 +1481,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let mut idx = TypeIndex::new();
@@ -1502,7 +1502,7 @@ types = {
     idx.complete = true;
 
     let script = "event = { requires_technology = \"[GetSomeTech]\" }\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errs = validate_ast(
         &parsed,
         &ruleset,
@@ -1563,7 +1563,7 @@ alias[effect:generate_character] = {
 alias[effect:set_character_flag] = value_set[character_flag]
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let mut ruleset = ast_to_ruleset(&parsed_cwt, &table);
     ruleset.reindex();
 
@@ -1572,8 +1572,7 @@ alias[effect:set_character_flag] = value_set[character_flag]
     let define = parse_string(
         "evt = { effect = { generate_character = { token_base = empowered_legislative } } }\n",
         &table,
-    )
-    .unwrap();
+    );
     let members =
         cwtools_index::dynamic_values::collect_value_set_members(&ruleset, &define, &table);
     assert!(
@@ -1598,7 +1597,7 @@ evt = {
     }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -1626,7 +1625,7 @@ evt = {
     }
 }
 "#;
-    let parsed_bad = parse_string(bad, &table).unwrap();
+    let parsed_bad = parse_string(bad, &table);
     let errors_bad = validate_ast(
         &parsed_bad,
         &ruleset,

@@ -759,7 +759,7 @@ mod tests {
         max_nodes: usize,
     ) -> (RuleSet, Vec<AliasExpansionError>) {
         let table = StringTable::new();
-        let parsed = parse_string(input, &table).unwrap();
+        let parsed = parse_string(input, &table);
         let mut ruleset = ast_to_ruleset(&parsed, &table);
         let errors = post_process_with_budget(&mut ruleset, max_nodes);
         (ruleset, errors)

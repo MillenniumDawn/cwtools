@@ -788,7 +788,7 @@ mod tests {
 
     fn find(text: &str, key: &str) -> FoundColour {
         let table = StringTable::new();
-        let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
+        let ast = cwtools_parser::parser::parse_string(text, &table);
         let lines: Vec<&str> = text.lines().collect();
         // The colour leaf is the first nested leaf of the first root child.
         let Child::Leaf(root) = ast.root_children[0] else {

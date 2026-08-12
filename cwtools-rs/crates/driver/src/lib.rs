@@ -112,8 +112,7 @@ fn load_or_parse(
     let cache_hit = cached.is_some();
     let parsed = match cached {
         Some(parsed) => parsed,
-        None => parse_string_without_comments(&text, table)
-            .map_err(|error| FileError::Parse(error.to_string()))?,
+        None => parse_string_without_comments(&text, table),
     };
     let metadata =
         metadata.filter(|key| workspace_cache::source_cache_key(path).as_ref() == Some(key));
@@ -813,21 +812,15 @@ fn parse_errors_to_validation(
 ) -> Vec<ValidationError> {
     errors
         .iter()
-        .map(|e| {
-            let (line, col, msg) = match e {
-                ParseError::Pos(l, c, m) => (*l, *c, m.clone()),
-                ParseError::General(m) => (0, 0, m.clone()),
-            };
-            ValidationError {
-                message: msg,
-                severity: ErrorSeverity::Error,
-                line,
-                col,
-                file: std::sync::Arc::clone(file_path),
-                code: None,
-                fix: None,
-                end: None,
-            }
+        .map(|ParseError::Pos(line, col, msg)| ValidationError {
+            message: msg.clone(),
+            severity: ErrorSeverity::Error,
+            line: *line,
+            col: *col,
+            file: std::sync::Arc::clone(file_path),
+            code: None,
+            fix: None,
+            end: None,
         })
         .collect()
 }
@@ -1169,9 +1162,7 @@ pub fn load_rules(
         RulesInput::File(file) => {
             let rules_str = std::fs::read_to_string(file)
                 .map_err(|e| format!("could not read rules {}: {}", file.display(), e))?;
-            parse_string(&rules_str, table)
-                .map(|parsed| ast_to_ruleset(&parsed, table))
-                .map_err(|e| format!("could not parse rules {}: {}", file.display(), e))
+            Ok(ast_to_ruleset(&parse_string(&rules_str, table), table))
         }
     }
 }

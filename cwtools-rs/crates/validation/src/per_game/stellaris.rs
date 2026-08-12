@@ -715,7 +715,7 @@ mod tests {
         type_index: Option<&TypeIndex>,
     ) -> Vec<(String, u32, u16)> {
         let table = StringTable::new();
-        let ast = parse_string(script, &table).unwrap();
+        let ast = parse_string(script, &table);
         let mut errors = Vec::new();
         validate_stellaris(&ast, ruleset, &table, &path.into(), type_index, &mut errors);
         errors
@@ -733,7 +733,7 @@ mod tests {
         use cwtools_parser::fix::apply_edits;
         let src = "set_empire_name = { key = \"NAME\" }\n";
         let table = StringTable::new();
-        let ast = parse_string(src, &table).unwrap();
+        let ast = parse_string(src, &table);
         let ruleset = RuleSet::new();
         let mut errors = Vec::new();
         validate_stellaris(
@@ -754,7 +754,7 @@ mod tests {
         assert_eq!(fixed, "set_name = { key = \"NAME\" }\n");
 
         // Revalidation of the fixed text no longer emits CW253.
-        let ast2 = parse_string(&fixed, &table).unwrap();
+        let ast2 = parse_string(&fixed, &table);
         let mut errors2 = Vec::new();
         validate_stellaris(
             &ast2,
@@ -777,7 +777,7 @@ mod tests {
     #[test]
     fn child_key_eq_is_case_insensitive() {
         let table = StringTable::new();
-        let ast = parse_string("root = {\n IF = {}\n Trigger = {}\n}\n", &table).unwrap();
+        let ast = parse_string("root = {\n IF = {}\n Trigger = {}\n}\n", &table);
         let block = as_block(&ast.root_children[0], &ast).expect("root is a block");
         assert!(
             block

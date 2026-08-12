@@ -994,7 +994,7 @@ mod tests {
 
     fn make_info_heuristic(source: &str) -> (FileInfo, StringTable) {
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
         let mut info = FileInfo::default();
         let type_names = HashMap::new();
         for child in &parsed.root_children {
@@ -1046,7 +1046,7 @@ mod tests {
     fn test_type_instance_simple() {
         let source = "my_ethos = { tradition = foo }";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let td = empty_type_def("ethoses", vec!["common/ethics"]);
         let rs = make_ruleset_with_type(td);
@@ -1062,7 +1062,7 @@ mod tests {
     fn test_type_instance_path_mismatch() {
         let source = "my_ethos = { tradition = foo }";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let td = empty_type_def("ethoses", vec!["common/ethics"]);
         let rs = make_ruleset_with_type(td);
@@ -1076,7 +1076,7 @@ mod tests {
     fn test_type_instance_skip_root_key() {
         let source = "technologies = { my_tech = { } another_tech = { } }";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let mut td = empty_type_def("technology", vec!["common/technologies"]);
         td.skip_root_key = vec![SkipRootKey::AnyKey];
@@ -1103,7 +1103,7 @@ mod tests {
     fn test_type_instance_name_field() {
         let source = "some_event = { id = my_event_001 }";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let mut td = empty_type_def("event", vec!["events"]);
         td.name_field = Some("id".to_string());
@@ -1121,7 +1121,7 @@ mod tests {
     fn test_type_instance_name_field_quoted() {
         let source = "spriteTypes = { spriteType = { name = \"GFX_test_icon\" } }";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let mut td = empty_type_def("spriteType", vec!["game/interface"]);
         td.name_field = Some("name".to_string());
@@ -1142,7 +1142,7 @@ mod tests {
     fn test_type_per_file_backslash_path() {
         let source = "MY_OOB = { y = yes }\n";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let mut td = empty_type_def("oob", vec!["history/units"]);
         td.type_per_file = true;
@@ -1164,7 +1164,7 @@ mod tests {
     fn test_type_instance_key_filter() {
         let source = "country_event = { id = foo }\nsome_other = { id = bar }";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let mut td = empty_type_def("event", vec!["events"]);
         // Only accept nodes whose key is "country_event"
@@ -1297,7 +1297,7 @@ mod tests {
     fn test_at_vars_collected() {
         let source = "@min_manpower = 100\n@max_tech = 5";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let rs = RuleSet::new();
         // collect_defined_variables was deleted (no production callers); use the
@@ -1319,7 +1319,7 @@ effect = {
     save_global_event_target_as = global_target
 }";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
         // collect_saved_event_targets was deleted (no production callers); use
         // the InfoService to exercise the same code path that production uses.
         let mut service = InfoService::new();
@@ -1352,7 +1352,7 @@ effect = {
     fn test_element_at_position_leaf() {
         let source = "foo = bar\n";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let element = element_at_position(&parsed, 1, 6, &table);
         match element {
@@ -1383,7 +1383,7 @@ alias[effect:set_temp_variable] = {
 "#;
         use cwtools_rules::rules_converter::ast_to_ruleset;
         let table = StringTable::new();
-        let parsed_cwt = parse_string(RULES, &table).unwrap();
+        let parsed_cwt = parse_string(RULES, &table);
         let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
         let effects = variable_defining_effects(&ruleset);
@@ -1391,7 +1391,7 @@ alias[effect:set_temp_variable] = {
         assert!(effects.contains("set_temp_variable"), "got: {:?}", effects);
 
         let script = "foo = { set_variable = { var = my_explicit value = 3 } set_temp_variable = { my_shorthand = 5 } }";
-        let parsed = parse_string(script, &table).unwrap();
+        let parsed = parse_string(script, &table);
         let mut names = Vec::new();
         collect_set_variable_names(&parsed, &table, &effects, &mut names);
         assert!(
@@ -1428,14 +1428,14 @@ alias[effect:resize_array] = {
 "#;
         use cwtools_rules::rules_converter::ast_to_ruleset;
         let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(RULES, &table).unwrap(), &table);
+        let ruleset = ast_to_ruleset(&parse_string(RULES, &table), &table);
 
         let effects = variable_defining_effects(&ruleset);
         assert!(effects.contains("add_to_array"), "got: {:?}", effects);
         assert!(effects.contains("resize_array"), "got: {:?}", effects);
 
         let script = "foo = { add_to_array = { array = my_arr value = 3 } resize_array = { array = other_arr size = 2 } }";
-        let parsed = parse_string(script, &table).unwrap();
+        let parsed = parse_string(script, &table);
         let mut names = Vec::new();
         collect_set_variable_names(&parsed, &table, &effects, &mut names);
         assert!(names.contains(&"my_arr".to_string()), "got: {:?}", names);
@@ -1461,11 +1461,11 @@ alias[effect:set_temp_variable] = {
 }
 "#;
         let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(RULES, &table).unwrap(), &table);
+        let ruleset = ast_to_ruleset(&parse_string(RULES, &table), &table);
         let effects = variable_defining_effects(&ruleset);
 
         let script = "foo = { set_variable = { var = my_explicit value = 3 } set_temp_variable = { my_shorthand = 5 } }";
-        let parsed = parse_string(script, &table).unwrap();
+        let parsed = parse_string(script, &table);
         let mut defs = Vec::new();
         collect_set_variable_defs(&parsed, &table, &effects, &mut defs);
 
@@ -1491,8 +1491,7 @@ alias[effect:set_temp_variable] = {
                 "types = { type[decision] = { path = \"common/decisions\" } }\
                  decision = { old_ref = <focus> }",
                 &table,
-            )
-            .unwrap(),
+            ),
             &table,
         );
         let new_rules = ast_to_ruleset(
@@ -1500,8 +1499,7 @@ alias[effect:set_temp_variable] = {
                 "types = { type[decision] = { path = \"common/decisions\" } }\
                  decision = { new_ref = <focus> }",
                 &table,
-            )
-            .unwrap(),
+            ),
             &table,
         );
         assert_eq!(old_rules.root_rules.len(), new_rules.root_rules.len());
@@ -1510,7 +1508,7 @@ alias[effect:set_temp_variable] = {
         let mut service = InfoService::new();
         service.index_file_with_path(
             "old.txt",
-            &parse_string("test = { old_ref = OLD }", &table).unwrap(),
+            &parse_string("test = { old_ref = OLD }", &table),
             &table,
             &old_rules,
             "common/decisions/old.txt",
@@ -1519,7 +1517,7 @@ alias[effect:set_temp_variable] = {
         service.update_ruleset_data(HashSet::new());
         service.index_file_with_path(
             "new.txt",
-            &parse_string("test = { new_ref = NEW }", &table).unwrap(),
+            &parse_string("test = { new_ref = NEW }", &table),
             &table,
             &new_rules,
             "common/decisions/new.txt",
@@ -1590,11 +1588,10 @@ alias[effect:set_temp_variable] = {
                 "types = { type[decision] = { path = \"common/decisions\" } }\
                  decision = { my_ref = <focus> }",
                 &table,
-            )
-            .unwrap(),
+            ),
             &table,
         );
-        let script = |t: &StringTable| parse_string("test = { my_ref = SHARED }", t).unwrap();
+        let script = |t: &StringTable| parse_string("test = { my_ref = SHARED }", t);
 
         let mut svc = InfoService::new();
         svc.index_file_with_path(
@@ -1643,8 +1640,7 @@ alias[effect:set_temp_variable] = {
             &parse_string(
                 "alias[effect:set_country_flag] = value_set[country_flag]",
                 &table,
-            )
-            .unwrap(),
+            ),
             &table,
         );
         rules.reindex();
@@ -1652,7 +1648,7 @@ alias[effect:set_temp_variable] = {
         let mut svc = InfoService::new();
         svc.index_file_with_path(
             "f.txt",
-            &parse_string("my_effect = { set_country_flag = my_flag }", &table).unwrap(),
+            &parse_string("my_effect = { set_country_flag = my_flag }", &table),
             &table,
             &rules,
             "common/f.txt",

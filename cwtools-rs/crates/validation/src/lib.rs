@@ -297,7 +297,7 @@ pub fn validate_prepared(
     file_path: &str,
     prepared: &Prepared,
 ) -> Vec<ValidationError> {
-    validate_prepared_inner(ast, file_path, prepared, None)
+    validate_prepared_inner(ast, file_path, prepared, None).0
 }
 
 /// As [`validate_prepared`], but also reporting which instances of the
@@ -311,7 +311,7 @@ pub fn validate_prepared_tracking_uses(
     prepared: &Prepared,
 ) -> (Vec<ValidationError>, references::UsedInstances) {
     let used = std::cell::RefCell::new(references::UsedInstances::default());
-    let errors = validate_prepared_inner(ast, file_path, prepared, Some(&used));
+    let (errors, _) = validate_prepared_inner(ast, file_path, prepared, Some(&used));
     (errors, used.into_inner())
 }
 
@@ -332,12 +332,15 @@ fn append_alias_branch_budget_error(ctx: &ValidationCtx, errors: &mut Vec<Valida
     errors.push(error);
 }
 
+/// The body behind both `validate_prepared` entry points. Returns the file's
+/// diagnostics and the number of alias branches evaluated producing them — the
+/// second is what the memo tests assert on, and no caller acts on it.
 fn validate_prepared_inner(
     ast: &ParsedFile,
     file_path: &str,
     prepared: &Prepared,
     type_uses: Option<&std::cell::RefCell<references::UsedInstances>>,
-) -> Vec<ValidationError> {
+) -> (Vec<ValidationError>, usize) {
     let Prepared {
         ruleset,
         table,
@@ -372,6 +375,7 @@ fn validate_prepared_inner(
         var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),
         alias_branch_budget: std::cell::RefCell::new(AliasBranchBudget::default()),
+        alias_memo: std::cell::RefCell::new(ctx::AliasMemo::default()),
         type_uses,
     };
 
@@ -408,7 +412,7 @@ fn validate_prepared_inner(
             errors.extend(per_game::run_game_validators(&ctx, g));
         }
         append_alias_branch_budget_error(&ctx, &mut errors);
-        return errors;
+        return (errors, ctx.alias_branches_evaluated());
     }
 
     // Resolve each root child's owning type (exact root-key match, then path
@@ -476,5 +480,6 @@ fn validate_prepared_inner(
     }
 
     append_alias_branch_budget_error(&ctx, &mut errors);
-    errors
+    let branches = ctx.alias_branches_evaluated();
+    (errors, branches)
 }

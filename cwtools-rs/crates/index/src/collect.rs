@@ -679,7 +679,7 @@ mod tests {
     fn key_prefix_filters_and_keeps_name_intact() {
         let source = "MY_thing = { } my_other = { } NOPE_thing = { }";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let mut td = type_def("thing", "common/things");
         td.key_prefix = Some("MY_".to_string());
@@ -694,7 +694,7 @@ mod tests {
     fn no_key_prefix_collects_all() {
         let source = "MY_thing = { } NOPE_thing = { }";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let rs = ruleset_with(type_def("thing", "common/things"));
 
@@ -711,7 +711,7 @@ mod tests {
         // `}` is the last char, on line 3 col 0; the range end lands one past it.
         let source = "thing_a = {\n    x = 1\n}";
         let table = StringTable::new();
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let rs = ruleset_with(type_def("thing", "common/things"));
         let result = collect_type_instances(&rs, &parsed, "common/things/00_things.txt", &table);

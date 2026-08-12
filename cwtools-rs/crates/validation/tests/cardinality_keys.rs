@@ -11,8 +11,8 @@ use cwtools_validation::{ValidationError, validate_ast};
 
 fn run(cwt: &str, script: &str) -> Vec<ValidationError> {
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(cwt, &table).unwrap(), &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parse_string(cwt, &table), &table);
+    let parsed = parse_string(script, &table);
     validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None)
 }
 

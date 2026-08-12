@@ -113,6 +113,7 @@ pub fn rules_at_pos(
         var_checks: prepared.var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),
         alias_branch_budget: std::cell::RefCell::new(AliasBranchBudget::default()),
+        alias_memo: std::cell::RefCell::new(crate::ctx::AliasMemo::default()),
         // The resolver is a read-only navigation walk; it never contributes to
         // the project-wide unused check.
         type_uses: None,

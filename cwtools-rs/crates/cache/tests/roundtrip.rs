@@ -15,7 +15,7 @@ nested = {
 }
 "#;
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     // Serialize to temp file
@@ -47,7 +47,7 @@ fn roundtrip_real_file() {
     );
     let input = std::fs::read_to_string(path).unwrap();
     let table = StringTable::new();
-    let parsed = parse_string(&input, &table).unwrap();
+    let parsed = parse_string(&input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
@@ -91,7 +91,7 @@ nested = {
 key_a key_b = { x = 1 }
 "#;
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     // Archived path.

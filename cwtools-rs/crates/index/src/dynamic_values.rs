@@ -400,7 +400,7 @@ mod tests {
     use cwtools_rules::rules_converter::ast_to_ruleset;
 
     fn ruleset_from(cwt: &str, table: &StringTable) -> RuleSet {
-        let parsed = parse_string(cwt, table).unwrap();
+        let parsed = parse_string(cwt, table);
         ast_to_ruleset(&parsed, table)
     }
 
@@ -428,8 +428,7 @@ enums = {
         let file = parse_string(
             "script_enum_equipment_stat = {\n\tbuild_cost_ic\n\treliability\n}\n",
             &table,
-        )
-        .unwrap();
+        );
         let got = collect_complex_enum_values(&rs, &file, "common/script_enums.txt", &table);
         let vals = got.get("equipment_stat").expect("collected");
         assert!(
@@ -461,8 +460,7 @@ enums = {
         let file = parse_string(
             "BRA = \"countries/Brazil.txt\"\nGER = \"countries/Germany.txt\"\n",
             &table,
-        )
-        .unwrap();
+        );
         let got =
             collect_complex_enum_values(&rs, &file, "common/country_tags/00_tags.txt", &table);
         let vals = got.get("country_tags").expect("collected");
@@ -494,8 +492,7 @@ enums = {
         let file = parse_string(
             "ideas = {\n\tcountry = {\n\t\tdesigner = yes\n\t\tmy_idea = { cost = 1 }\n\t}\n}\n",
             &table,
-        )
-        .unwrap();
+        );
         let got = collect_complex_enum_values(&rs, &file, "common/ideas/test.txt", &table);
         let vals = got.get("idea_name").expect("collected");
         assert!(vals.contains(&"my_idea".to_string()), "got {:?}", vals);
@@ -519,8 +516,7 @@ alias[effect:set_country_flag] = {
         let file = parse_string(
             "my_effect = {\n\tset_country_flag = simple_flag\n\tset_country_flag = stamped_flag@1936.1.1\n\tset_country_flag = { flag = block_flag value = 2 }\n}\n",
             &table,
-        )
-        .unwrap();
+        );
         let got = collect_value_set_members(&rs, &file, &table);
         let vals = got.get("country_flag").expect("collected");
         assert!(vals.contains(&"simple_flag".to_string()), "got {:?}", vals);
@@ -548,8 +544,7 @@ alias[effect:generate_character] = {
         let file = parse_string(
             "my_effect = {\n\tgenerate_character = {\n\t\ttoken_base = empowered_legislative\n\t\tname = NAME_x\n\t}\n}\n",
             &table,
-        )
-        .unwrap();
+        );
         let got = collect_value_set_members(&rs, &file, &table);
         let tokens = got
             .get("character_token")

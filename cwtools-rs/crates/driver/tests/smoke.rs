@@ -485,14 +485,13 @@ fn capped_alias_workspace() -> tempfile::TempDir {
 
     let users = tmp.path().join("mod").join("common").join("users");
     std::fs::create_dir_all(&users).unwrap();
+    // One two-overload usage past the 65,536-branch budget, every usage its own,
+    // so nothing is memoizable and the budget is what stops the file.
     let mut user = String::from("a_user = {\n");
-    for _ in 0..20 {
-        user.push_str("recurse = {\n");
+    for _ in 0..32_769 {
+        user.push_str("recurse = { }\n");
     }
-    user.push_str("bad = nope\n");
-    for _ in 0..=20 {
-        user.push_str("}\n");
-    }
+    user.push_str("}\n");
     std::fs::write(users.join("u.txt"), user).unwrap();
     // A neighbour with one ordinary error. The budget is per file, so the capped
     // file must not take this one's diagnostic down with it.

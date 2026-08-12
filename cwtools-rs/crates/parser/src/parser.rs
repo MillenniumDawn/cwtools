@@ -788,17 +788,17 @@ impl<'a> Parser<'a> {
         Some(Value::String(tokens))
     }
 
-    fn parse(mut self) -> Result<ParsedFile, ParseError> {
+    fn parse(mut self) -> ParsedFile {
         self.skip_whitespace();
         let mut root_children = Vec::new();
         while self.peek().is_some() {
             self.parse_statement(&mut root_children);
         }
-        Ok(ParsedFile {
+        ParsedFile {
             arena: self.arena,
             root_children,
             errors: self.errors,
-        })
+        }
     }
 }
 
@@ -876,16 +876,13 @@ pub const MAX_CLAUSE_DEPTH: u32 = 256;
 
 /// Strip UTF-8 BOM if present, then parse with comments preserved.
 #[tracing::instrument(skip_all)]
-pub fn parse_string(input: &str, table: &StringTable) -> Result<ParsedFile, ParseError> {
+pub fn parse_string(input: &str, table: &StringTable) -> ParsedFile {
     parse_string_with_comment_mode(input, table, CommentMode::Preserve)
 }
 
 /// Strip UTF-8 BOM if present, then parse without retaining comment text.
 #[tracing::instrument(skip_all)]
-pub fn parse_string_without_comments(
-    input: &str,
-    table: &StringTable,
-) -> Result<ParsedFile, ParseError> {
+pub fn parse_string_without_comments(input: &str, table: &StringTable) -> ParsedFile {
     parse_string_with_comment_mode(input, table, CommentMode::Discard)
 }
 
@@ -893,7 +890,7 @@ fn parse_string_with_comment_mode(
     input: &str,
     table: &StringTable,
     comment_mode: CommentMode,
-) -> Result<ParsedFile, ParseError> {
+) -> ParsedFile {
     let stripped = input.strip_prefix('\u{FEFF}').unwrap_or(input);
     Parser::new(stripped, table, comment_mode).parse()
 }
@@ -905,7 +902,7 @@ mod tests {
     #[test]
     fn simple_key_value() {
         let table = StringTable::new();
-        let result = parse_string("foo = bar", &table).unwrap();
+        let result = parse_string("foo = bar", &table);
         assert_eq!(result.root_children.len(), 1);
     }
 
@@ -915,8 +912,7 @@ mod tests {
         let parsed = parse_string_without_comments(
             "# ignored\nfirst = 1\n# also ignored\nsecond = 2",
             &table,
-        )
-        .unwrap();
+        );
         assert!(parsed.arena.comments.is_empty());
         assert_eq!(parsed.root_children.len(), 2);
     }
@@ -924,7 +920,7 @@ mod tests {
     #[test]
     fn nested_clause() {
         let table = StringTable::new();
-        let result = parse_string("root = { a = 1 }", &table).unwrap();
+        let result = parse_string("root = { a = 1 }", &table);
         assert_eq!(result.root_children.len(), 1);
     }
 
@@ -955,7 +951,7 @@ ENG = {
 }
 ";
         let table = StringTable::new();
-        let result = parse_string(src, &table).expect("names file should parse");
+        let result = parse_string(src, &table);
         assert!(
             result.errors.is_empty(),
             "expected no parse errors, got: {:?}",
@@ -972,7 +968,7 @@ ENG = {
         );
         let input = std::fs::read_to_string(path).unwrap();
         let table = StringTable::new();
-        let result = parse_string(&input, &table).unwrap();
+        let result = parse_string(&input, &table);
         assert!(!result.root_children.is_empty());
         assert!(!table.is_empty());
     }
@@ -980,7 +976,7 @@ ENG = {
     #[test]
     fn parse_angle_bracket_value() {
         let table = StringTable::new();
-        let result = parse_string("ethos = <ethos>", &table).unwrap();
+        let result = parse_string("ethos = <ethos>", &table);
         assert_eq!(result.root_children.len(), 1);
         if let Child::Leaf(idx) = &result.root_children[0] {
             let leaf = &result.arena.leaves[*idx as usize];
@@ -1015,7 +1011,7 @@ ENG = {
     fn date_token_is_string() {
         // "1444.11.11" must parse as one String, not be split at the first dot.
         let table = StringTable::new();
-        let result = parse_string("start = 1444.11.11", &table).unwrap();
+        let result = parse_string("start = 1444.11.11", &table);
         match value_of(&result, &table, 0) {
             Value::String(t) => {
                 assert_eq!(table.get_string(t.normal).unwrap_or_default(), "1444.11.11");
@@ -1027,7 +1023,7 @@ ENG = {
     #[test]
     fn normal_float_parses() {
         let table = StringTable::new();
-        let result = parse_string("x = 2.75", &table).unwrap();
+        let result = parse_string("x = 2.75", &table);
         match value_of(&result, &table, 0) {
             Value::Float(f) => assert!((f - 2.75).abs() < 1e-9),
             v => panic!("expected Float, got {:?}", v),
@@ -1038,7 +1034,7 @@ ENG = {
     fn hex_like_token_is_string() {
         // "0x1A" — after "0" the 'x' is a value-char so the whole thing is a String.
         let table = StringTable::new();
-        let result = parse_string("x = 0x1A", &table).unwrap();
+        let result = parse_string("x = 0x1A", &table);
         match value_of(&result, &table, 0) {
             Value::String(t) => {
                 assert_eq!(table.get_string(t.normal).unwrap_or_default(), "0x1A");
@@ -1051,7 +1047,7 @@ ENG = {
     fn scientific_like_token_is_string() {
         // "1e5" — after "1" the 'e' is a value-char so the whole token is a String.
         let table = StringTable::new();
-        let result = parse_string("x = 1e5", &table).unwrap();
+        let result = parse_string("x = 1e5", &table);
         match value_of(&result, &table, 0) {
             Value::String(t) => {
                 assert_eq!(table.get_string(t.normal).unwrap_or_default(), "1e5");
@@ -1067,7 +1063,7 @@ ENG = {
     #[test]
     fn leading_plus_parses_as_int() {
         let table = StringTable::new();
-        let result = parse_string("x = +5", &table).unwrap();
+        let result = parse_string("x = +5", &table);
         match value_of(&result, &table, 0) {
             Value::Int(5) => {}
             v => panic!("expected Int(5), got {:?}", v),
@@ -1077,7 +1073,7 @@ ENG = {
     #[test]
     fn leading_plus_float() {
         let table = StringTable::new();
-        let result = parse_string("x = +2.75", &table).unwrap();
+        let result = parse_string("x = +2.75", &table);
         match value_of(&result, &table, 0) {
             Value::Float(f) => assert!((f - 2.75).abs() < 1e-9),
             v => panic!("expected Float, got {:?}", v),
@@ -1094,7 +1090,7 @@ ENG = {
     fn qstr_backslash_n_stays_literal() {
         // Input: x = "hello\nworld"  — \n must NOT become newline
         let table = StringTable::new();
-        let result = parse_string(r#"x = "hello\nworld""#, &table).unwrap();
+        let result = parse_string(r#"x = "hello\nworld""#, &table);
         match value_of(&result, &table, 0) {
             Value::QString(t) => {
                 let raw = table.get_string(t.normal).unwrap_or_default();
@@ -1117,7 +1113,7 @@ ENG = {
         // Stored token is wrapped in outer quotes: "say "hi""
         // Use strip_prefix/suffix to remove exactly the outermost quotes.
         let table = StringTable::new();
-        let result = parse_string(r#"x = "say \"hi\"""#, &table).unwrap();
+        let result = parse_string(r#"x = "say \"hi\"""#, &table);
         match value_of(&result, &table, 0) {
             Value::QString(t) => {
                 let raw = table.get_string(t.normal).unwrap_or_default();
@@ -1135,7 +1131,7 @@ ENG = {
     fn qstr_double_backslash_collapses() {
         // Input: x = "a\\b"  — \\ becomes single \
         let table = StringTable::new();
-        let result = parse_string(r#"x = "a\\b""#, &table).unwrap();
+        let result = parse_string(r#"x = "a\\b""#, &table);
         match value_of(&result, &table, 0) {
             Value::QString(t) => {
                 let raw = table.get_string(t.normal).unwrap_or_default();
@@ -1189,7 +1185,7 @@ ENG = {
         let table = StringTable::new();
         // The real trigger: a quoted value followed by a bare value. Two values,
         // one clause, no parse error.
-        let result = parse_string(r#"callsigns = { "Sunshine" Demon }"#, &table).unwrap();
+        let result = parse_string(r#"callsigns = { "Sunshine" Demon }"#, &table);
         assert!(
             result.errors.is_empty(),
             "quoted-then-bare must not error: {:?}",
@@ -1202,7 +1198,7 @@ ENG = {
         );
         // A name embedding quotes splits at the first interior quote (game
         // behaviour) rather than being kept whole — and still no error.
-        let result = parse_string(r#"n = { "Division "Castillejos"" }"#, &table).unwrap();
+        let result = parse_string(r#"n = { "Division "Castillejos"" }"#, &table);
         assert!(
             result.errors.is_empty(),
             "interior-quote name must not error: {:?}",
@@ -1222,8 +1218,7 @@ ENG = {
         let result = parse_string(
             r#"n = { "light_armor" "medium_armor" "heavy_armor" }"#,
             &table,
-        )
-        .unwrap();
+        );
         let lvs = clause_leafvalues(&result, &table);
         assert_eq!(
             lvs,
@@ -1236,7 +1231,7 @@ ENG = {
     fn quoted_key_escape_rules_match_value() {
         // "\"key\"" = value — the key's \" should unescape to just "key" without outer quotes
         let table = StringTable::new();
-        let result = parse_string(r#""my\"key" = 1"#, &table).unwrap();
+        let result = parse_string(r#""my\"key" = 1"#, &table);
         if let Child::Leaf(i) = &result.root_children[0] {
             let leaf = &result.arena.leaves[*i as usize];
             let key_raw = table.get_string(leaf.key.normal).unwrap_or_default();
@@ -1254,7 +1249,7 @@ ENG = {
         // cursor exactly as before (open quote, body, close quote), so its leaf
         // start col is still the column of the opening quote and no error fires.
         let table = StringTable::new();
-        let result = parse_string("  \"k\" = 5", &table).unwrap();
+        let result = parse_string("  \"k\" = 5", &table);
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         match &result.root_children[0] {
             Child::Leaf(i) => {
@@ -1269,7 +1264,7 @@ ENG = {
     #[test]
     fn leaf_value_position_excludes_trailing_whitespace() {
         let table = StringTable::new();
-        let result = parse_string("a = # comment\n  \"value\"  # tail\nb = yes", &table).unwrap();
+        let result = parse_string("a = # comment\n  \"value\"  # tail\nb = yes", &table);
         let Child::Leaf(i) = &result.root_children[0] else {
             panic!("expected a leaf");
         };
@@ -1295,7 +1290,7 @@ block = { nested = value }
 shorthand { nested = value }
 "#;
         let table = StringTable::new();
-        let result = parse_string(input, &table).unwrap();
+        let result = parse_string(input, &table);
         let edits = result
             .root_children
             .iter()
@@ -1322,7 +1317,7 @@ shorthand { nested = value }
     #[test]
     fn missing_leaf_value_has_an_empty_value_span() {
         let table = StringTable::new();
-        let result = parse_string("missing = ", &table).unwrap();
+        let result = parse_string("missing = ", &table);
         let Child::Leaf(idx) = result.root_children[0] else {
             panic!("expected a leaf");
         };
@@ -1356,8 +1351,8 @@ shorthand { nested = value }
         // Two identical assignments, one with CRLF line ending, one with LF.
         // The column of the second key should be the same in both cases.
         let table = StringTable::new();
-        let crlf = parse_string("a = 1\r\nb = 2", &table).unwrap();
-        let lf = parse_string("a = 1\nb = 2", &table).unwrap();
+        let crlf = parse_string("a = 1\r\nb = 2", &table);
+        let lf = parse_string("a = 1\nb = 2", &table);
         let col_crlf = match &crlf.root_children[1] {
             Child::Leaf(i) => crlf.arena.leaves[*i as usize].pos.start.col,
             _ => panic!(),
@@ -1382,7 +1377,7 @@ shorthand { nested = value }
         // "@\[expr]" should parse as a String containing "@\[expr]".
         let table = StringTable::new();
         let input = r"x = @\[expr]";
-        let result = parse_string(input, &table).unwrap();
+        let result = parse_string(input, &table);
         match value_of(&result, &table, 0) {
             Value::String(t) => {
                 let s = table.get_string(t.normal).unwrap_or_default();
@@ -1402,7 +1397,7 @@ shorthand { nested = value }
         let table = StringTable::new();
         // a = "oops has no closing " before the newline.
         // b = 1 must still parse as a separate statement.
-        let result = parse_string("a = \"oops\nb = 1", &table).unwrap();
+        let result = parse_string("a = \"oops\nb = 1", &table);
         assert!(
             !result.errors.is_empty(),
             "expected a parse error for the unclosed quoted string"
@@ -1417,7 +1412,7 @@ shorthand { nested = value }
     #[test]
     fn unclosed_key_rhs_quote_at_eof_produces_error() {
         let table = StringTable::new();
-        let result = parse_string("a = \"unterminated", &table).unwrap();
+        let result = parse_string("a = \"unterminated", &table);
         assert!(
             !result.errors.is_empty(),
             "expected a parse error for an unclosed string at EOF"
@@ -1438,7 +1433,7 @@ shorthand { nested = value }
         // `"foo\nbar = 1\n" = 5\n`: the unclosed quoted key used to span three
         // lines, swallowing the well-formed `bar = 1`. It must now stop at the
         // first newline, flag the unclosed string, and leave `bar = 1` intact.
-        let result = parse_string("\"foo\nbar = 1\n\" = 5\n", &table).unwrap();
+        let result = parse_string("\"foo\nbar = 1\n\" = 5\n", &table);
         // (b) an unclosed-quoted-string error is recorded.
         assert!(
             !result.errors.is_empty(),
@@ -1466,7 +1461,7 @@ shorthand { nested = value }
         let table = StringTable::new();
         // A quoted key with no closing quote at EOF must error, not be accepted
         // silently.
-        let result = parse_string("\"unterminated = 5", &table).unwrap();
+        let result = parse_string("\"unterminated = 5", &table);
         assert!(
             !result.errors.is_empty(),
             "expected a parse error for an unclosed quoted key at EOF"
@@ -1496,8 +1491,7 @@ shorthand { nested = value }
     #[test]
     fn question_selector_key_is_one_keyed_clause() {
         let table = StringTable::new();
-        let result =
-            parse_string("war_propaganda_decision_cost?150 = { value = 150 }", &table).unwrap();
+        let result = parse_string("war_propaganda_decision_cost?150 = { value = 150 }", &table);
         assert_eq!(
             result.root_children.len(),
             1,
@@ -1515,7 +1509,7 @@ shorthand { nested = value }
         // The pre-TAOG `my_var?150 = 100` form: one key=value leaf, not a bare
         // value plus an orphan `= 100`.
         let table = StringTable::new();
-        let result = parse_string("war_propaganda_decision_cost?150 = 100", &table).unwrap();
+        let result = parse_string("war_propaganda_decision_cost?150 = 100", &table);
         assert_eq!(result.root_children.len(), 1, "{:?}", result.root_children);
         match &result.root_children[0] {
             Child::Leaf(i) => {
@@ -1533,8 +1527,7 @@ shorthand { nested = value }
     fn caret_selector_key_is_one_keyed_clause() {
         // The `^` variant was already a key char; lock it in as a sibling case.
         let table = StringTable::new();
-        let result =
-            parse_string("war_propaganda_decision_cost^foo = { value = 150 }", &table).unwrap();
+        let result = parse_string("war_propaganda_decision_cost^foo = { value = 150 }", &table);
         assert_eq!(result.root_children.len(), 1, "{:?}", result.root_children);
         assert_eq!(
             keyed_clause_key(&result, &table, 0),
@@ -1550,7 +1543,7 @@ shorthand { nested = value }
         // a trailing `?`.
         for src in ["foo ?= bar", "foo?= bar"] {
             let table = StringTable::new();
-            let result = parse_string(src, &table).unwrap();
+            let result = parse_string(src, &table);
             assert_eq!(
                 result.root_children.len(),
                 1,
@@ -1614,7 +1607,7 @@ shorthand { nested = value }
         // 30,000 levels is the reproducer that aborted with "fatal runtime
         // error: stack overflow" on the default 8 MB main stack.
         let table = StringTable::new();
-        let result = parse_string(&nested_clauses(30_000), &table).expect("parse must return");
+        let result = parse_string(&nested_clauses(30_000), &table);
         let errs = depth_errors(&result);
         assert_eq!(errs.len(), 1, "one depth error, got: {:?}", result.errors);
         assert!(
@@ -1630,7 +1623,7 @@ shorthand { nested = value }
         let table = StringTable::new();
         // 24 is the deepest nesting in HOI4 vanilla / Kaiserreich / the ruleset.
         for depth in [1, 24, MAX_CLAUSE_DEPTH as usize] {
-            let result = parse_string(&nested_clauses(depth), &table).unwrap();
+            let result = parse_string(&nested_clauses(depth), &table);
             assert!(
                 result.errors.is_empty(),
                 "depth {} must parse clean, got: {:?}",
@@ -1659,7 +1652,7 @@ shorthand { nested = value }
         let table = StringTable::new();
         let deep = nested_clauses(MAX_CLAUSE_DEPTH as usize + 1);
         let src = format!("{deep}\n# trailing }} brace\nafter = \"}}{{\"\nlast = 2\n");
-        let result = parse_string(&src, &table).unwrap();
+        let result = parse_string(&src, &table);
         assert_eq!(depth_errors(&result).len(), 1, "{:?}", result.errors);
         let last = result
             .root_children
@@ -1684,6 +1677,10 @@ shorthand { nested = value }
         let table = StringTable::new();
         let src = format!("foo = {}", "a".repeat(70_000));
         let result = parse_string(&src, &table);
-        assert!(result.is_ok(), "parse must complete without panicking");
+        assert_eq!(
+            result.root_children.len(),
+            1,
+            "parse must complete without panicking"
+        );
     }
 }

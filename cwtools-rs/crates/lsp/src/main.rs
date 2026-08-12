@@ -982,15 +982,14 @@ const DEBOUNCE_MS: u64 = 250;
 /// validation is logged without arming every later edit.
 static VALIDATE_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
 
-// ── Custom notification stubs ─────────────────────────────────────────────────
+// ── Custom notifications ──────────────────────────────────────────────────────
 
-// NOT PORTED — pre-trigger refactor.
-// (code-actions are handled in `code_action.rs`: QUICKFIX from SuggestedFix;
-// the techGraph / event-graph data is in `graph.rs` behind `getGraphData`.)
-// See the F# LanguageFeatures.fs module if these are needed later.
-//   - getEmbeddedMetadata: per-file metadata bundle sent to the extension on
-//     open (F# LanguageFeatures.getEmbeddedMetadata).  Low priority until the
-//     extension side is ported.
+// Code actions live in `code_action.rs` (QUICKFIX from SuggestedFix); the
+// techGraph / event-graph data is in `graph.rs` behind `getGraphData`.
+//
+// Not implemented: `getEmbeddedMetadata`, a per-file metadata bundle pushed to
+// the extension on open. Nothing in cwtools-vscode asks for it, so it stays
+// unbuilt until the extension side wants it.
 
 impl Backend {
     /// Spawn a background validation for `uri` at `version` and register the
@@ -1303,17 +1302,12 @@ impl Backend {
         }
         let table = self.state.string_table.clone();
         tokio::task::block_in_place(|| {
-            cwtools_parser::parser::parse_string(&text, &table)
-                .ok()
-                .map(|ast| {
-                    let ast = Arc::new(ast);
-                    *self.state.fresh_ast_cache.lock() =
-                        Some((uri.to_string(), version, Arc::clone(&ast)));
-                    AstSnapshot {
-                        ast,
-                        source: AstSource::FreshParse,
-                    }
-                })
+            let ast = Arc::new(cwtools_parser::parser::parse_string(&text, &table));
+            *self.state.fresh_ast_cache.lock() = Some((uri.to_string(), version, Arc::clone(&ast)));
+            Some(AstSnapshot {
+                ast,
+                source: AstSource::FreshParse,
+            })
         })
     }
 
@@ -1859,15 +1853,10 @@ impl LanguageServer for Backend {
             tokio::task::spawn_blocking(move || {
                 use crate::access::{FileRead, MAX_URI_READ_BYTES, read_authorized};
                 match read_authorized(&uri, &roots, MAX_URI_READ_BYTES) {
-                    FileRead::Text(text) => {
-                        match cwtools_parser::parser::parse_string(&text, &table) {
-                            Ok(parsed) => DiskState::Parsed {
-                                parsed,
-                                discarded_edits: text != *buffer_text,
-                            },
-                            Err(_) => DiskState::Absent,
-                        }
-                    }
+                    FileRead::Text(text) => DiskState::Parsed {
+                        parsed: cwtools_parser::parser::parse_string(&text, &table),
+                        discarded_edits: text != *buffer_text,
+                    },
                     FileRead::Missing | FileRead::Refused => DiskState::Absent,
                 }
             })
@@ -2265,7 +2254,7 @@ mod tests {
     #[test]
     fn document_store_keeps_stale_ast_source_in_the_budget() {
         let source = "root = { value = 1 }";
-        let ast = Arc::new(parse_string(source, &StringTable::new()).unwrap());
+        let ast = Arc::new(parse_string(source, &StringTable::new()));
         let mut store = DocumentStore::new();
         store
             .open("file:///doc".to_string(), document(source))
@@ -2710,7 +2699,7 @@ mod tests {
         let table = StringTable::new();
         // Nested: foo node containing a leaf "base = my_instance"
         let source = "foo = { base = my_instance }\n";
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let mut rs = bool_enum_ruleset();
         // Use an AliasRule (not path-filtered) that contains base -> TypeField(my_type)

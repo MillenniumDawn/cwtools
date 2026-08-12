@@ -954,8 +954,7 @@ impl Backend {
                             Some(cwtools_cache::workspace::content_hash(&text)),
                         ));
                     }
-                    let parsed =
-                        parse_string_without_comments(&text, &self.state.string_table).ok()?;
+                    let parsed = parse_string_without_comments(&text, &self.state.string_table);
                     if let Some((cd, fp)) = cache_info.as_ref() {
                         if let Some(source_key) = source_key.as_ref() {
                             workspace_cache::store_path(

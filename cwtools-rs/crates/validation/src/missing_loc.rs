@@ -106,9 +106,9 @@ thing = { x = scalar }
 
     fn run_at(logical_path: &str, script: &str, has: &[&str]) -> Vec<ValidationError> {
         let table = StringTable::new();
-        let parsed_cwt = parse_string(RULES, &table).unwrap();
+        let parsed_cwt = parse_string(RULES, &table);
         let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-        let parsed = parse_string(script, &table).unwrap();
+        let parsed = parse_string(script, &table);
         let present: std::collections::HashSet<String> =
             has.iter().map(|s| s.to_ascii_lowercase()).collect();
         let per_type = collect_type_instances(&ruleset, &parsed, logical_path, &table);

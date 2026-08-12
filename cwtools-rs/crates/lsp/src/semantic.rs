@@ -735,13 +735,13 @@ mod tests {
 
     fn tokens_for(text: &str) -> Vec<AbsToken> {
         let table = StringTable::new();
-        let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
+        let ast = cwtools_parser::parser::parse_string(text, &table);
         semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF16, None, None)
     }
 
     fn tokens_in_span(text: &str, span: LineSpan) -> Vec<AbsToken> {
         let table = StringTable::new();
-        let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
+        let ast = cwtools_parser::parser::parse_string(text, &table);
         semantic_tokens(
             &ast,
             &table,
@@ -1024,7 +1024,7 @@ mod tests {
         // column after it shifts by one and the token itself is length 2.
         let text = "a = 😀\n";
         let table = StringTable::new();
-        let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
+        let ast = cwtools_parser::parser::parse_string(text, &table);
         let tokens = semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF16, None, None);
         let value = tokens.iter().find(|t| t.token_type == TY_STRING).unwrap();
         assert_eq!((value.start, value.length), (4, 2));
@@ -1034,7 +1034,7 @@ mod tests {
     fn utf32_columns_and_lengths_count_scalars() {
         let text = "a = 😀\n";
         let table = StringTable::new();
-        let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
+        let ast = cwtools_parser::parser::parse_string(text, &table);
         let tokens = semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF32, None, None);
         let value = tokens.iter().find(|t| t.token_type == TY_STRING).unwrap();
         assert_eq!((value.start, value.length), (4, 1));
@@ -1044,7 +1044,7 @@ mod tests {
     fn a_non_bmp_char_before_a_token_shifts_its_utf16_column() {
         let text = "😀 = 1\n";
         let table = StringTable::new();
-        let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
+        let ast = cwtools_parser::parser::parse_string(text, &table);
         let tokens = semantic_tokens(&ast, &table, text, &PositionEncodingKind::UTF16, None, None);
         let number = tokens.iter().find(|t| t.token_type == TY_NUMBER).unwrap();
         assert_eq!(number.start, 5, "char col 4 is UTF-16 col 5");

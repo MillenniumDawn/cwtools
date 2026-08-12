@@ -313,7 +313,7 @@ mod tests {
 
     fn hints_for(text: &str, idx: &TypeIndex, loc: &LocTextMap) -> Vec<InlayHint> {
         let table = StringTable::new();
-        let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
+        let ast = cwtools_parser::parser::parse_string(text, &table);
         let range = Range::new(Position::new(0, 0), Position::new(1000, 0));
         loc_title_hints(
             &ast,
@@ -406,7 +406,7 @@ mod tests {
         let idx = idx_with("idea", &["my_idea"]);
         let loc = loc(&[("my_idea", "My Idea")]);
         let table = StringTable::new();
-        let ast = cwtools_parser::parser::parse_string(text, &table).expect("parse");
+        let ast = cwtools_parser::parser::parse_string(text, &table);
         // Restrict the range to the middle line only.
         let range = Range::new(Position::new(1, 0), Position::new(1, 100));
         let hints = loc_title_hints(

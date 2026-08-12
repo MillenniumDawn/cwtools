@@ -33,11 +33,8 @@ pub fn errors_to_cached(errors: &[ParseError]) -> CachedErrors {
     CachedErrors {
         errors: errors
             .iter()
-            .map(|error| match error {
-                ParseError::Pos(line, col, message) => {
-                    CachedParseError::Pos(*line, *col, message.clone())
-                }
-                ParseError::General(message) => CachedParseError::General(message.clone()),
+            .map(|ParseError::Pos(line, col, message)| {
+                CachedParseError::Pos(*line, *col, message.clone())
             })
             .collect(),
     }
@@ -48,10 +45,7 @@ pub fn cached_errors_to_parse(cached: CachedErrors) -> Vec<ParseError> {
     cached
         .errors
         .into_iter()
-        .map(|error| match error {
-            CachedParseError::Pos(line, col, message) => ParseError::Pos(line, col, message),
-            CachedParseError::General(message) => ParseError::General(message),
-        })
+        .map(|CachedParseError::Pos(line, col, message)| ParseError::Pos(line, col, message))
         .collect()
 }
 

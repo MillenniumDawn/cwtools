@@ -235,12 +235,12 @@ user = { uses = <thing> }
         files: &[(&str, &str)],
     ) -> Vec<ValidationError> {
         let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(rules_src, &table).unwrap(), &table);
+        let ruleset = ast_to_ruleset(&parse_string(rules_src, &table), &table);
         let registry = build_scope_registry_arc(&ruleset, game);
 
         let parsed: Vec<_> = files
             .iter()
-            .map(|(path, src)| (*path, parse_string(src, &table).unwrap()))
+            .map(|(path, src)| (*path, parse_string(src, &table)))
             .collect();
 
         let mut index = TypeIndex::new();
@@ -526,17 +526,17 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 ## severity = warning
 alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 "#;
+        // One two-overload usage past the 65,536-branch budget. Every usage is
+        // its own, so there is nothing to memoize and the budget is what stops
+        // the file.
         let mut user = String::from("a_user = {\n");
-        for _ in 0..20 {
-            user.push_str("recurse = {\n");
+        for _ in 0..32_769 {
+            user.push_str("recurse = { }\n");
         }
-        user.push_str("bad = nope\n");
-        for _ in 0..=20 {
-            user.push_str("}\n");
-        }
+        user.push_str("}\n");
         let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(CAPPED_ALIAS_RULES, &table).unwrap(), &table);
-        let parsed = parse_string(&user, &table).unwrap();
+        let ruleset = ast_to_ruleset(&parse_string(CAPPED_ALIAS_RULES, &table), &table);
+        let parsed = parse_string(&user, &table);
         let errors = crate::validate_ast(
             &parsed,
             &ruleset,
@@ -565,6 +565,72 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
         assert!(
             found.is_empty(),
             "capped validation must not emit CW239: {found:?}"
+        );
+    }
+
+    /// A memoized alias subtree still establishes what it references. The memo
+    /// replays diagnostics, not type uses, because a use recorded during the walk
+    /// that filled an entry is already in the file's sink. If that ever stopped
+    /// holding, this file would report its reference as unused.
+    #[test]
+    fn memoized_alias_validation_still_records_its_uses() {
+        const MEMOIZED_ALIAS_RULES: &str = r#"
+types = {
+    type[thing] = {
+        path = "game/common/things"
+        should_be_used = yes
+    }
+    type[user] = {
+        path = "game/common/users"
+    }
+}
+thing = { x = scalar }
+user = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+## severity = warning
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:uses] = <thing>
+"#;
+        // Twenty levels of two-way recursion around a field nothing accepts: no
+        // candidate comes back clean, so every level branches and the memo takes
+        // over partway down. The reference sits at the bottom, inside the part
+        // of the walk the memo answers for.
+        let mut user = String::from("a_user = {\n");
+        for _ in 0..20 {
+            user.push_str("recurse = {\n");
+        }
+        user.push_str("uses = my_thing\nbad = nope\n");
+        for _ in 0..=20 {
+            user.push_str("}\n");
+        }
+        let table = StringTable::new();
+        let ruleset = ast_to_ruleset(&parse_string(MEMOIZED_ALIAS_RULES, &table).unwrap(), &table);
+        let parsed = parse_string(&user, &table).unwrap();
+        let errors = crate::validate_ast(
+            &parsed,
+            &ruleset,
+            &table,
+            "common/users/test.txt",
+            None,
+            None,
+            None,
+        );
+        assert!(
+            errors.iter().all(|error| error.code != Some("CW277")),
+            "the fixture must finish rather than cap, or the blanket suppression \
+             would hide a lost use: {errors:?}"
+        );
+
+        let found = unused_in(
+            MEMOIZED_ALIAS_RULES,
+            &[
+                ("common/things/test.txt", "my_thing = { x = a }\n"),
+                ("common/users/test.txt", &user),
+            ],
+        );
+        assert!(
+            found.is_empty(),
+            "the memoized walk referenced my_thing: {found:?}"
         );
     }
 
@@ -926,7 +992,7 @@ technology = {
     #[test]
     fn needs_use_tracking_follows_the_config() {
         let table = StringTable::new();
-        let tracked = ast_to_ruleset(&parse_string(RULES, &table).unwrap(), &table);
+        let tracked = ast_to_ruleset(&parse_string(RULES, &table), &table);
         assert!(needs_use_tracking(&tracked, None));
         assert!(!needs_use_tracking(&RuleSet::new(), None));
         // Stellaris always tracks `technology` for CW231, config or not.
