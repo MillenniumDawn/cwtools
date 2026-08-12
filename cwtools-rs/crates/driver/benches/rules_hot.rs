@@ -11,7 +11,8 @@
 //! The ScopeRegistry cases exercise the loaded config's name lookup, named-link
 //! resolution, construction paths, and the validation save/restore lifecycle.
 //!
-//! The ruleset comes from a sibling checkout, same inputs as the corpus guard:
+//! The ruleset comes from a `cwtools-hoi4-config` checkout, same input as the
+//! corpus guard, named by `CWTOOLS_RULES` or found under `CWTOOLS_PROJECTS`:
 //!
 //!   CWTOOLS_RULES=/path/to/cwtools-hoi4-config/Config cargo bench -p cwtools_driver
 //!

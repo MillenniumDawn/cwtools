@@ -70,7 +70,7 @@ pub(crate) fn alias_overloads<'a>(
 /// Push order is exact → lowercase → patterns → scope_field. Validation
 /// coalesces fully equivalent candidates while the set is small; navigation
 /// retains every candidate. The scope check filters to the confident subset,
-/// preserving order for `pick_best`'s tie-break.
+/// preserving order for `pick_best_candidate`'s tie-break.
 ///
 /// A usage resolves to a handful of overloads at most, and this runs for every
 /// effect/trigger in the corpus, so the set is inline until it doesn't fit.

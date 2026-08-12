@@ -779,7 +779,7 @@ impl Backend {
 
         // Fallback: flat global list (original behavior) when context-aware
         // matching produced nothing (no rules loaded, unrecognised path, or a
-        // context `descend_rules` can't reach, e.g. inside an alias-driven block
+        // context `rules_at_pos` can't reach, e.g. inside an alias-driven block
         // like `check_variable = { … }`). On a large mod the workspace has tens
         // of thousands of variables/targets/keys, so cap the dump and flag the
         // result `is_incomplete` — the client re-requests as the user narrows.
