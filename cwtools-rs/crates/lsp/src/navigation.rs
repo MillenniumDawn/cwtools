@@ -206,38 +206,17 @@ impl Backend {
 
     /// Resolve a `FilepathField` reference (a game-relative path like
     /// `gfx/…/foo.dds`) to a file Location by probing the workspace root, then
-    /// the configured vanilla install. Returns an empty Vec when nothing exists.
+    /// the configured vanilla install. Returns an empty Vec when nothing exists
+    /// inside either of them.
     async fn file_ref_locations(&self, path: &str, fallback: &Url) -> Vec<Location> {
-        let path = unquote(path).trim();
-        if path.is_empty() {
-            return Vec::new();
-        }
-        let rel = path.trim_start_matches(['/', '\\']);
-        let rel = std::path::Path::new(rel);
-        if rel.is_absolute()
-            || rel.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
+        resolve_file_ref(&self.search_roots(), path)
+            .await
+            .map(|candidate| Location {
+                uri: parse_uri(crate::paths::path_to_uri(&candidate), fallback),
+                range: Range::default(),
             })
-        {
-            return Vec::new();
-        }
-        for root in self.search_roots() {
-            let candidate = root.join(rel);
-            // Async stat: a goto request must not block the runtime on a sync
-            // filesystem syscall (at most two candidate roots, so no batching).
-            if tokio::fs::metadata(&candidate).await.is_ok() {
-                return vec![Location {
-                    uri: parse_uri(crate::paths::path_to_uri(&candidate), fallback),
-                    range: Range::default(),
-                }];
-            }
-        }
-        Vec::new()
+            .into_iter()
+            .collect()
     }
 
     /// The classified `.cwt` reference under the cursor, read from the line
@@ -1196,6 +1175,18 @@ impl Backend {
         }
         Ok(Some(self.build_workspace_edit(by_uri)))
     }
+}
+
+/// The file a `FilepathField` value names under one of `roots`, or `None` when
+/// it names none of them. The value is mod content, so the join is contained
+/// before it is probed (#176).
+async fn resolve_file_ref(roots: &[std::path::PathBuf], path: &str) -> Option<std::path::PathBuf> {
+    let path = unquote(path).trim();
+    if path.is_empty() {
+        return None;
+    }
+    let rel = std::path::Path::new(path.trim_start_matches(['/', '\\']));
+    crate::access::contained_search_path(roots, rel).await
 }
 
 /// The rename-cancelled error for a target the edit boundary refused, naming
@@ -2224,6 +2215,29 @@ mod tests {
                 },
             },
         }
+    }
+
+    /// The goto side of #176: the `FilepathField` value is mod content, so one
+    /// climbing out of the search roots resolves to nothing rather than
+    /// reporting whether the file it names exists.
+    #[tokio::test]
+    async fn a_file_ref_that_climbs_out_of_the_roots_resolves_to_nothing() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path().join("mod");
+        std::fs::create_dir_all(root.join("gfx")).unwrap();
+        std::fs::write(root.join("gfx/pic.dds"), "x").unwrap();
+        std::fs::write(tmp.path().join("secret.dds"), "secret").unwrap();
+        let roots = vec![root.clone()];
+
+        assert_eq!(resolve_file_ref(&roots, "../secret.dds").await, None);
+        assert_eq!(
+            resolve_file_ref(&roots, "\"/gfx/../../secret.dds\"").await,
+            None
+        );
+        assert_eq!(
+            resolve_file_ref(&roots, "gfx/pic.dds").await,
+            Some(root.join("gfx/pic.dds"))
+        );
     }
 
     #[test]
