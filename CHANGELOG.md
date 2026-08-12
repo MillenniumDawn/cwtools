@@ -108,6 +108,7 @@
 - The release workflow defaults to `contents: read` and grants `contents: write` only on the `publish` job, and the two build jobs check out with `persist-credentials: false`. The platform builds run dependency build scripts and proc macros, so they no longer do that while a repository-write token sits in the runner's git config. (#168)
 - What CW100 means, "a required, name-derived localisation key", is now `TypeLocalisation::is_required_name_derived()` in `cwtools_rules`, and the `prefix + name + suffix` key it expects is `TypeLocalisation::derived_key()`. Both were open-coded at six sites spread across the validator, the LSP's loc-change sweep, the CW100 quick fix and `genlocall`, three of them written inverted, so changing the rule meant finding all six. The loc-display paths (hover, graph node labels) keep their own wider `primary || required` test and share only the key derivation. Diagnostics are unchanged. (#145)
 - The release workflow now refuses a `v*` tag whose commit is not an ancestor of `origin/main`, before any platform builds or the publish step run. This is defense in depth behind a repository ruleset restricting who can create or move a release tag, which has to be applied in the repository settings. (#158)
+- The README answers what the two binaries do and where the code lives. It lists the language server's features and the CLI's subcommands and report formats, and maps the 15 crates under `cwtools-rs/crates/` in a paragraph, so neither has to be pieced together from ARCHITECTURE.md. (#68)
 
 # 2.4.0
 
