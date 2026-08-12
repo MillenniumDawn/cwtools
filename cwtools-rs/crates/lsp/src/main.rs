@@ -976,15 +976,14 @@ struct Backend {
 /// to skip the per-keystroke re-parse that made large files lag.
 const DEBOUNCE_MS: u64 = 250;
 
-// ── Custom notification stubs ─────────────────────────────────────────────────
+// ── Custom notifications ──────────────────────────────────────────────────────
 
-// NOT PORTED — pre-trigger refactor.
-// (code-actions are handled in `code_action.rs`: QUICKFIX from SuggestedFix;
-// the techGraph / event-graph data is in `graph.rs` behind `getGraphData`.)
-// See the F# LanguageFeatures.fs module if these are needed later.
-//   - getEmbeddedMetadata: per-file metadata bundle sent to the extension on
-//     open (F# LanguageFeatures.getEmbeddedMetadata).  Low priority until the
-//     extension side is ported.
+// Code actions live in `code_action.rs` (QUICKFIX from SuggestedFix); the
+// techGraph / event-graph data is in `graph.rs` behind `getGraphData`.
+//
+// Not implemented: `getEmbeddedMetadata`, a per-file metadata bundle pushed to
+// the extension on open. Nothing in cwtools-vscode asks for it, so it stays
+// unbuilt until the extension side wants it.
 
 impl Backend {
     /// Spawn a background validation for `uri` at `version` and register the

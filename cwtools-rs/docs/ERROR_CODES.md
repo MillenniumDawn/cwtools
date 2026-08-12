@@ -52,7 +52,7 @@ and CW241 by CW262-265.
 | CW108 | Error | This research_leader is missing required "area" | A `research_leader` block omits the required `area` field. | Emitted (Stellaris only; `research_leader` nested in `common/technology/*.txt`) |
 | CW109 | Information | This research_leader uses area {} but the technology uses area {} | The area in `research_leader` disagrees with the enclosing technology's area. | Emitted (Stellaris only; args leader-then-tech, F# had them swapped) |
 | CW110 | Error | No category found for this technology | A technology definition has no category. | Emitted (Stellaris only; any `common/technology/*.txt` root block) |
-| CW113 | Error | File {} not found, this is case sensitive | A file path referenced in script doesn't exist. Every indexed file (mod and base game, live or cache-restored) is matched by exact on-disk case, so a case-mismatched reference is flagged for case-sensitive filesystems (Linux/Mac). On by default; set `case-sensitive-files = false` in `cwtools.toml` (or pass `--case-sensitive-files false`) for a Windows-authored mod that must tolerate case mismatches. | Emitted (FilepathField refs checked against the mod+vanilla file index) |
+| CW113 | Error | File {} not found, this is case sensitive | A file path referenced in script doesn't exist. Every indexed file (mod and base game, live or cache-restored) is matched by exact on-disk case, so a case-mismatched reference is flagged for case-sensitive filesystems (Linux/Mac). On by default; set `case-sensitive-files = false` in `cwtools.toml` (or pass `--case-sensitive-files false`) for a Windows-authored mod that must tolerate case mismatches. | Emitted (FilepathField refs checked against the mod+vanilla file index; needs base-game data, so a run without `--vanilla` or `--vanilla-cache` stays silent) |
 | CW120 | Information | Trigger {} can be made a pretrigger (see code action to fix) | A trigger that could be promoted to a pretrigger for performance. | Emitted (Stellaris only; per-scope set, event `trigger` and pop-job `possible` blocks) |
 | CW121 | Warning | This 'if' trigger contains no effects | An `if` block contains only a `limit` or nothing at all. | Emitted |
 | CW122 | Information | Localisation key {} should not be quoted when used inline, this can cause unexpected behaviour | A loc key is wrapped in quotes where it is used inline. | Emitted |
@@ -86,9 +86,9 @@ and CW241 by CW262-265.
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW227 | Error | Section template {} can not be found | A ship design references a section template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500; `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` exempt) |
+| CW227 | Error | Section template {} can not be found | A ship design references a section template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500, so it needs `--vanilla` or `--vanilla-cache`; `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` exempt) |
 | CW228 | Error | Section template {} does not have a slot {} | A section template is referenced with a slot name it doesn't define. | Defined, emission pending (vanilla data registries) |
-| CW229 | Error | Component template {} can not be found | A ship design references a component template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500) |
+| CW229 | Error | Component template {} can not be found | A ship design references a component template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500, so it needs `--vanilla` or `--vanilla-cache`) |
 | CW230 | Warning | Component and slot do not match, slot {} has size {} and component {} has size {} | The size of a component doesn't fit the slot it's placed in. | Defined, emission pending (vanilla data registries) |
 | CW231 | Warning | Technology {} is not used | A technology definition is never referenced anywhere. | Emitted (Stellaris only; same reference map as CW239, minus F#'s exemptions: `prereqfor_desc`, `modifier`, `feature_flags`, `weight = 0`, `weight_modifier` factor 0) |
 | CW233 | Error | Entity {} is not defined | A section or other asset references an entity that isn't defined. | Defined, emission pending (vanilla data registries / asset index) |
@@ -142,7 +142,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW250 | Error | {} | A planet-killer component template lacks its support script. | Emitted (Stellaris only; needs a matching `on_destroy_planet_with_<key>` on_action and `can_destroy_planet_with_<key>` scripted trigger; gated like CW500) |
+| CW250 | Error | {} | A planet-killer component template lacks its support script. | Emitted (Stellaris only; needs a matching `on_destroy_planet_with_<key>` on_action and `can_destroy_planet_with_<key>` scripted trigger; gated like CW500, so it needs `--vanilla` or `--vanilla-cache`) |
 | CW251 | Warning | This {} is unnecessary | A boolean operator (`AND`/`OR`) is nested directly inside an identical operator. | Emitted |
 | CW253 | Information | Consider using "set_name" instead for consistency | `set_empire_name` or `set_planet_name` should be replaced with `set_name`. | Emitted |
 | CW280 | Information | {} = { always = ... } matches the default and can be removed | HOI4 cleanup hint: a field whose body is exactly `{ always = <bool> }` matching the field's default (e.g. `allowed_civil_war = { always = no }`) is a no-op and can be deleted. Rust-original (no F# equivalent); field/default table in `per_game::hoi4`. | Emitted |
@@ -160,7 +160,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | CW258 | Information | Localisation file name should end with "l_language.yml" | Language tag is present but not at the end of the file name. F# defines this but leaves emission commented out as "only convention"; cwtools-rs matches that -- const defined, never fired. | Retired / not emitted |
 | CW259 | Error | This localisation string refers to itself | A loc key's value includes a `$KEY$` reference back to the same key. | Emitted |
 | CW260 | Error | Loc command {} used in wrong scope. In {} but expected {} | A loc command is used in a data scope that doesn't support it. | Emitted |
-| CW261 | Error | Key {} of type {} is defined multiple times | A `unique` type key appears more than once across the loaded files. | Emitted (reconciled from Rust CW501) |
+| CW261 | Error | Key {} of type {} is defined multiple times | A `unique` type key appears more than once as a root key in the same file. Detection is per-file, not project-wide: the same key duplicated across two files is not flagged. | Emitted (reconciled from Rust CW501) |
 | CW262 | Error | {} | An unexpected `key = { ... }` node where the rule doesn't allow one. Also fires on a bad key inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
 | CW263 | Error | {} | An unexpected `key = value` leaf where the rule doesn't allow one. Also fires on a mis-typed operator inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
 | CW264 | Warning | {} | An unexpected bare value where the rule doesn't allow one. | Emitted |
@@ -196,7 +196,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW500 | Error | Type '{}' not found | A type name referenced in rules or script has no definition. No F# equivalent. | Emitted |
+| CW500 | Error | Type '{}' not found | A type name referenced in rules or script has no definition. No F# equivalent. | Emitted (needs base-game data: the check only runs once the type index is complete, which means `--vanilla` or `--vanilla-cache`) |
 
 CW501 (duplicate type) and CW502 (unused type) were Rust-invented IDs that have been retired in favour of their F# equivalents CW261 and CW239 respectively.
 

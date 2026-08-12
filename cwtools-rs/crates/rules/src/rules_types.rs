@@ -663,7 +663,9 @@ pub struct TypeDefinition {
     pub unique: bool,
     pub should_be_referenced: bool,
     pub localisation: Vec<TypeLocalisation>,
-    /// `## graph_related_types = { ... }`: parsed for .cwt spec compatibility; not consumed.
+    /// `## graph_related_types = { ... }`: which other types may join a graph
+    /// seeded on this one. Consumed by the LSP's `getGraphData` (`lsp::graph`);
+    /// empty means any type.
     pub graph_related_types: Vec<String>,
     pub modifiers: Vec<TypeModifier>,
 }
