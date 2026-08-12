@@ -422,6 +422,8 @@ struct DocumentState {
     /// validation captures the value at spawn time; the cross-file dependent
     /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
     /// into the latest one instead of stacking up and double-validating.
+    /// Ordering is Relaxed: the counter only gates a staleness `!=` compare on
+    /// data already protected by locks, so no happens-before edge is needed.
     edit_generation: AtomicU64,
     /// Per open document, the interned `.lower` ids of the identifier-like
     /// tokens it mentions (keys + string values from its parsed AST). Used by
@@ -1721,7 +1723,7 @@ impl LanguageServer for Backend {
         // sweep entirely, and a changed export refreshes only real dependents.
         // Bump the edit counter so that sweep is tagged and a later edit
         // supersedes it.
-        let generation = self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = self.state.edit_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.spawn_debounced_validate(uri, version, generation, ValidateTrigger::DidOpen, 0);
     }
 
@@ -1765,7 +1767,7 @@ impl LanguageServer for Backend {
 
         // Bump the global edit counter so any in-flight dependent sweep from an
         // earlier edit knows it has been superseded and can stop early.
-        let generation = self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = self.state.edit_generation.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Validate in the background after a short debounce so a burst of
         // keystrokes coalesces into one validation and the handler returns
@@ -1794,7 +1796,7 @@ impl LanguageServer for Backend {
         }) else {
             return;
         };
-        let generation = self.state.edit_generation.load(Ordering::Acquire);
+        let generation = self.state.edit_generation.load(Ordering::Relaxed);
         self.spawn_debounced_validate(uri, version, generation, ValidateTrigger::DidSave, 0);
     }
 
@@ -1906,7 +1908,7 @@ impl LanguageServer for Backend {
             (
                 info.export_fingerprint(&uri),
                 info.export_names(&uri),
-                self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1,
+                self.state.edit_generation.fetch_add(1, Ordering::Relaxed) + 1,
             )
         };
 

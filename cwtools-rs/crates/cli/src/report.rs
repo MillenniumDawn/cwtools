@@ -179,11 +179,6 @@ fn file_uri(path: &str) -> String {
     }
 }
 
-/// A JSON string literal, quotes included.
-fn s(value: &str) -> String {
-    format!("\"{}\"", crate::diag::json_escape(value))
-}
-
 /// The SARIF 2.1.0 document for `diags` (trailing newline included). `base` is
 /// the run's source root: locations under it are emitted relative to
 /// `%SRCROOT%`, so the report resolves in any checkout of the same tree.
@@ -192,9 +187,6 @@ fn s(value: &str) -> String {
 /// catalog entries, and carries only the codes this run actually reported so
 /// every `ruleIndex` resolves.
 pub(crate) fn sarif_report(diags: &[&Diag], base: &Path) -> String {
-    // Carry the catalog entry itself, not just the id: every rule in the array
-    // then has a definition by construction, so the comma accounting can't be
-    // thrown off by a lookup that fails on the second pass.
     let mut rules: Vec<&'static (&'static str, ErrorCode)> = diags
         .iter()
         .filter_map(|d| codes::emitted_entry(d.code))
@@ -202,39 +194,18 @@ pub(crate) fn sarif_report(diags: &[&Diag], base: &Path) -> String {
     rules.sort_unstable_by_key(|(_, c)| c.id);
     rules.dedup_by_key(|(_, c)| c.id);
 
-    // id -> position in `rules`, built once: the per-result lookup below is
-    // otherwise a linear scan of the rule array for every diagnostic.
     let rule_index: std::collections::HashMap<String, usize> = rules
         .iter()
         .enumerate()
         .map(|(i, (_, c))| (c.id.to_ascii_lowercase(), i))
         .collect();
 
-    let mut out = String::new();
-    out.push_str("{\n");
-    out.push_str(&format!("  \"$schema\": {},\n", s(SARIF_SCHEMA)));
-    out.push_str("  \"version\": \"2.1.0\",\n");
-    out.push_str("  \"runs\": [\n");
-    out.push_str("    {\n");
-    out.push_str("      \"tool\": {\n");
-    out.push_str("        \"driver\": {\n");
-    out.push_str("          \"name\": \"cwtools\",\n");
-    out.push_str(&format!(
-        "          \"version\": {},\n",
-        s(env!("CARGO_PKG_VERSION"))
-    ));
-    out.push_str(&format!(
-        "          \"informationUri\": {},\n",
-        s(INFORMATION_URI)
-    ));
-    out.push_str("          \"rules\": [\n");
-    for (i, rule) in rules.iter().enumerate() {
-        out.push_str(&sarif_rule(rule, i + 1 == rules.len()));
-    }
-    out.push_str("          ]\n");
-    out.push_str("        }\n");
-    out.push_str("      },\n");
-    out.push_str("      \"originalUriBaseIds\": {\n");
+    let sarif_rules: Vec<SarifRule> = rules.iter().map(sarif_rule_from).collect();
+    let sarif_results: Vec<SarifResult> = diags
+        .iter()
+        .map(|d| sarif_result_from(d, base, &rule_index))
+        .collect();
+
     // A base URI must end in exactly one '/'. Trimming them all would turn the
     // filesystem root's `file:///` into `file:/`.
     let root = file_uri(&slashed(base));
@@ -242,105 +213,189 @@ pub(crate) fn sarif_report(diags: &[&Diag], base: &Path) -> String {
         Some(_) => root,
         None => format!("{root}/"),
     };
-    out.push_str(&format!(
-        "        \"SRCROOT\": {{ \"uri\": {} }}\n",
-        s(&root)
-    ));
-    out.push_str("      },\n");
-    // Parser columns are character counts, not UTF-16 code units.
-    out.push_str("      \"columnKind\": \"unicodeCodePoints\",\n");
-    out.push_str("      \"results\": [\n");
-    for (i, d) in diags.iter().enumerate() {
-        out.push_str(&sarif_result(d, base, &rule_index, i + 1 == diags.len()));
-    }
-    out.push_str("      ]\n");
-    out.push_str("    }\n");
-    out.push_str("  ]\n");
-    out.push_str("}\n");
+
+    let doc = SarifDocument {
+        schema: SARIF_SCHEMA.to_string(),
+        version: "2.1.0".to_string(),
+        runs: vec![SarifRun {
+            tool: SarifTool {
+                driver: SarifDriver {
+                    name: "cwtools".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    information_uri: INFORMATION_URI.to_string(),
+                    rules: sarif_rules,
+                },
+            },
+            original_uri_base_ids: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("SRCROOT".to_string(), SarifUriBase { uri: root });
+                m
+            },
+            column_kind: "unicodeCodePoints".to_string(),
+            results: sarif_results,
+        }],
+    };
+    let mut out = serde_json::to_string_pretty(&doc).unwrap();
+    out.push('\n');
     out
 }
 
-fn sarif_rule((const_name, code): &(&str, ErrorCode), last: bool) -> String {
-    // The template's `{}` are substitution points, not text a reader wants.
-    // A few entries are nothing but a pass-through `{}` (the message is built at
-    // the emit site), leaving the const's name as the only description.
+#[derive(serde::Serialize)]
+struct SarifDocument {
+    #[serde(rename = "$schema")]
+    schema: String,
+    version: String,
+    runs: Vec<SarifRun>,
+}
+
+#[derive(serde::Serialize)]
+struct SarifRun {
+    tool: SarifTool,
+    #[serde(rename = "originalUriBaseIds")]
+    original_uri_base_ids: std::collections::BTreeMap<String, SarifUriBase>,
+    #[serde(rename = "columnKind")]
+    column_kind: String,
+    results: Vec<SarifResult>,
+}
+
+#[derive(serde::Serialize)]
+struct SarifUriBase {
+    uri: String,
+}
+
+#[derive(serde::Serialize)]
+struct SarifTool {
+    driver: SarifDriver,
+}
+
+#[derive(serde::Serialize)]
+struct SarifDriver {
+    name: String,
+    version: String,
+    #[serde(rename = "informationUri")]
+    information_uri: String,
+    rules: Vec<SarifRule>,
+}
+
+#[derive(serde::Serialize)]
+struct SarifRule {
+    id: String,
+    name: String,
+    #[serde(rename = "shortDescription")]
+    short_description: SarifMessage,
+    #[serde(rename = "defaultConfiguration")]
+    default_configuration: SarifLevel,
+    #[serde(rename = "helpUri")]
+    help_uri: String,
+}
+
+#[derive(serde::Serialize)]
+struct SarifLevel {
+    level: String,
+}
+
+#[derive(serde::Serialize)]
+struct SarifMessage {
+    text: String,
+}
+
+#[derive(serde::Serialize)]
+struct SarifResult {
+    #[serde(rename = "ruleId", skip_serializing_if = "String::is_empty")]
+    rule_id: String,
+    #[serde(rename = "ruleIndex", skip_serializing_if = "Option::is_none")]
+    rule_index: Option<usize>,
+    level: String,
+    message: SarifMessage,
+    locations: Vec<SarifLocation>,
+    #[serde(rename = "partialFingerprints")]
+    partial_fingerprints: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(serde::Serialize)]
+struct SarifLocation {
+    #[serde(rename = "physicalLocation")]
+    physical_location: SarifPhysicalLocation,
+}
+
+#[derive(serde::Serialize)]
+struct SarifPhysicalLocation {
+    #[serde(rename = "artifactLocation")]
+    artifact_location: SarifArtifactLocation,
+    region: SarifRegion,
+}
+
+#[derive(serde::Serialize)]
+struct SarifArtifactLocation {
+    uri: String,
+    #[serde(rename = "uriBaseId", skip_serializing_if = "Option::is_none")]
+    uri_base_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct SarifRegion {
+    #[serde(rename = "startLine")]
+    start_line: u32,
+    #[serde(rename = "startColumn")]
+    start_column: u32,
+}
+
+fn sarif_rule_from((const_name, code): &&'static (&'static str, ErrorCode)) -> SarifRule {
     let description = code.message_template.replace("{}", "…");
     let description = if description.trim_matches(['…', ' ']).is_empty() {
         codes::rule_summary(const_name)
     } else {
         description
     };
-    format!(
-        "            {{\n\
-         \x20             \"id\": {},\n\
-         \x20             \"name\": {},\n\
-         \x20             \"shortDescription\": {{ \"text\": {} }},\n\
-         \x20             \"defaultConfiguration\": {{ \"level\": {} }},\n\
-         \x20             \"helpUri\": {}\n\
-         \x20           }}{}\n",
-        s(code.id),
-        s(&codes::rule_name(const_name)),
-        s(&description),
-        s(sarif_level(code.severity)),
-        s(&cwtools_error_codes::doc_url(code.id)),
-        if last { "" } else { "," }
-    )
+    SarifRule {
+        id: code.id.to_string(),
+        name: codes::rule_name(const_name),
+        short_description: SarifMessage { text: description },
+        default_configuration: SarifLevel {
+            level: sarif_level(code.severity).to_string(),
+        },
+        help_uri: cwtools_error_codes::doc_url(code.id),
+    }
 }
 
-fn sarif_result(
+fn sarif_result_from(
     d: &Diag,
     base: &Path,
     rule_index: &std::collections::HashMap<String, usize>,
-    last: bool,
-) -> String {
+) -> SarifResult {
     let (path, relative) = locate(&d.file, base);
-    let uri = if relative {
-        s(&uri_encode(&path, false))
+    let (uri, uri_base_id) = if relative {
+        (uri_encode(&path, false), Some("SRCROOT".to_string()))
     } else {
-        s(&file_uri(&path))
+        (file_uri(&path), None)
     };
-    let base_id = if relative {
-        ", \"uriBaseId\": \"SRCROOT\""
+    let rule_idx = if d.code.is_empty() {
+        None
     } else {
-        ""
+        rule_index.get(&d.code.to_ascii_lowercase()).copied()
     };
-
-    let mut out = String::from("        {\n");
-    if !d.code.is_empty() {
-        out.push_str(&format!("          \"ruleId\": {},\n", s(d.code)));
-        // Case-insensitively, to match how the rules were collected.
-        if let Some(idx) = rule_index.get(&d.code.to_ascii_lowercase()) {
-            out.push_str(&format!("          \"ruleIndex\": {idx},\n"));
-        }
+    SarifResult {
+        rule_id: d.code.to_string(),
+        rule_index: rule_idx,
+        level: sarif_level(d.severity).to_string(),
+        message: SarifMessage {
+            text: d.message.clone(),
+        },
+        locations: vec![SarifLocation {
+            physical_location: SarifPhysicalLocation {
+                artifact_location: SarifArtifactLocation { uri, uri_base_id },
+                region: SarifRegion {
+                    start_line: d.line.max(1),
+                    start_column: d.col.max(1),
+                },
+            },
+        }],
+        partial_fingerprints: {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert("cwtoolsDiagHash/v1".to_string(), d.hash.clone());
+            m
+        },
     }
-    out.push_str(&format!(
-        "          \"level\": {},\n",
-        s(sarif_level(d.severity))
-    ));
-    out.push_str(&format!(
-        "          \"message\": {{ \"text\": {} }},\n",
-        s(&d.message)
-    ));
-    out.push_str("          \"locations\": [\n");
-    out.push_str("            {\n");
-    out.push_str("              \"physicalLocation\": {\n");
-    out.push_str(&format!(
-        "                \"artifactLocation\": {{ \"uri\": {uri}{base_id} }},\n"
-    ));
-    out.push_str(&format!(
-        "                \"region\": {{ \"startLine\": {}, \"startColumn\": {} }}\n",
-        d.line.max(1),
-        d.col.max(1)
-    ));
-    out.push_str("              }\n");
-    out.push_str("            }\n");
-    out.push_str("          ],\n");
-    out.push_str(&format!(
-        "          \"partialFingerprints\": {{ \"cwtoolsDiagHash/v1\": {} }}\n",
-        s(&d.hash)
-    ));
-    out.push_str(if last { "        }\n" } else { "        },\n" });
-    out
 }
 
 #[cfg(test)]
@@ -468,8 +523,15 @@ mod tests {
         assert!(out.contains("sarif-schema-2.1.0.json"));
         assert!(out.contains("\"name\": \"cwtools\""));
         assert!(out.contains(&format!("\"version\": \"{}\"", env!("CARGO_PKG_VERSION"))));
-        assert!(out.contains("\"rules\": [\n          ]"), "got: {out}");
-        assert!(out.contains("\"results\": [\n      ]"), "got: {out}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["runs"][0]["tool"]["driver"]["rules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(v["runs"][0]["results"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -522,18 +584,16 @@ mod tests {
     fn sarif_locations_are_relative_to_the_source_root() {
         let d = diag(&abs("repo/common/x.txt"), 7, 3, "CW100", "m");
         let out = sarif_report(&[&d], Path::new(&abs("repo")));
-        assert!(
-            out.contains("\"uri\": \"common/x.txt\", \"uriBaseId\": \"SRCROOT\""),
-            "got: {out}"
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let loc = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"];
+        assert_eq!(loc["artifactLocation"]["uri"], "common/x.txt");
+        assert_eq!(loc["artifactLocation"]["uriBaseId"], "SRCROOT");
+        assert_eq!(
+            v["runs"][0]["originalUriBaseIds"]["SRCROOT"]["uri"],
+            format!("{URI}repo/")
         );
-        assert!(
-            out.contains(&format!("\"SRCROOT\": {{ \"uri\": \"{URI}repo/\" }}")),
-            "got: {out}"
-        );
-        assert!(
-            out.contains("\"startLine\": 7, \"startColumn\": 3"),
-            "got: {out}"
-        );
+        assert_eq!(loc["region"]["startLine"], 7);
+        assert_eq!(loc["region"]["startColumn"], 3);
     }
 
     /// A base URI keeps exactly one trailing slash; the filesystem root is the
@@ -541,9 +601,10 @@ mod tests {
     #[test]
     fn sarif_root_uri_survives_the_filesystem_root() {
         let out = sarif_report(&[], Path::new("/"));
-        assert!(
-            out.contains("\"SRCROOT\": { \"uri\": \"file:///\" }"),
-            "got: {out}"
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["runs"][0]["originalUriBaseIds"]["SRCROOT"]["uri"],
+            "file:///"
         );
     }
 
@@ -576,10 +637,15 @@ mod tests {
     fn sarif_omits_the_rule_id_when_a_diagnostic_has_no_code() {
         let d = diag("/repo/x.yml", 0, 0, "", "could not parse");
         let out = sarif_report(&[&d], Path::new("/repo"));
-        assert!(!out.contains("ruleId"), "got: {out}");
-        assert!(
-            out.contains("\"startLine\": 1, \"startColumn\": 1"),
-            "got: {out}"
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["runs"][0]["results"][0].get("ruleId").is_none());
+        assert_eq!(
+            v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["startLine"],
+            1
+        );
+        assert_eq!(
+            v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["startColumn"],
+            1
         );
     }
 
@@ -597,9 +663,12 @@ mod tests {
     fn sarif_escapes_json_in_messages() {
         let d = diag("/repo/x.txt", 1, 1, "CW100", "he said \"no\"\nthen left");
         let out = sarif_report(&[&d], Path::new("/repo"));
-        assert!(
-            out.contains(r#""text": "he said \"no\"\nthen left""#),
-            "got: {out}"
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["runs"][0]["results"][0]["message"]["text"],
+            "he said \"no\"\nthen left"
         );
+        // Also verify it round-trips as valid JSON (escaping was correct).
+        assert!(out.contains("\\\"no\\\""));
     }
 }
