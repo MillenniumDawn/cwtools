@@ -11198,6 +11198,7 @@ thing = { x = scalar }
 /// which also means a file the scan never validated shows up as a missing
 /// entry when the bar goes off, instead of blocking on a frame that never
 /// arrives.
+#[cfg(unix)]
 fn scan_diag_paths(
     reader: &mut BufReader<std::process::ChildStdout>,
     rel_paths: &[&str],
