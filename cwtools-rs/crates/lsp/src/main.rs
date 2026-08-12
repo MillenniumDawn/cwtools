@@ -379,6 +379,10 @@ struct DocumentState {
     /// advertise support isn't obliged to answer — so the whole stream is gated
     /// on this. The custom `loadingBar` notification is sent regardless.
     client_work_done_progress: std::sync::atomic::AtomicBool,
+    /// Whether the client advertised `workspace.semanticTokens.refreshSupport`.
+    /// A refresh is a server-to-client request, so a client that lacks this
+    /// capability may never answer and would hold the workspace scan open.
+    semantic_tokens_refresh_support: std::sync::atomic::AtomicBool,
     /// Whether the scan's `$/progress` token is currently live, so the phase
     /// updates pair one `begin` with one `end` on a token that exists.
     scan_progress_active: std::sync::atomic::AtomicBool,
@@ -915,6 +919,7 @@ impl DocumentState {
             workspace_edit_document_changes: std::sync::atomic::AtomicBool::new(false),
             completion_label_details: std::sync::atomic::AtomicBool::new(false),
             client_work_done_progress: std::sync::atomic::AtomicBool::new(false),
+            semantic_tokens_refresh_support: std::sync::atomic::AtomicBool::new(false),
             scan_progress_active: std::sync::atomic::AtomicBool::new(false),
             command_cancels: parking_lot::Mutex::new(HashMap::new()),
             loading_bar_active: std::sync::atomic::AtomicBool::new(false),
@@ -1114,8 +1119,16 @@ impl Backend {
     }
 
     pub(crate) async fn request_semantic_refresh(&self) {
+        if !self
+            .state
+            .semantic_tokens_refresh_support
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
         // `workspace/semanticTokens/refresh` tells the client to re-request tokens
-        // for visible editors. Ignore errors: old clients may not support it.
+        // for visible editors. Ignore errors from clients that advertised support
+        // but reject the request.
         let _ = self.client.semantic_tokens_refresh().await;
     }
 

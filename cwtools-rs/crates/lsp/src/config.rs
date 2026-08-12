@@ -531,6 +531,17 @@ impl Backend {
             .client_work_done_progress
             .store(work_done_progress, Ordering::Relaxed);
 
+        let semantic_tokens_refresh = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.semantic_tokens.as_ref())
+            .and_then(|s| s.refresh_support)
+            .unwrap_or(false);
+        self.state
+            .semantic_tokens_refresh_support
+            .store(semantic_tokens_refresh, Ordering::Relaxed);
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 position_encoding,
