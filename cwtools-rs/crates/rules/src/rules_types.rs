@@ -235,9 +235,9 @@ pub struct AliasCategoryIndex {
 /// `replace` allocation on the common (Linux) no-backslash case.
 fn normalize_path_lower(p: &str) -> String {
     if p.contains('\\') {
-        p.replace('\\', "/").trim_matches('/').to_lowercase()
+        p.replace('\\', "/").trim_matches('/').to_ascii_lowercase()
     } else {
-        p.trim_matches('/').to_lowercase()
+        p.trim_matches('/').to_ascii_lowercase()
     }
 }
 
@@ -247,9 +247,9 @@ fn normalize_path_lower(p: &str) -> String {
 /// keys on `PathOptions`.
 fn normalize_path_options(opts: &mut PathOptions) {
     opts.paths_lower = opts.paths.iter().map(|p| normalize_path_lower(p)).collect();
-    opts.path_file_lower = opts.path_file.as_deref().map(|s| s.to_lowercase());
+    opts.path_file_lower = opts.path_file.as_deref().map(|s| s.to_ascii_lowercase());
     opts.path_ext_lower = opts.path_extension.as_deref().map(|s| {
-        let s = s.to_lowercase();
+        let s = s.to_ascii_lowercase();
         s.strip_prefix('.').map(|t| t.to_string()).unwrap_or(s)
     });
 }

@@ -429,14 +429,13 @@ impl Session {
             type_index.value_set_values.merge_file(file_uri, value_sets);
         }
         let source_files = parsed
-            .iter()
+            .into_iter()
             .map(|src| SourceFile {
-                path: src.path.clone(),
-                logical_path: src.logical_path.clone(),
-                fingerprint: src.fingerprint.clone(),
+                path: src.path,
+                logical_path: src.logical_path,
+                fingerprint: src.fingerprint,
             })
             .collect();
-        drop(parsed);
 
         // Auto-managed cache: reuse a fresh one instead of walking the install,
         // and remember where to write one when there's nothing to reuse.

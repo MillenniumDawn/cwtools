@@ -380,6 +380,8 @@ dependencies = [
  "cwtools_string_table",
  "cwtools_validation",
  "predicates",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

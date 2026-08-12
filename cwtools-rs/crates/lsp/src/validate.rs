@@ -1144,7 +1144,7 @@ impl Backend {
                 // Preempt: a newer edit arrived. Save our changed_names into the
                 // shared pending set so the newer sweep drains and covers them;
                 // without this, dependents of the preempted edit stay stale.
-                if self.state.edit_generation.load(Ordering::SeqCst) != generation {
+                if self.state.edit_generation.load(Ordering::Relaxed) != generation {
                     tracing::debug!(generation, "revalidate_open_dependents superseded");
                     if let Some(names) = changed_names {
                         let mut pending = self.state.pending_changed_names.lock();
@@ -1479,7 +1479,7 @@ impl Backend {
         let generation = self
             .state
             .edit_generation
-            .load(std::sync::atomic::Ordering::SeqCst);
+            .load(std::sync::atomic::Ordering::Relaxed);
         let scope = {
             let rules_guard = self.state.rules.read();
             loc_change_candidate_names(rules_guard.ruleset.as_deref(), changed_keys)
@@ -1575,7 +1575,7 @@ impl Backend {
                 let generation = self
                     .state
                     .edit_generation
-                    .load(std::sync::atomic::Ordering::SeqCst);
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let scope = {
                     let rules_guard = self.state.rules.read();
                     loc_change_candidate_names(rules_guard.ruleset.as_deref(), &changed_keys)

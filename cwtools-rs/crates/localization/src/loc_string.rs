@@ -224,13 +224,28 @@ fn parse_bracket(s: &str, start: usize) -> Option<(LocElement<'_>, usize)> {
     Some((LocElement::Command(command), i))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum JominiParseError {
+    UnclosedParen,
+}
+
+impl std::fmt::Display for JominiParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnclosedParen => f.write_str("unclosed parenthesis in Jomini function"),
+        }
+    }
+}
+
+impl std::error::Error for JominiParseError {}
+
 /// Parse Jomini command chain / function call.
 ///
 /// Examples:
 /// * `Scope.Owner.GetName`
 /// * `GetName('param')`
 /// * `GetName(Scope.Owner.GetAge)`
-fn parse_jomini(input: &str) -> Result<Vec<JominiCommand>, String> {
+fn parse_jomini(input: &str) -> Result<Vec<JominiCommand>, JominiParseError> {
     let mut commands = Vec::new();
     let mut current = String::new();
     let mut chars = input.chars().peekable();
@@ -267,7 +282,7 @@ fn parse_jomini(input: &str) -> Result<Vec<JominiCommand>, String> {
 
 fn parse_jomini_params(
     chars: &mut std::iter::Peekable<std::str::Chars>,
-) -> Result<Vec<JominiParam>, String> {
+) -> Result<Vec<JominiParam>, JominiParseError> {
     let mut params = Vec::new();
     let mut current = String::new();
 
@@ -289,10 +304,10 @@ fn parse_jomini_params(
         }
     }
 
-    Err("unclosed parenthesis in Jomini function".to_string())
+    Err(JominiParseError::UnclosedParen)
 }
 
-fn parse_jomini_param(s: &str) -> Result<JominiParam, String> {
+fn parse_jomini_param(s: &str) -> Result<JominiParam, JominiParseError> {
     let trimmed = s.trim();
     // A lone `'` satisfies both starts_with and ends_with; it takes two quotes to
     // be a quoted literal, not one character playing both roles.

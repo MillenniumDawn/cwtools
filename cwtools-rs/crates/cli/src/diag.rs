@@ -99,23 +99,6 @@ fn csv_escape(s: &str) -> Cow<'_, str> {
     }
 }
 
-/// Minimal JSON string escape.
-pub(crate) fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// One rendered diagnostic row for the `validate` report. Reads only
 /// file/severity/code/message/line/hash — never a diagnostic's `fix`, so a
 /// `SuggestedFix` payload is inert here (locked in by `fix_payload_is_inert_in_report`).
@@ -284,16 +267,30 @@ pub(crate) fn csv_row(d: &Diag) -> String {
 
 /// One JSON report row (trailing newline included); `last` suppresses the comma.
 pub(crate) fn json_row(d: &Diag, last: bool) -> String {
-    format!(
-        "  {{\"file\":\"{}\",\"line\":{},\"severity\":\"{:?}\",\"code\":\"{}\",\"message\":\"{}\",\"hash\":\"{}\"}}{}\n",
-        json_escape(&d.file),
-        d.line,
-        d.severity,
-        json_escape(d.code),
-        json_escape(&d.message),
-        d.hash,
-        if last { "" } else { "," }
-    )
+    #[derive(serde::Serialize)]
+    struct JsonRow<'a> {
+        file: &'a str,
+        line: u32,
+        severity: String,
+        code: &'a str,
+        message: &'a str,
+        hash: &'a str,
+    }
+    let row = JsonRow {
+        file: &d.file,
+        line: d.line,
+        severity: format!("{:?}", d.severity),
+        code: d.code,
+        message: &d.message,
+        hash: &d.hash,
+    };
+    let mut s = String::from("  ");
+    s.push_str(&serde_json::to_string(&row).unwrap());
+    if !last {
+        s.push(',');
+    }
+    s.push('\n');
+    s
 }
 
 /// One grouped-CLI report row (the per-diagnostic line, not the file header).

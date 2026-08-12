@@ -7,7 +7,7 @@
 
 use crate::commands::{Lang, LocFile};
 use crate::csv_parser::parse_csv_loc_per_lang;
-use crate::yaml_parser::parse_loc_text;
+use crate::yaml_parser::{LocFileParseError, parse_loc_text};
 use cwtools_file_manager::{
     FileEncoding, ScanBudget, ScanBytes, is_excluded_dir, is_excluded_root_dir, is_loc_ext,
     read_text_capped_with_encoding,
@@ -149,7 +149,7 @@ fn parse_loc_file_entry(
     text: String,
     encoding: Option<FileEncoding>,
 ) -> Result<Vec<LocFile>, (String, String)> {
-    parse_loc_files(&path, &text, encoding).map_err(|e| (path, e))
+    parse_loc_files(&path, &text, encoding).map_err(|e| (path, e.to_string()))
 }
 
 /// Parse one loc file's text into its [`LocFile`]s: a `.csv` yields one per
@@ -162,7 +162,7 @@ pub fn parse_loc_files(
     path: &str,
     text: &str,
     encoding: Option<FileEncoding>,
-) -> Result<Vec<LocFile>, String> {
+) -> Result<Vec<LocFile>, LocFileParseError> {
     let is_csv = Path::new(path)
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
@@ -193,7 +193,7 @@ pub fn parse_loc_files(
                 file.encoding = encoding;
                 Ok(vec![file])
             }
-            Err(e) => Err(e),
+            Err(e) => Err(e), // LocFileParseError
         }
     }
 }

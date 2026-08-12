@@ -2427,7 +2427,7 @@ impl Backend {
             let queued: HashSet<String> =
                 { self.state.pending_changed_names.lock().drain().collect() };
             if !queued.is_empty() {
-                let generation = self.state.edit_generation.load(Ordering::SeqCst);
+                let generation = self.state.edit_generation.load(Ordering::Relaxed);
                 self.revalidate_open_dependents("", generation, Some(&queued))
                     .await;
             }

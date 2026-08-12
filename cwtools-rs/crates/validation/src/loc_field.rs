@@ -70,25 +70,30 @@ pub(crate) fn validate_localisation_field(
             ctx,
             leaf,
             raw.trim_matches('"'),
-            was_quoted,
-            synced,
-            is_inline,
+            LocKeyOpts {
+                was_quoted,
+                synced,
+                is_inline,
+            },
             scope_context,
             errors,
         )
     });
 }
 
+struct LocKeyOpts {
+    was_quoted: bool,
+    synced: bool,
+    is_inline: bool,
+}
+
 /// The body of [`validate_localisation_field`], with the reference text already
 /// unquoted and borrowed.
-#[allow(clippy::too_many_arguments)]
 fn check_loc_key(
     ctx: &ValidationCtx,
     leaf: &cwtools_parser::ast::Leaf,
     key_raw: &str,
-    was_quoted: bool,
-    synced: bool,
-    is_inline: bool,
+    opts: LocKeyOpts,
     scope_context: Option<&ScopeContext>,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -147,9 +152,9 @@ fn check_loc_key(
         );
     };
 
-    if is_inline {
+    if opts.is_inline {
         // F# four-way logic for inline loc keys.
-        match (was_quoted, exists) {
+        match (opts.was_quoted, exists) {
             (true, true) => {
                 let code = &error_codes::CW122_LOC_KEY_IN_INLINE;
                 let mut err = ValidationError::from_code(
@@ -173,7 +178,7 @@ fn check_loc_key(
             (false, true) => {} // unquoted + exists → ok
             (false, false) => push_missing(errors, "any language"),
         }
-    } else if synced && !in_overlay {
+    } else if opts.synced && !in_overlay {
         // Must exist in every language the project ships loc data for. A key in
         // the live overlay is accepted leniently (no per-language data there).
         for lang in idx.missing_synced_languages(key_lower) {

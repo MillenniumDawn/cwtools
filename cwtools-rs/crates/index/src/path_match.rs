@@ -76,12 +76,12 @@ impl NormalizedPath {
     pub fn new(logical_path: &str) -> Self {
         let norm = logical_path.replace('\\', "/");
         let basename = norm.rsplit('/').next().unwrap_or(&norm);
-        let basename_lower = basename.to_lowercase();
+        let basename_lower = basename.to_ascii_lowercase();
         let dir = match norm.rfind('/') {
             Some(idx) => &norm[..idx],
             None => "",
         };
-        let dir_lower = dir.to_lowercase();
+        let dir_lower = dir.to_ascii_lowercase();
         Self {
             dir_lower,
             basename_lower,
@@ -100,7 +100,7 @@ pub fn check_path_dir_norm(opts: &PathOptions, np: &NormalizedPath) -> bool {
             return false;
         }
     } else if let Some(pf) = &opts.path_file
-        && basename_lower != pf.to_lowercase().as_str()
+        && basename_lower != pf.to_ascii_lowercase().as_str()
     {
         return false;
     }
@@ -120,7 +120,7 @@ pub fn check_path_dir_norm(opts: &PathOptions, np: &NormalizedPath) -> bool {
             return false;
         }
     } else if let Some(ext) = &opts.path_extension {
-        let ext = ext.to_lowercase();
+        let ext = ext.to_ascii_lowercase();
         let ext = ext.strip_prefix('.').unwrap_or(&ext);
         if !check_ext(ext) {
             return false;
@@ -138,7 +138,7 @@ pub fn check_path_dir_norm(opts: &PathOptions, np: &NormalizedPath) -> bool {
         for p in &opts.paths {
             let pat = p.replace('\\', "/");
             let pat = pat.trim_matches('/');
-            let pat_lower = pat.to_lowercase();
+            let pat_lower = pat.to_ascii_lowercase();
             if dir_matches_pattern(dir_lower, &pat_lower, opts.path_strict) {
                 return true;
             }
