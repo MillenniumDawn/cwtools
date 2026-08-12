@@ -1559,6 +1559,81 @@ mod tests {
         assert_eq!(text, "caf\u{E9}\n", "0xE9 should decode as é (U+00E9)");
     }
 
+    /// The bytes a loc file actually carries decide CW254, and every test of
+    /// that code hands the enum over ready-made. These are the real ones.
+    #[test]
+    fn decode_bytes_reports_the_encoding_the_leading_bytes_describe() {
+        let body = b"l_english:\n key: \"hi\"\n";
+
+        let mut with_bom = UTF8_BOM.to_vec();
+        with_bom.extend_from_slice(body);
+        let (text, enc) = decode_bytes(with_bom);
+        assert_eq!(enc, FileEncoding::Utf8Bom);
+        assert!(
+            text.starts_with('\u{FEFF}'),
+            "the BOM stays in the text for the parsers to strip, got: {text:?}"
+        );
+
+        let (text, enc) = decode_bytes(body.to_vec());
+        assert_eq!(enc, FileEncoding::Utf8NoBom);
+        assert_eq!(text.as_bytes(), body);
+
+        // A lone 0xE9 is valid CP-1252 and invalid UTF-8, so the sniff has to
+        // fall through to the byte-wise decode rather than report a BOM-less
+        // UTF-8 file.
+        let (text, enc) = decode_bytes(b"key: \"caf\xE9\"\n".to_vec());
+        assert_eq!(enc, FileEncoding::NonUtf8);
+        assert!(text.contains('\u{E9}'), "got: {text:?}");
+    }
+
+    /// A UTF-16 file is not UTF-8 with a BOM, and it has to be reported as such
+    /// rather than mistaken for one: `FF FE` / `FE FF` are not the UTF-8 BOM,
+    /// and a UTF-16 body is not valid UTF-8 either.
+    #[test]
+    fn decode_bytes_does_not_take_a_utf16_bom_for_a_utf8_one() {
+        for bom in [[0xFFu8, 0xFE], [0xFE, 0xFF]] {
+            let mut bytes = bom.to_vec();
+            bytes.extend_from_slice(&[0x6C, 0x00, 0x5F, 0x00]); // "l_" in UTF-16
+            let (_, enc) = decode_bytes(bytes);
+            assert_eq!(enc, FileEncoding::NonUtf8, "for BOM {bom:02X?}");
+        }
+    }
+
+    /// A prefix of the BOM is not a BOM. Two of the three bytes and the file is
+    /// still BOM-less, which is what CW254 reports.
+    #[test]
+    fn decode_bytes_needs_all_three_bom_bytes() {
+        let mut bytes = UTF8_BOM[..2].to_vec();
+        bytes.extend_from_slice(b"l_english:\n");
+        let (_, enc) = decode_bytes(bytes);
+        assert_eq!(enc, FileEncoding::NonUtf8, "0xEF 0xBB alone is not UTF-8");
+
+        let (_, enc) = decode_bytes(UTF8_BOM.to_vec());
+        assert_eq!(enc, FileEncoding::Utf8Bom, "a BOM and nothing else");
+    }
+
+    /// The whole path a real file travels: bytes on disk, read, sniffed. The
+    /// enum every CW254 test builds by hand comes from here.
+    #[test]
+    fn read_text_with_encoding_sniffs_a_real_bom_off_disk() {
+        use std::io::Write as _;
+
+        let body = b"l_english:\n key: \"hi\"\n";
+        let mut bommed = UTF8_BOM.to_vec();
+        bommed.extend_from_slice(body);
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.write_all(&bommed).expect("write");
+        let (_, enc) = read_text_with_encoding(tmp.path()).expect("read");
+        assert_eq!(enc, FileEncoding::Utf8Bom);
+
+        let mut plain = tempfile::NamedTempFile::new().expect("tempfile");
+        plain.write_all(body).expect("write");
+        let (_, enc, len) = read_text_capped_with_encoding(plain.path(), 1024).expect("read");
+        assert_eq!(enc, FileEncoding::Utf8NoBom);
+        assert_eq!(len, body.len() as u64);
+    }
+
     // ── multi-mod expand / replace_path tests ─────────────────────────────────
 
     #[test]
