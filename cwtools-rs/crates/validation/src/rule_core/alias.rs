@@ -214,6 +214,67 @@ fn collect_loop_vars(
     seeded
 }
 
+/// Validate an aliased usage, reusing the result if this exact usage has already
+/// been validated in this exact state.
+///
+/// Recursive overloads make the same subtree reachable through many candidate
+/// paths, and validating one is a pure function of the usage and the state it is
+/// read in: the AST node, the alias category and key, the scope context, and the
+/// loop-local variables in scope (see [`ValidationCtx::alias_memo_key`]). What it
+/// leaves behind is its diagnostics, which the entry carries, and its type uses,
+/// which are already in the per-file sink from the walk that filled the entry.
+/// The scope and loop-variable stacks are restored by the walk itself, so a
+/// replay leaves the context exactly where a full walk would.
+///
+/// A hit skips the branch reservation the walk would have made, which is the
+/// point: a file whose repeats are equivalent now finishes instead of stopping
+/// at the branch limit. A result produced after the budget ran out is truncated,
+/// so it is never stored.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn validate_alias_usage(
+    ctx: &ValidationCtx,
+    category: &str,
+    key: &str,
+    leaf: Option<&cwtools_parser::ast::Leaf>,
+    clause_children: Option<&[Child]>,
+    fallback_pos: (u32, u16),
+    scope_context: &mut Option<ScopeContext>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(memo_key) = ctx.alias_memo_key(category, key, leaf, clause_children, scope_context)
+    else {
+        validate_alias_usage_uncached(
+            ctx,
+            category,
+            key,
+            leaf,
+            clause_children,
+            fallback_pos,
+            scope_context,
+            errors,
+        );
+        return;
+    };
+    if ctx.alias_memo_replay(&memo_key, errors) {
+        return;
+    }
+    let mut produced = Vec::new();
+    validate_alias_usage_uncached(
+        ctx,
+        category,
+        key,
+        leaf,
+        clause_children,
+        fallback_pos,
+        scope_context,
+        &mut produced,
+    );
+    if !ctx.alias_branch_budget_exhausted() {
+        ctx.alias_memo_store(memo_key, &produced);
+    }
+    errors.append(&mut produced);
+}
+
 /// Validate an aliased usage (`alias_name[cat] = ...`) against EVERY overload
 /// declared as `alias[cat:key]`.
 ///
@@ -225,7 +286,7 @@ fn collect_loop_vars(
 /// only when none match do we surface the closest (fewest-errors) candidate's
 /// errors, which is also how the `type = ...` discriminator naturally wins.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn validate_alias_usage(
+fn validate_alias_usage_uncached(
     ctx: &ValidationCtx,
     category: &str,
     key: &str,
@@ -521,5 +582,97 @@ fn alias_mismatch_error(
     match end {
         Some(end) => err.with_end(end),
         None => err,
+    }
+}
+
+/// Branch-count tests for the memo. They live in-crate because the count is not
+/// part of the validation API — the integration tests next door cover what a
+/// caller can see (which diagnostics come out).
+#[cfg(test)]
+mod tests {
+    use crate::{Prepared, ValidationError, build_scope_registry_arc, validate_prepared_inner};
+    use cwtools_parser::parser::parse_string;
+    use cwtools_rules::rules_converter::ast_to_ruleset;
+    use cwtools_string_table::string_table::StringTable;
+
+    /// Two `recurse` overloads that are not equal (only the severity differs), so
+    /// the equivalent-overload coalescing in `push_overload` cannot collapse them
+    /// and every level really does branch two ways.
+    const RECURSIVE_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+## severity = warning
+alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
+"#;
+
+    /// `depth` nested `recurse` blocks around a field no overload accepts, so no
+    /// candidate ever comes back clean and the disjunction explores every branch.
+    fn recursive_script(depth: usize) -> String {
+        let mut script = String::from("foo = {\n");
+        for _ in 0..depth {
+            script.push_str("recurse = {\n");
+        }
+        script.push_str("bad = nope\n");
+        for _ in 0..=depth {
+            script.push_str("}\n");
+        }
+        script
+    }
+
+    /// Validate one script and report its diagnostics with the number of alias
+    /// branches evaluated to produce them.
+    fn branches_for(depth: usize) -> (Vec<ValidationError>, usize) {
+        let table = StringTable::new();
+        let ruleset = ast_to_ruleset(&parse_string(RECURSIVE_RULES, &table).unwrap(), &table);
+        let parsed = parse_string(&recursive_script(depth), &table).unwrap();
+        let registry = build_scope_registry_arc(&ruleset, None);
+        let prepared = Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: None,
+            type_index: None,
+            modifier_keys: None,
+            loc_index: None,
+            extra_loc_keys: None,
+            registry: registry.as_ref(),
+            scope_checks: false,
+            var_checks: false,
+        };
+        validate_prepared_inner(&parsed, "game/common/foo/test.txt", &prepared, None)
+    }
+
+    /// 20 levels of two-way recursion is 2^21 branches walked exhaustively, which
+    /// is what used to spend the whole 65,536-branch budget and stop the file
+    /// short with CW277. Every level below the first repeats the same subtree in
+    /// the same state, so the memo answers it and the file finishes.
+    #[test]
+    fn recursive_overloads_memoize_instead_of_exhausting_the_budget() {
+        let (errors, branches) = branches_for(20);
+        assert!(
+            errors.iter().all(|error| error.code != Some("CW277")),
+            "the memo must keep the file under the branch limit: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|error| error.code == Some("CW263")),
+            "the file must validate to the deepest invalid field: {errors:?}"
+        );
+        assert!(
+            branches < 65_536,
+            "expected fewer branches than the budget, evaluated {branches}"
+        );
+    }
+
+    /// The count above only proves the file stayed inside the budget. This proves
+    /// the shape of the work changed: four more levels of two-way recursion is
+    /// sixteen times the exhaustive walk and costs a handful of branches.
+    #[test]
+    fn memoized_recursion_does_not_grow_exponentially_with_depth() {
+        let (_, shallow) = branches_for(20);
+        let (_, deeper) = branches_for(24);
+        assert!(
+            deeper - shallow <= 32,
+            "four more levels should cost a few branches, went from {shallow} to {deeper}"
+        );
     }
 }
