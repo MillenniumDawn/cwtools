@@ -1284,11 +1284,66 @@ ENG = {
     }
 
     #[test]
+    fn leaf_value_positions_cover_every_rhs_shape() {
+        use crate::fix::{SpanEdit, apply_edits};
+
+        let input = r#"plain=bare # trailing
+quoted = "a😀\"b" # trailing
+integer = +42
+boolean= no
+block = { nested = value }
+shorthand { nested = value }
+"#;
+        let table = StringTable::new();
+        let result = parse_string(input, &table).unwrap();
+        let edits = result
+            .root_children
+            .iter()
+            .filter_map(|child| match child {
+                Child::Leaf(idx) => Some(&result.arena.leaves[*idx as usize]),
+                Child::Comment(_) => None,
+                other => panic!("expected keyed leaf, got {other:?}"),
+            })
+            .map(|leaf| {
+                let key = table.get_string(leaf.key.normal).unwrap();
+                SpanEdit {
+                    range: leaf.value_pos,
+                    replacement: format!("<{key}>"),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            apply_edits(input, &edits),
+            "plain=<plain> # trailing\nquoted = <quoted> # trailing\ninteger = <integer>\nboolean= <boolean>\nblock = <block>\nshorthand <shorthand>\n"
+        );
+    }
+
+    #[test]
+    fn missing_leaf_value_has_an_empty_value_span() {
+        let table = StringTable::new();
+        let result = parse_string("missing = ", &table).unwrap();
+        let Child::Leaf(idx) = result.root_children[0] else {
+            panic!("expected a leaf");
+        };
+        let leaf = &result.arena.leaves[idx as usize];
+        assert_eq!(
+            leaf.value_pos,
+            SourceRange {
+                start: SourcePos { line: 1, col: 10 },
+                end: SourcePos { line: 1, col: 10 },
+            }
+        );
+    }
+
+    #[test]
     fn bare_string_value_excludes_non_string_forms() {
         assert!(is_bare_string_value("my_key"));
         assert!(is_bare_string_value("YES"));
         assert!(!is_bare_string_value("yes"));
         assert!(!is_bare_string_value("123"));
+        assert!(!is_bare_string_value("+token"));
+        assert!(!is_bare_string_value("-token"));
         assert!(!is_bare_string_value("foo=bar"));
     }
 

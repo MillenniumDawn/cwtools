@@ -269,14 +269,52 @@ fn cw240_boolean_enum_suggestion_stays_a_string() {
     use cwtools_parser::fix::apply_edits;
 
     let script = "foo = { mode = yess }";
-    let (_table, _ruleset, errors) = validate_pair(BOOLEAN_ENUM_RULES, script);
+    let (table, ruleset, errors) = validate_pair(BOOLEAN_ENUM_RULES, script);
     let err = errors
         .iter()
         .find(|e| e.code == Some("CW240"))
         .expect("CW240 emitted");
     let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
 
-    assert_eq!(apply_edits(script, &fix.edits), "foo = { mode = \"yes\" }");
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, "foo = { mode = \"yes\" }");
+    let ast = parse_string(&fixed, &table).unwrap();
+    assert!(
+        !validate_ast(&ast, &ruleset, &table, "test.txt", None, None, None)
+            .iter()
+            .any(|e| e.code == Some("CW240")),
+        "quoted boolean enum member must revalidate cleanly"
+    );
+}
+
+const ESCAPED_ENUM_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { "hist\"oric\\mode" fantasy sandbox } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_enum_suggestion_escapes_quotes_and_backslashes() {
+    use cwtools_parser::fix::apply_edits;
+
+    let script = r#"foo = { mode = "histr\"oric\\mode" }"#;
+    let (table, ruleset, errors) = validate_pair(ESCAPED_ENUM_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+
+    assert_eq!(fix.title, "Did you mean 'hist\"oric\\mode'?");
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, r#"foo = { mode = "hist\"oric\\mode" }"#);
+    let ast = parse_string(&fixed, &table).unwrap();
+    assert!(
+        !validate_ast(&ast, &ruleset, &table, "test.txt", None, None, None)
+            .iter()
+            .any(|e| e.code == Some("CW240")),
+        "escaped enum member must revalidate cleanly"
+    );
 }
 
 const ENUM_TIE_RULES: &str = r#"

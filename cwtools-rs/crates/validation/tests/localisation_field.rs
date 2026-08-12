@@ -111,6 +111,74 @@ fn inline_quoted_key_that_cannot_be_unquoted_has_no_fix() {
 }
 
 #[test]
+fn inline_quoted_keys_that_change_value_kind_have_no_fix() {
+    let idx = loc_index(&[(
+        "a_l_english.yml",
+        "l_english:\n yes: \"yes\"\n no: \"no\"\n 123: \"number\"\n -token: \"minus\"\n",
+    )]);
+
+    for key in ["yes", "no", "123", "-token"] {
+        let errs = run(&format!("mytype = {{ iname = \"{key}\" }}"), &idx);
+        let cw122 = errs
+            .iter()
+            .find(|e| e.code == Some("CW122"))
+            .unwrap_or_else(|| panic!("quoted {key:?} must still warn CW122: {errs:?}"));
+        assert!(
+            cw122.fix.is_none(),
+            "removing quotes from {key:?} changes its parsed value kind: {cw122:?}"
+        );
+    }
+}
+
+#[test]
+fn inline_quoted_escaped_backslash_key_unquotes_to_the_parsed_key() {
+    use cwtools_parser::fix::apply_edits;
+
+    let idx = loc_index(&[("a_l_english.yml", "l_english:\n foo\\bar: \"hi\"\n")]);
+    let script = r#"mytype = { iname = "foo\\bar" }"#;
+    let errs = run(script, &idx);
+    let cw122 = errs
+        .iter()
+        .find(|e| e.code == Some("CW122"))
+        .expect("quoted inline key warns CW122");
+    let fix = cw122
+        .fix
+        .as_ref()
+        .expect("a backslash is valid in a bare string key");
+
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, r#"mytype = { iname = foo\bar }"#);
+    assert!(
+        !run(&fixed, &idx).iter().any(|e| e.code == Some("CW122")),
+        "the unquoted parsed key must revalidate cleanly"
+    );
+}
+
+#[test]
+fn inline_quoted_uppercase_boolean_key_is_safely_unquoted() {
+    use cwtools_parser::fix::apply_edits;
+
+    let idx = loc_index(&[("a_l_english.yml", "l_english:\n YES: \"hi\"\n")]);
+    let script = "mytype = { iname = \"YES\" }";
+    let errs = run(script, &idx);
+    let cw122 = errs
+        .iter()
+        .find(|e| e.code == Some("CW122"))
+        .expect("quoted inline key warns CW122");
+    let fix = cw122
+        .fix
+        .as_ref()
+        .expect("uppercase YES is a bare string, not a boolean");
+
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, "mytype = { iname = YES }");
+    assert!(
+        !run(&fixed, &idx).iter().any(|e| e.code == Some("CW122")),
+        "the safely unquoted key must revalidate cleanly"
+    );
+}
+
+#[test]
 fn inline_quoted_missing_key_is_skipped() {
     let idx = loc_index(&[("a_l_english.yml", "l_english:\n other: \"hi\"\n")]);
     let errs = run("mytype = {\n iname = \"absent\"\n}\n", &idx);

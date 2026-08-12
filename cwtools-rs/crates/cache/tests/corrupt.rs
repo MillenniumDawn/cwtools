@@ -62,11 +62,12 @@ fn fingerprint_path(path: &Path) -> Result<Result<String, CacheError>, CacheErro
             for l in &arena.leaves {
                 let _ = write!(
                     out,
-                    "|L {:?} {:?} {:?} {:?}",
+                    "|L {:?} {:?} {:?} {:?} {:?}",
                     table.get_string(l.key.normal),
                     l.value,
                     l.op,
-                    l.pos
+                    l.pos,
+                    l.value_pos
                 );
             }
             for lv in &arena.leaf_values {

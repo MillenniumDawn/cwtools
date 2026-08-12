@@ -199,6 +199,7 @@ fn archived_to_arena_matches_reference_over_corpus() {
         for (a, b) in parsed.arena.leaves.iter().zip(arch_arena.leaves.iter()) {
             assert_eq!(a.op, b.op, "{ctx}");
             assert_eq!(a.pos, b.pos, "{ctx}");
+            assert_eq!(a.value_pos, b.value_pos, "{ctx}");
         }
         assert_eq!(
             parsed.arena.leaf_values.len(),

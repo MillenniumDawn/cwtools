@@ -8006,6 +8006,7 @@ enums = {
 }
 
 decision = {
+    label = scalar
     mode = enum[mode]
 }
 "#;
@@ -8015,7 +8016,7 @@ decision = {
     std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
 
     let rel_path = "common/decisions/test.txt";
-    let text = "decision = {\n    mode = histroic  # typo\n}\n";
+    let text = "decision = { label = \"😀\" mode = histroic } # typo\n";
     let file_path = ws.path().join(rel_path);
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, text).unwrap();
@@ -8092,11 +8093,26 @@ decision = {
         .and_then(serde_json::Value::as_array)
         .expect("edits for the document");
     assert_eq!(edits.len(), 1, "one text edit expected: {response}");
-    assert_eq!(edits[0]["range"]["start"]["line"], 1);
-    assert_eq!(edits[0]["range"]["start"]["character"], 11);
-    assert_eq!(edits[0]["range"]["end"]["line"], 1);
-    assert_eq!(edits[0]["range"]["end"]["character"], 19);
+    let value_start = text[..text.find("histroic").unwrap()]
+        .encode_utf16()
+        .count() as u64;
+    assert_eq!(edits[0]["range"]["start"]["line"], 0);
+    assert_eq!(edits[0]["range"]["start"]["character"], value_start);
+    assert_eq!(edits[0]["range"]["end"]["line"], 0);
+    assert_eq!(edits[0]["range"]["end"]["character"], value_start + 8);
     assert_eq!(edits[0]["newText"], "\"historic\"");
+
+    let units: Vec<u16> = text[..text.find('\n').unwrap()].encode_utf16().collect();
+    let start = edits[0]["range"]["start"]["character"].as_u64().unwrap() as usize;
+    let end = edits[0]["range"]["end"]["character"].as_u64().unwrap() as usize;
+    let mut fixed = String::from_utf16(&units[..start]).expect("start is on a char boundary");
+    fixed.push_str(edits[0]["newText"].as_str().unwrap());
+    fixed.push_str(&String::from_utf16(&units[end..]).expect("end is on a char boundary"));
+    fixed.push('\n');
+    assert_eq!(
+        fixed, "decision = { label = \"😀\" mode = \"historic\" } # typo\n",
+        "the UTF-16 edit must replace only the enum value"
+    );
 }
 
 #[test]
@@ -8107,6 +8123,7 @@ types = {
 }
 
 thing = {
+    label = scalar
     iname = localisation_inline
 }
 "#;
@@ -8123,7 +8140,7 @@ thing = {
     .unwrap();
 
     let rel_path = "common/things/test.txt";
-    let text = "thing = {\n    iname = \"my_key\"  # unnecessary\n}\n";
+    let text = "thing = { label = \"😀\" iname = \"my_key\" } # unnecessary\n";
     let file_path = ws.path().join(rel_path);
     std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
     std::fs::write(&file_path, text).unwrap();
@@ -8200,11 +8217,26 @@ thing = {
         .and_then(serde_json::Value::as_array)
         .expect("edits for the document");
     assert_eq!(edits.len(), 1, "one text edit expected: {response}");
-    assert_eq!(edits[0]["range"]["start"]["line"], 1);
-    assert_eq!(edits[0]["range"]["start"]["character"], 12);
-    assert_eq!(edits[0]["range"]["end"]["line"], 1);
-    assert_eq!(edits[0]["range"]["end"]["character"], 20);
+    let value_start = text[..text.find("\"my_key\"").unwrap()]
+        .encode_utf16()
+        .count() as u64;
+    assert_eq!(edits[0]["range"]["start"]["line"], 0);
+    assert_eq!(edits[0]["range"]["start"]["character"], value_start);
+    assert_eq!(edits[0]["range"]["end"]["line"], 0);
+    assert_eq!(edits[0]["range"]["end"]["character"], value_start + 8);
     assert_eq!(edits[0]["newText"], "my_key");
+
+    let units: Vec<u16> = text[..text.find('\n').unwrap()].encode_utf16().collect();
+    let start = edits[0]["range"]["start"]["character"].as_u64().unwrap() as usize;
+    let end = edits[0]["range"]["end"]["character"].as_u64().unwrap() as usize;
+    let mut fixed = String::from_utf16(&units[..start]).expect("start is on a char boundary");
+    fixed.push_str(edits[0]["newText"].as_str().unwrap());
+    fixed.push_str(&String::from_utf16(&units[end..]).expect("end is on a char boundary"));
+    fixed.push('\n');
+    assert_eq!(
+        fixed, "thing = { label = \"😀\" iname = my_key } # unnecessary\n",
+        "the UTF-16 edit must remove only the quotes"
+    );
 }
 
 #[test]
