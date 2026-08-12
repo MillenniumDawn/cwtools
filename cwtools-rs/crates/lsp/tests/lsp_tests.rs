@@ -9838,7 +9838,7 @@ fn test_initialize_advertises_the_new_capabilities() {
     println!("codeActionProvider = {}", caps["codeActionProvider"]);
     println!("workspace = {}", caps["workspace"]);
 
-    assert_eq!(caps["semanticTokensProvider"]["full"], true);
+    assert_eq!(caps["semanticTokensProvider"]["full"]["delta"], true);
     let types = caps["semanticTokensProvider"]["legend"]["tokenTypes"]
         .as_array()
         .expect("a token legend");
@@ -9864,6 +9864,70 @@ fn test_initialize_advertises_the_new_capabilities() {
         caps["workspace"]["workspaceFolders"]["changeNotifications"],
         true
     );
+}
+
+#[test]
+fn test_semantic_tokens_refresh_waits_for_advertised_client_support() {
+    let (ws, _) = boundary_workspace();
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let reader = BufReader::new(child.stdout.take().unwrap());
+    let stdin = child.stdin.take().unwrap();
+    let workspace = path_uri(ws.path());
+
+    let result = run_with_deadline(stdin, reader, 5, move |stdin, reader| {
+        write_frame_to(
+            stdin,
+            &jsonrpc_request(
+                1,
+                "initialize",
+                serde_json::json!({
+                    "processId": std::process::id(),
+                    "rootUri": workspace,
+                    "capabilities": {
+                        "workspace": { "semanticTokens": { "refreshSupport": true } }
+                    },
+                    "initializationOptions": { "language": "hoi4" }
+                }),
+            ),
+        )
+        .expect("initialize request");
+        read_response(reader).expect("initialize response");
+        write_frame_to(
+            stdin,
+            &jsonrpc_notification("initialized", serde_json::json!({})),
+        )
+        .expect("initialized notification");
+
+        let mut refreshed = false;
+        for _ in 0..5000 {
+            let raw = read_frame(reader).expect("server closed during scan");
+            let frame: serde_json::Value = serde_json::from_str(&raw).expect("LSP frame");
+            if frame["method"] == "workspace/semanticTokens/refresh" {
+                write_frame_to(
+                    stdin,
+                    &serde_json::json!({ "jsonrpc": "2.0", "id": frame["id"], "result": null })
+                        .to_string(),
+                )
+                .expect("semantic refresh response");
+                refreshed = true;
+            }
+            if frame["method"] == "loadingBar"
+                && frame["params"]["enable"] == serde_json::Value::Bool(false)
+            {
+                return refreshed;
+            }
+        }
+        false
+    });
+    child.kill().ok();
+    child.wait().ok();
+
+    assert_eq!(result, Some(true), "scan did not request semantic refresh");
 }
 
 #[test]
