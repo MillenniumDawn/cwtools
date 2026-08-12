@@ -2123,17 +2123,18 @@ fn test_completion_value_deleted_then_reoffered_keeps_context() {
 
 /// Spawn a server with DYNAMIC_RULES, write `loc_files` (each: filename under
 /// `localisation/`, full text including the `l_xxx:` header; a UTF-8 BOM is
-/// prepended) and the one script file, run the workspace scan, then return the
-/// hover markdown at (line, character) on the script. `extra_init` is merged
-/// into the init options. Polls until the loc map is populated.
-fn hover_markdown(
+/// prepended) and the one script file, run the workspace scan, then return
+/// hovers at (line, character) before and after each live settings update.
+/// `extra_init` is merged into the init options.
+fn hover_markdowns_with_live_settings(
     loc_files: &[(&str, &str)],
     script_rel: &str,
     script_text: &str,
     line: u32,
     character: u32,
     extra_init: serde_json::Value,
-) -> String {
+    live_settings: &[(serde_json::Value, &str)],
+) -> Vec<String> {
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     std::fs::write(rules_dir.path().join("test_rules.cwt"), DYNAMIC_RULES).unwrap();
@@ -2213,35 +2214,77 @@ fn hover_markdown(
     );
     write_frame(&mut child, &body).unwrap();
 
-    // Poll hover until loc_text is populated (workspace scan completes).
-    // read_response only returns id-bearing messages, so send then read.
-    // Budget generously: the scan runs on a background thread and, under a
-    // loaded CI box (the whole workspace test suite spawning dozens of servers),
-    // it can lag well past the fast no-load case.
-    let mut hover_value = String::new();
-    for attempt in 0..120 {
-        let hover_req = jsonrpc_request(
-            2 + attempt,
-            "textDocument/hover",
-            serde_json::json!({
-                "textDocument": { "uri": doc_uri },
-                "position": { "line": line, "character": character },
-            }),
-        );
-        write_frame(&mut child, &hover_req).unwrap();
-        let resp_str = read_response(&mut reader).expect("no hover response");
-        let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
-        hover_value = resp["result"]["contents"]["value"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        if hover_value.contains("Localisation") {
-            break;
+    // Poll hover until the initial loc index is populated, then after each
+    // live-setting update until its distinctive text appears. The notification
+    // has no response, so a subsequent request is the observable completion.
+    let mut expected_values: Vec<(Option<&serde_json::Value>, &str)> = vec![(None, "Localisation")];
+    expected_values.extend(
+        live_settings
+            .iter()
+            .map(|(settings, expected)| (Some(settings), *expected)),
+    );
+    let mut hover_values = Vec::with_capacity(expected_values.len());
+    let mut request_id = 2;
+    for (settings, expected) in expected_values {
+        if let Some(settings) = settings {
+            write_frame(
+                &mut child,
+                &jsonrpc_notification(
+                    "workspace/didChangeConfiguration",
+                    serde_json::json!({ "settings": settings }),
+                ),
+            )
+            .unwrap();
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut hover_value = String::new();
+        for _ in 0..120 {
+            let hover_req = jsonrpc_request(
+                request_id,
+                "textDocument/hover",
+                serde_json::json!({
+                    "textDocument": { "uri": doc_uri },
+                    "position": { "line": line, "character": character },
+                }),
+            );
+            request_id += 1;
+            write_frame(&mut child, &hover_req).unwrap();
+            let resp_str = read_response(&mut reader).expect("no hover response");
+            let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+            hover_value = resp["result"]["contents"]["value"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if hover_value.contains(expected) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        hover_values.push(hover_value);
     }
     child.kill().ok();
-    hover_value
+    hover_values
+}
+
+fn hover_markdown(
+    loc_files: &[(&str, &str)],
+    script_rel: &str,
+    script_text: &str,
+    line: u32,
+    character: u32,
+    extra_init: serde_json::Value,
+) -> String {
+    hover_markdowns_with_live_settings(
+        loc_files,
+        script_rel,
+        script_text,
+        line,
+        character,
+        extra_init,
+        &[],
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_default()
 }
 
 #[test]
@@ -2391,6 +2434,58 @@ fn test_hover_show_all_languages_flag() {
     assert!(
         hover.contains("Nom Francais"),
         "hover with the flag on should show French loc too, got: {hover}"
+    );
+}
+
+#[test]
+fn test_live_configuration_rebuilds_localisation_hover() {
+    let hovers = hover_markdowns_with_live_settings(
+        &[
+            (
+                "test_l_english.yml",
+                "l_english:\n my_idea:0 \"English Name\"\n",
+            ),
+            (
+                "test_l_french.yml",
+                "l_french:\n my_idea:0 \"Nom Francais\"\n",
+            ),
+        ],
+        "common/countries/test.txt",
+        "my_country = {\n    name = my_idea\n}\n",
+        1,
+        14,
+        serde_json::json!({ "localisationLanguages": ["English"] }),
+        &[
+            (
+                serde_json::json!({
+                    "localisationLanguages": ["French"],
+                    "hoverShowAllLanguages": false,
+                }),
+                "Nom Francais",
+            ),
+            (
+                serde_json::json!({
+                    "localisationLanguages": ["French"],
+                    "hoverShowAllLanguages": true,
+                }),
+                "English Name",
+            ),
+        ],
+    );
+    assert!(
+        hovers[0].contains("English Name") && !hovers[0].contains("Nom Francais"),
+        "initial hover should use English only, got: {:?}",
+        hovers[0]
+    );
+    assert!(
+        hovers[1].contains("Nom Francais") && !hovers[1].contains("English Name"),
+        "changing languages should rebuild the hover map, got: {:?}",
+        hovers[1]
+    );
+    assert!(
+        hovers[2].contains("English Name") && hovers[2].contains("Nom Francais"),
+        "enabling all-language hovers should rebuild the hover map, got: {:?}",
+        hovers[2]
     );
 }
 
