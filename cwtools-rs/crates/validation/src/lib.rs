@@ -22,7 +22,7 @@ mod rule_core;
 mod scope;
 mod subtype;
 
-pub use common::{ErrorSeverity, FilePath, ValidationError, error_hash};
+pub use common::{ErrorSeverity, FilePath, RelatedSpan, ValidationError, error_hash};
 pub use loc_field::build_modifier_keys;
 pub use scope::scope_matches_required;
 pub use subtype::{collect_subtype_instances, subtype_membership_for_instance};

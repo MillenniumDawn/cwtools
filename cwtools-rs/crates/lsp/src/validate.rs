@@ -67,6 +67,7 @@ pub(crate) fn loc_diag_to_validation_error(
         // Loc diagnostics expose only a single (line, col) point, so they keep the
         // whole-line squiggle (no cheap end to derive — see task-18 loc decision).
         end: None,
+        related: Vec::new(),
     }
 }
 
@@ -168,6 +169,7 @@ pub(crate) fn truncate_validation_errors(
             code: None,
             fix: None,
             end: None,
+            related: Vec::new(),
         });
     }
     errs.extend(limit);
@@ -344,6 +346,21 @@ impl<'a> DocLines<'a> {
         }
     }
 
+    /// Range for a secondary span, given the emit site's 1-based line, 0-based
+    /// char column and exclusive end. Applies the same whole-line fallback the
+    /// primary squiggle uses when there's no document text to walk the end back
+    /// through.
+    fn related_range(&self, line: u32, col: u16, end: (u32, u16)) -> Range {
+        let line = line.saturating_sub(1);
+        let start = self.position(line, col as u32);
+        let end = if self.has_text() {
+            self.clamped_end_position(end.0.saturating_sub(1), end.1 as u32, start)
+        } else {
+            self.end_position(line, start.character)
+        };
+        Range { start, end }
+    }
+
     /// End position for a diagnostic whose start is at encoded column `start`:
     /// the end of that line's content, but always at least one past `start` so
     /// the range is never empty. With no line info, a single-character span.
@@ -355,6 +372,39 @@ impl<'a> DocLines<'a> {
             .max(start + 1);
         Position { line, character }
     }
+}
+
+/// Codes whose diagnostics carry an LSP tag. DEPRECATED strikes the span
+/// through, UNNECESSARY fades it: both say "this line has no business being
+/// here" at a glance, before the message is read. Kept to the codes that mean
+/// exactly that — a tag on a code the reader still has to act on would fade
+/// script that works.
+const CODE_TAGS: &[(&str, DiagnosticTag)] = &[
+    ("CW121", DiagnosticTag::UNNECESSARY),
+    ("CW231", DiagnosticTag::UNNECESSARY),
+    ("CW236", DiagnosticTag::DEPRECATED),
+    ("CW239", DiagnosticTag::UNNECESSARY),
+];
+
+/// The tag list for a diagnostic's code, if it has one.
+fn code_tags(code: &NumberOrString) -> Option<Vec<DiagnosticTag>> {
+    let NumberOrString::String(id) = code else {
+        return None;
+    };
+    CODE_TAGS
+        .iter()
+        .find(|(c, _)| c.eq_ignore_ascii_case(id))
+        .map(|(_, tag)| vec![tag.clone()])
+}
+
+/// The error-code reference entry for a diagnostic's code, so the editor can
+/// offer "open documentation" on a `CWxxx` the reader hasn't met before.
+fn code_description(code: &NumberOrString) -> Option<CodeDescription> {
+    let NumberOrString::String(id) = code else {
+        return None;
+    };
+    let href = Url::parse(&cwtools_error_codes::doc_url(id)).ok()?;
+    Some(CodeDescription { href })
 }
 
 /// Build a whole-statement-line diagnostic at `(line, col)` — 0-based line,
@@ -370,6 +420,8 @@ fn diagnostic_at(
     message: String,
 ) -> Diagnostic {
     let start = lines.position(line, col);
+    let code_description = code.as_ref().and_then(code_description);
+    let tags = code.as_ref().and_then(code_tags);
     Diagnostic {
         range: Range {
             end: lines.end_position(line, start.character),
@@ -377,12 +429,22 @@ fn diagnostic_at(
         },
         severity: Some(severity),
         code,
-        code_description: None,
+        code_description,
         source: Some(source.to_string()),
         message,
         related_information: None,
-        tags: None,
+        tags,
         data: None,
+    }
+}
+
+/// The LSP severity for an engine severity.
+fn severity_to_lsp(severity: cwtools_validation::ErrorSeverity) -> DiagnosticSeverity {
+    match severity {
+        cwtools_validation::ErrorSeverity::Error => DiagnosticSeverity::ERROR,
+        cwtools_validation::ErrorSeverity::Warning => DiagnosticSeverity::WARNING,
+        cwtools_validation::ErrorSeverity::Information => DiagnosticSeverity::INFORMATION,
+        cwtools_validation::ErrorSeverity::Hint => DiagnosticSeverity::HINT,
     }
 }
 
@@ -402,6 +464,8 @@ pub(crate) fn parse_error_to_diagnostic(e: &ParseError, lines: &DocLines) -> Dia
 /// Convert a `.cwt` rule-config error (parse or structural reference) into an LSP
 /// diagnostic. `RuleParseError.line` is 1-based; `col` is a 0-based character.
 /// Shared by the load-time path (`config.rs`) and the live per-file CWT lint.
+/// A directory-targeted error (an unreadable rules folder) keeps the directory
+/// as its file, so it lands in Problems under the folder rather than vanishing.
 pub(crate) fn rule_parse_error_to_diagnostic(
     err: &cwtools_rules::ruleset_loader::RuleParseError,
     lines: &DocLines,
@@ -412,9 +476,9 @@ pub(crate) fn rule_parse_error_to_diagnostic(
         line,
         col,
         lines,
-        DiagnosticSeverity::ERROR,
+        severity_to_lsp(err.severity),
         "cwtools-rules",
-        None,
+        Some(NumberOrString::String(err.code.to_string())),
         err.message.clone(),
     )
 }
@@ -436,12 +500,7 @@ pub(crate) fn validation_error_to_diagnostic(
 ) -> Diagnostic {
     let line = err.line.saturating_sub(1);
     let col = err.col as u32;
-    let severity = match err.severity {
-        cwtools_validation::ErrorSeverity::Error => DiagnosticSeverity::ERROR,
-        cwtools_validation::ErrorSeverity::Warning => DiagnosticSeverity::WARNING,
-        cwtools_validation::ErrorSeverity::Information => DiagnosticSeverity::INFORMATION,
-        cwtools_validation::ErrorSeverity::Hint => DiagnosticSeverity::HINT,
-    };
+    let severity = severity_to_lsp(err.severity);
     let mut diag = diagnostic_at(
         line,
         col,
@@ -468,6 +527,26 @@ pub(crate) fn validation_error_to_diagnostic(
             end_line.saturating_sub(1),
             end_col as u32,
             diag.range.start,
+        );
+    }
+    // Secondary spans (the `if` a stray `else` is missing, the case a path is
+    // indexed under) are all in the file being validated, so they hang off its
+    // own URI. `err.file` is the document URI on this path; a ruleset-load
+    // error whose "file" is not a URI simply publishes no related information.
+    if !err.related.is_empty()
+        && let Ok(uri) = Url::parse(&err.file)
+    {
+        diag.related_information = Some(
+            err.related
+                .iter()
+                .map(|r| DiagnosticRelatedInformation {
+                    location: Location {
+                        uri: uri.clone(),
+                        range: lines.related_range(r.line, r.col, r.end),
+                    },
+                    message: r.message.clone(),
+                })
+                .collect(),
         );
     }
     // Carry any machine-applicable fix into `data` so the code-action handler
@@ -529,9 +608,8 @@ impl Backend {
         }
     }
 
-    /// Index an already-parsed AST into the info index. Extracted
-    /// from `index_document` so the workspace scan can index cache-hit ASTs
-    /// without re-parsing.
+    /// Index an already-parsed AST into the info index, so the workspace scan
+    /// can index cache-hit ASTs without re-parsing.
     ///
     /// `parsed_version` is the document version `parsed` came from, when it came
     /// from an open document. Callers indexing from disk (the workspace scan,
@@ -1931,6 +2009,7 @@ mod truncation_tests {
             code,
             fix: None,
             end: None,
+            related: Vec::new(),
         }
     }
 
@@ -2160,6 +2239,7 @@ mod whole_line_range_tests {
             code: Some("CW242"),
             fix: None,
             end: None,
+            related: Vec::new(),
         };
         let utf16 = validation_error_to_diagnostic(&err, &utf16_lines(text));
         assert_eq!(utf16.range.start.character, 3);
@@ -2186,6 +2266,7 @@ mod whole_line_range_tests {
             code: Some("CW242"),
             fix: None,
             end: None,
+            related: Vec::new(),
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.start.line, 1);
@@ -2212,6 +2293,7 @@ mod whole_line_range_tests {
             fix: None,
             // The leaf's own SourceRange end (1-based line 2, exclusive char 24).
             end: Some((2, 24)),
+            related: Vec::new(),
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.start.line, 1);
@@ -2236,6 +2318,7 @@ mod whole_line_range_tests {
             code: Some("CW262"),
             fix: None,
             end: Some((5, 0)), // what the parser actually emits: start of `}`
+            related: Vec::new(),
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.start.line, 1);
@@ -2262,6 +2345,7 @@ mod whole_line_range_tests {
             code: Some("CW240"),
             fix: None,
             end: Some((3, 0)), // start of the `}` line
+            related: Vec::new(),
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.end.line, 1, "must stay on the statement's line");
@@ -2283,6 +2367,7 @@ mod whole_line_range_tests {
             code: Some("CW500"),
             fix: None,
             end: Some((3, 4)), // start of `allowed` on the next line
+            related: Vec::new(),
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.end.line, 1);
@@ -2303,6 +2388,7 @@ mod whole_line_range_tests {
             code: Some("CW262"),
             fix: None,
             end: Some((3, 0)),
+            related: Vec::new(),
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert!(
@@ -2327,6 +2413,7 @@ mod whole_line_range_tests {
             code: Some("CW500"),
             fix: None,
             end: Some((3, 0)),
+            related: Vec::new(),
         };
         let diag = validation_error_to_diagnostic(&err, &ends);
         assert_eq!(diag.range.end.line, 1);
@@ -2345,6 +2432,7 @@ mod whole_line_range_tests {
             code: None,
             fix: None,
             end: None,
+            related: Vec::new(),
         };
         let diag = validation_error_to_diagnostic(&err, &DocLines::none());
         assert_eq!(diag.range.start.character, 2);
@@ -2365,6 +2453,7 @@ mod whole_line_range_tests {
             code: Some("CW500"),
             fix: None,
             end: Some((6, 0)),
+            related: Vec::new(),
         };
         let diag = validation_error_to_diagnostic(&err, &DocLines::none());
         assert_eq!(diag.range.start.line, 4);
@@ -2402,5 +2491,106 @@ mod whole_line_range_tests {
             Some(&NumberOrString::String("CW100".into())),
             &[]
         ));
+    }
+
+    #[test]
+    fn coded_diagnostics_link_to_their_documentation_row() {
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Warning,
+            line: 1,
+            col: 0,
+            file: "f".into(),
+            code: Some("CW113"),
+            fix: None,
+            end: None,
+            related: Vec::new(),
+        };
+        let diag = validation_error_to_diagnostic(&err, &DocLines::none());
+        let href = diag
+            .code_description
+            .expect("a CW code carries a doc link")
+            .href;
+        assert_eq!(href.fragment(), Some("cw113"));
+        assert!(href.as_str().ends_with("ERROR_CODES.md#cw113"));
+    }
+
+    #[test]
+    fn uncoded_diagnostics_have_no_doc_link_or_tag() {
+        // Parse errors carry no CW code, so there is no row to point at.
+        let diag = parse_error_to_diagnostic(
+            &cwtools_parser::ast::ParseError::Pos(1, 0, "bad".into()),
+            &DocLines::none(),
+        );
+        assert!(diag.code_description.is_none());
+        assert!(diag.tags.is_none());
+    }
+
+    #[test]
+    fn deprecated_and_unnecessary_codes_are_tagged() {
+        let tags = |id: &str| code_tags(&NumberOrString::String(id.into()));
+        assert_eq!(tags("CW236"), Some(vec![DiagnosticTag::DEPRECATED]));
+        assert_eq!(tags("cw121"), Some(vec![DiagnosticTag::UNNECESSARY]));
+        assert_eq!(tags("CW239"), Some(vec![DiagnosticTag::UNNECESSARY]));
+        assert_eq!(tags("CW231"), Some(vec![DiagnosticTag::UNNECESSARY]));
+        // A code the reader still has to act on must not be faded.
+        assert_eq!(tags("CW240"), None);
+        assert_eq!(code_tags(&NumberOrString::Number(121)), None);
+    }
+
+    #[test]
+    fn related_spans_publish_against_the_same_document() {
+        let text = "foo = {\n    else_if = { a = 1 }\n}\n";
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Error,
+            line: 1,
+            col: 0,
+            file: "file:///ws/events/test.txt".into(),
+            code: Some("CW238"),
+            fix: None,
+            end: None,
+            related: vec![cwtools_validation::RelatedSpan {
+                message: "this else_if has no preceding if".into(),
+                line: 2,
+                col: 4,
+                end: (2, 11),
+            }],
+        };
+        let diag = validation_error_to_diagnostic(&err, &utf16_lines(text));
+        let related = diag.related_information.expect("related span published");
+        assert_eq!(related.len(), 1);
+        assert_eq!(
+            related[0].location.uri.as_str(),
+            "file:///ws/events/test.txt"
+        );
+        assert_eq!(related[0].location.range.start.line, 1);
+        assert_eq!(related[0].location.range.start.character, 4);
+        assert_eq!(related[0].location.range.end.character, 11);
+        assert_eq!(related[0].message, "this else_if has no preceding if");
+    }
+
+    #[test]
+    fn related_spans_are_dropped_when_the_file_is_not_a_uri() {
+        // Ruleset-load diagnostics name a plain path; there is no document to
+        // hang a location off, and a bogus URI would be worse than none.
+        let err = ValidationError {
+            message: "x".into(),
+            severity: ErrorSeverity::Error,
+            line: 1,
+            col: 0,
+            file: "config/rules.cwt".into(),
+            code: Some("CW238"),
+            fix: None,
+            end: None,
+            related: vec![cwtools_validation::RelatedSpan {
+                message: "elsewhere".into(),
+                line: 1,
+                col: 0,
+                end: (1, 4),
+            }],
+        };
+        let diag = validation_error_to_diagnostic(&err, &DocLines::none());
+        assert!(diag.related_information.is_none());
     }
 }

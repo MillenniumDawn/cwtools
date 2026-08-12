@@ -148,7 +148,7 @@ fn load_perf_session() -> cwtools_driver::SessionWithFiles {
         ignore_dirs: &[],
         loc_languages: None,
         case_sensitive_files: false,
-        on_rules_warning: None,
+        on_rules_diagnostic: None,
     })
 }
 
@@ -217,7 +217,7 @@ fn cw100_count(workspace: &std::path::Path) -> usize {
         ignore_dirs: &[],
         loc_languages: None,
         case_sensitive_files: false,
-        on_rules_warning: None,
+        on_rules_diagnostic: None,
     });
     session
         .validate_all()
@@ -303,7 +303,7 @@ fn cw113_count(workspace: &std::path::Path, case_sensitive: bool) -> usize {
         ignore_dirs: &[],
         loc_languages: None,
         case_sensitive_files: case_sensitive,
-        on_rules_warning: None,
+        on_rules_diagnostic: None,
     });
     session
         .validate_all()
@@ -373,7 +373,7 @@ fn cw113_count_from_cache(
         ignore_dirs: &[],
         loc_languages: None,
         case_sensitive_files: case_sensitive,
-        on_rules_warning: None,
+        on_rules_diagnostic: None,
     });
     session
         .validate_all()
@@ -511,7 +511,7 @@ fn unused_session(workspace: &std::path::Path) -> cwtools_driver::SessionWithFil
         ignore_dirs: &[],
         loc_languages: None,
         case_sensitive_files: false,
-        on_rules_warning: None,
+        on_rules_diagnostic: None,
     })
 }
 
@@ -635,7 +635,7 @@ fn load_loc_session(
             ignore_dirs: &[],
             loc_languages: None,
             case_sensitive_files: false,
-            on_rules_warning: None,
+            on_rules_diagnostic: None,
         },
         parse_cache_dir,
     )
@@ -696,7 +696,7 @@ fn changed_source_is_not_validated_against_a_stale_index() {
         ignore_dirs: &[],
         loc_languages: None,
         case_sensitive_files: false,
-        on_rules_warning: None,
+        on_rules_diagnostic: None,
     });
     std::fs::write(
         tmp.path().join("mod/common/things/x.txt"),
@@ -766,7 +766,7 @@ fn load_cached(workspace: &std::path::Path, refresh: bool) -> cwtools_driver::Se
         ignore_dirs: &[],
         loc_languages: None,
         case_sensitive_files: false,
-        on_rules_warning: None,
+        on_rules_diagnostic: None,
     })
 }
 
@@ -920,7 +920,7 @@ fn load_scoped(
         ignore_dirs: &[],
         loc_languages: langs,
         case_sensitive_files: false,
-        on_rules_warning: None,
+        on_rules_diagnostic: None,
     })
 }
 

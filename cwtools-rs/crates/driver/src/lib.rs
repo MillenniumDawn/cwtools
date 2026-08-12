@@ -44,7 +44,7 @@ use cwtools_parser::ast::{ParseError, ParsedFile};
 use cwtools_parser::parser::{parse_string, parse_string_without_comments};
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_rules::rules_types::RuleSet;
-use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
+use cwtools_rules::ruleset_loader::{RuleParseError, load_ruleset_from_dir};
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::references::{UsedInstances, check_unused_instances, needs_use_tracking};
 use cwtools_validation::{
@@ -228,8 +228,9 @@ pub struct SessionConfig<'a> {
     /// enable for mods that also target case-sensitive filesystems (Linux/Mac),
     /// so a reference that only differs from the file by case is flagged.
     pub case_sensitive_files: bool,
-    /// Optional sink for rules-load warnings (so the CLI can print them on stderr).
-    pub on_rules_warning: Option<&'a mut dyn FnMut(String)>,
+    /// Optional sink for the problems the `.cwt` ruleset itself has, so the CLI
+    /// can report them alongside the mod's own diagnostics. Dropped when `None`.
+    pub on_rules_diagnostic: Option<&'a mut dyn FnMut(RuleParseError)>,
 }
 
 /// The immutable-after-load engine state for the batch (CLI) path.
@@ -274,15 +275,20 @@ impl Session {
             ignore_dirs,
             loc_languages,
             case_sensitive_files,
-            on_rules_warning,
+            on_rules_diagnostic,
         } = config;
 
         // Rules share their StringTable with the game files so interned ids match.
         let rules_table = StringTable::new();
-        let ruleset = load_rules(&rules, &rules_table, on_rules_warning).unwrap_or_else(|e| {
+        let (ruleset, rule_errors) = load_rules(&rules, &rules_table).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
-            RuleSet::new()
+            (RuleSet::new(), Vec::new())
         });
+        if let Some(sink) = on_rules_diagnostic {
+            for error in rule_errors {
+                sink(error);
+            }
+        }
         let parse_cache = parse_cache_dir.and_then(|dir| {
             let fingerprint =
                 workspace_cache::settings_fingerprint(&game.to_string(), &ruleset, &directory);
@@ -709,6 +715,7 @@ impl SessionWithFiles {
                             code: None,
                             fix: None,
                             end: None,
+                            related: Vec::new(),
                         }],
                         UsedInstances::default(),
                     )
@@ -735,6 +742,7 @@ impl SessionWithFiles {
                                 code: None,
                                 fix: None,
                                 end: None,
+                                related: Vec::new(),
                             }],
                             UsedInstances::default(),
                         );
@@ -821,6 +829,7 @@ fn parse_errors_to_validation(
             code: None,
             fix: None,
             end: None,
+            related: Vec::new(),
         })
         .collect()
 }
@@ -1141,28 +1150,24 @@ pub fn search_config_for(directory: &Path) -> FileManagerConfig {
     }
 }
 
-/// Load a `RuleSet` from a `.cwt` file or a directory of `.cwt` files. Directory
-/// load warnings are sent to `on_warning` if provided; a rules *file* that can't
-/// be read or parsed is an `Err` (the caller decides whether that's fatal).
+/// Load a `RuleSet` from a `.cwt` file or a directory of `.cwt` files, together
+/// with the problems the ruleset itself has. Those are non-fatal: the caller
+/// reports them (see `cwtools rules`) and decides what an error means. A rules
+/// *file* that can't be read at all is an `Err` — there is no ruleset and
+/// nothing to report against.
 pub fn load_rules(
     rules: &RulesInput,
     table: &StringTable,
-    on_warning: Option<&mut dyn FnMut(String)>,
-) -> Result<RuleSet, String> {
+) -> Result<(RuleSet, Vec<RuleParseError>), String> {
     match rules {
-        RulesInput::Dir(dir) => {
-            let (ruleset, errors) = load_ruleset_from_dir(dir, table, ScanBudget::default());
-            if let Some(sink) = on_warning {
-                for err in &errors {
-                    sink(err.to_string());
-                }
-            }
-            Ok(ruleset)
-        }
+        RulesInput::Dir(dir) => Ok(load_ruleset_from_dir(dir, table, ScanBudget::default())),
         RulesInput::File(file) => {
             let rules_str = std::fs::read_to_string(file)
                 .map_err(|e| format!("could not read rules {}: {}", file.display(), e))?;
-            Ok(ast_to_ruleset(&parse_string(&rules_str, table), table))
+            Ok((
+                ast_to_ruleset(&parse_string(&rules_str, table), table),
+                Vec::new(),
+            ))
         }
     }
 }
@@ -1226,28 +1231,24 @@ mod tests {
     }
 
     #[test]
-    fn load_rules_forwards_directory_read_errors_to_warning_sink() {
+    fn load_rules_returns_directory_read_errors_as_coded_diagnostics() {
         let file = tempfile::NamedTempFile::new().expect("temp file");
         let table = StringTable::new();
-        let mut warnings = Vec::new();
-        let mut on_warning = |warning| warnings.push(warning);
 
-        let ruleset = load_rules(
-            &RulesInput::Dir(file.path().to_path_buf()),
-            &table,
-            Some(&mut on_warning),
-        )
-        .expect("directory load remains non-fatal");
+        let (ruleset, errors) = load_rules(&RulesInput::Dir(file.path().to_path_buf()), &table)
+            .expect("directory load remains non-fatal");
 
         assert!(ruleset.types.is_empty());
-        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert_eq!(errors[0].code, "CW600");
+        assert_eq!(errors[0].severity, ErrorSeverity::Error);
         assert!(
-            warnings[0].starts_with(&format!(
-                "{}:1:0: read directory error:",
+            errors[0].to_string().starts_with(&format!(
+                "{}:1:0: CW600: read directory error:",
                 file.path().display()
             )),
-            "warning: {}",
-            warnings[0]
+            "error: {}",
+            errors[0]
         );
     }
 }

@@ -43,7 +43,7 @@ or a validator should run it, because a refactor that was supposed to change
 nothing is easy to believe and hard to prove.
 
 It validates a pinned real mod and diffs the report against a committed
-baseline (`scripts/corpus-baseline.csv`, 4036 diagnostics as of writing). Run it
+baseline (`scripts/corpus-baseline.csv`, 4041 diagnostics as of writing). Run it
 from the repo root, one level up from here:
 
 ```sh
@@ -55,12 +55,14 @@ per-code gone/new tally, and the first 40 lines of the diff, with the full diff
 written to a temp dir. Exit 2 means the run never happened (missing corpus,
 missing binary, validator crashed).
 
-Two inputs, both git checkouts, expected as siblings of this repo:
+Two inputs, both git checkouts, looked for side by side under
+`~/Documents/github-projects` (point `CWTOOLS_PROJECTS` at wherever you keep
+them):
 
 - corpus: [Kaiserreich-4-Development](https://github.com/Kaiserreich/Kaiserreich-4-Development)
 - rules: [cwtools-hoi4-config](https://github.com/cwtools/cwtools-hoi4-config), the `Config` directory
 
-Override either with `--corpus` / `--rules` or `CWTOOLS_CORPUS` /
+Override either on its own with `--corpus` / `--rules` or `CWTOOLS_CORPUS` /
 `CWTOOLS_RULES`; `--help` lists the rest. The revisions the baseline was taken
 against are recorded in its `#` header, and the script prints the revisions it
 actually ran on, so an input that has moved on is visible before you go hunting

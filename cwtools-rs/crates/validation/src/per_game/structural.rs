@@ -263,14 +263,26 @@ fn validate_if_else_order(
                 }
                 if !prev_was_if && k != kw.if_ {
                     let key_len = table.with_string(key, |s| s.chars().count()).unwrap_or(0);
-                    push(
-                        errors,
-                        &error_codes::CW238_IF_ELSE_ORDER,
-                        error_codes::CW238_IF_ELSE_ORDER
-                            .message_template
-                            .to_string(),
-                        key_token_range(block.range.start, key_len),
-                        file_path,
+                    // The squiggle sits on the enclosing block, so the follower
+                    // itself is the place to look: relate its key token.
+                    let follower = table.with_string(k, |s| s.to_string()).unwrap_or_default();
+                    let follower_range =
+                        key_token_range(inner.range.start, follower.chars().count());
+                    let code = &error_codes::CW238_IF_ELSE_ORDER;
+                    let range = key_token_range(block.range.start, key_len);
+                    errors.push(
+                        ValidationError::from_code(
+                            code,
+                            file_path,
+                            range.start.line,
+                            range.start.col,
+                            &[],
+                        )
+                        .with_end(range.end)
+                        .with_related(
+                            format!("this {follower} has no preceding if"),
+                            follower_range,
+                        ),
                     );
                     break;
                 }
@@ -827,6 +839,30 @@ mod tests {
     fn else_without_preceding_if_is_cw238() {
         let c = codes("foo = { else = { a = 1 } }\n");
         assert!(c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn cw238_relates_the_follower_that_has_no_if() {
+        let table = StringTable::new();
+        let ast = parse_string("foo = {\n    else_if = { a = 1 }\n}\n", &table);
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW238"))
+            .expect("CW238 emitted");
+
+        assert_eq!((err.line, err.col), (1, 0), "squiggle stays on the parent");
+        let related = &err.related;
+        assert_eq!(related.len(), 1, "got: {related:?}");
+        assert_eq!((related[0].line, related[0].col), (2, 4));
+        assert_eq!(related[0].end, (2, 4 + "else_if".len() as u16));
+        assert!(
+            related[0].message.contains("else_if"),
+            "got: {}",
+            related[0].message
+        );
     }
 
     #[test]

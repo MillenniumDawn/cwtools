@@ -19,7 +19,7 @@ pub(crate) fn dispatch(command: Commands) {
         Commands::Discover { directory } => discover::run(directory),
         Commands::Serialize { input, output } => cache::serialize(input, output),
         Commands::Deserialize { input } => cache::deserialize(input),
-        Commands::Rules { file } => rules::run(file),
+        Commands::Rules { file, report_type } => rules::run(file, report_type),
         Commands::Validate(args) => validate::run(args),
         Commands::CacheVanilla {
             game,
