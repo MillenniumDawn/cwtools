@@ -206,10 +206,10 @@ Problems in the `.cwt` ruleset itself rather than in the script it checks. Emitt
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW600 | Error | Rules file could not be read: {} | A `.cwt` file or rules directory the loader could not read: a missing or unreadable path, an unreadable directory entry, or a file over the scan budget. The offending path is the diagnostic's file, so a directory-targeted one lands on the folder. | Emitted |
-| CW601 | Error | Rule references undefined {} `{}` | A rule names a type, enum or single_alias that no `.cwt` file defines. Resolved after every file is merged, so a cross-file definition counts; alias categories are deliberately out of scope. | Emitted |
-| CW602 | Error | {} | A `single_alias_right[...]` the post-processor refused to expand: a reference cycle, a chain past the depth limit, or the node budget. Reported on the `single_alias` definition it names, which is where the fix goes. | Emitted |
-| CW603 | Warning | {} | A `##` directive whose value the loader can't parse (a malformed `cardinality` bound, an unrecognised `severity`), so the option silently falls back to its default. One rule under-checks; the ruleset still loads. | Emitted |
+| <a id="cw600"></a>CW600 | Error | Rules file could not be read: {} | A `.cwt` file or rules directory the loader could not read: a missing or unreadable path, an unreadable directory entry, or a file over the scan budget. The offending path is the diagnostic's file, so a directory-targeted one lands on the folder. | Emitted |
+| <a id="cw601"></a>CW601 | Error | Rule references undefined {} `{}` | A rule names a type, enum or single_alias that no `.cwt` file defines. Resolved after every file is merged, so a cross-file definition counts; alias categories are deliberately out of scope. | Emitted |
+| <a id="cw602"></a>CW602 | Error | {} | A `single_alias_right[...]` the post-processor refused to expand: a reference cycle, a chain past the depth limit, or the node budget. Reported on the `single_alias` definition it names, which is where the fix goes. | Emitted |
+| <a id="cw603"></a>CW603 | Warning | {} | A `##` directive whose value the loader can't parse (a malformed `cardinality` bound, an unrecognised `severity`), so the option silently falls back to its default. One rule under-checks; the ruleset still loads. | Emitted |
 
 ---
 
