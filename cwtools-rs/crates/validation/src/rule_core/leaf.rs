@@ -293,16 +293,21 @@ pub(super) fn validate_leaf(
                             && !asset_relative
                         {
                             let code = &error_codes::CW113_MISSING_FILE;
-                            errors.push(
-                                ValidationError::from_code(
-                                    code,
-                                    file_path,
-                                    leaf.pos.start.line,
-                                    leaf.pos.start.col,
-                                    &[candidate],
-                                )
-                                .with_end(leaf.pos.end),
-                            );
+                            let mut err = ValidationError::from_code(
+                                code,
+                                file_path,
+                                leaf.pos.start.line,
+                                leaf.pos.start.col,
+                                &[candidate],
+                            )
+                            .with_end(leaf.pos.end);
+                            // A path that is indexed under a different case is
+                            // the one CW113 the reader can fix by reading it:
+                            // say which spelling the probe found.
+                            if let Some(on_disk) = idx.file_index.on_disk_case(candidate) {
+                                err = err.with_related(format!("indexed as {on_disk}"), leaf.pos);
+                            }
+                            errors.push(err);
                         }
                     }
                 });

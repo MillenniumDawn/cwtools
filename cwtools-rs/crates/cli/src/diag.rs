@@ -309,6 +309,7 @@ mod tests {
             code: Some("CW282"),
             fix: None,
             end: None,
+            related: Vec::new(),
         }
     }
 

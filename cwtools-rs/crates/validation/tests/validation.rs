@@ -106,6 +106,7 @@ fn test_error_hash() {
         code: None,
         fix: None,
         end: None,
+        related: Vec::new(),
     };
     let hash = error_hash(&error);
     assert_eq!(
@@ -133,6 +134,7 @@ fn fix_payload_does_not_change_error_hash() {
         code: Some("CW282"),
         fix: None,
         end: None,
+        related: Vec::new(),
     };
     let mut with_fix = base.clone();
     with_fix.fix = Some(SuggestedFix::delete(
@@ -332,6 +334,41 @@ spriteType = {
         cw113.is_empty(),
         "texture references should resolve via their sibling extension, got: {:?}",
         cw113
+    );
+}
+
+#[test]
+fn case_mismatched_file_reference_relates_the_on_disk_spelling() {
+    // On a case-sensitive run the file is there, just under another spelling.
+    // CW113 says which one, so the reader doesn't go hunting for the file.
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(TEXTURE_CWT, &table), &table);
+
+    let mut idx = TypeIndex::new();
+    idx.file_index.set_case_sensitive(true);
+    idx.file_index
+        .add_paths(["gfx/test/button.dds".to_string()]);
+
+    let script = "spriteType = {\n    texturefile = \"gfx/test/Button.dds\"\n}\n";
+    let parsed = parse_string(script, &table);
+    let errs = validate_ast(
+        &parsed,
+        &ruleset,
+        &table,
+        "game/interface/test.gfx",
+        Some(cwtools_validation::Game::Hoi4),
+        Some(&idx),
+        None,
+    );
+    let cw113 = errs
+        .iter()
+        .find(|e| e.code == Some("CW113"))
+        .expect("case mismatch is flagged in case-sensitive mode");
+    assert_eq!(cw113.related.len(), 1, "got: {:?}", cw113.related);
+    assert!(
+        cw113.related[0].message.contains("gfx/test/button.dds"),
+        "got: {}",
+        cw113.related[0].message
     );
 }
 
