@@ -21,10 +21,60 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
+  # A v* tag is the only authorization this workflow gets, so check that the
+  # tag actually points into protected main before anything builds or ships.
+  # Defense in depth only: the real control is a ruleset on refs/tags/v* that
+  # stops an unauthorized tag from being created in the first place (#158).
+  # -------------------------------------------------------------------------
+  verify-tag-ancestry:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is load-bearing. merge-base --is-ancestor on a shallow
+      # clone answers from grafted history, so a legitimate tag whose commit
+      # sits below the cut fails the gate.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Tag commit must be an ancestor of main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # A workflow_dispatch off a branch builds without publishing, so
+          # there is no tag to hold to main. Pass rather than skip: a skipped
+          # job would skip everything that needs it.
+          case "$GITHUB_REF" in
+            refs/tags/*) ;;
+            *)
+              echo "$GITHUB_REF is not a tag; build-only run"
+              exit 0
+              ;;
+          esac
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --unshallow --no-tags origin
+          fi
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main"
+          # GITHUB_SHA, not the tag ref: that is the commit the build jobs
+          # check out, and it is what a tag moved mid-run would diverge from.
+          # ^{commit} dereferences an annotated tag object to its commit.
+          commit="$(git rev-parse --verify "${GITHUB_SHA}^{commit}")"
+          if ! git merge-base --is-ancestor \
+            "$commit" refs/remotes/origin/main; then
+            echo "::error::tag ${TAG} points at ${commit}, which is not on" \
+              "main; refusing to build or publish a release from it"
+            exit 1
+          fi
+          echo "tag ${TAG} -> ${commit} is an ancestor of origin/main"
+
+  # -------------------------------------------------------------------------
   # Rust — matrix across all three platforms
   # -------------------------------------------------------------------------
   release-rs:
     name: ${{ matrix.label }}
+    needs: [verify-tag-ancestry]
     strategy:
       fail-fast: false
       matrix:
@@ -141,6 +191,7 @@ jobs:
   # builds. The matrix still catches platform-specific release build failures.
   release-test:
     name: Rust release tests
+    needs: [verify-tag-ancestry]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -180,7 +231,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish:
     name: Publish GitHub release
-    needs: [release-rs, release-test]
+    needs: [verify-tag-ancestry, release-rs, release-test]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
