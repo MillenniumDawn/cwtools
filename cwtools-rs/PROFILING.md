@@ -83,18 +83,19 @@ args aren't formatted), and make sure the crate has `tracing` in its
 
 The LSP workspace walk consults three lists, layered in this order:
 
-1. **Engine baseline (always on)**: toolchain junk (`.git`, `target`, `.vs`, `node_modules`, `bin`,
-   `obj`, `out`, `dist`, `.idea`, `.vscode`, `resources`)
+1. **Engine baseline (always on)**: toolchain junk (`.git`, `.claude`, `target`, `.vs`,
+   `node_modules`, `bin`, `obj`, `out`, `dist`, `.idea`, `.vscode`, plus `resources`
+   at the workspace root only, since a nested `common/resources/` is game content)
    and free-form text files (`Changelog.txt`, `README.txt`, `LICENSE.txt`,
    `README.md`, `LICENSE.md`, `*.md`). These are hard-coded and cannot be
    disabled per-workspace — they exist because matching them otherwise
    wastes validator time on files that almost never contain script.
-2. **User file globs**: forwarded by the extension from
-   `cwtools.ignore.filePatterns` (in `settings.json`) into
+2. **User file globs**: forwarded by the extension from `cwtools.ignore_patterns`
+   and `cwtools.errors.ignorefiles` (in `settings.json`) into
    `initializationOptions.ignoreFilePatterns`. Re-read on every
    `workspace/didChangeConfiguration`.
-3. **User directory globs**: same as above, key
-   `cwtools.ignore.directories` → `initializationOptions.ignoreDirectories`.
+3. **User directory globs**: same key handling, `initializationOptions.ignoreDirectories`.
+   The VS Code extension has no setting feeding it today; another client can send it.
 
 Both user lists default to empty and extend (not replace) the engine
 baseline. Patterns use `*` and `?` only (no `**`).

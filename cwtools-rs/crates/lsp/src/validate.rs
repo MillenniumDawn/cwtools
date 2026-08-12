@@ -529,9 +529,8 @@ impl Backend {
         }
     }
 
-    /// Index an already-parsed AST into the info index. Extracted
-    /// from `index_document` so the workspace scan can index cache-hit ASTs
-    /// without re-parsing.
+    /// Index an already-parsed AST into the info index, so the workspace scan
+    /// can index cache-hit ASTs without re-parsing.
     ///
     /// `parsed_version` is the document version `parsed` came from, when it came
     /// from an open document. Callers indexing from disk (the workspace scan,
