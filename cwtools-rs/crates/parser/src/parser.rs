@@ -202,7 +202,9 @@ impl<'a> Parser<'a> {
             // Quoted key — same escape/termination rules as a quoted value: it
             // never spans a line, and an unclosed one is an error (a quoted key
             // is never a bare clause entry, so always report).
-            Some(self.scan_quoted(true))
+            let key = self.scan_quoted(true);
+            self.skip_whitespace();
+            Some(key)
         } else {
             let start = self.byte_pos();
             while let Some(c) = self.peek() {
@@ -234,20 +236,24 @@ impl<'a> Parser<'a> {
     /// so one-line `a = "x" b = "y"` pairs and namelists mixing quoted and bare
     /// entries (`{ "Sunshine" Demon }`) parse as separate values (matches the
     /// game, which splits a name at its first interior quote).
-    fn parse_value(&mut self, leafvalue: bool) -> Option<Value> {
+    fn parse_value(&mut self, leafvalue: bool) -> Option<(Value, SourceRange)> {
         self.skip_whitespace();
         // Skip any comments that appear before the actual value (e.g. value on next line).
         // The AST has no place for comments inside Leaf values, so just discard them.
         while self.skip_comment() {
             self.skip_whitespace();
         }
+        let start = self.pos();
 
         if self.peek() == Some('{') {
-            return self.parse_clause();
+            return self
+                .parse_clause()
+                .map(|value| self.finish_value(start, value));
         }
 
         if self.peek() == Some('"') {
-            return Some(self.parse_quoted_value(leafvalue));
+            let value = self.parse_quoted_value(leafvalue);
+            return Some(self.finish_value(start, value));
         }
 
         // Peek ahead for numbers / booleans / rgb / hsv / metaprogramming
@@ -288,7 +294,7 @@ impl<'a> Parser<'a> {
             if after.is_none_or(|c| !c.is_alphanumeric()) {
                 let saved = self.save();
                 if let Some(v) = self.parse_color_clause() {
-                    return Some(v);
+                    return Some(self.finish_value(start, v));
                 }
                 self.restore(saved);
             }
@@ -308,21 +314,30 @@ impl<'a> Parser<'a> {
             if after.is_none_or(|c| !c.is_alphanumeric()) {
                 let saved = self.save();
                 if let Some(v) = self.parse_color_clause() {
-                    return Some(v);
+                    return Some(self.finish_value(start, v));
                 }
                 self.restore(saved);
             }
         }
         if let Some(b) = self.parse_bool_keyword(&peek7, peek7_len) {
-            return Some(b);
+            return Some(self.finish_value(start, b));
         }
         // F# metaprogramming prefix is "@\[" (at, backslash, open-bracket): the
         // 3-char literal @\[.
         if peek7_len >= 3 && peek7[0] == '@' && peek7[1] == '\\' && peek7[2] == '[' {
-            return self.parse_metaprogramming();
+            return self
+                .parse_metaprogramming()
+                .map(|value| self.finish_value(start, value));
         }
 
         self.parse_number_or_string()
+            .map(|value| self.finish_value(start, value))
+    }
+
+    fn finish_value(&mut self, start: SourcePos, value: Value) -> (Value, SourceRange) {
+        let end = self.pos();
+        self.skip_whitespace();
+        (value, SourceRange { start, end })
     }
 
     /// Parse a `"`-delimited string value (cursor is positioned at the opening
@@ -402,7 +417,7 @@ impl<'a> Parser<'a> {
         // An unclosed string still gets a synthesized closing quote.
         let end_byte = self.byte_pos();
         let body_end = if closed { end_byte - 1 } else { end_byte };
-        let tokens = match owned {
+        match owned {
             Some(mut buf) => {
                 buf.push_str(&self.input[seg_start..body_end]);
                 buf.push('"');
@@ -415,9 +430,7 @@ impl<'a> Parser<'a> {
                 buf.push('"');
                 self.table.intern(&buf)
             }
-        };
-        self.skip_whitespace();
-        tokens
+        }
     }
 
     /// Recognize a standalone `yes`/`no` boolean keyword from the pre-peeked
@@ -432,11 +445,9 @@ impl<'a> Parser<'a> {
             }
             if let Some(c) = self.peek() {
                 if !is_value_char(c) {
-                    self.skip_whitespace();
                     return Some(Value::Bool(true));
                 }
             } else {
-                self.skip_whitespace();
                 return Some(Value::Bool(true));
             }
             // Not a standalone "yes" — backtrack
@@ -449,11 +460,9 @@ impl<'a> Parser<'a> {
             }
             if let Some(c) = self.peek() {
                 if !is_value_char(c) {
-                    self.skip_whitespace();
                     return Some(Value::Bool(false));
                 }
             } else {
-                self.skip_whitespace();
                 return Some(Value::Bool(false));
             }
             // Not a standalone "no" — backtrack
@@ -508,11 +517,9 @@ impl<'a> Parser<'a> {
         if num_token_ends && !num_str.is_empty() && num_str != "-" && num_str != "+" {
             // Try int first (strips leading '+' via parse::<i64>)
             if let Ok(i) = num_str.parse::<i64>() {
-                self.skip_whitespace();
                 return Some(Value::Int(i));
             }
             if let Ok(f) = num_str.parse::<f64>() {
-                self.skip_whitespace();
                 return Some(Value::Float(f));
             }
         }
@@ -534,7 +541,6 @@ impl<'a> Parser<'a> {
         if s.is_empty() {
             return None;
         }
-        self.skip_whitespace();
         let tokens = self.table.intern(s);
         Some(Value::String(tokens))
     }
@@ -564,7 +570,6 @@ impl<'a> Parser<'a> {
             self.skip_whitespace();
             if self.peek() == Some('}') {
                 self.advance();
-                self.skip_whitespace();
                 break;
             }
             if self.peek().is_none() {
@@ -617,7 +622,6 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        self.skip_whitespace();
     }
 
     fn parse_statement(&mut self, out: &mut Vec<Child>) {
@@ -640,13 +644,14 @@ impl<'a> Parser<'a> {
         let saved_cursor = self.save();
         if let Some(key) = self.parse_key() {
             if let Some(op) = self.parse_operator() {
-                if let Some(value) = self.parse_value(false) {
+                if let Some((value, value_pos)) = self.parse_value(false) {
                     let end = self.pos();
                     let leaf = Leaf {
                         key,
                         value,
                         op,
                         pos: SourceRange { start: saved, end },
+                        value_pos,
                     };
                     let idx = self.arena.push_leaf(leaf);
                     out.push(Child::Leaf(idx));
@@ -659,6 +664,7 @@ impl<'a> Parser<'a> {
                     value: Value::String(self.table.intern("")),
                     op,
                     pos: SourceRange { start: saved, end },
+                    value_pos: SourceRange { start: end, end },
                 };
                 let idx = self.arena.push_leaf(leaf);
                 out.push(Child::Leaf(idx));
@@ -674,26 +680,33 @@ impl<'a> Parser<'a> {
             }
             // No operator — check for shorthand `key { ... }`
             self.skip_whitespace();
-            if let Some('{') = self.peek()
-                && let Some(value) = self.parse_clause()
-            {
-                let end = self.pos();
-                let leaf = Leaf {
-                    key,
-                    value,
-                    op: Operator::Equals,
-                    pos: SourceRange { start: saved, end },
-                };
-                let idx = self.arena.push_leaf(leaf);
-                out.push(Child::Leaf(idx));
-                return;
+            if let Some('{') = self.peek() {
+                let value_start = self.pos();
+                if let Some(value) = self.parse_clause() {
+                    let value_end = self.pos();
+                    self.skip_whitespace();
+                    let end = self.pos();
+                    let leaf = Leaf {
+                        key,
+                        value,
+                        op: Operator::Equals,
+                        pos: SourceRange { start: saved, end },
+                        value_pos: SourceRange {
+                            start: value_start,
+                            end: value_end,
+                        },
+                    };
+                    let idx = self.arena.push_leaf(leaf);
+                    out.push(Child::Leaf(idx));
+                    return;
+                }
             }
             // Not a key=value or shorthand; restore and try leaf-value
             self.restore(saved_cursor);
         }
 
         // Leaf value (bare value)
-        if let Some(value) = self.parse_value(true) {
+        if let Some((value, _)) = self.parse_value(true) {
             let end = self.pos();
             let lv = LeafValue {
                 value,
@@ -771,7 +784,6 @@ impl<'a> Parser<'a> {
             return None;
         }
         let s = &self.input[start..self.byte_pos()];
-        self.skip_whitespace();
         let tokens = self.table.intern(s);
         Some(Value::String(tokens))
     }
@@ -826,6 +838,20 @@ fn is_value_char(c: char) -> bool {
     } else {
         c.is_alphanumeric() || c == 'š' || c == 'Š' || c == '’'
     }
+}
+
+/// Whether `value` parses as a bare string rather than a boolean or number.
+/// This is deliberately conservative: a value that starts numerically may be
+/// string-shaped in some cases, but quoting it is always safe.
+pub fn is_bare_string_value(value: &str) -> bool {
+    !value.is_empty()
+        && value != "yes"
+        && value != "no"
+        && value
+            .chars()
+            .next()
+            .is_some_and(|c| !matches!(c, '+' | '-') && !c.is_ascii_digit())
+        && value.chars().all(is_value_char)
 }
 
 fn is_key_char(c: char) -> bool {
@@ -1238,6 +1264,87 @@ ENG = {
             }
             other => panic!("expected a leaf, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn leaf_value_position_excludes_trailing_whitespace() {
+        let table = StringTable::new();
+        let result = parse_string("a = # comment\n  \"value\"  # tail\nb = yes", &table).unwrap();
+        let Child::Leaf(i) = &result.root_children[0] else {
+            panic!("expected a leaf");
+        };
+        let leaf = &result.arena.leaves[*i as usize];
+        assert_eq!(
+            leaf.value_pos,
+            SourceRange {
+                start: SourcePos { line: 2, col: 2 },
+                end: SourcePos { line: 2, col: 9 },
+            }
+        );
+    }
+
+    #[test]
+    fn leaf_value_positions_cover_every_rhs_shape() {
+        use crate::fix::{SpanEdit, apply_edits};
+
+        let input = r#"plain=bare # trailing
+quoted = "a😀\"b" # trailing
+integer = +42
+boolean= no
+block = { nested = value }
+shorthand { nested = value }
+"#;
+        let table = StringTable::new();
+        let result = parse_string(input, &table).unwrap();
+        let edits = result
+            .root_children
+            .iter()
+            .filter_map(|child| match child {
+                Child::Leaf(idx) => Some(&result.arena.leaves[*idx as usize]),
+                Child::Comment(_) => None,
+                other => panic!("expected keyed leaf, got {other:?}"),
+            })
+            .map(|leaf| {
+                let key = table.get_string(leaf.key.normal).unwrap();
+                SpanEdit {
+                    range: leaf.value_pos,
+                    replacement: format!("<{key}>"),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            apply_edits(input, &edits),
+            "plain=<plain> # trailing\nquoted = <quoted> # trailing\ninteger = <integer>\nboolean= <boolean>\nblock = <block>\nshorthand <shorthand>\n"
+        );
+    }
+
+    #[test]
+    fn missing_leaf_value_has_an_empty_value_span() {
+        let table = StringTable::new();
+        let result = parse_string("missing = ", &table).unwrap();
+        let Child::Leaf(idx) = result.root_children[0] else {
+            panic!("expected a leaf");
+        };
+        let leaf = &result.arena.leaves[idx as usize];
+        assert_eq!(
+            leaf.value_pos,
+            SourceRange {
+                start: SourcePos { line: 1, col: 10 },
+                end: SourcePos { line: 1, col: 10 },
+            }
+        );
+    }
+
+    #[test]
+    fn bare_string_value_excludes_non_string_forms() {
+        assert!(is_bare_string_value("my_key"));
+        assert!(is_bare_string_value("YES"));
+        assert!(!is_bare_string_value("yes"));
+        assert!(!is_bare_string_value("123"));
+        assert!(!is_bare_string_value("+token"));
+        assert!(!is_bare_string_value("-token"));
+        assert!(!is_bare_string_value("foo=bar"));
     }
 
     // -----------------------------------------------------------------------

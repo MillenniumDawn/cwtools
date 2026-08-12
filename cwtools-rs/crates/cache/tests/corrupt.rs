@@ -15,7 +15,7 @@ use cwtools_string_table::string_table::StringTable;
 use std::path::Path;
 
 const MAGIC: [u8; 4] = *b"CWB\x00";
-const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION: u8 = 4;
 
 /// A small but structurally complete cache: leaves, a nested clause, a comment.
 fn sample_bytes() -> Vec<u8> {
@@ -62,11 +62,12 @@ fn fingerprint_path(path: &Path) -> Result<Result<String, CacheError>, CacheErro
             for l in &arena.leaves {
                 let _ = write!(
                     out,
-                    "|L {:?} {:?} {:?} {:?}",
+                    "|L {:?} {:?} {:?} {:?} {:?}",
                     table.get_string(l.key.normal),
                     l.value,
                     l.op,
-                    l.pos
+                    l.pos,
+                    l.value_pos
                 );
             }
             for lv in &arena.leaf_values {
@@ -306,6 +307,10 @@ fn out_of_bounds_index_inside_a_clause_is_rejected() {
             start_col: 0,
             end_line: 1,
             end_col: 5,
+            value_start_line: 1,
+            value_start_col: 0,
+            value_end_line: 1,
+            value_end_col: 5,
         }],
         leaf_values: vec![],
         comments: vec![],

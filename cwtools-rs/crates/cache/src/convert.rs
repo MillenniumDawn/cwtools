@@ -94,6 +94,12 @@ pub fn archived_to_arena(
                 l.end_line.to_native(),
                 l.end_col.to_native(),
             ),
+            value_pos: cached_to_range(
+                l.value_start_line.to_native(),
+                l.value_start_col.to_native(),
+                l.value_end_line.to_native(),
+                l.value_end_col.to_native(),
+            ),
         });
     }
     for lv in cached.leaf_values.iter() {
@@ -254,6 +260,7 @@ fn children_to_cached(children: &[Child]) -> Vec<CachedChild> {
 
 fn leaf_to_cached(l: &Leaf, table: &StringResolver<'_>) -> CachedLeaf {
     let (sl, sc, el, ec) = range_to_cached(&l.pos);
+    let (vsl, vsc, vel, vec_) = range_to_cached(&l.value_pos);
     CachedLeaf {
         key: string_token_to_owned(&l.key, table),
         value: value_to_cached(&l.value, table),
@@ -262,6 +269,10 @@ fn leaf_to_cached(l: &Leaf, table: &StringResolver<'_>) -> CachedLeaf {
         start_col: sc,
         end_line: el,
         end_col: ec,
+        value_start_line: vsl,
+        value_start_col: vsc,
+        value_end_line: vel,
+        value_end_col: vec_,
     }
 }
 

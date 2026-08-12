@@ -13,6 +13,7 @@ use crate::scope::validate_scope_target;
 use cwtools_error_codes as error_codes;
 
 use super::children::validate_math_clause;
+use super::suggest::best_suggestion;
 
 /// Check a `value[variable]` (VariableGetField) read against the project-wide
 /// variable index. Emits CW246 when the value names a variable that was never
@@ -444,23 +445,36 @@ pub(super) fn validate_leaf(
             let key = table
                 .with_string(leaf.key.normal, |s| s.to_string())
                 .unwrap_or_default();
-            // No did-you-mean fix here (unlike CW262/CW263): an enum-value rename
-            // would replace the value token, but `Leaf` records no value-start
-            // position and `leaf.pos.end` absorbs trailing whitespace, so the value
-            // span can't be derived cleanly. Skipped like Task 8's CW122.
-            errors.push(
-                ValidationError::from_code(
-                    &error_codes::CW240_UNEXPECTED_VALUE,
-                    file_path,
-                    leaf.pos.start.line,
-                    leaf.pos.start.col,
-                    &[&format!(
-                        "Field '{}' has value '{}', expected {}",
-                        key, actual, expected
-                    )],
+            let mut err = ValidationError::from_code(
+                &error_codes::CW240_UNEXPECTED_VALUE,
+                file_path,
+                leaf.pos.start.line,
+                leaf.pos.start.col,
+                &[&format!(
+                    "Field '{}' has value '{}', expected {}",
+                    key, actual, expected
+                )],
+            )
+            .with_end(leaf.pos.end);
+            if let NewField::ValueField(ValueType::Enum(enum_name)) = right
+                && let Some(&idx) = ctx.ruleset.enum_by_name.get(enum_name)
+                && let Some(cand) = best_suggestion(
+                    actual
+                        .strip_prefix('"')
+                        .and_then(|value| value.strip_suffix('"'))
+                        .unwrap_or(&actual),
+                    ctx.ruleset.enums[idx].values.iter().map(String::as_str),
                 )
-                .with_end(leaf.pos.end),
-            );
+            {
+                let replacement =
+                    format!("\"{}\"", cand.replace('\\', "\\\\").replace('"', "\\\""));
+                err = err.with_fix(cwtools_parser::fix::SuggestedFix::replace(
+                    format!("Did you mean '{}'?", cand),
+                    leaf.value_pos,
+                    replacement,
+                ));
+            }
+            errors.push(err);
         }
     }
 }
