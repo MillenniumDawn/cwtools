@@ -35,6 +35,15 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
+Coverage is optional while we build history, with an 85% line target:
+
+```sh
+COVERAGE_THRESHOLD=85 bash ../scripts/coverage.sh
+```
+
+The command writes `target/coverage/lcov.info`, which is the source for CI and
+local review diffs.
+
 ## Corpus guard
 
 The test suite says the code still compiles and behaves. The corpus guard says
