@@ -438,6 +438,16 @@ fn diagnostic_at(
     }
 }
 
+/// The LSP severity for an engine severity.
+fn severity_to_lsp(severity: cwtools_validation::ErrorSeverity) -> DiagnosticSeverity {
+    match severity {
+        cwtools_validation::ErrorSeverity::Error => DiagnosticSeverity::ERROR,
+        cwtools_validation::ErrorSeverity::Warning => DiagnosticSeverity::WARNING,
+        cwtools_validation::ErrorSeverity::Information => DiagnosticSeverity::INFORMATION,
+        cwtools_validation::ErrorSeverity::Hint => DiagnosticSeverity::HINT,
+    }
+}
+
 pub(crate) fn parse_error_to_diagnostic(e: &ParseError, lines: &DocLines) -> Diagnostic {
     let ParseError::Pos(line, col, msg) = e;
     diagnostic_at(
@@ -454,6 +464,8 @@ pub(crate) fn parse_error_to_diagnostic(e: &ParseError, lines: &DocLines) -> Dia
 /// Convert a `.cwt` rule-config error (parse or structural reference) into an LSP
 /// diagnostic. `RuleParseError.line` is 1-based; `col` is a 0-based character.
 /// Shared by the load-time path (`config.rs`) and the live per-file CWT lint.
+/// A directory-targeted error (an unreadable rules folder) keeps the directory
+/// as its file, so it lands in Problems under the folder rather than vanishing.
 pub(crate) fn rule_parse_error_to_diagnostic(
     err: &cwtools_rules::ruleset_loader::RuleParseError,
     lines: &DocLines,
@@ -464,9 +476,9 @@ pub(crate) fn rule_parse_error_to_diagnostic(
         line,
         col,
         lines,
-        DiagnosticSeverity::ERROR,
+        severity_to_lsp(err.severity),
         "cwtools-rules",
-        None,
+        Some(NumberOrString::String(err.code.to_string())),
         err.message.clone(),
     )
 }
@@ -488,12 +500,7 @@ pub(crate) fn validation_error_to_diagnostic(
 ) -> Diagnostic {
     let line = err.line.saturating_sub(1);
     let col = err.col as u32;
-    let severity = match err.severity {
-        cwtools_validation::ErrorSeverity::Error => DiagnosticSeverity::ERROR,
-        cwtools_validation::ErrorSeverity::Warning => DiagnosticSeverity::WARNING,
-        cwtools_validation::ErrorSeverity::Information => DiagnosticSeverity::INFORMATION,
-        cwtools_validation::ErrorSeverity::Hint => DiagnosticSeverity::HINT,
-    };
+    let severity = severity_to_lsp(err.severity);
     let mut diag = diagnostic_at(
         line,
         col,

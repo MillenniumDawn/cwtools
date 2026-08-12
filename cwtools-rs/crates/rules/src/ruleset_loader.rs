@@ -3,6 +3,9 @@ use crate::post_process::post_process;
 use crate::rules_converter::ast_to_ruleset;
 use crate::rules_converter::{ast_to_ruleset_raw, validate_comment_directives};
 use crate::rules_types::{CwtDefKind, RuleSet};
+use cwtools_error_codes::{
+    CW600_RULES_FILE_UNREADABLE, CW602_RULES_UNEXPANDED_ALIAS, ErrorCode, ErrorSeverity,
+};
 use cwtools_file_manager::file_manager::{ScanBudget, ScanBytes, read_text_capped};
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::StringTable;
@@ -11,36 +14,64 @@ use std::path::Path;
 /// A non-fatal error from loading a `.cwt` rules directory: a file that failed
 /// to read, or whose rules didn't hold up. Carries the source location so the
 /// LSP can publish a diagnostic on the offending file and reveal where the
-/// rules broke.
+/// rules broke, and the catalog code/severity so the CLI can report it as an
+/// ordinary diagnostic and fail CI on it.
 #[derive(Debug, Clone)]
 pub struct RuleParseError {
     pub file: std::path::PathBuf,
     /// 1-based line. `1` for read errors and anything else without a position.
     pub line: u32,
     pub col: u16,
+    /// The catalog id this reports under (`CW600`-`CW603`).
+    pub code: &'static str,
+    pub severity: ErrorSeverity,
     pub message: String,
+}
+
+impl RuleParseError {
+    /// A rules-config problem at `file:line:col`, reported under the `code`
+    /// catalog entry. Use this rather than the fields so a new emit site can't
+    /// invent a code/severity pairing the catalog doesn't have.
+    pub fn new(
+        code: &ErrorCode,
+        file: std::path::PathBuf,
+        line: u32,
+        col: u16,
+        message: String,
+    ) -> Self {
+        Self {
+            file,
+            line,
+            col,
+            code: code.id,
+            severity: code.severity,
+            message,
+        }
+    }
 }
 
 impl std::fmt::Display for RuleParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}:{}:{}: {}",
+            "{}:{}:{}: {}: {}",
             self.file.display(),
             self.line,
             self.col,
+            self.code,
             self.message
         )
     }
 }
 
 fn directory_read_error(dir: &Path, error: std::io::Error) -> RuleParseError {
-    RuleParseError {
-        file: dir.to_path_buf(),
-        line: 1,
-        col: 0,
-        message: format!("read directory error: {error}"),
-    }
+    RuleParseError::new(
+        &CW600_RULES_FILE_UNREADABLE,
+        dir.to_path_buf(),
+        1,
+        0,
+        format!("read directory error: {error}"),
+    )
 }
 
 /// Place an unexpanded `single_alias` reference on its own definition, so the
@@ -56,12 +87,13 @@ fn alias_expansion_error(
         .def_positions
         .iter()
         .find(|p| p.kind == CwtDefKind::SingleAlias && p.name == error.name);
-    RuleParseError {
-        file: position.map_or_else(|| dir.to_path_buf(), |p| p.file.clone()),
-        line: position.map_or(1, |p| p.line),
-        col: position.map_or(0, |p| p.col),
-        message: error.message,
-    }
+    RuleParseError::new(
+        &CW602_RULES_UNEXPANDED_ALIAS,
+        position.map_or_else(|| dir.to_path_buf(), |p| p.file.clone()),
+        position.map_or(1, |p| p.line),
+        position.map_or(0, |p| p.col),
+        error.message,
+    )
 }
 
 /// Recursively collect all `*.cwt` files under `dir`. Symlinks and non-regular
@@ -168,12 +200,13 @@ pub fn load_ruleset_from_dir(
         match read_text_capped(path, budget.max_file_size) {
             Ok((content, n)) => {
                 if !bytes.try_reserve(n, budget.max_bytes) {
-                    errors.push(RuleParseError {
-                        file: path.clone(),
-                        line: 1,
-                        col: 0,
-                        message: "scan byte budget exceeded".to_string(),
-                    });
+                    errors.push(RuleParseError::new(
+                        &CW600_RULES_FILE_UNREADABLE,
+                        path.clone(),
+                        1,
+                        0,
+                        "scan byte budget exceeded".to_string(),
+                    ));
                     continue;
                 }
                 if path
@@ -201,12 +234,13 @@ pub fn load_ruleset_from_dir(
                 }
             }
             Err(e) => {
-                errors.push(RuleParseError {
-                    file: path.clone(),
-                    line: 1,
-                    col: 0,
-                    message: format!("read error: {}", e),
-                });
+                errors.push(RuleParseError::new(
+                    &CW600_RULES_FILE_UNREADABLE,
+                    path.clone(),
+                    1,
+                    0,
+                    format!("read error: {}", e),
+                ));
             }
         }
     }
@@ -308,6 +342,10 @@ mod tests {
             .unwrap_or_else(|| panic!("no cycle diagnostic in {errors:?}"));
         assert!(cycle.file.ends_with("cycle.cwt"), "error: {cycle}");
         assert_eq!(cycle.line, 1, "error: {cycle}");
+        assert_eq!(
+            (cycle.code, cycle.severity),
+            ("CW602", ErrorSeverity::Error)
+        );
     }
 
     /// A `.cwt` file over the per-file cap must be skipped, not read to EOF.

@@ -3,6 +3,7 @@
 use cwtools_driver::{RulesInput, Session, SessionConfig, VanillaCacheAuto};
 use cwtools_game::constants::Game;
 use cwtools_info::vanilla_cache;
+use cwtools_rules::ruleset_loader::RuleParseError;
 use std::collections::BTreeMap;
 
 use crate::cli::FixArgs;
@@ -177,7 +178,7 @@ pub(super) fn run(args: FixArgs) {
                 Some(loc_language)
             },
             case_sensitive_files,
-            on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
+            on_rules_diagnostic: Some(&mut |e: RuleParseError| eprintln!("warn: {}", e)),
         },
         cwtools_driver::default_cache_dir(),
     );

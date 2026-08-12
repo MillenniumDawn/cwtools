@@ -665,4 +665,47 @@ pub const CW239_UNUSED_TYPE: ErrorCode = ErrorCode {
     message_template: "{} of type {} is not used anywhere, but is expected to be",
 };
 
+// ── Rules-config diagnostics (Rust-only) ───────────────
+//
+// Problems in the `.cwt` ruleset itself rather than in the script it checks. F#
+// only ever printed these as text, so there is no ID to converge on. They are
+// emitted by `cwtools_rules` and reported against the `.cwt` file that carries
+// them, so a broken ruleset fails CI instead of degrading every later check in
+// silence.
+
+/// A `.cwt` file or rules directory the loader could not read: a missing or
+/// unreadable path, or a file over the scan budget. The offending path is the
+/// diagnostic's file.
+pub const CW600_RULES_FILE_UNREADABLE: ErrorCode = ErrorCode {
+    id: "CW600",
+    severity: ErrorSeverity::Error,
+    message_template: "Rules file could not be read: {}",
+};
+
+/// A rule naming a type, enum or single_alias that no `.cwt` file defines.
+/// Args are `(kind, name)`.
+pub const CW601_RULES_UNDEFINED_REFERENCE: ErrorCode = ErrorCode {
+    id: "CW601",
+    severity: ErrorSeverity::Error,
+    message_template: "Rule references undefined {} `{}`",
+};
+
+/// A `single_alias_right[...]` the post-processor refused to expand: a
+/// reference cycle, a chain past the depth limit, or the node budget. Reported
+/// on the `single_alias` definition it names. The message is built at the emit
+/// site.
+pub const CW602_RULES_UNEXPANDED_ALIAS: ErrorCode = ErrorCode {
+    id: "CW602",
+    severity: ErrorSeverity::Error,
+    message_template: "{}",
+};
+
+/// A `##` directive whose value the loader can't parse, so the option silently
+/// falls back to its default. The message is built at the emit site.
+pub const CW603_RULES_INVALID_DIRECTIVE: ErrorCode = ErrorCode {
+    id: "CW603",
+    severity: ErrorSeverity::Warning,
+    message_template: "{}",
+};
+
 // error_code_hash deleted: no callers, and it wasn't actually a hash.

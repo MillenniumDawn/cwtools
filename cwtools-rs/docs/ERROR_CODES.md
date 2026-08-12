@@ -1,6 +1,6 @@
 # CWTools Error Codes
 
-Each diagnostic the validator emits carries a `CWxxx` code. The codes mirror the F# cwtools catalog with a few intentional renumberings (see [Reconciliations](#reconciliations) below). They are emitted from `crates/validation` and surfaced through the LSP server as editor diagnostics or printed to stdout by the CLI.
+Each diagnostic the validator emits carries a `CWxxx` code. The codes mirror the F# cwtools catalog with a few intentional renumberings (see [Reconciliations](#reconciliations) below). They are emitted from `crates/validation`, plus the CW600 block from `crates/rules`, and surfaced through the LSP server as editor diagnostics or printed to stdout by the CLI.
 
 ## Severity levels
 
@@ -200,6 +200,19 @@ CW501 (duplicate type) and CW502 (unused type) were Rust-invented IDs that have 
 
 ---
 
+## CW600-CW603 -- Rules config (Rust-only)
+
+Problems in the `.cwt` ruleset itself rather than in the script it checks. Emitted from `crates/rules` as the config loads and reported against the `.cwt` file that carries them, so a broken ruleset surfaces in `cwtools rules`, in a `validate` report and in the editor's Problems panel instead of degrading every later check in silence. F# only ever printed these as text, so there is no ID to converge on.
+
+| ID | Severity | Message | Meaning | Status |
+|---|---|---|---|---|
+| CW600 | Error | Rules file could not be read: {} | A `.cwt` file or rules directory the loader could not read: a missing or unreadable path, an unreadable directory entry, or a file over the scan budget. The offending path is the diagnostic's file, so a directory-targeted one lands on the folder. | Emitted |
+| CW601 | Error | Rule references undefined {} `{}` | A rule names a type, enum or single_alias that no `.cwt` file defines. Resolved after every file is merged, so a cross-file definition counts; alias categories are deliberately out of scope. | Emitted |
+| CW602 | Error | {} | A `single_alias_right[...]` the post-processor refused to expand: a reference cycle, a chain past the depth limit, or the node budget. Reported on the `single_alias` definition it names, which is where the fix goes. | Emitted |
+| CW603 | Warning | {} | A `##` directive whose value the loader can't parse (a malformed `cardinality` bound, an unrecognised `severity`), so the option silently falls back to its default. One rule under-checks; the ruleset still loads. | Emitted |
+
+---
+
 ## Reconciliations
 
 These are intentional ID renumberings documented in `error_codes.rs`. All converge Rust-invented codes onto their F# equivalents so downstream baselines key off a single consistent number.
@@ -245,6 +258,7 @@ hits and Kaiserreich 1, all genuine unset variables.
 ### Rust-only extensions (no F# equivalent)
 
 - **CW500** — an `<type>` reference that resolves to no known instance (the event-specific case is F#'s CW222).
+- **CW600-CW603** — problems in the `.cwt` ruleset itself, which F# only ever printed as text.
 
 CW301 (pre-trigger at event root) was a Rust-invented ID that duplicated F#'s
 CW120 on the same leaf; it has been retired in favour of CW120.

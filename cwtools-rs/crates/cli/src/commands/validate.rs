@@ -3,11 +3,12 @@
 use cwtools_driver::{RulesInput, Session, SessionConfig, VanillaCacheAuto, index_game_dir};
 use cwtools_game::constants::Game;
 use cwtools_info::vanilla_cache;
+use cwtools_rules::ruleset_loader::RuleParseError;
 
 use crate::cli::ValidateArgs;
 use crate::diag::{
     Diag, SourceLines, cli_row, csv_row, is_ignored, json_row, loc_diagnostic_to_diag,
-    severity_rank, validation_to_diag,
+    rule_error_to_diag, severity_rank, validation_to_diag,
 };
 use crate::report::ReportType;
 use crate::run::{
@@ -225,6 +226,11 @@ pub(super) fn run(args: ValidateArgs) {
     // rules, discover/parse mod files, build the type/var/vanilla indexes,
     // expand modifier keys, build the loc index, prebuild the scope
     // registry. The CLI and LSP share this one implementation.
+    //
+    // A broken `.cwt` silently degrades every check below it, so the
+    // ruleset's own problems are collected here and reported as ordinary
+    // diagnostics rather than left on stderr for nobody to read.
+    let mut rule_errors: Vec<RuleParseError> = Vec::new();
     let session = Session::load_with_parse_cache(
         SessionConfig {
             game: game_id,
@@ -241,7 +247,7 @@ pub(super) fn run(args: ValidateArgs) {
                 Some(loc_language)
             },
             case_sensitive_files,
-            on_rules_warning: Some(&mut |w: String| eprintln!("warn: {}", w)),
+            on_rules_diagnostic: Some(&mut |e: RuleParseError| rule_errors.push(e)),
         },
         cwtools_driver::default_cache_dir(),
     );
@@ -319,6 +325,25 @@ pub(super) fn run(args: ValidateArgs) {
     let want_legacy_hash = !ignored.is_empty();
     let mut sources = SourceLines::default();
     let mut diags: Vec<Diag> = Vec::new();
+
+    // The ruleset's own problems lead the report: they explain whatever the
+    // checks below then failed to catch. Hashed against the rules root so a
+    // baseline survives the ruleset being checked out elsewhere, and filtered
+    // by the same code and hash policy as everything else.
+    for err in rule_errors {
+        if !codes::wanted(err.code, &only_codes, &ignore_codes) {
+            continue;
+        }
+        let line_text = sources
+            .trimmed(&err.file.to_string_lossy(), err.line)
+            .to_string();
+        let d = rule_error_to_diag(&rules, err, &line_text, want_legacy_hash);
+        if is_ignored(&ignored, &d) {
+            continue;
+        }
+        diags.push(d);
+    }
+
     for (path, errors) in session.validate_all() {
         let file_str = path.to_str().unwrap_or("");
         for err in errors {
