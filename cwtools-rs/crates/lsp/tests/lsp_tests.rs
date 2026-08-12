@@ -6447,6 +6447,8 @@ fn test_debounced_validate_panic_is_logged_and_next_edit_recovers() {
     // panic before it validates anything. The task joining the debounce handle
     // must log that panic instead of letting it vanish with the handle, and the
     // document must still validate on the next edit (the retry #182 relies on).
+    // The tail of the test pins the converse: an edit superseded inside the
+    // debounce window is aborted, and an abort is not a panic to log.
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     let vanilla = tempfile::tempdir().unwrap();
@@ -6496,6 +6498,29 @@ fn test_debounced_validate_panic_is_logged_and_next_edit_recovers() {
         std::time::Duration::from_millis(1200),
         std::time::Duration::from_secs(8),
     );
+
+    // Two edits back to back, so the first is superseded inside the debounce
+    // window and its task is aborted rather than left to finish. That abort is
+    // the other half of the join's contract: it must not be reported as a
+    // panic, or every keystroke would log one. Nothing else here would notice,
+    // since the abort is invisible in the publishes.
+    for version in [3, 4] {
+        write_frame(
+            &mut child,
+            &jsonrpc_notification(
+                "textDocument/didChange",
+                serde_json::json!({
+                    "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": [{"text": STORM_FILE}]}),
+            ),
+        )
+        .unwrap();
+    }
+    drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
     let log = fetch_profiling_log(&mut child, &rx, 1011);
     child.kill().ok();
 
@@ -6505,6 +6530,11 @@ fn test_debounced_validate_panic_is_logged_and_next_edit_recovers() {
     assert!(
         log.contains("document validation task panicked"),
         "expected the panicking validation to be logged, got: {log}"
+    );
+    assert_eq!(
+        log.matches("document validation task panicked").count(),
+        1,
+        "the superseded edit's abort must not be logged as a panic, got: {log}"
     );
     assert_eq!(
         count_publishes(&after_edit, "a.txt"),
