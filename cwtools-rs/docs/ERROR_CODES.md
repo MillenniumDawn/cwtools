@@ -21,6 +21,11 @@ Each diagnostic the validator emits carries a `CWxxx` code. The codes mirror the
 - **Defined, not wired** -- the const exists but nothing emits it yet. Either it's superseded by a more specific code, or a generic check would need a complete registry to stay false-positive-safe (the project never trades correctness for coverage).
 - **Emitted (escape hatch `CWTOOLS_...`)** -- runs by default; the env var disables it.
 
+Every row carries an anchor of its lowercased code, so `#cw113` lands on CW113
+and keeps working when the headings around it change. The editor's "open
+documentation" link on a diagnostic and the SARIF `helpUri` both point here that
+way.
+
 63 of F#'s 71 codes (after the experimental/dead cleanup) have a Rust
 definition. Codes with no emission site in either engine were removed from
 both; see [Removed](#removed-experimental--dead-deleted-from-both-engines).
@@ -36,7 +41,7 @@ and CW241 by CW262-265.
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW001 | Error | Localisation file parse error: {} | A line in a `.yml` loc file could not be parsed (no `:` separator). The parser recovers and continues; one diagnostic per bad line. Mirrors F# `validateLocalisationSyntax` / `YAMLLocalisationParser` `Failure` path. | Emitted |
+| <a id="cw001"></a>CW001 | Error | Localisation file parse error: {} | A line in a `.yml` loc file could not be parsed (no `:` separator). The parser recovers and continues; one diagnostic per bad line. Mirrors F# `validateLocalisationSyntax` / `YAMLLocalisationParser` `Failure` path. | Emitted |
 
 ---
 
@@ -44,70 +49,70 @@ and CW241 by CW262-265.
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW100 | Warning | Localisation key {} is not defined for {} | A referenced localisation key has no entry for the named language. | Emitted |
-| CW104 | Error | {} trigger used in incorrect scope. In {} but expected {} | A trigger is used in a scope it doesn't accept. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`). Scope tracking handles links/iterators/data-refs/root-scope; a DLC-scope long tail may still surface false positives |
-| CW105 | Error | {} effect used in incorrect scope. In {} but expected {} | An effect is used in the wrong scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
-| CW106 | Error | {} scope command used in incorrect scope. In {} but expected {} | A scope command is used outside its valid scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
-| CW107 | Information | Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick. | An event has no guard against running every tick. | Emitted (reconciled from F# CW107 / formerly Rust CW300) |
-| CW108 | Error | This research_leader is missing required "area" | A `research_leader` block omits the required `area` field. | Emitted (Stellaris only; `research_leader` nested in `common/technology/*.txt`) |
-| CW109 | Information | This research_leader uses area {} but the technology uses area {} | The area in `research_leader` disagrees with the enclosing technology's area. | Emitted (Stellaris only; args leader-then-tech, F# had them swapped) |
-| CW110 | Error | No category found for this technology | A technology definition has no category. | Emitted (Stellaris only; any `common/technology/*.txt` root block) |
-| CW113 | Error | File {} not found, this is case sensitive | A file path referenced in script doesn't exist. Every indexed file (mod and base game, live or cache-restored) is matched by exact on-disk case, so a case-mismatched reference is flagged for case-sensitive filesystems (Linux/Mac). On by default; set `case-sensitive-files = false` in `cwtools.toml` (or pass `--case-sensitive-files false`) for a Windows-authored mod that must tolerate case mismatches. | Emitted (FilepathField refs checked against the mod+vanilla file index; needs base-game data, so a run without `--vanilla` or `--vanilla-cache` stays silent) |
-| CW120 | Information | Trigger {} can be made a pretrigger (see code action to fix) | A trigger that could be promoted to a pretrigger for performance. | Emitted (Stellaris only; per-scope set, event `trigger` and pop-job `possible` blocks) |
-| CW121 | Warning | This 'if' trigger contains no effects | An `if` block contains only a `limit` or nothing at all. | Emitted |
-| CW122 | Information | Localisation key {} should not be quoted when used inline, this can cause unexpected behaviour | A loc key is wrapped in quotes where it is used inline. | Emitted |
+| <a id="cw100"></a>CW100 | Warning | Localisation key {} is not defined for {} | A referenced localisation key has no entry for the named language. | Emitted |
+| <a id="cw104"></a>CW104 | Error | {} trigger used in incorrect scope. In {} but expected {} | A trigger is used in a scope it doesn't accept. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`). Scope tracking handles links/iterators/data-refs/root-scope; a DLC-scope long tail may still surface false positives |
+| <a id="cw105"></a>CW105 | Error | {} effect used in incorrect scope. In {} but expected {} | An effect is used in the wrong scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
+| <a id="cw106"></a>CW106 | Error | {} scope command used in incorrect scope. In {} but expected {} | A scope command is used outside its valid scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
+| <a id="cw107"></a>CW107 | Information | Event is missing mean_time_to_happen, is_triggered_only, fire_only_once, or trigger={always=no}. Performance concern: event may fire every tick. | An event has no guard against running every tick. | Emitted (reconciled from F# CW107 / formerly Rust CW300) |
+| <a id="cw108"></a>CW108 | Error | This research_leader is missing required "area" | A `research_leader` block omits the required `area` field. | Emitted (Stellaris only; `research_leader` nested in `common/technology/*.txt`) |
+| <a id="cw109"></a>CW109 | Information | This research_leader uses area {} but the technology uses area {} | The area in `research_leader` disagrees with the enclosing technology's area. | Emitted (Stellaris only; args leader-then-tech, F# had them swapped) |
+| <a id="cw110"></a>CW110 | Error | No category found for this technology | A technology definition has no category. | Emitted (Stellaris only; any `common/technology/*.txt` root block) |
+| <a id="cw113"></a>CW113 | Error | File {} not found, this is case sensitive | A file path referenced in script doesn't exist. Every indexed file (mod and base game, live or cache-restored) is matched by exact on-disk case, so a case-mismatched reference is flagged for case-sensitive filesystems (Linux/Mac). On by default; set `case-sensitive-files = false` in `cwtools.toml` (or pass `--case-sensitive-files false`) for a Windows-authored mod that must tolerate case mismatches. | Emitted (FilepathField refs checked against the mod+vanilla file index; needs base-game data, so a run without `--vanilla` or `--vanilla-cache` stays silent) |
+| <a id="cw120"></a>CW120 | Information | Trigger {} can be made a pretrigger (see code action to fix) | A trigger that could be promoted to a pretrigger for performance. | Emitted (Stellaris only; per-scope set, event `trigger` and pop-job `possible` blocks) |
+| <a id="cw121"></a>CW121 | Warning | This 'if' trigger contains no effects | An `if` block contains only a `limit` or nothing at all. | Emitted |
+| <a id="cw122"></a>CW122 | Information | Localisation key {} should not be quoted when used inline, this can cause unexpected behaviour | A loc key is wrapped in quotes where it is used inline. | Emitted |
 
 ---
 
-## CW220-CW277 -- Loc references, event targets, bool/syntax hints, rules engine, type system
+## CW220-CW282 -- Loc references, event targets, bool/syntax hints, rules engine, type system
 
 ### CW220-CW222 -- Event targets / event index
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW220 | Error | {} or an event it calls require the event target(s) {} but they are not set by this event or by all possible events leading here | A required event target is never set on any path leading to this event. | Defined, emission pending (event-target dataflow + cross-file event index) |
-| CW221 | Warning | {} or an event it calls require the event target(s) {} but they may not always be set by this event or by all possible events leading here | A required event target is not set on all paths leading to this event. | Defined, emission pending (event-target dataflow + cross-file event index) |
-| CW222 | Warning | The event id {} is not defined | A reference to an event id (`<event>`) that has no definition. | Emitted (relabeled from CW500 for `<event>` type refs) |
+| <a id="cw220"></a>CW220 | Error | {} or an event it calls require the event target(s) {} but they are not set by this event or by all possible events leading here | A required event target is never set on any path leading to this event. | Defined, emission pending (event-target dataflow + cross-file event index) |
+| <a id="cw221"></a>CW221 | Warning | {} or an event it calls require the event target(s) {} but they may not always be set by this event or by all possible events leading here | A required event target is not set on all paths leading to this event. | Defined, emission pending (event-target dataflow + cross-file event index) |
+| <a id="cw222"></a>CW222 | Warning | The event id {} is not defined | A reference to an event id (`<event>`) that has no definition. | Emitted (relabeled from CW500 for `<event>` type refs) |
 
 ### CW223 -- Boolean/syntax structural hints
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW223 | Information | Do not use NOT with multiple children, replace this with either NOR or NAND to avoid ambiguity | `NOT` wraps more than one child, which is ambiguous. | Emitted |
+| <a id="cw223"></a>CW223 | Information | Do not use NOT with multiple children, replace this with either NOR or NAND to avoid ambiguity | `NOT` wraps more than one child, which is ambiguous. | Emitted |
 
 ### CW225-CW226 -- Localisation cross-references
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW225 | Error | Localisation key "{}" references "{}" which doesn't exist in {} | A loc string's `$KEY$` reference points to a key that has no definition. | Emitted |
-| CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). Multi-segment chains like `[THIS.var]` are lenient (scripted variables not indexed). Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted |
+| <a id="cw225"></a>CW225 | Error | Localisation key "{}" references "{}" which doesn't exist in {} | A loc string's `$KEY$` reference points to a key that has no definition. | Emitted |
+| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). Multi-segment chains like `[THIS.var]` are lenient (scripted variables not indexed). Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted |
 
 ### CW227-CW233 -- Section/component/mesh/entity (Stellaris-specific)
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW227 | Error | Section template {} can not be found | A ship design references a section template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500, so it needs `--vanilla` or `--vanilla-cache`; `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` exempt) |
-| CW228 | Error | Section template {} does not have a slot {} | A section template is referenced with a slot name it doesn't define. | Defined, emission pending (vanilla data registries) |
-| CW229 | Error | Component template {} can not be found | A ship design references a component template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500, so it needs `--vanilla` or `--vanilla-cache`) |
-| CW230 | Warning | Component and slot do not match, slot {} has size {} and component {} has size {} | The size of a component doesn't fit the slot it's placed in. | Defined, emission pending (vanilla data registries) |
-| CW231 | Warning | Technology {} is not used | A technology definition is never referenced anywhere. | Emitted (Stellaris only; same reference map as CW239, minus F#'s exemptions: `prereqfor_desc`, `modifier`, `feature_flags`, `weight = 0`, `weight_modifier` factor 0) |
-| CW233 | Error | Entity {} is not defined | A section or other asset references an entity that isn't defined. | Defined, emission pending (vanilla data registries / asset index) |
+| <a id="cw227"></a>CW227 | Error | Section template {} can not be found | A ship design references a section template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500, so it needs `--vanilla` or `--vanilla-cache`; `DEFAULT_COLONIZATION_SECTION`/`DEFAULT_CONSTRUCTION_SECTION` exempt) |
+| <a id="cw228"></a>CW228 | Error | Section template {} does not have a slot {} | A section template is referenced with a slot name it doesn't define. | Defined, emission pending (vanilla data registries) |
+| <a id="cw229"></a>CW229 | Error | Component template {} can not be found | A ship design references a component template that doesn't exist. | Emitted (Stellaris only; walks `ship_design`/`global_ship_design`, gated like CW500, so it needs `--vanilla` or `--vanilla-cache`) |
+| <a id="cw230"></a>CW230 | Warning | Component and slot do not match, slot {} has size {} and component {} has size {} | The size of a component doesn't fit the slot it's placed in. | Defined, emission pending (vanilla data registries) |
+| <a id="cw231"></a>CW231 | Warning | Technology {} is not used | A technology definition is never referenced anywhere. | Emitted (Stellaris only; same reference map as CW239, minus F#'s exemptions: `prereqfor_desc`, `modifier`, `feature_flags`, `weight = 0`, `weight_modifier` factor 0) |
+| <a id="cw233"></a>CW233 | Error | Entity {} is not defined | A section or other asset references an entity that isn't defined. | Defined, emission pending (vanilla data registries / asset index) |
 
 ### CW234-CW238 -- Loc placeholders, zero-modifier, if/else order
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW234 | Information | Localisation key {} is a placeholder for {} | A loc value is `REPLACE_ME` or similar placeholder text. | Emitted |
-| CW235 | Warning | Modifier {} has value 0. Modifiers are additive so likely doesn't do anything | A known modifier is set to `0`, which is a no-op for additive modifiers. | Emitted (fires on confirmed modifier names; rule-matched modifier fields not yet covered) |
-| CW236 | Warning | Nested if/else in effects was deprecated with 2.1 and will be removed in a future release | Stellaris: nested `if/else` in effects, deprecated since 2.1. | Emitted |
-| CW237 | Information | 2.1 changed nested if = { if else } behaviour in effects. Check this still works as expected | Stellaris: ambiguous nested `if = { if else }` after 2.1 behaviour change. | Emitted |
-| CW238 | Error | An else/else_if is missing a preceding if | An `else` or `else_if` block has no antecedent, either as a preceding sibling (`if = {…} else = {…}`, Stellaris 2.1+) or as the enclosing `if`/`else_if` it nests inside (HOI4 and pre-2.1 Stellaris). | Emitted (cross-game, both chain spellings; CW236/CW237 remain Stellaris-only) |
+| <a id="cw234"></a>CW234 | Information | Localisation key {} is a placeholder for {} | A loc value is `REPLACE_ME` or similar placeholder text. | Emitted |
+| <a id="cw235"></a>CW235 | Warning | Modifier {} has value 0. Modifiers are additive so likely doesn't do anything | A known modifier is set to `0`, which is a no-op for additive modifiers. | Emitted (fires on confirmed modifier names; rule-matched modifier fields not yet covered) |
+| <a id="cw236"></a>CW236 | Warning | Nested if/else in effects was deprecated with 2.1 and will be removed in a future release | Stellaris: nested `if/else` in effects, deprecated since 2.1. | Emitted |
+| <a id="cw237"></a>CW237 | Information | 2.1 changed nested if = { if else } behaviour in effects. Check this still works as expected | Stellaris: ambiguous nested `if = { if else }` after 2.1 behaviour change. | Emitted |
+| <a id="cw238"></a>CW238 | Error | An else/else_if is missing a preceding if | An `else` or `else_if` block has no antecedent, either as a preceding sibling (`if = {…} else = {…}`, Stellaris 2.1+) or as the enclosing `if`/`else_if` it nests inside (HOI4 and pre-2.1 Stellaris). | Emitted (cross-game, both chain spellings; CW236/CW237 remain Stellaris-only) |
 
 ### CW239 -- Unused type
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW239 | Warning | {} of type {} is not used anywhere, but is expected to be | A `should_be_referenced` type instance is never referenced in any other file. | Emitted (reconciled from Rust CW502) |
+| <a id="cw239"></a>CW239 | Warning | {} of type {} is not used anywhere, but is expected to be | A `should_be_referenced` type instance is never referenced in any other file. | Emitted (reconciled from Rust CW502) |
 
 Both CW239 and CW231 answer a project-wide question, so they run once at the end
 of a batch run instead of per file: the rule engine records every `<type>`
@@ -129,66 +134,59 @@ These are the core rules-engine codes. Severity and message text are computed pe
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW240 | Error | {} | A value didn't match its rule's field type (int/float/enum/bool/date, etc.). | Emitted |
-| CW242 | Warning | {} | A field appears too few or too many times (cardinality violation). | Emitted |
-| CW243 | Error | Target "{}" has incorrect scope. Is {} but expect {} | A scope target resolves to a scope the field doesn't expect. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
-| CW244 | Error | {} is not a target. Expected a target in scope(s) {} | A value is not a valid target in any of the expected scopes. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
-| CW245 | Error | Error in target. Link {} was used in scope {} but expected {} | A scope link inside a target chain was used in the wrong scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
-| CW246 | Warning | The variable {} has not been set | A referenced variable hasn't been assigned anywhere the engine can see. | Emitted (escape hatch `CWTOOLS_NO_VAR_CHECKS=1`) |
-| CW247 | Error | Trigger/Effect/Modifier {} used in wrong scope. In {} but expect {} | A trigger, effect, or modifier rule was used in the wrong scope. | Emitted |
-| CW248 | Error | Invalid scope command {} | A scope command is not valid here. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
+| <a id="cw240"></a>CW240 | Error | {} | A value didn't match its rule's field type (int/float/enum/bool/date, etc.). | Emitted |
+| <a id="cw242"></a>CW242 | Warning | {} | A field appears too few or too many times (cardinality violation). | Emitted |
+| <a id="cw243"></a>CW243 | Error | Target "{}" has incorrect scope. Is {} but expect {} | A scope target resolves to a scope the field doesn't expect. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
+| <a id="cw244"></a>CW244 | Error | {} is not a target. Expected a target in scope(s) {} | A value is not a valid target in any of the expected scopes. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
+| <a id="cw245"></a>CW245 | Error | Error in target. Link {} was used in scope {} but expected {} | A scope link inside a target chain was used in the wrong scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
+| <a id="cw246"></a>CW246 | Warning | The variable {} has not been set | A referenced variable hasn't been assigned anywhere the engine can see. | Emitted (escape hatch `CWTOOLS_NO_VAR_CHECKS=1`) |
+| <a id="cw247"></a>CW247 | Error | Trigger/Effect/Modifier {} used in wrong scope. In {} but expect {} | A trigger, effect, or modifier rule was used in the wrong scope. | Emitted |
+| <a id="cw248"></a>CW248 | Error | Invalid scope command {} | A scope command is not valid here. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
 
-### CW250-CW253 -- Game-specific: planet_killer, boolean, flag, set_name
+### CW250-CW253, CW280-CW282 -- Game-specific and cleanup hints
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW250 | Error | {} | A planet-killer component template lacks its support script. | Emitted (Stellaris only; needs a matching `on_destroy_planet_with_<key>` on_action and `can_destroy_planet_with_<key>` scripted trigger; gated like CW500, so it needs `--vanilla` or `--vanilla-cache`) |
-| CW251 | Warning | This {} is unnecessary | A boolean operator (`AND`/`OR`) is nested directly inside an identical operator. | Emitted |
-| CW253 | Information | Consider using "set_name" instead for consistency | `set_empire_name` or `set_planet_name` should be replaced with `set_name`. | Emitted |
-| CW280 | Information | {} = { always = ... } matches the default and can be removed | HOI4 cleanup hint: a field whose body is exactly `{ always = <bool> }` matching the field's default (e.g. `allowed_civil_war = { always = no }`) is a no-op and can be deleted. Rust-original (no F# equivalent); field/default table in `per_game::hoi4`. | Emitted |
-| CW281 | Warning | This 'limit' contains no triggers | A `limit = { }` block with no conditions. An empty limit matches everything, so it is almost always forgotten conditions or dead weight. Rust-original (no F# equivalent); emitted from `per_game::structural`. | Emitted |
-| CW282 | Information | This is the default value ({}) and can be omitted | A bool field explicitly set to the engine default declared by the rule's `## default_bool` directive, so the line is redundant. Rust-original (no F# equivalent); emitted from `rule_core::children`. | Emitted |
+| <a id="cw250"></a>CW250 | Error | {} | A planet-killer component template lacks its support script. | Emitted (Stellaris only; needs a matching `on_destroy_planet_with_<key>` on_action and `can_destroy_planet_with_<key>` scripted trigger; gated like CW500, so it needs `--vanilla` or `--vanilla-cache`) |
+| <a id="cw251"></a>CW251 | Warning | This {} is unnecessary | A boolean operator (`AND`/`OR`) is nested directly inside an identical operator. | Emitted |
+| <a id="cw253"></a>CW253 | Information | Consider using "set_name" instead for consistency | `set_empire_name` or `set_planet_name` should be replaced with `set_name`. | Emitted |
+| <a id="cw280"></a>CW280 | Information | {} = { always = ... } matches the default and can be removed | HOI4 cleanup hint: a field whose body is exactly `{ always = <bool> }` matching the field's default (e.g. `allowed_civil_war = { always = no }`) is a no-op and can be deleted. Rust-original (no F# equivalent); field/default table in `per_game::hoi4`. | Emitted |
+| <a id="cw281"></a>CW281 | Warning | This 'limit' contains no triggers | A `limit = { }` block with no conditions. An empty limit matches everything, so it is almost always forgotten conditions or dead weight. Rust-original (no F# equivalent); emitted from `per_game::structural`. | Emitted |
+| <a id="cw282"></a>CW282 | Information | This is the default value ({}) and can be omitted | A bool field explicitly set to the engine default declared by the rule's `## default_bool` directive, so the line is redundant. Rust-original (no F# equivalent); emitted from `rule_core::children`. | Emitted |
 
 ### CW254-CW268 -- Localisation file headers and content
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW254 | Error | Localisation files must be UTF-8 BOM, this file is not | A `.yml` loc file is not encoded as UTF-8 with BOM. | Emitted |
-| CW255 | Error | Localisation file name should contain (and ideally end with) "l_language.yml" | A loc file name contains no recognisable `l_xxx` language tag. | Emitted |
-| CW256 | Error | Localisation file should start with "l_language:" on the first line (or a comment) | A loc file's first content line is not a language header. | Emitted |
-| CW257 | Error | Localisation file's name has language {} doesn't match the header language {} | The language in the file name and the `l_xxx:` header disagree. | Emitted |
-| CW258 | Information | Localisation file name should end with "l_language.yml" | Language tag is present but not at the end of the file name. F# defines this but leaves emission commented out as "only convention"; cwtools-rs matches that -- const defined, never fired. | Retired / not emitted |
-| CW259 | Error | This localisation string refers to itself | A loc key's value includes a `$KEY$` reference back to the same key. | Emitted |
-| CW260 | Error | Loc command {} used in wrong scope. In {} but expected {} | A loc command is used in a data scope that doesn't support it. | Emitted |
-| CW261 | Error | Key {} of type {} is defined multiple times | A `unique` type key appears more than once as a root key in the same file. Detection is per-file, not project-wide: the same key duplicated across two files is not flagged. | Emitted (reconciled from Rust CW501) |
-| CW262 | Error | {} | An unexpected `key = { ... }` node where the rule doesn't allow one. Also fires on a bad key inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
-| CW263 | Error | {} | An unexpected `key = value` leaf where the rule doesn't allow one. Also fires on a mis-typed operator inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
-| CW264 | Warning | {} | An unexpected bare value where the rule doesn't allow one. | Emitted |
-| CW265 | Warning | {} | An unexpected `{ ... }` value clause where the rule doesn't allow one. | Emitted |
-| CW266 | Error | Localisation key {} uses command {} which does not exist in data type {}. | A loc command is not valid in the resolved data type for that scope. | Emitted (reconciled from Rust CW262) |
-| CW267 | Error | Expected a {} value, got {} | An alias key/value didn't match the expected alias category. | Emitted |
-| CW268 | Warning | Localisation key {} doesn't start and end with double quotes | A loc value is missing its enclosing double-quote delimiters. | Emitted |
+| <a id="cw254"></a>CW254 | Error | Localisation files must be UTF-8 BOM, this file is not | A `.yml` loc file is not encoded as UTF-8 with BOM. | Emitted |
+| <a id="cw255"></a>CW255 | Error | Localisation file name should contain (and ideally end with) "l_language.yml" | A loc file name contains no recognisable `l_xxx` language tag. | Emitted |
+| <a id="cw256"></a>CW256 | Error | Localisation file should start with "l_language:" on the first line (or a comment) | A loc file's first content line is not a language header. | Emitted |
+| <a id="cw257"></a>CW257 | Error | Localisation file's name has language {} doesn't match the header language {} | The language in the file name and the `l_xxx:` header disagree. | Emitted |
+| <a id="cw258"></a>CW258 | Information | Localisation file name should end with "l_language.yml" | Language tag is present but not at the end of the file name. F# defines this but leaves emission commented out as "only convention"; cwtools-rs matches that -- const defined, never fired. | Retired / not emitted |
+| <a id="cw259"></a>CW259 | Error | This localisation string refers to itself | A loc key's value includes a `$KEY$` reference back to the same key. | Emitted |
+| <a id="cw260"></a>CW260 | Error | Loc command {} used in wrong scope. In {} but expected {} | A loc command is used in a data scope that doesn't support it. | Emitted |
+| <a id="cw261"></a>CW261 | Error | Key {} of type {} is defined multiple times | A `unique` type key appears more than once as a root key in the same file. Detection is per-file, not project-wide: the same key duplicated across two files is not flagged. | Emitted (reconciled from Rust CW501) |
+| <a id="cw262"></a>CW262 | Error | {} | An unexpected `key = { ... }` node where the rule doesn't allow one. Also fires on a bad key inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
+| <a id="cw263"></a>CW263 | Error | {} | An unexpected `key = value` leaf where the rule doesn't allow one. Also fires on a mis-typed operator inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
+| <a id="cw264"></a>CW264 | Warning | {} | An unexpected bare value where the rule doesn't allow one. | Emitted |
+| <a id="cw265"></a>CW265 | Warning | {} | An unexpected `{ ... }` value clause where the rule doesn't allow one. | Emitted |
+| <a id="cw266"></a>CW266 | Error | Localisation key {} uses command {} which does not exist in data type {}. | A loc command is not valid in the resolved data type for that scope. | Emitted (reconciled from Rust CW262) |
+| <a id="cw267"></a>CW267 | Error | Expected a {} value, got {} | An alias key/value didn't match the expected alias category. | Emitted |
+| <a id="cw268"></a>CW268 | Warning | Localisation key {} doesn't start and end with double quotes | A loc value is missing its enclosing double-quote delimiters. | Emitted |
 
 ### CW269-CW277 -- Optimisation, precision, custom errors, inline scripts, invalid chars, key validation
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW269 | Hint | Optimise by merging this with {} by using {} | Two lists could be merged for a minor script optimisation. | Defined, emission pending (vanilla data registries) |
-| CW270 | Warning | Value too small, only 3 decimal places are supported in this context | A numeric value has more decimal places than the engine supports here. | Emitted (32-bit `variable_field` with >3 decimal places) |
-| CW271 | Warning | Expected an integer | A field that requires an integer received a float or non-numeric value. | Emitted (`int_variable_field` given a fractional value) |
-| CW272 | Error | {} | A custom message attached to a rule via `## error_if_only_match = ...`, raised when that overload is the only one a key matches. `## severity` on the same rule overrides Error. | Emitted |
-| CW273 | Warning | Modifier type {} is not defined but is used | A modifier's type reference points to a modifier-type that isn't defined. | Defined, emission pending (modifier-type registry) |
-| CW274 | Error | This usage of inline_script results in an error, see related | An `inline_script` call resolves to content that itself fails validation. | Defined, not wired (inline-script expansion does not propagate child errors yet) |
-| CW275 | Warning | Localisation value for {} contains unexpected characters, and may not render correctly | A loc value contains characters outside the expected set for that game. | Emitted |
-| CW276 | Warning | Localisation key {} contains invalid characters (spaces or special characters are not allowed) | A loc key contains a space or character not valid in a loc key (only alphanumeric, `_`, `.`, `-` are allowed). Rust-only (no F# equivalent). | Emitted |
-| CW277 | Warning | Validation stopped after reaching the alias branch limit | A file's recursive alias overloads exceeded the validator's per-file branch budget. Other diagnostics from that file, and project-wide unused-definition diagnostics from the run, may be incomplete. Rust-only (no F# equivalent). | Emitted |
-
----
-
-## CW400 -- Scope diagnostics (Rust-only)
-
-| ID | Severity | Message | Meaning | Status |
-|---|---|---|---|---|
+| <a id="cw269"></a>CW269 | Hint | Optimise by merging this with {} by using {} | Two lists could be merged for a minor script optimisation. | Defined, emission pending (vanilla data registries) |
+| <a id="cw270"></a>CW270 | Warning | Value too small, only 3 decimal places are supported in this context | A numeric value has more decimal places than the engine supports here. | Emitted (32-bit `variable_field` with >3 decimal places) |
+| <a id="cw271"></a>CW271 | Warning | Expected an integer | A field that requires an integer received a float or non-numeric value. | Emitted (`int_variable_field` given a fractional value) |
+| <a id="cw272"></a>CW272 | Error | {} | A custom message attached to a rule via `## error_if_only_match = ...`, raised when that overload is the only one a key matches. `## severity` on the same rule overrides Error. | Emitted |
+| <a id="cw273"></a>CW273 | Warning | Modifier type {} is not defined but is used | A modifier's type reference points to a modifier-type that isn't defined. | Defined, emission pending (modifier-type registry) |
+| <a id="cw274"></a>CW274 | Error | This usage of inline_script results in an error, see related | An `inline_script` call resolves to content that itself fails validation. | Defined, not wired (inline-script expansion does not propagate child errors yet) |
+| <a id="cw275"></a>CW275 | Warning | Localisation value for {} contains unexpected characters, and may not render correctly | A loc value contains characters outside the expected set for that game. | Emitted |
+| <a id="cw276"></a>CW276 | Warning | Localisation key {} contains invalid characters (spaces or special characters are not allowed) | A loc key contains a space or character not valid in a loc key (only alphanumeric, `_`, `.`, `-` are allowed). Rust-only (no F# equivalent). | Emitted |
+| <a id="cw277"></a>CW277 | Warning | Validation stopped after reaching the alias branch limit | A file's recursive alias overloads exceeded the validator's per-file branch budget. Other diagnostics from that file, and project-wide unused-definition diagnostics from the run, may be incomplete. Rust-only (no F# equivalent). | Emitted |
 
 ---
 
@@ -196,7 +194,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| CW500 | Error | Type '{}' not found | A type name referenced in rules or script has no definition. No F# equivalent. | Emitted (needs base-game data: the check only runs once the type index is complete, which means `--vanilla` or `--vanilla-cache`) |
+| <a id="cw500"></a>CW500 | Error | Type '{}' not found | A type name referenced in rules or script has no definition. No F# equivalent. | Emitted (needs base-game data: the check only runs once the type index is complete, which means `--vanilla` or `--vanilla-cache`) |
 
 CW501 (duplicate type) and CW502 (unused type) were Rust-invented IDs that have been retired in favour of their F# equivalents CW261 and CW239 respectively.
 

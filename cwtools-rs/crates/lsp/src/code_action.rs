@@ -1345,6 +1345,7 @@ mod tests {
             code: Some("CW253"),
             fix: Some(fix),
             end: Some((1, 17)),
+            related: Vec::new(),
         };
         let lines = crate::validate::DocLines::new(text, PositionEncodingKind::UTF16);
         let diag = crate::validate::validation_error_to_diagnostic(&err, &lines);

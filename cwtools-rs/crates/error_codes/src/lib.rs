@@ -22,6 +22,27 @@ pub struct ErrorCode {
     pub message_template: &'static str,
 }
 
+/// The published error-code reference, which every diagnostic links back to.
+pub const DOC_URL: &str =
+    "https://github.com/MillenniumDawn/cwtools/blob/main/cwtools-rs/docs/ERROR_CODES.md";
+
+/// Link straight to `id`'s row in the error-code reference, for a reader who
+/// wants the long form of what a `CWxxx` means.
+///
+/// The anchor is the lowercased id; `docs/ERROR_CODES.md` carries one
+/// `<a id="cw###">` target per row, so the fragment survives edits to the
+/// section headings around it.
+///
+/// # Examples
+///
+/// ```
+/// let url = cwtools_error_codes::doc_url("CW113");
+/// assert!(url.ends_with("ERROR_CODES.md#cw113"));
+/// ```
+pub fn doc_url(id: &str) -> String {
+    format!("{DOC_URL}#{}", id.to_ascii_lowercase())
+}
+
 impl ErrorCode {
     /// Substitute each `{}` placeholder in the template with the next param,
     /// in order (positional, like `format!`). Extra `{}` are left as-is.

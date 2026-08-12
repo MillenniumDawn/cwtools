@@ -2,7 +2,7 @@
 //! validation submodules.
 
 use cwtools_game::scope_engine::ScopeContext;
-use cwtools_parser::ast::{Child, Leaf, ParsedFile, SourcePos, Value};
+use cwtools_parser::ast::{Child, Leaf, ParsedFile, SourcePos, SourceRange, Value};
 use cwtools_parser::fix::SuggestedFix;
 use cwtools_rules::rules_types::*;
 use cwtools_string_table::string_table::{StringTable, StringTokens};
@@ -41,6 +41,26 @@ pub struct ValidationError {
     /// hashes and renders identically with or without one. The LSP publishes a
     /// precise squiggle when set, and falls back to the whole line when `None`.
     pub end: Option<(u32, u16)>,
+    /// Secondary spans the message is about: the `if` an `else` is missing, the
+    /// spelling a path is indexed under. Empty for most codes. Pure metadata
+    /// like `fix` and `end` (the report/hash path never reads it); the LSP
+    /// publishes them as `relatedInformation`.
+    pub related: Vec<RelatedSpan>,
+}
+
+/// A secondary span attached to a diagnostic, always in the same file as the
+/// diagnostic it hangs off. Use it where the message names something the reader
+/// has to go and look at; the `message` says what that place is, so it reads on
+/// its own in the editor's related-information list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelatedSpan {
+    pub message: String,
+    /// 1-based line, matching [`ValidationError::line`].
+    pub line: u32,
+    /// 0-based column, matching [`ValidationError::col`].
+    pub col: u16,
+    /// Exclusive end of the span, in the same convention as the start.
+    pub end: (u32, u16),
 }
 
 impl ValidationError {
@@ -63,6 +83,7 @@ impl ValidationError {
             code: Some(code.id),
             fix: None,
             end: None,
+            related: Vec::new(),
         }
     }
 
@@ -87,6 +108,7 @@ impl ValidationError {
             code: Some(code.id),
             fix: None,
             end: None,
+            related: Vec::new(),
         }
     }
 
@@ -105,6 +127,20 @@ impl ValidationError {
     /// Left unset (whole-line squiggle) where no clean range is in hand.
     pub(crate) fn with_end(mut self, end: SourcePos) -> Self {
         self.end = Some((end.line, end.col));
+        self
+    }
+
+    /// Point at a second place in the same file that the reader needs to see to
+    /// make sense of the message (the `if` a stray `else` is missing, the case
+    /// a path is actually indexed under). Chains like [`with_end`](Self::with_end);
+    /// `range` follows the same convention (`leaf.pos` / `key_token_range(…)`).
+    pub(crate) fn with_related(mut self, message: impl Into<String>, range: SourceRange) -> Self {
+        self.related.push(RelatedSpan {
+            message: message.into(),
+            line: range.start.line,
+            col: range.start.col,
+            end: (range.end.line, range.end.col),
+        });
         self
     }
 }

@@ -15,6 +15,7 @@ struct Keys {
     set_empire_name: StringId,
     set_planet_name: StringId,
     if_: StringId,
+    else_: StringId,
     else_if: StringId,
     ship_design: StringId,
     global_ship_design: StringId,
@@ -29,6 +30,7 @@ impl Keys {
             set_empire_name: table.intern("set_empire_name").lower,
             set_planet_name: table.intern("set_planet_name").lower,
             if_: table.intern("if").lower,
+            else_: table.intern("else").lower,
             else_if: table.intern("else_if").lower,
             ship_design: table.intern("ship_design").lower,
             global_ship_design: table.intern("global_ship_design").lower,
@@ -200,16 +202,26 @@ fn walk_if_else(
 
             // CW237 — ambiguous if = { if ... else }.
             if key == kw.if_ && has_else && has_if {
-                errors.push(
-                    ValidationError::from_code(
-                        &error_codes::CW237_AMBIGUOUS_IF_ELSE,
-                        file_path,
-                        line,
-                        col,
-                        &[],
-                    )
-                    .with_end(key_end),
-                );
+                // 2.1 changed which `if` the nested `else` binds to, so the
+                // `else` is the branch to go and read. A non-block `else` has
+                // no span to point at, and the diagnostic keeps just its own.
+                let else_range = block_children
+                    .iter()
+                    .filter_map(|c| as_block(c, ast))
+                    .find(|b| b.key_lower == kw.else_)
+                    .map(|b| key_token_range(b.range.start, key_len(table, b.key_lower)));
+                let mut err = ValidationError::from_code(
+                    &error_codes::CW237_AMBIGUOUS_IF_ELSE,
+                    file_path,
+                    line,
+                    col,
+                    &[],
+                )
+                .with_end(key_end);
+                if let Some(range) = else_range {
+                    err = err.with_related("this else changed which if it binds to", range);
+                }
+                errors.push(err);
             }
         }
     });
@@ -975,6 +987,34 @@ mod tests {
             "foo = { if = { limit = { } if = { a = 1 } else = { b = 2 } } }\n",
         );
         assert!(has_code(&c, "CW237"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn cw237_relates_the_nested_else() {
+        let table = StringTable::new();
+        let ast = parse_string(
+            "foo = {\n    if = {\n        if = { a = 1 }\n        else = { b = 2 }\n    }\n}\n",
+            &table,
+        );
+        let mut errors = Vec::new();
+        validate_stellaris(
+            &ast,
+            &RuleSet::new(),
+            &table,
+            &EVENTS.into(),
+            None,
+            &mut errors,
+        );
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW237"))
+            .expect("CW237 emitted");
+
+        let related = &err.related;
+        assert_eq!(related.len(), 1, "got: {related:?}");
+        assert_eq!((related[0].line, related[0].col), (4, 8));
+        assert_eq!(related[0].end, (4, 8 + "else".len() as u16));
     }
 
     // ── Technology (CW110) ────────────────────────────────────────────────

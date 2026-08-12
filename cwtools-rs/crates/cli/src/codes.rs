@@ -196,6 +196,27 @@ mod tests {
         );
     }
 
+    /// Every diagnostic links to `docs/ERROR_CODES.md#cw###`, so a code with no
+    /// anchor there lands the reader at the top of the file instead of on its
+    /// row. Checked against the doc itself, not a second list to keep in step.
+    #[test]
+    fn every_code_has_a_documentation_anchor() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/ERROR_CODES.md"),
+        )
+        .expect("the error-code reference is checked in beside the crates");
+
+        let missing: Vec<&str> = CATALOG
+            .iter()
+            .map(|(_, c)| c.id)
+            .filter(|id| !doc.contains(&format!("<a id=\"{}\">", id.to_ascii_lowercase())))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/ERROR_CODES.md needs an <a id=\"cw###\"> anchor for: {missing:?}"
+        );
+    }
+
     #[test]
     fn ids_are_unique() {
         let mut ids: Vec<&str> = CATALOG.iter().map(|(_, c)| c.id).collect();
