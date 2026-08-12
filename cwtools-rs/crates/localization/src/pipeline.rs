@@ -589,6 +589,54 @@ mod tests {
         assert!(validate_loc_project(&svc).iter().all(|d| d.code != "CW254"));
     }
 
+    /// The four tests above hand the encoding over ready-made, so none of them
+    /// covers the sniff that produces it. This one writes the real `EF BB BF`
+    /// (and leaves it off) and takes the files through the walk-read-detect
+    /// path the CLI's `loc` command uses, which is the only way CW254 fires.
+    #[test]
+    fn a_real_bom_on_disk_decides_cw254() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = tmp.path().join("localisation");
+        std::fs::create_dir_all(&loc).unwrap();
+        let body = "l_english:\n key1: \"hi\"\n";
+
+        let mut bommed = vec![0xEF, 0xBB, 0xBF];
+        bommed.extend_from_slice(body.as_bytes());
+        std::fs::write(loc.join("bom_l_english.yml"), &bommed).unwrap();
+        std::fs::write(loc.join("nobom_l_english.yml"), body).unwrap();
+
+        let svc = LocService::from_folder(tmp.path(), cwtools_file_manager::ScanBudget::default());
+        assert_eq!(svc.files().len(), 2, "errors: {:?}", svc.errors());
+        let flagged: Vec<String> = validate_loc_project(&svc)
+            .into_iter()
+            .filter(|d| d.code == "CW254")
+            .map(|d| d.file.replace('\\', "/"))
+            .collect();
+        assert_eq!(flagged.len(), 1, "got: {flagged:?}");
+        assert!(
+            flagged[0].ends_with("nobom_l_english.yml"),
+            "only the BOM-less file may be flagged, got: {flagged:?}"
+        );
+    }
+
+    /// The BOM has to survive the read as a BOM and not as three characters of
+    /// the language header: a file that only just parses (`l_english:` on the
+    /// first line, right after the marker) must still resolve its language,
+    /// else it would collect CW255/CW256 instead of nothing.
+    #[test]
+    fn a_real_bom_does_not_leak_into_the_language_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = tmp.path().join("localisation");
+        std::fs::create_dir_all(&loc).unwrap();
+        let mut bommed = vec![0xEF, 0xBB, 0xBF];
+        bommed.extend_from_slice(b"l_english:\n key1: \"hi\"\n");
+        std::fs::write(loc.join("bom_l_english.yml"), &bommed).unwrap();
+
+        let svc = LocService::from_folder(tmp.path(), cwtools_file_manager::ScanBudget::default());
+        let codes: Vec<&str> = validate_loc_project(&svc).iter().map(|d| d.code).collect();
+        assert!(codes.is_empty(), "a well-formed loc file: {codes:?}");
+    }
+
     #[test]
     fn malformed_line_emits_cw001_and_rest_parses() {
         // A line with no ':' separator triggers CW001 at the recovery point.

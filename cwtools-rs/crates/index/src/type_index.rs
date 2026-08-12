@@ -164,6 +164,22 @@ impl FileIndex {
         })
     }
 
+    /// The on-disk spelling of `path`, for a reference that names an indexed
+    /// file but writes its case differently. `None` when the reference already
+    /// matches, when nothing of that name is indexed, or on a case-insensitive
+    /// run (which records no original case). Answers "then what is it called?"
+    /// for a case-mismatch CW113.
+    pub fn on_disk_case(&self, path: &str) -> Option<&str> {
+        let norm: String = path
+            .trim()
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        let orig = self.files_exact.get(&norm.to_ascii_lowercase())?;
+        (orig.as_str() != norm).then_some(orig.as_str())
+    }
+
     /// Add relative paths (the vanilla-cache restore path), each carrying its
     /// on-disk case. Lowercased into the case-insensitive set always; recorded
     /// into the exact-case map only while `case_sensitive` is set, so the
@@ -733,6 +749,23 @@ mod tests {
             "case mismatch must be flagged in case-sensitive mode"
         );
         assert!(idx.contains("gfx/interface/x.dds"));
+    }
+
+    #[test]
+    fn file_index_reports_the_on_disk_case_of_a_mismatch() {
+        let mut idx = FileIndex::new();
+        idx.set_case_sensitive(true);
+        idx.add_paths(vec!["gfx/interface/x.dds".to_string()]);
+        assert_eq!(
+            idx.on_disk_case("GFX/interface/X.dds"),
+            Some("gfx/interface/x.dds")
+        );
+        assert_eq!(
+            idx.on_disk_case("gfx/interface/x.dds"),
+            None,
+            "a reference that already matches has nothing to report"
+        );
+        assert_eq!(idx.on_disk_case("gfx/interface/missing.dds"), None);
     }
 
     #[test]

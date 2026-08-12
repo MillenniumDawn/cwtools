@@ -22,11 +22,11 @@ Then, roughly bottom-up:
 - `parser`: Paradox script text to an arena AST (on `string_table`).
 - `file_manager`: file discovery + parse orchestration (which dirs/files to walk,
   the exclude globs; on `parser`, `string_table`).
-- `cache`: rkyv+zstd on-disk AST cache (`.cwb`) (on `parser`, `string_table`).
+- `cache`: rkyv+zstd on-disk AST cache (`.cwb`) (on `parser`, `string_table`, `rules`).
 - `rules`: `.cwt` rule loading, giving a `RuleSet` of types/aliases/enums and
-  scope/link inputs (on `game`, `parser`, `string_table`, `error_codes`).
+  scope/link inputs (on `game`, `parser`, `string_table`, `error_codes`, `file_manager`).
 - `localization`: `.yml` loc parsing, `LocService`/`LocIndex`, loc reference and
-  scope validation (on `error_codes`, `game`, `file_manager`).
+  scope validation (on `error_codes`, `game`, `file_manager`, `parser`).
 - `index`: `TypeIndex`/`VarIndex`/`FileIndex` + value-set/complex-enum collection
   + the vanilla cache payload (on `parser`, `file_manager`, `string_table`, `rules`, `cache`).
 - `validation`: the rule engine and per-game validators; emits `ValidationError`s
@@ -97,8 +97,9 @@ fixed outside the editor clears.
 
 The loop is idle-gated. Each cycle re-reads the effective interval, sleeps it out,
 then waits for the user to go idle before running (`should_run_background_pass`:
-the initial index is ready, no scan already running, and at least 15s since the
-last activity). `mark_activity` resets that idle clock on edits, completion, hover,
+the initial index is ready, no scan already running, and at least
+`backgroundReindexIdleSeconds` (default 15s) since the last activity).
+`mark_activity` resets that idle clock on edits, completion, hover,
 and navigation, so a background pass never competes with a request the user is
 waiting on. The re-entrancy guard (`scan_in_progress`) means a background pass and a
 foreground scan can't overlap; the loser skips.
@@ -117,7 +118,7 @@ interval and idle window for tests.
 Generic rule validation runs first (the `.cwt` engine in `validation/src/rule_core`).
 Then `run_game_validators` (`validation/src/per_game/mod.rs`) adds:
 
-- `common` checks (unique types, warning-only downgrades),
+- `common` checks (duplicate `unique` type keys, CW261),
 - cross-game `structural` hints (empty `if`/`limit`, `NOT` misuse, redundant booleans), then
 - a dispatch on `Game`: `stellaris` (full validators), `hoi4` (cleanup hints),
   and `_ =>` common-only for every other game, EU4 included.
@@ -174,12 +175,14 @@ There is no central registry to update. Three edits:
 The four largest areas are directory modules, each a thin `mod`/`lib` over focused files:
 
 - `validation/src/rule_core/`: the `.cwt` rule engine (`matching`, `children`,
-  `leaf`, `alias`, `subtype_merge`, `mod`). The biggest of the four.
+  `leaf`, `alias`, `subtype_merge`, `suggest`, `mod`). The biggest of the four.
 - `game/src/scope_engine/`: `engine` (`ScopeId`/`ScopeContext`/transitions) vs
   `links` (per-game hardcoded link tables), over `mod`.
 - `lsp/src/completion/`: `builders` (item construction), `snippets`, `scope_names`,
-  `resolve` (lazy `completionItem/resolve`: documentation and detail filled in for
-  the one item the editor focuses, kept out of the initial list), over `mod`.
+  `cwt` (completion inside the rules files themselves), `loc_keys` (the
+  prefix-searchable view of the loc-key union), `resolve` (lazy
+  `completionItem/resolve`: documentation and detail filled in for the one item
+  the editor focuses, kept out of the initial list), over `mod`.
 - `index/src/`: `type_index`, `path_match`, `collect`, `variables`, `dynamic_values`,
   `vanilla_cache`, behind a thin `lib.rs` that re-exports the public surface.
 
@@ -228,4 +231,4 @@ and stream results) but is not planned. The in-memory maps are cheap enough to r
 
 ## Build and profiling
 
-See `BUILD.md` for build instructions and `PROFILING.md` for build/runtime profiling.
+See `BUILD.md` for build instructions and `PROFILING.md` for runtime profiling.

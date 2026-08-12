@@ -715,6 +715,7 @@ impl SessionWithFiles {
                             code: None,
                             fix: None,
                             end: None,
+                            related: Vec::new(),
                         }],
                         UsedInstances::default(),
                     )
@@ -741,6 +742,7 @@ impl SessionWithFiles {
                                 code: None,
                                 fix: None,
                                 end: None,
+                                related: Vec::new(),
                             }],
                             UsedInstances::default(),
                         );
@@ -827,6 +829,7 @@ fn parse_errors_to_validation(
             code: None,
             fix: None,
             end: None,
+            related: Vec::new(),
         })
         .collect()
 }

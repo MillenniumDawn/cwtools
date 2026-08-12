@@ -152,7 +152,7 @@ pub enum PatternKind {
 ///
 /// An alias name like `modifier:production_speed_<building>_factor` or
 /// `effect:set_country_flag_value[country_flag]` is split once into its
-/// structural parts so the per-call `alias_pattern_matches` can skip the
+/// structural parts so the per-call `parsed_pattern_matches` can skip the
 /// string scanning.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedAliasPattern {

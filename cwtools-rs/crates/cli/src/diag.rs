@@ -118,7 +118,7 @@ pub(crate) fn json_escape(s: &str) -> String {
 
 /// One rendered diagnostic row for the `validate` report. Reads only
 /// file/severity/code/message/line/hash — never a diagnostic's `fix`, so a
-/// `SuggestedFix` payload is inert here (locked in by `fix_payload_is_inert`).
+/// `SuggestedFix` payload is inert here (locked in by `fix_payload_is_inert_in_report`).
 pub(crate) struct Diag {
     pub(crate) file: cwtools_validation::FilePath,
     pub(crate) severity: cwtools_validation::ErrorSeverity,
@@ -335,6 +335,7 @@ mod tests {
             code: Some("CW282"),
             fix: None,
             end: None,
+            related: Vec::new(),
         }
     }
 

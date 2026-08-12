@@ -143,8 +143,6 @@ pub(crate) fn github_row(d: &Diag, base: &Path) -> String {
 
 const SARIF_SCHEMA: &str = "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json";
 const INFORMATION_URI: &str = "https://github.com/MillenniumDawn/cwtools";
-const HELP_URI: &str =
-    "https://github.com/MillenniumDawn/cwtools/blob/main/cwtools-rs/docs/ERROR_CODES.md";
 
 fn sarif_level(s: ErrorSeverity) -> &'static str {
     match s {
@@ -284,7 +282,7 @@ fn sarif_rule((const_name, code): &(&str, ErrorCode), last: bool) -> String {
         s(&codes::rule_name(const_name)),
         s(&description),
         s(sarif_level(code.severity)),
-        s(HELP_URI),
+        s(&cwtools_error_codes::doc_url(code.id)),
         if last { "" } else { "," }
     )
 }

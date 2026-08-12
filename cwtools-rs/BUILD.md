@@ -74,7 +74,7 @@ The workspace uses `lto = "thin"` (not fat), `codegen-units = 1`, and
 `strip = true`. Thin LTO parallelizes well and links much faster than fat LTO,
 especially on Windows where MSVC `link.exe` is the bottleneck.
 
-See `PROFILING.md` for build profiling and runtime tracing.
+See `PROFILING.md` for runtime tracing.
 
 ## Platform notes
 
