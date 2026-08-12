@@ -624,8 +624,8 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
     /// branches evaluated to produce them.
     fn branches_for(depth: usize) -> (Vec<ValidationError>, usize) {
         let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(RECURSIVE_RULES, &table).unwrap(), &table);
-        let parsed = parse_string(&recursive_script(depth), &table).unwrap();
+        let ruleset = ast_to_ruleset(&parse_string(RECURSIVE_RULES, &table), &table);
+        let parsed = parse_string(&recursive_script(depth), &table);
         let registry = build_scope_registry_arc(&ruleset, None);
         let prepared = Prepared {
             ruleset: &ruleset,

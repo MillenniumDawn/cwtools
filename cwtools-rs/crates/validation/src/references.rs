@@ -604,8 +604,8 @@ alias[effect:uses] = <thing>
             user.push_str("}\n");
         }
         let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(MEMOIZED_ALIAS_RULES, &table).unwrap(), &table);
-        let parsed = parse_string(&user, &table).unwrap();
+        let ruleset = ast_to_ruleset(&parse_string(MEMOIZED_ALIAS_RULES, &table), &table);
+        let parsed = parse_string(&user, &table);
         let errors = crate::validate_ast(
             &parsed,
             &ruleset,
