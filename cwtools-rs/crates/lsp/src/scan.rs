@@ -1532,6 +1532,11 @@ impl Backend {
         // complete, re-run them so those stale diagnostics clear on their own.
         self.revalidate_all_open_docs(crate::ValidateTrigger::Reindex)
             .await;
+        // Type index changed globally; semantic tokens cached under the old
+        // ruleset are stale and would patch incorrectly via delta. Invalidate
+        // and ask the client to re-request visible files (#184).
+        self.invalidate_all_semantic_tokens();
+        self.request_semantic_refresh().await;
         // The status bar is cleared by the `validate_entire_workspace` wrapper on
         // return, so every exit path (this one and the early returns above) clears
         // it uniformly.
@@ -2413,6 +2418,10 @@ impl Backend {
                 self.revalidate_open_dependents("", generation, Some(&queued))
                     .await;
             }
+            // Bulk index change (watched batch) may affect rule-driven token
+            // upgrades for visible files; refresh client tokens.
+            self.invalidate_all_semantic_tokens();
+            self.request_semantic_refresh().await;
         }
         // Clear our slot before the final check so a producer that queued an
         // event while we ran can arm the next window (or we do it here). Setting
