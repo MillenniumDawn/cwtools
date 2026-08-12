@@ -1,4 +1,4 @@
-//! Tier S/G scope emissions (gated behind CWTOOLS_SCOPE_CHECKS):
+//! Tier S/G scope emissions (on by default; `CWTOOLS_NO_SCOPE_CHECKS=1` disables):
 //! - CW235 zero-modifier (a known modifier set to 0)
 //! - CW247 rule-wrong-scope (reconciled from the Rust-invented CW400)
 //! - CW104 trigger-wrong-scope (alias scope check)
