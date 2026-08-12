@@ -396,6 +396,18 @@ mod tests {
     }
 
     #[test]
+    fn jomini_parse_error_display() {
+        assert_eq!(
+            JominiParseError::UnclosedParen.to_string(),
+            "unclosed parenthesis in Jomini function"
+        );
+        // The error is produced by an unterminated '(' chain; parse_bracket
+        // then falls back to a plain Command so the value still parses.
+        let elems = parse_loc_elements("[Scope.GetName(]");
+        assert_eq!(elems, vec![LocElement::Command("Scope.GetName(")]);
+    }
+
+    #[test]
     fn test_jomini_lone_quote_param() {
         // `[GetName(')]` — a single `'` satisfies both starts_with and ends_with,
         // so stripping "the quotes" sliced [1..0] and panicked the process.

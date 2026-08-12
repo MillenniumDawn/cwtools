@@ -566,6 +566,41 @@ mod tests {
         assert_eq!(sources.trimmed(path, 1), "first");
     }
 
+    #[test]
+    fn json_row_escapes_special_characters_via_serde() {
+        let root = Path::new(".");
+        let mut err = err_base();
+        err.message = "say \"hi\"\\bye\n\r\t\u{0001}end".to_string();
+        err.file = "a/b\"c.txt".into();
+        let d = validation_to_diag(root, err, "x", false);
+        let row = json_row(&d, true);
+        // Must be valid JSON and round-trip.
+        let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(v["message"], "say \"hi\"\\bye\n\r\t\u{0001}end");
+        assert_eq!(v["file"], "a/b\"c.txt");
+        // Raw bytes must not contain a literal newline inside the string value.
+        assert!(row.contains("\\n"));
+        assert!(row.contains("\\r"));
+        assert!(row.contains("\\t"));
+        assert!(row.contains("\\\""));
+        assert!(row.contains("\\\\"));
+    }
+
+    #[test]
+    fn json_report_rows_form_a_valid_json_array() {
+        let root = Path::new(".");
+        let d0 = validation_to_diag(root, err_base(), "x", false);
+        let mut e1 = err_base();
+        e1.message = "other".to_string();
+        let d1 = validation_to_diag(root, e1, "y", false);
+        let mut out = String::from("[\n");
+        out.push_str(&json_row(&d0, false));
+        out.push_str(&json_row(&d1, true));
+        out.push_str("]\n");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+    }
+
     // Inertness guard (Task 8/18, step 2): a fix payload AND an end position must
     // not change the report. The `Diag` mapping and every report row read neither —
     // locked in here so populating the emit sites keeps validate output byte-identical.

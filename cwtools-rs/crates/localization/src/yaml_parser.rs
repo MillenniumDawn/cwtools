@@ -633,6 +633,45 @@ mod tests {
         assert!(parse_loc_text("", "test.yml").is_err());
     }
 
+    #[test]
+    fn loc_file_parse_error_empty_file_variant_and_display() {
+        let err = parse_loc_text("", "test.yml").unwrap_err();
+        assert_eq!(err, LocFileParseError::EmptyFile);
+        assert_eq!(err.to_string(), "empty file after stripping comments");
+        // Empty file also when only comments / blanks precede EOF.
+        let err2 = parse_loc_text("# just a comment\n\n", "test.yml").unwrap_err();
+        assert_eq!(err2, LocFileParseError::EmptyFile);
+    }
+
+    #[test]
+    fn loc_file_parse_error_missing_colon_variant_and_display() {
+        let err = parse_loc_text("l_english\n key:0 \"v\"\n", "test.yml").unwrap_err();
+        match &err {
+            LocFileParseError::MissingColon { header } => assert_eq!(header, "l_english"),
+            other => panic!("expected MissingColon, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "missing ':' in language header: \"l_english\""
+        );
+    }
+
+    #[test]
+    fn loc_file_parse_error_propagates_through_service_boundary() {
+        // Service maps the typed error to String via Display; downstream
+        // LocService.errors and CLI diagnostics still see the same text.
+        let err = crate::service::parse_loc_files("bad.yml", "no colon here\n", None).unwrap_err();
+        assert!(matches!(err, LocFileParseError::MissingColon { .. }));
+        assert!(err.to_string().contains("missing ':'"));
+        let svc = crate::service::LocService::from_files(vec![(
+            "bad.yml".to_string(),
+            "no colon here\n".to_string(),
+        )]);
+        assert_eq!(svc.files().len(), 0);
+        assert!(!svc.errors().is_empty());
+        assert!(svc.errors()[0].1.contains("missing ':'"));
+    }
+
     // ---- UTF-8 BOM tests ---------------------------------------------------
 
     #[test]
