@@ -44,7 +44,7 @@ static REINDEX_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
 /// True when `name` is set to a truthy value (`1`, `true`, `yes`, `on`) — same
 /// convention as `cwtools_profiling::profile_enabled`, so `VAR=0` or an empty
 /// value (a shell habit for "unset") doesn't accidentally arm a test hook.
-fn env_flag(name: &str) -> bool {
+pub(crate) fn env_flag(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")

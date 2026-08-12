@@ -6442,6 +6442,78 @@ fn test_watched_batch_panic_is_recovered_and_retried() {
 }
 
 #[test]
+fn test_debounced_validate_panic_is_logged_and_next_edit_recovers() {
+    // #182: CWTOOLS_VALIDATE_PANIC_ONCE makes the FIRST debounced validation
+    // panic before it validates anything. The task joining the debounce handle
+    // must log that panic instead of letting it vanish with the handle, and the
+    // document must still validate on the next edit (the retry #182 relies on).
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server_env(
+        ws.path(),
+        rules_dir.path(),
+        vanilla.path(),
+        &[("CWTOOLS_VALIDATE_PANIC_ONCE", "1")],
+    );
+    let uri = write_disk_file(ws.path(), "common/decisions/a.txt", STORM_FILE);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{
+                "uri": uri, "languageId": "hoi4", "version": 1, "text": STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+    let after_open = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    assert_eq!(
+        count_publishes(&after_open, "a.txt"),
+        0,
+        "the panicking open validation should not have published"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": {"uri": uri, "version": 2},
+                "contentChanges": [{"text": STORM_FILE}]}),
+        ),
+    )
+    .unwrap();
+    let after_edit = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1011);
+    child.kill().ok();
+
+    // Pin the precondition: without this the test passes just as well on a
+    // build where the injection never fired, since a validation that simply
+    // published late satisfies everything else here.
+    assert!(
+        log.contains("document validation task panicked"),
+        "expected the panicking validation to be logged, got: {log}"
+    );
+    assert_eq!(
+        count_publishes(&after_edit, "a.txt"),
+        1,
+        "the next edit should still validate and publish once"
+    );
+}
+
+#[test]
 fn test_watched_distinct_files_each_validate_once() {
     // A burst of distinct non-open files in one window: each validates exactly
     // once, all after a single coalescing window.
@@ -11126,6 +11198,7 @@ thing = { x = scalar }
 /// which also means a file the scan never validated shows up as a missing
 /// entry when the bar goes off, instead of blocking on a frame that never
 /// arrives.
+#[cfg(unix)]
 fn scan_diag_paths(
     reader: &mut BufReader<std::process::ChildStdout>,
     rel_paths: &[&str],
