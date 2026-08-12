@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 /// The kind of a loc-entry validation error.
 ///
 /// Carries the structured data needed to build a diagnostic with the correct
-/// F# numeric code (see `pipeline::map_loc_error`). The language is supplied by
+/// F# numeric code (see `pipeline::loc_error_code_severity`). The language is supplied by
 /// the caller (it comes from the file being validated), not stored here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocErrorKind {

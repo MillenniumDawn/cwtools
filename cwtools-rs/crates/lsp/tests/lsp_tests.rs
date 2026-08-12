@@ -11887,6 +11887,203 @@ fn test_execute_command_reports_progress_against_the_client_token() {
     );
 }
 
+/// #228: two commands in flight at once each keep their own `$/progress`
+/// stream. `cacheVanilla` doesn't take the scan flag, so it can begin while a
+/// `reindexWorkspace` scan is still running; the scan's later phases have to
+/// stay on the re-index token instead of following whichever command began
+/// last and then falling back to the server's stream when that one ends.
+#[test]
+fn test_concurrent_commands_keep_separate_progress_streams() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    // Explicit and empty, so `cacheVanilla` re-indexes nothing instead of
+    // whatever real game install auto-discovery finds on the host.
+    let vanilla_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("editor_rules.cwt"), EDITOR_RULES).unwrap();
+    let p = ws.path().join("common/national_focus/tree.txt");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "my_focus = {\n    id = my_focus\n}\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        // Holds every scan at its first phase, so the re-index is reliably
+        // still running when the second command opens and closes its stream —
+        // rather than racing a workspace big enough to take a measurable time.
+        .env("CWTOOLS_SCAN_HOLD_MS", "5000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": { "window": { "workDoneProgress": true } },
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla_dir.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // As in the token tests above, everything runs inside the deadline closure
+    // because answering `window/workDoneProgress/create` is what lets the
+    // startup scan finish.
+    let stdin = child.stdin.take().unwrap();
+    let collected = run_with_deadline(stdin, reader, 180, |stdin, reader| {
+        // Every `$/progress` frame as `(token, kind)`, in arrival order — the
+        // interleaving is the thing under test.
+        let mut events: Vec<(String, String)> = Vec::new();
+        let mut reindex_result: Option<serde_json::Value> = None;
+        let mut reindex_closed = false;
+        // Same scan-guard race as the tests above: the bar-off notification
+        // precedes the flag release, so a command sent on it can lose the CAS.
+        // Retry until one actually re-indexes, each attempt on its own ids and
+        // tokens so the frames stay attributable.
+        let mut attempt = 0i64;
+        let mut reindex_token = String::new();
+        let mut vanilla_token = String::new();
+        let send_reindex = |stdin: &mut std::process::ChildStdin, attempt: i64| -> String {
+            let token = format!("cwtools/command/228/reindex/{attempt}");
+            write_frame_to(
+                stdin,
+                &jsonrpc_request(
+                    100 + attempt,
+                    "workspace/executeCommand",
+                    serde_json::json!({
+                        "command": "reindexWorkspace",
+                        "arguments": [],
+                        "workDoneToken": token,
+                    }),
+                ),
+            )
+            .unwrap();
+            token
+        };
+        for _ in 0..20_000 {
+            let Ok(raw) = read_frame(reader) else { break };
+            if raw.is_empty() {
+                break; // EOF
+            }
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if v["id"] == serde_json::json!(100 + attempt) && v.get("result").is_some() {
+                if v["result"] == serde_json::json!("Re-index already in progress.") {
+                    attempt += 1;
+                    events.clear();
+                    vanilla_token.clear();
+                    reindex_closed = false;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    reindex_token = send_reindex(stdin, attempt);
+                    continue;
+                }
+                // Recorded rather than returned: the response and the `end` are
+                // merged onto one output with no ordering between them, so
+                // either can land first.
+                reindex_result = Some(v["result"].clone());
+                if reindex_closed {
+                    break;
+                }
+                continue;
+            }
+            match v["method"].as_str() {
+                Some("window/workDoneProgress/create") => write_frame_to(
+                    stdin,
+                    &serde_json::json!({ "jsonrpc": "2.0", "id": v["id"], "result": null })
+                        .to_string(),
+                )
+                .unwrap(),
+                Some("$/progress") => {
+                    let token = v["params"]["token"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let kind = v["params"]["value"]["kind"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    // The re-index owns the workspace and is held at its first
+                    // phase; start the overlapping command now.
+                    if token == reindex_token && kind == "begin" && vanilla_token.is_empty() {
+                        vanilla_token = format!("cwtools/command/228/vanilla/{attempt}");
+                        write_frame_to(
+                            stdin,
+                            &jsonrpc_request(
+                                200 + attempt,
+                                "workspace/executeCommand",
+                                serde_json::json!({
+                                    "command": "cacheVanilla",
+                                    "arguments": [],
+                                    "workDoneToken": vanilla_token,
+                                }),
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    reindex_closed |= token == reindex_token && kind == "end";
+                    events.push((token, kind));
+                    if reindex_closed && reindex_result.is_some() {
+                        break;
+                    }
+                }
+                // The startup scan is done; run the command it was blocking.
+                Some("loadingBar")
+                    if reindex_token.is_empty()
+                        && v["params"]["enable"] == serde_json::Value::Bool(false) =>
+                {
+                    reindex_token = send_reindex(stdin, attempt);
+                }
+                _ => {}
+            }
+        }
+        (events, reindex_token, vanilla_token, reindex_result)
+    });
+    child.kill().ok();
+
+    let (events, reindex_token, vanilla_token, reindex_result) =
+        collected.expect("timed out waiting for the commands to finish");
+    assert_eq!(
+        reindex_result.and_then(|r| r.as_str().map(str::to_string)),
+        Some("Workspace re-indexed.".to_string())
+    );
+    assert!(
+        !vanilla_token.is_empty(),
+        "the overlapping command was never sent: {events:?}"
+    );
+    let vanilla_end = events
+        .iter()
+        .position(|(token, kind)| token == &vanilla_token && kind == "end")
+        .unwrap_or_else(|| panic!("the second command never closed its stream: {events:?}"));
+    // The bug: the second command's `begin` took the indicator, so the first
+    // command's remaining phases reported against the second token and then,
+    // once that one ended, against the server's `cwtools/scan` stream instead.
+    assert!(
+        events[vanilla_end + 1..]
+            .iter()
+            .any(|(token, kind)| token == &reindex_token && kind == "report"),
+        "the re-index's later phases must stay on its own token: {events:?}"
+    );
+    let mine: Vec<&str> = events
+        .iter()
+        .filter(|(token, _)| token == &reindex_token)
+        .map(|(_, kind)| kind.as_str())
+        .collect();
+    assert_eq!(mine.first(), Some(&"begin"), "{events:?}");
+    assert_eq!(mine.last(), Some(&"end"), "{events:?}");
+}
+
 /// #145: the Cancel button. `window/workDoneProgress/cancel` is a notification,
 /// so the server handles it while the scan is still running — unlike
 /// `$/cancelRequest`, which tower-lsp answers by dropping the handler and which

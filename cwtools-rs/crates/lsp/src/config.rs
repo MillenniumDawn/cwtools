@@ -1239,7 +1239,8 @@ impl Backend {
         // it off. The guard covers both exits: the normal one below, and
         // the client cancelling the command mid-index (#204).
         let guard = crate::scan::ScanGuard::for_command(self);
-        self.ensure_vanilla_index(true, false).await;
+        self.ensure_vanilla_index(Some(&progress), true, false)
+            .await;
         self.merge_pending_vanilla_index();
         self.rebuild_modifier_keys();
         guard.finish().await;
