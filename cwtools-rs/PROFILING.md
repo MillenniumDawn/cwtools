@@ -18,7 +18,10 @@ default and turns on when either of these is set, so normal runs stay quiet:
   client never drains the server's stderr, so under `CWTOOLS_PROFILE` the output
   is routed to a bounded in-memory ring buffer (4 MB, oldest bytes dropped)
   instead of stderr; the client fetches it with the export-profiling-log command.
-  On the CLI it is the easy "just show me timings" switch.
+  The buffer routing applies to every binary and only the LSP drains it, so on
+  the CLI `CWTOOLS_PROFILE` gets you the `[profile]` RSS report and no span
+  timings. For CLI timings use `RUST_LOG` and leave `CWTOOLS_PROFILE` unset;
+  setting both still buffers.
 
 ## Run a profiled validate
 
