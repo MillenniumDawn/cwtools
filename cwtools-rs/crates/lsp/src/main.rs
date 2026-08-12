@@ -976,6 +976,12 @@ struct Backend {
 /// to skip the per-keystroke re-parse that made large files lag.
 const DEBOUNCE_MS: u64 = 250;
 
+/// Test-only one-shot panic switch for `CWTOOLS_VALIDATE_PANIC_ONCE` (#182),
+/// the debounced-validation counterpart of the scan-side switches. Fires at
+/// most once per server process so the e2e suite can prove a panicking
+/// validation is logged without arming every later edit.
+static VALIDATE_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
+
 // ── Custom notification stubs ─────────────────────────────────────────────────
 
 // NOT PORTED — pre-trigger refactor.
@@ -995,6 +1001,12 @@ impl Backend {
     /// version-checked snapshot inside `debounced_validate`, so a newer edit
     /// landing in the gap supersedes this one instead of publishing stale
     /// results.
+    ///
+    /// The task that joins the handle logs a panic instead of dropping it with
+    /// the handle (#182); the next edit is the retry. This site keeps its own
+    /// join rather than `scan::spawn_logging_panics` because it needs the
+    /// `AbortHandle` and must not report an ordinary supersede/close abort as
+    /// a panic.
     fn spawn_debounced_validate(
         &self,
         uri: String,
@@ -1012,6 +1024,11 @@ impl Backend {
         let handle = tokio::spawn(async move {
             if start_rx.await.is_err() {
                 return;
+            }
+            if crate::scan::env_flag("CWTOOLS_VALIDATE_PANIC_ONCE")
+                && VALIDATE_PANIC_ONCE.swap(false, Ordering::SeqCst)
+            {
+                panic!("CWTOOLS_VALIDATE_PANIC_ONCE: injected panic for #182 test coverage");
             }
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
