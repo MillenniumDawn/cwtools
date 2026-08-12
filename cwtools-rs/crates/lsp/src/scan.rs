@@ -683,15 +683,7 @@ impl Backend {
             self.send_loading_bar_pct(true, Phase::Discover.label(), Some(0))
                 .await;
         }
-        // `CWTOOLS_SCAN_HOLD_MS` test override: hold the scan open (after the
-        // loading bar, which doubles as the scan-started signal) so the tests
-        // can overlap it with watched-file batches deterministically.
-        if let Some(ms) = std::env::var("CWTOOLS_SCAN_HOLD_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
+        hold_scan_for_tests().await;
 
         let workspace_uri = self.state.config.read().workspace_uri.clone();
 
@@ -2641,6 +2633,30 @@ where
             tracing::error!("{context} panicked: {e}");
             false
         }
+    }
+}
+
+/// Hold an in-flight scan open when a test asks for it, from just after the
+/// loading bar so the scan-started signal is already out. `CWTOOLS_SCAN_HOLD_MS`
+/// holds for a fixed span, which is enough when a test only needs the scan busy
+/// while it sends something. `CWTOOLS_SCAN_HOLD_FILE` names a path and holds for
+/// as long as it exists, so a test that also cares *when* the hold ends starts
+/// and ends it on a signal it owns rather than betting on a wall-clock window
+/// that parallel load can blow through (#198). Unset, which is every real run,
+/// both are no-ops.
+async fn hold_scan_for_tests() {
+    if let Some(ms) = std::env::var("CWTOOLS_SCAN_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+    let Ok(gate) = std::env::var("CWTOOLS_SCAN_HOLD_FILE") else {
+        return;
+    };
+    let gate = std::path::PathBuf::from(gate);
+    while tokio::fs::try_exists(&gate).await.unwrap_or(false) {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 

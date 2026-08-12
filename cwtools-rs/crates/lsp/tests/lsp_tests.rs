@@ -3381,8 +3381,9 @@ fn is_scan_started(v: &serde_json::Value) -> bool {
 /// [`spawn_frame_collector`] channel. `what` names the scan awaited, so a
 /// failure says which one never started.
 ///
-/// `CWTOOLS_SCAN_HOLD_MS` sleeps the scan open *after* this signal fires (see
-/// `scan::validate_entire_workspace_inner`), so the wait for the started signal
+/// `CWTOOLS_SCAN_HOLD_MS` (and `CWTOOLS_SCAN_HOLD_FILE`, which holds while the
+/// named path exists) holds the scan open *after* this signal fires (see
+/// `scan::hold_scan_for_tests`), so the wait for the started signal
 /// is a measure of server command-processing latency under load, not of the
 /// hold. Size `budget` to that latency (a generous fixed value), not to the
 /// hold magnitude: the hold cannot expire before the signal it follows, so a
@@ -12744,27 +12745,34 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     let vanilla = tempfile::tempdir().unwrap();
+    let signals = tempfile::tempdir().unwrap();
     std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
 
-    // The reload's 1s deadline expires while the competing scan still holds
-    // the guard (5s hold), so it must answer queued — and then the deferred
-    // retry must run a revalidation once the scan releases.
+    // This test cares about both ends of the hold: the reload's 1s deadline has
+    // to expire inside it, and the deferred retry has to run once it releases.
+    // A fixed hold makes both a bet on wall-clock that parallel load can lose,
+    // so the competing scan holds while `gate` exists and this test moves the
+    // gate itself (#198). The file lives outside the workspace so creating it
+    // isn't a watched-file change.
+    let gate = signals.path().join("scan-hold");
+    let gate_env = gate.to_string_lossy().into_owned();
     let (mut child, reader) = storm_server_env(
         ws.path(),
         rules_dir.path(),
         vanilla.path(),
         &[
-            ("CWTOOLS_SCAN_HOLD_MS", "5000"),
+            ("CWTOOLS_SCAN_HOLD_FILE", gate_env.as_str()),
             ("CWTOOLS_RETRY_DEADLINE_MS", "1000"),
         ],
     );
     let rx = spawn_frame_collector(reader);
 
-    // Start a competing scan and wait for the scan-started signal, so the
-    // hold is definitely active for the reload's whole deadline.
+    // Arm the hold (the startup scan is already done, so it isn't caught by
+    // it), then start the competing scan that trips it.
+    std::fs::write(&gate, "").unwrap();
     reindex_until_scan_starts(&mut child, &rx);
 
-    // The give-up response arrives ~1s in, well before the 5s hold releases.
+    // The give-up response arrives ~1s in, with the scan still held.
     write_frame(
         &mut child,
         &jsonrpc_request(
@@ -12777,7 +12785,7 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
     let (response, _) = wait_for_response_watching_scans(
         &rx,
         901,
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(30),
         "reloadrulesconfig to give up on its 1s deadline",
     );
     let msg = response["result"].as_str().expect("string result");
@@ -12786,10 +12794,9 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
         "the reload must report the queued revalidation: {msg}"
     );
 
-    // The deferred retry wins the CAS once the 5s hold releases and runs a
-    // full revalidation (a bar-on after the response). The budget only has to
-    // outlast the rest of the hold plus a 500ms retry poll; keep it well clear
-    // of that, since waiting longer cannot change what the test observes.
+    // Release the hold. The deferred retry then wins the CAS and runs a full
+    // revalidation, a bar-on that can only come after the response.
+    std::fs::remove_file(&gate).unwrap();
     wait_for_scan_started(
         &rx,
         std::time::Duration::from_secs(30),
