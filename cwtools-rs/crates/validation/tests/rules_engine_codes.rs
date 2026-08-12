@@ -186,6 +186,118 @@ fn cw263_close_match_attaches_did_you_mean_fix() {
     );
 }
 
+const ENUM_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { historic fantasy sandbox } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_enum_close_match_attaches_did_you_mean_fix() {
+    use cwtools_parser::fix::apply_edits;
+    let script = "foo = {\n    mode = histroic  # typo\n}\n";
+    let (table, ruleset, errors) = validate_pair(ENUM_RULES, script);
+
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+    assert_eq!(fix.title, "Did you mean 'historic'?");
+
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, "foo = {\n    mode = \"historic\"  # typo\n}\n");
+
+    let ast2 = parse_string(&fixed, &table).unwrap();
+    let errors2 = validate_ast(&ast2, &ruleset, &table, "test.txt", None, None, None);
+    assert!(
+        !errors2.iter().any(|e| e.code == Some("CW240")),
+        "CW240 must be gone after applying the fix"
+    );
+}
+
+#[test]
+fn cw240_quoted_enum_value_replaces_the_quotes_too() {
+    use cwtools_parser::fix::apply_edits;
+
+    let script = "foo = { mode = \"histroic\" }";
+    let (_table, _ruleset, errors) = validate_pair(ENUM_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+
+    assert_eq!(
+        apply_edits(script, &fix.edits),
+        "foo = { mode = \"historic\" }"
+    );
+}
+
+const SPACED_ENUM_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { "historic mode" fantasy sandbox } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_spaced_enum_value_keeps_its_quotes() {
+    use cwtools_parser::fix::apply_edits;
+
+    let script = "foo = { mode = \"histroic mode\" }";
+    let (_table, _ruleset, errors) = validate_pair(SPACED_ENUM_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+
+    assert_eq!(
+        apply_edits(script, &fix.edits),
+        "foo = { mode = \"historic mode\" }"
+    );
+}
+
+const BOOLEAN_ENUM_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { yes fantasy sandbox } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_boolean_enum_suggestion_stays_a_string() {
+    use cwtools_parser::fix::apply_edits;
+
+    let script = "foo = { mode = yess }";
+    let (_table, _ruleset, errors) = validate_pair(BOOLEAN_ENUM_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+
+    assert_eq!(apply_edits(script, &fix.edits), "foo = { mode = \"yes\" }");
+}
+
+const ENUM_TIE_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { dark dusk } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_enum_ambiguous_match_has_no_fix() {
+    let (_t, _r, errors) = validate_pair(ENUM_TIE_RULES, "foo = { mode = dask }");
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    assert!(
+        err.fix.is_none(),
+        "ambiguous suggestion must not carry a fix"
+    );
+}
+
 const NODE_RULES: &str = r#"
 types = { type[foo] = { path = "game/common/foo" } }
 foo = {

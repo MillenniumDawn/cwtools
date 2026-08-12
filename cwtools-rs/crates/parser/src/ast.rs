@@ -77,6 +77,7 @@ pub struct Leaf {
     pub value: Value,
     pub op: Operator,
     pub pos: SourceRange,
+    pub value_pos: SourceRange,
 }
 
 pub struct LeafValue {

@@ -29,7 +29,8 @@ use cwtools_string_table::string_table::StringTable;
 /// v4: workspace scans discard comments before caching because only open-document
 /// semantic-token parsing needs them.
 /// v5: recovered parse errors are persisted with the AST.
-const CACHE_VERSION: u32 = 5;
+/// v6: Leaf records the exact value range.
+const CACHE_VERSION: u32 = 6;
 
 /// Whether platform metadata provides a reliable no-read change stamp.
 pub const PATH_METADATA_CACHE_SUPPORTED: bool = cfg!(unix);

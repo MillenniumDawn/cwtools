@@ -150,14 +150,13 @@ fn check_loc_key(
     if is_inline {
         // F# four-way logic for inline loc keys.
         match (was_quoted, exists) {
-            (true, true) => {
-                // No fix attached: the fix would replace the quoted value with the
-                // bare `key_raw`, but the AST `Leaf` stores a single `pos` covering
-                // key→value and never the value's own start column, and `pos.end`
-                // absorbs trailing whitespace (a QString leaf's end lands on the
-                // next line). The value's exact span can't be derived here without
-                // re-lexing, so we skip rather than approximate.
+            (true, true) if cwtools_parser::parser::is_bare_string_value(key_raw) => {
                 let code = &error_codes::CW122_LOC_KEY_IN_INLINE;
+                let fix = cwtools_parser::fix::SuggestedFix::replace(
+                    "Remove unnecessary quotes",
+                    leaf.value_pos,
+                    key_raw,
+                );
                 errors.push(
                     ValidationError::from_code(
                         code,
@@ -166,10 +165,11 @@ fn check_loc_key(
                         leaf.pos.start.col,
                         &[key_raw],
                     )
+                    .with_fix(fix)
                     .with_end(leaf.pos.end),
                 );
             }
-            (true, false) => {} // quoted + missing → skip (lenient, matches F#)
+            (true, _) => {} // Quoted values that cannot be safely unquoted stay quoted.
             (false, true) => {} // unquoted + exists → ok
             (false, false) => push_missing(errors, "any language"),
         }

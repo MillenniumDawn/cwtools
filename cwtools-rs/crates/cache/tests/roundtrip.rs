@@ -34,6 +34,9 @@ nested = {
     assert_eq!(arena2.leaf_values.len(), parsed.arena.leaf_values.len());
     assert_eq!(arena2.comments.len(), parsed.arena.comments.len());
     assert_eq!(root2.len(), parsed.root_children.len());
+    for (actual, expected) in arena2.leaves.iter().zip(&parsed.arena.leaves) {
+        assert_eq!(actual.value_pos, expected.value_pos);
+    }
 }
 
 #[test]

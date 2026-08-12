@@ -72,10 +72,38 @@ fn unsynced_missing_key_warns_cw100() {
 
 #[test]
 fn inline_quoted_existing_key_warns_cw122() {
+    use cwtools_parser::fix::apply_edits;
+
     let idx = loc_index(&[("a_l_english.yml", "l_english:\n my_key: \"hi\"\n")]);
-    let errs = run("mytype = {\n iname = \"my_key\"\n}\n", &idx);
-    let cw122 = errs.iter().filter(|e| e.code == Some("CW122")).count();
-    assert_eq!(cw122, 1, "quoted inline existing key → CW122: {:?}", errs);
+    let script = "mytype = {\n iname = \"my_key\"  # unnecessary\n}\n";
+    let errs = run(script, &idx);
+    let cw122 = errs
+        .iter()
+        .find(|e| e.code == Some("CW122"))
+        .expect("quoted inline key warns CW122");
+    let fix = cw122
+        .fix
+        .as_ref()
+        .expect("CW122 carries a quote-removal fix");
+    assert_eq!(fix.title, "Remove unnecessary quotes");
+
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, "mytype = {\n iname = my_key  # unnecessary\n}\n");
+    assert!(
+        !run(&fixed, &idx).iter().any(|e| e.code == Some("CW122")),
+        "CW122 must be gone after applying the fix"
+    );
+}
+
+#[test]
+fn inline_quoted_key_that_cannot_be_unquoted_is_accepted() {
+    let idx = loc_index(&[("a_l_english.yml", "l_english:\n foo=bar: \"hi\"\n")]);
+    let errs = run("mytype = { iname = \"foo=bar\" }", &idx);
+    assert!(
+        !errs.iter().any(|e| e.code == Some("CW122")),
+        "a key that needs quotes must not warn: {:?}",
+        errs
+    );
 }
 
 #[test]

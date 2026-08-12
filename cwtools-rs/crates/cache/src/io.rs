@@ -44,7 +44,8 @@ const MAGIC: &[u8; 4] = b"CWB\x00";
 ///     representation, `Leaf` + `Value::Clause`; nothing ever wrote Nodes).
 /// v3: dropped CachedValueClause/CachedChild::ValueClause (the dead parallel
 ///     clause slab; the AST/cache use only Leaf + Value::Clause).
-const FORMAT_VERSION: u8 = 3;
+/// v4: added the exact value range to CachedLeaf.
+const FORMAT_VERSION: u8 = 4;
 
 const ERRORS_MAGIC: &[u8; 4] = b"CWE\x00";
 const ERRORS_FORMAT_VERSION: u8 = 1;
