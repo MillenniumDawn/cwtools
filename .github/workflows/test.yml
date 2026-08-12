@@ -91,6 +91,12 @@ jobs:
         run: |
           cargo install cargo-machete --locked --force
           cargo machete
+      # Keeps #157's inheritance posture (repository, [lints], shared test deps)
+      # from drifting when a new crate is added. Runs from repo root so the
+      # script can see both cwtools-rs/ and scripts/.
+      - name: workspace manifest inheritance
+        working-directory: ${{ github.workspace }}
+        run: ./scripts/workspace-manifest-check.sh
 
   # Releases ship Linux, Windows, and macOS binaries, so a platform-only
   # break must fail here before it ships (#66). The tag-triggered release
