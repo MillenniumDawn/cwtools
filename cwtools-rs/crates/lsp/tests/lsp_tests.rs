@@ -3381,8 +3381,9 @@ fn is_scan_started(v: &serde_json::Value) -> bool {
 /// [`spawn_frame_collector`] channel. `what` names the scan awaited, so a
 /// failure says which one never started.
 ///
-/// `CWTOOLS_SCAN_HOLD_MS` sleeps the scan open *after* this signal fires (see
-/// `scan::validate_entire_workspace_inner`), so the wait for the started signal
+/// `CWTOOLS_SCAN_HOLD_MS` (and `CWTOOLS_SCAN_HOLD_FILE`, which holds while the
+/// named path exists) holds the scan open *after* this signal fires (see
+/// `scan::hold_scan_for_tests`), so the wait for the started signal
 /// is a measure of server command-processing latency under load, not of the
 /// hold. Size `budget` to that latency (a generous fixed value), not to the
 /// hold magnitude: the hold cannot expire before the signal it follows, so a
@@ -3674,22 +3675,22 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 alias[effect:needs_int] = int
 "#;
 
-/// A `common/users` file whose recursive alias exhausts the branch budget,
-/// preceded by `noise` single-overload value errors. Those cost no budget, so
-/// the caller can push the file past the server's per-file diagnostic cap
-/// without changing where the cap falls.
+/// A `common/users` file whose alias usages exhaust the branch budget, preceded
+/// by `noise` single-overload value errors. Those cost no budget, so the caller
+/// can push the file past the server's per-file diagnostic cap without changing
+/// where the cap falls.
+///
+/// Every usage is its own, so there is nothing for the alias memo to reuse and
+/// the budget is what stops the file: one two-overload usage past capacity.
 fn capped_alias_file(noise: usize) -> String {
     let mut text = String::from("a_user = {\n");
     for _ in 0..noise {
         text.push_str("needs_int = nope\n");
     }
-    for _ in 0..20 {
-        text.push_str("recurse = {\n");
+    for _ in 0..32_769 {
+        text.push_str("recurse = { }\n");
     }
-    text.push_str("bad = nope\n");
-    for _ in 0..=20 {
-        text.push_str("}\n");
-    }
+    text.push_str("}\n");
     text
 }
 
@@ -4072,6 +4073,96 @@ fn test_closing_a_buffer_with_discarded_edits_restores_disk_uses() {
         1,
         "discarding the edit restores the reference, so only lone_thing stays \
          unused, got: {codes:?}"
+    );
+}
+
+#[test]
+fn test_closed_file_cw239_only_catches_up_on_the_next_scan() {
+    // The other half of the staleness contract ERROR_CODES.md states for CW239:
+    // an open file's answer moves with every edit (the test above), a closed
+    // file's waits for the next scan. Only the first half was covered, so the
+    // dependent sweep growing a "republish closed files too" path — which would
+    // mean re-reading and re-validating arbitrarily many files per keystroke —
+    // would break nothing.
+    let (ws, mut child, mut reader, _a_path, b_path) = spawn_unused_workspace();
+    let scanned = diags_for(&mut reader, "a.txt", 1).expect("a.txt scan diagnostics");
+    assert!(
+        scanned.contains(&"CW239".to_string()),
+        "lone_thing starts out referenced by nothing, got: {scanned:?}"
+    );
+    wait_for_scan_done(&mut reader);
+
+    let b_uri = path_uri(&b_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text": B_TEXT}}),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, "b.txt", 1).expect("b.txt diagnostics");
+
+    // Reference lone_thing from the open buffer. a.txt, which defines it, is
+    // closed and stays closed.
+    let rx = spawn_frame_collector(reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": b_uri, "version": 2 },
+                "contentChanges": [{ "text":
+                    "a_user = { uses = used_thing }\nb_user = { uses = lone_thing }\n" }]
+            }),
+        ),
+    )
+    .unwrap();
+    let frames = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(800),
+        std::time::Duration::from_secs(6),
+    );
+    assert_eq!(
+        count_publishes(&frames, "b.txt"),
+        1,
+        "the edit must be validated, or nothing below is being tested"
+    );
+    assert_eq!(
+        count_publishes(&frames, "a.txt"),
+        0,
+        "a closed file must not be republished by the open-file sweep"
+    );
+
+    // The scan is what refreshes it, and it counts the open buffer's unsaved
+    // reference: the diagnostic clears without b.txt ever being written to disk.
+    reindex_until_scan_starts(&mut child, &rx);
+    let republished = recv_frame_until(
+        &rx,
+        std::time::Duration::from_secs(30),
+        "the reindex to republish a.txt",
+        |_| {},
+        |v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("a.txt"))
+        },
+    );
+    child.kill().ok();
+    drop(ws);
+
+    let codes: Vec<&str> = republished["params"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert!(
+        !codes.contains(&"CW239"),
+        "the scan must catch the closed file up on the reference added since, \
+         got: {codes:?}"
     );
 }
 
@@ -6441,6 +6532,108 @@ fn test_watched_batch_panic_is_recovered_and_retried() {
 }
 
 #[test]
+fn test_debounced_validate_panic_is_logged_and_next_edit_recovers() {
+    // #182: CWTOOLS_VALIDATE_PANIC_ONCE makes the FIRST debounced validation
+    // panic before it validates anything. The task joining the debounce handle
+    // must log that panic instead of letting it vanish with the handle, and the
+    // document must still validate on the next edit (the retry #182 relies on).
+    // The tail of the test pins the converse: an edit superseded inside the
+    // debounce window is aborted, and an abort is not a panic to log.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server_env(
+        ws.path(),
+        rules_dir.path(),
+        vanilla.path(),
+        &[("CWTOOLS_VALIDATE_PANIC_ONCE", "1")],
+    );
+    let uri = write_disk_file(ws.path(), "common/decisions/a.txt", STORM_FILE);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{
+                "uri": uri, "languageId": "hoi4", "version": 1, "text": STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+    let after_open = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    assert_eq!(
+        count_publishes(&after_open, "a.txt"),
+        0,
+        "the panicking open validation should not have published"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": {"uri": uri, "version": 2},
+                "contentChanges": [{"text": STORM_FILE}]}),
+        ),
+    )
+    .unwrap();
+    let after_edit = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+
+    // Two edits back to back, so the first is superseded inside the debounce
+    // window and its task is aborted rather than left to finish. That abort is
+    // the other half of the join's contract: it must not be reported as a
+    // panic, or every keystroke would log one. Nothing else here would notice,
+    // since the abort is invisible in the publishes.
+    for version in [3, 4] {
+        write_frame(
+            &mut child,
+            &jsonrpc_notification(
+                "textDocument/didChange",
+                serde_json::json!({
+                    "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": [{"text": STORM_FILE}]}),
+            ),
+        )
+        .unwrap();
+    }
+    drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(8),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1011);
+    child.kill().ok();
+
+    // Pin the precondition: without this the test passes just as well on a
+    // build where the injection never fired, since a validation that simply
+    // published late satisfies everything else here.
+    assert!(
+        log.contains("document validation task panicked"),
+        "expected the panicking validation to be logged, got: {log}"
+    );
+    assert_eq!(
+        log.matches("document validation task panicked").count(),
+        1,
+        "the superseded edit's abort must not be logged as a panic, got: {log}"
+    );
+    assert_eq!(
+        count_publishes(&after_edit, "a.txt"),
+        1,
+        "the next edit should still validate and publish once"
+    );
+}
+
+#[test]
 fn test_watched_distinct_files_each_validate_once() {
     // A burst of distinct non-open files in one window: each validates exactly
     // once, all after a single coalescing window.
@@ -7565,6 +7758,112 @@ fn test_did_open_then_immediate_close_ends_empty() {
 }
 
 #[test]
+fn test_did_save_revalidates_the_open_document() {
+    // did_save takes its own path: no text arrives with the notification
+    // (`include_text` is false), nothing is written to the document store, and
+    // the edit generation is read rather than bumped — it re-validates the
+    // buffer the server already holds. Nothing pinned that it validates at all.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let uri = write_disk_file(ws.path(), "common/decisions/s.txt", STORM_FILE);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":uri,"languageId":"hoi4","version":1,"text":STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+    let opened = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(800),
+        std::time::Duration::from_secs(6),
+    );
+    assert_eq!(
+        count_publishes(&opened, "s.txt"),
+        1,
+        "the open must publish before the save window opens"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didSave",
+            serde_json::json!({"textDocument":{"uri":uri}}),
+        ),
+    )
+    .unwrap();
+    let saved = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(800),
+        std::time::Duration::from_secs(6),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1020);
+    child.kill().ok();
+
+    assert_eq!(
+        count_validate_log(&log, "didSave"),
+        1,
+        "a save must validate the document once, tagged as a save"
+    );
+    assert_eq!(
+        count_publishes(&saved, "s.txt"),
+        1,
+        "a save must republish the saved document's diagnostics"
+    );
+}
+
+#[test]
+fn test_did_save_for_a_document_that_was_never_opened_is_a_no_op() {
+    // Unlike did_change, which reports a rejection, did_save returns silently
+    // when the URI is not an open document: it needs the stored version, and
+    // there is none. A client that saves a file it never opened (or one the
+    // retention cap evicted) must not make the server read or validate it.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let uri = write_disk_file(ws.path(), "common/decisions/u.txt", STORM_FILE);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didSave",
+            serde_json::json!({"textDocument":{"uri":uri}}),
+        ),
+    )
+    .unwrap();
+
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(6),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1021);
+    child.kill().ok();
+
+    assert_eq!(
+        count_validate_log(&log, "didSave"),
+        0,
+        "a save for a document that was never opened must not validate anything"
+    );
+    assert_eq!(
+        count_publishes(&frames, "u.txt"),
+        0,
+        "and must not publish diagnostics for it"
+    );
+}
+
+#[test]
 fn test_did_close_restores_disk_definition() {
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
@@ -8086,6 +8385,251 @@ types = {
     assert_eq!(
         fixed, "x = { }\n",
         "applied edit must delete the empty limit"
+    );
+}
+
+#[test]
+fn test_cw240_quickfix_replaces_only_the_enum_value() {
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+
+enums = {
+    enum[mode] = { historic fantasy sandbox }
+}
+
+decision = {
+    label = scalar
+    mode = enum[mode]
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/decisions/test.txt";
+    let text = "decision = { label = \"😀\" mode = histroic } # typo\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW240")
+        .expect("CW240 diagnostic published for the misspelled enum value");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag], "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let response = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let actions = response["result"].as_array().expect("array result");
+    assert_eq!(actions.len(), 1, "one quickfix expected: {response}");
+    assert_eq!(actions[0]["title"], "Did you mean 'historic'?");
+    let edits = actions[0]["edit"]["changes"]
+        .get(&doc_uri)
+        .and_then(serde_json::Value::as_array)
+        .expect("edits for the document");
+    assert_eq!(edits.len(), 1, "one text edit expected: {response}");
+    let value_start = text[..text.find("histroic").unwrap()]
+        .encode_utf16()
+        .count() as u64;
+    assert_eq!(edits[0]["range"]["start"]["line"], 0);
+    assert_eq!(edits[0]["range"]["start"]["character"], value_start);
+    assert_eq!(edits[0]["range"]["end"]["line"], 0);
+    assert_eq!(edits[0]["range"]["end"]["character"], value_start + 8);
+    assert_eq!(edits[0]["newText"], "\"historic\"");
+
+    let units: Vec<u16> = text[..text.find('\n').unwrap()].encode_utf16().collect();
+    let start = edits[0]["range"]["start"]["character"].as_u64().unwrap() as usize;
+    let end = edits[0]["range"]["end"]["character"].as_u64().unwrap() as usize;
+    let mut fixed = String::from_utf16(&units[..start]).expect("start is on a char boundary");
+    fixed.push_str(edits[0]["newText"].as_str().unwrap());
+    fixed.push_str(&String::from_utf16(&units[end..]).expect("end is on a char boundary"));
+    fixed.push('\n');
+    assert_eq!(
+        fixed, "decision = { label = \"😀\" mode = \"historic\" } # typo\n",
+        "the UTF-16 edit must replace only the enum value"
+    );
+}
+
+#[test]
+fn test_cw122_quickfix_removes_only_the_quotes() {
+    const RULES: &str = r#"
+types = {
+    type[thing] = { path = "game/common/things" }
+}
+
+thing = {
+    label = scalar
+    iname = localisation_inline
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+    let loc_dir = ws.path().join("localisation");
+    std::fs::create_dir_all(&loc_dir).unwrap();
+    std::fs::write(
+        loc_dir.join("test_l_english.yml"),
+        b"\xEF\xBB\xBFl_english:\n my_key: \"My key\"\n",
+    )
+    .unwrap();
+
+    let rel_path = "common/things/test.txt";
+    let text = "thing = { label = \"😀\" iname = \"my_key\" } # unnecessary\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":doc_uri,"languageId":"hoi4","version":1,"text":text}}),
+        ),
+    )
+    .unwrap();
+    let diag = wait_for_diag_object(&mut reader, rel_path, "CW122")
+        .expect("CW122 diagnostic published for the quoted inline key");
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": doc_uri },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag], "only": ["quickfix"] },
+            }),
+        ),
+    )
+    .unwrap();
+    let response = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let actions = response["result"].as_array().expect("array result");
+    assert_eq!(actions.len(), 1, "one quickfix expected: {response}");
+    assert_eq!(actions[0]["title"], "Remove unnecessary quotes");
+    let edits = actions[0]["edit"]["changes"]
+        .get(&doc_uri)
+        .and_then(serde_json::Value::as_array)
+        .expect("edits for the document");
+    assert_eq!(edits.len(), 1, "one text edit expected: {response}");
+    let value_start = text[..text.find("\"my_key\"").unwrap()]
+        .encode_utf16()
+        .count() as u64;
+    assert_eq!(edits[0]["range"]["start"]["line"], 0);
+    assert_eq!(edits[0]["range"]["start"]["character"], value_start);
+    assert_eq!(edits[0]["range"]["end"]["line"], 0);
+    assert_eq!(edits[0]["range"]["end"]["character"], value_start + 8);
+    assert_eq!(edits[0]["newText"], "my_key");
+
+    let units: Vec<u16> = text[..text.find('\n').unwrap()].encode_utf16().collect();
+    let start = edits[0]["range"]["start"]["character"].as_u64().unwrap() as usize;
+    let end = edits[0]["range"]["end"]["character"].as_u64().unwrap() as usize;
+    let mut fixed = String::from_utf16(&units[..start]).expect("start is on a char boundary");
+    fixed.push_str(edits[0]["newText"].as_str().unwrap());
+    fixed.push_str(&String::from_utf16(&units[end..]).expect("end is on a char boundary"));
+    fixed.push('\n');
+    assert_eq!(
+        fixed, "thing = { label = \"😀\" iname = my_key } # unnecessary\n",
+        "the UTF-16 edit must remove only the quotes"
     );
 }
 
@@ -10880,6 +11424,7 @@ thing = { x = scalar }
 /// which also means a file the scan never validated shows up as a missing
 /// entry when the bar goes off, instead of blocking on a frame that never
 /// arrives.
+#[cfg(unix)]
 fn scan_diag_paths(
     reader: &mut BufReader<std::process::ChildStdout>,
     rel_paths: &[&str],
@@ -11340,6 +11885,203 @@ fn test_execute_command_reports_progress_against_the_client_token() {
         percentages.iter().all(|&p| p <= 100),
         "percentage out of range: {percentages:?}"
     );
+}
+
+/// #228: two commands in flight at once each keep their own `$/progress`
+/// stream. `cacheVanilla` doesn't take the scan flag, so it can begin while a
+/// `reindexWorkspace` scan is still running; the scan's later phases have to
+/// stay on the re-index token instead of following whichever command began
+/// last and then falling back to the server's stream when that one ends.
+#[test]
+fn test_concurrent_commands_keep_separate_progress_streams() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    // Explicit and empty, so `cacheVanilla` re-indexes nothing instead of
+    // whatever real game install auto-discovery finds on the host.
+    let vanilla_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("editor_rules.cwt"), EDITOR_RULES).unwrap();
+    let p = ws.path().join("common/national_focus/tree.txt");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, "my_focus = {\n    id = my_focus\n}\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        // Holds every scan at its first phase, so the re-index is reliably
+        // still running when the second command opens and closes its stream —
+        // rather than racing a workspace big enough to take a measurable time.
+        .env("CWTOOLS_SCAN_HOLD_MS", "5000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": { "window": { "workDoneProgress": true } },
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "vanilla": vanilla_dir.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    // As in the token tests above, everything runs inside the deadline closure
+    // because answering `window/workDoneProgress/create` is what lets the
+    // startup scan finish.
+    let stdin = child.stdin.take().unwrap();
+    let collected = run_with_deadline(stdin, reader, 180, |stdin, reader| {
+        // Every `$/progress` frame as `(token, kind)`, in arrival order — the
+        // interleaving is the thing under test.
+        let mut events: Vec<(String, String)> = Vec::new();
+        let mut reindex_result: Option<serde_json::Value> = None;
+        let mut reindex_closed = false;
+        // Same scan-guard race as the tests above: the bar-off notification
+        // precedes the flag release, so a command sent on it can lose the CAS.
+        // Retry until one actually re-indexes, each attempt on its own ids and
+        // tokens so the frames stay attributable.
+        let mut attempt = 0i64;
+        let mut reindex_token = String::new();
+        let mut vanilla_token = String::new();
+        let send_reindex = |stdin: &mut std::process::ChildStdin, attempt: i64| -> String {
+            let token = format!("cwtools/command/228/reindex/{attempt}");
+            write_frame_to(
+                stdin,
+                &jsonrpc_request(
+                    100 + attempt,
+                    "workspace/executeCommand",
+                    serde_json::json!({
+                        "command": "reindexWorkspace",
+                        "arguments": [],
+                        "workDoneToken": token,
+                    }),
+                ),
+            )
+            .unwrap();
+            token
+        };
+        for _ in 0..20_000 {
+            let Ok(raw) = read_frame(reader) else { break };
+            if raw.is_empty() {
+                break; // EOF
+            }
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if v["id"] == serde_json::json!(100 + attempt) && v.get("result").is_some() {
+                if v["result"] == serde_json::json!("Re-index already in progress.") {
+                    attempt += 1;
+                    events.clear();
+                    vanilla_token.clear();
+                    reindex_closed = false;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    reindex_token = send_reindex(stdin, attempt);
+                    continue;
+                }
+                // Recorded rather than returned: the response and the `end` are
+                // merged onto one output with no ordering between them, so
+                // either can land first.
+                reindex_result = Some(v["result"].clone());
+                if reindex_closed {
+                    break;
+                }
+                continue;
+            }
+            match v["method"].as_str() {
+                Some("window/workDoneProgress/create") => write_frame_to(
+                    stdin,
+                    &serde_json::json!({ "jsonrpc": "2.0", "id": v["id"], "result": null })
+                        .to_string(),
+                )
+                .unwrap(),
+                Some("$/progress") => {
+                    let token = v["params"]["token"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let kind = v["params"]["value"]["kind"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    // The re-index owns the workspace and is held at its first
+                    // phase; start the overlapping command now.
+                    if token == reindex_token && kind == "begin" && vanilla_token.is_empty() {
+                        vanilla_token = format!("cwtools/command/228/vanilla/{attempt}");
+                        write_frame_to(
+                            stdin,
+                            &jsonrpc_request(
+                                200 + attempt,
+                                "workspace/executeCommand",
+                                serde_json::json!({
+                                    "command": "cacheVanilla",
+                                    "arguments": [],
+                                    "workDoneToken": vanilla_token,
+                                }),
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    reindex_closed |= token == reindex_token && kind == "end";
+                    events.push((token, kind));
+                    if reindex_closed && reindex_result.is_some() {
+                        break;
+                    }
+                }
+                // The startup scan is done; run the command it was blocking.
+                Some("loadingBar")
+                    if reindex_token.is_empty()
+                        && v["params"]["enable"] == serde_json::Value::Bool(false) =>
+                {
+                    reindex_token = send_reindex(stdin, attempt);
+                }
+                _ => {}
+            }
+        }
+        (events, reindex_token, vanilla_token, reindex_result)
+    });
+    child.kill().ok();
+
+    let (events, reindex_token, vanilla_token, reindex_result) =
+        collected.expect("timed out waiting for the commands to finish");
+    assert_eq!(
+        reindex_result.and_then(|r| r.as_str().map(str::to_string)),
+        Some("Workspace re-indexed.".to_string())
+    );
+    assert!(
+        !vanilla_token.is_empty(),
+        "the overlapping command was never sent: {events:?}"
+    );
+    let vanilla_end = events
+        .iter()
+        .position(|(token, kind)| token == &vanilla_token && kind == "end")
+        .unwrap_or_else(|| panic!("the second command never closed its stream: {events:?}"));
+    // The bug: the second command's `begin` took the indicator, so the first
+    // command's remaining phases reported against the second token and then,
+    // once that one ended, against the server's `cwtools/scan` stream instead.
+    assert!(
+        events[vanilla_end + 1..]
+            .iter()
+            .any(|(token, kind)| token == &reindex_token && kind == "report"),
+        "the re-index's later phases must stay on its own token: {events:?}"
+    );
+    let mine: Vec<&str> = events
+        .iter()
+        .filter(|(token, _)| token == &reindex_token)
+        .map(|(_, kind)| kind.as_str())
+        .collect();
+    assert_eq!(mine.first(), Some(&"begin"), "{events:?}");
+    assert_eq!(mine.last(), Some(&"end"), "{events:?}");
 }
 
 /// #145: the Cancel button. `window/workDoneProgress/cancel` is a notification,
@@ -12499,27 +13241,34 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
     let ws = tempfile::tempdir().unwrap();
     let rules_dir = tempfile::tempdir().unwrap();
     let vanilla = tempfile::tempdir().unwrap();
+    let signals = tempfile::tempdir().unwrap();
     std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
 
-    // The reload's 1s deadline expires while the competing scan still holds
-    // the guard (5s hold), so it must answer queued — and then the deferred
-    // retry must run a revalidation once the scan releases.
+    // This test cares about both ends of the hold: the reload's 1s deadline has
+    // to expire inside it, and the deferred retry has to run once it releases.
+    // A fixed hold makes both a bet on wall-clock that parallel load can lose,
+    // so the competing scan holds while `gate` exists and this test moves the
+    // gate itself (#198). The file lives outside the workspace so creating it
+    // isn't a watched-file change.
+    let gate = signals.path().join("scan-hold");
+    let gate_env = gate.to_string_lossy().into_owned();
     let (mut child, reader) = storm_server_env(
         ws.path(),
         rules_dir.path(),
         vanilla.path(),
         &[
-            ("CWTOOLS_SCAN_HOLD_MS", "5000"),
+            ("CWTOOLS_SCAN_HOLD_FILE", gate_env.as_str()),
             ("CWTOOLS_RETRY_DEADLINE_MS", "1000"),
         ],
     );
     let rx = spawn_frame_collector(reader);
 
-    // Start a competing scan and wait for the scan-started signal, so the
-    // hold is definitely active for the reload's whole deadline.
+    // Arm the hold (the startup scan is already done, so it isn't caught by
+    // it), then start the competing scan that trips it.
+    std::fs::write(&gate, "").unwrap();
     reindex_until_scan_starts(&mut child, &rx);
 
-    // The give-up response arrives ~1s in, well before the 5s hold releases.
+    // The give-up response arrives ~1s in, with the scan still held.
     write_frame(
         &mut child,
         &jsonrpc_request(
@@ -12532,7 +13281,7 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
     let (response, _) = wait_for_response_watching_scans(
         &rx,
         901,
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(30),
         "reloadrulesconfig to give up on its 1s deadline",
     );
     let msg = response["result"].as_str().expect("string result");
@@ -12541,10 +13290,9 @@ fn test_reloadrulesconfig_give_up_lands_queued_revalidation() {
         "the reload must report the queued revalidation: {msg}"
     );
 
-    // The deferred retry wins the CAS once the 5s hold releases and runs a
-    // full revalidation (a bar-on after the response). The budget only has to
-    // outlast the rest of the hold plus a 500ms retry poll; keep it well clear
-    // of that, since waiting longer cannot change what the test observes.
+    // Release the hold. The deferred retry then wins the CAS and runs a full
+    // revalidation, a bar-on that can only come after the response.
+    std::fs::remove_file(&gate).unwrap();
     wait_for_scan_started(
         &rx,
         std::time::Duration::from_secs(30),
@@ -12887,5 +13635,134 @@ fn test_access_boundary_allows_an_auto_discovered_vanilla_install() {
             .iter()
             .any(|r| r["startLine"] == 0 && r["endLine"] == 4),
         "an auto-discovered base-game file must be readable, got: {response}"
+    );
+}
+
+/// Every game id `Game::from_str` accepts, with the Steam `steamapps/common`
+/// folder `discover_vanilla_dir` has to map it to. ARCHITECTURE.md lists that
+/// mapping as one of the nine sites a new game touches in lockstep, and as one
+/// of the ones the compiler cannot catch: the match ends in `_ => None`, so a
+/// missing or misspelled arm compiles and quietly discovers nothing forever.
+/// `eu5` and `custom` are deliberately absent — neither ships on Steam under a
+/// known folder, and both take the `None` arm today.
+#[cfg(unix)]
+const STEAM_INSTALL_FOLDERS: &[(&str, &str)] = &[
+    ("hoi4", "Hearts of Iron IV"),
+    ("stellaris", "Stellaris"),
+    ("eu4", "Europa Universalis IV"),
+    ("ck2", "Crusader Kings II"),
+    ("ck3", "Crusader Kings III"),
+    ("vic2", "Victoria 2"),
+    ("vic3", "Victoria 3"),
+    ("ir", "ImperatorRome"),
+];
+
+/// Boot a server for `game` against a `$HOME` holding a base-game file under
+/// `folder`, and ask for that file's folding ranges. Ranges mean the install
+/// was discovered — nothing else puts a path outside the workspace inside the
+/// access boundary — and an empty result means it was not.
+#[cfg(unix)]
+fn auto_discovered_vanilla_response(game: &str, folder: &str) -> serde_json::Value {
+    let home = tempfile::tempdir().unwrap();
+    let vanilla_file = home
+        .path()
+        .join(".steam/steam/steamapps/common")
+        .join(folder)
+        .join("common/national_focus/base.txt");
+    std::fs::create_dir_all(vanilla_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &vanilla_file,
+        "outer = {\n    inner = {\n        x = 1\n    }\n}\n",
+    )
+    .unwrap();
+
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let reader = BufReader::new(child.stdout.take().unwrap());
+    let stdin = child.stdin.take().unwrap();
+    let ws_uri = path_uri(ws.path());
+    let rules = rules_dir.path().to_string_lossy().to_string();
+    let file_uri = path_uri(&vanilla_file);
+    let game = game.to_string();
+
+    let response = run_with_deadline(stdin, reader, 60, move |stdin, reader| {
+        write_frame_to(
+            stdin,
+            &jsonrpc_request(
+                1,
+                "initialize",
+                serde_json::json!({
+                    "processId": std::process::id(),
+                    "rootUri": ws_uri,
+                    "capabilities": {},
+                    // No `vanilla`: auto-discovery is the thing under test.
+                    "initializationOptions": { "language": game, "rulesCache": rules }
+                }),
+            ),
+        )
+        .ok()?;
+        read_response(reader).ok()?;
+        write_frame_to(
+            stdin,
+            &jsonrpc_notification("initialized", serde_json::json!({})),
+        )
+        .ok()?;
+        wait_for_scan_done(reader);
+        write_frame_to(
+            stdin,
+            &jsonrpc_request(
+                2,
+                "textDocument/foldingRange",
+                serde_json::json!({ "textDocument": { "uri": file_uri } }),
+            ),
+        )
+        .ok()?;
+        serde_json::from_str::<serde_json::Value>(&read_response(reader).ok()?).ok()
+    });
+    child.kill().ok();
+    child.wait().ok();
+    response.flatten().expect("the server never answered")
+}
+
+#[cfg(unix)]
+#[test]
+fn test_steam_folder_is_mapped_for_every_supported_game() {
+    for (game, folder) in STEAM_INSTALL_FOLDERS {
+        let response = auto_discovered_vanilla_response(game, folder);
+        assert!(
+            !response["result"].is_null(),
+            "{game} must auto-discover its install under {folder:?}; an empty \
+             result means the file was refused as outside the boundary, so the \
+             mapping produced no install: {response}"
+        );
+        let ranges = expect_ranges(&response);
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r["startLine"] == 0 && r["endLine"] == 4),
+            "{game} must auto-discover its install under {folder:?}, got: {response}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_steam_folder_mapping_is_per_game_not_a_wildcard() {
+    // The positive case above passes for any implementation that discovers
+    // *something* under `steamapps/common`. This is what makes it a mapping:
+    // an install sitting under another game's folder name is not this game's.
+    let response = auto_discovered_vanilla_response("hoi4", "Stellaris");
+    assert_refused(
+        &response,
+        "an install under a different game's Steam folder",
     );
 }

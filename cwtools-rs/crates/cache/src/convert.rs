@@ -33,11 +33,8 @@ pub fn errors_to_cached(errors: &[ParseError]) -> CachedErrors {
     CachedErrors {
         errors: errors
             .iter()
-            .map(|error| match error {
-                ParseError::Pos(line, col, message) => {
-                    CachedParseError::Pos(*line, *col, message.clone())
-                }
-                ParseError::General(message) => CachedParseError::General(message.clone()),
+            .map(|ParseError::Pos(line, col, message)| {
+                CachedParseError::Pos(*line, *col, message.clone())
             })
             .collect(),
     }
@@ -48,10 +45,7 @@ pub fn cached_errors_to_parse(cached: CachedErrors) -> Vec<ParseError> {
     cached
         .errors
         .into_iter()
-        .map(|error| match error {
-            CachedParseError::Pos(line, col, message) => ParseError::Pos(line, col, message),
-            CachedParseError::General(message) => ParseError::General(message),
-        })
+        .map(|CachedParseError::Pos(line, col, message)| ParseError::Pos(line, col, message))
         .collect()
 }
 
@@ -93,6 +87,12 @@ pub fn archived_to_arena(
                 l.start_col.to_native(),
                 l.end_line.to_native(),
                 l.end_col.to_native(),
+            ),
+            value_pos: cached_to_range(
+                l.value_start_line.to_native(),
+                l.value_start_col.to_native(),
+                l.value_end_line.to_native(),
+                l.value_end_col.to_native(),
             ),
         });
     }
@@ -254,6 +254,7 @@ fn children_to_cached(children: &[Child]) -> Vec<CachedChild> {
 
 fn leaf_to_cached(l: &Leaf, table: &StringResolver<'_>) -> CachedLeaf {
     let (sl, sc, el, ec) = range_to_cached(&l.pos);
+    let (vsl, vsc, vel, vec_) = range_to_cached(&l.value_pos);
     CachedLeaf {
         key: string_token_to_owned(&l.key, table),
         value: value_to_cached(&l.value, table),
@@ -262,6 +263,10 @@ fn leaf_to_cached(l: &Leaf, table: &StringResolver<'_>) -> CachedLeaf {
         start_col: sc,
         end_line: el,
         end_col: ec,
+        value_start_line: vsl,
+        value_start_col: vsc,
+        value_end_line: vel,
+        value_end_col: vec_,
     }
 }
 

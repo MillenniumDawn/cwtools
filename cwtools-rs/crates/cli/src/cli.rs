@@ -43,10 +43,17 @@ pub(crate) enum Commands {
         /// Input cache file
         input: PathBuf,
     },
-    /// Parse a .cwt rules file or directory and print summary
+    /// Parse a .cwt rules file or directory, print a summary, and report the
+    /// problems the ruleset itself has. Exits 1 when any of them is an error.
     Rules {
         /// Path to a .cwt file or a directory containing .cwt files
         file: PathBuf,
+        /// Report format for the rules problems: cli (default, grouped text),
+        /// csv, json, github (Actions workflow commands) or sarif (SARIF
+        /// 2.1.0). Anything but cli moves the ruleset summary to stderr so the
+        /// report has stdout to itself.
+        #[arg(long, value_name = "FORMAT", value_parser = report::parse_report_type)]
+        report_type: Option<ReportType>,
     },
     /// Validate a directory of game files against .cwt rules
     Validate(ValidateArgs),

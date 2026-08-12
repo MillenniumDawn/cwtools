@@ -2,8 +2,8 @@
 //! links. Leaves are found by the same rule-matched walk semantic tokens use
 //! (`block_rules_for` + matched-rule descent), so only fields the ruleset
 //! types as `filepath[..]` / `icon[..]` produce links; targets are probed
-//! against the workspace root then the vanilla install, and only existing
-//! files link.
+//! against the workspace root then the vanilla install, and only a file that
+//! exists inside one of them links.
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -116,31 +116,25 @@ impl Backend {
             let Some(col) = value_col_in_line(line, value, from) else {
                 continue;
             };
-            let rel = std::path::Path::new(c.rel_path.trim_start_matches('/'));
-            for root in &roots {
-                let target = root.join(rel);
-                // Async stat: a link request must not block the runtime on a
-                // sync filesystem syscall.
-                if tokio::fs::metadata(&target).await.is_ok() {
-                    let start = source_position_to_lsp(&text, line0, col, &encoding);
-                    let end = source_position_to_lsp(
-                        &text,
-                        line0,
-                        col + value.chars().count() as u32,
-                        &encoding,
-                    );
-                    links.push(DocumentLink {
-                        range: Range { start, end },
-                        target: Some(crate::paths::parse_uri(
-                            crate::paths::path_to_uri(&target),
-                            fallback,
-                        )),
-                        tooltip: None,
-                        data: None,
-                    });
-                    break;
-                }
-            }
+            let rel = std::path::Path::new(c.rel_path.trim_start_matches(['/', '\\']));
+            // Async, and contained before it is probed: a link request must not
+            // block the runtime on a sync filesystem syscall, and a leaf value
+            // is mod content that must not reach outside the roots (#176).
+            let Some(target) = crate::access::contained_search_path(&roots, rel).await else {
+                continue;
+            };
+            let start = source_position_to_lsp(&text, line0, col, &encoding);
+            let end =
+                source_position_to_lsp(&text, line0, col + value.chars().count() as u32, &encoding);
+            links.push(DocumentLink {
+                range: Range { start, end },
+                target: Some(crate::paths::parse_uri(
+                    crate::paths::path_to_uri(&target),
+                    fallback,
+                )),
+                tooltip: None,
+                data: None,
+            });
         }
         if links.is_empty() {
             Ok(None)
@@ -311,6 +305,32 @@ mod tests {
         // Dynamic/templated paths can't resolve statically.
         assert_eq!(filepath_link_candidate(None, None, "gfx/$NAME$.dds"), None);
         assert_eq!(filepath_link_candidate(None, None, ""), None);
+    }
+
+    /// The probe the request runs on each candidate: the same trim and
+    /// containment call `document_link_impl` makes, so a leaf value that climbs
+    /// out of the roots links to nothing instead of reporting the file exists
+    /// (#176).
+    #[tokio::test]
+    async fn a_candidate_that_climbs_out_of_the_roots_links_to_nothing() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path().join("mod");
+        std::fs::create_dir_all(root.join("gfx")).unwrap();
+        std::fs::write(root.join("gfx/pic.dds"), "x").unwrap();
+        std::fs::write(tmp.path().join("secret.dds"), "secret").unwrap();
+        let roots = vec![root.clone()];
+
+        let escaping = filepath_link_candidate(Some("gfx/"), Some(".dds"), "gfx/../../secret")
+            .expect("a candidate");
+        assert_eq!(probe(&roots, &escaping).await, None);
+
+        let inside = filepath_link_candidate(Some("gfx/"), Some(".dds"), "pic").expect("candidate");
+        assert_eq!(probe(&roots, &inside).await, Some(root.join("gfx/pic.dds")));
+    }
+
+    async fn probe(roots: &[std::path::PathBuf], rel_path: &str) -> Option<std::path::PathBuf> {
+        let rel = std::path::Path::new(rel_path.trim_start_matches(['/', '\\']));
+        crate::access::contained_search_path(roots, rel).await
     }
 
     #[test]

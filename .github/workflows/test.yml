@@ -271,3 +271,57 @@ jobs:
         run: >-
           cargo +nightly-2026-07-24 fuzz run parse_loc_text
           fuzz/seeds/parse_loc_text -- -runs=0
+
+  # Coverage is a hard target, but this path starts with a 85% line floor so
+  # we can see which gaps remain before making it a required gate.
+  coverage-rs:
+    name: Rust coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cwtools-rs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain (stable + llvm tools)
+        # stable
+        uses: "dtolnay/rust-toolchain@29eef336d9b2848a0b54\
+          8edc03f92a220660cdb8"
+        with:
+          components: llvm-tools
+      # Registry cache (including ~/.cargo/bin) helps cargo-llvm-cov install
+      # reuse across runs.
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: >-
+            ${{ runner.os }}-cargo-registry-${{
+            hashFiles('cwtools-rs/Cargo.lock') }}
+      # Cache target output so repeated runs avoid rebuilds.
+      - name: Cache cargo target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: cwtools-rs/target
+          key: >-
+            ${{ runner.os }}-cargo-coverage-target-${{
+            hashFiles('cwtools-rs/Cargo.lock', 'cwtools-rs/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-target-
+          save-always: true
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked --version 0.8.7
+      - name: Run coverage (85% line floor)
+        env:
+          COVERAGE_THRESHOLD: 85
+        run: bash ../scripts/coverage.sh
+        continue-on-error: true
+      - name: Upload lcov report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: rust-coverage-lcov
+          path: cwtools-rs/target/coverage/lcov.info
+          if-no-files-found: error

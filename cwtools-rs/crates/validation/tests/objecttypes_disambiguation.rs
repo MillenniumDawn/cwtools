@@ -47,7 +47,7 @@ pdxparticle = {
 
 fn ruleset_and_table() -> (cwtools_rules::rules_types::RuleSet, StringTable) {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(CWT, &table).unwrap();
+    let parsed_cwt = parse_string(CWT, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     (ruleset, table)
 }
@@ -70,7 +70,7 @@ objectTypes = {
     }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -107,7 +107,7 @@ objectTypes = {
     }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,

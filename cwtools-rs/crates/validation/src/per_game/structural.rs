@@ -263,14 +263,26 @@ fn validate_if_else_order(
                 }
                 if !prev_was_if && k != kw.if_ {
                     let key_len = table.with_string(key, |s| s.chars().count()).unwrap_or(0);
-                    push(
-                        errors,
-                        &error_codes::CW238_IF_ELSE_ORDER,
-                        error_codes::CW238_IF_ELSE_ORDER
-                            .message_template
-                            .to_string(),
-                        key_token_range(block.range.start, key_len),
-                        file_path,
+                    // The squiggle sits on the enclosing block, so the follower
+                    // itself is the place to look: relate its key token.
+                    let follower = table.with_string(k, |s| s.to_string()).unwrap_or_default();
+                    let follower_range =
+                        key_token_range(inner.range.start, follower.chars().count());
+                    let code = &error_codes::CW238_IF_ELSE_ORDER;
+                    let range = key_token_range(block.range.start, key_len);
+                    errors.push(
+                        ValidationError::from_code(
+                            code,
+                            file_path,
+                            range.start.line,
+                            range.start.col,
+                            &[],
+                        )
+                        .with_end(range.end)
+                        .with_related(
+                            format!("this {follower} has no preceding if"),
+                            follower_range,
+                        ),
                     );
                     break;
                 }
@@ -451,7 +463,7 @@ mod tests {
     /// The codes emitted for `src` at `path` (path matters for CW107's events-dir check).
     fn codes_at(path: &str, src: &str) -> Vec<&'static str> {
         let table = StringTable::new();
-        let ast = parse_string(src, &table).unwrap();
+        let ast = parse_string(src, &table);
         let mut errors = Vec::new();
         validate_structural(&ast, &table, &path.into(), Game::Hoi4, &mut errors);
         errors.iter().filter_map(|e| e.code).collect()
@@ -461,7 +473,7 @@ mod tests {
     /// assert the result equals `expected` and no longer emits `code`.
     fn assert_fix(code: &str, src: &str, expected: &str) {
         let table = StringTable::new();
-        let ast = parse_string(src, &table).unwrap();
+        let ast = parse_string(src, &table);
         let mut errors = Vec::new();
         validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
@@ -473,7 +485,7 @@ mod tests {
         let fixed = apply_edits(src, &fix.edits);
         assert_eq!(fixed, expected, "{code} fix output");
 
-        let ast2 = parse_string(&fixed, &table).unwrap();
+        let ast2 = parse_string(&fixed, &table);
         let mut errors2 = Vec::new();
         validate_structural(&ast2, &table, &"test.txt".into(), Game::Hoi4, &mut errors2);
         assert!(
@@ -488,7 +500,7 @@ mod tests {
     fn cw223_underlines_only_the_not_key() {
         let src = "x = {\n    NOT = {\n        a = 1\n        b = 2\n    }\n}\n";
         let table = StringTable::new();
-        let ast = parse_string(src, &table).unwrap();
+        let ast = parse_string(src, &table);
         let mut errors = Vec::new();
         validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
@@ -534,7 +546,7 @@ mod tests {
 
         for (src, line, col, len) in [(and_src, 1, 0, 3), (or_src, 2, 4, 2)] {
             let table = StringTable::new();
-            let ast = parse_string(src, &table).unwrap();
+            let ast = parse_string(src, &table);
             let mut errors = Vec::new();
             validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
@@ -565,7 +577,7 @@ mod tests {
             "x = { if = { a = 1 } else_if = { } else = { b = 2 } }\n",
         ] {
             let table = StringTable::new();
-            let ast = parse_string(src, &table).unwrap();
+            let ast = parse_string(src, &table);
             let mut errors = Vec::new();
             validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
@@ -798,7 +810,7 @@ mod tests {
     #[test]
     fn cw107_underlines_only_the_event_key() {
         let table = StringTable::new();
-        let ast = parse_string("my_event = {\n    id = test.1\n}\n", &table).unwrap();
+        let ast = parse_string("my_event = {\n    id = test.1\n}\n", &table);
         let mut errors = Vec::new();
         validate_structural(
             &ast,
@@ -827,6 +839,30 @@ mod tests {
     fn else_without_preceding_if_is_cw238() {
         let c = codes("foo = { else = { a = 1 } }\n");
         assert!(c.contains(&"CW238"), "got: {:?}", c);
+    }
+
+    #[test]
+    fn cw238_relates_the_follower_that_has_no_if() {
+        let table = StringTable::new();
+        let ast = parse_string("foo = {\n    else_if = { a = 1 }\n}\n", &table);
+        let mut errors = Vec::new();
+        validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
+
+        let err = errors
+            .iter()
+            .find(|e| e.code == Some("CW238"))
+            .expect("CW238 emitted");
+
+        assert_eq!((err.line, err.col), (1, 0), "squiggle stays on the parent");
+        let related = &err.related;
+        assert_eq!(related.len(), 1, "got: {related:?}");
+        assert_eq!((related[0].line, related[0].col), (2, 4));
+        assert_eq!(related[0].end, (2, 4 + "else_if".len() as u16));
+        assert!(
+            related[0].message.contains("else_if"),
+            "got: {}",
+            related[0].message
+        );
     }
 
     #[test]
@@ -901,7 +937,7 @@ mod tests {
     #[test]
     fn cw238_underlines_only_the_containing_key() {
         let table = StringTable::new();
-        let ast = parse_string("foo = {\n    else = { a = 1 }\n}\n", &table).unwrap();
+        let ast = parse_string("foo = {\n    else = { a = 1 }\n}\n", &table);
         let mut errors = Vec::new();
         validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 

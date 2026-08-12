@@ -426,7 +426,7 @@ mod skip_root_key_tests {
 
     fn parse_type(cwt: &str) -> Vec<SkipRootKey> {
         let table = StringTable::new();
-        let ast = parse_string(cwt, &table).unwrap();
+        let ast = parse_string(cwt, &table);
         let rs = ast_to_ruleset(&ast, &table);
         rs.types
             .into_iter()

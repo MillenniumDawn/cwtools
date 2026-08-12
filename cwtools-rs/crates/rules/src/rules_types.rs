@@ -152,7 +152,7 @@ pub enum PatternKind {
 ///
 /// An alias name like `modifier:production_speed_<building>_factor` or
 /// `effect:set_country_flag_value[country_flag]` is split once into its
-/// structural parts so the per-call `alias_pattern_matches` can skip the
+/// structural parts so the per-call `parsed_pattern_matches` can skip the
 /// string scanning.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedAliasPattern {
@@ -235,9 +235,9 @@ pub struct AliasCategoryIndex {
 /// `replace` allocation on the common (Linux) no-backslash case.
 fn normalize_path_lower(p: &str) -> String {
     if p.contains('\\') {
-        p.replace('\\', "/").trim_matches('/').to_lowercase()
+        p.replace('\\', "/").trim_matches('/').to_ascii_lowercase()
     } else {
-        p.trim_matches('/').to_lowercase()
+        p.trim_matches('/').to_ascii_lowercase()
     }
 }
 
@@ -247,9 +247,9 @@ fn normalize_path_lower(p: &str) -> String {
 /// keys on `PathOptions`.
 fn normalize_path_options(opts: &mut PathOptions) {
     opts.paths_lower = opts.paths.iter().map(|p| normalize_path_lower(p)).collect();
-    opts.path_file_lower = opts.path_file.as_deref().map(|s| s.to_lowercase());
+    opts.path_file_lower = opts.path_file.as_deref().map(|s| s.to_ascii_lowercase());
     opts.path_ext_lower = opts.path_extension.as_deref().map(|s| {
-        let s = s.to_lowercase();
+        let s = s.to_ascii_lowercase();
         s.strip_prefix('.').map(|t| t.to_string()).unwrap_or(s)
     });
 }
@@ -663,7 +663,9 @@ pub struct TypeDefinition {
     pub unique: bool,
     pub should_be_referenced: bool,
     pub localisation: Vec<TypeLocalisation>,
-    /// `## graph_related_types = { ... }`: parsed for .cwt spec compatibility; not consumed.
+    /// `## graph_related_types = { ... }`: which other types may join a graph
+    /// seeded on this one. Consumed by the LSP's `getGraphData` (`lsp::graph`);
+    /// empty means any type.
     pub graph_related_types: Vec<String>,
     pub modifiers: Vec<TypeModifier>,
 }

@@ -21,7 +21,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let ruleset = ast_to_ruleset(&parsed, &table);
 
     let op = ruleset

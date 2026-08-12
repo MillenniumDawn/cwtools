@@ -29,7 +29,8 @@ use cwtools_string_table::string_table::StringTable;
 /// v4: workspace scans discard comments before caching because only open-document
 /// semantic-token parsing needs them.
 /// v5: recovered parse errors are persisted with the AST.
-const CACHE_VERSION: u32 = 5;
+/// v6: Leaf records the exact value range.
+const CACHE_VERSION: u32 = 6;
 
 /// Whether platform metadata provides a reliable no-read change stamp.
 pub const PATH_METADATA_CACHE_SUPPORTED: bool = cfg!(unix);
@@ -717,7 +718,7 @@ mod tests {
         let fp = 1234;
         validate_or_clear(tmp.path(), fp).unwrap(); // create the dir + sig
         let text = "foo = { bar = 1 baz = \"two\" }\n";
-        let parsed = parse_string(text, &table).unwrap();
+        let parsed = parse_string(text, &table);
 
         // Miss before anything is stored.
         assert!(load(tmp.path(), fp, text, &table).is_none());
@@ -740,7 +741,7 @@ mod tests {
         let fp = 162;
         validate_or_clear(tmp.path(), fp).unwrap();
         let text = "a = 1\n";
-        let parsed = parse_string(text, &table).unwrap();
+        let parsed = parse_string(text, &table);
         store(tmp.path(), fp, text, &parsed, &table);
         assert!(load(tmp.path(), fp, text, &table).is_some());
 
@@ -765,7 +766,7 @@ mod tests {
         let fp = 99;
         validate_or_clear(tmp.path(), fp).unwrap();
         let text = "a = 1\n";
-        let parsed = parse_string(text, &table).unwrap();
+        let parsed = parse_string(text, &table);
         store(tmp.path(), fp, text, &parsed, &table);
         // Edited content hashes to a different .cwb path -> miss (forces re-parse).
         assert!(load(tmp.path(), fp, "a = 2\n", &table).is_none());
@@ -778,14 +779,14 @@ mod tests {
         let fp = 7;
         validate_or_clear(tmp.path(), fp).unwrap();
         let text = "x = 1\n";
-        let mut parsed = parse_string(text, &table).unwrap();
-        parsed.errors.push(ParseError::General("boom".into()));
+        let mut parsed = parse_string(text, &table);
+        parsed.errors.push(ParseError::Pos(3, 4, "boom".into()));
         store(tmp.path(), fp, text, &parsed, &table);
 
         let loaded = load(tmp.path(), fp, text, &table).expect("expected a cache hit");
         assert!(matches!(
             loaded.errors.as_slice(),
-            [ParseError::General(message)] if message == "boom"
+            [ParseError::Pos(3, 4, message)] if message == "boom"
         ));
 
         let dir = workspace_cache_dir(tmp.path(), fp);
@@ -802,7 +803,7 @@ mod tests {
         let table = StringTable::new();
         let fp = 8;
         validate_or_clear(tmp.path(), fp).unwrap();
-        let parsed = parse_string("a = 1\n", &table).unwrap();
+        let parsed = parse_string("a = 1\n", &table);
 
         let source_key = source_cache_key(&source).unwrap();
         store_path(tmp.path(), fp, &source, &source_key, &parsed, &table);
@@ -824,7 +825,7 @@ mod tests {
         let table = StringTable::new();
         let fp = 8;
         validate_or_clear(tmp.path(), fp).unwrap();
-        let parsed = parse_string("a = 1\n", &table).unwrap();
+        let parsed = parse_string("a = 1\n", &table);
 
         let source_key = source_cache_key(&source).unwrap();
         store_path(tmp.path(), fp, &source, &source_key, &parsed, &table);
@@ -841,7 +842,7 @@ mod tests {
         let table = StringTable::new();
         let fp = 9;
         validate_or_clear(tmp.path(), fp).unwrap();
-        let parsed = parse_string("a = 1\n", &table).unwrap();
+        let parsed = parse_string("a = 1\n", &table);
         let source_key = source_cache_key(&source).unwrap();
         store_path(tmp.path(), fp, &source, &source_key, &parsed, &table);
 
@@ -864,7 +865,7 @@ mod tests {
         let fp = 10;
         validate_or_clear(tmp.path(), fp).unwrap();
         let source_key = source_cache_key(&source).unwrap();
-        let parsed = parse_string("a = 1\n", &table).unwrap();
+        let parsed = parse_string("a = 1\n", &table);
 
         fs::write(&source, "a = 200\n").unwrap();
         store_path(tmp.path(), fp, &source, &source_key, &parsed, &table);
@@ -909,9 +910,8 @@ mod tests {
             let Some(source_key) = source_cache_key(path) else {
                 continue;
             };
-            if let Ok(text) = std::fs::read_to_string(path)
-                && let Ok(parsed) = parse_string(&text, &table)
-            {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let parsed = parse_string(&text, &table);
                 store_path(tmp.path(), fp, path, &source_key, &parsed, &table);
                 parsed_ok += 1;
             }
@@ -1158,7 +1158,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let table = StringTable::new();
         let text = "k = 1\n";
-        let parsed = parse_string(text, &table).unwrap();
+        let parsed = parse_string(text, &table);
         validate_or_clear(tmp.path(), 1).unwrap();
         store(tmp.path(), 1, text, &parsed, &table);
         validate_or_clear(tmp.path(), 2).unwrap();

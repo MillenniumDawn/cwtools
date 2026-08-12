@@ -170,12 +170,33 @@ pub fn check_loc_file_lang(file: &str, header_key: &str) -> Option<LangHeaderDia
     None
 }
 
+/// Fatal parse error for a YAML loc file (the language header itself is bad).
+/// Per-entry lenient failures are `LocParseError` on the file instead.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocFileParseError {
+    EmptyFile,
+    MissingColon { header: String },
+}
+
+impl std::fmt::Display for LocFileParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyFile => f.write_str("empty file after stripping comments"),
+            Self::MissingColon { header } => {
+                write!(f, "missing ':' in language header: {header:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LocFileParseError {}
+
 /// Parse a single YAML localisation file from text.
 ///
 /// Returns `Err` if the language header is malformed.
 /// Entries with invalid content still parse; the caller is responsible for
 /// calling `validate_quotes` / `validate_invalid_chars`.
-pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
+pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, LocFileParseError> {
     // One Arc allocation shared by every Position in this file.
     let stream_name: Arc<str> = Arc::from(name);
     // Strip leading UTF-8 BOM(s). Loc files are required to be UTF-8-with-BOM
@@ -200,7 +221,7 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
                 }
                 break line;
             }
-            None => return Err("empty file after stripping comments".to_string()),
+            None => return Err(LocFileParseError::EmptyFile),
         }
     };
 
@@ -208,7 +229,9 @@ pub fn parse_loc_text(text: &str, name: &str) -> Result<LocFile, String> {
     let header = header_line;
     let colon = header
         .find(':')
-        .ok_or_else(|| format!("missing ':' in language header: {header:?}"))?;
+        .ok_or_else(|| LocFileParseError::MissingColon {
+            header: header.to_string(),
+        })?;
     // Trim both ends: a header may carry leading whitespace (`  l_english:`),
     // which F# tolerates via `line.Trim()`. `trim_end` alone would leave the
     // leading space and fail the exact `key_to_language` lookup.
@@ -608,6 +631,45 @@ mod tests {
     #[test]
     fn test_empty_file() {
         assert!(parse_loc_text("", "test.yml").is_err());
+    }
+
+    #[test]
+    fn loc_file_parse_error_empty_file_variant_and_display() {
+        let err = parse_loc_text("", "test.yml").unwrap_err();
+        assert_eq!(err, LocFileParseError::EmptyFile);
+        assert_eq!(err.to_string(), "empty file after stripping comments");
+        // Empty file also when only comments / blanks precede EOF.
+        let err2 = parse_loc_text("# just a comment\n\n", "test.yml").unwrap_err();
+        assert_eq!(err2, LocFileParseError::EmptyFile);
+    }
+
+    #[test]
+    fn loc_file_parse_error_missing_colon_variant_and_display() {
+        let err = parse_loc_text("l_english\n key:0 \"v\"\n", "test.yml").unwrap_err();
+        match &err {
+            LocFileParseError::MissingColon { header } => assert_eq!(header, "l_english"),
+            other => panic!("expected MissingColon, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "missing ':' in language header: \"l_english\""
+        );
+    }
+
+    #[test]
+    fn loc_file_parse_error_propagates_through_service_boundary() {
+        // Service maps the typed error to String via Display; downstream
+        // LocService.errors and CLI diagnostics still see the same text.
+        let err = crate::service::parse_loc_files("bad.yml", "no colon here\n", None).unwrap_err();
+        assert!(matches!(err, LocFileParseError::MissingColon { .. }));
+        assert!(err.to_string().contains("missing ':'"));
+        let svc = crate::service::LocService::from_files(vec![(
+            "bad.yml".to_string(),
+            "no colon here\n".to_string(),
+        )]);
+        assert_eq!(svc.files().len(), 0);
+        assert!(!svc.errors().is_empty());
+        assert!(svc.errors()[0].1.contains("missing ':'"));
     }
 
     // ---- UTF-8 BOM tests ---------------------------------------------------

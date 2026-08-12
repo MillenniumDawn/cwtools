@@ -15,7 +15,7 @@ use cwtools_string_table::string_table::StringTable;
 use std::path::Path;
 
 const MAGIC: [u8; 4] = *b"CWB\x00";
-const FORMAT_VERSION: u8 = 3;
+const FORMAT_VERSION: u8 = 4;
 
 /// A small but structurally complete cache: leaves, a nested clause, a comment.
 fn sample_bytes() -> Vec<u8> {
@@ -29,7 +29,7 @@ nested = {
 }
 "#;
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
@@ -62,11 +62,12 @@ fn fingerprint_path(path: &Path) -> Result<Result<String, CacheError>, CacheErro
             for l in &arena.leaves {
                 let _ = write!(
                     out,
-                    "|L {:?} {:?} {:?} {:?}",
+                    "|L {:?} {:?} {:?} {:?} {:?}",
                     table.get_string(l.key.normal),
                     l.value,
                     l.op,
-                    l.pos
+                    l.pos,
+                    l.value_pos
                 );
             }
             for lv in &arena.leaf_values {
@@ -239,7 +240,7 @@ fn bit_flipped_payload_never_yields_an_altered_ast() {
 fn checksumless_frame_still_loads() {
     let input = "foo = bar\n";
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
     let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cached).unwrap();
 
@@ -306,6 +307,10 @@ fn out_of_bounds_index_inside_a_clause_is_rejected() {
             start_col: 0,
             end_line: 1,
             end_col: 5,
+            value_start_line: 1,
+            value_start_col: 0,
+            value_end_line: 1,
+            value_end_col: 5,
         }],
         leaf_values: vec![],
         comments: vec![],

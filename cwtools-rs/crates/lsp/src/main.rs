@@ -387,11 +387,6 @@ struct DocumentState {
     /// `window/workDoneProgress/cancel` sets one; the scan polls it. Entries
     /// live exactly as long as their command.
     pub(crate) command_cancels: parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// The `workDoneToken` of the command currently owning the progress
-    /// indicator, if any. While this is set, the scan's phase updates report
-    /// against it instead of opening the server's own `cwtools/scan` stream,
-    /// so one operation shows the user one progress bar.
-    pub(crate) active_command_progress: parking_lot::Mutex<Option<ProgressToken>>,
     /// Whether a scan has the loading indicator open, over both channels. The
     /// close is sent defensively from several places (a cancelled or panicked
     /// scan's `ScanGuard`, `cacheVanilla` after an index that may have been a
@@ -427,6 +422,8 @@ struct DocumentState {
     /// validation captures the value at spawn time; the cross-file dependent
     /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
     /// into the latest one instead of stacking up and double-validating.
+    /// Ordering is Relaxed: the counter only gates a staleness `!=` compare on
+    /// data already protected by locks, so no happens-before edge is needed.
     edit_generation: AtomicU64,
     /// Per open document, the interned `.lower` ids of the identifier-like
     /// tokens it mentions (keys + string values from its parsed AST). Used by
@@ -920,7 +917,6 @@ impl DocumentState {
             client_work_done_progress: std::sync::atomic::AtomicBool::new(false),
             scan_progress_active: std::sync::atomic::AtomicBool::new(false),
             command_cancels: parking_lot::Mutex::new(HashMap::new()),
-            active_command_progress: parking_lot::Mutex::new(None),
             loading_bar_active: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             handshake_complete: std::sync::atomic::AtomicBool::new(false),
@@ -990,15 +986,20 @@ struct Backend {
 /// to skip the per-keystroke re-parse that made large files lag.
 const DEBOUNCE_MS: u64 = 250;
 
-// ── Custom notification stubs ─────────────────────────────────────────────────
+/// Test-only one-shot panic switch for `CWTOOLS_VALIDATE_PANIC_ONCE` (#182),
+/// the debounced-validation counterpart of the scan-side switches. Fires at
+/// most once per server process so the e2e suite can prove a panicking
+/// validation is logged without arming every later edit.
+static VALIDATE_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
 
-// NOT PORTED — pre-trigger refactor.
-// (code-actions are handled in `code_action.rs`: QUICKFIX from SuggestedFix;
-// the techGraph / event-graph data is in `graph.rs` behind `getGraphData`.)
-// See the F# LanguageFeatures.fs module if these are needed later.
-//   - getEmbeddedMetadata: per-file metadata bundle sent to the extension on
-//     open (F# LanguageFeatures.getEmbeddedMetadata).  Low priority until the
-//     extension side is ported.
+// ── Custom notifications ──────────────────────────────────────────────────────
+
+// Code actions live in `code_action.rs` (QUICKFIX from SuggestedFix); the
+// techGraph / event-graph data is in `graph.rs` behind `getGraphData`.
+//
+// Not implemented: `getEmbeddedMetadata`, a per-file metadata bundle pushed to
+// the extension on open. Nothing in cwtools-vscode asks for it, so it stays
+// unbuilt until the extension side wants it.
 
 impl Backend {
     /// Spawn a background validation for `uri` at `version` and register the
@@ -1009,6 +1010,12 @@ impl Backend {
     /// version-checked snapshot inside `debounced_validate`, so a newer edit
     /// landing in the gap supersedes this one instead of publishing stale
     /// results.
+    ///
+    /// The task that joins the handle logs a panic instead of dropping it with
+    /// the handle (#182); the next edit is the retry. This site keeps its own
+    /// join rather than `scan::spawn_logging_panics` because it needs the
+    /// `AbortHandle` and must not report an ordinary supersede/close abort as
+    /// a panic.
     fn spawn_debounced_validate(
         &self,
         uri: String,
@@ -1026,6 +1033,11 @@ impl Backend {
         let handle = tokio::spawn(async move {
             if start_rx.await.is_err() {
                 return;
+            }
+            if crate::scan::env_flag("CWTOOLS_VALIDATE_PANIC_ONCE")
+                && VALIDATE_PANIC_ONCE.swap(false, Ordering::SeqCst)
+            {
+                panic!("CWTOOLS_VALIDATE_PANIC_ONCE: injected panic for #182 test coverage");
             }
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -1314,17 +1326,12 @@ impl Backend {
         }
         let table = self.state.string_table.clone();
         tokio::task::block_in_place(|| {
-            cwtools_parser::parser::parse_string(&text, &table)
-                .ok()
-                .map(|ast| {
-                    let ast = Arc::new(ast);
-                    *self.state.fresh_ast_cache.lock() =
-                        Some((uri.to_string(), version, Arc::clone(&ast)));
-                    AstSnapshot {
-                        ast,
-                        source: AstSource::FreshParse,
-                    }
-                })
+            let ast = Arc::new(cwtools_parser::parser::parse_string(&text, &table));
+            *self.state.fresh_ast_cache.lock() = Some((uri.to_string(), version, Arc::clone(&ast)));
+            Some(AstSnapshot {
+                ast,
+                source: AstSource::FreshParse,
+            })
         })
     }
 
@@ -1744,9 +1751,9 @@ impl LanguageServer for Backend {
         // sweep entirely, and a changed export refreshes only real dependents.
         // Bump the edit counter so that sweep is tagged and a later edit
         // supersedes it.
-        let generation = self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = self.state.edit_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.invalidate_semantic_tokens(&uri);
-        self.spawn_debounced_validate(uri.clone(), version, generation, ValidateTrigger::DidOpen, 0);
+        self.spawn_debounced_validate(uri, version, generation, ValidateTrigger::DidOpen, 0);
     }
 
     #[tracing::instrument(skip_all)]
@@ -1789,7 +1796,7 @@ impl LanguageServer for Backend {
 
         // Bump the global edit counter so any in-flight dependent sweep from an
         // earlier edit knows it has been superseded and can stop early.
-        let generation = self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = self.state.edit_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.invalidate_semantic_tokens(&uri);
 
         // Validate in the background after a short debounce so a burst of
@@ -1820,7 +1827,7 @@ impl LanguageServer for Backend {
         }) else {
             return;
         };
-        let generation = self.state.edit_generation.load(Ordering::Acquire);
+        let generation = self.state.edit_generation.load(Ordering::Relaxed);
         self.spawn_debounced_validate(uri, version, generation, ValidateTrigger::DidSave, 0);
     }
 
@@ -1874,15 +1881,10 @@ impl LanguageServer for Backend {
             tokio::task::spawn_blocking(move || {
                 use crate::access::{FileRead, MAX_URI_READ_BYTES, read_authorized};
                 match read_authorized(&uri, &roots, MAX_URI_READ_BYTES) {
-                    FileRead::Text(text) => {
-                        match cwtools_parser::parser::parse_string(&text, &table) {
-                            Ok(parsed) => DiskState::Parsed {
-                                parsed,
-                                discarded_edits: text != *buffer_text,
-                            },
-                            Err(_) => DiskState::Absent,
-                        }
-                    }
+                    FileRead::Text(text) => DiskState::Parsed {
+                        parsed: cwtools_parser::parser::parse_string(&text, &table),
+                        discarded_edits: text != *buffer_text,
+                    },
                     FileRead::Missing | FileRead::Refused => DiskState::Absent,
                 }
             })
@@ -1938,7 +1940,7 @@ impl LanguageServer for Backend {
             (
                 info.export_fingerprint(&uri),
                 info.export_names(&uri),
-                self.state.edit_generation.fetch_add(1, Ordering::AcqRel) + 1,
+                self.state.edit_generation.fetch_add(1, Ordering::Relaxed) + 1,
             )
         };
 
@@ -2154,13 +2156,17 @@ impl LanguageServer for Backend {
             // Move open-document state if the renamed file was open.
             let moved = {
                 let mut docs = self.state.documents.lock();
-                docs.remove(old).map(|doc| (old.to_string(), new.to_string(), doc))
+                docs.remove(old)
+                    .map(|doc| (old.to_string(), new.to_string(), doc))
             };
             if let Some((old_uri, new_uri, doc)) = moved {
                 let _ = self.state.documents.lock().open(new_uri.clone(), doc);
                 // Move cached tokens to the new URI so delta resumes.
                 if let Some(entry) = self.state.semantic_tokens_cache.lock().remove(&old_uri) {
-                    self.state.semantic_tokens_cache.lock().insert(new_uri, entry);
+                    self.state
+                        .semantic_tokens_cache
+                        .lock()
+                        .insert(new_uri, entry);
                 } else {
                     self.invalidate_semantic_tokens(&new_uri);
                 }
@@ -2327,7 +2333,7 @@ mod tests {
     #[test]
     fn document_store_keeps_stale_ast_source_in_the_budget() {
         let source = "root = { value = 1 }";
-        let ast = Arc::new(parse_string(source, &StringTable::new()).unwrap());
+        let ast = Arc::new(parse_string(source, &StringTable::new()));
         let mut store = DocumentStore::new();
         store
             .open("file:///doc".to_string(), document(source))
@@ -2772,7 +2778,7 @@ mod tests {
         let table = StringTable::new();
         // Nested: foo node containing a leaf "base = my_instance"
         let source = "foo = { base = my_instance }\n";
-        let parsed = parse_string(source, &table).unwrap();
+        let parsed = parse_string(source, &table);
 
         let mut rs = bool_enum_ruleset();
         // Use an AliasRule (not path-filtered) that contains base -> TypeField(my_type)

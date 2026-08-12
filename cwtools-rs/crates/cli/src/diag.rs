@@ -99,26 +99,9 @@ fn csv_escape(s: &str) -> Cow<'_, str> {
     }
 }
 
-/// Minimal JSON string escape.
-pub(crate) fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// One rendered diagnostic row for the `validate` report. Reads only
 /// file/severity/code/message/line/hash — never a diagnostic's `fix`, so a
-/// `SuggestedFix` payload is inert here (locked in by `fix_payload_is_inert`).
+/// `SuggestedFix` payload is inert here (locked in by `fix_payload_is_inert_in_report`).
 pub(crate) struct Diag {
     pub(crate) file: cwtools_validation::FilePath,
     pub(crate) severity: cwtools_validation::ErrorSeverity,
@@ -218,6 +201,32 @@ pub(crate) fn loc_diagnostic_to_diag(
     }
 }
 
+/// Map a rules-config `RuleParseError` to a report `Diag`, computing its hash
+/// from the trimmed source line. Consumes the error (moves the message). `root`
+/// is the rules root the hash is relativized against, so a baseline survives the
+/// ruleset being checked out somewhere else.
+pub(crate) fn rule_error_to_diag(
+    root: &Path,
+    err: cwtools_rules::ruleset_loader::RuleParseError,
+    line_text: &str,
+    legacy: bool,
+) -> Diag {
+    let file = err.file.to_string_lossy().into_owned();
+    let hash = diag_hash(root, &file, err.code, &err.message, line_text);
+    let legacy_hash = legacy_hash_if_wanted(legacy, root, &file, err.code, &err.message, err.line);
+    Diag {
+        file: file.as_str().into(),
+        severity: err.severity,
+        code: err.code,
+        message: err.message,
+        line: err.line,
+        // Rules columns are 0-based; both CI formats are 1-based.
+        col: err.col as u32 + 1,
+        hash,
+        legacy_hash,
+    }
+}
+
 /// Map a `LocService` fatal parse error (a file that couldn't even be
 /// lenient-parsed, so there's no line number) to a report `Diag`. Always
 /// Error-severity; `line` is 0 like other whole-file diagnostics, so there's no
@@ -258,16 +267,30 @@ pub(crate) fn csv_row(d: &Diag) -> String {
 
 /// One JSON report row (trailing newline included); `last` suppresses the comma.
 pub(crate) fn json_row(d: &Diag, last: bool) -> String {
-    format!(
-        "  {{\"file\":\"{}\",\"line\":{},\"severity\":\"{:?}\",\"code\":\"{}\",\"message\":\"{}\",\"hash\":\"{}\"}}{}\n",
-        json_escape(&d.file),
-        d.line,
-        d.severity,
-        json_escape(d.code),
-        json_escape(&d.message),
-        d.hash,
-        if last { "" } else { "," }
-    )
+    #[derive(serde::Serialize)]
+    struct JsonRow<'a> {
+        file: &'a str,
+        line: u32,
+        severity: String,
+        code: &'a str,
+        message: &'a str,
+        hash: &'a str,
+    }
+    let row = JsonRow {
+        file: &d.file,
+        line: d.line,
+        severity: format!("{:?}", d.severity),
+        code: d.code,
+        message: &d.message,
+        hash: &d.hash,
+    };
+    let mut s = String::from("  ");
+    s.push_str(&serde_json::to_string(&row).unwrap());
+    if !last {
+        s.push(',');
+    }
+    s.push('\n');
+    s
 }
 
 /// One grouped-CLI report row (the per-diagnostic line, not the file header).
@@ -309,6 +332,7 @@ mod tests {
             code: Some("CW282"),
             fix: None,
             end: None,
+            related: Vec::new(),
         }
     }
 
@@ -540,6 +564,41 @@ mod tests {
         assert_eq!(sources.trimmed("/no/such/file.txt", 1), "");
         // The slot re-fills when the file changes back.
         assert_eq!(sources.trimmed(path, 1), "first");
+    }
+
+    #[test]
+    fn json_row_escapes_special_characters_via_serde() {
+        let root = Path::new(".");
+        let mut err = err_base();
+        err.message = "say \"hi\"\\bye\n\r\t\u{0001}end".to_string();
+        err.file = "a/b\"c.txt".into();
+        let d = validation_to_diag(root, err, "x", false);
+        let row = json_row(&d, true);
+        // Must be valid JSON and round-trip.
+        let v: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(v["message"], "say \"hi\"\\bye\n\r\t\u{0001}end");
+        assert_eq!(v["file"], "a/b\"c.txt");
+        // Raw bytes must not contain a literal newline inside the string value.
+        assert!(row.contains("\\n"));
+        assert!(row.contains("\\r"));
+        assert!(row.contains("\\t"));
+        assert!(row.contains("\\\""));
+        assert!(row.contains("\\\\"));
+    }
+
+    #[test]
+    fn json_report_rows_form_a_valid_json_array() {
+        let root = Path::new(".");
+        let d0 = validation_to_diag(root, err_base(), "x", false);
+        let mut e1 = err_base();
+        e1.message = "other".to_string();
+        let d1 = validation_to_diag(root, e1, "y", false);
+        let mut out = String::from("[\n");
+        out.push_str(&json_row(&d0, false));
+        out.push_str(&json_row(&d1, true));
+        out.push_str("]\n");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
     }
 
     // Inertness guard (Task 8/18, step 2): a fix payload AND an end position must

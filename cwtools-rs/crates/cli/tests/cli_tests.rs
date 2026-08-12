@@ -148,6 +148,68 @@ fn test_rules_missing_file_fails() {
         .failure();
 }
 
+/// A rules directory with one hard problem (a reference to an undefined type)
+/// and one soft one (a `## cardinality` the loader can't parse).
+fn broken_rules_dir() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("broken.cwt"),
+        "types = { type[test_type] = { path = \"game/common\" } }\n\
+         ## cardinality = 0..x\n\
+         r = { a = <undefined_type> }\n",
+    )
+    .unwrap();
+    tmp
+}
+
+#[test]
+fn test_rules_clean_directory_reports_no_problems() {
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args(["rules", rules_dir.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Rules check complete: 0 errors, 0 warnings",
+        ));
+}
+
+#[test]
+fn test_rules_reports_coded_problems_and_fails() {
+    let rules = broken_rules_dir();
+    cwtools()
+        .args(["rules", rules.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW601"))
+        .stdout(predicate::str::contains("CW603"))
+        .stdout(predicate::str::contains(
+            "Rules check complete: 1 errors, 1 warnings",
+        ));
+}
+
+/// A machine-readable report owns stdout: the ruleset summary moves to stderr
+/// so `cwtools rules --report-type csv > out.csv` is a usable CSV.
+#[test]
+fn test_rules_csv_report_keeps_the_summary_off_stdout() {
+    let rules = broken_rules_dir();
+    cwtools()
+        .args([
+            "rules",
+            rules.path().to_str().unwrap(),
+            "--report-type",
+            "csv",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::starts_with(
+            "file,line,severity,code,message,hash\n",
+        ))
+        .stdout(predicate::str::contains("CW601"))
+        .stdout(predicate::str::contains("Types:").not())
+        .stderr(predicate::str::contains("Types:"));
+}
+
 // ── Serialize / Deserialize ──────────────────────────────────────────────────
 
 #[test]
@@ -261,6 +323,56 @@ fn test_validate_csv_report() {
         .assert()
         .success()
         .stdout(predicate::str::contains("file,line,severity"));
+}
+
+/// A broken `.cwt` degrades every check that runs against it, so `validate`
+/// carries the ruleset's own problems in its report and fails on them.
+#[test]
+fn test_validate_reports_rules_problems() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules = broken_rules_dir();
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules.path().to_str().unwrap(),
+            "--report-type",
+            "csv",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW601"))
+        .stdout(predicate::str::contains("CW603"));
+}
+
+/// Rules problems answer to the same code policy as everything else: suppress
+/// the error and the run is clean again.
+#[test]
+fn test_validate_ignore_code_suppresses_a_rules_problem() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules = broken_rules_dir();
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules.path().to_str().unwrap(),
+            "--report-type",
+            "csv",
+            "--ignore-code",
+            "CW601",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW601").not())
+        .stdout(predicate::str::contains("CW603"));
 }
 
 #[test]

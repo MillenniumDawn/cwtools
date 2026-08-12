@@ -73,7 +73,7 @@ equipments = {
 "#;
 
 fn build_index(ruleset: &cwtools_rules::rules_types::RuleSet, table: &StringTable) -> TypeIndex {
-    let parsed = parse_string(SCRIPT, table).unwrap();
+    let parsed = parse_string(SCRIPT, table);
     let logical = "common/units/equipment/ships.txt";
     let collected = cwtools_index::collect_type_instances_with_subtypes(
         ruleset,
@@ -118,8 +118,8 @@ fn instance_projection(
 #[test]
 fn fused_collection_matches_the_separate_walks() {
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(CWT, &table).unwrap(), &table);
-    let parsed = parse_string(SCRIPT, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parse_string(CWT, &table), &table);
+    let parsed = parse_string(SCRIPT, &table);
     let logical = "common/units/equipment/ships.txt";
 
     let separate_instances =
@@ -146,7 +146,7 @@ fn fused_collection_matches_the_separate_walks() {
 #[test]
 fn naval_variant_with_archetype_ref_activates_naval_equip() {
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(CWT, &table).unwrap(), &table);
+    let ruleset = ast_to_ruleset(&parse_string(CWT, &table), &table);
 
     // The archetype is tagged naval_equip from its own `type = submarine`.
     let idx = build_index(&ruleset, &table);
@@ -155,7 +155,7 @@ fn naval_variant_with_archetype_ref_activates_naval_equip() {
         "archetype should be a naval_equip member"
     );
 
-    let parsed = parse_string(SCRIPT, &table).unwrap();
+    let parsed = parse_string(SCRIPT, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,

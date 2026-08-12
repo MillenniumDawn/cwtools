@@ -11,7 +11,8 @@
 //! The ScopeRegistry cases exercise the loaded config's name lookup, named-link
 //! resolution, construction paths, and the validation save/restore lifecycle.
 //!
-//! The ruleset comes from a sibling checkout, same inputs as the corpus guard:
+//! The ruleset comes from a `cwtools-hoi4-config` checkout, same input as the
+//! corpus guard, named by `CWTOOLS_RULES` or found under `CWTOOLS_PROJECTS`:
 //!
 //!   CWTOOLS_RULES=/path/to/cwtools-hoi4-config/Config cargo bench -p cwtools_driver
 //!
@@ -133,20 +134,16 @@ fn bench_rules_hot(c: &mut Criterion) {
         return;
     };
     let table = StringTable::new();
-    let mut warnings = Vec::new();
-    let ruleset = {
-        let mut on_warning = |warning| warnings.push(warning);
-        match load_rules(&RulesInput::Dir(dir), &table, Some(&mut on_warning)) {
-            Ok(rs) => rs,
-            Err(e) => {
-                eprintln!("rules_hot: could not load rules: {e}");
-                return;
-            }
+    let (ruleset, rule_errors) = match load_rules(&RulesInput::Dir(dir), &table) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("rules_hot: could not load rules: {e}");
+            return;
         }
     };
     assert!(
-        warnings.is_empty(),
-        "rules_hot: load warnings: {warnings:?}"
+        rule_errors.is_empty(),
+        "rules_hot: rules problems: {rule_errors:?}"
     );
     let type_index = TypeIndex::default();
     let scope_registry =
@@ -176,7 +173,7 @@ fn bench_rules_hot(c: &mut Criterion) {
         scope_checks: false,
         var_checks: false,
     };
-    let ast = parse_string(FOCUS_FILE, &table).expect("parse focus file");
+    let ast = parse_string(FOCUS_FILE, &table);
     let path = "common/national_focus/bench.txt";
     let (line, col) = cursor_at(FOCUS_FILE, CURSOR_LINE);
 

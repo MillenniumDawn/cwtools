@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::ruleset_loader::RuleParseError;
+use cwtools_error_codes::CW603_RULES_INVALID_DIRECTIVE;
 use std::path::Path;
 
 /// Extract description from ### comments (## are options).
@@ -372,12 +373,13 @@ pub(crate) fn validate_comment_directives(ast: &ParsedFile, path: &Path) -> Vec<
             _ => None,
         };
         if let Some(message) = message {
-            errors.push(RuleParseError {
-                file: path.to_path_buf(),
-                line: comment.pos.start.line,
-                col: comment.pos.start.col,
+            errors.push(RuleParseError::new(
+                &CW603_RULES_INVALID_DIRECTIVE,
+                path.to_path_buf(),
+                comment.pos.start.line,
+                comment.pos.start.col,
                 message,
-            });
+            ));
         }
     }
     errors
@@ -523,7 +525,7 @@ mod tests {
 
     fn parse(src: &str) -> ParsedFile {
         let table = cwtools_string_table::string_table::StringTable::new();
-        cwtools_parser::parser::parse_string(src, &table).unwrap()
+        cwtools_parser::parser::parse_string(src, &table)
     }
 
     #[test]

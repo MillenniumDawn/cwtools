@@ -44,7 +44,7 @@ static REINDEX_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
 /// True when `name` is set to a truthy value (`1`, `true`, `yes`, `on`) — same
 /// convention as `cwtools_profiling::profile_enabled`, so `VAR=0` or an empty
 /// value (a shell habit for "unset") doesn't accidentally arm a test hook.
-fn env_flag(name: &str) -> bool {
+pub(crate) fn env_flag(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
@@ -312,10 +312,17 @@ impl Backend {
     /// `cacheVanilla` that hit a fresh cache and indexed nothing), and a client
     /// should see one close per open, not one per caller that thought about it.
     pub(crate) async fn send_loading_bar(&self, enable: bool, value: &str) {
-        self.send_loading_bar_pct(enable, value, None).await;
+        self.send_loading_bar_pct(None, enable, value, None).await;
     }
 
-    /// [`send_loading_bar`] with a known position on the 0-100 bar.
+    /// [`send_loading_bar`] with a known position on the 0-100 bar, reported
+    /// against `owner`'s stream when a command drove this scan.
+    ///
+    /// `owner` is the command whose `workspace/executeCommand` started the
+    /// work, not whichever command started last: two commands overlapping (a
+    /// `cacheVanilla` sent while a `reindexWorkspace` is still scanning) each
+    /// keep their own `$/progress` stream. `None` is the startup scan and the
+    /// periodic background pass, which report over the server's own stream.
     ///
     /// The percentage rides the `loadingBar` payload too (as an optional
     /// `percentage` field) so the extension's status bar can show it; a client
@@ -324,6 +331,7 @@ impl Backend {
     /// [`send_loading_bar`]: Backend::send_loading_bar
     pub(crate) async fn send_loading_bar_pct(
         &self,
+        owner: Option<&CommandProgress>,
         enable: bool,
         value: &str,
         percentage: Option<u32>,
@@ -339,7 +347,7 @@ impl Backend {
             None => serde_json::json!({ "enable": enable, "value": value }),
         };
         self.client.send_notification::<LoadingBar>(payload).await;
-        self.send_work_done_progress(enable, value, percentage)
+        self.send_work_done_progress(owner, enable, value, percentage)
             .await;
     }
 
@@ -348,26 +356,30 @@ impl Backend {
     /// ends it. Silent unless the client advertised `window.workDoneProgress` —
     /// a server-initiated progress needs `window/workDoneProgress/create`, and a
     /// client that didn't advertise support isn't required to answer it.
-    async fn send_work_done_progress(&self, enable: bool, value: &str, percentage: Option<u32>) {
+    async fn send_work_done_progress(
+        &self,
+        owner: Option<&CommandProgress>,
+        enable: bool,
+        value: &str,
+        percentage: Option<u32>,
+    ) {
         use tower_lsp::lsp_types::request::WorkDoneProgressCreate;
-        // A command that passed its own `workDoneToken` owns the indicator:
-        // its phases report against that token and its `end` is sent by
+        // A command that passed its own `workDoneToken` owns this scan: its
+        // phases report against that token and its `end` is sent by
         // `CommandProgress`, so opening the server's stream on top would show
-        // two bars for one operation. Cloned out of the lock first — the guard
-        // is `parking_lot`'s and must not be held across the await.
-        let command_token = self.state.active_command_progress.lock().clone();
+        // two bars for one operation.
+        let command_token = owner.and_then(CommandProgress::token).cloned();
         if let Some(token) = command_token
             && enable
         {
-            // Phase updates only. `begin`/`end` belong to the command, which
-            // outlives any single scan it triggers.
+            // Phase updates only. `begin`/`end` belong to `CommandProgress`,
+            // which outlives any single scan the command triggers.
             //
-            // The close deliberately falls through instead: a scan whose stream
-            // was opened *before* this command latched (the startup scan, still
-            // finishing when the user hits Re-index) still owes that stream an
-            // `end`, and swallowing it here would leave the client spinning on
-            // `cwtools/scan` forever. Below, an unopened stream is a no-op, so
-            // falling through costs a command-owned scan nothing.
+            // A close deliberately falls through to the server's stream
+            // instead: the startup scan may still have `cwtools/scan` open when
+            // the user hits Re-index, and swallowing its `end` here would leave
+            // the client spinning on it forever. Below, an unopened stream is a
+            // no-op, so falling through costs a command-owned scan nothing.
             self.client
                 .send_notification::<tower_lsp::lsp_types::notification::Progress>(ProgressParams {
                     token,
@@ -518,7 +530,7 @@ impl Backend {
             // checks fire (they're gated on `complete` to avoid false
             // positives during mod-only validation). The driver's Session
             // sets this for the CLI path; the LSP merges vanilla directly and
-            // must set it here too. See rule_core.rs gate on `idx.complete`.
+            // must set it here too. See rule_core/leaf.rs gate on `idx.complete`.
             info_guard.type_index.complete = true;
             // `vanilla_index` is now None — mark it merged so
             // ensure_vanilla_index does not re-run on the next scan.
@@ -680,18 +692,10 @@ impl Backend {
         let cancel = cancel_flag_of(progress);
         cwtools_profiling::log_rss("workspace_scan_start");
         if !quiet {
-            self.send_loading_bar_pct(true, Phase::Discover.label(), Some(0))
+            self.send_loading_bar_pct(progress, true, Phase::Discover.label(), Some(0))
                 .await;
         }
-        // `CWTOOLS_SCAN_HOLD_MS` test override: hold the scan open (after the
-        // loading bar, which doubles as the scan-started signal) so the tests
-        // can overlap it with watched-file batches deterministically.
-        if let Some(ms) = std::env::var("CWTOOLS_SCAN_HOLD_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        }
+        hold_scan_for_tests().await;
 
         let workspace_uri = self.state.config.read().workspace_uri.clone();
 
@@ -840,6 +844,7 @@ impl Backend {
         // within a single scan.
         if !quiet {
             self.send_loading_bar_pct(
+                progress,
                 true,
                 Phase::Parse.label(),
                 Some(phase_percentage(Phase::Parse, 0, 1)),
@@ -962,8 +967,7 @@ impl Backend {
                             Some(cwtools_cache::workspace::content_hash(&text)),
                         ));
                     }
-                    let parsed =
-                        parse_string_without_comments(&text, &self.state.string_table).ok()?;
+                    let parsed = parse_string_without_comments(&text, &self.state.string_table);
                     if let Some((cd, fp)) = cache_info.as_ref() {
                         if let Some(source_key) = source_key.as_ref() {
                             workspace_cache::store_path(
@@ -1140,13 +1144,14 @@ impl Backend {
         // takes effect when it returns.
         if !quiet {
             self.send_loading_bar_pct(
+                progress,
                 true,
                 Phase::Vanilla.label(),
                 Some(phase_percentage(Phase::Vanilla, 0, 1)),
             )
             .await;
         }
-        self.ensure_vanilla_index(false, quiet).await;
+        self.ensure_vanilla_index(progress, false, quiet).await;
         if cancel.is_cancelled() {
             return false;
         }
@@ -1172,6 +1177,7 @@ impl Backend {
         // quiet pass to compare against.
         if !quiet {
             self.send_loading_bar_pct(
+                progress,
                 true,
                 Phase::Localisation.label(),
                 Some(phase_percentage(Phase::Localisation, 0, 1)),
@@ -1211,6 +1217,7 @@ impl Backend {
         // whole session.
         if !quiet {
             self.send_loading_bar_pct(
+                progress,
                 true,
                 Phase::Validate.label(),
                 Some(phase_percentage(Phase::Validate, 0, 1)),
@@ -1445,6 +1452,7 @@ impl Backend {
                 }
                 if !quiet {
                     self.send_loading_bar_pct(
+                        progress,
                         true,
                         Phase::Publish.label(),
                         Some(phase_percentage(Phase::Publish, i + 1, publish_total)),
@@ -1912,7 +1920,16 @@ impl Backend {
     /// background pass that (re)indexes vanilla doesn't flash the status bar. The
     /// scan wrapper only clears the bar on a non-quiet run, so a quiet caller
     /// must not raise it or it would spin forever.
-    pub(crate) async fn ensure_vanilla_index(&self, force_rebuild: bool, quiet: bool) {
+    ///
+    /// `progress` is the command that asked for the index, so its phase report
+    /// lands on that command's own stream rather than whichever command started
+    /// most recently.
+    pub(crate) async fn ensure_vanilla_index(
+        &self,
+        progress: Option<&CommandProgress>,
+        force_rebuild: bool,
+        quiet: bool,
+    ) {
         // Already populated (or already merged into type_index and dropped)? Done.
         if !force_rebuild
             && (self.state.vanilla_index.lock().is_some()
@@ -2019,7 +2036,8 @@ impl Backend {
         }
 
         if !quiet {
-            self.send_loading_bar(true, "Indexing base game…").await;
+            self.send_loading_bar_pct(progress, true, "Indexing base game…", None)
+                .await;
         }
         self.client
             .log_message(
@@ -2414,7 +2432,7 @@ impl Backend {
             let queued: HashSet<String> =
                 { self.state.pending_changed_names.lock().drain().collect() };
             if !queued.is_empty() {
-                let generation = self.state.edit_generation.load(Ordering::SeqCst);
+                let generation = self.state.edit_generation.load(Ordering::Relaxed);
                 self.revalidate_open_dependents("", generation, Some(&queued))
                     .await;
             }
@@ -2650,6 +2668,30 @@ where
             tracing::error!("{context} panicked: {e}");
             false
         }
+    }
+}
+
+/// Hold an in-flight scan open when a test asks for it, from just after the
+/// loading bar so the scan-started signal is already out. `CWTOOLS_SCAN_HOLD_MS`
+/// holds for a fixed span, which is enough when a test only needs the scan busy
+/// while it sends something. `CWTOOLS_SCAN_HOLD_FILE` names a path and holds for
+/// as long as it exists, so a test that also cares *when* the hold ends starts
+/// and ends it on a signal it owns rather than betting on a wall-clock window
+/// that parallel load can blow through (#198). Unset, which is every real run,
+/// both are no-ops.
+async fn hold_scan_for_tests() {
+    if let Some(ms) = std::env::var("CWTOOLS_SCAN_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+    let Ok(gate) = std::env::var("CWTOOLS_SCAN_HOLD_FILE") else {
+        return;
+    };
+    let gate = std::path::PathBuf::from(gate);
+    while tokio::fs::try_exists(&gate).await.unwrap_or(false) {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 

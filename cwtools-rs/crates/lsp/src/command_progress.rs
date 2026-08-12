@@ -229,6 +229,12 @@ impl Drop for PhaseTicker {
 /// `loadingBar` + `cwtools/scan` reporting, so an older client (or a plain
 /// `:LspExecuteCommand` from an editor that doesn't pass tokens) behaves
 /// exactly as it did before.
+///
+/// Two commands in flight at once hold one of these each, and the work a
+/// command starts is handed the one that started it (#228). Nothing about the
+/// stream is global: a second command beginning cannot divert the first's
+/// phases onto its own token, and a second command ending cannot leave the
+/// first reporting to the server's stream.
 pub(crate) struct CommandProgress {
     state: Arc<DocumentState>,
     /// `None` when the request carried no token — every method is then a no-op
@@ -241,7 +247,7 @@ pub(crate) struct CommandProgress {
 }
 
 impl CommandProgress {
-    /// Register the token, latch it as the active indicator, and send `begin`.
+    /// Register the token and send `begin`.
     ///
     /// No `window/workDoneProgress/create` round trip: that request exists so a
     /// *server*-initiated token can be registered with the client, and this
@@ -272,10 +278,6 @@ impl CommandProgress {
             .command_cancels
             .lock()
             .insert(key.clone(), flag.clone());
-        // While a command owns the indicator, the scan's phase updates report
-        // against this token instead of opening the server's own stream — one
-        // operation should light up one progress bar, not two.
-        *backend.state.active_command_progress.lock() = Some(token.clone());
         let sink = ProgressSink {
             client: backend.client.clone(),
             token,
@@ -299,6 +301,14 @@ impl CommandProgress {
     /// The flag to hand to the scan.
     pub(crate) fn cancel_flag(&self) -> CancelFlag {
         self.cancel.clone()
+    }
+
+    /// The token this command's phase reports go to, or `None` when the request
+    /// carried none. The scan reports its boundaries against the token of the
+    /// command that started it, so two commands running at once keep their
+    /// streams apart.
+    pub(crate) fn token(&self) -> Option<&ProgressToken> {
+        self.sink.as_ref().map(|sink| &sink.token)
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -354,23 +364,10 @@ impl CommandProgress {
         }
     }
 
-    /// Drop the token from the cancel registry and, if we are still the active
-    /// indicator, release that too.
-    ///
-    /// The active-indicator slot is only cleared when it still holds *our*
-    /// token: commands are near-enough serialized by the scan flag, but
-    /// `cacheVanilla` doesn't take it, so a second command can legitimately
-    /// have latched itself in the meantime and must not be unlatched by our
-    /// exit.
+    /// Drop the token from the cancel registry.
     fn deregister(&self) {
         if let Some(key) = self.key.as_ref() {
             self.state.command_cancels.lock().remove(key);
-        }
-        if let Some(sink) = self.sink.as_ref() {
-            let mut active = self.state.active_command_progress.lock();
-            if active.as_ref() == Some(&sink.token) {
-                *active = None;
-            }
         }
     }
 }

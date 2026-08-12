@@ -77,9 +77,9 @@ fn resolve_with(
     for_completion: bool,
 ) -> Option<RuleContext> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let registry = build_scope_registry_arc(&ruleset, None);
     let prepared = Prepared {
         ruleset: &ruleset,
@@ -232,22 +232,20 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 alias[effect:needs_int] = int
 "#;
+    // Every usage is distinct, so nothing is reusable and the file spends the
+    // whole budget one usage before the end. The cursor lands in the last block,
+    // past the point validation gave up at.
     let mut script = String::from("foo = {\n");
-    for _ in 0..20 {
-        script.push_str("recurse = {\n");
+    for _ in 0..32_769 {
+        script.push_str("recurse = { }\n");
     }
-    // `bad` matches no overload, so no candidate ever comes back clean and the
-    // disjunction explores every branch — which is what exhausts the budget.
-    script.push_str("needs_int = 3\nbad = nope\n");
-    for _ in 0..=20 {
-        script.push_str("}\n");
-    }
+    script.push_str("recurse = {\nneeds_int = 3\n}\n}\n");
 
     // The fixture has to be one validation actually gives up on, or the
     // resolution below proves nothing.
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(cwt, &table).unwrap(), &table);
-    let parsed = parse_string(&script, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parse_string(cwt, &table), &table);
+    let parsed = parse_string(&script, &table);
     let errors = cwtools_validation::validate_ast(
         &parsed,
         &ruleset,
@@ -581,9 +579,9 @@ alias[trigger:always] = bool
     // child exists. Build it by replacing the marker with spaces.
     let script = script.replace("MARKER", "      ");
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(&script, &table).unwrap();
+    let parsed = parse_string(&script, &table);
     let prepared = Prepared {
         ruleset: &ruleset,
         table: &table,
@@ -709,10 +707,10 @@ fn cursor_on_blank_line_after_field_is_insert_position() {
     // value completions, usually empty) instead of the block's fields. It must be
     // an insert position (cwtools-vscode#20).
     let table = StringTable::new();
-    let parsed_cwt = parse_string(FOCUS_RULES, &table).unwrap();
+    let parsed_cwt = parse_string(FOCUS_RULES, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let script = "shared_focus = {\n\tid = my_shared\n\ticon = GFX_x\n\t\n}\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let registry = build_scope_registry_arc(&ruleset, None);
     let prepared = Prepared {
         ruleset: &ruleset,

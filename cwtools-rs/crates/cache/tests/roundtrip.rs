@@ -15,7 +15,7 @@ nested = {
 }
 "#;
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     // Serialize to temp file
@@ -34,6 +34,9 @@ nested = {
     assert_eq!(arena2.leaf_values.len(), parsed.arena.leaf_values.len());
     assert_eq!(arena2.comments.len(), parsed.arena.comments.len());
     assert_eq!(root2.len(), parsed.root_children.len());
+    for (actual, expected) in arena2.leaves.iter().zip(&parsed.arena.leaves) {
+        assert_eq!(actual.value_pos, expected.value_pos);
+    }
 }
 
 #[test]
@@ -44,7 +47,7 @@ fn roundtrip_real_file() {
     );
     let input = std::fs::read_to_string(path).unwrap();
     let table = StringTable::new();
-    let parsed = parse_string(&input, &table).unwrap();
+    let parsed = parse_string(&input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
@@ -88,7 +91,7 @@ nested = {
 key_a key_b = { x = 1 }
 "#;
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     // Archived path.
@@ -196,6 +199,7 @@ fn archived_to_arena_matches_reference_over_corpus() {
         for (a, b) in parsed.arena.leaves.iter().zip(arch_arena.leaves.iter()) {
             assert_eq!(a.op, b.op, "{ctx}");
             assert_eq!(a.pos, b.pos, "{ctx}");
+            assert_eq!(a.value_pos, b.value_pos, "{ctx}");
         }
         assert_eq!(
             parsed.arena.leaf_values.len(),

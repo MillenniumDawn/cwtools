@@ -17,9 +17,9 @@ use cwtools_validation::validate_ast;
 
 fn codes_for(cwt: &str, script: &str) -> Vec<String> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     errors
         .into_iter()
@@ -42,9 +42,9 @@ foo = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(RULES, &table).unwrap();
+    let parsed_cwt = parse_string(RULES, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string("foo = { name = x }", &table).unwrap();
+    let parsed = parse_string("foo = { name = x }", &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     let cw242 = errors
         .iter()
@@ -149,9 +149,9 @@ fn validate_pair(
     Vec<cwtools_validation::ValidationError>,
 ) {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     (table, ruleset, errors)
 }
@@ -178,11 +178,161 @@ fn cw263_close_match_attaches_did_you_mean_fix() {
     );
 
     // The corrected key matches `count = int`; CW263 is gone on revalidation.
-    let ast2 = parse_string(&fixed, &table).unwrap();
+    let ast2 = parse_string(&fixed, &table);
     let errors2 = validate_ast(&ast2, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         !errors2.iter().any(|e| e.code == Some("CW263")),
         "CW263 must be gone after applying the fix"
+    );
+}
+
+const ENUM_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { historic fantasy sandbox } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_enum_close_match_attaches_did_you_mean_fix() {
+    use cwtools_parser::fix::apply_edits;
+    let script = "foo = {\n    mode = histroic  # typo\n}\n";
+    let (table, ruleset, errors) = validate_pair(ENUM_RULES, script);
+
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+    assert_eq!(fix.title, "Did you mean 'historic'?");
+
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, "foo = {\n    mode = \"historic\"  # typo\n}\n");
+
+    let ast2 = parse_string(&fixed, &table);
+    let errors2 = validate_ast(&ast2, &ruleset, &table, "test.txt", None, None, None);
+    assert!(
+        !errors2.iter().any(|e| e.code == Some("CW240")),
+        "CW240 must be gone after applying the fix"
+    );
+}
+
+#[test]
+fn cw240_quoted_enum_value_replaces_the_quotes_too() {
+    use cwtools_parser::fix::apply_edits;
+
+    let script = "foo = { mode = \"histroic\" }";
+    let (_table, _ruleset, errors) = validate_pair(ENUM_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+
+    assert_eq!(
+        apply_edits(script, &fix.edits),
+        "foo = { mode = \"historic\" }"
+    );
+}
+
+const SPACED_ENUM_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { "historic mode" fantasy sandbox } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_spaced_enum_value_keeps_its_quotes() {
+    use cwtools_parser::fix::apply_edits;
+
+    let script = "foo = { mode = \"histroic mode\" }";
+    let (_table, _ruleset, errors) = validate_pair(SPACED_ENUM_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+
+    assert_eq!(
+        apply_edits(script, &fix.edits),
+        "foo = { mode = \"historic mode\" }"
+    );
+}
+
+const BOOLEAN_ENUM_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { yes fantasy sandbox } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_boolean_enum_suggestion_stays_a_string() {
+    use cwtools_parser::fix::apply_edits;
+
+    let script = "foo = { mode = yess }";
+    let (table, ruleset, errors) = validate_pair(BOOLEAN_ENUM_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, "foo = { mode = \"yes\" }");
+    let ast = parse_string(&fixed, &table);
+    assert!(
+        !validate_ast(&ast, &ruleset, &table, "test.txt", None, None, None)
+            .iter()
+            .any(|e| e.code == Some("CW240")),
+        "quoted boolean enum member must revalidate cleanly"
+    );
+}
+
+const ESCAPED_ENUM_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { "hist\"oric\\mode" fantasy sandbox } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_enum_suggestion_escapes_quotes_and_backslashes() {
+    use cwtools_parser::fix::apply_edits;
+
+    let script = r#"foo = { mode = "histr\"oric\\mode" }"#;
+    let (table, ruleset, errors) = validate_pair(ESCAPED_ENUM_RULES, script);
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    let fix = err.fix.as_ref().expect("CW240 carries a did-you-mean fix");
+
+    assert_eq!(fix.title, "Did you mean 'hist\"oric\\mode'?");
+    let fixed = apply_edits(script, &fix.edits);
+    assert_eq!(fixed, r#"foo = { mode = "hist\"oric\\mode" }"#);
+    let ast = parse_string(&fixed, &table);
+    assert!(
+        !validate_ast(&ast, &ruleset, &table, "test.txt", None, None, None)
+            .iter()
+            .any(|e| e.code == Some("CW240")),
+        "escaped enum member must revalidate cleanly"
+    );
+}
+
+const ENUM_TIE_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+enums = { enum[mode] = { dark dusk } }
+foo = { mode = enum[mode] }
+"#;
+
+#[test]
+fn cw240_enum_ambiguous_match_has_no_fix() {
+    let (_t, _r, errors) = validate_pair(ENUM_TIE_RULES, "foo = { mode = dask }");
+    let err = errors
+        .iter()
+        .find(|e| e.code == Some("CW240"))
+        .expect("CW240 emitted");
+    assert!(
+        err.fix.is_none(),
+        "ambiguous suggestion must not carry a fix"
     );
 }
 
@@ -211,7 +361,7 @@ fn cw262_close_match_attaches_did_you_mean_fix() {
     let fixed = apply_edits(script, &fix.edits);
     assert_eq!(fixed, "foo = {\n    settings = { x = 1 }\n}\n");
 
-    let ast2 = parse_string(&fixed, &table).unwrap();
+    let ast2 = parse_string(&fixed, &table);
     let errors2 = validate_ast(&ast2, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         !errors2.iter().any(|e| e.code == Some("CW262")),

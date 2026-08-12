@@ -32,7 +32,7 @@ enums = {
 "#;
 
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let ruleset = ast_to_ruleset(&parsed, &table);
 
     assert_eq!(ruleset.aliases.len(), 1); // alias[effect:create_starbase] extracted
@@ -63,7 +63,7 @@ fn test_parse_real_cwt() {
     );
     let input = std::fs::read_to_string(path).unwrap();
     let table = StringTable::new();
-    let parsed = parse_string(&input, &table).unwrap();
+    let parsed = parse_string(&input, &table);
     let ruleset = ast_to_ruleset(&parsed, &table);
 
     assert!(!ruleset.types.is_empty(), "expected at least one type");
@@ -139,7 +139,7 @@ fn test_parse_stellaris_ethics() {
     );
     let input = std::fs::read_to_string(path).unwrap();
     let table = StringTable::new();
-    let parsed = parse_string(&input, &table).unwrap();
+    let parsed = parse_string(&input, &table);
     let ruleset = ast_to_ruleset(&parsed, &table);
 
     assert!(!ruleset.types.is_empty(), "expected at least one type");
