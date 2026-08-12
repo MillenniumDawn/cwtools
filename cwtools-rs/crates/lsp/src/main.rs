@@ -387,11 +387,6 @@ struct DocumentState {
     /// `window/workDoneProgress/cancel` sets one; the scan polls it. Entries
     /// live exactly as long as their command.
     pub(crate) command_cancels: parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// The `workDoneToken` of the command currently owning the progress
-    /// indicator, if any. While this is set, the scan's phase updates report
-    /// against it instead of opening the server's own `cwtools/scan` stream,
-    /// so one operation shows the user one progress bar.
-    pub(crate) active_command_progress: parking_lot::Mutex<Option<ProgressToken>>,
     /// Whether a scan has the loading indicator open, over both channels. The
     /// close is sent defensively from several places (a cancelled or panicked
     /// scan's `ScanGuard`, `cacheVanilla` after an index that may have been a
@@ -908,7 +903,6 @@ impl DocumentState {
             client_work_done_progress: std::sync::atomic::AtomicBool::new(false),
             scan_progress_active: std::sync::atomic::AtomicBool::new(false),
             command_cancels: parking_lot::Mutex::new(HashMap::new()),
-            active_command_progress: parking_lot::Mutex::new(None),
             loading_bar_active: std::sync::atomic::AtomicBool::new(false),
             index_ready: std::sync::atomic::AtomicBool::new(false),
             handshake_complete: std::sync::atomic::AtomicBool::new(false),
