@@ -5,7 +5,7 @@ on:
   # manual fallback for re-runs (off a tag ref it builds but skips publish).
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 # Never cancel an in-flight release; queue instead.
