@@ -13,8 +13,11 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Default to least privilege; only publish widens to write. The build jobs
+# compile dependency build scripts and proc macros, so they must not hold a
+# repository-write credential.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,6 +57,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust toolchain (stable)
         # stable
@@ -147,6 +151,8 @@ jobs:
         working-directory: cwtools-rs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain (stable)
         # stable
         uses: "dtolnay/rust-toolchain@29eef336d9b2848a0b54\
@@ -183,6 +189,9 @@ jobs:
     needs: [release-rs, release-test]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    # The only job that writes: `gh release create/upload` needs it.
+    permissions:
+      contents: write
     steps:
       - name: Download archives
         # v8.0.1
