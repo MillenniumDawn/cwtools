@@ -825,6 +825,8 @@ fn alias_branch_budget_accepts_exact_capacity() {
     );
 }
 
+/// The budget is the fallback guarantee: distinct usages have nothing to reuse,
+/// so 32,769 of them still stop the file one usage past capacity.
 #[test]
 fn alias_branch_budget_rejects_the_next_usage() {
     let errors = validate_aliases(
@@ -834,31 +836,32 @@ fn alias_branch_budget_rejects_the_next_usage() {
     assert_eq!(errors.len(), 1, "expected one limit diagnostic: {errors:?}");
     assert_eq!(errors[0].code, Some("CW277"));
     assert_eq!(errors[0].severity, ErrorSeverity::Warning);
+    // The usage that could not be funded, squiggling its key.
+    assert_eq!((errors[0].line, errors[0].col), (32_770, 0));
+    assert_eq!(errors[0].end, Some((32_770, 7)));
 }
 
+/// Distinct overloads (only the severity differs, so the equivalent-candidate
+/// coalescing cannot collapse them) recurse into the same subtree in the same
+/// state at every level. The memo answers the repeat, so a depth that used to
+/// spend the whole budget validates to the bottom instead.
 #[test]
-fn distinct_recursive_aliases_stop_at_the_branch_budget() {
+fn distinct_recursive_aliases_are_memoized_not_capped() {
     let errors = validate_recursive_aliases(RECURSIVE_DISTINCT_ALIAS_RULES, 20);
-    let capped: Vec<_> = errors
-        .iter()
-        .filter(|error| error.code == Some("CW277"))
-        .collect();
-    assert_eq!(capped.len(), 1, "expected one limit diagnostic: {errors:?}");
-    assert_eq!(capped[0].severity, ErrorSeverity::Warning);
-    assert_eq!((capped[0].line, capped[0].col), (21, 0));
-    assert_eq!(capped[0].end, Some((21, 7)));
     assert!(
-        errors.iter().all(|error| error.code != Some("CW263")),
-        "the cap must stop before validating the deepest invalid field: {errors:?}"
+        errors.iter().all(|error| error.code != Some("CW277")),
+        "an equivalent repeated subtree must not exhaust the budget: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| error.code == Some("CW263")),
+        "the deepest invalid field should be reported: {errors:?}"
     );
 }
 
 /// The disjunction accepts on the first clean candidate, so a file that is
 /// actually valid never opens the second overload and never spends the budget.
 /// That is what keeps the cap off legitimate script: depth alone is not what
-/// exhausts it, unresolvable depth is — the same shape that caps at 20 levels
-/// in [`distinct_recursive_aliases_stop_at_the_branch_budget`] validates clean
-/// at 40 once the innermost block resolves.
+/// exhausts it, unresolvable depth is.
 ///
 /// Kept to 40 deliberately. The deepest nesting in real content is 24, the
 /// parser refuses to descend past `MAX_CLAUSE_DEPTH`, and a debug-build walk
@@ -897,13 +900,11 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 /// report the limit too, or an OOB-shaped file stops validating in silence.
 #[test]
 fn type_per_file_recursion_stops_at_the_branch_budget() {
+    // One usage past capacity, all of them distinct, so there is nothing for the
+    // memo to reuse and the budget is what stops the file.
     let mut script = String::new();
-    for _ in 0..20 {
-        script.push_str("recurse = {\n");
-    }
-    script.push_str("bad = nope\n");
-    for _ in 0..20 {
-        script.push_str("}\n");
+    for _ in 0..32_769 {
+        script.push_str("recurse = { }\n");
     }
     let errors = validate_aliases_at(
         RECURSIVE_PER_FILE_ALIAS_RULES,

@@ -232,16 +232,14 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 alias[effect:needs_int] = int
 "#;
+    // Every usage is distinct, so nothing is reusable and the file spends the
+    // whole budget one usage before the end. The cursor lands in the last block,
+    // past the point validation gave up at.
     let mut script = String::from("foo = {\n");
-    for _ in 0..20 {
-        script.push_str("recurse = {\n");
+    for _ in 0..32_769 {
+        script.push_str("recurse = { }\n");
     }
-    // `bad` matches no overload, so no candidate ever comes back clean and the
-    // disjunction explores every branch — which is what exhausts the budget.
-    script.push_str("needs_int = 3\nbad = nope\n");
-    for _ in 0..=20 {
-        script.push_str("}\n");
-    }
+    script.push_str("recurse = {\nneeds_int = 3\n}\n}\n");
 
     // The fixture has to be one validation actually gives up on, or the
     // resolution below proves nothing.

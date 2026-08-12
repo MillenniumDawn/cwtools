@@ -3675,22 +3675,22 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
 alias[effect:needs_int] = int
 "#;
 
-/// A `common/users` file whose recursive alias exhausts the branch budget,
-/// preceded by `noise` single-overload value errors. Those cost no budget, so
-/// the caller can push the file past the server's per-file diagnostic cap
-/// without changing where the cap falls.
+/// A `common/users` file whose alias usages exhaust the branch budget, preceded
+/// by `noise` single-overload value errors. Those cost no budget, so the caller
+/// can push the file past the server's per-file diagnostic cap without changing
+/// where the cap falls.
+///
+/// Every usage is its own, so there is nothing for the alias memo to reuse and
+/// the budget is what stops the file: one two-overload usage past capacity.
 fn capped_alias_file(noise: usize) -> String {
     let mut text = String::from("a_user = {\n");
     for _ in 0..noise {
         text.push_str("needs_int = nope\n");
     }
-    for _ in 0..20 {
-        text.push_str("recurse = {\n");
+    for _ in 0..32_769 {
+        text.push_str("recurse = { }\n");
     }
-    text.push_str("bad = nope\n");
-    for _ in 0..=20 {
-        text.push_str("}\n");
-    }
+    text.push_str("}\n");
     text
 }
 
