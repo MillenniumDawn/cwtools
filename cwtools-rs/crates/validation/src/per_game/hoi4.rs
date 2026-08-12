@@ -88,7 +88,7 @@ mod tests {
 
     fn run(src: &str) -> Vec<ValidationError> {
         let table = StringTable::new();
-        let ast = parse_string(src, &table).expect("parse");
+        let ast = parse_string(src, &table);
         let ruleset = cwtools_rules::rules_types::RuleSet::new();
         let mut errors = Vec::new();
         validate_hoi4(&ast, &ruleset, &table, &"test.txt".into(), &mut errors);
@@ -135,7 +135,7 @@ mod tests {
         use cwtools_parser::fix::apply_edits;
         let src = "my_idea = { allowed_civil_war = { always = no } }\n";
         let table = StringTable::new();
-        let ast = parse_string(src, &table).expect("parse");
+        let ast = parse_string(src, &table);
         let ruleset = cwtools_rules::rules_types::RuleSet::new();
         let mut errors = Vec::new();
         validate_hoi4(&ast, &ruleset, &table, &"test.txt".into(), &mut errors);
@@ -148,7 +148,7 @@ mod tests {
         let fixed = apply_edits(src, &fix.edits);
         assert_eq!(fixed, "my_idea = { }\n");
 
-        let ast2 = parse_string(&fixed, &table).expect("parse");
+        let ast2 = parse_string(&fixed, &table);
         let mut errors2 = Vec::new();
         validate_hoi4(&ast2, &ruleset, &table, &"test.txt".into(), &mut errors2);
         assert!(

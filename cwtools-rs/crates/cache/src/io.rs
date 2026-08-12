@@ -48,7 +48,11 @@ const MAGIC: &[u8; 4] = b"CWB\x00";
 const FORMAT_VERSION: u8 = 4;
 
 const ERRORS_MAGIC: &[u8; 4] = b"CWE\x00";
-const ERRORS_FORMAT_VERSION: u8 = 1;
+/// v1: initial versioned sidecar.
+/// v2: dropped `CachedParseError::General` (the parser only ever records a
+///     positioned error), so a v1 sidecar can hold a variant that no longer
+///     exists.
+const ERRORS_FORMAT_VERSION: u8 = 2;
 
 /// Hard caps on a `.cwb` read and on what its body may decompress to. A cache
 /// path is chosen by a CLI flag or an LSP client (#162), so neither the read nor

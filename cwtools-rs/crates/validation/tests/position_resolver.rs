@@ -77,9 +77,9 @@ fn resolve_with(
     for_completion: bool,
 ) -> Option<RuleContext> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let registry = build_scope_registry_arc(&ruleset, None);
     let prepared = Prepared {
         ruleset: &ruleset,
@@ -246,8 +246,8 @@ alias[effect:needs_int] = int
     // The fixture has to be one validation actually gives up on, or the
     // resolution below proves nothing.
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(cwt, &table).unwrap(), &table);
-    let parsed = parse_string(&script, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parse_string(cwt, &table), &table);
+    let parsed = parse_string(&script, &table);
     let errors = cwtools_validation::validate_ast(
         &parsed,
         &ruleset,
@@ -581,9 +581,9 @@ alias[trigger:always] = bool
     // child exists. Build it by replacing the marker with spaces.
     let script = script.replace("MARKER", "      ");
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(&script, &table).unwrap();
+    let parsed = parse_string(&script, &table);
     let prepared = Prepared {
         ruleset: &ruleset,
         table: &table,
@@ -709,10 +709,10 @@ fn cursor_on_blank_line_after_field_is_insert_position() {
     // value completions, usually empty) instead of the block's fields. It must be
     // an insert position (cwtools-vscode#20).
     let table = StringTable::new();
-    let parsed_cwt = parse_string(FOCUS_RULES, &table).unwrap();
+    let parsed_cwt = parse_string(FOCUS_RULES, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let script = "shared_focus = {\n\tid = my_shared\n\ticon = GFX_x\n\t\n}\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let registry = build_scope_registry_arc(&ruleset, None);
     let prepared = Prepared {
         ruleset: &ruleset,

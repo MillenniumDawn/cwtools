@@ -265,8 +265,6 @@ fn accept_script_file(cfg: &FileManagerConfig, path: &Path) -> bool {
 pub enum FileError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Parse error: {0}")]
-    Parse(String),
     /// The configured root isn't a directory. Distinct from an empty walk: a
     /// path that doesn't resolve must not read as "this mod has no files".
     #[error("directory does not exist: {0}")]
@@ -514,19 +512,14 @@ impl FileManager {
                         return None;
                     }
                 };
-                match parse_string_without_comments(&content, table) {
-                    Ok(parsed) => Some(ParsedFile {
-                        path: file.path,
-                        logical_path: file.logical_path,
-                        arena: parsed.arena,
-                        root_children: parsed.root_children,
-                        errors: parsed.errors,
-                    }),
-                    Err(e) => {
-                        eprintln!("warn: skipping {}: {}", file.path.display(), e);
-                        None
-                    }
-                }
+                let parsed = parse_string_without_comments(&content, table);
+                Some(ParsedFile {
+                    path: file.path,
+                    logical_path: file.logical_path,
+                    arena: parsed.arena,
+                    root_children: parsed.root_children,
+                    errors: parsed.errors,
+                })
             })
             .collect();
 
@@ -622,19 +615,14 @@ impl FileManager {
                         return None;
                     }
                 };
-                match parse_string_without_comments(&content, table) {
-                    Ok(parsed) => Some(ParsedFile {
-                        path: file.path,
-                        logical_path: file.logical_path,
-                        arena: parsed.arena,
-                        root_children: parsed.root_children,
-                        errors: parsed.errors,
-                    }),
-                    Err(e) => {
-                        eprintln!("warn: skipping {}: {}", file.path.display(), e);
-                        None
-                    }
-                }
+                let parsed = parse_string_without_comments(&content, table);
+                Some(ParsedFile {
+                    path: file.path,
+                    logical_path: file.logical_path,
+                    arena: parsed.arena,
+                    root_children: parsed.root_children,
+                    errors: parsed.errors,
+                })
             })
             .collect();
 
@@ -644,16 +632,14 @@ impl FileManager {
     pub fn parse_single_file(&mut self, path: &Path) -> Result<ParsedFile, FileError> {
         let content = read_text(path)?;
         let logical_path = compute_logical_path(path, &self.config.root);
-        match parse_string(&content, &self.string_table) {
-            Ok(parsed) => Ok(ParsedFile {
-                path: path.to_path_buf(),
-                logical_path,
-                arena: parsed.arena,
-                root_children: parsed.root_children,
-                errors: parsed.errors,
-            }),
-            Err(e) => Err(FileError::Parse(format!("{}: {}", path.display(), e))),
-        }
+        let parsed = parse_string(&content, &self.string_table);
+        Ok(ParsedFile {
+            path: path.to_path_buf(),
+            logical_path,
+            arena: parsed.arena,
+            root_children: parsed.root_children,
+            errors: parsed.errors,
+        })
     }
 }
 

@@ -35,16 +35,16 @@ fn validate(
     file_path: &str,
 ) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(rules, &table).unwrap(), &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parse_string(rules, &table), &table);
+    let parsed = parse_string(script, &table);
     let idx = TypeIndex::new();
     validate_ast(&parsed, &ruleset, &table, file_path, None, Some(&idx), None)
 }
 
 fn navigate(rules: &str, script: &str, file_path: &str, marker: &str) -> Option<RuleContext> {
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(rules, &table).unwrap(), &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parse_string(rules, &table), &table);
+    let parsed = parse_string(script, &table);
     let registry = build_scope_registry_arc(&ruleset, None);
     let prepared = Prepared {
         ruleset: &ruleset,

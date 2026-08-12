@@ -15,25 +15,15 @@ pub(super) fn serialize(input: PathBuf, output: PathBuf) {
         std::process::exit(1);
     });
     let table = StringTable::new();
-    match parse_string(&input_str, &table) {
-        Ok(parsed) => {
-            let cached = cwtools_cache::convert::arena_to_cached(
-                &parsed.arena,
-                &parsed.root_children,
-                &table,
-            );
-            match cwtools_cache::io::serialize_to_file(&cached, &output) {
-                Ok(_) => {
-                    println!("Serialized to {}", output.display());
-                }
-                Err(e) => {
-                    eprintln!("Error serializing: {}", e);
-                    std::process::exit(1);
-                }
-            }
+    let parsed = parse_string(&input_str, &table);
+    let cached =
+        cwtools_cache::convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
+    match cwtools_cache::io::serialize_to_file(&cached, &output) {
+        Ok(_) => {
+            println!("Serialized to {}", output.display());
         }
         Err(e) => {
-            eprintln!("Error parsing {}: {}", input.display(), e);
+            eprintln!("Error serializing: {}", e);
             std::process::exit(1);
         }
     }

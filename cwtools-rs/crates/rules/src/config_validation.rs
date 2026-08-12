@@ -279,7 +279,7 @@ mod tests {
 
     fn check(src: &str) -> Vec<RuleParseError> {
         let table = StringTable::new();
-        let parsed = parse_string(src, &table).unwrap();
+        let parsed = parse_string(src, &table);
         let ruleset = ast_to_ruleset(&parsed, &table);
         let files = vec![(PathBuf::from("test.cwt"), parsed)];
         validate_ruleset_references(&files, &ruleset, &table)
@@ -291,7 +291,7 @@ mod tests {
                    enums = {\n    enum[stat] = { army navy }\n    complex_enum[cats] = { path = \"common/c\" name = { x } }\n}\n\
                    single_alias[block] = { a = bool }\n";
         let table = StringTable::new();
-        let parsed = parse_string(src, &table).unwrap();
+        let parsed = parse_string(src, &table);
         let mut out = Vec::new();
         collect_definition_positions(&PathBuf::from("defs.cwt"), &parsed, &table, &mut out);
         let find = |kind: CwtDefKind, name: &str| {
@@ -350,8 +350,8 @@ mod tests {
         let table = StringTable::new();
         let a_src = "types = {\n    type[foo] = { path = \"common/foo\" }\n}\n";
         let b_src = "r = {\n    a = <foo>\n    b = <bar>\n}\n";
-        let a = parse_string(a_src, &table).unwrap();
-        let b = parse_string(b_src, &table).unwrap();
+        let a = parse_string(a_src, &table);
+        let b = parse_string(b_src, &table);
 
         let mut merged = ast_to_ruleset(&a, &table);
         merge_ruleset(&mut merged, ast_to_ruleset(&b, &table));

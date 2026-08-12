@@ -4,8 +4,6 @@ use cwtools_string_table::string_table::StringTokens;
 pub enum ParseError {
     #[error("{0}:{1}: {2}")]
     Pos(u32, u16, String),
-    #[error("{0}")]
-    General(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

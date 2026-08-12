@@ -31,9 +31,9 @@ fn errors_hoi4_at(
     type_index: Option<&TypeIndex>,
 ) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     validate_prepared(
         &parsed,
@@ -294,7 +294,7 @@ foo = {
     dummy = scalar
 }
 "#;
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let mut modifiers = HashSet::new();
@@ -305,7 +305,7 @@ foo = {
     attack_factor = 0
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(
         &parsed,
@@ -339,7 +339,7 @@ foo = {
     dummy = scalar
 }
 "#;
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let mut modifiers = HashSet::new();
@@ -350,7 +350,7 @@ foo = {
     attack_factor = 0.05
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(
         &parsed,
@@ -386,9 +386,9 @@ foo = {
     dummy = scalar
 }
 "#;
-    let ruleset = ast_to_ruleset(&parse_string(cwt, &table).unwrap(), &table);
+    let ruleset = ast_to_ruleset(&parse_string(cwt, &table), &table);
     let mods: HashSet<String> = modifiers.iter().map(|m| m.to_string()).collect();
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     validate_prepared(
         &parsed,
