@@ -37,8 +37,13 @@
 //! name a symlink at all. The base game and the rules dir are readable but
 //! never writable, so the two boundaries take different root lists
 //! ([`crate::Config::authorized_roots`] and [`crate::Config::editable_roots`]).
+//!
+//! A path a mod *writes* rather than a client sends gets a third and smaller
+//! boundary in [`contained_search_path`]: the document-link and goto probes
+//! join a `filepath[..]` leaf value onto the search roots and stat the result,
+//! which without containment answers whether a file exists anywhere on disk.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use tower_lsp::lsp_types::Url;
 
@@ -164,6 +169,43 @@ fn canonicalize_for_containment(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The first of `roots` under which the relative reference `rel` names an
+/// existing file, or `None` when it names none of them.
+///
+/// A `filepath[..]` leaf value is mod content rather than a client URI, but the
+/// document-link and goto probes join it onto the search roots and stat the
+/// result — so without a containment test a `../`-laden value reports whether a
+/// file exists anywhere on disk (#176). Both sides of the test go through
+/// `canonicalize` as in [`authorized_path`], which resolves a symlinked target
+/// too; `roots` arrive unresolved here, unlike the authorized ones. What comes
+/// back is the plain join, since that is what the client is handed as a URI and
+/// a Windows verbatim `\\?\` prefix does not survive that round trip.
+pub(crate) async fn contained_search_path(roots: &[PathBuf], rel: &Path) -> Option<PathBuf> {
+    if rel
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        tracing::debug!(path = %rel.display(), "access: not a plain relative reference");
+        return None;
+    }
+    for root in roots {
+        let target = root.join(rel);
+        // The resolve doubles as the existence probe, so a reference naming
+        // nothing costs the one call the bare stat used to.
+        let Ok(canonical) = tokio::fs::canonicalize(&target).await else {
+            continue;
+        };
+        let Ok(canonical_root) = tokio::fs::canonicalize(root).await else {
+            continue;
+        };
+        if canonical.starts_with(&canonical_root) {
+            return Some(target);
+        }
+        tracing::debug!(path = %canonical.display(), "access: reference outside its search root");
+    }
+    None
+}
+
 /// Why a path may not be the target of a server-generated edit. Carried so a
 /// refusal the user sees (the rename cancellation) can name the actual cause
 /// instead of guessing at the call site.
@@ -269,7 +311,7 @@ fn canonicalize_new_path(path: &Path) -> Option<PathBuf> {
         if std::fs::symlink_metadata(cursor).is_ok() {
             return None;
         }
-        let std::path::Component::Normal(name) = cursor.components().next_back()? else {
+        let Component::Normal(name) = cursor.components().next_back()? else {
             tracing::debug!(path = %path.display(), "access: edit target is not a plain path");
             return None;
         };
@@ -630,6 +672,72 @@ mod tests {
         let file = tmp.path().join("a.txt");
         std::fs::write(&file, "foo = { }\n").unwrap();
         assert_eq!(authorized_path(&uri(&file), &[]), None);
+    }
+
+    // ── The search-root boundary ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_path_resolves_under_the_first_root_that_has_the_file() {
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let vanilla = tempfile::TempDir::new().expect("vanilla");
+        let gfx = vanilla.path().join("gfx");
+        std::fs::create_dir(&gfx).unwrap();
+        std::fs::write(gfx.join("pic.dds"), "x").unwrap();
+        let roots = vec![workspace.path().to_path_buf(), vanilla.path().to_path_buf()];
+
+        let found = contained_search_path(&roots, Path::new("gfx/pic.dds"))
+            .await
+            .expect("contained");
+        assert!(found.starts_with(vanilla.path()));
+        assert_eq!(
+            contained_search_path(&roots, Path::new("gfx/missing.dds")).await,
+            None
+        );
+    }
+
+    /// The reported hole: the join was stated with no containment test, so a
+    /// `../`-laden leaf value answered whether a file exists outside the roots
+    /// (#176). The refusal is syntactic, so it holds on Windows too.
+    #[tokio::test]
+    async fn search_path_refuses_a_value_that_climbs_out_of_the_root() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path().join("mod");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(tmp.path().join("secret.txt"), "secret\n").unwrap();
+        let roots = vec![root.clone()];
+
+        assert_eq!(
+            contained_search_path(&roots, Path::new("../secret.txt")).await,
+            None
+        );
+        assert_eq!(
+            contained_search_path(&roots, Path::new("gfx/../../secret.txt")).await,
+            None
+        );
+    }
+
+    /// The half the syntactic refusal can't reach, and the reason containment
+    /// is canonical: every component is a plain name, but one of them is a link
+    /// out of the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_path_refuses_a_directory_symlink_pointing_out_of_the_root() {
+        let root = tempfile::TempDir::new().expect("root");
+        let other = tempfile::TempDir::new().expect("other");
+        std::fs::write(other.path().join("secret.txt"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(other.path(), root.path().join("gfx")).unwrap();
+        assert_eq!(
+            contained_search_path(&[root.path().to_path_buf()], Path::new("gfx/secret.txt")).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn search_path_refuses_everything_when_no_root_is_configured() {
+        assert_eq!(
+            contained_search_path(&[], Path::new("gfx/pic.dds")).await,
+            None
+        );
     }
 
     // ── The edit boundary ─────────────────────────────────────────────────
