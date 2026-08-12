@@ -523,7 +523,7 @@ mod tests {
 
     fn parse(src: &str) -> ParsedFile {
         let table = cwtools_string_table::string_table::StringTable::new();
-        cwtools_parser::parser::parse_string(src, &table).unwrap()
+        cwtools_parser::parser::parse_string(src, &table)
     }
 
     #[test]

@@ -176,7 +176,7 @@ fn bench_rules_hot(c: &mut Criterion) {
         scope_checks: false,
         var_checks: false,
     };
-    let ast = parse_string(FOCUS_FILE, &table).expect("parse focus file");
+    let ast = parse_string(FOCUS_FILE, &table);
     let path = "common/national_focus/bench.txt";
     let (line, col) = cursor_at(FOCUS_FILE, CURSOR_LINE);
 

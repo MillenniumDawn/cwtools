@@ -451,7 +451,7 @@ mod tests {
     /// The codes emitted for `src` at `path` (path matters for CW107's events-dir check).
     fn codes_at(path: &str, src: &str) -> Vec<&'static str> {
         let table = StringTable::new();
-        let ast = parse_string(src, &table).unwrap();
+        let ast = parse_string(src, &table);
         let mut errors = Vec::new();
         validate_structural(&ast, &table, &path.into(), Game::Hoi4, &mut errors);
         errors.iter().filter_map(|e| e.code).collect()
@@ -461,7 +461,7 @@ mod tests {
     /// assert the result equals `expected` and no longer emits `code`.
     fn assert_fix(code: &str, src: &str, expected: &str) {
         let table = StringTable::new();
-        let ast = parse_string(src, &table).unwrap();
+        let ast = parse_string(src, &table);
         let mut errors = Vec::new();
         validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
@@ -473,7 +473,7 @@ mod tests {
         let fixed = apply_edits(src, &fix.edits);
         assert_eq!(fixed, expected, "{code} fix output");
 
-        let ast2 = parse_string(&fixed, &table).unwrap();
+        let ast2 = parse_string(&fixed, &table);
         let mut errors2 = Vec::new();
         validate_structural(&ast2, &table, &"test.txt".into(), Game::Hoi4, &mut errors2);
         assert!(
@@ -488,7 +488,7 @@ mod tests {
     fn cw223_underlines_only_the_not_key() {
         let src = "x = {\n    NOT = {\n        a = 1\n        b = 2\n    }\n}\n";
         let table = StringTable::new();
-        let ast = parse_string(src, &table).unwrap();
+        let ast = parse_string(src, &table);
         let mut errors = Vec::new();
         validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
@@ -534,7 +534,7 @@ mod tests {
 
         for (src, line, col, len) in [(and_src, 1, 0, 3), (or_src, 2, 4, 2)] {
             let table = StringTable::new();
-            let ast = parse_string(src, &table).unwrap();
+            let ast = parse_string(src, &table);
             let mut errors = Vec::new();
             validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
@@ -565,7 +565,7 @@ mod tests {
             "x = { if = { a = 1 } else_if = { } else = { b = 2 } }\n",
         ] {
             let table = StringTable::new();
-            let ast = parse_string(src, &table).unwrap();
+            let ast = parse_string(src, &table);
             let mut errors = Vec::new();
             validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 
@@ -798,7 +798,7 @@ mod tests {
     #[test]
     fn cw107_underlines_only_the_event_key() {
         let table = StringTable::new();
-        let ast = parse_string("my_event = {\n    id = test.1\n}\n", &table).unwrap();
+        let ast = parse_string("my_event = {\n    id = test.1\n}\n", &table);
         let mut errors = Vec::new();
         validate_structural(
             &ast,
@@ -901,7 +901,7 @@ mod tests {
     #[test]
     fn cw238_underlines_only_the_containing_key() {
         let table = StringTable::new();
-        let ast = parse_string("foo = {\n    else = { a = 1 }\n}\n", &table).unwrap();
+        let ast = parse_string("foo = {\n    else = { a = 1 }\n}\n", &table);
         let mut errors = Vec::new();
         validate_structural(&ast, &table, &"test.txt".into(), Game::Hoi4, &mut errors);
 

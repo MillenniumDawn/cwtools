@@ -33,9 +33,9 @@ foo = {
 
 fn codes(script: &str, vars: &[&str]) -> Vec<String> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(RULES, &table).unwrap();
+    let parsed_cwt = parse_string(RULES, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let mut idx = TypeIndex::new();
     for v in vars {
         idx.var_index.add_name(v);
@@ -204,8 +204,8 @@ foo = {
 
 fn varset_codes(script: &str) -> Vec<String> {
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(VARSET_RULES, &table).unwrap(), &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parse_string(VARSET_RULES, &table), &table);
+    let parsed = parse_string(script, &table);
     let idx = TypeIndex::new();
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     validate_prepared(
@@ -304,8 +304,8 @@ alias[effect:use_var] = variable_field
 /// the loop locals.
 fn loop_codes(script: &str) -> Vec<String> {
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(LOOP_RULES, &table).unwrap(), &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parse_string(LOOP_RULES, &table), &table);
+    let parsed = parse_string(script, &table);
     let mut idx = TypeIndex::new();
     idx.var_index.add_name("my_existing_var");
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));

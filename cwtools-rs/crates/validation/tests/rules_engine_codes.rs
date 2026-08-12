@@ -17,9 +17,9 @@ use cwtools_validation::validate_ast;
 
 fn codes_for(cwt: &str, script: &str) -> Vec<String> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     errors
         .into_iter()
@@ -42,9 +42,9 @@ foo = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(RULES, &table).unwrap();
+    let parsed_cwt = parse_string(RULES, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string("foo = { name = x }", &table).unwrap();
+    let parsed = parse_string("foo = { name = x }", &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     let cw242 = errors
         .iter()
@@ -149,9 +149,9 @@ fn validate_pair(
     Vec<cwtools_validation::ValidationError>,
 ) {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     (table, ruleset, errors)
 }
@@ -178,7 +178,7 @@ fn cw263_close_match_attaches_did_you_mean_fix() {
     );
 
     // The corrected key matches `count = int`; CW263 is gone on revalidation.
-    let ast2 = parse_string(&fixed, &table).unwrap();
+    let ast2 = parse_string(&fixed, &table);
     let errors2 = validate_ast(&ast2, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         !errors2.iter().any(|e| e.code == Some("CW263")),
@@ -208,7 +208,7 @@ fn cw240_enum_close_match_attaches_did_you_mean_fix() {
     let fixed = apply_edits(script, &fix.edits);
     assert_eq!(fixed, "foo = {\n    mode = \"historic\"  # typo\n}\n");
 
-    let ast2 = parse_string(&fixed, &table).unwrap();
+    let ast2 = parse_string(&fixed, &table);
     let errors2 = validate_ast(&ast2, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         !errors2.iter().any(|e| e.code == Some("CW240")),
@@ -278,7 +278,7 @@ fn cw240_boolean_enum_suggestion_stays_a_string() {
 
     let fixed = apply_edits(script, &fix.edits);
     assert_eq!(fixed, "foo = { mode = \"yes\" }");
-    let ast = parse_string(&fixed, &table).unwrap();
+    let ast = parse_string(&fixed, &table);
     assert!(
         !validate_ast(&ast, &ruleset, &table, "test.txt", None, None, None)
             .iter()
@@ -308,7 +308,7 @@ fn cw240_enum_suggestion_escapes_quotes_and_backslashes() {
     assert_eq!(fix.title, "Did you mean 'hist\"oric\\mode'?");
     let fixed = apply_edits(script, &fix.edits);
     assert_eq!(fixed, r#"foo = { mode = "hist\"oric\\mode" }"#);
-    let ast = parse_string(&fixed, &table).unwrap();
+    let ast = parse_string(&fixed, &table);
     assert!(
         !validate_ast(&ast, &ruleset, &table, "test.txt", None, None, None)
             .iter()
@@ -361,7 +361,7 @@ fn cw262_close_match_attaches_did_you_mean_fix() {
     let fixed = apply_edits(script, &fix.edits);
     assert_eq!(fixed, "foo = {\n    settings = { x = 1 }\n}\n");
 
-    let ast2 = parse_string(&fixed, &table).unwrap();
+    let ast2 = parse_string(&fixed, &table);
     let errors2 = validate_ast(&ast2, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         !errors2.iter().any(|e| e.code == Some("CW262")),

@@ -219,7 +219,7 @@ fn config_driven_cw120_fires_for_planet_event() {
     let table = StringTable::new();
 
     let run = |script: &str| {
-        let ast = cwtools_parser::parser::parse_string(script, &table).unwrap();
+        let ast = cwtools_parser::parser::parse_string(script, &table);
         let mut errors = Vec::new();
         validate_stellaris(
             &ast,

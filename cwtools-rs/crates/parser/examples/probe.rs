@@ -4,7 +4,7 @@ use cwtools_string_table::string_table::StringTable;
 
 fn dump(label: &str, input: &str) {
     let table = StringTable::new();
-    let r = parse_string(input, &table).unwrap();
+    let r = parse_string(input, &table);
     println!("== {label}: {input:?}");
     println!(
         "   roots={} errors={:?}",

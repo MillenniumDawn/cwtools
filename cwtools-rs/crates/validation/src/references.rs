@@ -235,12 +235,12 @@ user = { uses = <thing> }
         files: &[(&str, &str)],
     ) -> Vec<ValidationError> {
         let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(rules_src, &table).unwrap(), &table);
+        let ruleset = ast_to_ruleset(&parse_string(rules_src, &table), &table);
         let registry = build_scope_registry_arc(&ruleset, game);
 
         let parsed: Vec<_> = files
             .iter()
-            .map(|(path, src)| (*path, parse_string(src, &table).unwrap()))
+            .map(|(path, src)| (*path, parse_string(src, &table)))
             .collect();
 
         let mut index = TypeIndex::new();
@@ -535,8 +535,8 @@ alias[effect:recurse] = { alias_name[effect] = alias_match_left[effect] }
             user.push_str("}\n");
         }
         let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(CAPPED_ALIAS_RULES, &table).unwrap(), &table);
-        let parsed = parse_string(&user, &table).unwrap();
+        let ruleset = ast_to_ruleset(&parse_string(CAPPED_ALIAS_RULES, &table), &table);
+        let parsed = parse_string(&user, &table);
         let errors = crate::validate_ast(
             &parsed,
             &ruleset,
@@ -926,7 +926,7 @@ technology = {
     #[test]
     fn needs_use_tracking_follows_the_config() {
         let table = StringTable::new();
-        let tracked = ast_to_ruleset(&parse_string(RULES, &table).unwrap(), &table);
+        let tracked = ast_to_ruleset(&parse_string(RULES, &table), &table);
         assert!(needs_use_tracking(&tracked, None));
         assert!(!needs_use_tracking(&RuleSet::new(), None));
         // Stellaris always tracks `technology` for CW231, config or not.

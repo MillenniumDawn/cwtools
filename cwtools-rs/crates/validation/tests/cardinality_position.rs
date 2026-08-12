@@ -20,7 +20,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let script = r#"
@@ -32,7 +32,7 @@ my_decision = {
     // Line 3 (1-based): `    icon = test_icon`
     // `required_field` is absent -> CW242 under-count
 
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
 
     let card = errors
@@ -84,12 +84,12 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // File has content but no required_field.
     let script = "some_other_field = value\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -132,7 +132,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let script = r#"
@@ -142,7 +142,7 @@ my_decision = {
     custom_cost_text = b
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
 
     let card = errors
