@@ -118,6 +118,41 @@ pub(crate) fn extract_u64_setting(opts: &Value, key: &str) -> Option<u64> {
     parsed
 }
 
+fn extract_localisation_languages(opts: &Value) -> Option<Option<Vec<cwtools_localization::Lang>>> {
+    let value = opts.get("localisationLanguages")?;
+    let Some(languages) = value.as_array() else {
+        tracing::warn!(value = %value, "ignoring localisationLanguages: expected an array");
+        return None;
+    };
+    let parsed = languages
+        .iter()
+        .filter_map(|value| value.as_str())
+        .filter_map(cwtools_localization::Lang::from_name)
+        .collect::<Vec<_>>();
+    Some((!parsed.is_empty()).then_some(parsed))
+}
+
+fn extract_bool_setting(opts: &Value, key: &str) -> Option<bool> {
+    let value = opts.get(key)?;
+    let parsed = value.as_bool();
+    if parsed.is_none() {
+        tracing::warn!(key, value = %value, "ignoring setting: expected a boolean");
+    }
+    parsed
+}
+
+fn extract_hover_scope_display(opts: &Value) -> Option<bool> {
+    let value = opts.get("hoverScopeDisplay")?;
+    match value.as_str() {
+        Some("context") => Some(false),
+        Some("resolved") => Some(true),
+        _ => {
+            tracing::warn!(value = %value, "ignoring hoverScopeDisplay: expected context or resolved");
+            None
+        }
+    }
+}
+
 /// Decode workspace-folder URIs to filesystem paths, for the access boundary's
 /// root list. Strict on purpose: a folder URI that isn't a `file:` URI
 /// contributes no root, where the lax converter would turn
@@ -990,27 +1025,54 @@ impl Backend {
             extract_u64_setting(&params.settings, "backgroundReindexIntervalMinutes");
         let reindex_idle_secs =
             extract_u64_setting(&params.settings, "backgroundReindexIdleSeconds");
+        let localisation_languages = extract_localisation_languages(&params.settings);
+        let hover_all_languages = extract_bool_setting(&params.settings, "hoverShowAllLanguages");
+        let hover_debug = extract_bool_setting(&params.settings, "hoverDebug");
+        let hover_resolved_scope = extract_hover_scope_display(&params.settings);
 
-        // No-op guard: the client re-sends the whole `cwtools` section on any
-        // change to an unrelated key, so an identical payload arrives often.
-        // Skip the write and the open-doc revalidate storm (#90) when nothing
-        // this handler mutates actually changed. Every field is `None` when
-        // its key is absent, and a missing key is never a change.
-        {
+        let (
+            current_loc_languages,
+            current_files,
+            current_dirs,
+            current_codes,
+            current_reindex_minutes,
+            current_reindex_idle_secs,
+        ) = {
             let cfg = self.state.config.read();
-            let unchanged = files
+            (
+                cfg.loc_languages.clone(),
+                cfg.ignore_file_patterns.clone(),
+                cfg.ignore_dir_patterns.clone(),
+                cfg.ignored_error_codes.clone(),
+                cfg.background_reindex_interval_minutes,
+                cfg.background_reindex_idle_seconds,
+            )
+        };
+        let (current_hover_all, current_hover_debug, current_hover_resolved_scope) = (
+            self.state.hover_show_all_languages.load(Ordering::Relaxed),
+            self.state.hover_debug.load(Ordering::Relaxed),
+            self.state.hover_resolved_scope.load(Ordering::Relaxed),
+        );
+        let unchanged = files.as_ref().is_none_or(|files| files == &current_files)
+            && dirs.as_ref().is_none_or(|dirs| dirs == &current_dirs)
+            && codes.as_ref().is_none_or(|codes| codes == &current_codes)
+            && reindex_minutes.is_none_or(|minutes| minutes == current_reindex_minutes)
+            && reindex_idle_secs.is_none_or(|seconds| seconds == current_reindex_idle_secs)
+            && localisation_languages
                 .as_ref()
-                .is_none_or(|f| *f == cfg.ignore_file_patterns)
-                && dirs.as_ref().is_none_or(|d| *d == cfg.ignore_dir_patterns)
-                && codes.as_ref().is_none_or(|c| *c == cfg.ignored_error_codes)
-                && reindex_minutes.is_none_or(|m| m == cfg.background_reindex_interval_minutes)
-                && reindex_idle_secs.is_none_or(|s| s == cfg.background_reindex_idle_seconds);
-            if unchanged {
-                tracing::debug!("didChangeConfiguration: no relevant change; skipping revalidate");
-                return;
-            }
+                .is_none_or(|languages| languages == &current_loc_languages)
+            && hover_all_languages.is_none_or(|all| all == current_hover_all)
+            && hover_debug.is_none_or(|debug| debug == current_hover_debug)
+            && hover_resolved_scope.is_none_or(|resolved| resolved == current_hover_resolved_scope);
+        if unchanged {
+            tracing::debug!("didChangeConfiguration: no relevant change; skipping revalidate");
+            return;
         }
 
+        let localisation_changed = localisation_languages
+            .as_ref()
+            .is_some_and(|languages| languages != &current_loc_languages);
+        let hover_all_changed = hover_all_languages.is_some_and(|all| all != current_hover_all);
         {
             // Any field written here must join the comparison above, or an
             // identical re-send of a changed field will slip past the guard.
@@ -1030,6 +1092,22 @@ impl Backend {
             if let Some(secs) = reindex_idle_secs {
                 cfg.background_reindex_idle_seconds = secs;
             }
+            if let Some(languages) = localisation_languages {
+                cfg.loc_languages = languages;
+            }
+        }
+        if let Some(all) = hover_all_languages {
+            self.state
+                .hover_show_all_languages
+                .store(all, Ordering::Relaxed);
+        }
+        if let Some(debug) = hover_debug {
+            self.state.hover_debug.store(debug, Ordering::Relaxed);
+        }
+        if let Some(resolved) = hover_resolved_scope {
+            self.state
+                .hover_resolved_scope
+                .store(resolved, Ordering::Relaxed);
         }
         // Bump the quiet-pass fingerprint generation: ignore globs or suppressed
         // codes may have changed, so the next background pass must re-run.
@@ -1045,11 +1123,15 @@ impl Backend {
             reindex_idle_secs = ?reindex_idle_secs,
             "config updated via didChangeConfiguration"
         );
-        // Re-filter the open documents' diagnostics against the updated
-        // suppression list without waiting for a reload. Gated on the initial
-        // index being ready so we don't publish partial cross-file results
-        // before the first scan finishes (that scan republishes anyway).
-        if self.state.index_ready.load(Ordering::Relaxed) {
+        // Localisation settings shape the project-wide loc index and hover
+        // text, so they need the same serialized full scan as startup. A scan
+        // already in progress may have passed its loc phase; queue one behind
+        // it instead of racing a second rebuild.
+        if localisation_changed || hover_all_changed {
+            if !self.validate_entire_workspace(false).await {
+                self.spawn_deferred_revalidation("didChangeConfiguration");
+            }
+        } else if self.state.index_ready.load(Ordering::Relaxed) {
             self.revalidate_all_open_docs(crate::ValidateTrigger::ConfigChange)
                 .await;
         }
