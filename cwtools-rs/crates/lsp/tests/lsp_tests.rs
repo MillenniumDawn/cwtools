@@ -5935,6 +5935,85 @@ fn test_background_reindex_survives_a_panicking_pass() {
 }
 
 #[test]
+fn test_document_validation_logs_a_panicking_task() {
+    // #182: CWTOOLS_VALIDATE_PANIC_ONCE makes the FIRST debounced document
+    // validation panic. That task's handle is kept for the abort a newer edit
+    // needs, so nothing observes the panic unless the cleanup task does. The
+    // panic must reach the log and the next edit must still validate. Asserts
+    // on the profiling log (storm_server_env sets CWTOOLS_PROFILE=1) so a
+    // build where the injection never fired fails here instead of passing on
+    // the cleared diagnostic alone, which is equally true of a validation
+    // that never panicked.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let with_call = "my_dec = {\n    complete_effect = {\n        my_se = yes\n    }\n}\n";
+    let b_path = ws.path().join("common/decisions/b.txt");
+    std::fs::create_dir_all(b_path.parent().unwrap()).unwrap();
+    std::fs::write(&b_path, with_call).unwrap();
+
+    let (mut child, reader) = storm_server_env(
+        ws.path(),
+        rules_dir.path(),
+        vanilla.path(),
+        &[("CWTOOLS_VALIDATE_PANIC_ONCE", "1")],
+    );
+    let rx = spawn_frame_collector(reader);
+
+    // The open's validation is the one that panics: the scripted effect it
+    // calls doesn't exist, so it would have published CW263.
+    let b_uri = path_uri(&b_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":&b_uri,"languageId":"hoi4","version":1,
+                "text":with_call}}),
+        ),
+    )
+    .unwrap();
+
+    // Two edits back to back: the first is superseded inside the debounce
+    // window, so its task is aborted rather than left to finish. An abort is
+    // not a panic and must not be logged as one. The second drops the call,
+    // clearing CW263 — which only happens if the panicked predecessor left
+    // the debounce registry usable.
+    for (version, text) in [(2, with_call), (3, "my_dec = { }\n")] {
+        write_frame(
+            &mut child,
+            &jsonrpc_notification(
+                "textDocument/didChange",
+                serde_json::json!({
+                    "textDocument": { "uri": &b_uri, "version": version },
+                    "contentChanges": [{ "text": text }]
+                }),
+            ),
+        )
+        .unwrap();
+    }
+
+    let result = wait_for_cleared_diag_with_deadline(
+        &rx,
+        "b.txt",
+        "CW263",
+        std::time::Duration::from_secs(15),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 2002);
+    child.kill().ok();
+
+    if let Err(e) = result {
+        panic!("{e}");
+    }
+    assert_eq!(
+        log.matches("document validation (").count(),
+        1,
+        "expected the injected panic logged once and no line for the aborted edit, got: {log}"
+    );
+}
+
+#[test]
 fn test_background_reindex_idle_window_from_init_option() {
     // `backgroundReindexIdleSeconds` in initializationOptions must drive the
     // idle gate — here 0, so the pass fires as soon as the 1s interval

@@ -44,7 +44,7 @@ static REINDEX_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
 /// True when `name` is set to a truthy value (`1`, `true`, `yes`, `on`) — same
 /// convention as `cwtools_profiling::profile_enabled`, so `VAR=0` or an empty
 /// value (a shell habit for "unset") doesn't accidentally arm a test hook.
-fn env_flag(name: &str) -> bool {
+pub(crate) fn env_flag(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
@@ -2627,8 +2627,19 @@ pub(crate) async fn spawn_logging_panics<F>(context: &str, fut: F) -> bool
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    match tokio::spawn(fut).await {
+    log_panics(context, tokio::spawn(fut)).await
+}
+
+/// [`spawn_logging_panics`] for a caller that has to hold the `JoinHandle`
+/// itself: `spawn_debounced_validate` keeps an abort handle so a newer edit
+/// can cancel a superseded validation, so it spawns the task and hands the
+/// handle here rather than handing over the future (#182). A deliberate abort
+/// is not a panic and is not logged, since the debounce aborts its predecessor
+/// on every keystroke. Returns whether the task ran to completion.
+pub(crate) async fn log_panics(context: &str, handle: tokio::task::JoinHandle<()>) -> bool {
+    match handle.await {
         Ok(()) => true,
+        Err(e) if e.is_cancelled() => false,
         Err(e) => {
             tracing::error!("{context} panicked: {e}");
             false
@@ -2811,6 +2822,17 @@ mod tests {
     async fn test_spawn_logging_panics_reports_true_on_success() {
         let ok = spawn_logging_panics("test task", async {}).await;
         assert!(ok, "a task that returns normally must report true");
+    }
+
+    #[tokio::test]
+    async fn test_log_panics_reports_an_aborted_task_as_incomplete() {
+        // The debounce caller (#182) aborts a superseded validation on every
+        // keystroke, so the abort has to come back as "did not complete"
+        // without the wrapper treating it as a panic.
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let ok = log_panics("test task", handle).await;
+        assert!(!ok, "an aborted task must report false, not propagate");
     }
 
     // ── watched_batch_slot_is_ours (#155 fix-round-2 MINOR-4 regression) ────

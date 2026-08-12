@@ -976,6 +976,11 @@ struct Backend {
 /// to skip the per-keystroke re-parse that made large files lag.
 const DEBOUNCE_MS: u64 = 250;
 
+/// Test-only one-shot panic switch for `CWTOOLS_VALIDATE_PANIC_ONCE` (#182),
+/// the per-document counterpart to the two background-task switches in
+/// `scan.rs`. Fires at most once per server process.
+static VALIDATE_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
+
 // ── Custom notification stubs ─────────────────────────────────────────────────
 
 // NOT PORTED — pre-trigger refactor.
@@ -1016,6 +1021,15 @@ impl Backend {
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
+            // Test-only panic injection (#182): CWTOOLS_VALIDATE_PANIC_ONCE
+            // panics the first document validation after the server starts,
+            // then clears itself, so the e2e suite can exercise the logging
+            // path below.
+            if crate::scan::env_flag("CWTOOLS_VALIDATE_PANIC_ONCE")
+                && VALIDATE_PANIC_ONCE.swap(false, Ordering::SeqCst)
+            {
+                panic!("CWTOOLS_VALIDATE_PANIC_ONCE: injected panic for #182 test coverage");
+            }
             Backend { client, state }
                 .debounced_validate(uri, version, generation, trigger)
                 .await;
@@ -1024,13 +1038,7 @@ impl Backend {
         let cleanup_state = self.state.clone();
         let cleanup_key = key.clone();
         tokio::spawn(async move {
-            match handle.await {
-                Ok(()) => {}
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => {
-                    tracing::error!(%error, uri = %cleanup_key, "document validation task panicked")
-                }
-            }
+            crate::scan::log_panics(&format!("document validation ({cleanup_key})"), handle).await;
             let mut tasks = cleanup_state.debounce_handles.lock();
             remove_debounce_task(&mut tasks, &cleanup_key, id);
             drop(tasks);
