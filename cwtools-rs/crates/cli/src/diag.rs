@@ -218,6 +218,32 @@ pub(crate) fn loc_diagnostic_to_diag(
     }
 }
 
+/// Map a rules-config `RuleParseError` to a report `Diag`, computing its hash
+/// from the trimmed source line. Consumes the error (moves the message). `root`
+/// is the rules root the hash is relativized against, so a baseline survives the
+/// ruleset being checked out somewhere else.
+pub(crate) fn rule_error_to_diag(
+    root: &Path,
+    err: cwtools_rules::ruleset_loader::RuleParseError,
+    line_text: &str,
+    legacy: bool,
+) -> Diag {
+    let file = err.file.to_string_lossy().into_owned();
+    let hash = diag_hash(root, &file, err.code, &err.message, line_text);
+    let legacy_hash = legacy_hash_if_wanted(legacy, root, &file, err.code, &err.message, err.line);
+    Diag {
+        file: file.as_str().into(),
+        severity: err.severity,
+        code: err.code,
+        message: err.message,
+        line: err.line,
+        // Rules columns are 0-based; both CI formats are 1-based.
+        col: err.col as u32 + 1,
+        hash,
+        legacy_hash,
+    }
+}
+
 /// Map a `LocService` fatal parse error (a file that couldn't even be
 /// lenient-parsed, so there's no line number) to a report `Diag`. Always
 /// Error-severity; `line` is 0 like other whole-file diagnostics, so there's no

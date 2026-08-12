@@ -16,7 +16,7 @@ pub(super) fn run(file: PathBuf) {
             eprintln!("warn: {}", err);
         }
         println!("Parsed rule directory: {}", file.display());
-        print_ruleset_summary(&ruleset);
+        print_ruleset_summary(&ruleset, false);
     } else {
         let mut manager = FileManager::new(FileManagerConfig::default());
         match manager.parse_single_file(&file) {

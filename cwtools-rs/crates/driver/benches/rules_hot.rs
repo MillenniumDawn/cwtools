@@ -133,20 +133,16 @@ fn bench_rules_hot(c: &mut Criterion) {
         return;
     };
     let table = StringTable::new();
-    let mut warnings = Vec::new();
-    let ruleset = {
-        let mut on_warning = |warning| warnings.push(warning);
-        match load_rules(&RulesInput::Dir(dir), &table, Some(&mut on_warning)) {
-            Ok(rs) => rs,
-            Err(e) => {
-                eprintln!("rules_hot: could not load rules: {e}");
-                return;
-            }
+    let (ruleset, rule_errors) = match load_rules(&RulesInput::Dir(dir), &table) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("rules_hot: could not load rules: {e}");
+            return;
         }
     };
     assert!(
-        warnings.is_empty(),
-        "rules_hot: load warnings: {warnings:?}"
+        rule_errors.is_empty(),
+        "rules_hot: rules problems: {rule_errors:?}"
     );
     let type_index = TypeIndex::default();
     let scope_registry =

@@ -1,3 +1,4 @@
+use cwtools_error_codes::ErrorSeverity;
 use cwtools_rules::rules_types::RootRule;
 use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
 use cwtools_string_table::string_table::StringTable;
@@ -119,10 +120,47 @@ fn load_ruleset_dir_reports_directory_read_error() {
     let error = &errors[0];
     assert_eq!(error.file, path);
     assert_eq!((error.line, error.col), (1, 0));
+    assert_eq!(
+        (error.code, error.severity),
+        ("CW600", ErrorSeverity::Error)
+    );
     assert!(
         error.message.starts_with("read directory error:"),
         "error: {error}"
     );
+}
+
+/// Every rules problem carries a catalog code and a severity, so the CLI can
+/// report it like any other diagnostic and fail CI on the errors alone. A
+/// malformed `## cardinality` degrades one rule rather than breaking the
+/// ruleset, so it stays a warning; an undefined reference does not.
+#[test]
+fn load_ruleset_dir_codes_and_grades_every_problem() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("broken.cwt"),
+        "types = { type[foo] = { path = \"common/foo\" } }\n\
+         ## cardinality = 0..x\n\
+         r = { a = <undefined_type> }\n",
+    )
+    .expect("write broken.cwt");
+
+    let table = StringTable::new();
+    let (_, errors) = load_ruleset_from_dir(
+        tmp.path(),
+        &table,
+        cwtools_file_manager::file_manager::ScanBudget::default(),
+    );
+
+    let find = |code: &str| {
+        errors
+            .iter()
+            .find(|e| e.code == code)
+            .unwrap_or_else(|| panic!("no {code} in {errors:?}"))
+    };
+    assert_eq!(find("CW601").severity, ErrorSeverity::Error);
+    assert!(find("CW601").message.contains("undefined_type"));
+    assert_eq!(find("CW603").severity, ErrorSeverity::Warning);
 }
 
 /// End-to-end load of the real HOI4 config (`cwtools-hoi4-config`), which is
