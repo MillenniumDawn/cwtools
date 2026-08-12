@@ -640,8 +640,8 @@ const VIC2_SCOPES: &[ScopeDef] = &[
 ];
 
 // ── VIC3 ──────────────────────────────────────────────────────────────────────
-// F# VIC3Constants.fs is currently minimal (commented-out or stub).
-// Keeping as-is pending upstream F# work.
+// No scope list. Filling it in by hand is the wrong direction: the scope tables
+// are meant to come from the game's own .cwt config (#8, #13).
 
 const VIC3_SCOPES: &[ScopeDef] = &[];
 
@@ -779,7 +779,7 @@ const IR_SCOPES: &[ScopeDef] = &[
 ];
 
 // ── EU5 ───────────────────────────────────────────────────────────────────────
-// F# EU5Constants.fs is a stub in the upstream codebase.
+// No scope list, same reason as VIC3 above (#8, #13).
 
 const EU5_SCOPES: &[ScopeDef] = &[];
 

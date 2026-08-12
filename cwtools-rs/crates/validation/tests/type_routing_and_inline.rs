@@ -4,7 +4,7 @@ use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::validate_ast;
 
 fn ruleset(cwt: &str, table: &StringTable) -> cwtools_rules::rules_types::RuleSet {
-    ast_to_ruleset(&parse_string(cwt, table).unwrap(), table)
+    ast_to_ruleset(&parse_string(cwt, table), table)
 }
 
 // Regression: a top-level node must be validated against the type its own key
@@ -36,7 +36,7 @@ light = {
     );
     // A top-level `animation` node in a .asset file: must validate as model_animation.
     let script = "animation = { name = \"a\" file = \"x.anim\" }\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &rs,
@@ -78,7 +78,7 @@ foo = {
     );
     // `sub` is present but empty → its required bare value is missing.
     let script = "my_foo = {\n\tname = \"x\"\n\tsub = {\n\t}\n}\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &rs, &table, "common/foo/a.txt", None, None, None);
     let card: Vec<&cwtools_validation::ValidationError> = errors
         .iter()

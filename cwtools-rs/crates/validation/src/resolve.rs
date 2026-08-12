@@ -495,7 +495,7 @@ mod tests {
     fn path_candidates_handle_backslash_paths() {
         let table = StringTable::new();
         let cwt = "types = { type[foo] = { path = \"common/foo\" } }";
-        let parsed = parse_string(cwt, &table).unwrap();
+        let parsed = parse_string(cwt, &table);
         let rs = ast_to_ruleset(&parsed, &table);
 
         // Forward-slash resolves the type.
@@ -515,7 +515,7 @@ mod tests {
     fn grandchild_candidates_handle_backslash_paths() {
         let table = StringTable::new();
         let cwt = "types = { type[foo] = { path = \"common/foo\" skip_root_key = wrapper } }";
-        let parsed = parse_string(cwt, &table).unwrap();
+        let parsed = parse_string(cwt, &table);
         let rs = ast_to_ruleset(&parsed, &table);
         for path in ["common/foo/x.txt", "common\\foo\\x.txt"] {
             let candidates = path_candidates_for_file(path, &rs);

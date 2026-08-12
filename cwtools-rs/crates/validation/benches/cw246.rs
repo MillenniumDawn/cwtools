@@ -71,9 +71,9 @@ fn script_source() -> String {
 
 fn bench_cw246(c: &mut Criterion) {
     let table = StringTable::new();
-    let rules_ast = parse_string(&rules_source(), &table).expect("rules parse");
+    let rules_ast = parse_string(&rules_source(), &table);
     let ruleset = ast_to_ruleset(&rules_ast, &table);
-    let script_ast = parse_string(&script_source(), &table).expect("script parse");
+    let script_ast = parse_string(&script_source(), &table);
 
     let mut idx = TypeIndex::new();
     for i in 0..DEFINED_COUNT {

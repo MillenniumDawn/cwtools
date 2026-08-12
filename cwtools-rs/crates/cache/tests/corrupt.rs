@@ -29,7 +29,7 @@ nested = {
 }
 "#;
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
 
     let tmp = tempfile::NamedTempFile::with_suffix(".cwb").unwrap();
@@ -240,7 +240,7 @@ fn bit_flipped_payload_never_yields_an_altered_ast() {
 fn checksumless_frame_still_loads() {
     let input = "foo = bar\n";
     let table = StringTable::new();
-    let parsed = parse_string(input, &table).unwrap();
+    let parsed = parse_string(input, &table);
     let cached = convert::arena_to_cached(&parsed.arena, &parsed.root_children, &table);
     let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cached).unwrap();
 

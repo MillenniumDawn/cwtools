@@ -30,7 +30,7 @@ enums = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let script = r#"
@@ -38,7 +38,7 @@ container = {
     orientation = upper_left
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "gfx/test.txt", None, None, None);
     assert!(
         !errors.iter().any(|e| e.message.contains("orientation")),
@@ -47,7 +47,7 @@ container = {
     );
 
     // A value in neither case is still rejected.
-    let bad = parse_string("container = { orientation = sideways }", &table).unwrap();
+    let bad = parse_string("container = { orientation = sideways }", &table);
     let bad_errors = validate_ast(&bad, &ruleset, &table, "gfx/test.txt", None, None, None);
     assert!(
         bad_errors.iter().any(|e| e.message.contains("orientation")),
@@ -75,7 +75,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let script = r#"
@@ -87,7 +87,7 @@ guiTypes = {
     }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -135,7 +135,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let asset = r#"
@@ -144,7 +144,7 @@ music = {
     file = "main.ogg"
 }
 "#;
-    let parsed = parse_string(asset, &table).unwrap();
+    let parsed = parse_string(asset, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -166,7 +166,7 @@ music = {
 
     // The .txt form still routes to `music` (song required, name unexpected).
     let txt = "music = { name = \"x\" }";
-    let parsed_txt = parse_string(txt, &table).unwrap();
+    let parsed_txt = parse_string(txt, &table);
     let txt_errors = validate_ast(
         &parsed_txt,
         &ruleset,
@@ -198,7 +198,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let script = r#"
@@ -208,7 +208,7 @@ container = {
     @col_1 = 73
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -225,7 +225,7 @@ container = {
     );
 
     // A non-@ unknown key is still flagged.
-    let bad = parse_string("container = { name = \"ok\"  bogus = 1 }", &table).unwrap();
+    let bad = parse_string("container = { name = \"ok\"  bogus = 1 }", &table);
     let bad_errors = validate_ast(
         &bad,
         &ruleset,
@@ -272,13 +272,13 @@ enums = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     // `cruiser` matches <unit.ship_unit> (indexed elsewhere) but is NOT in
     // enum[ship_units]; the enum rule must not report "appears 0 time(s)".
     let script = "ship_name = { type = ship  ship_types = { cruiser } }";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -325,7 +325,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let script = r#"
@@ -337,7 +337,7 @@ terrain = {
     desert = { type = desert color = { 3 } texture = 9 }
 }
 "#;
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -359,8 +359,7 @@ terrain = {
     let bad = parse_string(
         "terrain = { terrain_0 = { type = plains color = { 0 } texture = 1 bogus = 1 } }",
         &table,
-    )
-    .unwrap();
+    );
     let bad_errors = validate_ast(
         &bad,
         &ruleset,
@@ -395,7 +394,7 @@ types = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
 
     let mut index = TypeIndex::new();
@@ -419,8 +418,7 @@ types = {
     let ok = parse_string(
         "bare = { picture = research_bonus } full = { picture = GFX_idea_research_bonus }",
         &table,
-    )
-    .unwrap();
+    );
     let ok_errors = validate_ast(
         &ok,
         &ruleset,
@@ -437,7 +435,7 @@ types = {
     );
 
     // A picture with no matching sprite under any form is a genuine miss.
-    let bad = parse_string("x = { picture = nonexistent_art }", &table).unwrap();
+    let bad = parse_string("x = { picture = nonexistent_art }", &table);
     let bad_errors = validate_ast(
         &bad,
         &ruleset,

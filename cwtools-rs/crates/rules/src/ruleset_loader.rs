@@ -4,18 +4,18 @@ use crate::rules_converter::ast_to_ruleset;
 use crate::rules_converter::{ast_to_ruleset_raw, validate_comment_directives};
 use crate::rules_types::{CwtDefKind, RuleSet};
 use cwtools_file_manager::file_manager::{ScanBudget, ScanBytes, read_text_capped};
-use cwtools_parser::ast::ParseError;
 use cwtools_parser::parser::parse_string;
 use cwtools_string_table::string_table::StringTable;
 use std::path::Path;
 
 /// A non-fatal error from loading a `.cwt` rules directory: a file that failed
-/// to read or parse. Carries the source location so the LSP can publish a
-/// diagnostic on the offending file and reveal where the rules broke.
+/// to read, or whose rules didn't hold up. Carries the source location so the
+/// LSP can publish a diagnostic on the offending file and reveal where the
+/// rules broke.
 #[derive(Debug, Clone)]
 pub struct RuleParseError {
     pub file: std::path::PathBuf,
-    /// 1-based line. `1` for read errors or parse errors without a position.
+    /// 1-based line. `1` for read errors and anything else without a position.
     pub line: u32,
     pub col: u16,
     pub message: String,
@@ -144,8 +144,8 @@ fn parse_folders_list(content: &str) -> Vec<String> {
 /// Walk `dir` for `*.cwt` files, parse each with `table`, convert via
 /// `ast_to_ruleset`, and merge all results into one `RuleSet`.
 ///
-/// Returns `(ruleset, errors)`. Errors are non-fatal: files that fail to read
-/// or parse are skipped and their messages collected.
+/// Returns `(ruleset, errors)`. Errors are non-fatal: a file that fails to read
+/// is skipped and its message collected.
 pub fn load_ruleset_from_dir(
     dir: &Path,
     table: &StringTable,
@@ -182,37 +182,22 @@ pub fn load_ruleset_from_dir(
                 {
                     combined.folders.extend(parse_folders_list(&content));
                 } else {
-                    match parse_string(&content, table) {
-                        Ok(parsed) => {
-                            errors.extend(validate_comment_directives(&parsed, path));
-                            let ruleset = ast_to_ruleset_raw(&parsed, table);
-                            merge_ruleset(&mut combined, ruleset);
-                            crate::config_validation::collect_reference_candidates(
-                                path,
-                                &parsed,
-                                table,
-                                &mut ref_candidates,
-                            );
-                            crate::config_validation::collect_definition_positions(
-                                path,
-                                &parsed,
-                                table,
-                                &mut combined.def_positions,
-                            );
-                        }
-                        Err(e) => {
-                            let (line, col, message) = match e {
-                                ParseError::Pos(l, c, m) => (l, c, m),
-                                ParseError::General(m) => (1, 0, m),
-                            };
-                            errors.push(RuleParseError {
-                                file: path.clone(),
-                                line,
-                                col,
-                                message: format!("parse error: {}", message),
-                            });
-                        }
-                    }
+                    let parsed = parse_string(&content, table);
+                    errors.extend(validate_comment_directives(&parsed, path));
+                    let ruleset = ast_to_ruleset_raw(&parsed, table);
+                    merge_ruleset(&mut combined, ruleset);
+                    crate::config_validation::collect_reference_candidates(
+                        path,
+                        &parsed,
+                        table,
+                        &mut ref_candidates,
+                    );
+                    crate::config_validation::collect_definition_positions(
+                        path,
+                        &parsed,
+                        table,
+                        &mut combined.def_positions,
+                    );
                 }
             }
             Err(e) => {
@@ -262,11 +247,10 @@ mod tests {
     #[test]
     fn merge_preserves_scope_links() {
         let table = StringTable::new();
-        let links = parse_string("links = { character = { from_data = yes } }", &table).unwrap();
+        let links = parse_string("links = { character = { from_data = yes } }", &table);
         let mut a = ast_to_ruleset(&links, &table);
 
-        let other =
-            parse_string("types = { type[evt] = { path = \"game/events\" } }", &table).unwrap();
+        let other = parse_string("types = { type[evt] = { path = \"game/events\" } }", &table);
         let b = ast_to_ruleset(&other, &table);
 
         merge_ruleset(&mut a, b);

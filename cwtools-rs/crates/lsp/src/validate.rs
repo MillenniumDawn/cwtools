@@ -387,18 +387,15 @@ fn diagnostic_at(
 }
 
 pub(crate) fn parse_error_to_diagnostic(e: &ParseError, lines: &DocLines) -> Diagnostic {
-    let (line, col, msg) = match e {
-        ParseError::Pos(line, col, msg) => (line.saturating_sub(1), *col as u32, msg.clone()),
-        ParseError::General(msg) => (0, 0, msg.clone()),
-    };
+    let ParseError::Pos(line, col, msg) = e;
     diagnostic_at(
-        line,
-        col,
+        line.saturating_sub(1),
+        *col as u32,
         lines,
         DiagnosticSeverity::ERROR,
         "cwtools",
         None,
-        msg,
+        msg.clone(),
     )
 }
 
@@ -1524,39 +1521,24 @@ impl Backend {
         // ruleset, rather than running the game-script validator (which would
         // flag every rule field as unknown). See #43.
         if crate::paths::is_cwt_file(uri) {
-            match parse_string(text, &self.state.string_table) {
-                Ok(parsed) => {
-                    for parse_err in &parsed.errors {
-                        diagnostics.push(parse_error_to_diagnostic(parse_err, &lines));
-                    }
-                    // Structural reference check against the merged ruleset. Only
-                    // runs once rules are loaded; before then there's nothing to
-                    // resolve references against (and everything would falsely
-                    // report undefined).
-                    let rules_guard = self.state.rules.read();
-                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
-                        let path = std::path::PathBuf::from(uri_to_path_str(uri));
-                        let files = [(path, parsed)];
-                        for err in cwtools_rules::config_validation::validate_ruleset_references(
-                            &files,
-                            ruleset,
-                            &self.state.string_table,
-                        ) {
-                            diagnostics.push(rule_parse_error_to_diagnostic(&err, &lines));
-                        }
-                    }
-                }
-                Err(e) => {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position::default(),
-                            end: Position::default(),
-                        },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        source: Some("cwtools-rules".to_string()),
-                        message: format!("Parse error: {}", e),
-                        ..Default::default()
-                    });
+            let parsed = parse_string(text, &self.state.string_table);
+            for parse_err in &parsed.errors {
+                diagnostics.push(parse_error_to_diagnostic(parse_err, &lines));
+            }
+            // Structural reference check against the merged ruleset. Only runs
+            // once rules are loaded; before then there's nothing to resolve
+            // references against (and everything would falsely report
+            // undefined).
+            let rules_guard = self.state.rules.read();
+            if let Some(ruleset) = rules_guard.ruleset.as_ref() {
+                let path = std::path::PathBuf::from(uri_to_path_str(uri));
+                let files = [(path, parsed)];
+                for err in cwtools_rules::config_validation::validate_ruleset_references(
+                    &files,
+                    ruleset,
+                    &self.state.string_table,
+                ) {
+                    diagnostics.push(rule_parse_error_to_diagnostic(&err, &lines));
                 }
             }
             return (diagnostics, None);
@@ -1568,113 +1550,94 @@ impl Backend {
         // index, validate) with no await in it. Without the fence a 1 MB script
         // file holds a tokio worker for the whole validate, while the scan paths
         // that do the same work already fence theirs. (#87)
-        tokio::task::block_in_place(|| match parse_string(text, &self.state.string_table) {
-            Ok(parsed) => {
-                for parse_err in &parsed.errors {
-                    diagnostics.push(parse_error_to_diagnostic(parse_err, &lines));
-                }
+        tokio::task::block_in_place(|| {
+            let parsed = parse_string(text, &self.state.string_table);
+            for parse_err in &parsed.errors {
+                diagnostics.push(parse_error_to_diagnostic(parse_err, &lines));
+            }
 
-                // Index this file the same way the workspace scan and did_close
-                // disk-restore do (previously an inlined, drifted subset that
-                // skipped subtype-membership indexing — an open file could lose
-                // its `<type.subtype>` membership while being edited).
-                self.index_parsed_file(uri, &parsed, parsed_version);
+            // Index this file the same way the workspace scan and did_close
+            // disk-restore do (previously an inlined, drifted subset that
+            // skipped subtype-membership indexing — an open file could lose
+            // its `<type.subtype>` membership while being edited).
+            self.index_parsed_file(uri, &parsed, parsed_version);
 
-                // Validation. Lock order: rules -> info_service -> loc_index.
-                let (errors, log_msg) = {
-                    let game = self.state.config.read().game();
-                    // Live overlay of unsaved loc keys in open `.yml` files, so a
-                    // key just added there resolves in this file's loc checks
-                    // (CW100/CW122) without a full rescan (#36). Computed before
-                    // the other guards (independent lock).
-                    let overlay = self.loc_overlay_keys();
-                    let rules_guard = self.state.rules.read();
-                    if let Some(ruleset) = rules_guard.ruleset.as_ref() {
-                        let start = std::time::Instant::now();
-                        // Pass the workspace TypeIndex for cross-file type reference checking.
-                        let info_guard = self.state.info_service.read();
-                        let type_index = &info_guard.type_index;
-                        let loc_guard = self.state.loc_index.read();
-                        // Single-file path: the scope registry is cached (built
-                        // once at ruleset load).
-                        let (scope_checks, var_checks) = {
-                            let cfg = self.state.config.read();
-                            (cfg.scope_checks, cfg.var_checks)
-                        };
-                        let prepared = make_prepared(
-                            ruleset,
-                            &self.state.string_table,
-                            game,
-                            type_index,
-                            &rules_guard.modifier_keys,
-                            loc_guard.as_ref(),
-                            Some(&overlay),
-                            rules_guard.scope_registry.as_ref(),
-                            scope_checks,
-                            var_checks,
-                        );
-                        let track = needs_use_tracking(ruleset, game);
-                        let (mut errs, used) = if track {
-                            let (errs, used) =
-                                validate_prepared_tracking_uses(&parsed, uri, &prepared);
-                            (errs, Some(used))
-                        } else {
-                            (validate_prepared(&parsed, uri, &prepared), None)
-                        };
-                        if let Some(used) = used {
-                            errs.extend(
-                                self.unused_instance_errors(uri, used, ruleset, game, type_index),
-                            );
-                        }
-                        append_missing_loc_errors(uri, &prepared, &mut errs);
-                        drop(loc_guard);
-                        drop(info_guard);
-                        let elapsed = start.elapsed();
-                        let total = truncate_validation_errors(&mut errs, uri);
-                        let msg = format!(
-                            "[validate] ({}) {} errors in {:?} ({} types, {} enums, {} aliases)",
-                            trigger.as_str(),
-                            total,
-                            elapsed,
-                            ruleset.types.len(),
-                            ruleset.enums.len(),
-                            ruleset.aliases.len()
-                        );
-                        (errs, Some(msg))
+            // Validation. Lock order: rules -> info_service -> loc_index.
+            let (errors, log_msg) = {
+                let game = self.state.config.read().game();
+                // Live overlay of unsaved loc keys in open `.yml` files, so a
+                // key just added there resolves in this file's loc checks
+                // (CW100/CW122) without a full rescan (#36). Computed before
+                // the other guards (independent lock).
+                let overlay = self.loc_overlay_keys();
+                let rules_guard = self.state.rules.read();
+                if let Some(ruleset) = rules_guard.ruleset.as_ref() {
+                    let start = std::time::Instant::now();
+                    // Pass the workspace TypeIndex for cross-file type reference checking.
+                    let info_guard = self.state.info_service.read();
+                    let type_index = &info_guard.type_index;
+                    let loc_guard = self.state.loc_index.read();
+                    // Single-file path: the scope registry is cached (built
+                    // once at ruleset load).
+                    let (scope_checks, var_checks) = {
+                        let cfg = self.state.config.read();
+                        (cfg.scope_checks, cfg.var_checks)
+                    };
+                    let prepared = make_prepared(
+                        ruleset,
+                        &self.state.string_table,
+                        game,
+                        type_index,
+                        &rules_guard.modifier_keys,
+                        loc_guard.as_ref(),
+                        Some(&overlay),
+                        rules_guard.scope_registry.as_ref(),
+                        scope_checks,
+                        var_checks,
+                    );
+                    let track = needs_use_tracking(ruleset, game);
+                    let (mut errs, used) = if track {
+                        let (errs, used) = validate_prepared_tracking_uses(&parsed, uri, &prepared);
+                        (errs, Some(used))
                     } else {
-                        (Vec::new(), None)
+                        (validate_prepared(&parsed, uri, &prepared), None)
+                    };
+                    if let Some(used) = used {
+                        errs.extend(
+                            self.unused_instance_errors(uri, used, ruleset, game, type_index),
+                        );
                     }
-                };
-
-                if let Some(msg) = log_msg {
-                    // tracing, not a client log_message, so a per-keystroke/
-                    // per-watched-file line doesn't flood the output channel.
-                    // Still captured by exportProfilingLog and stderr (RUST_LOG).
-                    tracing::info!(target: "cwtools::profile", "{}", msg);
+                    append_missing_loc_errors(uri, &prepared, &mut errs);
+                    drop(loc_guard);
+                    drop(info_guard);
+                    let elapsed = start.elapsed();
+                    let total = truncate_validation_errors(&mut errs, uri);
+                    let msg = format!(
+                        "[validate] ({}) {} errors in {:?} ({} types, {} enums, {} aliases)",
+                        trigger.as_str(),
+                        total,
+                        elapsed,
+                        ruleset.types.len(),
+                        ruleset.enums.len(),
+                        ruleset.aliases.len()
+                    );
+                    (errs, Some(msg))
+                } else {
+                    (Vec::new(), None)
                 }
+            };
 
-                for err in &errors {
-                    diagnostics.push(validation_error_to_diagnostic(err, &lines));
-                }
-                (diagnostics, Some(parsed))
+            if let Some(msg) = log_msg {
+                // tracing, not a client log_message, so a per-keystroke/
+                // per-watched-file line doesn't flood the output channel.
+                // Still captured by exportProfilingLog and stderr (RUST_LOG).
+                tracing::info!(target: "cwtools::profile", "{}", msg);
             }
-            Err(e) => {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position::default(),
-                        end: Position::default(),
-                    },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: None,
-                    code_description: None,
-                    source: Some("cwtools".to_string()),
-                    message: format!("Parse error: {}", e),
-                    related_information: None,
-                    tags: None,
-                    data: None,
-                });
-                (diagnostics, None)
+
+            for err in &errors {
+                diagnostics.push(validation_error_to_diagnostic(err, &lines));
             }
+            (diagnostics, Some(parsed))
         })
     }
 }
@@ -1727,7 +1690,7 @@ mod perf_bench {
         let text = std::fs::read_to_string(fixture).expect("fixture").repeat(8);
         eprintln!("fixture: {} bytes", text.len());
         let table = cwtools_string_table::string_table::StringTable::new();
-        let parsed = parse_string(&text, &table).expect("parse");
+        let parsed = parse_string(&text, &table);
 
         bench("collect_doc_tokens", 30, || {
             collect_doc_tokens(&parsed).len()
@@ -1874,7 +1837,7 @@ mod perf_bench {
                 eprintln!("  skipping missing fixture {}", game_file.display());
                 continue;
             };
-            let parsed = parse_string(&text, &table).expect("parse");
+            let parsed = parse_string(&text, &table);
             let uri = format!("file:///bench/{}", logical_path);
             eprintln!("fixture: {} ({} bytes)", logical_path, text.len());
 

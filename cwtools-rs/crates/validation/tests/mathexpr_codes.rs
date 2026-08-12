@@ -36,9 +36,9 @@ alias[mathexpr:round] = bool
 
 fn codes(script: &str) -> Vec<String> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(RULES, &table).unwrap();
+    let parsed_cwt = parse_string(RULES, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let idx = TypeIndex::new();
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(
@@ -130,9 +130,9 @@ alias[mathexpr:subtract] = math_expr
 
 fn codes_value_set(script: &str) -> Vec<String> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(RULES_VALUE_SET, &table).unwrap();
+    let parsed_cwt = parse_string(RULES_VALUE_SET, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let idx = TypeIndex::new();
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(
@@ -213,9 +213,9 @@ alias[mathexpr:multiply] = math_expr
 
 fn codes_alias(script: &str) -> Vec<String> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(RULES_ALIAS, &table).unwrap();
+    let parsed_cwt = parse_string(RULES_ALIAS, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let idx = TypeIndex::new();
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(
@@ -289,9 +289,9 @@ alias[mathexpr:subtract] = math_expr
 
 fn codes_trigger(script: &str) -> Vec<String> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(RULES_TRIGGER, &table).unwrap();
+    let parsed_cwt = parse_string(RULES_TRIGGER, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let idx = TypeIndex::new();
     let registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
     let errors = validate_prepared(

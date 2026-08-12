@@ -18,9 +18,9 @@ foo = {
 
 fn validate(script: &str) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(RULES, &table).unwrap();
+    let parsed_cwt = parse_string(RULES, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None)
 }
 
@@ -61,9 +61,9 @@ fn cw282_fix_deletes_redundant_leaf() {
     use cwtools_parser::fix::apply_edits;
     let src = "foo = { name = x some_bool_field = yes }";
     let table = StringTable::new();
-    let parsed_cwt = parse_string(RULES, &table).unwrap();
+    let parsed_cwt = parse_string(RULES, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(src, &table).unwrap();
+    let parsed = parse_string(src, &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
 
     let err = errors
@@ -75,7 +75,7 @@ fn cw282_fix_deletes_redundant_leaf() {
     assert_eq!(fixed, "foo = { name = x }");
 
     // Revalidation of the fixed text no longer emits CW282.
-    let parsed2 = parse_string(&fixed, &table).unwrap();
+    let parsed2 = parse_string(&fixed, &table);
     let errors2 = validate_ast(&parsed2, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         !errors2.iter().any(|e| e.code == Some("CW282")),
@@ -94,9 +94,9 @@ foo = {
 }
 "#;
     let table = StringTable::new();
-    let parsed_cwt = parse_string(PLAIN, &table).unwrap();
+    let parsed_cwt = parse_string(PLAIN, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string("foo = { name = x some_bool_field = yes }", &table).unwrap();
+    let parsed = parse_string("foo = { name = x some_bool_field = yes }", &table);
     let errors = validate_ast(&parsed, &ruleset, &table, "test.txt", None, None, None);
     assert!(
         !errors.iter().any(|e| e.code == Some("CW282")),

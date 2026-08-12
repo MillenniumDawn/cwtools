@@ -44,7 +44,7 @@ static REINDEX_PANIC_ONCE: AtomicBool = AtomicBool::new(true);
 /// True when `name` is set to a truthy value (`1`, `true`, `yes`, `on`) — same
 /// convention as `cwtools_profiling::profile_enabled`, so `VAR=0` or an empty
 /// value (a shell habit for "unset") doesn't accidentally arm a test hook.
-fn env_flag(name: &str) -> bool {
+pub(crate) fn env_flag(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
@@ -954,8 +954,7 @@ impl Backend {
                             Some(cwtools_cache::workspace::content_hash(&text)),
                         ));
                     }
-                    let parsed =
-                        parse_string_without_comments(&text, &self.state.string_table).ok()?;
+                    let parsed = parse_string_without_comments(&text, &self.state.string_table);
                     if let Some((cd, fp)) = cache_info.as_ref() {
                         if let Some(source_key) = source_key.as_ref() {
                             workspace_cache::store_path(

@@ -16,9 +16,9 @@ use cwtools_validation::validate_ast;
 fn codes(game: Game, script: &str) -> Vec<String> {
     let table = StringTable::new();
     // Empty ruleset: the structural pass is rules-independent.
-    let parsed_cwt = parse_string("", &table).unwrap();
+    let parsed_cwt = parse_string("", &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     let errors = validate_ast(
         &parsed,
         &ruleset,
@@ -54,10 +54,10 @@ foo = {
 fn cw223_message_is_game_specific() {
     // HOI4 has no NOR/NAND triggers, so its message must not advise them.
     let table = StringTable::new();
-    let parsed_cwt = parse_string("", &table).unwrap();
+    let parsed_cwt = parse_string("", &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let script = "foo = { NOT = { a = 1\n b = 2 } }";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
 
     let msg = |game| {
         validate_ast(
@@ -329,11 +329,11 @@ foo = {
 #[test]
 fn cw236_underlines_only_the_if_key() {
     let table = StringTable::new();
-    let parsed_cwt = parse_string("", &table).unwrap();
+    let parsed_cwt = parse_string("", &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let script =
         "foo = {\n    if = {\n        limit = { x = 1 }\n        else = { b = 2 }\n    }\n}\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
 
     let err = validate_ast(
         &parsed,
@@ -359,10 +359,10 @@ fn cw236_underlines_only_the_if_key() {
 #[test]
 fn cw238_underlines_only_the_containing_key() {
     let table = StringTable::new();
-    let parsed_cwt = parse_string("", &table).unwrap();
+    let parsed_cwt = parse_string("", &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let script = "foo = {\n    else = { a = 1 }\n}\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
 
     let err = validate_ast(
         &parsed,
@@ -392,10 +392,10 @@ fn cw238_underlines_only_the_containing_key() {
 fn cw261_underlines_only_the_duplicated_key() {
     let table = StringTable::new();
     let cwt = "types = {\n    type[thing] = {\n        path = \"game/common/things\"\n        unique = yes\n    }\n}\n";
-    let parsed_cwt = parse_string(cwt, &table).unwrap();
+    let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let script = "thing = {\n    a = 1\n}\nthing = {\n    b = 2\n}\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
 
     let err = validate_ast(
         &parsed,
@@ -423,10 +423,10 @@ fn cw261_underlines_only_the_duplicated_key() {
 #[test]
 fn cw253_underlines_only_the_deprecated_key() {
     let table = StringTable::new();
-    let parsed_cwt = parse_string("", &table).unwrap();
+    let parsed_cwt = parse_string("", &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
     let script = "foo = {\n    set_empire_name = {\n        key = \"X\"\n    }\n}\n";
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
 
     let err = validate_ast(
         &parsed,

@@ -21,7 +21,6 @@ pub struct CachedErrors {
 #[repr(u8)]
 pub enum CachedParseError {
     Pos(u32, u16, String),
-    General(String),
 }
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

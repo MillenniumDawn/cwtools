@@ -32,9 +32,9 @@ fn loc_index(files: &[(&str, &str)]) -> LocIndex {
 
 fn run(script: &str, idx: &LocIndex) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(CWT, &table).unwrap();
+    let parsed_cwt = parse_string(CWT, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let parsed = parse_string(script, &table);
     validate_ast_with_loc(
         &parsed,
         &ruleset,
@@ -279,9 +279,9 @@ fn overlay_key_resolves_missing_loc() {
     use std::collections::HashSet;
 
     let table = StringTable::new();
-    let parsed_cwt = parse_string(CWT, &table).unwrap();
+    let parsed_cwt = parse_string(CWT, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string("mytype = {\n name = just_added_key\n}\n", &table).unwrap();
+    let parsed = parse_string("mytype = {\n name = just_added_key\n}\n", &table);
     // Index lacks the key.
     let idx = loc_index(&[("a_l_english.yml", "l_english:\n other: \"hi\"\n")]);
 
@@ -325,9 +325,9 @@ fn overlay_key_resolves_missing_loc() {
 #[test]
 fn no_loc_index_is_lenient() {
     let table = StringTable::new();
-    let parsed_cwt = parse_string(CWT, &table).unwrap();
+    let parsed_cwt = parse_string(CWT, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let parsed = parse_string("mytype = {\n name = absent_key\n}\n", &table).unwrap();
+    let parsed = parse_string("mytype = {\n name = absent_key\n}\n", &table);
     let errs = validate_ast_with_loc(
         &parsed, &ruleset, &table, "test.txt", None, None, None, None,
     );

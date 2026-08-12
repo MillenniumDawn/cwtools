@@ -30,8 +30,8 @@ thing = {
 
 fn errors_for(script: &str) -> Vec<cwtools_validation::ValidationError> {
     let table = StringTable::new();
-    let ruleset = ast_to_ruleset(&parse_string(CWT, &table).unwrap(), &table);
-    let parsed = parse_string(script, &table).unwrap();
+    let ruleset = ast_to_ruleset(&parse_string(CWT, &table), &table);
+    let parsed = parse_string(script, &table);
     validate_ast(
         &parsed,
         &ruleset,
