@@ -586,6 +586,32 @@ pub(crate) fn lang_display_name(lang: cwtools_localization::Lang) -> &'static st
 mod tests {
     use super::*;
 
+    /// `default_cache_dir` exists twice — here for the LSP and in
+    /// `cwtools_driver` for the CLI — and the driver's doc promises both land
+    /// in the same `cwtools` directory. Nothing checked that, so an edit to one
+    /// copy could leave the editor and the CLI caching the same install in two
+    /// places and each re-indexing what the other already had.
+    ///
+    /// Reads the ambient environment rather than setting any: both are pure
+    /// functions of it, and agreeing on whatever it happens to be is the whole
+    /// contract. Setting it would race every other test in this binary.
+    #[test]
+    fn default_cache_dir_agrees_with_the_driver_copy() {
+        let ours = default_cache_dir().expect("the LSP copy always answers");
+        assert_eq!(
+            Some(&ours),
+            cwtools_driver::default_cache_dir().as_ref(),
+            "the LSP and CLI cache directories have drifted apart"
+        );
+        // Every branch of both copies ends in `cwtools`, whichever env var won.
+        assert_eq!(
+            ours.file_name().and_then(|n| n.to_str()),
+            Some("cwtools"),
+            "got: {}",
+            ours.display()
+        );
+    }
+
     #[test]
     fn is_loc_file_matches_all_loc_extensions() {
         // hover/goto, completion, and validate must agree (#2/#217).

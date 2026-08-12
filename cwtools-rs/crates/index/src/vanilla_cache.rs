@@ -738,6 +738,188 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ── Corruption handling ──────────────────────────────────────────────────
+    // Everything below has to come back as an `Err`, because that is what every
+    // consumer relies on: `driver::load_fresh_vanilla_cache`, the LSP's scan and
+    // config paths and the CLI all collapse an error to a miss and re-index the
+    // install. A panic instead would take the server or CLI down over a file a
+    // crash, a full disk or a stale format left behind. The `.cwb` parse cache
+    // has the same suite (`cwtools_cache/tests/corrupt.rs`); this is the `.cwv`
+    // half, which had none.
+
+    /// A small but complete cache: two types, per-instance source files, and
+    /// every aux list populated so the body is a real payload rather than a
+    /// header and a stub.
+    fn sample_cache_bytes() -> Vec<u8> {
+        let mut per: HashMap<String, Vec<(Arc<str>, TypeInstance)>> = HashMap::new();
+        per.insert(
+            "spriteType".to_string(),
+            vec![(
+                Arc::from("gfx/interface/icons.gfx"),
+                TypeInstance {
+                    name: "GFX_a".into(),
+                    location: SourceLocation {
+                        line: 2,
+                        col: 1,
+                        end: (4, 1),
+                    },
+                    primary_loc_key: Some("GFX_A_TITLE".into()),
+                },
+            )],
+        );
+        per.insert(
+            "event".to_string(),
+            vec![(
+                Arc::from("events/base.txt"),
+                TypeInstance {
+                    name: "base.1".into(),
+                    location: SourceLocation {
+                        line: 7,
+                        col: 0,
+                        end: (12, 1),
+                    },
+                    primary_loc_key: None,
+                },
+            )],
+        );
+        let aux = VanillaCacheAux {
+            loc_keys: vec![("english".into(), vec!["key_a".into(), "key_b".into()])],
+            file_paths: vec!["gfx/interface/icons.gfx".into(), "events/base.txt".into()],
+            var_names: vec!["my_var".into()],
+            complex_enum_values: vec![("equipment_stat".into(), vec!["build_cost_ic".into()])],
+            value_set_values: vec![("country_flag".into(), vec!["my_flag".into()])],
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(cache_file_name("hoi4", "v1.16.4"));
+        save_per_type(&per, "hoi4", "v1.16.4", &path, aux).unwrap();
+        std::fs::read(&path).unwrap()
+    }
+
+    /// Write `bytes` to a temp `.cwv` and take them through the whole load path
+    /// the consumers use: the read cap, the header, the version, zstd, rkyv and
+    /// the restore into `VanillaCacheData`.
+    fn load_bytes(bytes: &[u8]) -> std::io::Result<(String, String, VanillaCacheData)> {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(cache_file_name("hoi4", "corrupt"));
+        std::fs::write(&path, bytes).unwrap();
+        load(&path)
+    }
+
+    /// Sanity anchor: the unmodified bytes every test below mutates do load.
+    #[test]
+    fn sample_cache_bytes_load_clean() {
+        let bytes = sample_cache_bytes();
+        assert!(bytes.starts_with(MAGIC), "sample lost its magic");
+        assert_eq!(bytes[MAGIC.len()], CACHE_VERSION, "sample version drifted");
+        let (game, fp, data) = load_bytes(&bytes).expect("sample must load");
+        assert_eq!((game.as_str(), fp.as_str()), ("hoi4", "v1.16.4"));
+        assert_eq!(data.per_type.len(), 2);
+    }
+
+    /// A zero-byte file is what a crash mid-write leaves behind. It must not
+    /// reach zstd or rkyv at all.
+    #[test]
+    fn zero_byte_cache_is_a_clean_miss() {
+        let err = load_bytes(&[]).unwrap_err();
+        assert!(
+            err.to_string().contains("not a vanilla cache file"),
+            "{err}"
+        );
+    }
+
+    /// Any prefix shorter than magic+version is the same crash-mid-write case.
+    #[test]
+    fn cache_shorter_than_magic_plus_version_is_a_clean_miss() {
+        let bytes = sample_cache_bytes();
+        for len in 0..=MAGIC.len() {
+            let err = load_bytes(&bytes[..len]).unwrap_err();
+            assert!(
+                err.to_string().contains("not a vanilla cache file"),
+                "len {len} gave {err}"
+            );
+        }
+    }
+
+    /// A single wrong magic byte is enough, and so is a body with the header
+    /// sliced off (what a pre-v4 raw file would look like).
+    #[test]
+    fn a_corrupted_magic_is_a_clean_miss() {
+        let bytes = sample_cache_bytes();
+        for i in 0..MAGIC.len() {
+            let mut corrupt = bytes.clone();
+            corrupt[i] ^= 0xff;
+            let err = load_bytes(&corrupt).unwrap_err();
+            assert!(
+                err.to_string().contains("not a vanilla cache file"),
+                "magic byte {i} gave {err}"
+            );
+        }
+
+        let err = load_bytes(&bytes[MAGIC.len() + 1..]).unwrap_err();
+        assert!(
+            err.to_string().contains("not a vanilla cache file"),
+            "{err}"
+        );
+    }
+
+    /// The point of `CACHE_VERSION`: a cache from any other layout is refused
+    /// rather than reinterpreted under the current one. Eleven format bumps
+    /// have happened and only the immediately-previous one was covered.
+    #[test]
+    fn every_other_version_byte_is_a_clean_miss() {
+        let bytes = sample_cache_bytes();
+        for version in [0u8, 1, 4, CACHE_VERSION - 1, CACHE_VERSION + 1, 255] {
+            let mut corrupt = bytes.clone();
+            corrupt[MAGIC.len()] = version;
+            let err = load_bytes(&corrupt).unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported"),
+                "version {version} gave {err}"
+            );
+        }
+    }
+
+    /// A valid header over a body that stops early: the write was interrupted
+    /// after the header landed, or the disk filled up. zstd and rkyv have to
+    /// reject it — a partial cache served as a hit is a base-game index missing
+    /// whatever the truncation cut off.
+    #[test]
+    fn a_truncated_body_is_a_clean_miss() {
+        let bytes = sample_cache_bytes();
+        let body_start = MAGIC.len() + 1;
+        assert!(
+            bytes.len() > body_start + 8,
+            "sample body too small to truncate"
+        );
+        for len in body_start..bytes.len() {
+            assert!(
+                load_bytes(&bytes[..len]).is_err(),
+                "truncating to {len} of {} bytes loaded as valid",
+                bytes.len()
+            );
+        }
+    }
+
+    /// A body that is not zstd at all: something else ended up in the cache dir
+    /// under a `.cwv` name and happened to carry the header.
+    #[test]
+    fn a_non_zstd_body_is_a_clean_miss() {
+        let mut bytes = MAGIC.to_vec();
+        bytes.push(CACHE_VERSION);
+        bytes.extend_from_slice(b"this is not a zstd frame, it is prose");
+        assert!(load_bytes(&bytes).is_err());
+    }
+
+    /// A missing cache file is the ordinary cold-start miss, and has to surface
+    /// as an error the caller already handles rather than anything special.
+    #[test]
+    fn a_missing_cache_file_is_a_clean_miss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = load(&tmp.path().join(cache_file_name("hoi4", "absent"))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    }
+
     #[test]
     fn ruleset_shape_hash_is_stable_and_sensitive() {
         use cwtools_rules::rules_types::{PathOptions, TypeDefinition};

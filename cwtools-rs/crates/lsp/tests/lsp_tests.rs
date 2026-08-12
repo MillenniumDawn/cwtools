@@ -4076,6 +4076,96 @@ fn test_closing_a_buffer_with_discarded_edits_restores_disk_uses() {
     );
 }
 
+#[test]
+fn test_closed_file_cw239_only_catches_up_on_the_next_scan() {
+    // The other half of the staleness contract ERROR_CODES.md states for CW239:
+    // an open file's answer moves with every edit (the test above), a closed
+    // file's waits for the next scan. Only the first half was covered, so the
+    // dependent sweep growing a "republish closed files too" path — which would
+    // mean re-reading and re-validating arbitrarily many files per keystroke —
+    // would break nothing.
+    let (ws, mut child, mut reader, _a_path, b_path) = spawn_unused_workspace();
+    let scanned = diags_for(&mut reader, "a.txt", 1).expect("a.txt scan diagnostics");
+    assert!(
+        scanned.contains(&"CW239".to_string()),
+        "lone_thing starts out referenced by nothing, got: {scanned:?}"
+    );
+    wait_for_scan_done(&mut reader);
+
+    let b_uri = path_uri(&b_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":b_uri,"languageId":"hoi4","version":1,
+                "text": B_TEXT}}),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, "b.txt", 1).expect("b.txt diagnostics");
+
+    // Reference lone_thing from the open buffer. a.txt, which defines it, is
+    // closed and stays closed.
+    let rx = spawn_frame_collector(reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": b_uri, "version": 2 },
+                "contentChanges": [{ "text":
+                    "a_user = { uses = used_thing }\nb_user = { uses = lone_thing }\n" }]
+            }),
+        ),
+    )
+    .unwrap();
+    let frames = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(800),
+        std::time::Duration::from_secs(6),
+    );
+    assert_eq!(
+        count_publishes(&frames, "b.txt"),
+        1,
+        "the edit must be validated, or nothing below is being tested"
+    );
+    assert_eq!(
+        count_publishes(&frames, "a.txt"),
+        0,
+        "a closed file must not be republished by the open-file sweep"
+    );
+
+    // The scan is what refreshes it, and it counts the open buffer's unsaved
+    // reference: the diagnostic clears without b.txt ever being written to disk.
+    reindex_until_scan_starts(&mut child, &rx);
+    let republished = recv_frame_until(
+        &rx,
+        std::time::Duration::from_secs(30),
+        "the reindex to republish a.txt",
+        |_| {},
+        |v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"]
+                    .as_str()
+                    .is_some_and(|u| u.ends_with("a.txt"))
+        },
+    );
+    child.kill().ok();
+    drop(ws);
+
+    let codes: Vec<&str> = republished["params"]["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert!(
+        !codes.contains(&"CW239"),
+        "the scan must catch the closed file up on the reference added since, \
+         got: {codes:?}"
+    );
+}
+
 // ── B5/B7: document symbols, folding, highlight, cross-file references/rename ──
 
 /// Spawn a server with `rules`, write `files` to disk, initialize with
@@ -7664,6 +7754,112 @@ fn test_did_open_then_immediate_close_ends_empty() {
         diags.is_empty(),
         "final publish for a closed file must be empty, got: {:?}",
         diags
+    );
+}
+
+#[test]
+fn test_did_save_revalidates_the_open_document() {
+    // did_save takes its own path: no text arrives with the notification
+    // (`include_text` is false), nothing is written to the document store, and
+    // the edit generation is read rather than bumped — it re-validates the
+    // buffer the server already holds. Nothing pinned that it validates at all.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let uri = write_disk_file(ws.path(), "common/decisions/s.txt", STORM_FILE);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({"textDocument":{"uri":uri,"languageId":"hoi4","version":1,"text":STORM_FILE}}),
+        ),
+    )
+    .unwrap();
+    let opened = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(800),
+        std::time::Duration::from_secs(6),
+    );
+    assert_eq!(
+        count_publishes(&opened, "s.txt"),
+        1,
+        "the open must publish before the save window opens"
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didSave",
+            serde_json::json!({"textDocument":{"uri":uri}}),
+        ),
+    )
+    .unwrap();
+    let saved = drain_after_first(
+        &rx,
+        std::time::Duration::from_millis(800),
+        std::time::Duration::from_secs(6),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1020);
+    child.kill().ok();
+
+    assert_eq!(
+        count_validate_log(&log, "didSave"),
+        1,
+        "a save must validate the document once, tagged as a save"
+    );
+    assert_eq!(
+        count_publishes(&saved, "s.txt"),
+        1,
+        "a save must republish the saved document's diagnostics"
+    );
+}
+
+#[test]
+fn test_did_save_for_a_document_that_was_never_opened_is_a_no_op() {
+    // Unlike did_change, which reports a rejection, did_save returns silently
+    // when the URI is not an open document: it needs the stored version, and
+    // there is none. A client that saves a file it never opened (or one the
+    // retention cap evicted) must not make the server read or validate it.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let uri = write_disk_file(ws.path(), "common/decisions/u.txt", STORM_FILE);
+    let rx = spawn_frame_collector(reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didSave",
+            serde_json::json!({"textDocument":{"uri":uri}}),
+        ),
+    )
+    .unwrap();
+
+    let frames = drain_until_quiet(
+        &rx,
+        std::time::Duration::from_millis(1200),
+        std::time::Duration::from_secs(6),
+    );
+    let log = fetch_profiling_log(&mut child, &rx, 1021);
+    child.kill().ok();
+
+    assert_eq!(
+        count_validate_log(&log, "didSave"),
+        0,
+        "a save for a document that was never opened must not validate anything"
+    );
+    assert_eq!(
+        count_publishes(&frames, "u.txt"),
+        0,
+        "and must not publish diagnostics for it"
     );
 }
 
@@ -13242,5 +13438,134 @@ fn test_access_boundary_allows_an_auto_discovered_vanilla_install() {
             .iter()
             .any(|r| r["startLine"] == 0 && r["endLine"] == 4),
         "an auto-discovered base-game file must be readable, got: {response}"
+    );
+}
+
+/// Every game id `Game::from_str` accepts, with the Steam `steamapps/common`
+/// folder `discover_vanilla_dir` has to map it to. ARCHITECTURE.md lists that
+/// mapping as one of the nine sites a new game touches in lockstep, and as one
+/// of the ones the compiler cannot catch: the match ends in `_ => None`, so a
+/// missing or misspelled arm compiles and quietly discovers nothing forever.
+/// `eu5` and `custom` are deliberately absent — neither ships on Steam under a
+/// known folder, and both take the `None` arm today.
+#[cfg(unix)]
+const STEAM_INSTALL_FOLDERS: &[(&str, &str)] = &[
+    ("hoi4", "Hearts of Iron IV"),
+    ("stellaris", "Stellaris"),
+    ("eu4", "Europa Universalis IV"),
+    ("ck2", "Crusader Kings II"),
+    ("ck3", "Crusader Kings III"),
+    ("vic2", "Victoria 2"),
+    ("vic3", "Victoria 3"),
+    ("ir", "ImperatorRome"),
+];
+
+/// Boot a server for `game` against a `$HOME` holding a base-game file under
+/// `folder`, and ask for that file's folding ranges. Ranges mean the install
+/// was discovered — nothing else puts a path outside the workspace inside the
+/// access boundary — and an empty result means it was not.
+#[cfg(unix)]
+fn auto_discovered_vanilla_response(game: &str, folder: &str) -> serde_json::Value {
+    let home = tempfile::tempdir().unwrap();
+    let vanilla_file = home
+        .path()
+        .join(".steam/steam/steamapps/common")
+        .join(folder)
+        .join("common/national_focus/base.txt");
+    std::fs::create_dir_all(vanilla_file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &vanilla_file,
+        "outer = {\n    inner = {\n        x = 1\n    }\n}\n",
+    )
+    .unwrap();
+
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let reader = BufReader::new(child.stdout.take().unwrap());
+    let stdin = child.stdin.take().unwrap();
+    let ws_uri = path_uri(ws.path());
+    let rules = rules_dir.path().to_string_lossy().to_string();
+    let file_uri = path_uri(&vanilla_file);
+    let game = game.to_string();
+
+    let response = run_with_deadline(stdin, reader, 60, move |stdin, reader| {
+        write_frame_to(
+            stdin,
+            &jsonrpc_request(
+                1,
+                "initialize",
+                serde_json::json!({
+                    "processId": std::process::id(),
+                    "rootUri": ws_uri,
+                    "capabilities": {},
+                    // No `vanilla`: auto-discovery is the thing under test.
+                    "initializationOptions": { "language": game, "rulesCache": rules }
+                }),
+            ),
+        )
+        .ok()?;
+        read_response(reader).ok()?;
+        write_frame_to(
+            stdin,
+            &jsonrpc_notification("initialized", serde_json::json!({})),
+        )
+        .ok()?;
+        wait_for_scan_done(reader);
+        write_frame_to(
+            stdin,
+            &jsonrpc_request(
+                2,
+                "textDocument/foldingRange",
+                serde_json::json!({ "textDocument": { "uri": file_uri } }),
+            ),
+        )
+        .ok()?;
+        serde_json::from_str::<serde_json::Value>(&read_response(reader).ok()?).ok()
+    });
+    child.kill().ok();
+    child.wait().ok();
+    response.flatten().expect("the server never answered")
+}
+
+#[cfg(unix)]
+#[test]
+fn test_steam_folder_is_mapped_for_every_supported_game() {
+    for (game, folder) in STEAM_INSTALL_FOLDERS {
+        let response = auto_discovered_vanilla_response(game, folder);
+        assert!(
+            !response["result"].is_null(),
+            "{game} must auto-discover its install under {folder:?}; an empty \
+             result means the file was refused as outside the boundary, so the \
+             mapping produced no install: {response}"
+        );
+        let ranges = expect_ranges(&response);
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r["startLine"] == 0 && r["endLine"] == 4),
+            "{game} must auto-discover its install under {folder:?}, got: {response}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_steam_folder_mapping_is_per_game_not_a_wildcard() {
+    // The positive case above passes for any implementation that discovers
+    // *something* under `steamapps/common`. This is what makes it a mapping:
+    // an install sitting under another game's folder name is not this game's.
+    let response = auto_discovered_vanilla_response("hoi4", "Stellaris");
+    assert_refused(
+        &response,
+        "an install under a different game's Steam folder",
     );
 }
