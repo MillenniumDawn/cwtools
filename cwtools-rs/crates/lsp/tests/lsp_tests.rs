@@ -8965,6 +8965,109 @@ types = {
     assert_eq!(hint["paddingLeft"], true, "got: {hint}");
 }
 
+// ── Inlay hints: resolved scopes ─────────────────────────────────────────────
+
+#[test]
+fn test_inlay_hint_shows_rule_aware_scope() {
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "common/decisions" }
+}
+scopes = {
+    Country = { aliases = { country } }
+    Character = { aliases = { character } }
+}
+decision = {
+    ## push_scope = character
+    custom = {
+        add = int
+    }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), RULES).unwrap();
+    let rel_path = "common/decisions/scope.txt";
+    let text = "my_decision = {\n    custom = {\n        add = 1\n    }\n}\n";
+    let path = ws.path().join(rel_path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, text).unwrap();
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&path);
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": ws_uri,
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                    "inlayHintsScopes": true,
+                    "inlayHintsLocTitles": false,
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {"uri": doc_uri, "languageId": "hoi4", "version": 1, "text": text}
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, rel_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            2,
+            "textDocument/inlayHint",
+            serde_json::json!({
+                "textDocument": {"uri": doc_uri},
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 10, "character": 0}}
+            }),
+        ),
+    )
+    .unwrap();
+    let response = read_response(&mut reader).unwrap();
+    child.kill().ok();
+    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let hints = value["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("inlay result array: {value}"));
+    assert_eq!(hints.len(), 1, "got: {value}");
+    assert_eq!(hints[0]["label"], "→ character", "got: {value}");
+    assert_eq!(hints[0]["position"]["line"], 1, "got: {value}");
+    assert_eq!(hints[0]["position"]["character"], 13, "got: {value}");
+    assert_eq!(hints[0]["tooltip"], serde_json::Value::Null, "got: {value}");
+    assert_eq!(
+        hints[0]["textEdits"],
+        serde_json::Value::Null,
+        "got: {value}"
+    );
+}
+
 // ── getGraphData ─────────────────────────────────────────────────────────────
 
 /// A focus type whose instances reference each other, plus a decision type that

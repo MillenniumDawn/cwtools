@@ -251,15 +251,28 @@ pub(crate) fn highlight_kind(line: &str, col: u32, name: &str) -> DocumentHighli
     }
 }
 
-/// The 0-based char column just past the first `=` at/after `key_col` on `line`
-/// (the operator of a `key = value` leaf; also the `=` in `>=`/`?=`/etc.). The
-/// value token scan starts here so nothing in the key can be mistaken for the
-/// value. `None` when no `=` follows the key.
+/// The 0-based char column just past the assignment `=` at/after `key_col` on
+/// `line`. Quoted keys may contain an equals sign, so only an equals outside a
+/// quoted string can be the assignment operator.
 pub(crate) fn value_start_after_eq(line: &str, key_col: u32) -> Option<u32> {
+    let mut quoted = false;
+    let mut backslashes = 0;
     line.chars()
         .enumerate()
         .skip(key_col as usize)
-        .find(|(_, c)| *c == '=')
+        .find(|(_, c)| {
+            let escaped = backslashes % 2 == 1;
+            if *c == '"' && !escaped {
+                quoted = !quoted;
+            }
+            let is_assignment = *c == '=' && !quoted;
+            if *c == '\\' {
+                backslashes += 1;
+            } else {
+                backslashes = 0;
+            }
+            is_assignment
+        })
         .map(|(i, _)| i as u32 + 1)
 }
 
@@ -1044,6 +1057,13 @@ mod tests {
             highlight_kind("    var >= MY_FOCUS", 11, "MY_FOCUS"),
             DocumentHighlightKind::READ
         );
+    }
+
+    #[test]
+    fn value_start_after_eq_ignores_quoted_key_equals() {
+        assert_eq!(value_start_after_eq("\"a=b\" = { }", 0), Some(7));
+        assert_eq!(value_start_after_eq("\"a\\\"=b\" = { }", 0), Some(9));
+        assert_eq!(value_start_after_eq("\"a\\\\\"=b\" = { }", 0), Some(6));
     }
 
     #[test]

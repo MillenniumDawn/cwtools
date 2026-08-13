@@ -74,7 +74,7 @@ pub(crate) fn alias_overloads<'a>(
 ///
 /// A usage resolves to a handful of overloads at most, and this runs for every
 /// effect/trigger in the corpus, so the set is inline until it doesn't fit.
-fn alias_overloads_with_confidence<'a>(
+pub(crate) fn alias_overloads_with_confidence<'a>(
     ruleset: &'a RuleSet,
     type_index: Option<&cwtools_index::TypeIndex>,
     category: &str,

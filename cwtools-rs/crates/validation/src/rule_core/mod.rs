@@ -8,7 +8,7 @@ mod matching;
 mod subtype_merge;
 mod suggest;
 
-pub(crate) use alias::alias_overloads;
+pub(crate) use alias::{alias_overloads, alias_overloads_with_confidence};
 pub(crate) use children::{math_clause_rules, rule_right_is_math_expr};
 pub(crate) use leaf::{field_matches_value, is_builtin_variable};
 pub(crate) use matching::{matching_candidates, rule_matches_leaf_key};
