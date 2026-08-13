@@ -8,6 +8,7 @@ use cwtools_rules::rules_types::*;
 
 use crate::common::{ValidationError, with_leaf_value_str};
 use crate::ctx::ValidationCtx;
+use crate::rule_core::is_builtin_variable;
 use cwtools_error_codes as error_codes;
 
 /// Build the set of valid modifier names for `alias_name[modifier]` slots from
@@ -194,9 +195,22 @@ fn check_loc_key(
         let initial = scope_context
             .map(|c| c.current())
             .unwrap_or(cwtools_game::scope_engine::SCOPE_ANY);
+        // The scripted-variable registry a chain segment is judged against: the
+        // config's built-in reads plus every variable the project sets. Withheld
+        // while the variable index is empty (an unscanned workspace), which
+        // leaves multi-segment chains lenient rather than flagging all of them.
+        let var_index = ctx
+            .type_index
+            .map(|i| &i.var_index)
+            .filter(|v| !v.is_empty());
+        let names_variable = |name: &str| {
+            is_builtin_variable(ctx.ruleset, name) || var_index.is_some_and(|v| v.contains(name))
+        };
+        let lookup: cwtools_localization::ScriptedVariables<'_> = &names_variable;
         let data = cwtools_localization::LocScopeData {
             game,
             registry: scope_context.map(|c| c.registry.clone()),
+            scripted_variables: var_index.is_some().then_some(lookup),
             ..Default::default()
         };
         for diag in cwtools_localization::validate_loc_commands(entry, initial, &data) {

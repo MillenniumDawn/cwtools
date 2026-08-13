@@ -20,7 +20,9 @@ pub use pipeline::{
     validate_loc_project, validate_loc_project_scoped, validate_loc_project_with_union,
     validate_parsed_loc_files,
 };
-pub use scope_validation::{LocCommandDiagnostic, LocScopeData, validate_loc_commands};
+pub use scope_validation::{
+    LocCommandDiagnostic, LocScopeData, ScriptedVariables, validate_loc_commands,
+};
 pub use service::*;
 pub use validation::{
     HARDCODED_LOC, LocErrorKind, LocValidationError, validate_invalid_chars, validate_key_chars,

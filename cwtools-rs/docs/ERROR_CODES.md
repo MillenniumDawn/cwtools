@@ -85,7 +85,7 @@ and CW241 by CW262-265.
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | <a id="cw225"></a>CW225 | Error | Localisation key "{}" references "{}" which doesn't exist in {} | A loc string's `$KEY$` reference points to a key that has no definition. | Emitted |
-| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). Multi-segment chains like `[THIS.var]` are lenient (scripted variables not indexed). Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted |
+| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). A `?`-marked variable read (`[?ROOT.war_support\|1]`) is checked against the project's variable registry: the config's built-in `value[variable]` reads plus every name the mod sets, so only a name neither knows is reported. A chain without the `?` ends in a command or a scripted-localisation name and stays lenient, as does one reading through a variable (`[?some_var.SomeLoc]`) or through a segment the scope engine can't resolve. Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted |
 
 ### CW227-CW233 -- Section/component/mesh/entity (Stellaris-specific)
 

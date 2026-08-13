@@ -27,7 +27,7 @@ use super::suggest::best_suggestion;
 /// not flag CW246. Both sides may carry a scope suffix — the member declares the
 /// family (`party_popularity@<ideology>`) and the read names one of it
 /// (`party_popularity@social_democrat`) — so match on the base before the `@`.
-fn is_builtin_variable(ruleset: &RuleSet, token: &str) -> bool {
+pub(crate) fn is_builtin_variable(ruleset: &RuleSet, token: &str) -> bool {
     let token_base = token.split('@').next().unwrap_or(token);
     ruleset.is_builtin_variable_base(token_base)
 }
