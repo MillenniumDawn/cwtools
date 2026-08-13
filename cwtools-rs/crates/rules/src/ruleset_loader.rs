@@ -410,4 +410,21 @@ mod tests {
         );
         assert!(rs.localisation_commands.contains("getname"));
     }
+
+    #[test]
+    fn localisation_commands_placeholder_quoting_and_malformed() {
+        let table = StringTable::new();
+        // Quoted placeholder must still be skipped, malformed placeholder must not.
+        let cwt = r#"localisation_commands = { "<scripted_loc>" = any "<scripted_loc" = any "<scripted_loc> " = any GetFoo = any }"#;
+        let parsed = parse_string(cwt, &table);
+        let rs = ast_to_ruleset(&parsed, &table);
+        assert!(
+            !rs.localisation_commands.contains("<scripted_loc>"),
+            "quoted placeholder must be skipped"
+        );
+        // "<scripted_loc" is not a well-formed placeholder (missing '>'), so it is kept as a name — but lowercased, unlikely to collide.
+        assert!(rs.localisation_commands.contains("<scripted_loc"));
+        assert!(rs.localisation_commands.contains("getfoo"));
+        assert_eq!(rs.localisation_commands.len(), 3);
+    }
 }

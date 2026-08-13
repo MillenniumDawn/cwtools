@@ -10,7 +10,7 @@ use crate::loc_string::JominiCommand;
 use cwtools_game::constants::Game as EngineGame;
 use cwtools_game::scope_engine::{SCOPE_ANY, ScopeContext, ScopeId, ScopeResult};
 use cwtools_game::scope_registry::ScopeRegistry;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -54,6 +54,7 @@ pub enum LocCommandDiagnostic {
 /// caller's own normalization (`@` concatenation, `?`/`^` selectors, case)
 /// applies on top. `Sync` because both the per-file validation pass and the
 /// standalone loc lint fan out over rayon holding a `&LocScopeData`.
+// Both registries (variables and scripted_locs) share the same lookup shape.
 pub type ScriptedVariables<'a> = &'a (dyn Fn(&str) -> bool + Sync);
 
 /// Per-game static data needed for loc-command validation.
@@ -64,12 +65,12 @@ pub type ScriptedVariables<'a> = &'a (dyn Fn(&str) -> bool + Sync);
 pub struct LocScopeData<'a> {
     /// Game variant (controls which scope links are loaded).
     pub game: Option<EngineGame>,
-    /// Terminal getter commands accepted for this game.
+    /// Terminal getter commands accepted for this game. Lowercased.
     ///
     /// If this is empty every unknown command is accepted (fully lenient).
     /// If non-empty, any unknown final segment not in this list will produce
     /// a `ChainEndsInScope` diagnostic.
-    pub terminal_commands: Vec<String>,
+    pub terminal_commands: FxHashSet<String>,
     /// Whether `?variable` syntax is accepted (HOI4 / Stellaris).
     pub question_mark_variable: bool,
     /// Whether `parameter:xxx` references are accepted.
@@ -92,7 +93,7 @@ impl Default for LocScopeData<'_> {
     fn default() -> Self {
         Self {
             game: None,
-            terminal_commands: Vec::new(),
+            terminal_commands: FxHashSet::default(),
             question_mark_variable: true,
             parameter_variables: true,
             registry: None,
@@ -146,14 +147,8 @@ pub fn validate_loc_commands(
     };
     let mut diags = Vec::new();
 
-    // Lowercased terminal-command set, built once per entry. The membership test
-    // (`is_terminal_command`) ran a linear case-insensitive scan per segment;
-    // a set turns that into an O(1) lookup. Identifiers are ASCII.
-    let terminal_set: HashSet<String> = data
-        .terminal_commands
-        .iter()
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    // `terminal_commands` is already lowercased (from RuleSet). Use directly.
+    let terminal_set = &data.terminal_commands;
 
     // Validate legacy [command] strings (single-segment, dot-split internally)
     for cmd in &entry.commands {
@@ -162,7 +157,7 @@ pub fn validate_loc_commands(
             initial_scope,
             engine_game,
             data,
-            &terminal_set,
+            terminal_set,
             &mut diags,
         );
     }
@@ -174,7 +169,7 @@ pub fn validate_loc_commands(
             initial_scope,
             engine_game,
             data,
-            &terminal_set,
+            terminal_set,
             &mut diags,
         );
     }
@@ -245,7 +240,7 @@ fn classify_segment(
     seg_lower: &str,
     is_last: bool,
     data: &LocScopeData<'_>,
-    terminal_set: &HashSet<String>,
+    terminal_set: &FxHashSet<String>,
 ) -> SegmentPre {
     if is_bypass_prefix(seg_lower, data) {
         return SegmentPre::Bypass;
@@ -308,7 +303,7 @@ fn validate_command_string(
     initial_scope: ScopeId,
     engine_game: EngineGame,
     data: &LocScopeData<'_>,
-    terminal_set: &HashSet<String>,
+    terminal_set: &FxHashSet<String>,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
     if is_bypass_prefix(&cmd.to_ascii_lowercase(), data) {
@@ -389,7 +384,7 @@ fn validate_jomini_chain(
     initial_scope: ScopeId,
     engine_game: EngineGame,
     data: &LocScopeData<'_>,
-    terminal_set: &HashSet<String>,
+    terminal_set: &FxHashSet<String>,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
     if chain.is_empty() {
@@ -477,16 +472,8 @@ fn validate_jomini_chain(
     }
 }
 
-/// Whether `segment` reads a variable the scripted-variable registry can vouch
-/// for, so a chain ending on it is legitimate rather than a typo.
-///
-/// The segment carries the `|format` suffix loc syntax allows (`my_var|R0`),
-/// which the registry never holds; strip it before asking. Three forms are taken
-/// on trust because their written text is not a name to look up: a bare number
-/// the read formats (`[?0.3|-=%1]`), a `holder:name` read through a scope the
-/// engine resolves at runtime, and a `$ARG$`-concatenated name.
-fn reads_a_variable(segment: &str, data: &LocScopeData<'_>) -> bool {
-    let Some(lookup) = data.scripted_variables else {
+fn is_known_name(segment: &str, lookup: Option<ScriptedVariables<'_>>) -> bool {
+    let Some(lookup) = lookup else {
         return false;
     };
     let name = segment.split('|').next().unwrap_or(segment).trim();
@@ -496,15 +483,20 @@ fn reads_a_variable(segment: &str, data: &LocScopeData<'_>) -> bool {
     name.parse::<f64>().is_ok() || lookup(name)
 }
 
+/// Whether `segment` reads a variable the scripted-variable registry can vouch
+/// for, so a chain ending on it is legitimate rather than a typo.
+///
+/// The segment carries the `|format` suffix loc syntax allows (`my_var|R0`),
+/// which the registry never holds; strip it before asking. Three forms are taken
+/// on trust because their written text is not a name to look up: a bare number
+/// the read formats (`[?0.3|-=%1]`), a `holder:name` read through a scope the
+/// engine resolves at runtime, and a `$ARG$`-concatenated name.
+fn reads_a_variable(segment: &str, data: &LocScopeData<'_>) -> bool {
+    is_known_name(segment, data.scripted_variables)
+}
+
 fn is_scripted_loc(segment: &str, data: &LocScopeData<'_>) -> bool {
-    let Some(lookup) = data.scripted_locs else {
-        return false;
-    };
-    let name = segment.split('|').next().unwrap_or(segment).trim();
-    if name.is_empty() || name.contains(':') || name.contains('$') {
-        return true;
-    }
-    name.parse::<f64>().is_ok() || lookup(name)
+    is_known_name(segment, data.scripted_locs)
 }
 
 /// Check if a command segment is (or looks like) a terminal getter.
@@ -515,8 +507,8 @@ fn is_scripted_loc(segment: &str, data: &LocScopeData<'_>) -> bool {
 /// This covers the common Paradox naming convention (`GetName`, `GetDesc`,
 /// `GetRuler`…) plus the per-game list provided in `LocScopeData`.
 /// `lower` is the already-lowercased segment; `terminal_set` is the lowercased
-/// terminal-command set (built once per entry by `validate_loc_commands`).
-fn is_terminal_command(lower: &str, terminal_set: &HashSet<String>) -> bool {
+/// terminal-command set from `LocScopeData`.
+fn is_terminal_command(lower: &str, terminal_set: &FxHashSet<String>) -> bool {
     // Convention: terminal getters start with "Get" (case-insensitive)
     lower.starts_with("get") || terminal_set.contains(lower)
 }
@@ -585,12 +577,10 @@ mod tests {
         }
         LocScopeData {
             game: Some(EngineGame::Hoi4),
-            terminal_commands: vec![
-                "GetName".into(),
-                "GetNameDef".into(),
-                "GetAdjective".into(),
-                "GetLeader".into(),
-            ],
+            terminal_commands: ["GetName", "GetNameDef", "GetAdjective", "GetLeader"]
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect(),
             question_mark_variable: true,
             parameter_variables: true,
             registry: Some(Arc::new(reg)),
@@ -812,7 +802,7 @@ mod tests {
         }]]);
         let data = LocScopeData {
             game: Some(EngineGame::Hoi4),
-            terminal_commands: Vec::new(),
+            terminal_commands: FxHashSet::default(),
             question_mark_variable: true,
             parameter_variables: true,
             registry: None, // no registry

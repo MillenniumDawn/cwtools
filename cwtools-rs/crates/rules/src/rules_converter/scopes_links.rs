@@ -161,6 +161,8 @@ pub(crate) fn extract_scope_defs(
 }
 
 /// Collect `localisation_commands = { GetName = ... }` terminal getters.
+/// The placeholder `<scripted_loc>` is intentionally skipped — it is not a
+/// concrete command but a marker that any scripted_loc name is valid.
 pub(crate) fn extract_localisation_commands(
     children: &[Child],
     ast: &ParsedFile,
@@ -177,7 +179,7 @@ pub(crate) fn extract_localisation_commands(
             .trim()
             .trim_matches('"')
             .to_string();
-        if name.is_empty() || name.starts_with('<') && name.ends_with('>') {
+        if name.is_empty() || (name.starts_with('<') && name.ends_with('>')) {
             continue;
         }
         ruleset

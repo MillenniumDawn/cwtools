@@ -202,6 +202,8 @@ fn check_loc_key(
         let ruleset = ctx.ruleset;
         let type_index = ctx.type_index;
         let var_index = type_index.map(|i| &i.var_index).filter(|v| !v.is_empty());
+        // Sync: closures capture only &RuleSet / Option<&TypeIndex> (both Sync),
+        // not &ValidationCtx (contains RefCell).
         let names_variable = |name: &str| {
             is_builtin_variable(ruleset, name) || var_index.is_some_and(|v| v.contains(name))
         };
