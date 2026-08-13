@@ -14,20 +14,6 @@ fn fixtures_dir() -> PathBuf {
 static SCRATCH_HOME: std::sync::LazyLock<tempfile::TempDir> =
     std::sync::LazyLock::new(|| tempfile::tempdir().expect("failed to create scratch home"));
 
-/// What git exports to a hook. `cargo test` run from the pre-push hook inherits
-/// it, and any git the tests reach — a fixture repo below, or the one `--since`
-/// shells out to — would then read the developer's real repository instead of
-/// the tempdir it was pointed at. Stripped from every child this file spawns.
-const GIT_HOOK_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_COMMON_DIR",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_PREFIX",
-];
-
 fn cwtools() -> Command {
     let mut cmd = Command::cargo_bin("cwtools").unwrap();
     cmd.env("RUST_LOG", "");
@@ -38,9 +24,6 @@ fn cwtools() -> Command {
     cmd.env("HOME", home);
     cmd.env("XDG_CACHE_HOME", home.join("cache"));
     cmd.env("LOCALAPPDATA", home.join("localappdata"));
-    for key in GIT_HOOK_ENV {
-        cmd.env_remove(key);
-    }
     cmd
 }
 
@@ -594,12 +577,12 @@ fn test_validate_output_hashes_with_a_scope_warns() {
 }
 
 fn git(dir: &std::path::Path, args: &[&str]) {
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(dir).args(args);
-    for key in GIT_HOOK_ENV {
-        cmd.env_remove(key);
-    }
-    let out = cmd.output().unwrap();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -671,33 +654,6 @@ fn test_validate_since_unknown_ref_is_a_usage_error() {
         .failure()
         .code(2)
         .stderr(predicate::str::contains("--since"));
-}
-
-/// `--since` resolves against `--directory`. Git exports `GIT_DIR` to a hook and
-/// it overrides `-C`, so a run from the pre-commit hook the flag exists for used
-/// to diff the hook's repository instead of the mod.
-#[test]
-fn test_validate_since_ignores_an_inherited_git_dir() {
-    let repo = git_repo_mod();
-    let rules_dir = fixtures_dir().join("rules");
-    let mut cmd = cwtools();
-    cmd.env("GIT_DIR", repo.path().join("no_such_repo.git"));
-    cmd.args([
-        "validate",
-        "--game",
-        "stellaris",
-        "--directory",
-        repo.path().to_str().unwrap(),
-        "--rules",
-        rules_dir.to_str().unwrap(),
-        "--since",
-        "HEAD",
-    ]);
-    // Nothing changed since HEAD, so the event's CW107 is out of scope. A leaked
-    // GIT_DIR names no repository, which would fail the run instead (exit 2).
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("CW107").not());
 }
 
 // ── Automatic base-game cache ────────────────────────────────────────────────

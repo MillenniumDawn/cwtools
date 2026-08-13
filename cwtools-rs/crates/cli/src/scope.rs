@@ -98,31 +98,15 @@ fn changed_since(reference: &str, directory: &Path) -> Result<Vec<PathBuf>, Stri
         .collect())
 }
 
-/// What git exports to a hook. It overrides `-C`, so a `cwtools` run from inside
-/// a hook — the pre-commit case `--since` exists for — would resolve the ref
-/// against the hook's repository rather than `--directory`. Stripped so `-C`
-/// stays authoritative.
-const GIT_HOOK_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_COMMON_DIR",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_PREFIX",
-];
-
 /// One `git` call in `dir`: its stdout on success, a message naming the command
 /// and git's own stderr on failure. A `--since` that can't be resolved fails the
 /// run, because both ways of carrying on — reporting on everything, or on
 /// nothing — read as a pass.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args);
-    for key in GIT_HOOK_ENV {
-        cmd.env_remove(key);
-    }
-    let output = cmd
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
         .output()
         .map_err(|e| format!("--since needs git on PATH: {e}"))?;
     if !output.status.success() {
@@ -220,7 +204,12 @@ mod tests {
     fn an_unknown_ref_is_an_error_naming_the_git_command() {
         let repo = tempfile::tempdir().unwrap();
         assert!(
-            git(repo.path(), &["init"]).is_ok(),
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .arg("init")
+                .output()
+                .is_ok_and(|o| o.status.success()),
             "git is required for this test"
         );
         let e = resolve(&[], Some("no/such/ref"), repo.path()).unwrap_err();
