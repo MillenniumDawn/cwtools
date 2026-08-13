@@ -24,6 +24,11 @@ fn cwtools() -> Command {
     cmd.env("HOME", home);
     cmd.env("XDG_CACHE_HOME", home.join("cache"));
     cmd.env("LOCALAPPDATA", home.join("localappdata"));
+    // Same reason as HOME: a suite run from a git hook inherits the hook's
+    // GIT_DIR, and `--since` would resolve against that repo, not the fixture.
+    for key in INHERITED_GIT_ENV {
+        cmd.env_remove(key);
+    }
     cmd
 }
 
@@ -509,6 +514,28 @@ fn validate_dir(dir: &std::path::Path, extra: &[&str]) -> assert_cmd::assert::As
     cmd.assert()
 }
 
+/// [`validate_dir`] with `GIT_DIR` set, standing in for a run inside a git hook.
+fn validate_dir_env(
+    dir: &std::path::Path,
+    extra: &[&str],
+    git_dir: &std::path::Path,
+) -> assert_cmd::assert::Assert {
+    let rules_dir = fixtures_dir().join("rules");
+    let mut cmd = cwtools();
+    cmd.env("GIT_DIR", git_dir);
+    cmd.args([
+        "validate",
+        "--game",
+        "stellaris",
+        "--directory",
+        dir.to_str().unwrap(),
+        "--rules",
+        rules_dir.to_str().unwrap(),
+    ]);
+    cmd.args(extra);
+    cmd.assert()
+}
+
 #[test]
 fn test_validate_file_scopes_the_report() {
     let mod_dir = fixtures_dir().join("discover").join("mod_a");
@@ -576,13 +603,31 @@ fn test_validate_output_hashes_with_a_scope_warns() {
     .stderr(predicate::str::contains("--output-hashes"));
 }
 
+/// Variables git exports to a hook. The pre-push hook runs `cargo test
+/// --workspace`, so these tests inherit them, and an inherited `GIT_DIR`
+/// outranks `-C`: without this the fixture's `init`/`config`/`add`/`commit`
+/// run against the developer's own checkout, writing a test identity into its
+/// config and committing the fixture over its branch. Also cleared for the
+/// binary under test, so `--since` is exercised against the fixture rather
+/// than whatever repo invoked the suite.
+const INHERITED_GIT_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_WORK_TREE",
+];
+
 fn git(dir: &std::path::Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+    for key in INHERITED_GIT_ENV {
+        command.env_remove(key);
+    }
+    let out = command.output().unwrap();
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -641,6 +686,33 @@ fn test_validate_since_covers_untracked_files() {
     )
     .unwrap();
     validate_dir(repo.path(), &["--since", "HEAD"])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
+/// `--since` exists for pre-commit and pre-push hooks, and git hands every hook
+/// a `GIT_DIR` naming the repo the hook fired in. That variable outranks `-C`,
+/// so the scope has to be resolved with it cleared or a hook run reports on the
+/// wrong repository's diff without failing.
+#[test]
+fn test_validate_since_ignores_an_inherited_git_dir() {
+    let repo = git_repo_mod();
+    let elsewhere = git_repo_mod();
+    let event = repo.path().join("events").join("test.txt");
+    let hook_env = elsewhere.path().join(".git");
+
+    // Clean tree: the event's CW107 is out of scope, and stays out however the
+    // ambient GIT_DIR is set.
+    validate_dir_env(repo.path(), &["--since", "HEAD"], &hook_env)
+        .success()
+        .stdout(predicate::str::contains("CW107").not());
+
+    // Touching the file brings it back, which it cannot do if the diff was
+    // taken against `elsewhere` (where nothing changed).
+    let mut text = std::fs::read_to_string(&event).unwrap();
+    text.push_str("# touched\n");
+    std::fs::write(&event, text).unwrap();
+    validate_dir_env(repo.path(), &["--since", "HEAD"], &hook_env)
         .success()
         .stdout(predicate::str::contains("CW107"));
 }

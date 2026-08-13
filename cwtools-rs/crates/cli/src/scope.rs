@@ -98,15 +98,33 @@ fn changed_since(reference: &str, directory: &Path) -> Result<Vec<PathBuf>, Stri
         .collect())
 }
 
+/// Variables git exports to a hook, which name the hook's own repository. An
+/// inherited `GIT_DIR` outranks `-C`, so a `--since` run from a pre-commit or
+/// pre-push hook (the case the flag exists for) would resolve the ref and the
+/// changed-file list against that repository instead of the mod directory, and
+/// report the wrong file set without failing.
+const INHERITED_GIT_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_WORK_TREE",
+];
+
 /// One `git` call in `dir`: its stdout on success, a message naming the command
 /// and git's own stderr on failure. A `--since` that can't be resolved fails the
 /// run, because both ways of carrying on — reporting on everything, or on
 /// nothing — read as a pass.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+    for key in INHERITED_GIT_ENV {
+        command.env_remove(key);
+    }
+    let output = command
         .output()
         .map_err(|e| format!("--since needs git on PATH: {e}"))?;
     if !output.status.success() {
@@ -200,18 +218,23 @@ mod tests {
 
     /// An unresolvable ref fails the run rather than quietly scoping it to
     /// nothing, and the message says which command could not be run.
+    /// `git init` in `dir`, with the hook environment cleared for the same
+    /// reason [`INHERITED_GIT_ENV`] exists: run under `cargo test` from a git
+    /// hook, an inherited `GIT_DIR` would re-init the developer's repository
+    /// instead of the temp dir.
+    fn git_init(dir: &Path) -> bool {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(dir).arg("init");
+        for key in INHERITED_GIT_ENV {
+            command.env_remove(key);
+        }
+        command.output().is_ok_and(|o| o.status.success())
+    }
+
     #[test]
     fn an_unknown_ref_is_an_error_naming_the_git_command() {
         let repo = tempfile::tempdir().unwrap();
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(repo.path())
-                .arg("init")
-                .output()
-                .is_ok_and(|o| o.status.success()),
-            "git is required for this test"
-        );
+        assert!(git_init(repo.path()), "git is required for this test");
         let e = resolve(&[], Some("no/such/ref"), repo.path()).unwrap_err();
         assert!(e.contains("--since"), "got: {e}");
         assert!(e.contains("merge-base"), "names the command: {e}");
