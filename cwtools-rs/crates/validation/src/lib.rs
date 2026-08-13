@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use cwtools_error_codes as error_codes;
 
+pub mod inline_script;
 pub mod missing_loc;
 pub mod per_game;
 pub mod position;
@@ -23,6 +24,7 @@ mod scope;
 mod subtype;
 
 pub use common::{ErrorSeverity, FilePath, RelatedSpan, ValidationError, error_hash};
+pub use inline_script::InlineScripts;
 pub use loc_field::build_modifier_keys;
 pub use scope::scope_matches_required;
 pub use subtype::{collect_subtype_instances, subtype_membership_for_instance};
@@ -205,6 +207,7 @@ pub fn validate_ast_with_loc(
             modifier_keys,
             loc_index,
             extra_loc_keys: None,
+            inline_scripts: None,
             registry: registry.as_ref(),
             scope_checks,
             var_checks,
@@ -248,6 +251,10 @@ pub struct Prepared<'a> {
     /// Extra loc keys to treat as existing (the LSP live overlay of unsaved keys
     /// in open `.yml` files). Lowercased. `None` outside the LSP single-file path.
     pub extra_loc_keys: Option<&'a HashSet<String>>,
+    /// The mod's `common/inline_scripts` bodies, so a call site can be checked
+    /// against what it actually pulls in. `None` leaves every `inline_script`
+    /// call accepted unexpanded.
+    pub inline_scripts: Option<&'a inline_script::InlineScripts>,
     pub registry: Option<&'a std::sync::Arc<ScopeRegistry>>,
     pub scope_checks: bool,
     pub var_checks: bool,
@@ -349,6 +356,7 @@ fn validate_prepared_inner(
         modifier_keys,
         loc_index,
         extra_loc_keys,
+        inline_scripts,
         registry,
         scope_checks,
         var_checks,
@@ -361,6 +369,11 @@ fn validate_prepared_inner(
     // candidate errors the disjunctions discard) shares it.
     let file_arc: common::FilePath = std::sync::Arc::from(file_path);
 
+    // Owned out here so an expanded inline_script body can borrow the same two
+    // and spend the file's budget rather than a fresh one.
+    let alias_branch_budget = std::cell::RefCell::new(AliasBranchBudget::default());
+    let inline_stack = std::cell::RefCell::new(Vec::new());
+
     let ctx = ValidationCtx {
         ast,
         ruleset,
@@ -371,10 +384,12 @@ fn validate_prepared_inner(
         modifier_keys,
         loc_index,
         extra_loc_keys,
+        inline_scripts,
         scope_checks,
         var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),
-        alias_branch_budget: std::cell::RefCell::new(AliasBranchBudget::default()),
+        alias_branch_budget: &alias_branch_budget,
+        inline_stack: &inline_stack,
         alias_memo: std::cell::RefCell::new(ctx::AliasMemo::default()),
         type_uses,
     };

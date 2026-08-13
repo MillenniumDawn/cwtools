@@ -38,6 +38,10 @@ pub(crate) fn make_prepared<'a>(
         modifier_keys: Some(modifier_keys),
         loc_index,
         extra_loc_keys,
+        // The editor keeps no inline-script registry yet (#256), so a call site
+        // is accepted as written instead of being checked against a body the
+        // server hasn't loaded.
+        inline_scripts: None,
         registry,
         scope_checks,
         var_checks,
