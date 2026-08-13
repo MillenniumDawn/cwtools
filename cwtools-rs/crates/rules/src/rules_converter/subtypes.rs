@@ -126,7 +126,7 @@ fn build_subtype(
 fn extract_comment_value(comments: &[String], key: &str) -> Option<String> {
     find_directive(comments, key)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(|s| strip_quotes(s).to_string())
 }
 
 fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {
@@ -143,4 +143,44 @@ fn parse_only_if_not_from_comments(comments: &[String]) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod subtype_directive_tests {
+    use cwtools_parser::parser::parse_string;
+    use cwtools_string_table::string_table::StringTable;
+
+    use crate::{rules_converter::ast_to_ruleset, rules_types::SubTypeDefinition};
+
+    fn parse_subtype(cwt: &str) -> SubTypeDefinition {
+        let table = StringTable::new();
+        let ast = parse_string(cwt, &table);
+        ast_to_ruleset(&ast, &table)
+            .types
+            .into_iter()
+            .next()
+            .expect("no type parsed")
+            .subtypes
+            .into_iter()
+            .next()
+            .expect("no subtype parsed")
+    }
+
+    // Directive values are raw comment text, so quotes must be stripped to
+    // match how `value_to_string` returns body values.
+    #[test]
+    fn quoted_subtype_directive_value_is_unquoted() {
+        let sub = parse_subtype(
+            r#"types = {
+                type[foo] = {
+                    path = "game/common/foo"
+                    ## display_name = "Display Name"
+                    ## starts_with = "pre_"
+                    subtype[bar] = { }
+                }
+            }"#,
+        );
+        assert_eq!(sub.display_name, Some("Display Name".to_string()));
+        assert_eq!(sub.starts_with, Some("pre_".to_string()));
+    }
 }

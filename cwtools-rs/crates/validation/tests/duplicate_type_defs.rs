@@ -17,9 +17,14 @@ types = {
     type[other] = {
         path = "game/common/others"
     }
+    ## unique = yes
+    type[commented] = {
+        path = "game/common/commented"
+    }
 }
 thing = { x = scalar }
 other = { x = scalar }
+commented = { x = scalar }
 "#;
 
 /// Index every file, then validate every file, the way the driver does.
@@ -121,6 +126,26 @@ fn distinct_ids_are_clean() {
         &[],
     );
     assert!(found.is_empty(), "got: {found:?}");
+}
+
+// The type declares `unique` as a `## ` directive rather than a body leaf, which
+// is how most of the HOI4 config spells it (#264).
+#[test]
+fn duplicate_of_a_comment_declared_unique_type_is_flagged() {
+    let found = cw261_for(
+        &[
+            ("game/common/commented/a.txt", "dup = { x = yes }\n"),
+            ("game/common/commented/b.txt", "dup = { x = no }\n"),
+        ],
+        &[],
+    );
+    assert_eq!(found.len(), 2, "got: {found:?}");
+    assert!(
+        found
+            .iter()
+            .all(|(_, m)| m.contains("dup") && m.contains("commented")),
+        "got: {found:?}"
+    );
 }
 
 #[test]
