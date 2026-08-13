@@ -959,4 +959,75 @@ mod tests {
             diags
         );
     }
+
+    #[test]
+    fn terminal_command_case_insensitive() {
+        let entry = chain(&["Root", "getname"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "terminal lookup must be case-insensitive: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn scripted_loc_with_format_suffix_is_accepted() {
+        let entry = chain(&["Root", "AST_GetNavyName|Y"]);
+        let mut data = hoi4_data_with_variables();
+        data.scripted_locs = Some(&|name: &str| name.eq_ignore_ascii_case("AST_GetNavyName"));
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "|format suffix must be stripped before lookup: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn scripted_loc_case_insensitive() {
+        let entry = chain(&["Root", "ast_getnavyname"]);
+        let mut data = hoi4_data_with_variables();
+        data.scripted_locs = Some(&|name: &str| name.eq_ignore_ascii_case("AST_GetNavyName"));
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "scripted_loc lookup must be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn scripted_loc_special_segments_are_trusted() {
+        for seg in ["holder:foo", "$ARG$", "", "1.5"] {
+            let entry = chain(&["Root", seg]);
+            let mut data = hoi4_data_with_variables();
+            data.scripted_locs = Some(&|_: &str| false);
+            let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+            assert!(
+                diags.is_empty(),
+                "segment {seg:?} with :/$/numeric/empty must be trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_with_format_and_mixed_case_is_accepted() {
+        let entry = chain(&["?Root", "WAR_SUPPORT|1"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "variable lookup must strip |format and ignore case"
+        );
+    }
+
+    #[test]
+    fn command_chain_unknown_intermediate_with_terminal_tail_stays_lenient() {
+        let entry = chain(&["Root", "PAL", "GetName"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "unknown intermediate poisons even terminal tails"
+        );
+    }
 }

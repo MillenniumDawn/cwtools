@@ -428,3 +428,100 @@ fn no_loc_index_is_lenient() {
     );
     assert_eq!(cw100s(&errs), 0, "no loc loaded → accept: {:?}", errs);
 }
+
+const SCOPED_WITH_CMDS_CWT: &str = r#"
+scopes = { Country = { aliases = { country } } }
+localisation_commands = { GetName = any GetTag = any }
+types = { type[mytype] = { path = "game/common/mytype" } }
+mytype = { name = localisation }
+"#;
+
+fn scoped_with_cmds_loc_codes(loc: &str, scripted_locs: &[&str]) -> Vec<String> {
+    use cwtools_index::{SourceLocation, TypeInstance};
+    use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(SCOPED_WITH_CMDS_CWT, &table), &table);
+    let idx = loc_index(&[("a_l_english.yml", loc)]);
+    let mut type_index = cwtools_index::TypeIndex::new();
+    for sl in scripted_locs {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "scripted_loc".to_string(),
+            vec![TypeInstance {
+                name: sl.to_string(),
+                location: SourceLocation {
+                    line: 1,
+                    col: 0,
+                    end: (1, 0),
+                },
+                primary_loc_key: None,
+                required_loc_keys: Vec::new(),
+            }],
+        );
+        type_index.merge("game/common/scripted_localisation/defs.txt", map);
+    }
+    let parsed = parse_string("mytype = {\n name = my_key\n}\n", &table);
+    let registry = build_scope_registry_arc(&ruleset, Some(cwtools_game::constants::Game::Hoi4));
+    validate_prepared(
+        &parsed,
+        "game/common/mytype/test.txt",
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(cwtools_game::constants::Game::Hoi4),
+            type_index: Some(&type_index),
+            modifier_keys: None,
+            loc_index: Some(&idx),
+            extra_loc_keys: None,
+            inline_scripts: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: true,
+        },
+    )
+    .into_iter()
+    .filter_map(|e| e.code.map(String::from))
+    .collect()
+}
+
+#[test]
+fn command_chain_with_terminal_is_clean() {
+    let codes = scoped_with_cmds_loc_codes("l_english:\n my_key: \"[ROOT.GetName]\"\n", &[]);
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "terminal command tail must not warn: {codes:?}"
+    );
+}
+
+#[test]
+fn command_chain_typo_warns_cw226() {
+    let codes = scoped_with_cmds_loc_codes("l_english:\n my_key: \"[ROOT.TotallyUnknown]\"\n", &[]);
+    assert!(
+        codes.contains(&"CW226".to_string()),
+        "typo command tail must warn CW226: {codes:?}"
+    );
+}
+
+#[test]
+fn command_chain_with_scripted_loc_is_clean() {
+    let codes = scoped_with_cmds_loc_codes(
+        "l_english:\n my_key: \"[ROOT.AST_GetNavyName]\"\n",
+        &["AST_GetNavyName"],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "scripted_loc tail must not warn when index has it: {codes:?}"
+    );
+}
+
+#[test]
+fn command_chain_scripted_loc_typo_warns_when_index_populated() {
+    let codes = scoped_with_cmds_loc_codes(
+        "l_english:\n my_key: \"[ROOT.AST_Typo]\"\n",
+        &["AST_GetNavyName"],
+    );
+    assert!(
+        codes.contains(&"CW226".to_string()),
+        "scripted_loc typo must warn when index populated: {codes:?}"
+    );
+}

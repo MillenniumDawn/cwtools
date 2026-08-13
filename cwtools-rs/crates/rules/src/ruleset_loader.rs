@@ -372,4 +372,42 @@ mod tests {
         );
         let _ = ruleset;
     }
+
+    #[test]
+    fn localisation_commands_are_parsed_and_merged() {
+        let table = StringTable::new();
+        let a = parse_string(
+            "localisation_commands = { GetName = any GetTag = { any } <scripted_loc> = any }",
+            &table,
+        );
+        let mut ra = ast_to_ruleset(&a, &table);
+        assert!(ra.localisation_commands.contains("getname"));
+        assert!(ra.localisation_commands.contains("gettag"));
+        assert!(
+            !ra.localisation_commands.contains("<scripted_loc>"),
+            "placeholder must be skipped"
+        );
+        assert_eq!(ra.localisation_commands.len(), 2);
+
+        let b = parse_string("localisation_commands = { GetLeader = any }", &table);
+        let rb = ast_to_ruleset(&b, &table);
+        merge_ruleset(&mut ra, rb);
+        assert!(ra.localisation_commands.contains("getleader"));
+        assert_eq!(ra.localisation_commands.len(), 3);
+    }
+
+    #[test]
+    fn localisation_commands_case_folding_and_quoting() {
+        let table = StringTable::new();
+        let cwt = r#"localisation_commands = { "GetName" = any getname = any GETNAME = any }"#;
+        let parsed = parse_string(cwt, &table);
+        let rs = ast_to_ruleset(&parsed, &table);
+        assert_eq!(
+            rs.localisation_commands.len(),
+            1,
+            "duplicate case variants must dedupe lowercased: {:?}",
+            rs.localisation_commands
+        );
+        assert!(rs.localisation_commands.contains("getname"));
+    }
 }
