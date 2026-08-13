@@ -32,11 +32,22 @@ fn fnv1a_digest(parts: [&str; 4]) -> String {
 /// Falls back to `file` (still `/`-separated) when it isn't under `root` — a
 /// vanilla install path reported alongside mod files, say — rather than
 /// panicking. Lexical only, no filesystem access, so a file that was never
-/// written to disk (as in tests) still hashes.
+/// written to disk (as in tests) still hashes. The strip is done via
+/// `Path::strip_prefix`, with a drive-prefix prepended to `file` on Windows
+/// when it has none: a leading-`/`-no-drive path is root-relative there
+/// while a `C:/...` path is drive-absolute, and the two prefix kinds don't
+/// match under `strip_prefix`. We don't want the same logical path spelled
+/// two ways to fall through to the fallback and hash differently.
 fn relative_file(file: &str, root: &Path) -> String {
-    let file = file.replace('\\', "/");
-    let root = root.to_string_lossy().replace('\\', "/");
-    match Path::new(&file).strip_prefix(Path::new(&root)) {
+    let mut file = file.replace('\\', "/");
+    let root_str = root.to_string_lossy().replace('\\', "/");
+    if let Some((drive, _)) = root_str.split_once(':')
+        && !file.contains(':')
+        && let Some(rest) = file.strip_prefix('/')
+    {
+        file = format!("{drive}:/{rest}");
+    }
+    match Path::new(&file).strip_prefix(Path::new(&root_str)) {
         Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
         Err(_) => file,
     }
