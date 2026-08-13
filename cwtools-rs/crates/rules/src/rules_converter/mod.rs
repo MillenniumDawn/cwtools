@@ -404,16 +404,22 @@ pub(crate) fn extract_bracket_content(full: &str, prefix: &str) -> Option<String
     None
 }
 
+/// Strip one balanced pair of surrounding double quotes, nothing more.
+/// `value_to_string` and the comment-directive readers share this so a quoted
+/// directive value reads the same as the equivalent body value.
+pub(crate) fn strip_quotes(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 pub(crate) fn value_to_string(value: &Value, table: &StringTable) -> String {
     match value {
         Value::String(t) | Value::QString(t) => {
             let s = table.get_string(t.normal).unwrap_or_default();
-            // Strip surrounding quotes if present
-            if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-                s[1..s.len() - 1].to_string()
-            } else {
-                s
-            }
+            strip_quotes(&s).to_string()
         }
         Value::Float(f) => f.to_string(),
         Value::Int(i) => i.to_string(),
