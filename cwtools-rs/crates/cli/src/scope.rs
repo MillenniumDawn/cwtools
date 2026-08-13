@@ -87,6 +87,11 @@ fn key(path: &Path) -> String {
 /// script is the case a scoped run most wants to catch.
 fn changed_since(reference: &str, directory: &Path) -> Result<Vec<PathBuf>, String> {
     let root = PathBuf::from(git(directory, &["rev-parse", "--show-toplevel"])?.trim_end());
+    // Where `directory` sits inside the repo, `/`-separated with a trailing
+    // slash, empty when it is the repo root. This is what lets a git-reported
+    // path be re-spelled the way the run spells its own files; see [`rerooted`].
+    let prefix = git(directory, &["rev-parse", "--show-prefix"])?;
+    let prefix = prefix.trim_end_matches(['\n', '\r']);
     let base = git(&root, &["merge-base", reference, "HEAD"])?;
     let changed = git(&root, &["diff", "--name-only", "-z", base.trim_end()])?;
     let untracked = git(&root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
@@ -94,8 +99,29 @@ fn changed_since(reference: &str, directory: &Path) -> Result<Vec<PathBuf>, Stri
         .split('\0')
         .chain(untracked.split('\0'))
         .filter(|s| !s.is_empty())
-        .map(|s| root.join(s))
+        .map(|s| rerooted(s, prefix, directory, &root))
         .collect())
+}
+
+/// One repo-relative path from git, as an absolute path spelled the way this run
+/// spells the files it discovered.
+///
+/// Git answers in its own spelling of the repository root, which is the resolved
+/// one: on Windows a `--directory` under an 8.3 short path (`RUNNER~1`) comes
+/// back long, and on macOS a `/var/folders` temp dir comes back as
+/// `/private/var/folders`. Discovery walked the path the run was *given*, so
+/// comparing the two spellings directly matches nothing and the run reports on
+/// no files at all. Rebuilding the path under `directory` keeps both sides in
+/// the caller's spelling, which is the only one both halves agree on.
+///
+/// A file outside `directory` (the repo root's own README, a sibling crate)
+/// keeps git's spelling: nothing discovered can match it either way, and it is
+/// still the honest absolute path for the `--file` warning to name.
+fn rerooted(repo_relative: &str, prefix: &str, directory: &Path, root: &Path) -> PathBuf {
+    match repo_relative.strip_prefix(prefix) {
+        Some(under_directory) => directory.join(under_directory),
+        None => root.join(repo_relative),
+    }
 }
 
 /// Variables git exports to a hook, which name the hook's own repository. An
@@ -216,8 +242,6 @@ mod tests {
         assert_eq!(scope.missing(), [typo]);
     }
 
-    /// An unresolvable ref fails the run rather than quietly scoping it to
-    /// nothing, and the message says which command could not be run.
     /// `git init` in `dir`, with the hook environment cleared for the same
     /// reason [`INHERITED_GIT_ENV`] exists: run under `cargo test` from a git
     /// hook, an inherited `GIT_DIR` would re-init the developer's repository
@@ -231,6 +255,60 @@ mod tests {
         command.output().is_ok_and(|o| o.status.success())
     }
 
+    /// An absolute path spelled the host's way: a leading `/` names the current
+    /// drive's root on Windows, which is not what an absolute path means there.
+    fn abs(tail: &str) -> String {
+        if cfg!(windows) {
+            format!("C:/{tail}")
+        } else {
+            format!("/{tail}")
+        }
+    }
+
+    /// Git answers in its own spelling of the repo root. Where that differs from
+    /// the one the run was handed — an 8.3 short path on Windows, a
+    /// `/var` → `/private/var` symlink on macOS — the caller's spelling has to
+    /// win, because that is the one discovery walked.
+    #[test]
+    fn a_changed_file_is_respelled_under_the_directory_it_was_given() {
+        let directory = PathBuf::from(abs("given/mod"));
+        let root = PathBuf::from(abs("resolved"));
+        let file = rerooted("mod/events/x.txt", "mod/", &directory, &root);
+        assert_eq!(
+            file,
+            directory.join("events/x.txt"),
+            "got: {}",
+            file.display()
+        );
+    }
+
+    /// The mod directory being the repo root is the empty-prefix case, where
+    /// every reported path is already relative to it.
+    #[test]
+    fn an_empty_prefix_roots_everything_at_the_directory() {
+        let directory = PathBuf::from(abs("given"));
+        let root = PathBuf::from(abs("resolved"));
+        let file = rerooted("events/x.txt", "", &directory, &root);
+        assert_eq!(
+            file,
+            directory.join("events/x.txt"),
+            "got: {}",
+            file.display()
+        );
+    }
+
+    /// A file the mod directory does not contain keeps git's spelling. Nothing
+    /// discovered can match it, and it is still the honest absolute path.
+    #[test]
+    fn a_file_outside_the_directory_keeps_the_repo_spelling() {
+        let directory = PathBuf::from(abs("given/mod"));
+        let root = PathBuf::from(abs("resolved"));
+        let file = rerooted("README.md", "mod/", &directory, &root);
+        assert_eq!(file, root.join("README.md"), "got: {}", file.display());
+    }
+
+    /// An unresolvable ref fails the run rather than quietly scoping it to
+    /// nothing, and the message says which command could not be run.
     #[test]
     fn an_unknown_ref_is_an_error_naming_the_git_command() {
         let repo = tempfile::tempdir().unwrap();

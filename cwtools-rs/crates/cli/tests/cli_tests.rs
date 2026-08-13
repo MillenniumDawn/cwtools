@@ -690,6 +690,31 @@ fn test_validate_since_covers_untracked_files() {
         .stdout(predicate::str::contains("CW107"));
 }
 
+/// Git answers `rev-parse` in its own, resolved spelling of the repo root,
+/// while discovery walks the path the run was handed. Where the two differ the
+/// scope used to match nothing and the run reported on no files at all
+/// ("Discovered 3 files / Reporting on 0 of them"): on Windows a temp dir is an
+/// 8.3 short path (`RUNNER~1`) that git reports long, and on macOS `/var` is a
+/// symlink git reports as `/private/var`.
+///
+/// A `..` component reproduces the same class on every platform: `absolute()`
+/// keeps it, git resolves it away.
+#[test]
+fn test_validate_since_matches_an_unresolved_directory_spelling() {
+    let repo = git_repo_mod();
+    let event = repo.path().join("events").join("test.txt");
+    // `<repo>/events/..` names `<repo>` without being spelled like it.
+    let indirect = repo.path().join("events").join("..");
+
+    let mut text = std::fs::read_to_string(&event).unwrap();
+    text.push_str("# touched\n");
+    std::fs::write(&event, text).unwrap();
+
+    validate_dir(&indirect, &["--since", "HEAD"])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
 /// `--since` exists for pre-commit and pre-push hooks, and git hands every hook
 /// a `GIT_DIR` naming the repo the hook fired in. That variable outranks `-C`,
 /// so the scope has to be resolved with it cleared or a hook run reports on the
