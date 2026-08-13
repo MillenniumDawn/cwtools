@@ -1,7 +1,7 @@
 //! Localisation-field checks (CW100/CW122 existence, CW260/CW266 loc commands)
 //! and modifier-key set construction.
 
-use cwtools_game::scope_engine::{ScopeContext, ScopeId};
+use cwtools_game::scope_engine::ScopeContext;
 use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_parser::ast::Value;
 use cwtools_rules::rules_types::*;
@@ -213,7 +213,8 @@ fn check_loc_key(
 }
 
 /// Convert a `LocCommandDiagnostic` (from the loc scope engine) into a
-/// `ValidationError` with the matching F# numeric code.
+/// `ValidationError` with the matching F# numeric code. The code and message
+/// come from the loc crate, shared with the standalone `cwtools loc` pass.
 fn push_loc_command_diagnostic(
     diag: &cwtools_localization::LocCommandDiagnostic,
     loc_key: &str,
@@ -222,39 +223,7 @@ fn push_loc_command_diagnostic(
     registry: Option<&ScopeRegistry>,
     errors: &mut Vec<ValidationError>,
 ) {
-    use cwtools_localization::LocCommandDiagnostic as D;
-    let scope_name = |id: u32| -> String {
-        match registry {
-            Some(reg) => reg.name_of(ScopeId(id)),
-            None => id.to_string(),
-        }
-    };
-    let (code, message) = match diag {
-        D::WrongScope {
-            command,
-            current_scope,
-            expected_scopes,
-        } => {
-            let expected = expected_scopes
-                .iter()
-                .map(|s| scope_name(*s))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let code = &error_codes::CW260_LOC_COMMAND_WRONG_SCOPE;
-            (
-                code,
-                code.format(&[command, &scope_name(*current_scope), &expected]),
-            )
-        }
-        D::ChainEndsInScope { command } => {
-            let code = &error_codes::CW266_LOC_COMMAND_NOT_IN_DATA_TYPE;
-            (code, code.format(&[loc_key, command.as_str(), "scope"]))
-        }
-        D::NotFound { command } => {
-            let code = &error_codes::CW226_INVALID_LOC_COMMAND;
-            (code, code.format(&[loc_key, command.as_str()]))
-        }
-    };
+    let (code, message) = cwtools_localization::loc_command_parts(diag, loc_key, registry);
     errors.push(
         ValidationError::from_code_with(
             code,

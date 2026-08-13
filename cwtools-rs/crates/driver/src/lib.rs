@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cwtools_cache::workspace::{self as workspace_cache, SourceCacheKey};
 use cwtools_file_manager::file_manager::{
     DirectoryType, DiscoveredFile, FileError, FileManager, FileManagerConfig, ScanBudget,
-    classify_directory,
+    classify_directory, glob_match,
 };
 use cwtools_file_manager::{FileEncoding, read_text, read_text_with_encoding};
 use cwtools_game::constants::Game;
@@ -579,7 +579,7 @@ impl Session {
         {
             loc_dirs.push(v.as_path());
         }
-        let loc_service = load_loc_service(&loc_dirs, loc_languages.as_deref());
+        let loc_service = load_loc_service(&loc_dirs, loc_languages.as_deref(), &[], &[]);
         let mut loc_index = LocIndex::build_scoped(&loc_service, loc_languages.as_deref());
         if let Some(keys) = cached_loc_keys {
             // Scoped the same way as the walked files above, so a cache hit and a
@@ -927,21 +927,31 @@ fn parse_errors_to_validation(
         .collect()
 }
 
-/// Load the loc files under `dirs`, materializing only the languages a scoped
-/// run will use. Without `langs` every file is parsed (the default). With it, a
-/// file whose header declares a language outside the set is dropped before its
+/// Load the loc files under `dirs`, materializing only what a scoped run will
+/// use. Without `langs` every language is parsed (the default). With it, a file
+/// whose header declares a language outside the set is dropped before its
 /// entries are built — the base game ships eleven of them, and a scoped run
 /// neither validates nor looks up the rest. A file whose header language can't
 /// be read is always kept, matching how `validate_loc_project_with_union`
-/// scopes its own per-file pass.
-fn load_loc_service(dirs: &[&Path], langs: Option<&[Lang]>) -> LocService {
-    let Some(langs) = langs else {
+/// scopes its own per-file pass. `ignore_files` and `ignore_dirs` are the user's
+/// discovery globs, matched against the file name and against every directory
+/// name below the root the file was found under.
+///
+/// With none of the three the whole tree loads through the budgeted walk.
+pub fn load_loc_service(
+    dirs: &[&Path],
+    langs: Option<&[Lang]>,
+    ignore_files: &[String],
+    ignore_dirs: &[String],
+) -> LocService {
+    if langs.is_none() && ignore_files.is_empty() && ignore_dirs.is_empty() {
         return LocService::from_folders(dirs, ScanBudget::default());
-    };
+    }
     use rayon::prelude::*;
     let files: Vec<(String, String, Option<FileEncoding>)> =
         LocService::discover_files(dirs, ScanBudget::default())
             .into_par_iter()
+            .filter(|path| !loc_path_ignored(path, dirs, ignore_files, ignore_dirs))
             .filter_map(|path| {
                 // CSV loc (CK2/VIC2) carries every language in one file, keyed by
                 // column, so there is no single header language to filter on.
@@ -951,6 +961,7 @@ fn load_loc_service(dirs: &[&Path], langs: Option<&[Lang]>) -> LocService {
                 let path_str = path.to_string_lossy().into_owned();
                 let (text, encoding) = read_text_with_encoding(&path).ok()?;
                 if !is_csv
+                    && let Some(langs) = langs
                     && let Some(lang) = loc_header_language(&text, &path_str)
                     && !langs.contains(&lang)
                 {
@@ -960,6 +971,38 @@ fn load_loc_service(dirs: &[&Path], langs: Option<&[Lang]>) -> LocService {
             })
             .collect();
     LocService::from_files_with_encoding(files)
+}
+
+/// Whether a discovered loc path is excluded by the user's `--ignore-file` /
+/// `--ignore-dir` globs. Directory globs match a directory name at any depth, so
+/// the path is taken relative to the root it was discovered under first: an
+/// absolute root that happens to contain a `build` component is not the mod's.
+fn loc_path_ignored(
+    path: &Path,
+    roots: &[&Path],
+    file_globs: &[String],
+    dir_globs: &[String],
+) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if file_globs.iter().any(|pat| glob_match(pat, name)) {
+        return true;
+    }
+    if dir_globs.is_empty() {
+        return false;
+    }
+    let relative = roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path);
+    relative
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|c| c.as_os_str().to_str())
+        .any(|dir| dir_globs.iter().any(|pat| glob_match(pat, dir)))
 }
 
 /// The language a loc file declares, without parsing its entries. The header
@@ -1296,6 +1339,27 @@ mod tests {
                 "header-only read diverged from the full parse on {text:?}"
             );
         }
+    }
+
+    /// A directory glob names a directory inside the mod, so it is matched
+    /// against the path below the root: a root that itself sits under `build`
+    /// must not exclude every file in it.
+    #[test]
+    fn loc_ignore_globs_apply_below_the_root() {
+        let root = Path::new("build/mod");
+        let kept = root.join("localisation/greeting_l_english.yml");
+        let staged = root.join("build/localisation/greeting_l_english.yml");
+        let dir_globs = ["build".to_string()];
+
+        assert!(!loc_path_ignored(&kept, &[root], &[], &dir_globs));
+        assert!(loc_path_ignored(&staged, &[root], &[], &dir_globs));
+        assert!(loc_path_ignored(
+            &kept,
+            &[root],
+            &["greeting*".to_string()],
+            &[]
+        ));
+        assert!(!loc_path_ignored(&kept, &[root], &[], &[]));
     }
 
     #[test]

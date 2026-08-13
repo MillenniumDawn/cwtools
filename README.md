@@ -25,7 +25,7 @@ Both binaries drive the same pipeline.
 `cwtools`, the CLI:
 
 - `validate` checks a mod against a ruleset. A workspace of mods is detected and layered by load order.
-- `loc` checks localisation `.yml` on its own.
+- `loc` checks localisation `.yml` on its own, with `--ignore-file`, `--ignore-dir` and `--loc-language` to narrow the scan. The file-level checks need nothing else; add `--game` and `--rules` and it loads the ruleset's scopes and links too, so a `[command]` chain that names nothing or leaves a scope its next link doesn't accept is reported (CW226/CW260/CW266). It reads the ruleset, never the game files, so those chains start from an unknown scope: `validate` is what checks them where each key is used.
 - `fix` applies the machine-applicable fixes, dry-run by default.
 - `cache-vanilla` pre-indexes a base game install so later runs skip re-parsing it.
 - `parse`, `discover`, `rules`, `serialize` and `deserialize` inspect one file, a tree, or a `.cwb` cache.

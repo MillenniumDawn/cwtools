@@ -1252,6 +1252,159 @@ fn test_loc_ignore_hashes_filters_error_before_exit_code() {
         .stdout(predicate::str::contains("CW225").not());
 }
 
+// ── Loc scope/command checks (--game + --rules) ──────────────────────────────
+//
+// The `loc_commands` fixture holds one unknown Jomini call and one chain that
+// leaves a scope its next link doesn't accept. Without a ruleset there is no
+// scope registry, so neither can be judged and neither is reported.
+
+fn loc_commands_dir() -> PathBuf {
+    fixtures_dir().join("loc_commands")
+}
+
+fn loc_rules_dir() -> PathBuf {
+    fixtures_dir().join("loc_rules")
+}
+
+#[test]
+fn test_loc_without_rules_runs_no_command_checks() {
+    cwtools()
+        .args(["loc", loc_commands_dir().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW226").not())
+        .stdout(predicate::str::contains("CW260").not());
+}
+
+#[test]
+fn test_loc_with_rules_reports_the_command_checks() {
+    cwtools()
+        .args([
+            "loc",
+            loc_commands_dir().to_str().unwrap(),
+            "--game",
+            "hoi4",
+            "--rules",
+            loc_rules_dir().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW226"))
+        .stdout(predicate::str::contains("totally_unknown"))
+        .stdout(predicate::str::contains("CW260"))
+        .stdout(predicate::str::contains(
+            "controller used in wrong scope. In country but expected state",
+        ))
+        .stderr(predicate::str::contains("Loaded 2 scopes and 2 links"));
+}
+
+/// Half the pair checks nothing, and says so rather than looking like it did:
+/// a `cwtools.toml` written for `validate` routinely sets one and not the other.
+#[test]
+fn test_loc_game_without_rules_warns_and_checks_nothing() {
+    cwtools()
+        .args([
+            "loc",
+            loc_commands_dir().to_str().unwrap(),
+            "--game",
+            "hoi4",
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW226").not())
+        .stderr(predicate::str::contains(
+            "need both --game and --rules; --game on its own does nothing",
+        ));
+}
+
+#[test]
+fn test_loc_reads_game_and_rules_from_the_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let loc = tmp.path().join("mod").join("localisation");
+    std::fs::create_dir_all(&loc).unwrap();
+    std::fs::copy(
+        loc_commands_dir().join("localisation/cmds_l_english.yml"),
+        loc.join("cmds_l_english.yml"),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("cwtools.toml"),
+        format!(
+            "game = \"hoi4\"\ndirectory = \"mod\"\nrules = {:?}\n",
+            loc_rules_dir().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    cwtools()
+        .arg("loc")
+        .current_dir(tmp.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("CW226"))
+        .stderr(predicate::str::contains("applied: game, directory, rules"));
+}
+
+#[test]
+fn test_loc_ignore_file_skips_the_file() {
+    cwtools()
+        .args([
+            "loc",
+            loc_commands_dir().to_str().unwrap(),
+            "--ignore-file",
+            "cmds*",
+            "--allow-empty",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 entries"));
+}
+
+#[test]
+fn test_loc_ignore_dir_skips_the_tree() {
+    cwtools()
+        .args([
+            "loc",
+            loc_commands_dir().to_str().unwrap(),
+            "--ignore-dir",
+            "localisation",
+            "--allow-empty",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 entries"));
+}
+
+#[test]
+fn test_loc_language_scopes_the_scan() {
+    // The fixture is english-only, so scoping to french loads nothing.
+    cwtools()
+        .args([
+            "loc",
+            loc_commands_dir().to_str().unwrap(),
+            "--loc-language",
+            "french",
+            "--allow-empty",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 entries"));
+}
+
+#[test]
+fn test_loc_language_unknown_fails() {
+    cwtools()
+        .args([
+            "loc",
+            loc_commands_dir().to_str().unwrap(),
+            "--loc-language",
+            "klingon",
+        ])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("invalid language 'klingon'"));
+}
+
 #[test]
 fn test_validate_hash_baseline_survives_inserted_line() {
     // The digest is content-derived, so inserting a line above a baselined
@@ -1891,7 +2044,7 @@ fn test_config_warns_about_keys_the_command_ignores() {
     .unwrap();
     std::fs::write(
         tmp.path().join("cwtools.toml"),
-        "directory = \"mod\"\ngame = \"hoi4\"\nloc-languages = [\"english\"]\n",
+        "directory = \"mod\"\nvanilla = \"game\"\ncase-sensitive-files = false\n",
     )
     .unwrap();
     cwtools()
@@ -1900,7 +2053,7 @@ fn test_config_warns_about_keys_the_command_ignores() {
         .assert()
         .success()
         .stderr(predicate::str::contains(
-            "sets game, loc-languages, which `loc` does not read",
+            "sets vanilla, case-sensitive-files, which `loc` does not read",
         ));
 }
 
