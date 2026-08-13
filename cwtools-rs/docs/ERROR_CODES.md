@@ -85,7 +85,7 @@ and CW241 by CW262-265.
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | <a id="cw225"></a>CW225 | Error | Localisation key "{}" references "{}" which doesn't exist in {} | A loc string's `$KEY$` reference points to a key that has no definition. | Emitted |
-| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). Multi-segment chains like `[THIS.var]` are lenient (scripted variables not indexed). Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted |
+| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). Multi-segment chains like `[THIS.var]` are lenient (scripted variables not indexed). Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted (see [where the loc command checks run](#where-the-loc-command-checks-run)) |
 
 ### CW227-CW233 -- Section/component/mesh/entity (Stellaris-specific)
 
@@ -164,13 +164,13 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | <a id="cw257"></a>CW257 | Error | Localisation file's name has language {} doesn't match the header language {} | The language in the file name and the `l_xxx:` header disagree. | Emitted |
 | <a id="cw258"></a>CW258 | Information | Localisation file name should end with "l_language.yml" | Language tag is present but not at the end of the file name. F# defines this but leaves emission commented out as "only convention"; cwtools-rs matches that -- const defined, never fired. | Retired / not emitted |
 | <a id="cw259"></a>CW259 | Error | This localisation string refers to itself | A loc key's value includes a `$KEY$` reference back to the same key. | Emitted |
-| <a id="cw260"></a>CW260 | Error | Loc command {} used in wrong scope. In {} but expected {} | A loc command is used in a data scope that doesn't support it. | Emitted |
+| <a id="cw260"></a>CW260 | Error | Loc command {} used in wrong scope. In {} but expected {} | A loc command is used in a data scope that doesn't support it. | Emitted (see [where the loc command checks run](#where-the-loc-command-checks-run)) |
 | <a id="cw261"></a>CW261 | Error | Key {} of type {} is defined multiple times | A `unique` type key appears more than once as a root key in the same file. Detection is per-file, not project-wide: the same key duplicated across two files is not flagged. | Emitted (reconciled from Rust CW501) |
 | <a id="cw262"></a>CW262 | Error | {} | An unexpected `key = { ... }` node where the rule doesn't allow one. Also fires on a bad key inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
 | <a id="cw263"></a>CW263 | Error | {} | An unexpected `key = value` leaf where the rule doesn't allow one. Also fires on a mis-typed operator inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
 | <a id="cw264"></a>CW264 | Warning | {} | An unexpected bare value where the rule doesn't allow one. | Emitted |
 | <a id="cw265"></a>CW265 | Warning | {} | An unexpected `{ ... }` value clause where the rule doesn't allow one. | Emitted |
-| <a id="cw266"></a>CW266 | Error | Localisation key {} uses command {} which does not exist in data type {}. | A loc command is not valid in the resolved data type for that scope. | Emitted (reconciled from Rust CW262) |
+| <a id="cw266"></a>CW266 | Error | Localisation key {} uses command {} which does not exist in data type {}. | A loc command is not valid in the resolved data type for that scope. | Emitted (reconciled from Rust CW262; see [where the loc command checks run](#where-the-loc-command-checks-run)) |
 | <a id="cw267"></a>CW267 | Error | Expected a {} value, got {} | An alias key/value didn't match the expected alias category. | Emitted |
 | <a id="cw268"></a>CW268 | Warning | Localisation key {} doesn't start and end with double quotes | A loc value is missing its enclosing double-quote delimiters. | Emitted |
 
@@ -242,6 +242,23 @@ corpus to validate.
 | Per-template field data (slots/sizes) + asset index | CW228, CW230, CW233 |
 | List-merge optimisation hint | CW269 |
 | Modifier-type registry | CW273 |
+
+### Where the loc command checks run
+
+**CW226, CW260** and **CW266** judge a `[command]` chain in a loc value against
+the game's scopes and links, so they need a ruleset. Two passes run them, and
+they see different things:
+
+- `cwtools validate` and the language server run them at each reference site,
+  seeded with the scope of the field using the key. That is the stricter answer:
+  a chain valid in one scope and wrong in another is caught where it is wrong.
+- `cwtools loc --game <game> --rules <path>` runs them over every entry in the
+  scan, starting from an unknown scope. There are no game files to name a
+  reference site, so only what is wrong in *every* scope is reported.
+
+`cwtools loc` without both settings loads no registry and reports none of the
+three; the file-level loc checks (CW225, CW254-CW259, CW268, CW275, CW276) do
+not need one and always run.
 
 ### Wired, runs by default (with an escape hatch)
 

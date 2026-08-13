@@ -211,10 +211,21 @@ pub(crate) struct LocArgs {
     /// Directory containing localisation .yml files
     pub(crate) directory: Option<PathBuf>,
     /// Read settings from this cwtools.toml instead of searching for one.
-    /// `loc` reads directory, report-type, min-severity, ignore-codes,
-    /// only-codes and allow-empty; see `validate --help` for the schema.
+    /// `loc` reads game, directory, rules, report-type, min-severity,
+    /// ignore-files, ignore-dirs, loc-languages, ignore-codes, only-codes and
+    /// allow-empty; see `validate --help` for the schema.
     #[arg(long, value_name = "FILE")]
     pub(crate) config: Option<PathBuf>,
+    /// Game identifier (hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom).
+    /// Together with --rules it turns on the scope-aware loc command checks
+    /// (CW226/CW260/CW266); on its own it does nothing.
+    #[arg(long, short)]
+    pub(crate) game: Option<String>,
+    /// Path to a .cwt rules file OR a directory containing .cwt rule files.
+    /// Read for its scope and link definitions only — no game files are
+    /// discovered or indexed. Needs --game to take effect.
+    #[arg(long, short)]
+    pub(crate) rules: Option<PathBuf>,
     /// Report format: cli (default, grouped text), csv, json, github
     /// (Actions workflow commands), or sarif (SARIF 2.1.0).
     #[arg(long, value_name = "FORMAT", value_parser = report::parse_report_type)]
@@ -230,6 +241,21 @@ pub(crate) struct LocArgs {
     /// use later with --ignore-hashes.
     #[arg(long)]
     pub(crate) output_hashes: Option<PathBuf>,
+    /// Filename glob patterns to skip while scanning. May be repeated.
+    /// Examples: --ignore-file "wip*" --ignore-file "*_draft_l_english.yml"
+    #[arg(long = "ignore-file", value_name = "GLOB")]
+    pub(crate) ignore_files: Vec<String>,
+    /// Directory glob patterns to skip while scanning, matched against any
+    /// directory name under the target. May be repeated.
+    /// Examples: --ignore-dir "build" --ignore-dir "temp*"
+    #[arg(long = "ignore-dir", value_name = "GLOB")]
+    pub(crate) ignore_dirs: Vec<String>,
+    /// Restrict the scan to this language (repeatable). Valid values: english,
+    /// french, german, spanish, russian, polish, braz_por, simp_chinese,
+    /// japanese, korean, turkish, default. Omit to check every language with
+    /// data. A `$ref$` only resolves against the languages that are loaded.
+    #[arg(long = "loc-language", value_name = "LANG", value_parser = parse_lang)]
+    pub(crate) loc_language: Vec<Lang>,
     /// Only report diagnostics at or above this severity. Valid values:
     /// error, warning, info, hint. Omit to report everything.
     #[arg(long, value_name = "LEVEL", value_parser = parse_min_severity)]

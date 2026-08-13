@@ -1,8 +1,12 @@
 //! `loc`: the standalone localisation lint over a directory of `.yml` files.
 
-use cwtools_file_manager::file_manager::ScanBudget;
-use cwtools_localization::{LocService, validate_loc_project};
-use cwtools_validation::ErrorSeverity;
+use std::path::Path;
+
+use cwtools_driver::RulesInput;
+use cwtools_game::constants::Game;
+use cwtools_localization::{LocScopeData, validate_loc_project_commands};
+use cwtools_string_table::string_table::StringTable;
+use cwtools_validation::{ErrorSeverity, build_scope_registry_arc};
 
 use crate::cli::LocArgs;
 use crate::diag::{
@@ -20,10 +24,15 @@ pub(super) fn run(args: LocArgs) {
     let LocArgs {
         directory,
         config,
+        game,
+        rules,
         report_type,
         output_file,
         ignore_hashes,
         output_hashes,
+        ignore_files,
+        ignore_dirs,
+        loc_language,
         min_severity,
         ignore_codes,
         only_codes,
@@ -33,10 +42,35 @@ pub(super) fn run(args: LocArgs) {
     let file_cfg = load_config(config.as_deref(), directory.as_deref());
     let mut applied: Vec<&'static str> = Vec::new();
     let fc = file_cfg.as_ref();
+    let game = config::pick(game, fc.and_then(|c| c.game.clone()), "game", &mut applied);
     let directory = config::pick(
         directory,
         fc.and_then(|c| c.directory.clone()),
         "directory",
+        &mut applied,
+    );
+    let rules = config::pick(
+        rules,
+        fc.and_then(|c| c.rules.clone()),
+        "rules",
+        &mut applied,
+    );
+    let ignore_files = config::pick_list(
+        ignore_files,
+        fc.map(|c| c.ignore_files.clone()).unwrap_or_default(),
+        "ignore-files",
+        &mut applied,
+    );
+    let ignore_dirs = config::pick_list(
+        ignore_dirs,
+        fc.map(|c| c.ignore_dirs.clone()).unwrap_or_default(),
+        "ignore-dirs",
+        &mut applied,
+    );
+    let loc_language = config::pick_list(
+        loc_language,
+        fc.map(|c| c.loc_languages.clone()).unwrap_or_default(),
+        "loc-languages",
         &mut applied,
     );
     let report_type = config::pick(
@@ -84,12 +118,20 @@ pub(super) fn run(args: LocArgs) {
         std::process::exit(EXIT_DISCOVERY_FAILED);
     }
 
+    // Rules are optional. Without them `loc` stays the scope-independent lint it
+    // has always been; with --game and --rules the ruleset's scope registry
+    // comes up too and the command checks (CW226/CW260/CW266) run alongside it.
+    // Only the ruleset is read — no game files are discovered or indexed.
+    let scope_data = loc_scope_data(game.as_deref(), rules.as_deref());
+
     let divert = report_owns_stdout(report_type, output_file.as_ref());
     status(
         format!("Scanning localisation in {}", directory.display()),
         divert,
     );
-    let service = LocService::from_folder(&directory, ScanBudget::default());
+    let langs = (!loc_language.is_empty()).then_some(loc_language.as_slice());
+    let service =
+        cwtools_driver::load_loc_service(&[&directory], langs, &ignore_files, &ignore_dirs);
     exit_if_empty(
         service.files().len(),
         allow_empty,
@@ -113,15 +155,25 @@ pub(super) fn run(args: LocArgs) {
         })
         .unwrap_or_default();
 
-    // Standalone loc lint uses the scope-independent checks (CW225 etc.);
-    // scope-aware command checks need the referencing config's scope.
+    // The scope-independent checks (CW225 etc.) always run. The command checks
+    // follow when a ruleset supplied a scope registry; with no reference site to
+    // seed them they start every chain at `any`, so they report what is wrong in
+    // every scope rather than what is wrong where the key is used.
     let want_legacy_hash = !ignored.is_empty();
     let mut sources = SourceLines::default();
     let keep = |d: &Diag| {
         !is_ignored(&ignored, d)
             && min_severity.is_none_or(|m| severity_rank(d.severity) >= severity_rank(m))
     };
-    let diags: Vec<Diag> = validate_loc_project(&service)
+    let mut loc_diags = cwtools_localization::validate_loc_project_scoped(
+        &service,
+        langs,
+        &std::collections::HashSet::new(),
+    );
+    if let Some(data) = &scope_data {
+        loc_diags.extend(validate_loc_project_commands(&service, langs, data));
+    }
+    let diags: Vec<Diag> = loc_diags
         .into_iter()
         .filter(|d| codes::wanted(d.code, &only_codes, &ignore_codes))
         .map(|d| {
@@ -258,4 +310,60 @@ pub(super) fn run(args: LocArgs) {
     if code != 0 {
         std::process::exit(code);
     }
+}
+
+/// Build the loc scope settings from `--game` and `--rules`, or `None` when the
+/// run didn't ask for the scope checks. Loads the ruleset for its scope and link
+/// definitions only; the ruleset's own problems are counted, not reported, since
+/// a loc report has no place to put them (`cwtools rules` does).
+///
+/// Both settings are needed: the registry is per-game, and a ruleset without a
+/// game has no scopes to build it from. One on its own warns and checks nothing,
+/// which keeps a `cwtools.toml` written for `validate` usable here.
+fn loc_scope_data(game: Option<&str>, rules: Option<&Path>) -> Option<LocScopeData> {
+    let (game, rules) = match (game, rules) {
+        (Some(game), Some(rules)) => (game, rules),
+        (None, None) => return None,
+        (game, _) => {
+            let given = if game.is_some() { "--game" } else { "--rules" };
+            eprintln!(
+                "warn: the loc scope checks (CW226/CW260/CW266) need both --game and --rules; \
+                 {given} on its own does nothing"
+            );
+            return None;
+        }
+    };
+    let Some(game) = Game::from_str(game) else {
+        eprintln!(
+            "Unknown game: {game}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, \
+             eu5, custom"
+        );
+        std::process::exit(1);
+    };
+
+    let table = StringTable::new();
+    let (ruleset, problems) =
+        cwtools_driver::load_rules(&RulesInput::from_path(rules.to_path_buf()), &table)
+            .unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(EXIT_DISCOVERY_FAILED);
+            });
+    eprintln!(
+        "Loaded {} scopes and {} links from {} for the {game} loc command checks",
+        ruleset.scope_inputs.len(),
+        ruleset.link_inputs.len(),
+        rules.display()
+    );
+    if !problems.is_empty() {
+        eprintln!(
+            "warn: the ruleset has {} problems; run `cwtools rules {}` for them",
+            problems.len(),
+            rules.display()
+        );
+    }
+    Some(LocScopeData {
+        game: Some(game),
+        registry: build_scope_registry_arc(&ruleset, Some(game)),
+        ..Default::default()
+    })
 }
