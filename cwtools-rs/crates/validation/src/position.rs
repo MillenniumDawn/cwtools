@@ -22,8 +22,8 @@ use crate::resolve::{
     resolve_root_child, type_has_content,
 };
 use crate::rule_core::{
-    alias_overloads, flatten_nested_subtype_rules, matching_candidates, merged_rules_for_type,
-    rule_matches_leaf_key,
+    alias_overloads, alias_overloads_with_confidence, flatten_nested_subtype_rules,
+    matching_candidates, merged_rules_for_type, rule_matches_leaf_key,
 };
 use crate::scope::{enter_block_scope, seed_root_scope};
 use crate::{Prepared, initial_scope_context};
@@ -245,6 +245,20 @@ pub fn scope_transitions(
     start_line: u32,
     end_line: u32,
 ) -> Vec<ScopeTransition> {
+    scope_transitions_with_limit(ast, file_path, prepared, start_line, end_line, usize::MAX)
+}
+
+pub fn scope_transitions_with_limit(
+    ast: &ParsedFile,
+    file_path: &str,
+    prepared: &Prepared<'_>,
+    start_line: u32,
+    end_line: u32,
+    max_transitions: usize,
+) -> Vec<ScopeTransition> {
+    if max_transitions == 0 {
+        return Vec::new();
+    }
     let Some(mut scope_context) = initial_scope_context(file_path, prepared.registry) else {
         return Vec::new();
     };
@@ -287,6 +301,7 @@ pub fn scope_transitions(
             &mut scope_context,
             start_line,
             end_line,
+            max_transitions,
             &mut out,
         );
         return out;
@@ -299,6 +314,9 @@ pub fn scope_transitions(
         allow_content_fallback: false,
     };
     for child in &ast.root_children {
+        if out.len() >= max_transitions {
+            break;
+        }
         let Child::Leaf(idx) = child else { continue };
         let leaf = &ast.arena.leaves[*idx as usize];
         let Value::Clause(children) = &leaf.value else {
@@ -322,6 +340,7 @@ pub fn scope_transitions(
                 &mut scope_context,
                 start_line,
                 end_line,
+                max_transitions,
                 &mut out,
             ),
             ResolvedType::Wrapper {
@@ -339,6 +358,7 @@ pub fn scope_transitions(
                 &mut scope_context,
                 start_line,
                 end_line,
+                max_transitions,
                 &mut out,
             ),
             ResolvedType::None => {}
@@ -358,8 +378,12 @@ fn collect_entity_scope(
     scope_context: &mut ScopeContext,
     start_line: u32,
     end_line: u32,
+    max_transitions: usize,
     out: &mut Vec<ScopeTransition>,
 ) {
+    if node_range.is_some_and(|range| range.end.line < start_line) {
+        return;
+    }
     let (merged, matched, push_scope) =
         merged_rules_for_type(ctx, type_def, children, inner_rules, node_key, false);
     if matched.is_empty() && merged.is_empty() && node_range.is_some() {
@@ -380,6 +404,7 @@ fn collect_entity_scope(
         && range.start.line >= start_line
         && range.start.line <= end_line
         && resolved != ambient
+        && out.len() < max_transitions
     {
         out.push(ScopeTransition {
             range,
@@ -394,6 +419,7 @@ fn collect_entity_scope(
         scope_context,
         start_line,
         end_line,
+        max_transitions,
         out,
     );
     scope_context.restore(saved);
@@ -411,10 +437,14 @@ fn collect_wrapper_scope(
     scope_context: &mut ScopeContext,
     start_line: u32,
     end_line: u32,
+    max_transitions: usize,
     out: &mut Vec<ScopeTransition>,
 ) {
     let candidates = grandchild_candidates_for_wrapper(path_candidates, wrapper_root_key);
     for child in grandchildren {
+        if out.len() >= max_transitions {
+            return;
+        }
         let (key, children, range) = match child {
             Child::Leaf(idx) => {
                 let leaf = &ctx.ast.arena.leaves[*idx as usize];
@@ -429,6 +459,9 @@ fn collect_wrapper_scope(
             }
             _ => continue,
         };
+        if range.end.line < start_line {
+            continue;
+        }
         if let [next, rest @ ..] = skip_tail {
             if cwtools_index::skip_root_key_matches(next, &key) {
                 collect_wrapper_scope(
@@ -442,6 +475,7 @@ fn collect_wrapper_scope(
                     scope_context,
                     start_line,
                     end_line,
+                    max_transitions,
                     out,
                 );
             }
@@ -462,6 +496,7 @@ fn collect_wrapper_scope(
             scope_context,
             start_line,
             end_line,
+            max_transitions,
             out,
         );
     }
@@ -475,6 +510,7 @@ fn collect_scope_children(
     scope_context: &mut ScopeContext,
     start_line: u32,
     end_line: u32,
+    max_transitions: usize,
     out: &mut Vec<ScopeTransition>,
 ) {
     let flattened;
@@ -488,6 +524,9 @@ fn collect_scope_children(
         rules
     };
     for child in children {
+        if out.len() >= max_transitions {
+            return;
+        }
         let Child::Leaf(idx) = child else {
             if let Child::LeafValue(idx) = child {
                 let lv = &ctx.ast.arena.leaf_values[*idx as usize];
@@ -501,6 +540,7 @@ fn collect_scope_children(
                             scope_context,
                             start_line,
                             end_line,
+                            max_transitions,
                             out,
                         );
                     }
@@ -525,7 +565,7 @@ fn collect_scope_children(
             rule_matches_leaf_key,
         );
         let mut next = Vec::new();
-        let mut scope_options = Vec::new();
+        let mut scope_options: Vec<(&Options, bool)> = Vec::new();
         let mut math_expression = false;
         let mut ambiguous_body = false;
         for (rule, opts) in candidates {
@@ -538,7 +578,13 @@ fn collect_scope_children(
                     left: NewField::AliasField(category),
                     ..
                 } => {
-                    let aliases = alias_overloads(ctx.ruleset, ctx.type_index, category, key);
+                    let aliases = alias_overloads_with_confidence(
+                        ctx.ruleset,
+                        ctx.type_index,
+                        category,
+                        key,
+                        false,
+                    );
                     if aliases.len() > 1
                         && !ctx.reserve_alias_branches(
                             aliases.len(),
@@ -549,12 +595,18 @@ fn collect_scope_children(
                         return;
                     }
                     let mut first_node_alias = None;
-                    for alias in aliases {
+                    for (alias, confident) in aliases {
+                        if !confident {
+                            continue;
+                        }
                         if let RuleType::NodeRule { rules: body, .. } = &alias.0 {
-                            if first_node_alias.is_some_and(|first| first != alias) {
+                            if first_node_alias
+                                .as_ref()
+                                .is_some_and(|first| *first != alias.0)
+                            {
                                 ambiguous_body = true;
                             } else {
-                                first_node_alias = Some(alias);
+                                first_node_alias = Some(alias.0.clone());
                             }
                             next.extend(body.iter().cloned());
                             scope_options.push((&alias.1, true));
@@ -572,9 +624,6 @@ fn collect_scope_children(
                 _ => {}
             }
         }
-        if next.is_empty() {
-            continue;
-        }
         if math_expression {
             let math_rules = crate::rule_core::math_clause_rules();
             collect_scope_children(
@@ -584,6 +633,7 @@ fn collect_scope_children(
                 scope_context,
                 start_line,
                 end_line,
+                max_transitions,
                 out,
             );
             continue;
@@ -632,8 +682,17 @@ fn collect_scope_children(
                 resolved,
             });
         }
-        if !ambiguous_body {
-            collect_scope_children(ctx, inner, &next, scope_context, start_line, end_line, out);
+        if !ambiguous_body && !next.is_empty() && leaf.pos.end.line >= start_line {
+            collect_scope_children(
+                ctx,
+                inner,
+                &next,
+                scope_context,
+                start_line,
+                end_line,
+                max_transitions,
+                out,
+            );
         }
         scope_context.restore(saved);
     }
@@ -1141,6 +1200,45 @@ mod tests {
         let transitions = scope_transitions(&ast, "common/foo/test.txt", &prepared, 1, 5);
         assert_eq!(transitions.len(), 1, "got: {transitions:?}");
         assert_eq!(transitions[0].range.start.line, 2);
+        assert_eq!(transitions[0].resolved, ScopeId(101));
+    }
+
+    #[test]
+    fn scope_transitions_include_empty_scope_changing_blocks() {
+        use cwtools_game::constants::Game;
+        use cwtools_parser::parser::parse_string;
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        use cwtools_string_table::string_table::StringTable;
+        let table = StringTable::new();
+        let rules = parse_string(
+            "types = { type[foo] = { path = \"common/foo\" } }\n\
+             scopes = { Country = { aliases = { country } } Character = { aliases = { character } } }\n\
+             foo = {
+                 ## push_scope = character
+                 custom = { }
+             }
+",
+            &table,
+        );
+        let ruleset = ast_to_ruleset(&rules, &table);
+        assert!(ruleset.type_rules_idx.contains_key("foo"));
+        let registry = crate::build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
+        let prepared = crate::Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(Game::Hoi4),
+            type_index: None,
+            modifier_keys: None,
+            loc_index: None,
+            extra_loc_keys: None,
+            inline_scripts: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: false,
+        };
+        let ast = parse_string("foo = { custom = { } }\n", &table);
+        let transitions = scope_transitions(&ast, "common/foo/test.txt", &prepared, 1, 1);
+        assert_eq!(transitions.len(), 1);
         assert_eq!(transitions[0].resolved, ScopeId(101));
     }
 

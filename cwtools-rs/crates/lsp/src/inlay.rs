@@ -23,7 +23,7 @@
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    InlayHint, InlayHintLabel, InlayHintParams, PositionEncodingKind, Range,
+    InlayHint, InlayHintLabel, InlayHintParams, Position, PositionEncodingKind, Range,
 };
 
 use cwtools_game::scope_engine::{SCOPE_ANY, SCOPE_INVALID, ScopeId};
@@ -71,12 +71,11 @@ impl Backend {
         let encoding = self.state.config.read().position_encoding.clone();
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = crate::paths::logical_path_from_uri(&uri, &ws_prefix);
-        let mut hints: Vec<InlayHint> = Vec::new();
-        if loc_titles {
+        let loc_hints = if loc_titles {
             // Lock order: info_service -> loc_text (documents already released).
             let info = self.state.info_service.read();
             let loc_text = self.state.loc_text.read();
-            hints = loc_title_hints(
+            loc_title_hints(
                 &ast,
                 &self.state.string_table,
                 &text,
@@ -84,62 +83,73 @@ impl Backend {
                 &info.type_index,
                 &loc_text,
                 &encoding,
-            );
-        }
+            )
+        } else {
+            Vec::new()
+        };
+        let mut scope_hints = Vec::new();
         if scopes {
-            let rem = MAX_HINTS.saturating_sub(hints.len());
-            if rem > 0 {
-                let rules_guard = self.state.rules.read();
-                let info_guard = self.state.info_service.read();
-                if let (Some(ruleset), Some(registry)) = (
-                    rules_guard.ruleset.as_ref(),
-                    rules_guard.scope_registry.as_ref(),
-                ) {
-                    let (game, scope_checks, var_checks) = {
-                        let cfg = self.state.config.read();
-                        (cfg.game(), cfg.scope_checks, cfg.var_checks)
-                    };
-                    let prepared = crate::validate::make_prepared(
-                        ruleset,
-                        &self.state.string_table,
-                        game,
-                        &info_guard.type_index,
-                        rules_guard.modifier_keys.as_ref(),
-                        None,
-                        None,
-                        Some(registry),
-                        scope_checks,
-                        var_checks,
-                    );
-                    let transitions = cwtools_validation::position::scope_transitions(
-                        &ast,
-                        &logical_path,
-                        &prepared,
-                        params.range.start.line + 1,
-                        params.range.end.line + 2,
-                    );
-                    let mut scope_hints = scope_hints_from_transitions(
-                        &transitions,
-                        &text,
-                        registry,
-                        &encoding,
-                        params.range,
-                    );
-                    if scope_hints.len() > rem {
-                        scope_hints.truncate(rem);
-                    }
-                    hints.extend(scope_hints);
-                }
+            let rules_guard = self.state.rules.read();
+            let info_guard = self.state.info_service.read();
+            if let (Some(ruleset), Some(registry)) = (
+                rules_guard.ruleset.as_ref(),
+                rules_guard.scope_registry.as_ref(),
+            ) {
+                let (game, scope_checks, var_checks) = {
+                    let cfg = self.state.config.read();
+                    (cfg.game(), cfg.scope_checks, cfg.var_checks)
+                };
+                let prepared = crate::validate::make_prepared(
+                    ruleset,
+                    &self.state.string_table,
+                    game,
+                    &info_guard.type_index,
+                    rules_guard.modifier_keys.as_ref(),
+                    None,
+                    None,
+                    Some(registry),
+                    scope_checks,
+                    var_checks,
+                );
+                let (start_line, end_line) = source_line_bounds(params.range);
+                let transitions = cwtools_validation::position::scope_transitions_with_limit(
+                    &ast,
+                    &logical_path,
+                    &prepared,
+                    start_line,
+                    end_line,
+                    MAX_HINTS,
+                );
+                scope_hints = scope_hints_from_transitions(
+                    &transitions,
+                    &text,
+                    registry,
+                    &encoding,
+                    params.range,
+                );
             }
         }
-        hints.sort_by_key(|hint| (hint.position.line, hint.position.character));
-        hints.truncate(MAX_HINTS);
+        let hints = merge_hints(loc_hints, scope_hints);
         if hints.is_empty() {
             Ok(None)
         } else {
             Ok(Some(hints))
         }
     }
+}
+
+fn source_line_bounds(range: Range) -> (u32, u32) {
+    (
+        range.start.line.saturating_add(1),
+        range.end.line.saturating_add(2),
+    )
+}
+
+fn merge_hints(mut first: Vec<InlayHint>, mut second: Vec<InlayHint>) -> Vec<InlayHint> {
+    first.append(&mut second);
+    first.sort_by_key(|hint| (hint.position.line, hint.position.character));
+    first.truncate(MAX_HINTS);
+    first
 }
 
 /// Compute the localised-title inlay hints for the leaves of `file` whose lines
@@ -194,9 +204,22 @@ impl Ctx<'_> {
         self.lines.get(line0 as usize).copied().unwrap_or("")
     }
 
-    fn in_range(&self, line0: u32) -> bool {
+    fn line_in_range(&self, line0: u32) -> bool {
         line0 >= self.range.start.line && line0 <= self.range.end.line
     }
+
+    fn position_in_range(&self, position: Position) -> bool {
+        position_in_half_open_range(position, self.range)
+    }
+}
+
+fn position_in_half_open_range(position: Position, range: Range) -> bool {
+    let start = range.start;
+    let end = range.end;
+    (position.line > start.line
+        || (position.line == start.line && position.character >= start.character))
+        && (position.line < end.line
+            || (position.line == end.line && position.character < end.character))
 }
 
 fn collect_hints(children: &[Child], cx: &Ctx<'_>, out: &mut Vec<InlayHint>) {
@@ -219,7 +242,7 @@ fn collect_hints(children: &[Child], cx: &Ctx<'_>, out: &mut Vec<InlayHint>) {
                     continue;
                 }
                 let line0 = leaf.pos.start.line.saturating_sub(1);
-                if !cx.in_range(line0) {
+                if !cx.line_in_range(line0) {
                     continue;
                 }
                 // `key = value`: skip the key, start the token scan after the `=`.
@@ -228,14 +251,15 @@ fn collect_hints(children: &[Child], cx: &Ctx<'_>, out: &mut Vec<InlayHint>) {
                     cx,
                     line0,
                     Anchor::Keyed(leaf.pos.start.col as u32),
-                ) {
+                ) && cx.position_in_range(hint.position)
+                {
                     out.push(hint);
                 }
             }
             Child::LeafValue(idx) => {
                 let lv = &cx.arena.leaf_values[*idx as usize];
                 let line0 = lv.pos.start.line.saturating_sub(1);
-                if !cx.in_range(line0) {
+                if !cx.line_in_range(line0) {
                     continue;
                 }
                 // A bare value token: annotate it (scan from its own start). An
@@ -246,6 +270,7 @@ fn collect_hints(children: &[Child], cx: &Ctx<'_>, out: &mut Vec<InlayHint>) {
                 // normal case via the Leaf branch above).
                 if let Some(hint) =
                     hint_for_value(&lv.value, cx, line0, Anchor::Bare(lv.pos.start.col as u32))
+                    && cx.position_in_range(hint.position)
                 {
                     out.push(hint);
                 }
@@ -276,13 +301,7 @@ fn scope_hints_from_transitions(
                 text,
                 encoding,
             )?;
-            let p = hint.position;
-            let start = request_range.start;
-            let end = request_range.end;
-            let in_range = (p.line > start.line
-                || (p.line == start.line && p.character >= start.character))
-                && (p.line < end.line || (p.line == end.line && p.character < end.character));
-            in_range.then_some(hint)
+            position_in_half_open_range(hint.position, request_range).then_some(hint)
         })
         .collect()
 }
@@ -655,6 +674,37 @@ mod tests {
         assert_eq!(hint.padding_right, None);
         assert!(hint.tooltip.is_none());
         assert!(hint.text_edits.is_none());
+    }
+
+    #[test]
+    fn scope_hint_range_is_half_open() {
+        let text = "owner = { }\n";
+        let table = StringTable::new();
+        let ast = cwtools_parser::parser::parse_string(text, &table);
+        let Child::Leaf(idx) = ast.root_children[0] else {
+            panic!("expected a keyed clause");
+        };
+        let (registry, country, character) = scope_registry_for_tests();
+        let range = ast.arena.leaves[idx as usize].pos;
+        let lines = &["owner = { }"];
+        let hint = scope_hint_for_block(
+            &registry,
+            country,
+            character,
+            range,
+            lines,
+            text,
+            &PositionEncodingKind::UTF16,
+        )
+        .expect("scope hint should render");
+        assert!(position_in_half_open_range(
+            hint.position,
+            Range::new(Position::new(0, 0), Position::new(0, 9),)
+        ));
+        assert!(!position_in_half_open_range(
+            hint.position,
+            Range::new(Position::new(0, 0), Position::new(0, 8),)
+        ));
     }
 
     #[test]

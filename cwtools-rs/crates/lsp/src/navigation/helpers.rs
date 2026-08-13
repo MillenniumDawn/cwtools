@@ -256,18 +256,20 @@ pub(crate) fn highlight_kind(line: &str, col: u32, name: &str) -> DocumentHighli
 /// quoted string can be the assignment operator.
 pub(crate) fn value_start_after_eq(line: &str, key_col: u32) -> Option<u32> {
     let mut quoted = false;
-    let mut escaped = false;
+    let mut backslashes = 0;
     line.chars()
         .enumerate()
         .skip(key_col as usize)
         .find(|(_, c)| {
+            let escaped = backslashes % 2 == 1;
             if *c == '"' && !escaped {
                 quoted = !quoted;
             }
             let is_assignment = *c == '=' && !quoted;
-            escaped = *c == '\\' && !escaped;
-            if *c != '\\' {
-                escaped = false;
+            if *c == '\\' {
+                backslashes += 1;
+            } else {
+                backslashes = 0;
             }
             is_assignment
         })
@@ -1061,6 +1063,7 @@ mod tests {
     fn value_start_after_eq_ignores_quoted_key_equals() {
         assert_eq!(value_start_after_eq("\"a=b\" = { }", 0), Some(7));
         assert_eq!(value_start_after_eq("\"a\\\"=b\" = { }", 0), Some(9));
+        assert_eq!(value_start_after_eq("\"a\\\\\"=b\" = { }", 0), Some(6));
     }
 
     #[test]
