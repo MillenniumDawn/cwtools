@@ -890,15 +890,21 @@ pub(crate) fn code_token_cols_in_line_ignore_case(line: &str, needle_lower: &str
 /// Every 0-based char column where `$needle_lower$` appears as a loc ref in
 /// `line` (including `|colour` suffix, e.g. `$MY_KEY|Y$`). Returns the column
 /// of the inner key's first character (after the opening `$`), case-insensitive.
-/// Used for yml `$REF$` rename.
+/// Used for yml `$REF$` rename. Skips `$` refs inside unquoted `#` comments
+/// and handles currency `$` like "$5 for $ITEM$" by advancing one dollar on
+/// invalid ident.
 pub(crate) fn loc_ref_key_cols_in_line(line: &str, needle_lower: &str) -> Vec<u32> {
     let mut out = Vec::new();
-    // Find all `$` positions as char indices
     let chars: Vec<char> = line.chars().collect();
+    // Collect `$` positions, stopping at an unquoted `#` comment.
     let mut dollars: Vec<usize> = Vec::new();
+    let mut in_string = false;
     for (i, &c) in chars.iter().enumerate() {
-        if c == '$' {
-            dollars.push(i);
+        match c {
+            '"' => in_string = !in_string,
+            '#' if !in_string => break,
+            '$' => dollars.push(i),
+            _ => {}
         }
     }
     let mut i = 0;
@@ -911,12 +917,16 @@ pub(crate) fn loc_ref_key_cols_in_line(line: &str, needle_lower: &str) -> Vec<u3
         }
         let inner: String = chars[open + 1..close].iter().collect();
         let key = inner.split('|').next().unwrap_or(&inner);
-        if !key.is_empty()
+        let is_valid = !key.is_empty()
             && key
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-            && key.to_ascii_lowercase() == needle_lower
-        {
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+        if !is_valid {
+            // Currency or malformed like "$5 for $" — skip only the opening `$"
+            i += 1;
+            continue;
+        }
+        if key.to_ascii_lowercase() == needle_lower {
             out.push((open + 1) as u32);
         }
         i += 2;
@@ -1451,10 +1461,24 @@ mod tests {
             loc_ref_key_cols_in_line("  desc: \"See $my_key|Y$\"", "my_key"),
             vec![14]
         );
-        // Not inside comment? yml comments start with # but our helper does not skip #; still, rename should possibly handle? For now, it still finds even after # – not critical.
         assert_eq!(
             loc_ref_key_cols_in_line("x = foo $my_key_extra$ y", "my_key"),
             Vec::<u32>::new()
+        );
+        // Currency: "$5 for $ITEM$" should pair ITEM correctly (invalid "$5 for $" skips one dollar)
+        assert_eq!(
+            loc_ref_key_cols_in_line("a $5 for $ITEM$ b", "item").len(),
+            1
+        );
+        assert_eq!(
+            loc_ref_key_cols_in_line("a $5 for $ITEM$ b", "5"),
+            Vec::<u32>::new()
+        );
+        // Unquoted # comment: refs after # are ignored
+        assert!(loc_ref_key_cols_in_line("x = foo # $my_key$ comment", "my_key").is_empty());
+        assert_eq!(
+            loc_ref_key_cols_in_line("x = \"foo # $my_key$\" # $my_key$", "my_key").len(),
+            1
         );
     }
 

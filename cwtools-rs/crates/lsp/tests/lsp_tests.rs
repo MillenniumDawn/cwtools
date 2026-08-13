@@ -13986,21 +13986,50 @@ fn test_loc_rename_with_desc_sibling() {
         "rename result must not be null, got {}",
         resp_str
     );
-    let edit_str = edit.to_string();
+    let new_texts = {
+        let mut v = Vec::new();
+        if let Some(arr) = edit["documentChanges"].as_array() {
+            for doc in arr {
+                if let Some(edits) = doc["edits"].as_array() {
+                    for e in edits {
+                        if let Some(t) = e["newText"].as_str() {
+                            v.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        } else if let Some(map) = edit["changes"].as_object() {
+            for (_, edits) in map {
+                if let Some(arr) = edits.as_array() {
+                    for e in arr {
+                        if let Some(t) = e["newText"].as_str() {
+                            v.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        v
+    };
     assert!(
-        edit_str.contains("new_item"),
-        "new_item in edit, got {}",
-        edit_str
+        new_texts.contains(&"new_item".to_string()),
+        "new_item in edit, got {:?}",
+        new_texts
     );
     assert!(
-        edit_str.contains("new_item_desc"),
-        "sibling _desc renamed, got {}",
-        edit_str
+        new_texts.contains(&"new_item_desc".to_string()),
+        "sibling _desc renamed, got {:?}",
+        new_texts
     );
     assert!(
-        edit_str.contains("new_item_tooltip"),
-        "sibling _tooltip renamed, got {}",
-        edit_str
+        new_texts.contains(&"new_item_tooltip".to_string()),
+        "sibling _tooltip renamed, got {:?}",
+        new_texts
+    );
+    assert!(
+        !new_texts.iter().any(|s| s.contains("extra")),
+        "unexpected extra sibling, got {:?}",
+        new_texts
     );
 }
 
@@ -14250,17 +14279,46 @@ fn test_loc_rename_only_existing_siblings() {
     let resp_str = read_response(&mut reader).unwrap();
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     child.kill().ok();
-    let edit_str = resp["result"].to_string();
-    assert!(edit_str.contains("new_item"), "new_item, got {}", edit_str);
+    let edit = &resp["result"];
+    let new_texts = {
+        let mut v = Vec::new();
+        if let Some(arr) = edit["documentChanges"].as_array() {
+            for doc in arr {
+                if let Some(edits) = doc["edits"].as_array() {
+                    for e in edits {
+                        if let Some(t) = e["newText"].as_str() {
+                            v.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        } else if let Some(map) = edit["changes"].as_object() {
+            for (_, edits) in map {
+                if let Some(arr) = edits.as_array() {
+                    for e in arr {
+                        if let Some(t) = e["newText"].as_str() {
+                            v.push(t.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        v
+    };
     assert!(
-        edit_str.contains("new_item_desc"),
-        "sibling _desc must be renamed, got {}",
-        edit_str
+        new_texts.contains(&"new_item".to_string()),
+        "new_item, got {:?}",
+        new_texts
     );
     assert!(
-        !edit_str.contains("new_item_tooltip"),
-        "non-existent _tooltip must NOT be in edit, got {}",
-        edit_str
+        new_texts.contains(&"new_item_desc".to_string()),
+        "sibling _desc must be renamed, got {:?}",
+        new_texts
+    );
+    assert!(
+        !new_texts.contains(&"new_item_tooltip".to_string()),
+        "non-existent _tooltip must NOT be in edit, got {:?}",
+        new_texts
     );
 }
 
@@ -14320,20 +14378,48 @@ fn test_loc_rename_across_languages() {
     child.kill().ok();
     let edit = &resp["result"];
     assert!(!edit.is_null(), "rename must succeed, got {}", resp_str);
-    let edit_str = edit.to_string();
-    // Both language files should be edited
+    let mut uris = Vec::new();
+    let mut new_texts = Vec::new();
+    if let Some(arr) = edit["documentChanges"].as_array() {
+        for doc in arr {
+            if let Some(uri) = doc["textDocument"]["uri"].as_str() {
+                uris.push(uri.to_string());
+            }
+            if let Some(edits) = doc["edits"].as_array() {
+                for e in edits {
+                    if let Some(t) = e["newText"].as_str() {
+                        new_texts.push(t.to_string());
+                    }
+                }
+            }
+        }
+    } else if let Some(map) = edit["changes"].as_object() {
+        for (uri, edits) in map {
+            uris.push(uri.clone());
+            if let Some(arr) = edits.as_array() {
+                for e in arr {
+                    if let Some(t) = e["newText"].as_str() {
+                        new_texts.push(t.to_string());
+                    }
+                }
+            }
+        }
+    }
     assert!(
-        edit_str.contains("l_english") || edit_str.matches("new_key").count() >= 2,
-        "both language files should be edited, got {}",
-        edit_str
+        uris.iter().any(|u| u.contains("test_l_english.yml")),
+        "english file must be edited, got {:?}",
+        uris
     );
-    // At least two edits (one per file) – count occurrences of new_key
-    let count = edit_str.matches("new_key").count();
     assert!(
-        count >= 2,
-        "expected at least 2 edits for 2 language files, got {} in {}",
-        count,
-        edit_str
+        uris.iter().any(|u| u.contains("test_l_french.yml")),
+        "french file must be edited, got {:?}",
+        uris
+    );
+    assert!(
+        new_texts.iter().filter(|t| *t == "new_key").count() >= 2,
+        "expected at least 2 new_key edits, got {:?} in {:?}",
+        new_texts,
+        uris
     );
 }
 

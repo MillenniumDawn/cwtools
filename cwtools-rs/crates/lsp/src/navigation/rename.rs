@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
-use crate::Backend;
 use crate::paths::{logical_path_from_uri, lsp_pos_to_source_in_text};
+use crate::{Backend, FileTextSnapshot};
 
 use super::{
     at_var_at_cursor, code_token_cols_in_line, prepare_rename_range, rename_refused,
@@ -113,17 +113,12 @@ impl Backend {
         uri: &str,
         key_lower: &str,
         new_name: &str,
-    ) -> Option<WorkspaceEdit> {
+    ) -> Result<Option<WorkspaceEdit>> {
         // Sibling family: base + _desc/_tooltip variants. Only touch keys that
         // exist (is_known), plus the triggered key itself.
         let root = loc_root(key_lower);
         let trigger_suffix = key_lower.strip_prefix(&root).unwrap_or("");
         let new_lower = new_name.to_lowercase();
-        let new_root_lower = if !trigger_suffix.is_empty() && new_lower.ends_with(trigger_suffix) {
-            new_lower[..new_lower.len() - trigger_suffix.len()].to_string()
-        } else {
-            new_lower.clone()
-        };
         let new_root_original = if !trigger_suffix.is_empty() && new_lower.ends_with(trigger_suffix)
         {
             let suffix_len = trigger_suffix.len();
@@ -141,6 +136,7 @@ impl Backend {
             format!("{root}_desc"),
             format!("{root}_tooltip"),
             format!("{root}_desc_tooltip"),
+            format!("{root}_tooltip_desc"),
         ];
         let mut target_to_new: HashMap<String, String> = HashMap::new();
         for cand in candidates {
@@ -155,23 +151,26 @@ impl Backend {
         // Ensure the triggered key maps even when it wasn't in the static list
         // (e.g. _tooltip_desc or arbitrary suffix).
         if !target_to_new.contains_key(key_lower) {
-            // suffix already computed, new_name already includes it if needed
             target_to_new.insert(key_lower.to_string(), new_name.to_string());
         }
-        // Filter to only those that actually have definitions/usages: keep
-        // those where `is_known` or is the trigger.
-        let keys: HashSet<String> = target_to_new.keys().cloned().collect();
-        let fallback = uri.parse::<Url>().ok()?;
+        if uri.parse::<Url>().is_err() {
+            return Ok(None);
+        }
+        // Fetch loc files once and reuse.
+        let loc_uris = self.loc_file_uris().await;
+        let loc_texts = if loc_uris.is_empty() {
+            HashMap::new()
+        } else {
+            self.file_text_snapshots_for(&loc_uris).await
+        };
         // Use block_in_place for the heavy file scans: both loc and script
         // collections may read many files.
         let loc_edits = self
-            .collect_loc_rename_definitions(&keys, &target_to_new, &fallback)
+            .collect_loc_rename_definitions(&target_to_new, &loc_uris, &loc_texts)
             .await;
-        let script_edits = self
-            .collect_loc_rename_usages(&keys, &target_to_new, &fallback)
-            .await;
+        let script_edits = self.collect_loc_rename_usages(&target_to_new).await;
         let yml_ref_edits = self
-            .collect_loc_yml_refs(&keys, &target_to_new, &fallback)
+            .collect_loc_yml_refs(&target_to_new, &loc_uris, &loc_texts)
             .await;
         let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
         for (file_uri, edits) in loc_edits
@@ -182,7 +181,7 @@ impl Backend {
             by_uri.entry(file_uri).or_default().extend(edits);
         }
         if by_uri.is_empty() {
-            return None;
+            return Ok(None);
         }
         // Dedup within each file (a key that appears multiple times on same line)
         let mut deduped: HashMap<String, Vec<TextEdit>> = HashMap::new();
@@ -192,63 +191,30 @@ impl Backend {
             deduped.insert(file_uri, edits);
         }
         let by_uri: Vec<(String, Vec<TextEdit>)> = deduped.into_iter().collect();
-        // Respect edit boundary like TypeRef rename
-        if self.first_refused_edit_target(&by_uri, uri).is_some() {
-            return None;
+        // Reject edits outside workspace.
+        if let Some(err) = self.first_refused_edit_target(&by_uri, uri) {
+            return Err(err);
         }
-        // Need to delegate refusal as error? The caller expects Option; we
-        // handle refusal by returning None and letting the outer caller treat as
-        // no edit, but we should propagate the error similarly to TypeRef.
-        // Check the boundary explicitly and return None to avoid partial rename;
-        // the error path is handled inside `rename_loc` above, but the public
-        // `rename_impl` will surface it as an error if we return None?
-        // Instead, we return the edit here; the outer `rename_impl` will have
-        // already checked `first_refused_edit_target` via the TypeRef path,
-        // but loc path needs to surface the error as a request failure to match
-        // the TypeRef behaviour. Use the helper to produce an error and store
-        // it? Simpler: if refused, just return None and let the type path
-        // handle; the rename will be cancelled silently, which is less helpful
-        // than the TypeRef error. Check again and if refused, we will return
-        // None and the caller will fall through to TypeRef (which returns None)
-        // resulting in no edit. To surface the boundary, we mirror TypeRef's
-        // error: the caller of `rename_loc` would need to map to Err. For now
-        // we just drop the refused case and let the outer handler return an
-        // explicit error if needed. Since `rename_loc` is called inside
-        // `rename_impl` which returns Result, we could change it to return
-        // Result. For simplicity, return None here and let the outer check
-        // handle it: the outer `rename_impl` checks refusal after building
-        // by_uri, so we must ensure the loc path does not bypass it.
-        // We already checked; if refused we return None, and the outer
-        // `rename_impl` will try TypeRef and likely return Ok(None), which
-        // hides the boundary error. To preserve the error, we check here and
-        // if refused, we could store it, but we choose to just not produce an
-        // edit that would cross the boundary — the rename is cancelled.
-        // The simplest correct behaviour is to not apply a partial rename, so
-        // returning None (no edit) is safe, just not as diagnostic as the
-        // TypeRef path.
-        let _ = new_root_lower;
-        Some(self.build_workspace_edit(by_uri))
+        Ok(Some(self.build_workspace_edit(by_uri)))
     }
 
     async fn collect_loc_rename_definitions(
         &self,
-        _keys: &HashSet<String>,
         target_to_new: &HashMap<String, String>,
-        fallback: &Url,
+        loc_uris: &[String],
+        texts: &HashMap<String, FileTextSnapshot>,
     ) -> Vec<(String, Vec<TextEdit>)> {
-        let loc_uris = self.loc_file_uris().await;
         if loc_uris.is_empty() {
             return Vec::new();
         }
-        let texts = self.file_text_snapshots_for(&loc_uris).await;
         let encoding = self.state.config.read().position_encoding.clone();
         let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
         for uri in loc_uris {
-            let Some(snapshot) = texts.get(&uri) else {
+            let Some(snapshot) = texts.get(uri) else {
                 continue;
             };
             let text = &snapshot.text;
-            let path = crate::paths::uri_to_path_str(&uri);
+            let path = crate::paths::uri_to_path_str(uri);
             let files =
                 cwtools_localization::parse_loc_files(&path, text, None).unwrap_or_default();
             for file in files {
@@ -268,7 +234,6 @@ impl Backend {
                         range,
                         new_text: new_text.clone(),
                     });
-                    let _ = fallback;
                 }
             }
         }
@@ -277,9 +242,7 @@ impl Backend {
 
     async fn collect_loc_rename_usages(
         &self,
-        keys: &HashSet<String>,
         target_to_new: &HashMap<String, String>,
-        fallback: &Url,
     ) -> Vec<(String, Vec<TextEdit>)> {
         let mut script_uris: HashSet<String> = HashSet::new();
         {
@@ -319,27 +282,23 @@ impl Backend {
                     }
                 }
             }
-            let _ = fallback;
-            let _ = keys;
         }
         by_uri.into_iter().collect()
     }
 
     async fn collect_loc_yml_refs(
         &self,
-        keys: &HashSet<String>,
         target_to_new: &HashMap<String, String>,
-        _fallback: &Url,
+        loc_uris: &[String],
+        texts: &HashMap<String, FileTextSnapshot>,
     ) -> Vec<(String, Vec<TextEdit>)> {
-        let loc_uris = self.loc_file_uris().await;
         if loc_uris.is_empty() {
             return Vec::new();
         }
-        let texts = self.file_text_snapshots_for(&loc_uris).await;
         let encoding = self.state.config.read().position_encoding.clone();
         let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
         for uri in loc_uris {
-            let Some(snapshot) = texts.get(&uri) else {
+            let Some(snapshot) = texts.get(uri) else {
                 continue;
             };
             let text = &snapshot.text;
@@ -355,7 +314,6 @@ impl Backend {
                     }
                 }
             }
-            let _ = keys;
         }
         by_uri.into_iter().collect()
     }
@@ -457,12 +415,13 @@ impl Backend {
         }
 
         // Loc key rename (with _desc/_tooltip siblings), before TypeRef.
-        if let Some(key_lower) = self.loc_key_at_cursor(&uri, pos, &logical_path).await
-            && let Some(edit) = self.rename_loc(&uri, &key_lower, &new_name).await
-        {
-            return Ok(Some(edit));
+        if let Some(key_lower) = self.loc_key_at_cursor(&uri, pos, &logical_path).await {
+            match self.rename_loc(&uri, &key_lower, &new_name).await {
+                Ok(Some(edit)) => return Ok(Some(edit)),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
         }
-        // If loc rename produced no edits (no known sibling), fall through to TypeRef.
 
         // Identify what's under the cursor
         let type_ref = self.type_ref_at_cursor(&uri, pos, &logical_path);

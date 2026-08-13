@@ -59,11 +59,11 @@ impl Backend {
             if self.is_known_loc_key(&lower) {
                 return Some(lower);
             }
-            // Fallback: the word before the cursor on a loc definition line
-            // may be the key even when the index hasn't seen it yet (open file
-            // not yet overlaid). Treat any word on a loc line containing `:` as
-            // potential key.
-            if line.contains(':') {
+            // Fallback for unsaved keys: only treat word before `:` as key.
+            if let Some(colon) = line.find(':')
+                && let Some(word_col) = line.find(&word)
+                && word_col < colon
+            {
                 return Some(lower);
             }
             return None;
