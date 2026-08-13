@@ -47,12 +47,21 @@ pub enum LocCommandDiagnostic {
     },
 }
 
+/// Whether a chain segment names a variable the project defines.
+///
+/// The variable index sits above this crate, so the caller supplies the probe.
+/// It is handed the segment with its `|format` suffix already stripped; the
+/// caller's own normalization (`@` concatenation, `?`/`^` selectors, case)
+/// applies on top. `Sync` because both the per-file validation pass and the
+/// standalone loc lint fan out over rayon holding a `&LocScopeData`.
+pub type ScriptedVariables<'a> = &'a (dyn Fn(&str) -> bool + Sync);
+
 /// Per-game static data needed for loc-command validation.
 ///
 /// The caller constructs this from their game configuration and passes it to
 /// `validate_loc_commands`.  Using a struct keeps the function signature
 /// stable while the data grows.
-pub struct LocScopeData {
+pub struct LocScopeData<'a> {
     /// Game variant (controls which scope links are loaded).
     pub game: Option<EngineGame>,
     /// Terminal getter commands accepted for this game.
@@ -68,9 +77,13 @@ pub struct LocScopeData {
     /// Config-driven scope/link registry. When set, the loc scope engine uses it
     /// (shared with the validation path) instead of the hardcoded per-game table.
     pub registry: Option<Arc<ScopeRegistry>>,
+    /// Scripted-variable registry, consulted before CW226 fires on an unknown
+    /// final segment. `None` keeps every multi-segment chain lenient, which is
+    /// what a run with no variable index gets.
+    pub scripted_variables: Option<ScriptedVariables<'a>>,
 }
 
-impl Default for LocScopeData {
+impl Default for LocScopeData<'_> {
     fn default() -> Self {
         Self {
             game: None,
@@ -78,13 +91,18 @@ impl Default for LocScopeData {
             question_mark_variable: true,
             parameter_variables: true,
             registry: None,
+            scripted_variables: None,
         }
     }
 }
 
 /// Build the loc scope context: from the config registry when provided (shared
 /// with the validation path), else from the game's hardcoded table.
-fn build_loc_ctx(data: &LocScopeData, engine_game: EngineGame, initial: ScopeId) -> ScopeContext {
+fn build_loc_ctx(
+    data: &LocScopeData<'_>,
+    engine_game: EngineGame,
+    initial: ScopeId,
+) -> ScopeContext {
     match &data.registry {
         Some(reg) => ScopeContext::from_registry(reg.clone(), initial),
         None => ScopeContext::new(engine_game, initial),
@@ -104,7 +122,7 @@ fn build_loc_ctx(data: &LocScopeData, engine_game: EngineGame, initial: ScopeId)
 pub fn validate_loc_commands(
     entry: &LocEntry,
     initial_scope: ScopeId,
-    data: &LocScopeData,
+    data: &LocScopeData<'_>,
 ) -> Vec<LocCommandDiagnostic> {
     // Nothing to validate: skip building the terminal set / engine mapping and
     // return the empty (non-allocating) Vec for the common no-command entry.
@@ -195,7 +213,7 @@ fn game_to_engine(game: Option<EngineGame>) -> EngineGame {
 ///
 /// Mirrors F# handling of `event_target:`, `parameter:`, `?`. The caller
 /// lowercases once and shares the result with `is_terminal_command`.
-fn is_bypass_prefix(lower: &str, data: &LocScopeData) -> bool {
+fn is_bypass_prefix(lower: &str, data: &LocScopeData<'_>) -> bool {
     lower.starts_with("event_target:")
         || lower.starts_with("scope:")
         || (data.parameter_variables && lower.starts_with("parameter:"))
@@ -220,7 +238,7 @@ enum SegmentPre {
 fn classify_segment(
     seg_lower: &str,
     is_last: bool,
-    data: &LocScopeData,
+    data: &LocScopeData<'_>,
     terminal_set: &HashSet<String>,
 ) -> SegmentPre {
     if is_bypass_prefix(seg_lower, data) {
@@ -283,7 +301,7 @@ fn validate_command_string(
     cmd: &str,
     initial_scope: ScopeId,
     engine_game: EngineGame,
-    data: &LocScopeData,
+    data: &LocScopeData<'_>,
     terminal_set: &HashSet<String>,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
@@ -364,7 +382,7 @@ fn validate_jomini_chain(
     chain: &[JominiCommand],
     initial_scope: ScopeId,
     engine_game: EngineGame,
-    data: &LocScopeData,
+    data: &LocScopeData<'_>,
     terminal_set: &HashSet<String>,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
@@ -373,15 +391,19 @@ fn validate_jomini_chain(
     }
     let last_idx = chain.len() - 1;
     let mut ctx = build_loc_ctx(data, engine_game, initial_scope);
-    // Suppress CW226 when the chain has more than one segment. For chains like
-    // [THIS.scripted_var] or [ROOT.var_name], the scope engine resolves the
-    // intermediate (THIS/ROOT → NewScope) but the final segment is a scripted
-    // variable or localisation reference that the Rust engine doesn't index.
-    // F#'s HOI4 validator had the full scripted-variable registry; without it
-    // we can only be confident about single-segment Jomini calls like [Func()].
-    // Unknown intermediates (e.g. country-tag scopes like PAL) also poison the
-    // chain, which is tracked below.
-    let mut had_lenient_intermediate = chain.len() > 1;
+    // A `?` marks the bracket as a variable read (`[?ROOT.war_support|1]`), so the
+    // final segment is a variable name the scripted-variable registry answers for.
+    // A chain without one ends in a command or a scripted-localisation name, and
+    // there is no registry for those — it stays exempt, as every multi-segment
+    // chain used to be. So does a chain reading through a variable
+    // (`[?GER_crisis_id.GERGetCrisisType]`), where the tail is a command again.
+    // Unknown intermediates (country-tag scopes like PAL) poison either kind,
+    // which is tracked below.
+    let marker = chain[0].key.strip_prefix('?');
+    let variable_read = data.question_mark_variable
+        && marker.is_some_and(|m| !reads_a_variable(m, data))
+        && data.scripted_variables.is_some();
+    let mut had_lenient_intermediate = !variable_read && chain.len() > 1;
 
     for (i, cmd) in chain.iter().enumerate() {
         let seg = &cmd.key;
@@ -393,7 +415,9 @@ fn validate_jomini_chain(
         let looks_terminal = match classify_segment(&seg_lower, is_last, data, terminal_set) {
             SegmentPre::Bypass => {
                 ctx.push_scope(SCOPE_ANY);
-                if !is_last {
+                // The `?` marker is not an unresolved segment, only the scope it
+                // is attached to; `event_target:` and friends really are opaque.
+                if !is_last && !seg_lower.starts_with('?') {
                     had_lenient_intermediate = true;
                 }
                 continue;
@@ -428,9 +452,11 @@ fn validate_jomini_chain(
                     && data.registry.is_some()
                     && !looks_terminal
                     && !had_lenient_intermediate
+                    && !reads_a_variable(seg, data)
                 {
                     // Registry present, chain resolved cleanly up to this point,
-                    // final command is unknown: CW226 (mirrors F# `LocNotFound`).
+                    // final command is neither a command nor a defined variable:
+                    // CW226 (mirrors F# `LocNotFound`).
                     diags.push(LocCommandDiagnostic::NotFound {
                         command: seg.to_string(),
                     });
@@ -441,6 +467,25 @@ fn validate_jomini_chain(
             }
         }
     }
+}
+
+/// Whether `segment` reads a variable the scripted-variable registry can vouch
+/// for, so a chain ending on it is legitimate rather than a typo.
+///
+/// The segment carries the `|format` suffix loc syntax allows (`my_var|R0`),
+/// which the registry never holds; strip it before asking. Three forms are taken
+/// on trust because their written text is not a name to look up: a bare number
+/// the read formats (`[?0.3|-=%1]`), a `holder:name` read through a scope the
+/// engine resolves at runtime, and a `$ARG$`-concatenated name.
+fn reads_a_variable(segment: &str, data: &LocScopeData<'_>) -> bool {
+    let Some(lookup) = data.scripted_variables else {
+        return false;
+    };
+    let name = segment.split('|').next().unwrap_or(segment).trim();
+    if name.is_empty() || name.contains(':') || name.contains('$') {
+        return true;
+    }
+    name.parse::<f64>().is_ok() || lookup(name)
 }
 
 /// Check if a command segment is (or looks like) a terminal getter.
@@ -493,7 +538,7 @@ mod tests {
         }
     }
 
-    fn hoi4_data() -> LocScopeData {
+    fn hoi4_data() -> LocScopeData<'static> {
         // HOI4 is config-driven: supply a minimal registry (country/state +
         // owner/controller links) so the scope chains resolve in tests.
         use cwtools_game::scope_engine::{ScopeId, ScopeLink};
@@ -530,6 +575,15 @@ mod tests {
             question_mark_variable: true,
             parameter_variables: true,
             registry: Some(Arc::new(reg)),
+            scripted_variables: None,
+        }
+    }
+
+    /// `hoi4_data` plus a registry that knows one variable, `war_support`.
+    fn hoi4_data_with_variables() -> LocScopeData<'static> {
+        LocScopeData {
+            scripted_variables: Some(&|name: &str| name.eq_ignore_ascii_case("war_support")),
+            ..hoi4_data()
         }
     }
 
@@ -742,12 +796,105 @@ mod tests {
             question_mark_variable: true,
             parameter_variables: true,
             registry: None, // no registry
+            scripted_variables: None,
         };
         let diags = validate_loc_commands(&entry, ScopeId(0), &data);
         assert!(
             diags.is_empty(),
             "without registry, unknown command should be accepted: {:?}",
             diags
+        );
+    }
+
+    // ── CW226 on multi-segment chains, gated by the variable registry ─────────
+
+    fn chain(segments: &[&str]) -> LocEntry {
+        make_entry_with_jomini(vec![
+            segments
+                .iter()
+                .map(|s| JominiCommand {
+                    key: (*s).into(),
+                    params: Vec::new(),
+                })
+                .collect(),
+        ])
+    }
+
+    #[test]
+    fn chain_reading_a_defined_variable_is_accepted() {
+        // [?Root.war_support|1]: the registry knows the name, and the `|1` format
+        // suffix is not part of it.
+        let entry = chain(&["?Root", "war_support|1"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "a read of a defined variable should be accepted: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn chain_reading_an_undefined_variable_emits_not_found() {
+        // Same shape, misspelt: nothing in the registry answers for it.
+        let entry = chain(&["?Root", "war_suport"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert_eq!(
+            diags,
+            vec![LocCommandDiagnostic::NotFound {
+                command: "war_suport".into(),
+            }],
+        );
+    }
+
+    #[test]
+    fn chain_reading_through_a_variable_stays_lenient() {
+        // [?war_support.SomeScriptedLoc]: the marked segment is itself a variable,
+        // so the tail is a command again and no registry can answer for it.
+        let entry = chain(&["?war_support", "SomeScriptedLoc"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "a read through a variable should stay lenient: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn command_chain_stays_lenient() {
+        // No `?`: the final segment is a command or a scripted-localisation name,
+        // and there is no registry for those.
+        let entry = chain(&["Root", "war_suport"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "a command chain should stay lenient: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn chain_with_unknown_intermediate_stays_lenient() {
+        // `PAL` is a country tag, not a scope link: the chain never resolved, so
+        // its final segment is not judged.
+        let entry = chain(&["?Root", "PAL", "war_suport"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "an unresolved intermediate should keep the chain lenient: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn multi_segment_chain_without_variable_registry_stays_lenient() {
+        // The pre-registry behaviour, still what a run with no variable index gets.
+        let entry = chain(&["?Root", "war_suport"]);
+        let data = hoi4_data();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "without a variable registry every multi-segment chain is exempt: {diags:?}"
         );
     }
 

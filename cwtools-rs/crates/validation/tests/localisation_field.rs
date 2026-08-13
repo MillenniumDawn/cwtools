@@ -323,6 +323,100 @@ fn overlay_key_resolves_missing_loc() {
     );
 }
 
+/// A ruleset with scopes, so the loc-command checks run, plus a `mytype` whose
+/// `name` is a loc reference.
+const SCOPED_CWT: &str = r#"
+scopes = {
+    Country = { aliases = { country } }
+}
+types = {
+    type[mytype] = {
+        path = "game/common/mytype"
+    }
+}
+mytype = {
+    name = localisation
+}
+"#;
+
+/// Validate a `mytype` referencing `key`, with `variables` as the project's
+/// defined script variables. Returns the emitted codes.
+fn scoped_loc_codes(loc: &str, key: &str, variables: &[&str]) -> Vec<String> {
+    use cwtools_validation::{Prepared, build_scope_registry_arc, validate_prepared};
+
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(SCOPED_CWT, &table), &table);
+    let idx = loc_index(&[("a_l_english.yml", loc)]);
+    let mut type_index = cwtools_index::TypeIndex::new();
+    for v in variables {
+        type_index.var_index.add_name(v);
+    }
+    let script = format!("mytype = {{\n name = {key}\n}}\n");
+    let parsed = parse_string(&script, &table);
+    let registry = build_scope_registry_arc(&ruleset, Some(cwtools_game::constants::Game::Hoi4));
+    validate_prepared(
+        &parsed,
+        "game/common/mytype/test.txt",
+        &Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: Some(cwtools_game::constants::Game::Hoi4),
+            type_index: Some(&type_index),
+            modifier_keys: None,
+            loc_index: Some(&idx),
+            extra_loc_keys: None,
+            inline_scripts: None,
+            registry: registry.as_ref(),
+            scope_checks: true,
+            var_checks: true,
+        },
+    )
+    .into_iter()
+    .filter_map(|e| e.code.map(String::from))
+    .collect()
+}
+
+#[test]
+fn chain_reading_a_defined_variable_is_clean() {
+    let codes = scoped_loc_codes(
+        "l_english:\n my_key: \"[?ROOT.war_support|1]\"\n",
+        "my_key",
+        &["war_support"],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "a chain reading a defined variable must not warn: {codes:?}"
+    );
+}
+
+#[test]
+fn chain_reading_an_undefined_variable_warns_cw226() {
+    let codes = scoped_loc_codes(
+        "l_english:\n my_key: \"[?ROOT.war_suport|1]\"\n",
+        "my_key",
+        &["war_support"],
+    );
+    assert!(
+        codes.contains(&"CW226".to_string()),
+        "a misspelt variable must warn CW226: {codes:?}"
+    );
+}
+
+#[test]
+fn chain_reading_a_variable_without_an_index_is_lenient() {
+    // No variables collected yet (an unscanned workspace): the registry can
+    // vouch for nothing, so the chain stays exempt rather than warning.
+    let codes = scoped_loc_codes(
+        "l_english:\n my_key: \"[?ROOT.war_suport|1]\"\n",
+        "my_key",
+        &[],
+    );
+    assert!(
+        !codes.contains(&"CW226".to_string()),
+        "without a variable index the chain is exempt: {codes:?}"
+    );
+}
+
 #[test]
 fn no_loc_index_is_lenient() {
     let table = StringTable::new();
