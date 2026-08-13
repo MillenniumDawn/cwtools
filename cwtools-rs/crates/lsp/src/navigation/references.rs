@@ -123,9 +123,7 @@ impl Backend {
                 uris.insert(crate::paths::path_to_uri(&path));
             }
         }
-        // Also include any loc file the index already knows (covers vanilla fallback?)
-        // Vanilla loc is not under workspace, so skipped; workspace loc files discovered above
-        // already cover it. Keep the set as is.
+        // Vanilla not under workspace roots; discovered set is complete.
         uris.into_iter().collect()
     }
 

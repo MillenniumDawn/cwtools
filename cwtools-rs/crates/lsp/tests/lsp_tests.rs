@@ -14477,21 +14477,49 @@ fn test_loc_rename_updates_dollar_refs_in_yml() {
     let resp_str = read_response(&mut reader).unwrap();
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     child.kill().ok();
-    let edit_str = resp["result"].to_string();
-    // Definition in main file
-    assert!(edit_str.contains("new_key"), "new_key, got {}", edit_str);
-    // $REF$ inside ref file: inner key should be renamed, colour suffix preserved
+    let edit = &resp["result"];
+    assert!(!edit.is_null(), "rename must succeed, got {}", resp_str);
+    let mut uris = Vec::new();
+    let mut new_texts = Vec::new();
+    if let Some(arr) = edit["documentChanges"].as_array() {
+        for doc in arr {
+            if let Some(uri) = doc["textDocument"]["uri"].as_str() {
+                uris.push(uri.to_string());
+            }
+            if let Some(edits) = doc["edits"].as_array() {
+                for e in edits {
+                    if let Some(t) = e["newText"].as_str() {
+                        new_texts.push(t.to_string());
+                    }
+                }
+            }
+        }
+    } else if let Some(map) = edit["changes"].as_object() {
+        for (uri, edits) in map {
+            uris.push(uri.clone());
+            if let Some(arr) = edits.as_array() {
+                for e in arr {
+                    if let Some(t) = e["newText"].as_str() {
+                        new_texts.push(t.to_string());
+                    }
+                }
+            }
+        }
+    }
     assert!(
-        edit_str.contains("ref_l_english"),
-        "ref file should be edited, got {}",
-        edit_str
+        uris.iter().any(|u| u.contains("main_l_english.yml")),
+        "main file must be edited, got {:?}",
+        uris
     );
-    // The edit should contain new_key but not my_key inside the ref file's range (the new_text is new_key)
-    let count = edit_str.matches("new_key").count();
     assert!(
-        count >= 3,
-        "expected at least 3 edits (def + 2 refs), got {} in {}",
-        count,
-        edit_str
+        uris.iter().any(|u| u.contains("ref_l_english.yml")),
+        "ref file must be edited, got {:?}",
+        uris
+    );
+    assert!(
+        new_texts.iter().filter(|t| *t == "new_key").count() >= 3,
+        "expected at least 3 new_key edits (def + 2 refs), got {:?} in {:?}",
+        new_texts,
+        uris
     );
 }

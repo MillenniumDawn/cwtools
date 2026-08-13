@@ -163,8 +163,7 @@ impl Backend {
         } else {
             self.file_text_snapshots_for(&loc_uris).await
         };
-        // Use block_in_place for the heavy file scans: both loc and script
-        // collections may read many files.
+        // Reuse loc files for definitions and yml refs.
         let loc_edits = self
             .collect_loc_rename_definitions(&target_to_new, &loc_uris, &loc_texts)
             .await;
