@@ -24,6 +24,11 @@ fn cwtools() -> Command {
     cmd.env("HOME", home);
     cmd.env("XDG_CACHE_HOME", home.join("cache"));
     cmd.env("LOCALAPPDATA", home.join("localappdata"));
+    // Same reason as HOME: a suite run from a git hook inherits the hook's
+    // GIT_DIR, and `--since` would resolve against that repo, not the fixture.
+    for key in INHERITED_GIT_ENV {
+        cmd.env_remove(key);
+    }
     cmd
 }
 
@@ -509,6 +514,28 @@ fn validate_dir(dir: &std::path::Path, extra: &[&str]) -> assert_cmd::assert::As
     cmd.assert()
 }
 
+/// [`validate_dir`] with `GIT_DIR` set, standing in for a run inside a git hook.
+fn validate_dir_env(
+    dir: &std::path::Path,
+    extra: &[&str],
+    git_dir: &std::path::Path,
+) -> assert_cmd::assert::Assert {
+    let rules_dir = fixtures_dir().join("rules");
+    let mut cmd = cwtools();
+    cmd.env("GIT_DIR", git_dir);
+    cmd.args([
+        "validate",
+        "--game",
+        "stellaris",
+        "--directory",
+        dir.to_str().unwrap(),
+        "--rules",
+        rules_dir.to_str().unwrap(),
+    ]);
+    cmd.args(extra);
+    cmd.assert()
+}
+
 #[test]
 fn test_validate_file_scopes_the_report() {
     let mod_dir = fixtures_dir().join("discover").join("mod_a");
@@ -576,13 +603,31 @@ fn test_validate_output_hashes_with_a_scope_warns() {
     .stderr(predicate::str::contains("--output-hashes"));
 }
 
+/// Variables git exports to a hook. The pre-push hook runs `cargo test
+/// --workspace`, so these tests inherit them, and an inherited `GIT_DIR`
+/// outranks `-C`: without this the fixture's `init`/`config`/`add`/`commit`
+/// run against the developer's own checkout, writing a test identity into its
+/// config and committing the fixture over its branch. Also cleared for the
+/// binary under test, so `--since` is exercised against the fixture rather
+/// than whatever repo invoked the suite.
+const INHERITED_GIT_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_WORK_TREE",
+];
+
 fn git(dir: &std::path::Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+    for key in INHERITED_GIT_ENV {
+        command.env_remove(key);
+    }
+    let out = command.output().unwrap();
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -641,6 +686,58 @@ fn test_validate_since_covers_untracked_files() {
     )
     .unwrap();
     validate_dir(repo.path(), &["--since", "HEAD"])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
+/// Git answers `rev-parse` in its own, resolved spelling of the repo root,
+/// while discovery walks the path the run was handed. Where the two differ the
+/// scope used to match nothing and the run reported on no files at all
+/// ("Discovered 3 files / Reporting on 0 of them"): on Windows a temp dir is an
+/// 8.3 short path (`RUNNER~1`) that git reports long, and on macOS `/var` is a
+/// symlink git reports as `/private/var`.
+///
+/// A `..` component reproduces the same class on every platform: `absolute()`
+/// keeps it, git resolves it away.
+#[test]
+fn test_validate_since_matches_an_unresolved_directory_spelling() {
+    let repo = git_repo_mod();
+    let event = repo.path().join("events").join("test.txt");
+    // `<repo>/events/..` names `<repo>` without being spelled like it.
+    let indirect = repo.path().join("events").join("..");
+
+    let mut text = std::fs::read_to_string(&event).unwrap();
+    text.push_str("# touched\n");
+    std::fs::write(&event, text).unwrap();
+
+    validate_dir(&indirect, &["--since", "HEAD"])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
+/// `--since` exists for pre-commit and pre-push hooks, and git hands every hook
+/// a `GIT_DIR` naming the repo the hook fired in. That variable outranks `-C`,
+/// so the scope has to be resolved with it cleared or a hook run reports on the
+/// wrong repository's diff without failing.
+#[test]
+fn test_validate_since_ignores_an_inherited_git_dir() {
+    let repo = git_repo_mod();
+    let elsewhere = git_repo_mod();
+    let event = repo.path().join("events").join("test.txt");
+    let hook_env = elsewhere.path().join(".git");
+
+    // Clean tree: the event's CW107 is out of scope, and stays out however the
+    // ambient GIT_DIR is set.
+    validate_dir_env(repo.path(), &["--since", "HEAD"], &hook_env)
+        .success()
+        .stdout(predicate::str::contains("CW107").not());
+
+    // Touching the file brings it back, which it cannot do if the diff was
+    // taken against `elsewhere` (where nothing changed).
+    let mut text = std::fs::read_to_string(&event).unwrap();
+    text.push_str("# touched\n");
+    std::fs::write(&event, text).unwrap();
+    validate_dir_env(repo.path(), &["--since", "HEAD"], &hook_env)
         .success()
         .stdout(predicate::str::contains("CW107"));
 }
@@ -708,6 +805,56 @@ fn test_validate_vanilla_writes_and_reuses_the_cache() {
         1,
         "--refresh-vanilla-cache overwrites in place"
     );
+}
+
+// ── Vanilla-gated check families ─────────────────────────────────────────────
+//
+// Without a base-game index CW113/CW222/CW500 (and, on Stellaris, CW227/CW229/
+// CW250) report nothing, which reads as a clean file. The run has to say so.
+
+#[test]
+fn test_validate_notices_the_checks_a_missing_base_game_disables() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--no-vanilla-cache",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no base-game data loaded"))
+        .stderr(predicate::str::contains(
+            "CW113, CW222, CW227, CW229, CW250, CW500",
+        ));
+}
+
+#[test]
+fn test_validate_stays_quiet_about_the_gate_with_a_base_game() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--vanilla",
+            discover_dir.to_str().unwrap(),
+            "--no-vanilla-cache",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no base-game data loaded").not());
 }
 
 #[test]
@@ -1684,12 +1831,19 @@ fn test_validate_github_report() {
         .output()
         .unwrap();
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let mut lines = stdout.lines();
+    // No --vanilla, so the run leads with the notice naming the families it
+    // could not check. It carries no file, so it is a bare `::notice::`.
+    let notice = lines.next().unwrap_or_default();
+    assert!(notice.starts_with("::notice::"), "{stdout:?}");
+    assert!(notice.contains("CW500"), "{stdout:?}");
     // CW107 is Information-severity, which GitHub renders as a notice.
-    assert!(stdout.starts_with("::notice file="), "{stdout:?}");
-    assert!(stdout.contains(",line=3,col="), "{stdout:?}");
-    assert!(stdout.contains(",title=CW107::"), "{stdout:?}");
+    let row = lines.next().unwrap_or_default();
+    assert!(row.starts_with("::notice file="), "{stdout:?}");
+    assert!(row.contains(",line=3,col="), "{stdout:?}");
+    assert!(row.contains(",title=CW107::"), "{stdout:?}");
     // One workflow command per diagnostic, on one physical line each.
-    assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+    assert_eq!(stdout.lines().count(), 2, "{stdout:?}");
 }
 
 /// GitHub resolves annotation paths against the checkout root, which a step's

@@ -93,6 +93,12 @@ which doesn't fit `Session`'s load-once ownership. Instead the LSP holds its own
 workspace state and builds a `Prepared` from the same shared primitives per
 validation. Same sequence, different ownership.
 
+One capability is CLI-only today: `Session` loads the mod's
+`common/inline_scripts` bodies so an `inline_script` call site can be validated
+against what it pulls in (CW274 and the body's own diagnostics). The LSP keeps no
+such registry yet and passes `inline_scripts: None`, which accepts a call site
+without expanding it.
+
 ### Background reindex
 
 A long-running session drifts: files deleted while the server had no watcher event,

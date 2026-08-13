@@ -48,8 +48,8 @@ use cwtools_rules::ruleset_loader::{RuleParseError, load_ruleset_from_dir};
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::references::{UsedInstances, check_unused_instances, needs_use_tracking};
 use cwtools_validation::{
-    ErrorSeverity, Prepared, ValidationError, build_modifier_keys, build_scope_registry_arc,
-    checks_from_env, validate_prepared, validate_prepared_tracking_uses,
+    ErrorSeverity, InlineScripts, Prepared, ValidationError, build_modifier_keys,
+    build_scope_registry_arc, checks_from_env, validate_prepared, validate_prepared_tracking_uses,
 };
 
 /// A discovered workspace/mod file, retained between indexing and validation.
@@ -186,6 +186,38 @@ impl RulesInput {
     }
 }
 
+/// The checks a run cannot make without a base-game index, so a caller can say
+/// so instead of letting them read as clean.
+///
+/// Every one of these compares script against the union of mod and base-game
+/// definitions. Without `--vanilla` or `--vanilla-cache` that union is only the
+/// mod, so the engine cannot tell a genuinely missing definition from one the
+/// base game supplies and stays silent rather than flagging every vanilla
+/// reference. Returns an empty slice when `has_vanilla`, so a caller can render
+/// the notice unconditionally.
+///
+/// # Examples
+///
+/// ```
+/// use cwtools_driver::vanilla_gated_checks;
+/// use cwtools_game::constants::Game;
+///
+/// assert!(vanilla_gated_checks(Game::Hoi4, true).is_empty());
+/// assert!(vanilla_gated_checks(Game::Hoi4, false).contains(&"CW500"));
+/// ```
+pub fn vanilla_gated_checks(game: Game, has_vanilla: bool) -> &'static [&'static str] {
+    if has_vanilla {
+        return &[];
+    }
+    match game {
+        // CW227/CW229 (ship-design templates) and CW250 (planet-killer support
+        // script) sit behind the same index-completeness gate, but only the
+        // Stellaris validator emits them.
+        Game::Stellaris => &["CW113", "CW222", "CW227", "CW229", "CW250", "CW500"],
+        _ => &["CW113", "CW222", "CW500"],
+    }
+}
+
 /// Auto-managed on-disk cache of the base-game index, so a batch run doesn't
 /// re-parse the whole install every time. Only consulted when `vanilla` is a
 /// directory and no explicit `vanilla_cache` was supplied: a cache whose
@@ -245,6 +277,7 @@ pub struct Session {
     ruleset: RuleSet,
     type_index: TypeIndex,
     modifier_keys: HashSet<String>,
+    inline_scripts: InlineScripts,
     loc_service: LocService,
     loc_index: LocIndex,
     loc_languages: Option<Vec<Lang>>,
@@ -428,7 +461,7 @@ impl Session {
             }
             type_index.value_set_values.merge_file(file_uri, value_sets);
         }
-        let source_files = parsed
+        let source_files: Vec<SourceFile> = parsed
             .into_iter()
             .map(|src| SourceFile {
                 path: src.path,
@@ -436,6 +469,11 @@ impl Session {
                 fingerprint: src.fingerprint,
             })
             .collect();
+
+        // Bodies an `inline_script` call site splices in. Kept resident because a
+        // call site can only be checked against what it pulls in, and the same
+        // script is reached from every file that references it.
+        let inline_scripts = load_inline_scripts(&source_files, &rules_table);
 
         // Auto-managed cache: reuse a fresh one instead of walking the install,
         // and remember where to write one when there's nothing to reuse.
@@ -520,7 +558,9 @@ impl Session {
 
         // Mark the index as complete when vanilla data was loaded (either from a
         // directory or a pre-generated cache).  This lets CW500 type-reference
-        // checks fire without false positives on mod-only validation.
+        // checks fire without false positives on mod-only validation. Set
+        // together with the file index above, so `complete` answers for every
+        // family [`vanilla_gated_checks`] names.
         if has_vanilla_data {
             type_index.complete = true;
         }
@@ -561,6 +601,7 @@ impl Session {
             ruleset,
             type_index,
             modifier_keys,
+            inline_scripts,
             loc_service,
             loc_index,
             loc_languages,
@@ -592,6 +633,7 @@ impl Session {
             loc_index: Some(&self.loc_index),
             // The CLI/driver loads loc from disk; no live-edit overlay.
             extra_loc_keys: None,
+            inline_scripts: Some(&self.inline_scripts),
             registry: self.registry.as_ref(),
             scope_checks,
             var_checks,
@@ -648,6 +690,11 @@ impl Session {
     /// The expanded modifier-key set.
     pub fn modifier_keys(&self) -> &HashSet<String> {
         &self.modifier_keys
+    }
+
+    /// The `common/inline_scripts` bodies call sites expand against.
+    pub fn inline_scripts(&self) -> &InlineScripts {
+        &self.inline_scripts
     }
 
     /// The loc-key index (workspace + vanilla).
@@ -829,6 +876,33 @@ impl SessionWithFiles {
     pub fn parsed_files(&self) -> &[SourceFile] {
         &self.files
     }
+}
+
+/// Parse the workspace's `common/inline_scripts` files into the expansion
+/// registry. Re-read rather than kept from the indexing pass: the ASTs there are
+/// consumed building the indexes, and a mod holds a handful of these against
+/// thousands of script files.
+fn load_inline_scripts(files: &[SourceFile], table: &StringTable) -> InlineScripts {
+    let mut scripts = InlineScripts::default();
+    for file in files
+        .iter()
+        .filter(|file| InlineScripts::is_script_path(&file.logical_path))
+    {
+        match read_text(&file.path) {
+            Ok(text) => {
+                scripts.insert(
+                    &file.logical_path,
+                    parse_string_without_comments(&text, table),
+                );
+            }
+            Err(error) => eprintln!(
+                "warn: skipping inline script {}: {}",
+                file.path.display(),
+                error
+            ),
+        }
+    }
+    scripts
 }
 
 /// Convert parse errors from a partially-parsed file into `ValidationError`s so
@@ -1332,6 +1406,27 @@ mod tests {
             )),
             "error: {}",
             errors[0]
+        );
+    }
+
+    #[test]
+    fn vanilla_gated_checks_are_silent_once_the_index_is_loaded() {
+        for game in [Game::Hoi4, Game::Stellaris, Game::Ck3] {
+            assert!(vanilla_gated_checks(game, true).is_empty(), "{game}");
+        }
+    }
+
+    #[test]
+    fn vanilla_gated_checks_name_the_families_that_go_quiet() {
+        assert_eq!(
+            vanilla_gated_checks(Game::Hoi4, false),
+            ["CW113", "CW222", "CW500"]
+        );
+        // The ship-design and planet-killer checks share the gate but only
+        // Stellaris emits them.
+        assert_eq!(
+            vanilla_gated_checks(Game::Stellaris, false),
+            ["CW113", "CW222", "CW227", "CW229", "CW250", "CW500"]
         );
     }
 }
