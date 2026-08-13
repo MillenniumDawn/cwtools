@@ -844,6 +844,67 @@ pub(crate) fn source_range_without_text(
     )
 }
 
+/// Every 0-based char column where `needle_lower` appears on `line` as a whole
+/// identifier (bounded by non-identifier chars), ignoring anything behind an
+/// unquoted `#` comment. `needle_lower` must already be lowercased. Case
+/// insensitive: `MY_KEY` matches `my_key`. Used for loc keys which are stored
+/// lowercased.
+pub(crate) fn code_token_cols_in_line_ignore_case(line: &str, needle_lower: &str) -> Vec<u32> {
+    let needle: Vec<char> = needle_lower.chars().collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = line.chars().collect();
+    if needle.len() > chars.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => in_string = !in_string,
+            '#' if !in_string => break,
+            _ => {}
+        }
+        if i + needle.len() <= chars.len() {
+            let slice = &chars[i..i + needle.len()];
+            let matches = slice
+                .iter()
+                .zip(needle.iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b);
+            if matches {
+                let before_ok = i == 0 || !is_ident_char(chars[i - 1]);
+                let after = i + needle.len();
+                let after_ok = after >= chars.len() || !is_ident_char(chars[after]);
+                if before_ok && after_ok {
+                    out.push(i as u32);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Strip any `_desc` / `_tooltip` suffixes (repeatedly) to get the family root.
+/// `"my_thing_desc_tooltip"` -> `"my_thing"`.
+pub(crate) fn loc_root(key_lower: &str) -> String {
+    let mut k = key_lower;
+    loop {
+        if let Some(stripped) = k.strip_suffix("_desc") {
+            k = stripped;
+            continue;
+        }
+        if let Some(stripped) = k.strip_suffix("_tooltip") {
+            k = stripped;
+            continue;
+        }
+        break;
+    }
+    k.to_string()
+}
+
 /// Build a `SymbolInformation` (the `deprecated` field is required by the
 /// struct but deprecated by the protocol).
 pub(crate) fn make_symbol(

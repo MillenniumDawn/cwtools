@@ -13830,3 +13830,176 @@ fn test_steam_folder_mapping_is_per_game_not_a_wildcard() {
         "an install under a different game's Steam folder",
     );
 }
+
+// ── Loc second-class fix: outline, references, rename ────────────────────
+
+#[test]
+fn test_loc_outline_shows_keys_in_yml() {
+    let yml = "l_english:\n my_key:0 \"Hello\"\n my_key_desc:0 \"Desc\"\n my_other:0 \"World\"\n";
+    let files = &[("localisation/test_l_english.yml", yml)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["localisation/test_l_english.yml"],
+        serde_json::json!({"textDocument": {"documentSymbol": {"hierarchicalDocumentSymbolSupport": false}}}),
+        "localisation/test_l_english.yml",
+        "textDocument/documentSymbol",
+        serde_json::json!({}),
+    );
+    let syms = result.as_array().expect("loc outline array");
+    let names: Vec<String> = syms
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        names.contains(&"my_key".to_string()),
+        "my_key in {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"my_key_desc".to_string()),
+        "my_key_desc in {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"my_other".to_string()),
+        "my_other in {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_loc_references_find_script_usages() {
+    let yml = "l_english:\n my_loc_key:0 \"Hello\"\n";
+    let script = "generated = {\n    title = my_loc_key\n    desc = my_loc_key\n}\n";
+    let files = &[
+        ("localisation/test_l_english.yml", yml),
+        ("common/test/event.txt", script),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["localisation/test_l_english.yml", "common/test/event.txt"],
+        serde_json::json!({}),
+        "localisation/test_l_english.yml",
+        "textDocument/references",
+        serde_json::json!({
+            "position": {"line": 1, "character": 2},
+            "context": {"includeDeclaration": false}
+        }),
+    );
+    let locs = result.as_array().expect("references array");
+    assert!(!locs.is_empty(), "expected script usages, got null/empty");
+    let has_script = locs
+        .iter()
+        .any(|l| l["uri"].as_str().unwrap().contains("event.txt"));
+    assert!(has_script, "script usage not found in {:?}", result);
+}
+
+#[test]
+fn test_loc_rename_with_desc_sibling() {
+    let yml =
+        "l_english:\n my_item:0 \"Item\"\n my_item_desc:0 \"Desc\"\n my_item_tooltip:0 \"Tip\"\n";
+    let script = "thing = {\n    name = my_item\n    tooltip = my_item_tooltip\n}\n";
+    let files = &[
+        ("localisation/test_l_english.yml", yml),
+        ("common/test/thing.txt", script),
+    ];
+    // Prepare rename range
+    let prep = feature_request(
+        GOTO_RULES,
+        files,
+        &["localisation/test_l_english.yml"],
+        serde_json::json!({}),
+        "localisation/test_l_english.yml",
+        "textDocument/prepareRename",
+        serde_json::json!({"position": {"line": 1, "character": 2}}),
+    );
+    assert!(
+        !prep.is_null(),
+        "prepareRename for loc key must not be null, got {:?}",
+        prep
+    );
+    // Rename
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    for (rel, content) in files {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+    let ws_uri = path_uri(ws.path());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {"workspace": {"workspaceEdit": {"documentChanges": true}}},
+            "initializationOptions": {"language": "hoi4", "rulesCache": rules_dir.path().to_string_lossy(), "vanilla": vanilla.path().to_string_lossy()}
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    {
+        let rel = "localisation/test_l_english.yml";
+        let content = files.iter().find(|(r, _)| *r == rel).unwrap().1;
+        let uri = path_uri(ws.path().join(rel));
+        write_frame(
+            &mut child,
+            &jsonrpc_notification(
+                "textDocument/didOpen",
+                serde_json::json!({"textDocument": {"uri": uri, "languageId": "hoi4", "version": 1, "text": content}}),
+            ),
+        )
+        .unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+    let uri = path_uri(ws.path().join("localisation/test_l_english.yml"));
+    let req = jsonrpc_request(
+        10,
+        "textDocument/rename",
+        serde_json::json!({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 2}, "newName": "new_item"}),
+    );
+    write_frame(&mut child, &req).unwrap();
+    let resp_str = read_response(&mut reader).unwrap();
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    child.kill().ok();
+    let edit = &resp["result"];
+    assert!(
+        !edit.is_null(),
+        "rename result must not be null, got {}",
+        resp_str
+    );
+    let edit_str = edit.to_string();
+    assert!(
+        edit_str.contains("new_item"),
+        "new_item in edit, got {}",
+        edit_str
+    );
+    assert!(
+        edit_str.contains("new_item_desc"),
+        "sibling _desc renamed, got {}",
+        edit_str
+    );
+    assert!(
+        edit_str.contains("new_item_tooltip"),
+        "sibling _tooltip renamed, got {}",
+        edit_str
+    );
+}
