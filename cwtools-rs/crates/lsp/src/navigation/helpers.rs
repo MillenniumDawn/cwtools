@@ -844,6 +844,114 @@ pub(crate) fn source_range_without_text(
     )
 }
 
+/// Every 0-based char column where `needle_lower` appears on `line` as a whole
+/// identifier (bounded by non-identifier chars), ignoring anything behind an
+/// unquoted `#` comment. `needle_lower` must already be lowercased. Case
+/// insensitive: `MY_KEY` matches `my_key`. Used for loc keys which are stored
+/// lowercased.
+pub(crate) fn code_token_cols_in_line_ignore_case(line: &str, needle_lower: &str) -> Vec<u32> {
+    let needle: Vec<char> = needle_lower.chars().collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<char> = line.chars().collect();
+    if needle.len() > chars.len() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => in_string = !in_string,
+            '#' if !in_string => break,
+            _ => {}
+        }
+        if i + needle.len() <= chars.len() {
+            let slice = &chars[i..i + needle.len()];
+            let matches = slice
+                .iter()
+                .zip(needle.iter())
+                .all(|(a, b)| a.to_ascii_lowercase() == *b);
+            if matches {
+                let before_ok = i == 0 || !is_ident_char(chars[i - 1]);
+                let after = i + needle.len();
+                let after_ok = after >= chars.len() || !is_ident_char(chars[after]);
+                if before_ok && after_ok {
+                    out.push(i as u32);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Every 0-based char column where `$needle_lower$` appears as a loc ref in
+/// `line` (including `|colour` suffix, e.g. `$MY_KEY|Y$`). Returns the column
+/// of the inner key's first character (after the opening `$`), case-insensitive.
+/// Used for yml `$REF$` rename. Skips `$` refs inside unquoted `#` comments
+/// and handles currency `$` like "$5 for $ITEM$" by advancing one dollar on
+/// invalid ident.
+pub(crate) fn loc_ref_key_cols_in_line(line: &str, needle_lower: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = line.chars().collect();
+    // Collect `$` positions, stopping at an unquoted `#` comment.
+    let mut dollars: Vec<usize> = Vec::new();
+    let mut in_string = false;
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '"' => in_string = !in_string,
+            '#' if !in_string => break,
+            '$' => dollars.push(i),
+            _ => {}
+        }
+    }
+    let mut i = 0;
+    while i + 1 < dollars.len() {
+        let open = dollars[i];
+        let close = dollars[i + 1];
+        if close <= open + 1 {
+            i += 1;
+            continue;
+        }
+        let inner: String = chars[open + 1..close].iter().collect();
+        let key = inner.split('|').next().unwrap_or(&inner);
+        let is_valid = !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+        if !is_valid {
+            // Currency or malformed like "$5 for $" — skip only the opening `$"
+            i += 1;
+            continue;
+        }
+        if key.to_ascii_lowercase() == needle_lower {
+            out.push((open + 1) as u32);
+        }
+        i += 2;
+    }
+    out
+}
+
+/// Strip any `_desc` / `_tooltip` suffixes (repeatedly) to get the family root.
+/// `"my_thing_desc_tooltip"` -> `"my_thing"`.
+pub(crate) fn loc_root(key_lower: &str) -> String {
+    let mut k = key_lower;
+    loop {
+        if let Some(stripped) = k.strip_suffix("_desc") {
+            k = stripped;
+            continue;
+        }
+        if let Some(stripped) = k.strip_suffix("_tooltip") {
+            k = stripped;
+            continue;
+        }
+        break;
+    }
+    k.to_string()
+}
+
 /// Build a `SymbolInformation` (the `deprecated` field is required by the
 /// struct but deprecated by the protocol).
 pub(crate) fn make_symbol(
@@ -1312,6 +1420,78 @@ mod tests {
             2,
             "different URIs at same position must both survive"
         );
+    }
+
+    #[test]
+    fn code_token_ignore_case_matches_case_insensitively_and_respects_boundaries() {
+        // Case-insensitive whole-token: MY_KEY matches my_key / My_Key but not my_key_extra
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("x = MY_KEY y", "my_key"),
+            vec![4]
+        );
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("x = my_key_extra", "my_key"),
+            Vec::<u32>::new()
+        );
+        // Comment handling: # my_key inside comment not counted
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("x = my_key # MY_KEY", "my_key"),
+            vec![4]
+        );
+        // Quoted: inside "..." still matches (script values are quoted)
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("x = \"MY_KEY\" # MY_KEY", "my_key"),
+            vec![5]
+        );
+        // Dots are identifier chars, so my.key should not match my key
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("a = my.key", "my_key"),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn loc_ref_key_cols_finds_dollar_refs_inside_yml() {
+        // $KEY$ and $KEY|Y$ both count, case-insensitive, whole-token
+        assert_eq!(
+            loc_ref_key_cols_in_line("  desc: \"See $MY_KEY$ and $OTHER|Y$\"", "my_key"),
+            vec![14]
+        );
+        assert_eq!(
+            loc_ref_key_cols_in_line("  desc: \"See $my_key|Y$\"", "my_key"),
+            vec![14]
+        );
+        assert_eq!(
+            loc_ref_key_cols_in_line("x = foo $my_key_extra$ y", "my_key"),
+            Vec::<u32>::new()
+        );
+        // Currency: "$5 for $ITEM$" should pair ITEM correctly (invalid "$5 for $" skips one dollar)
+        assert_eq!(
+            loc_ref_key_cols_in_line("a $5 for $ITEM$ b", "item").len(),
+            1
+        );
+        assert_eq!(
+            loc_ref_key_cols_in_line("a $5 for $ITEM$ b", "5"),
+            Vec::<u32>::new()
+        );
+        // Unquoted # comment: refs after # are ignored
+        assert!(loc_ref_key_cols_in_line("x = foo # $my_key$ comment", "my_key").is_empty());
+        assert_eq!(
+            loc_ref_key_cols_in_line("x = \"foo # $my_key$\" # $my_key$", "my_key").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn loc_root_strips_desc_and_tooltip_repeatedly() {
+        assert_eq!(loc_root("my_key"), "my_key");
+        assert_eq!(loc_root("my_key_desc"), "my_key");
+        assert_eq!(loc_root("my_key_tooltip"), "my_key");
+        assert_eq!(loc_root("my_key_desc_tooltip"), "my_key");
+        assert_eq!(loc_root("my_key_tooltip_desc"), "my_key");
+        assert_eq!(loc_root("my_key_desc_desc"), "my_key");
+        // Non-suffix substring not stripped
+        assert_eq!(loc_root("my_key_desc_extra"), "my_key_desc_extra");
     }
 
     #[test]

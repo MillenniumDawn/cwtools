@@ -138,6 +138,13 @@ impl Backend {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri.to_string();
 
+        // Localisation file: per-file key outline from the loc entries.
+        if crate::paths::is_loc_file(&uri)
+            && let Some(resp) = self.loc_document_symbols(&params).await
+        {
+            return Ok(Some(resp));
+        }
+
         // Hierarchical outline walked straight from the retained AST, when the
         // client advertises `hierarchicalDocumentSymbolSupport`. Falls through to
         // the flat instance/variable list otherwise (or when the AST is empty).
@@ -224,6 +231,85 @@ impl Backend {
             Ok(None)
         } else {
             Ok(Some(DocumentSymbolResponse::Flat(symbols)))
+        }
+    }
+
+    async fn loc_document_symbols(
+        &self,
+        params: &DocumentSymbolParams,
+    ) -> Option<DocumentSymbolResponse> {
+        let uri = params.text_document.uri.to_string();
+        let text = self.file_text_for(&uri).await?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        let path = crate::paths::uri_to_path_str(&uri);
+        let files = cwtools_localization::parse_loc_files(&path, &text, None).unwrap_or_default();
+        if files.iter().all(|f| f.entries.is_empty()) {
+            return None;
+        }
+        let encoding = self.state.config.read().position_encoding.clone();
+        let hierarchical = self
+            .state
+            .hierarchical_symbols
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if hierarchical {
+            let mut syms: Vec<DocumentSymbol> = Vec::new();
+            for file in &files {
+                for entry in &file.entries {
+                    let line0 = (entry.position.line.saturating_sub(1)) as u32;
+                    let line_text = text.lines().nth(line0 as usize).unwrap_or("");
+                    let col = line_text
+                        .find(&entry.key)
+                        .map(|b| line_text[..b].chars().count() as u32)
+                        .unwrap_or(0);
+                    let range = crate::navigation::helpers::source_range_in_text(
+                        &text, line0, col, &entry.key, &encoding,
+                    );
+                    #[allow(deprecated)]
+                    syms.push(DocumentSymbol {
+                        name: entry.key.clone(),
+                        detail: None,
+                        kind: SymbolKind::KEY,
+                        tags: None,
+                        deprecated: None,
+                        range,
+                        selection_range: range,
+                        children: None,
+                    });
+                }
+            }
+            if syms.is_empty() {
+                None
+            } else {
+                Some(DocumentSymbolResponse::Nested(syms))
+            }
+        } else {
+            let mut symbols: Vec<SymbolInformation> = Vec::new();
+            for file in &files {
+                for entry in &file.entries {
+                    let line0 = (entry.position.line.saturating_sub(1)) as u32;
+                    let line_text = text.lines().nth(line0 as usize).unwrap_or("");
+                    let col = line_text
+                        .find(&entry.key)
+                        .map(|b| line_text[..b].chars().count() as u32)
+                        .unwrap_or(0);
+                    symbols.push(make_symbol(
+                        entry.key.clone(),
+                        SymbolKind::KEY,
+                        Location {
+                            uri: params.text_document.uri.clone(),
+                            range: self.source_range_with_text(Some(&text), line0, col, &entry.key),
+                        },
+                        None,
+                    ));
+                }
+            }
+            if symbols.is_empty() {
+                None
+            } else {
+                Some(DocumentSymbolResponse::Flat(symbols))
+            }
         }
     }
 }

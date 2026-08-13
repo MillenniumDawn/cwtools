@@ -5,8 +5,12 @@ use tower_lsp::lsp_types::*;
 
 use cwtools_info::PositionElement;
 
-use crate::paths::{logical_path_from_uri, parse_uri};
+use crate::navigation::helpers::{code_token_cols_in_line_ignore_case, word_at_position};
+use crate::paths::{
+    loc_ref_at_cursor_with_encoding, logical_path_from_uri, lsp_pos_to_source_in_text, parse_uri,
+};
 use crate::{Backend, FileTextSnapshot};
+use cwtools_info::ReferenceHint;
 
 use super::scan_use_sites;
 use super::{
@@ -15,6 +19,218 @@ use super::{
 };
 
 impl Backend {
+    pub(crate) fn is_known_loc_key(&self, lower: &str) -> bool {
+        if let Some(idx) = self.state.loc_index.read().as_ref()
+            && idx.union().contains(lower)
+        {
+            return true;
+        }
+        for set in self.state.loc_live_overlay.read().values() {
+            if set.contains(lower) {
+                return true;
+            }
+        }
+        for set in self.state.loc_watched_overlay.read().values() {
+            if set.contains(lower) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) async fn loc_key_at_cursor(
+        &self,
+        uri: &str,
+        pos: Position,
+        logical_path: &str,
+    ) -> Option<String> {
+        if crate::paths::is_loc_file(uri) {
+            let text = self.file_text_for(uri).await?;
+            let encoding = self.state.config.read().position_encoding.clone();
+            let line = text.lines().nth(pos.line as usize).unwrap_or("");
+            if let Some((key, _, _)) =
+                loc_ref_at_cursor_with_encoding(line, pos.character, &encoding)
+            {
+                return Some(key.to_lowercase());
+            }
+            let (_, col) = lsp_pos_to_source_in_text(&text, pos, &encoding);
+            let word = word_at_position(&text, pos.line, col as u32)?;
+            let lower = word.to_lowercase();
+            if self.is_known_loc_key(&lower) {
+                return Some(lower);
+            }
+            // Fallback for unsaved keys: only treat word before `:` as key.
+            if let Some(colon) = line.find(':')
+                && let Some(word_col) = line.find(&word)
+                && word_col < colon
+            {
+                return Some(lower);
+            }
+            return None;
+        }
+        // Script file: prefer rule-classified LocRef
+        if let Some(info) = self.rule_info_at_cursor(uri, pos, logical_path)
+            && let ReferenceHint::LocRef { key } = info.hint
+        {
+            return Some(key.trim_matches('"').to_lowercase());
+        }
+        let text = self.file_text_for(uri).await?;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let (_, col) = lsp_pos_to_source_in_text(&text, pos, &encoding);
+        let word = word_at_position(&text, pos.line, col as u32)?;
+        let lower = word.to_lowercase();
+        if self.is_known_loc_key(&lower) {
+            Some(lower)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) async fn loc_file_uris(&self) -> Vec<String> {
+        let mut uris: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Open loc docs
+        for uri in self.state.documents.lock().keys() {
+            if crate::paths::is_loc_file(uri) {
+                uris.insert(uri.clone());
+            }
+        }
+        // Discovered loc files under workspace roots
+        let roots: Vec<std::path::PathBuf> = {
+            let cfg = self.state.config.read();
+            if !cfg.workspace_roots.is_empty() {
+                cfg.workspace_roots.clone()
+            } else if let Some(ws) = &cfg.workspace_uri {
+                if let Ok(url) = Url::parse(ws)
+                    && let Ok(p) = url.to_file_path()
+                {
+                    vec![p]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        };
+        if !roots.is_empty() {
+            let discovered = tokio::task::block_in_place(|| {
+                let refs: Vec<&std::path::Path> = roots.iter().map(|p| p.as_path()).collect();
+                cwtools_localization::LocService::discover_files(
+                    &refs,
+                    cwtools_file_manager::file_manager::ScanBudget::default(),
+                )
+            });
+            for path in discovered {
+                uris.insert(crate::paths::path_to_uri(&path));
+            }
+        }
+        // Vanilla not under workspace roots; discovered set is complete.
+        uris.into_iter().collect()
+    }
+
+    pub(crate) async fn collect_loc_definitions(
+        &self,
+        keys: &std::collections::HashSet<String>,
+        fallback: &Url,
+    ) -> Vec<Location> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let loc_uris = self.loc_file_uris().await;
+        if loc_uris.is_empty() {
+            return Vec::new();
+        }
+        let texts = self.file_text_snapshots_for(&loc_uris).await;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let mut out = Vec::new();
+        for uri in loc_uris {
+            let Some(snapshot) = texts.get(&uri) else {
+                continue;
+            };
+            let text = &snapshot.text;
+            let path = crate::paths::uri_to_path_str(&uri);
+            let files =
+                cwtools_localization::parse_loc_files(&path, text, None).unwrap_or_default();
+            for file in files {
+                for entry in file.entries {
+                    let lower = entry.key.to_lowercase();
+                    if !keys.contains(&lower) {
+                        continue;
+                    }
+                    let line0 = (entry.position.line.saturating_sub(1)) as u32;
+                    let line_text = text.lines().nth(line0 as usize).unwrap_or("");
+                    let col = line_text
+                        .find(&entry.key)
+                        .map(|b| line_text[..b].chars().count() as u32)
+                        .unwrap_or(0);
+                    let fallback_url = Url::parse(&uri).unwrap_or_else(|_| fallback.clone());
+                    out.push(Location {
+                        uri: fallback_url,
+                        range: crate::navigation::helpers::source_range_in_text(
+                            text, line0, col, &entry.key, &encoding,
+                        ),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) async fn collect_loc_script_usages(
+        &self,
+        keys: &std::collections::HashSet<String>,
+        fallback: &Url,
+    ) -> Vec<Location> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        // Gather candidate script files: indexed files + open docs
+        let mut script_uris: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let info = self.state.info_service.read();
+            for uri in info.files.keys() {
+                if crate::paths::is_script_file(uri) {
+                    script_uris.insert(uri.clone());
+                }
+            }
+        }
+        for uri in self.state.documents.lock().keys() {
+            if crate::paths::is_script_file(uri) {
+                script_uris.insert(uri.clone());
+            }
+        }
+        if script_uris.is_empty() {
+            return Vec::new();
+        }
+        let script_uris: Vec<String> = script_uris.into_iter().collect();
+        let texts = self.file_text_snapshots_for(&script_uris).await;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let mut out = Vec::new();
+        for uri in script_uris {
+            let Some(snapshot) = texts.get(&uri) else {
+                continue;
+            };
+            let text = &snapshot.text;
+            let fallback_url = Url::parse(&uri).unwrap_or_else(|_| fallback.clone());
+            for (line0, line) in text.lines().enumerate() {
+                for key_lower in keys.iter() {
+                    for col in code_token_cols_in_line_ignore_case(line, key_lower) {
+                        out.push(Location {
+                            uri: fallback_url.clone(),
+                            range: crate::navigation::helpers::source_range_in_text(
+                                text,
+                                line0 as u32,
+                                col,
+                                key_lower,
+                                &encoding,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub(crate) async fn references_impl(
         &self,
         params: ReferenceParams,
@@ -24,6 +240,23 @@ impl Backend {
 
         let ws_prefix = self.state.config.read().workspace_prefix.clone();
         let logical_path = logical_path_from_uri(&uri, &ws_prefix);
+
+        // Loc key: find definitions in .yml plus script usages.
+        if let Some(key_lower) = self.loc_key_at_cursor(&uri, pos, &logical_path).await {
+            let include_declaration = params.context.include_declaration;
+            let fallback = &params.text_document_position.text_document.uri;
+            let mut keys: HashSet<String> = HashSet::new();
+            keys.insert(key_lower.clone());
+            let mut all_locs: Vec<Location> = Vec::new();
+            if include_declaration {
+                all_locs.extend(self.collect_loc_definitions(&keys, fallback).await);
+            }
+            all_locs.extend(self.collect_loc_script_usages(&keys, fallback).await);
+            let all_locs = dedup_locations(all_locs);
+            if !all_locs.is_empty() {
+                return Ok(Some(all_locs));
+            }
+        }
 
         // Rule-aware: identify a TypeRef at cursor, then gather every location
         // where that instance is defined or used. Definitions come from the
