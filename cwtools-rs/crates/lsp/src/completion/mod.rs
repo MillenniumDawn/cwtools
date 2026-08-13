@@ -980,6 +980,7 @@ mod tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         info.type_index
@@ -1498,6 +1499,7 @@ mod perf_bench {
                 end: (1, 0),
             },
             primary_loc_key: None,
+            required_loc_keys: Vec::new(),
         };
         let mut per_type: HashMap<String, Vec<cwtools_info::TypeInstance>> = HashMap::new();
         per_type.insert(

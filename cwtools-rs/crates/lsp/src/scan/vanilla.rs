@@ -154,7 +154,7 @@ impl Backend {
             // Drop the previous base-game contribution (a re-merge after
             // cacheVanilla / clearAllCaches) before merging the fresh one.
             info_guard.type_index.remove_files(&old);
-            info_guard.type_index.merge_with_uris(converted);
+            info_guard.type_index.merge_base_game_with_uris(converted);
             // Vanilla data is loaded, so the index now holds every base-game
             // instance. Mark it complete so the CW500/CW222 type-reference
             // checks fire (they're gated on `complete` to avoid false

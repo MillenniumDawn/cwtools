@@ -152,6 +152,7 @@ mod tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         info.type_index.merge("file:///states/s.txt", per_type);
@@ -211,6 +212,7 @@ mod tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         info.type_index.merge("file:///events/e.txt", per_type);

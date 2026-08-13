@@ -447,6 +447,7 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
                     end: (ci.el, ci.ec),
                 },
                 primary_loc_key: ci.p,
+                required_loc_keys: Vec::new(),
             },
         ));
     }
@@ -547,6 +548,7 @@ mod tests {
                         end: (4, 1),
                     },
                     primary_loc_key: Some("GFX_A_TITLE".into()),
+                    required_loc_keys: Vec::new(),
                 },
                 TypeInstance {
                     name: "GFX_b".into(),
@@ -556,6 +558,7 @@ mod tests {
                         end: (9, 4),
                     },
                     primary_loc_key: None,
+                    required_loc_keys: Vec::new(),
                 },
             ],
         );
@@ -613,7 +616,7 @@ mod tests {
         assert_eq!(loaded.value_set_values[0].0, "country_flag");
 
         let mut idx2 = TypeIndex::new();
-        idx2.merge_with_uris(loaded.per_type);
+        idx2.merge_base_game_with_uris(loaded.per_type);
         assert!(idx2.contains("spriteType", "GFX_A"));
         assert!(idx2.contains("spriteType", "gfx_b"));
         let _ = std::fs::remove_file(&path);
@@ -637,6 +640,7 @@ mod tests {
                         end: (12, 1),
                     },
                     primary_loc_key: Some("base_1_title".into()),
+                    required_loc_keys: Vec::new(),
                 },
             )],
         );
@@ -764,6 +768,7 @@ mod tests {
                         end: (4, 1),
                     },
                     primary_loc_key: Some("GFX_A_TITLE".into()),
+                    required_loc_keys: Vec::new(),
                 },
             )],
         );
@@ -779,6 +784,7 @@ mod tests {
                         end: (12, 1),
                     },
                     primary_loc_key: None,
+                    required_loc_keys: Vec::new(),
                 },
             )],
         );

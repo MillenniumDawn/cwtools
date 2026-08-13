@@ -141,6 +141,7 @@ fn indexed_instance_block_remains_lenient() {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         )]),
     );
@@ -382,13 +383,19 @@ foo = {
 /// dynamic-modifier set. Returns the emitted codes. The modifier set is the
 /// lowercase canonical form the loader builds.
 fn modifier_codes(modifiers: &[&str], script: &str) -> Vec<String> {
-    let table = StringTable::new();
     let cwt = r#"
 types = { type[foo] = { path = "game/common/foo" } }
 foo = {
     dummy = scalar
 }
 "#;
+    modifier_codes_with_rules(cwt, modifiers, script)
+}
+
+/// As [`modifier_codes`], but against a caller-supplied ruleset, for the cases
+/// where the modifier key has to match a rule.
+fn modifier_codes_with_rules(cwt: &str, modifiers: &[&str], script: &str) -> Vec<String> {
+    let table = StringTable::new();
     let ruleset = ast_to_ruleset(&parse_string(cwt, &table), &table);
     let mods: HashSet<String> = modifiers.iter().map(|m| m.to_string()).collect();
     let parsed = parse_string(script, &table);
@@ -439,6 +446,64 @@ fn mixed_case_zero_modifier_still_fires_cw235() {
     assert!(
         c.contains(&"CW235".to_string()),
         "a mixed-case zero modifier must still fire CW235, got: {:?}",
+        c
+    );
+}
+
+/// A `modifier = { ... }` block whose contents are matched through the
+/// `modifier` alias, plus a rule field of the type's own that shares a modifier
+/// name. The shape every real modifier block in the configs has.
+const MODIFIER_BLOCK_RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = {
+    modifier = {
+        alias_name[modifier] = alias_match_left[modifier]
+    }
+    factor = float
+}
+alias[modifier:attack_factor] = float
+alias[modifier:factor] = float
+"#;
+
+#[test]
+fn rule_matched_zero_modifier_is_cw235() {
+    // The key matches the `alias_name[modifier]` rule, so it never reached the
+    // no-candidate branch the check used to live in.
+    let c = modifier_codes_with_rules(
+        MODIFIER_BLOCK_RULES,
+        &["attack_factor", "factor"],
+        "foo = { modifier = { attack_factor = 0 } }",
+    );
+    assert!(
+        c.contains(&"CW235".to_string()),
+        "a rule-matched zero modifier must fire CW235, got: {:?}",
+        c
+    );
+}
+
+#[test]
+fn rule_matched_nonzero_modifier_is_clean() {
+    let c = modifier_codes_with_rules(
+        MODIFIER_BLOCK_RULES,
+        &["attack_factor", "factor"],
+        "foo = { modifier = { attack_factor = 0.05 } }",
+    );
+    assert!(!c.contains(&"CW235".to_string()), "got: {:?}", c);
+}
+
+#[test]
+fn zero_rule_field_sharing_a_modifier_name_is_clean() {
+    // `factor` is a field of `foo`'s own rules AND a registered modifier. It
+    // matched a SpecificField rule, not the modifier alias, so a zero is a
+    // legitimate value here and must not read as a no-op modifier.
+    let c = modifier_codes_with_rules(
+        MODIFIER_BLOCK_RULES,
+        &["attack_factor", "factor"],
+        "foo = { factor = 0 }",
+    );
+    assert!(
+        !c.contains(&"CW235".to_string()),
+        "a zero rule field must not fire CW235, got: {:?}",
         c
     );
 }

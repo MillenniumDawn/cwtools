@@ -8,6 +8,7 @@
 //! These run inside `per_game::run_game_validators`, so a `game` must be set.
 
 use cwtools_game::constants::Game;
+use cwtools_index::{TypeIndex, collect_type_instances};
 use cwtools_parser::parser::parse_string;
 use cwtools_rules::rules_converter::ast_to_ruleset;
 use cwtools_string_table::string_table::StringTable;
@@ -385,37 +386,42 @@ fn cw238_underlines_only_the_containing_key() {
     );
 }
 
-// CW261 fires at the second occurrence of a `unique = yes` type key. The
-// complaint is the duplicated key, so it spans the key, not the whole second
-// definition.
+// CW261 fires at every definition of a duplicated `unique = yes` instance id.
+// One of them has to go, so the squiggle spans the whole definition.
 #[test]
-fn cw261_underlines_only_the_duplicated_key() {
+fn cw261_spans_each_duplicate_definition() {
     let table = StringTable::new();
     let cwt = "types = {\n    type[thing] = {\n        path = \"game/common/things\"\n        unique = yes\n    }\n}\n";
     let parsed_cwt = parse_string(cwt, &table);
     let ruleset = ast_to_ruleset(&parsed_cwt, &table);
-    let script = "thing = {\n    a = 1\n}\nthing = {\n    b = 2\n}\n";
+    let path = "game/common/things/test.txt";
+    let script = "dup = {\n    a = 1\n}\ndup = {\n    b = 2\n}\n";
     let parsed = parse_string(script, &table);
 
-    let err = validate_ast(
+    let mut index = TypeIndex::new();
+    index.merge(
+        path,
+        collect_type_instances(&ruleset, &parsed, path, &table),
+    );
+
+    let errs: Vec<_> = validate_ast(
         &parsed,
         &ruleset,
         &table,
-        "test.txt",
+        path,
         Some(Game::Hoi4),
-        None,
+        Some(&index),
         None,
     )
     .into_iter()
-    .find(|e| e.code == Some("CW261"))
-    .expect("CW261 emitted");
+    .filter(|e| e.code == Some("CW261"))
+    .collect();
 
-    assert_eq!((err.line, err.col), (4, 0));
-    assert_eq!(
-        err.end,
-        Some((4, "thing".len() as u16)),
-        "CW261 must span only the key"
-    );
+    assert_eq!(errs.len(), 2, "got: {errs:?}");
+    // Each span runs from the definition's key to just past its closing brace.
+    let spans: Vec<_> = errs.iter().map(|e| ((e.line, e.col), e.end)).collect();
+    assert!(spans.contains(&((1, 0), Some((4, 0)))), "got: {spans:?}");
+    assert!(spans.contains(&((4, 0), Some((7, 0)))), "got: {spans:?}");
 }
 
 // The complaint is the key name, not the block, and the fix already renames only

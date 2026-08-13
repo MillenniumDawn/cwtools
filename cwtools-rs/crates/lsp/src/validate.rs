@@ -1849,6 +1849,7 @@ mod perf_bench {
                         end: (1, 0),
                     },
                     primary_loc_key: None,
+                    required_loc_keys: Vec::new(),
                 });
         }
         type_index.merge("file:///bench/defs.txt", per_type);
@@ -2184,6 +2185,7 @@ mod whole_line_range_tests {
                 end: (1, 0),
             },
             primary_loc_key: None,
+            required_loc_keys: Vec::new(),
         };
         let mut index = TypeIndex::new();
         index.merge(

@@ -1915,6 +1915,7 @@ mod resolve_data_tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         info.type_index.merge("file:///states/s.txt", per_type);
@@ -1998,6 +1999,7 @@ mod resolve_data_tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         info.type_index.merge("file:///x.txt", per_type);

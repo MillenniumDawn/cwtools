@@ -21,6 +21,13 @@ pub struct TypeInstance {
     /// re-reading the definition. `None` when the type has no primary
     /// explicit-field localisation (name-derived keys are computed on demand).
     pub primary_loc_key: Option<String>,
+    /// Loc keys this instance must provide that a `## required` localisation
+    /// entry takes from a child field's value (`## required title = title`)
+    /// rather than from the instance name. Resolved here because the node body
+    /// is gone by the time CW100 runs off the index. Empty for the common case:
+    /// a type with no required explicit-field loc entry, or an instance that
+    /// omits the field.
+    pub required_loc_keys: Vec<String>,
 }
 
 /// Holds all known instances for every type, aggregated across files.
@@ -347,6 +354,44 @@ impl VarIndex {
     }
 }
 
+/// How many definitions of one instance name a type holds, split by where they
+/// came from. `total` answers "does this name exist" (`contains`); `workspace`
+/// answers "did the project define it more than once" (CW261), which a
+/// base-game definition the mod is overriding must not contribute to.
+#[derive(Debug, Default, Clone, Copy)]
+struct NameRefs {
+    total: usize,
+    workspace: usize,
+}
+
+/// Drop one definition of `name` from a type's name set, removing the entry
+/// once its last definition goes. The [`NameRefs`] counterpart of `dec_ref`.
+fn release_name(set: &mut FxHashMap<Arc<str>, NameRefs>, name: &str, base_game: bool) {
+    if let Some(refs) = set.get_mut(name)
+        && refs.release(base_game)
+    {
+        set.remove(name);
+    }
+}
+
+impl NameRefs {
+    fn add(&mut self, base_game: bool) {
+        self.total += 1;
+        if !base_game {
+            self.workspace += 1;
+        }
+    }
+
+    /// Drop one definition, reporting whether the name is now gone entirely.
+    fn release(&mut self, base_game: bool) -> bool {
+        self.total = self.total.saturating_sub(1);
+        if !base_game {
+            self.workspace = self.workspace.saturating_sub(1);
+        }
+        self.total == 0
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TypeIndex {
     /// type_name → Vec<(file_uri, instance)>
@@ -362,7 +407,11 @@ pub struct TypeIndex {
     /// was quadratic over the corpus for high-cardinality types (state, character,
     /// country_event). The refcount lets `remove_file` drop a name only when its
     /// last definition in that type goes.
-    instance_sets: FxHashMap<String, FxHashMap<Arc<str>, usize>>,
+    instance_sets: FxHashMap<String, FxHashMap<Arc<str>, NameRefs>>,
+    /// The URIs a base-game merge contributed. Keeps the removal paths able to
+    /// tell which half of a [`NameRefs`] an instance belongs to, and stays empty
+    /// on a mod-only run.
+    base_game_uris: FxHashSet<Arc<str>>,
     /// file_uri → type_name → this file's own positions within `map[type_name]`.
     /// Lets [`instances_in_file`](Self::instances_in_file) and
     /// [`remove_file`](Self::remove_file) both cost O(the file's own entries)
@@ -371,8 +420,9 @@ pub struct TypeIndex {
     /// the vec's last element into the freed slot, so every swap repairs the
     /// position recorded for whichever other file owned that relocated entry
     /// (see `swap_remove_instance`). Kept in sync by every insertion (`merge`,
-    /// `merge_with_uris`) and removal (`remove_file`, `remove_files`) path. Not
-    /// serialized: the vanilla cache reloads through `merge_with_uris`, which
+    /// `merge_base_game_with_uris`) and removal (`remove_file`, `remove_files`)
+    /// path. Not serialized: the vanilla cache reloads through
+    /// `merge_base_game_with_uris`, which
     /// rebuilds this map (same as `name_counts` / `instance_sets`).
     file_positions: FxHashMap<Arc<str>, FxHashMap<String, Vec<usize>>>,
     /// Index of every asset/file path under the game roots, for `filepath`
@@ -414,6 +464,22 @@ impl TypeIndex {
         } else {
             names.contains_key(instance)
         }
+    }
+
+    /// How many times the workspace defines `instance` as a `type_name`
+    /// (case-insensitive). Base-game definitions are excluded, so a mod that
+    /// redefines a base-game instance reads as an override, not a duplicate.
+    /// More than one is CW261's whole question.
+    pub fn workspace_definition_count(&self, type_name: &str, instance: &str) -> usize {
+        let Some(names) = self.instance_sets.get(type_name) else {
+            return 0;
+        };
+        let refs = if instance.bytes().any(|b| b.is_ascii_uppercase()) {
+            names.get(instance.to_ascii_lowercase().as_str())
+        } else {
+            names.get(instance)
+        };
+        refs.map(|r| r.workspace).unwrap_or(0)
     }
 
     /// Return true if `name` is a known instance of ANY type. Used to recognise
@@ -518,7 +584,32 @@ impl TypeIndex {
     /// and document-symbol output without adding a distinct definition.
     #[tracing::instrument(skip_all, fields(types = per_type.len()))]
     pub fn merge(&mut self, file_uri: &str, per_type: HashMap<String, Vec<TypeInstance>>) {
+        self.merge_from(file_uri, per_type, false);
+    }
+
+    /// As [`merge`](Self::merge), but for base-game content. The instances are
+    /// indexed exactly the same way; they just don't count toward
+    /// [`workspace_definition_count`](Self::workspace_definition_count), so a
+    /// mod redefining a base-game instance reads as an override rather than a
+    /// duplicate.
+    pub fn merge_base_game(
+        &mut self,
+        file_uri: &str,
+        per_type: HashMap<String, Vec<TypeInstance>>,
+    ) {
+        self.merge_from(file_uri, per_type, true);
+    }
+
+    fn merge_from(
+        &mut self,
+        file_uri: &str,
+        per_type: HashMap<String, Vec<TypeInstance>>,
+        base_game: bool,
+    ) {
         let uri: Arc<str> = Arc::from(file_uri);
+        if base_game {
+            self.base_game_uris.insert(Arc::clone(&uri));
+        }
         for (type_name, instances) in per_type {
             let subtype_key = is_subtype_key(&type_name);
             let set = self.instance_sets.entry(type_name.clone()).or_default();
@@ -546,19 +637,20 @@ impl TypeIndex {
                         }
                     }
                 };
-                *set.entry(lower).or_insert(0) += 1;
+                set.entry(lower).or_default().add(base_game);
                 positions.push(entry.len());
                 entry.push((Arc::clone(&uri), inst));
             }
         }
     }
 
-    /// Merge instances that each carry their own source URI. Like [`merge`], but
-    /// the per-instance URI is stored as-is instead of a single shared key, so a
-    /// batch spanning many files (the vanilla index, where every base-game file
-    /// contributes a few instances) keeps each instance pointing at its real
-    /// source file. `remove_files` drops such a batch by URI.
-    pub fn merge_with_uris(
+    /// Merge base-game instances that each carry their own source URI. Like
+    /// [`merge_base_game`](Self::merge_base_game), but the per-instance URI is
+    /// stored as-is instead of a single shared key, so a batch spanning many
+    /// files (the vanilla index, where every base-game file contributes a few
+    /// instances) keeps each instance pointing at its real source file.
+    /// `remove_files` drops such a batch by URI.
+    pub fn merge_base_game_with_uris(
         &mut self,
         per_type: impl IntoIterator<Item = (String, Vec<(Arc<str>, TypeInstance)>)>,
     ) {
@@ -583,10 +675,11 @@ impl TypeIndex {
                         }
                     }
                 };
-                *set.entry(lower).or_insert(0) += 1;
+                set.entry(lower).or_default().add(true);
                 // Each instance can come from a different file, so key on its own
                 // uri; clone the type name only the first time it's seen per uri.
                 let pos = entry.len();
+                self.base_game_uris.insert(Arc::clone(&uri));
                 let type_positions = self.file_positions.entry(Arc::clone(&uri)).or_default();
                 match type_positions.get_mut(type_name.as_str()) {
                     Some(positions) => positions.push(pos),
@@ -615,16 +708,20 @@ impl TypeIndex {
             v.retain(|(uri, inst)| {
                 let keep = !file_uris.contains(uri);
                 if !keep {
+                    let base_game = self.base_game_uris.contains(uri);
                     let lower = inst.name.to_ascii_lowercase();
                     if !subtype_key {
                         dec_ref(&mut self.name_counts, lower.as_str());
                     }
                     if let Some(set) = self.instance_sets.get_mut(type_name) {
-                        dec_ref(set, lower.as_str());
+                        release_name(set, lower.as_str(), base_game);
                     }
                 }
                 keep
             });
+        }
+        for uri in file_uris {
+            self.base_game_uris.remove(uri);
         }
         self.map.retain(|_, v| !v.is_empty());
         self.instance_sets.retain(|_, names| !names.is_empty());
@@ -661,6 +758,7 @@ impl TypeIndex {
         let Some(type_positions) = self.file_positions.remove(file_uri) else {
             return;
         };
+        let base_game = self.base_game_uris.remove(file_uri);
         for (type_name, mut positions) in type_positions {
             // Subtype-qualified keys never contributed to `name_counts` (see
             // `merge`), so they must not decrement it here.
@@ -680,7 +778,7 @@ impl TypeIndex {
                     dec_ref(&mut self.name_counts, lower.as_str());
                 }
                 if let Some(set) = self.instance_sets.get_mut(&type_name) {
-                    dec_ref(set, lower.as_str());
+                    release_name(set, lower.as_str(), base_game);
                 }
                 self.swap_remove_instance(&type_name, index);
             }
@@ -807,6 +905,7 @@ mod tests {
                     end: (7, 4),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         idx.merge("file://e.txt", map);
@@ -826,7 +925,7 @@ mod tests {
                 ("tech".to_string(), vec![inst("a_tech", 2)]),
             ]),
         );
-        idx.merge_with_uris(vec![
+        idx.merge_base_game_with_uris(vec![
             (
                 "event".to_string(),
                 vec![(Arc::<str>::from("file://b.txt"), inst("b_ev", 3))],
@@ -862,6 +961,7 @@ mod tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         idx.merge("common/lns/x.txt", per_type);
@@ -891,6 +991,7 @@ mod tests {
                 end: (line, 0),
             },
             primary_loc_key: None,
+            required_loc_keys: Vec::new(),
         }
     }
 
@@ -919,7 +1020,7 @@ mod tests {
     type Snap = (
         std::collections::BTreeMap<String, Vec<(String, String, u32)>>,
         std::collections::BTreeMap<String, usize>,
-        std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>>,
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, (usize, usize)>>,
     );
 
     fn snapshot(idx: &TypeIndex) -> Snap {
@@ -938,13 +1039,15 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
-        let instance_sets: BTreeMap<String, BTreeMap<String, usize>> = idx
+        let instance_sets: BTreeMap<String, BTreeMap<String, (usize, usize)>> = idx
             .instance_sets
             .iter()
             .map(|(k, m)| {
                 (
                     k.clone(),
-                    m.iter().map(|(kk, vv)| (kk.to_string(), *vv)).collect(),
+                    m.iter()
+                        .map(|(kk, vv)| (kk.to_string(), (vv.total, vv.workspace)))
+                        .collect(),
                 )
             })
             .collect();
@@ -973,7 +1076,7 @@ mod tests {
                     HashMap::from([("event".to_string(), vec![inst("shared_ev", 5)])]),
                 );
             }
-            idx.merge_with_uris(vec![
+            idx.merge_base_game_with_uris(vec![
                 (
                     "event".to_string(),
                     vec![
@@ -996,11 +1099,11 @@ mod tests {
         assert!(full.is_any_instance("shared_ev"));
     }
 
-    /// Removing a `merge_with_uris`-contributed file must likewise match a
+    /// Removing a `merge_base_game_with_uris`-contributed file must likewise match a
     /// rebuild without it. Exercises the per-instance-uri insertion path, whose
     /// reverse-map bookkeeping differs from the single-uri path.
     #[test]
-    fn remove_file_parity_removing_merge_with_uris_file() {
+    fn remove_file_parity_removing_merge_base_game_with_uris_file() {
         let build = |include_c: bool| -> TypeIndex {
             let mut idx = TypeIndex::new();
             idx.merge(
@@ -1021,7 +1124,7 @@ mod tests {
                     vec![(Arc::<str>::from("file://c.txt"), inst("shared_ev", 7))],
                 ));
             }
-            idx.merge_with_uris(batch);
+            idx.merge_base_game_with_uris(batch);
             idx
         };
 
@@ -1061,7 +1164,7 @@ mod tests {
     #[test]
     fn remove_files_bulk_then_remove_file_singular() {
         let mut idx = TypeIndex::new();
-        idx.merge_with_uris(vec![(
+        idx.merge_base_game_with_uris(vec![(
             "event".to_string(),
             vec![
                 (Arc::<str>::from("v1"), inst("e1", 1)),
@@ -1175,7 +1278,7 @@ mod tests {
     #[test]
     fn subtype_key_removal_preserves_name_counts_exemption() {
         let mut idx = TypeIndex::new();
-        idx.merge_with_uris(vec![
+        idx.merge_base_game_with_uris(vec![
             (
                 "event".to_string(),
                 vec![(Arc::<str>::from("f.txt"), inst("ev", 1))],

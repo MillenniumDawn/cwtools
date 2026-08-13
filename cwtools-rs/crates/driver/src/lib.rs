@@ -503,7 +503,7 @@ impl Session {
             // Merge each cached instance under its real source file (not a shared
             // sentinel) so cross-file reference resolution keeps the base-game
             // provenance the cache stored.
-            type_index.merge_with_uris(cache.per_type);
+            type_index.merge_base_game_with_uris(cache.per_type);
             for n in &cache.var_names {
                 type_index.var_index.add_name(n);
             }
@@ -548,7 +548,7 @@ impl Session {
                     type_name,
                     entries.into_iter().map(|(_, inst)| inst).collect(),
                 )]);
-                type_index.merge("<vanilla>", per_type);
+                type_index.merge_base_game("<vanilla>", per_type);
             }
             // File index (mod + vanilla) for `filepath` checks (CW113). Only when
             // vanilla is present: mod files commonly reference base-game assets.

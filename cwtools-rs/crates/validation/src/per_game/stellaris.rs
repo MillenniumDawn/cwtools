@@ -712,6 +712,7 @@ mod tests {
                         end: (0, 0),
                     },
                     primary_loc_key: None,
+                    required_loc_keys: Vec::new(),
                 });
         }
         let mut idx = TypeIndex::new();

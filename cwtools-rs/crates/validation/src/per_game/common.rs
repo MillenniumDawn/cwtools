@@ -1,9 +1,8 @@
+use crate::ctx::ValidationCtx;
 use crate::{ValidationError, error_codes};
-use cwtools_parser::ast::{Child, ParsedFile, SourceRange, Value};
-use cwtools_parser::fix::key_token_range;
+use cwtools_parser::ast::{Child, ParsedFile, SourcePos, SourceRange, Value};
 use cwtools_rules::rules_types::{RuleSet, TypeDefinition};
 use cwtools_string_table::string_table::{StringId, StringTable};
-use rustc_hash::FxHashMap;
 
 /// True when any directory segment of `file_path` equals `segment`
 /// (case-insensitive). Mods sometimes nest `events/` into subfolders.
@@ -110,55 +109,48 @@ pub(crate) fn walk_blocks(children: &[Child], ast: &ParsedFile, f: &mut impl FnM
 }
 
 /// Validate common features across all games.
-pub fn validate_common(
-    ast: &ParsedFile,
-    ruleset: &RuleSet,
-    table: &StringTable,
-    file_path: &crate::FilePath,
-    errors: &mut Vec<ValidationError>,
-) {
-    // Root keys repeat (a file is many instances of one type), so the owned key
-    // is only materialised the first time each distinct one is seen.
-    let mut type_counts: FxHashMap<StringId, usize> = FxHashMap::default();
+pub(crate) fn validate_common(ctx: &ValidationCtx, errors: &mut Vec<ValidationError>) {
+    check_duplicate_type_defs(ctx, errors);
+}
 
-    for child in &ast.root_children {
-        let (leaf, key_id) = match child {
-            Child::Leaf(idx) => {
-                let leaf = &ast.arena.leaves[*idx as usize];
-                (leaf, leaf.key.normal)
-            }
-            Child::LeafValue(_) | Child::Comment(_) => continue,
-        };
-        let count = type_counts.entry(key_id).or_insert(0);
-        *count += 1;
-        let count = *count;
-
-        // Check if this type is defined with unique=true, and emit exactly once,
-        // at the second occurrence, so the error anchors at the duplicate rather
-        // than at 0,0.
-        let unique_dup = count == 2
-            && table
-                .with_string(key_id, |k| {
-                    find_matching_type(k, ruleset).is_some_and(|td| td.unique)
-                })
-                .unwrap_or(false);
-        if unique_dup {
-            let key = table.get_string(key_id).unwrap_or_default();
-            // The complaint is the duplicated key, so the squiggle covers
-            // the key token, not the whole entity definition.
-            let end = key_token_range(leaf.pos.start, key.chars().count()).end;
-            let (line, col) = (leaf.pos.start.line, leaf.pos.start.col);
-            // CW261 (DuplicateTypeDef). F#'s message is
-            // "Key {id} of type {typename} is defined multiple times";
-            // this per-file detection keys off the type name appearing
-            // as repeated sibling keys, so `id` and `typename` collapse
-            // to the same token. F#'s check is project-wide and grouped
-            // by extracted instance id — a known refinement gap.
-            let code = &error_codes::CW261_DUPLICATE_TYPE_DEF;
-            errors.push(
-                ValidationError::from_code(code, file_path, line, col, &[&key, &key]).with_end(end),
-            );
+/// CW261 (F# `DuplicateTypeDef`): an instance of a `## unique` type whose id the
+/// project defines more than once. Project-wide, off the index's per-type name
+/// counts, so a second definition in another file is caught too — and reported
+/// at every definition site, since any one of them is a candidate for deletion.
+/// Base-game definitions don't count: a mod redefining one is an override.
+///
+/// Costs nothing for a ruleset that declares no `## unique` type, and one hash
+/// lookup per instance otherwise.
+fn check_duplicate_type_defs(ctx: &ValidationCtx, errors: &mut Vec<ValidationError>) {
+    let Some(type_index) = ctx.type_index else {
+        return;
+    };
+    if !ctx.ruleset.types.iter().any(|td| td.unique) {
+        return;
+    }
+    for (type_name, inst) in type_index.instances_in_file(ctx.file_path) {
+        if !find_matching_type(type_name, ctx.ruleset).is_some_and(|td| td.unique) {
+            continue;
         }
+        if type_index.workspace_definition_count(type_name, &inst.name) < 2 {
+            continue;
+        }
+        // The whole definition is the complaint (one of them has to go), so the
+        // squiggle spans it rather than just the key.
+        let end = SourcePos {
+            line: inst.location.end.0,
+            col: inst.location.end.1,
+        };
+        errors.push(
+            ValidationError::from_code(
+                &error_codes::CW261_DUPLICATE_TYPE_DEF,
+                ctx.file_path,
+                inst.location.line,
+                inst.location.col,
+                &[&inst.name, type_name],
+            )
+            .with_end(end),
+        );
     }
 }
 

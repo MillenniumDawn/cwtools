@@ -392,6 +392,51 @@ impl<'a> BlockRules<'a> {
     }
 }
 
+/// The alias category a `modifier = { ... }` block's contents are matched
+/// through. A key that only ever matched rules of this category is in the block
+/// *because* it is a modifier, which is what makes a zero value a no-op.
+const MODIFIER_ALIAS: &str = "modifier";
+
+/// Whether every candidate rule matched the key through the `modifier` alias
+/// category. False as soon as one candidate is a rule field of the block's own
+/// (a `SpecificField`, an `enum[...]`, …), so a legitimately-zero rule field is
+/// never read as a zero modifier.
+fn candidates_are_modifier_alias_only(candidates: &[&(RuleType, Options)]) -> bool {
+    !candidates.is_empty()
+        && candidates.iter().all(|(rule_type, _)| {
+            matches!(
+                rule_type,
+                RuleType::LeafRule {
+                    left: NewField::AliasField(category),
+                    ..
+                } | RuleType::NodeRule {
+                    left: NewField::AliasField(category),
+                    ..
+                } if category == MODIFIER_ALIAS
+            )
+        })
+}
+
+/// CW235 (F# `ZeroModifier`): a known modifier set to 0 does nothing, because
+/// modifiers are additive.
+fn push_zero_modifier(
+    file_path: &FilePath,
+    leaf: &cwtools_parser::ast::Leaf,
+    key: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    errors.push(
+        ValidationError::from_code(
+            &error_codes::CW235_ZERO_MODIFIER,
+            file_path,
+            leaf.pos.start.line,
+            leaf.pos.start.col,
+            &[key],
+        )
+        .with_end(leaf.pos.end),
+    );
+}
+
 /// Whether a rule's right-hand side is the `math_expr` value type.
 pub(crate) fn rule_right_is_math_expr(rule_type: &RuleType) -> bool {
     matches!(
@@ -572,17 +617,7 @@ fn count_and_validate_children<'r>(
                     // CW235 (F# `ZeroModifier`): a known modifier set to 0 is a no-op
                     // (modifiers are additive). Only fires on confirmed modifiers.
                     if is_modifier && value_is_zero(&leaf.value) {
-                        let code = &error_codes::CW235_ZERO_MODIFIER;
-                        errors.push(
-                            ValidationError::from_code(
-                                code,
-                                file_path,
-                                leaf.pos.start.line,
-                                leaf.pos.start.col,
-                                &[key],
-                            )
-                            .with_end(leaf.pos.end),
-                        );
+                        push_zero_modifier(file_path, leaf, key, errors);
                     }
                     // A `@name = value` leaf is a Paradox read-time variable
                     // definition, valid anywhere in a block. F# skips these from the
@@ -644,6 +679,17 @@ fn count_and_validate_children<'r>(
                         errors.push(err);
                     }
                 } else {
+                    // CW235 again, for the common case: the key matched, but only
+                    // through the `modifier` alias, so it IS a modifier and a zero
+                    // is still a no-op. Gated on the match being modifier-only so a
+                    // rule field of the type's own (`factor = 0`, `cost = 0`) that
+                    // happens to share a modifier's name is left alone.
+                    if value_is_zero(&leaf.value)
+                        && candidates_are_modifier_alias_only(&candidates)
+                        && modifier_keys.is_some_and(|mk| mk.contains(key.to_lowercase().as_str()))
+                    {
+                        push_zero_modifier(file_path, leaf, key, errors);
+                    }
                     // An overloaded key (several rules with the same key, e.g. two
                     // `province = { ... }` forms) is a disjunction — accept if any
                     // candidate validates cleanly.

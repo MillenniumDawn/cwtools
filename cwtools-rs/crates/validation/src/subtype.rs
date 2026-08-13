@@ -87,6 +87,7 @@ pub fn subtype_membership_for_instance(
                 // Hover resolves the primary loc key via the base-type
                 // instances; subtype-qualified entries don't need it.
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             });
         }
     }

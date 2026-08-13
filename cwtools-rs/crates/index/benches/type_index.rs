@@ -25,6 +25,7 @@ fn instance(type_name: &str, file_index: usize, n: usize) -> TypeInstance {
             end: (n as u32, 0),
         },
         primary_loc_key: None,
+        required_loc_keys: Vec::new(),
     }
 }
 
