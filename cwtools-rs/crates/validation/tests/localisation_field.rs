@@ -365,6 +365,7 @@ fn scoped_loc_codes(loc: &str, key: &str, variables: &[&str]) -> Vec<String> {
             modifier_keys: None,
             loc_index: Some(&idx),
             extra_loc_keys: None,
+            inline_scripts: None,
             registry: registry.as_ref(),
             scope_checks: true,
             var_checks: true,

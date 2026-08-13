@@ -52,8 +52,9 @@ pub enum LocCommandDiagnostic {
 /// The variable index sits above this crate, so the caller supplies the probe.
 /// It is handed the segment with its `|format` suffix already stripped; the
 /// caller's own normalization (`@` concatenation, `?`/`^` selectors, case)
-/// applies on top.
-pub type ScriptedVariables<'a> = &'a dyn Fn(&str) -> bool;
+/// applies on top. `Sync` because both the per-file validation pass and the
+/// standalone loc lint fan out over rayon holding a `&LocScopeData`.
+pub type ScriptedVariables<'a> = &'a (dyn Fn(&str) -> bool + Sync);
 
 /// Per-game static data needed for loc-command validation.
 ///

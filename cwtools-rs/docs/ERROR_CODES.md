@@ -86,8 +86,7 @@ and CW241 by CW262-265.
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | <a id="cw225"></a>CW225 | Error | Localisation key "{}" references "{}" which doesn't exist in {} | A loc string's `$KEY$` reference points to a key that has no definition. | Emitted |
-| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). A `?`-marked variable read (`[?ROOT.war_support\|1]`) is checked against the project's variable registry: the config's built-in `value[variable]` reads plus every name the mod sets, so only a name neither knows is reported. A chain without the `?` ends in a command or a scripted-localisation name and stays lenient, as does one reading through a variable (`[?some_var.SomeLoc]`) or through a segment the scope engine can't resolve. Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted |
-| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). Multi-segment chains like `[THIS.var]` are lenient (scripted variables not indexed). Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted (see [where the loc command checks run](#where-the-loc-command-checks-run)) |
+| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). A `?`-marked variable read (`[?ROOT.war_support\|1]`) is checked against the project's variable registry: the config's built-in `value[variable]` reads plus every name the mod sets, so only a name neither knows is reported. A chain without the `?` ends in a command or a scripted-localisation name and stays lenient, as does one reading through a variable (`[?some_var.SomeLoc]`) or through a segment the scope engine can't resolve. Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted (see [where the loc command checks run](#where-the-loc-command-checks-run)) |
 
 ### CW227-CW233 -- Section/component/mesh/entity (Stellaris-specific)
 
@@ -257,6 +256,16 @@ they see different things:
 - `cwtools loc --game <game> --rules <path>` runs them over every entry in the
   scan, starting from an unknown scope. There are no game files to name a
   reference site, so only what is wrong in *every* scope is reported.
+
+CW226's scripted-variable registry follows the same split. The two passes that
+walk the game files collect one (the config's built-in `value[variable]` reads
+plus every name the mod sets), so they check what a `?`-marked read names.
+`cwtools loc` reads the `.yml` files and the ruleset only, and never walks the
+game files the mod's own variable names come from; a registry holding just the
+built-ins would call every mod-set variable undefined, so it is withheld and
+every multi-segment chain stays lenient there. `validate` withholds it the same
+way while its variable index is still empty, which is what the language server
+sees before its first scan finishes.
 
 `cwtools loc` without both settings loads no registry and reports none of the
 three; the file-level loc checks (CW225, CW254-CW259, CW268, CW275, CW276) do

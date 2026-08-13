@@ -320,7 +320,13 @@ pub(super) fn run(args: LocArgs) {
 /// Both settings are needed: the registry is per-game, and a ruleset without a
 /// game has no scopes to build it from. One on its own warns and checks nothing,
 /// which keeps a `cwtools.toml` written for `validate` usable here.
-fn loc_scope_data(game: Option<&str>, rules: Option<&Path>) -> Option<LocScopeData> {
+///
+/// No scripted-variable registry: this lint reads the `.yml` files and the
+/// ruleset, and never walks the game files a variable index is collected from.
+/// A half-built registry would report every mod-set variable as undefined, so
+/// the probe is withheld and multi-segment chains stay lenient, the same way an
+/// unscanned workspace behaves in `validate`. Hence `'static`: nothing borrowed.
+fn loc_scope_data(game: Option<&str>, rules: Option<&Path>) -> Option<LocScopeData<'static>> {
     let (game, rules) = match (game, rules) {
         (Some(game), Some(rules)) => (game, rules),
         (None, None) => return None,
