@@ -74,6 +74,15 @@ fn primary_explicit_loc_field(td: &TypeDefinition) -> Option<&str> {
         .and_then(|l| l.explicit_field.as_deref())
 }
 
+/// The child fields a type's `## required` localisation entries read their key
+/// from (`## required title = title`). Empty for the usual `$`-pattern types, so
+/// the per-instance resolution below costs nothing for them.
+fn required_explicit_loc_fields(td: &TypeDefinition) -> impl Iterator<Item = &str> {
+    td.localisation
+        .iter()
+        .filter_map(|l| l.required_explicit_field())
+}
+
 /// Read the value of the child leaf whose key equals `field_name` (case-
 /// insensitive), unquoted. The shared lookup behind `name_field` and primary
 /// explicit-field localisation.
@@ -356,6 +365,7 @@ fn collect_type_instances_inner(
                 },
                 // type_per_file types have no node body to read a field from.
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             });
             // `type_per_file` types carry no node body, so they contribute no
             // subtype membership (`for_each_instance_node` skips them too).
@@ -379,6 +389,13 @@ fn collect_type_instances_inner(
                 let primary_loc_key = primary_explicit_loc_field(td).and_then(|field| {
                     field_value_from_children(field, clause_children, arena, table)
                 });
+                // Same read for the `## required` explicit-field entries, whose
+                // keys CW100 checks for existence.
+                let required_loc_keys: Vec<String> = required_explicit_loc_fields(td)
+                    .filter_map(|field| {
+                        field_value_from_children(field, clause_children, arena, table)
+                    })
+                    .collect();
                 if let (Some(hook), Some(out)) = (node_hook, subtype_instances.as_deref_mut()) {
                     let node = InstanceNode {
                         td,
@@ -393,6 +410,7 @@ fn collect_type_instances_inner(
                     name,
                     location,
                     primary_loc_key,
+                    required_loc_keys,
                 });
             };
             for child in &file.root_children {

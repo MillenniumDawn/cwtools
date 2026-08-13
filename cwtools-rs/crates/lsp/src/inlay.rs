@@ -297,6 +297,7 @@ mod tests {
                         end: (1, 0),
                     },
                     primary_loc_key: None,
+                    required_loc_keys: Vec::new(),
                 })
                 .collect(),
         );
@@ -467,6 +468,7 @@ mod tests {
                         end: (1, 0),
                     },
                     primary_loc_key: None,
+                    required_loc_keys: Vec::new(),
                 }],
             );
             idx.merge("file:///mod/y.txt", pt);

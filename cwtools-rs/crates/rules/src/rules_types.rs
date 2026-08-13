@@ -754,6 +754,16 @@ impl TypeLocalisation {
         self.required && !self.optional && self.explicit_field.is_none()
     }
 
+    /// The child field a `## required` loc key is read from, for the
+    /// explicit-field form (`## required title = title`). `None` when the entry
+    /// is optional, not required, or derives its key from the instance name.
+    pub fn required_explicit_field(&self) -> Option<&str> {
+        if !self.required || self.optional {
+            return None;
+        }
+        self.explicit_field.as_deref()
+    }
+
     /// The key this definition derives for an instance called `name`. Only
     /// meaningful when `explicit_field` is unset, where the key comes from a
     /// child field's value instead. Case is left alone; the loc index is

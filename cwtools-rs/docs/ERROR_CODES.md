@@ -50,7 +50,7 @@ and CW241 by CW262-265.
 
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
-| <a id="cw100"></a>CW100 | Warning | Localisation key {} is not defined for {} | A referenced localisation key has no entry for the named language. | Emitted |
+| <a id="cw100"></a>CW100 | Warning | Localisation key {} is not defined for {} | A referenced localisation key has no entry for the named language. Also covers the `## required` keys a type declares, both the name-derived form (`name = "$_desc"`) and the explicit-field form, where the key is the value of a child field (`title = title`). An instance that omits the explicit field is not flagged; the missing field is the rules' cardinality complaint. | Emitted |
 | <a id="cw104"></a>CW104 | Error | {} trigger used in incorrect scope. In {} but expected {} | A trigger is used in a scope it doesn't accept. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`). Scope tracking handles links/iterators/data-refs/root-scope; a DLC-scope long tail may still surface false positives |
 | <a id="cw105"></a>CW105 | Error | {} effect used in incorrect scope. In {} but expected {} | An effect is used in the wrong scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
 | <a id="cw106"></a>CW106 | Error | {} scope command used in incorrect scope. In {} but expected {} | A scope command is used outside its valid scope. | Emitted (escape hatch `CWTOOLS_NO_SCOPE_CHECKS=1`) |
@@ -104,7 +104,7 @@ and CW241 by CW262-265.
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | <a id="cw234"></a>CW234 | Information | Localisation key {} is a placeholder for {} | A loc value is `REPLACE_ME` or similar placeholder text. | Emitted |
-| <a id="cw235"></a>CW235 | Warning | Modifier {} has value 0. Modifiers are additive so likely doesn't do anything | A known modifier is set to `0`, which is a no-op for additive modifiers. | Emitted (fires on confirmed modifier names; rule-matched modifier fields not yet covered) |
+| <a id="cw235"></a>CW235 | Warning | Modifier {} has value 0. Modifiers are additive so likely doesn't do anything | A known modifier is set to `0`, which is a no-op for additive modifiers. Fires wherever the key is a confirmed modifier: with no matching rule at all, and inside a `modifier = { ... }` block, where the key matches through the `modifier` alias. A key that matches a rule field of the block's own is left alone even when it shares a modifier's name, so a legitimate `factor = 0` is not flagged. | Emitted |
 | <a id="cw236"></a>CW236 | Warning | Nested if/else in effects was deprecated with 2.1 and will be removed in a future release | Stellaris: nested `if/else` in effects, deprecated since 2.1. | Emitted |
 | <a id="cw237"></a>CW237 | Information | 2.1 changed nested if = { if else } behaviour in effects. Check this still works as expected | Stellaris: ambiguous nested `if = { if else }` after 2.1 behaviour change. | Emitted |
 | <a id="cw238"></a>CW238 | Error | An else/else_if is missing a preceding if | An `else` or `else_if` block has no antecedent, either as a preceding sibling (`if = {…} else = {…}`, Stellaris 2.1+) or as the enclosing `if`/`else_if` it nests inside (HOI4 and pre-2.1 Stellaris). | Emitted (cross-game, both chain spellings; CW236/CW237 remain Stellaris-only) |
@@ -166,7 +166,7 @@ These are the core rules-engine codes. Severity and message text are computed pe
 | <a id="cw258"></a>CW258 | Information | Localisation file name should end with "l_language.yml" | Language tag is present but not at the end of the file name. F# defines this but leaves emission commented out as "only convention"; cwtools-rs matches that -- const defined, never fired. | Retired / not emitted |
 | <a id="cw259"></a>CW259 | Error | This localisation string refers to itself | A loc key's value includes a `$KEY$` reference back to the same key. | Emitted |
 | <a id="cw260"></a>CW260 | Error | Loc command {} used in wrong scope. In {} but expected {} | A loc command is used in a data scope that doesn't support it. | Emitted (see [where the loc command checks run](#where-the-loc-command-checks-run)) |
-| <a id="cw261"></a>CW261 | Error | Key {} of type {} is defined multiple times | A `unique` type key appears more than once as a root key in the same file. Detection is per-file, not project-wide: the same key duplicated across two files is not flagged. | Emitted (reconciled from Rust CW501) |
+| <a id="cw261"></a>CW261 | Error | Key {} of type {} is defined multiple times | The project defines the same instance id of a `unique` type more than once. Project-wide: a duplicate in another file counts, and every definition site is flagged, since any one of them is the candidate for deletion. Base-game definitions are excluded, so a mod redefining one reads as an override. | Emitted (reconciled from Rust CW501) |
 | <a id="cw262"></a>CW262 | Error | {} | An unexpected `key = { ... }` node where the rule doesn't allow one. Also fires on a bad key inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
 | <a id="cw263"></a>CW263 | Error | {} | An unexpected `key = value` leaf where the rule doesn't allow one. Also fires on a mis-typed operator inside a [math expression](MATH_EXPRESSIONS.md). | Emitted |
 | <a id="cw264"></a>CW264 | Warning | {} | An unexpected bare value where the rule doesn't allow one. | Emitted |

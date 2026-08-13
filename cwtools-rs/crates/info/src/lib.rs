@@ -875,6 +875,7 @@ mod tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         idx.merge("file://test.txt", map);
@@ -899,6 +900,7 @@ mod tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         idx.merge("file://a.txt", map.clone());
@@ -928,6 +930,7 @@ mod tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         idx.merge("file://a.txt", map.clone());
@@ -960,6 +963,7 @@ mod tests {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             }],
         );
         idx.merge("file://a.txt", map);

@@ -39,6 +39,7 @@ fn type_index(entries: &[(&str, &str)]) -> TypeIndex {
                     end: (1, 0),
                 },
                 primary_loc_key: None,
+                required_loc_keys: Vec::new(),
             });
     }
     idx.merge("test_defs.txt", per_type);

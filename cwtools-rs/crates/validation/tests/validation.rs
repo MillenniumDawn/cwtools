@@ -259,6 +259,7 @@ types = {
                 end: (1, 0),
             },
             primary_loc_key: None,
+            required_loc_keys: Vec::new(),
         }],
     );
     idx.merge("file://tech.txt", map);
@@ -632,6 +633,7 @@ event = {
                 end: (1, 0),
             },
             primary_loc_key: None,
+            required_loc_keys: Vec::new(),
         }],
     );
     idx.merge("file://tech.txt", map);
@@ -1364,6 +1366,7 @@ widget = {
                 end: (1, 0),
             },
             primary_loc_key: None,
+            required_loc_keys: Vec::new(),
         }],
     );
     idx.merge("game/interface/sprites.gfx", map);
@@ -1533,6 +1536,7 @@ types = {
                 end: (1, 0),
             },
             primary_loc_key: None,
+            required_loc_keys: Vec::new(),
         }],
     );
     idx.merge("file://tech.txt", map);

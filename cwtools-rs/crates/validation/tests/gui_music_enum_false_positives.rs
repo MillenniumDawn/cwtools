@@ -410,6 +410,7 @@ types = {
                 end: (1, 1),
             },
             primary_loc_key: None,
+            required_loc_keys: Vec::new(),
         }],
     );
     index.merge("interface/ideas.gfx", per_type);
