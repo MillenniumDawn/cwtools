@@ -3,12 +3,15 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
-use crate::Backend;
 use crate::paths::{logical_path_from_uri, lsp_pos_to_source_in_text};
+use crate::{Backend, FileTextSnapshot};
 
 use super::{
     at_var_at_cursor, code_token_cols_in_line, prepare_rename_range, rename_refused,
-    source_range_in_text,
+    source_range_in_text, word_at_position,
+};
+use crate::navigation::helpers::{
+    code_token_cols_in_line_ignore_case, loc_ref_key_cols_in_line, loc_root,
 };
 
 impl Backend {
@@ -28,6 +31,22 @@ impl Backend {
         if let Some(text) = text.as_deref()
             && let Some((_, range)) = Self::at_var_rename_target(text, pos, &position_encoding)
         {
+            return Ok(Some(PrepareRenameResponse::Range(range)));
+        }
+
+        // Loc key next, before TypeRef: a loc key in either a .yml or a script
+        // file is a valid rename target.
+        if let Some(key_lower) = self.loc_key_at_cursor(&uri, pos, &logical_path).await {
+            // Show the range of the actual token under the cursor (preserve
+            // original case length). Use the word at cursor if available, else
+            // the lowercased key.
+            let token = if let Some(t) = text.as_deref() {
+                let (_, col) = lsp_pos_to_source_in_text(t, pos, &position_encoding);
+                word_at_position(t, pos.line, col as u32).unwrap_or_else(|| key_lower.clone())
+            } else {
+                key_lower.clone()
+            };
+            let range = prepare_rename_range(text.as_deref(), pos, &token, &position_encoding);
             return Ok(Some(PrepareRenameResponse::Range(range)));
         }
 
@@ -87,6 +106,215 @@ impl Backend {
         let (name, start_col) = at_var_at_cursor(text, pos.line, col as u32)?;
         let range = source_range_in_text(text, pos.line, start_col, &name, encoding);
         Some((name, range))
+    }
+
+    async fn rename_loc(
+        &self,
+        uri: &str,
+        key_lower: &str,
+        new_name: &str,
+    ) -> Result<Option<WorkspaceEdit>> {
+        // Sibling family: base + _desc/_tooltip variants. Only touch keys that
+        // exist (is_known), plus the triggered key itself.
+        let root = loc_root(key_lower);
+        let trigger_suffix = key_lower.strip_prefix(&root).unwrap_or("");
+        let new_lower = new_name.to_lowercase();
+        let new_root_original = if !trigger_suffix.is_empty() && new_lower.ends_with(trigger_suffix)
+        {
+            let suffix_len = trigger_suffix.len();
+            let end = new_name.len().saturating_sub(suffix_len);
+            if new_name[end..].eq_ignore_ascii_case(trigger_suffix) {
+                new_name[..end].to_string()
+            } else {
+                new_name.to_string()
+            }
+        } else {
+            new_name.to_string()
+        };
+        let candidates: Vec<String> = vec![
+            root.clone(),
+            format!("{root}_desc"),
+            format!("{root}_tooltip"),
+            format!("{root}_desc_tooltip"),
+            format!("{root}_tooltip_desc"),
+        ];
+        let mut target_to_new: HashMap<String, String> = HashMap::new();
+        for cand in candidates {
+            if cand == key_lower || self.is_known_loc_key(&cand) {
+                let suffix = cand.strip_prefix(&root).unwrap_or("");
+                let new_sib = format!("{}{}", new_root_original, suffix);
+                // Also handle the triggered suffix variant even if not in
+                // candidates (e.g. _tooltip_desc) — ensure original maps.
+                target_to_new.entry(cand).or_insert(new_sib);
+            }
+        }
+        // Ensure the triggered key maps even when it wasn't in the static list
+        // (e.g. _tooltip_desc or arbitrary suffix).
+        if !target_to_new.contains_key(key_lower) {
+            target_to_new.insert(key_lower.to_string(), new_name.to_string());
+        }
+        if uri.parse::<Url>().is_err() {
+            return Ok(None);
+        }
+        // Fetch loc files once and reuse.
+        let loc_uris = self.loc_file_uris().await;
+        let loc_texts = if loc_uris.is_empty() {
+            HashMap::new()
+        } else {
+            self.file_text_snapshots_for(&loc_uris).await
+        };
+        // Reuse loc files for definitions and yml refs.
+        let loc_edits = self
+            .collect_loc_rename_definitions(&target_to_new, &loc_uris, &loc_texts)
+            .await;
+        let script_edits = self.collect_loc_rename_usages(&target_to_new).await;
+        let yml_ref_edits = self
+            .collect_loc_yml_refs(&target_to_new, &loc_uris, &loc_texts)
+            .await;
+        let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
+        for (file_uri, edits) in loc_edits
+            .into_iter()
+            .chain(script_edits)
+            .chain(yml_ref_edits)
+        {
+            by_uri.entry(file_uri).or_default().extend(edits);
+        }
+        if by_uri.is_empty() {
+            return Ok(None);
+        }
+        // Dedup within each file (a key that appears multiple times on same line)
+        let mut deduped: HashMap<String, Vec<TextEdit>> = HashMap::new();
+        for (file_uri, mut edits) in by_uri {
+            edits.sort_by_key(|a| a.range.start);
+            edits.dedup_by(|a, b| a.range == b.range);
+            deduped.insert(file_uri, edits);
+        }
+        let by_uri: Vec<(String, Vec<TextEdit>)> = deduped.into_iter().collect();
+        // Reject edits outside workspace.
+        if let Some(err) = self.first_refused_edit_target(&by_uri, uri) {
+            return Err(err);
+        }
+        Ok(Some(self.build_workspace_edit(by_uri)))
+    }
+
+    async fn collect_loc_rename_definitions(
+        &self,
+        target_to_new: &HashMap<String, String>,
+        loc_uris: &[String],
+        texts: &HashMap<String, FileTextSnapshot>,
+    ) -> Vec<(String, Vec<TextEdit>)> {
+        if loc_uris.is_empty() {
+            return Vec::new();
+        }
+        let encoding = self.state.config.read().position_encoding.clone();
+        let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
+        for uri in loc_uris {
+            let Some(snapshot) = texts.get(uri) else {
+                continue;
+            };
+            let text = &snapshot.text;
+            let path = crate::paths::uri_to_path_str(uri);
+            let files =
+                cwtools_localization::parse_loc_files(&path, text, None).unwrap_or_default();
+            for file in files {
+                for entry in file.entries {
+                    let lower = entry.key.to_lowercase();
+                    let Some(new_text) = target_to_new.get(&lower) else {
+                        continue;
+                    };
+                    let line0 = (entry.position.line.saturating_sub(1)) as u32;
+                    let line_text = text.lines().nth(line0 as usize).unwrap_or("");
+                    let col = line_text
+                        .find(&entry.key)
+                        .map(|b| line_text[..b].chars().count() as u32)
+                        .unwrap_or(0);
+                    let range = source_range_in_text(text, line0, col, &entry.key, &encoding);
+                    by_uri.entry(uri.clone()).or_default().push(TextEdit {
+                        range,
+                        new_text: new_text.clone(),
+                    });
+                }
+            }
+        }
+        by_uri.into_iter().collect()
+    }
+
+    async fn collect_loc_rename_usages(
+        &self,
+        target_to_new: &HashMap<String, String>,
+    ) -> Vec<(String, Vec<TextEdit>)> {
+        let mut script_uris: HashSet<String> = HashSet::new();
+        {
+            let info = self.state.info_service.read();
+            for uri in info.files.keys() {
+                if crate::paths::is_script_file(uri) {
+                    script_uris.insert(uri.clone());
+                }
+            }
+        }
+        for uri in self.state.documents.lock().keys() {
+            if crate::paths::is_script_file(uri) {
+                script_uris.insert(uri.clone());
+            }
+        }
+        if script_uris.is_empty() {
+            return Vec::new();
+        }
+        let script_uris: Vec<String> = script_uris.into_iter().collect();
+        let texts = self.file_text_snapshots_for(&script_uris).await;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
+        for uri in script_uris {
+            let Some(snapshot) = texts.get(&uri) else {
+                continue;
+            };
+            let text = &snapshot.text;
+            for (line0, line) in text.lines().enumerate() {
+                for (key_lower, new_text) in target_to_new.iter() {
+                    for col in code_token_cols_in_line_ignore_case(line, key_lower) {
+                        let range =
+                            source_range_in_text(text, line0 as u32, col, key_lower, &encoding);
+                        by_uri.entry(uri.clone()).or_default().push(TextEdit {
+                            range,
+                            new_text: new_text.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        by_uri.into_iter().collect()
+    }
+
+    async fn collect_loc_yml_refs(
+        &self,
+        target_to_new: &HashMap<String, String>,
+        loc_uris: &[String],
+        texts: &HashMap<String, FileTextSnapshot>,
+    ) -> Vec<(String, Vec<TextEdit>)> {
+        if loc_uris.is_empty() {
+            return Vec::new();
+        }
+        let encoding = self.state.config.read().position_encoding.clone();
+        let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
+        for uri in loc_uris {
+            let Some(snapshot) = texts.get(uri) else {
+                continue;
+            };
+            let text = &snapshot.text;
+            for (line0, line) in text.lines().enumerate() {
+                for (key_lower, new_text) in target_to_new.iter() {
+                    for col in loc_ref_key_cols_in_line(line, key_lower) {
+                        let range =
+                            source_range_in_text(text, line0 as u32, col, key_lower, &encoding);
+                        by_uri.entry(uri.clone()).or_default().push(TextEdit {
+                            range,
+                            new_text: new_text.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        by_uri.into_iter().collect()
     }
 
     /// The refusal for the first URI in `by_uri` a generated edit may not write
@@ -183,6 +411,15 @@ impl Backend {
             && let Some((name, _)) = Self::at_var_rename_target(text, pos, &position_encoding)
         {
             return self.rename_at_var(&uri, text, &name, &new_name);
+        }
+
+        // Loc key rename (with _desc/_tooltip siblings), before TypeRef.
+        if let Some(key_lower) = self.loc_key_at_cursor(&uri, pos, &logical_path).await {
+            match self.rename_loc(&uri, &key_lower, &new_name).await {
+                Ok(Some(edit)) => return Ok(Some(edit)),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         // Identify what's under the cursor
