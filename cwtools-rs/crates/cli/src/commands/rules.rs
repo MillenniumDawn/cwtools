@@ -90,7 +90,7 @@ fn render(
         }
         ReportType::Sarif => {
             let refs: Vec<&Diag> = diags.iter().collect();
-            out.push_str(&report::sarif_report(&refs, &report::report_root()));
+            out.push_str(&report::sarif_report(&refs, &report::report_root(), None));
         }
         ReportType::Cli => {
             let mut current = "";

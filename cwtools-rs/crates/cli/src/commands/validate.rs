@@ -13,7 +13,7 @@ use crate::diag::{
 use crate::report::ReportType;
 use crate::run::{
     EXIT_USAGE, announce_config, exit_code, exit_if_empty, load_config, missing_required,
-    report_owns_stdout, status,
+    report_owns_stdout, status, vanilla_notice,
 };
 use crate::{codes, config, report, scope};
 
@@ -280,6 +280,16 @@ pub(super) fn run(args: ValidateArgs) {
     );
     eprintln!("  Discovered {} files", session.parsed_files().len());
 
+    // Whole-run notice, not a diagnostic: nothing in the mod is wrong, the run
+    // just could not answer for these families. `complete` is the gate the
+    // checks themselves read, so the two cannot drift apart. Kept on stderr for
+    // every format, and carried in the report body for the two CI formats that
+    // have a run-level slot for it.
+    let vanilla_notice = vanilla_notice(game_id, session.type_index().complete);
+    if let Some(notice) = &vanilla_notice {
+        eprintln!("  note: {notice}");
+    }
+
     // The discovered files the scope covers. Everything is still indexed, so
     // the cross-file checks are unaffected; the driver skips validating the
     // rest where it can, and the report filter below is what makes the run
@@ -497,13 +507,20 @@ pub(super) fn run(args: ValidateArgs) {
         }
         ReportType::Github => {
             let root = report::report_root();
+            if let Some(notice) = &vanilla_notice {
+                out.push_str(&report::github_notice(notice));
+            }
             for d in &diags {
                 out.push_str(&report::github_row(d, &root));
             }
         }
         ReportType::Sarif => {
             let refs: Vec<&Diag> = diags.iter().collect();
-            out.push_str(&report::sarif_report(&refs, &report::report_root()));
+            out.push_str(&report::sarif_report(
+                &refs,
+                &report::report_root(),
+                vanilla_notice.as_deref(),
+            ));
         }
         ReportType::Cli => {
             // cli: grouped by file

@@ -186,6 +186,38 @@ impl RulesInput {
     }
 }
 
+/// The checks a run cannot make without a base-game index, so a caller can say
+/// so instead of letting them read as clean.
+///
+/// Every one of these compares script against the union of mod and base-game
+/// definitions. Without `--vanilla` or `--vanilla-cache` that union is only the
+/// mod, so the engine cannot tell a genuinely missing definition from one the
+/// base game supplies and stays silent rather than flagging every vanilla
+/// reference. Returns an empty slice when `has_vanilla`, so a caller can render
+/// the notice unconditionally.
+///
+/// # Examples
+///
+/// ```
+/// use cwtools_driver::vanilla_gated_checks;
+/// use cwtools_game::constants::Game;
+///
+/// assert!(vanilla_gated_checks(Game::Hoi4, true).is_empty());
+/// assert!(vanilla_gated_checks(Game::Hoi4, false).contains(&"CW500"));
+/// ```
+pub fn vanilla_gated_checks(game: Game, has_vanilla: bool) -> &'static [&'static str] {
+    if has_vanilla {
+        return &[];
+    }
+    match game {
+        // CW227/CW229 (ship-design templates) and CW250 (planet-killer support
+        // script) sit behind the same index-completeness gate, but only the
+        // Stellaris validator emits them.
+        Game::Stellaris => &["CW113", "CW222", "CW227", "CW229", "CW250", "CW500"],
+        _ => &["CW113", "CW222", "CW500"],
+    }
+}
+
 /// Auto-managed on-disk cache of the base-game index, so a batch run doesn't
 /// re-parse the whole install every time. Only consulted when `vanilla` is a
 /// directory and no explicit `vanilla_cache` was supplied: a cache whose
@@ -520,7 +552,9 @@ impl Session {
 
         // Mark the index as complete when vanilla data was loaded (either from a
         // directory or a pre-generated cache).  This lets CW500 type-reference
-        // checks fire without false positives on mod-only validation.
+        // checks fire without false positives on mod-only validation. Set
+        // together with the file index above, so `complete` answers for every
+        // family [`vanilla_gated_checks`] names.
         if has_vanilla_data {
             type_index.complete = true;
         }
@@ -1268,6 +1302,27 @@ mod tests {
             )),
             "error: {}",
             errors[0]
+        );
+    }
+
+    #[test]
+    fn vanilla_gated_checks_are_silent_once_the_index_is_loaded() {
+        for game in [Game::Hoi4, Game::Stellaris, Game::Ck3] {
+            assert!(vanilla_gated_checks(game, true).is_empty(), "{game}");
+        }
+    }
+
+    #[test]
+    fn vanilla_gated_checks_name_the_families_that_go_quiet() {
+        assert_eq!(
+            vanilla_gated_checks(Game::Hoi4, false),
+            ["CW113", "CW222", "CW500"]
+        );
+        // The ship-design and planet-killer checks share the gate but only
+        // Stellaris emits them.
+        assert_eq!(
+            vanilla_gated_checks(Game::Stellaris, false),
+            ["CW113", "CW222", "CW227", "CW229", "CW250", "CW500"]
         );
     }
 }
