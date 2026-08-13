@@ -183,7 +183,7 @@ pub(super) fn run(args: LocArgs) {
         }
         ReportType::Sarif => {
             let all: Vec<&Diag> = diags.iter().chain(parse_errors.iter()).collect();
-            out.push_str(&report::sarif_report(&all, &report::report_root()));
+            out.push_str(&report::sarif_report(&all, &report::report_root(), None));
         }
         ReportType::Cli => {
             let mut by_file: std::collections::BTreeMap<&str, Vec<&Diag>> =
