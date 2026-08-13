@@ -14003,3 +14003,409 @@ fn test_loc_rename_with_desc_sibling() {
         edit_str
     );
 }
+
+#[test]
+fn test_loc_outline_hierarchical_vs_flat() {
+    let yml = "l_english:\n aaa:0 \"A\"\n bbb:0 \"B\"\n";
+    let files = &[("localisation/test_l_english.yml", yml)];
+    // Flat
+    let flat = feature_request(
+        GOTO_RULES,
+        files,
+        &["localisation/test_l_english.yml"],
+        serde_json::json!({"textDocument": {"documentSymbol": {"hierarchicalDocumentSymbolSupport": false}}}),
+        "localisation/test_l_english.yml",
+        "textDocument/documentSymbol",
+        serde_json::json!({}),
+    );
+    let flat_arr = flat.as_array().expect("flat array");
+    assert_eq!(
+        flat_arr.len(),
+        2,
+        "flat outline should have 2 symbols, got {:?}",
+        flat
+    );
+    assert!(
+        flat_arr[0]["kind"].is_number(),
+        "SymbolInformation must have kind"
+    );
+    // Hierarchical
+    let hierarchical = feature_request(
+        GOTO_RULES,
+        files,
+        &["localisation/test_l_english.yml"],
+        serde_json::json!({"textDocument": {"documentSymbol": {"hierarchicalDocumentSymbolSupport": true}}}),
+        "localisation/test_l_english.yml",
+        "textDocument/documentSymbol",
+        serde_json::json!({}),
+    );
+    let hier_arr = hierarchical.as_array().expect("hierarchical array");
+    assert_eq!(
+        hier_arr.len(),
+        2,
+        "hierarchical outline should have 2 symbols, got {:?}",
+        hierarchical
+    );
+    assert!(
+        hier_arr[0]["selectionRange"].is_object(),
+        "DocumentSymbol must have selectionRange"
+    );
+}
+
+#[test]
+fn test_loc_outline_outside_localisation_is_empty() {
+    let yml = "l_english:\n my_key:0 \"Hello\"\n";
+    // File under .github is has_loc_ext but not is_loc_file, so outline should be empty (no game AST)
+    let files = &[(".github/workflows/ci.yml", yml)];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &[".github/workflows/ci.yml"],
+        serde_json::json!({"textDocument": {"documentSymbol": {"hierarchicalDocumentSymbolSupport": false}}}),
+        ".github/workflows/ci.yml",
+        "textDocument/documentSymbol",
+        serde_json::json!({}),
+    );
+    assert!(
+        result.is_null() || result.as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "outside localisation dir should have no outline, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_loc_references_include_declaration_flag() {
+    let yml = "l_english:\n my_key:0 \"Hello\"\n";
+    let script = "x = {\n    title = my_key\n}\n";
+    let files = &[
+        ("localisation/test_l_english.yml", yml),
+        ("common/test/event.txt", script),
+    ];
+    let with_decl = feature_request(
+        GOTO_RULES,
+        files,
+        &["localisation/test_l_english.yml", "common/test/event.txt"],
+        serde_json::json!({}),
+        "localisation/test_l_english.yml",
+        "textDocument/references",
+        serde_json::json!({"position": {"line": 1, "character": 2}, "context": {"includeDeclaration": true}}),
+    );
+    let locs_true = with_decl.as_array().expect("refs with decl");
+    assert!(
+        locs_true
+            .iter()
+            .any(|l| l["uri"].as_str().unwrap().contains("test_l_english.yml")),
+        "includeDeclaration true must include yml definition, got {:?}",
+        with_decl
+    );
+    let without_decl = feature_request(
+        GOTO_RULES,
+        files,
+        &["localisation/test_l_english.yml", "common/test/event.txt"],
+        serde_json::json!({}),
+        "localisation/test_l_english.yml",
+        "textDocument/references",
+        serde_json::json!({"position": {"line": 1, "character": 2}, "context": {"includeDeclaration": false}}),
+    );
+    let locs_false = without_decl.as_array().expect("refs without decl");
+    assert!(
+        !locs_false
+            .iter()
+            .any(|l| l["uri"].as_str().unwrap().contains("test_l_english.yml")),
+        "includeDeclaration false must not include yml definition, got {:?}",
+        without_decl
+    );
+    assert!(
+        locs_false
+            .iter()
+            .any(|l| l["uri"].as_str().unwrap().contains("event.txt")),
+        "script usage must still be present, got {:?}",
+        without_decl
+    );
+}
+
+#[test]
+fn test_loc_references_case_insensitive_and_whole_token() {
+    let yml = "l_english:\n my_key:0 \"Hello\"\n";
+    // MY_KEY different case should match, my_key_extra should NOT, comment should NOT
+    let script = "x = {\n    title = MY_KEY\n    other = my_key_extra\n    # my_key comment\n    quoted = \"my_key\"\n}\n";
+    let files = &[
+        ("localisation/test_l_english.yml", yml),
+        ("common/test/event.txt", script),
+    ];
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["localisation/test_l_english.yml", "common/test/event.txt"],
+        serde_json::json!({}),
+        "localisation/test_l_english.yml",
+        "textDocument/references",
+        serde_json::json!({"position": {"line": 1, "character": 2}, "context": {"includeDeclaration": false}}),
+    );
+    let locs = result.as_array().expect("refs");
+    // Filter to event.txt locations
+    let script_locs: Vec<_> = locs
+        .iter()
+        .filter(|l| l["uri"].as_str().unwrap().contains("event.txt"))
+        .collect();
+    // Should find MY_KEY (line 1) and quoted "my_key" (line 4), but not my_key_extra nor comment
+    assert_eq!(
+        script_locs.len(),
+        2,
+        "expected 2 script usages (case-insensitive, whole-token, quoted), got {:?}",
+        result
+    );
+    let lines: Vec<u64> = script_locs
+        .iter()
+        .map(|l| l["range"]["start"]["line"].as_u64().unwrap())
+        .collect();
+    assert!(
+        lines.contains(&1),
+        "MY_KEY on line 1 not found, got {:?}",
+        lines
+    );
+    assert!(
+        lines.contains(&4),
+        "quoted my_key on line 4 not found, got {:?}",
+        lines
+    );
+}
+
+#[test]
+fn test_loc_references_from_script_side() {
+    let yml = "l_english:\n my_key:0 \"Hello\"\n";
+    let script = "x = {\n    title = my_key\n}\n";
+    let files = &[
+        ("localisation/test_l_english.yml", yml),
+        ("common/test/event.txt", script),
+    ];
+    // Cursor on script usage (line 1, inside my_key)
+    let result = feature_request(
+        GOTO_RULES,
+        files,
+        &["localisation/test_l_english.yml", "common/test/event.txt"],
+        serde_json::json!({}),
+        "common/test/event.txt",
+        "textDocument/references",
+        serde_json::json!({"position": {"line": 1, "character": 13}, "context": {"includeDeclaration": true}}),
+    );
+    let locs = result.as_array().expect("refs from script");
+    assert!(
+        locs.iter()
+            .any(|l| l["uri"].as_str().unwrap().contains("test_l_english.yml")),
+        "script-side references must include yml definition, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_loc_rename_only_existing_siblings() {
+    let yml = "l_english:\n my_item:0 \"Item\"\n my_item_desc:0 \"Desc\"\n";
+    // No my_item_tooltip exists, so rename should NOT produce it
+    let files = &[("localisation/test_l_english.yml", yml)];
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    for (rel, content) in files {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+    let ws_uri = path_uri(ws.path());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({"processId": std::process::id(), "rootUri": ws_uri, "capabilities": {"workspace": {"workspaceEdit": {"documentChanges": true}}}, "initializationOptions": {"language": "hoi4", "rulesCache": rules_dir.path().to_string_lossy(), "vanilla": vanilla.path().to_string_lossy()}}),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    {
+        let rel = "localisation/test_l_english.yml";
+        let content = yml;
+        let uri = path_uri(ws.path().join(rel));
+        write_frame(&mut child, &jsonrpc_notification("textDocument/didOpen", serde_json::json!({"textDocument": {"uri": uri, "languageId": "hoi4", "version": 1, "text": content}}))).unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+    let uri = path_uri(ws.path().join("localisation/test_l_english.yml"));
+    let req = jsonrpc_request(
+        10,
+        "textDocument/rename",
+        serde_json::json!({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 2}, "newName": "new_item"}),
+    );
+    write_frame(&mut child, &req).unwrap();
+    let resp_str = read_response(&mut reader).unwrap();
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    child.kill().ok();
+    let edit_str = resp["result"].to_string();
+    assert!(edit_str.contains("new_item"), "new_item, got {}", edit_str);
+    assert!(
+        edit_str.contains("new_item_desc"),
+        "sibling _desc must be renamed, got {}",
+        edit_str
+    );
+    assert!(
+        !edit_str.contains("new_item_tooltip"),
+        "non-existent _tooltip must NOT be in edit, got {}",
+        edit_str
+    );
+}
+
+#[test]
+fn test_loc_rename_across_languages() {
+    let yml_en = "l_english:\n my_key:0 \"Hello\"\n";
+    let yml_fr = "l_french:\n my_key:0 \"Bonjour\"\n";
+    let files = &[
+        ("localisation/test_l_english.yml", yml_en),
+        ("localisation/test_l_french.yml", yml_fr),
+    ];
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    for (rel, content) in files {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+    let ws_uri = path_uri(ws.path());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({"processId": std::process::id(), "rootUri": ws_uri, "capabilities": {"workspace": {"workspaceEdit": {"documentChanges": true}}}, "initializationOptions": {"language": "hoi4", "rulesCache": rules_dir.path().to_string_lossy(), "vanilla": vanilla.path().to_string_lossy()}}),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    {
+        let rel = "localisation/test_l_english.yml";
+        let uri = path_uri(ws.path().join(rel));
+        write_frame(&mut child, &jsonrpc_notification("textDocument/didOpen", serde_json::json!({"textDocument": {"uri": uri, "languageId": "hoi4", "version": 1, "text": yml_en}}))).unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+    let uri = path_uri(ws.path().join("localisation/test_l_english.yml"));
+    let req = jsonrpc_request(
+        10,
+        "textDocument/rename",
+        serde_json::json!({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 2}, "newName": "new_key"}),
+    );
+    write_frame(&mut child, &req).unwrap();
+    let resp_str = read_response(&mut reader).unwrap();
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    child.kill().ok();
+    let edit = &resp["result"];
+    assert!(!edit.is_null(), "rename must succeed, got {}", resp_str);
+    let edit_str = edit.to_string();
+    // Both language files should be edited
+    assert!(
+        edit_str.contains("l_english") || edit_str.matches("new_key").count() >= 2,
+        "both language files should be edited, got {}",
+        edit_str
+    );
+    // At least two edits (one per file) – count occurrences of new_key
+    let count = edit_str.matches("new_key").count();
+    assert!(
+        count >= 2,
+        "expected at least 2 edits for 2 language files, got {} in {}",
+        count,
+        edit_str
+    );
+}
+
+#[test]
+fn test_loc_rename_updates_dollar_refs_in_yml() {
+    let yml_main = "l_english:\n my_key:0 \"Hello\"\n";
+    let yml_ref = "l_english:\n other:0 \"See $my_key$ and $my_key|Y$ end\"\n";
+    let files = &[
+        ("localisation/main_l_english.yml", yml_main),
+        ("localisation/ref_l_english.yml", yml_ref),
+    ];
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    for (rel, content) in files {
+        let p = ws.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+    let ws_uri = path_uri(ws.path());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({"processId": std::process::id(), "rootUri": ws_uri, "capabilities": {"workspace": {"workspaceEdit": {"documentChanges": true}}}, "initializationOptions": {"language": "hoi4", "rulesCache": rules_dir.path().to_string_lossy(), "vanilla": vanilla.path().to_string_lossy()}}),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let _ = read_response(&mut reader).unwrap();
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+    {
+        let rel = "localisation/main_l_english.yml";
+        let uri = path_uri(ws.path().join(rel));
+        write_frame(&mut child, &jsonrpc_notification("textDocument/didOpen", serde_json::json!({"textDocument": {"uri": uri, "languageId": "hoi4", "version": 1, "text": yml_main}}))).unwrap();
+        wait_for_diagnostics(&mut reader, rel);
+    }
+    let uri = path_uri(ws.path().join("localisation/main_l_english.yml"));
+    let req = jsonrpc_request(
+        10,
+        "textDocument/rename",
+        serde_json::json!({"textDocument": {"uri": uri}, "position": {"line": 1, "character": 2}, "newName": "new_key"}),
+    );
+    write_frame(&mut child, &req).unwrap();
+    let resp_str = read_response(&mut reader).unwrap();
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    child.kill().ok();
+    let edit_str = resp["result"].to_string();
+    // Definition in main file
+    assert!(edit_str.contains("new_key"), "new_key, got {}", edit_str);
+    // $REF$ inside ref file: inner key should be renamed, colour suffix preserved
+    assert!(
+        edit_str.contains("ref_l_english"),
+        "ref file should be edited, got {}",
+        edit_str
+    );
+    // The edit should contain new_key but not my_key inside the ref file's range (the new_text is new_key)
+    let count = edit_str.matches("new_key").count();
+    assert!(
+        count >= 3,
+        "expected at least 3 edits (def + 2 refs), got {} in {}",
+        count,
+        edit_str
+    );
+}

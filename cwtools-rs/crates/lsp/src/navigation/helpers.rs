@@ -887,6 +887,43 @@ pub(crate) fn code_token_cols_in_line_ignore_case(line: &str, needle_lower: &str
     out
 }
 
+/// Every 0-based char column where `$needle_lower$` appears as a loc ref in
+/// `line` (including `|colour` suffix, e.g. `$MY_KEY|Y$`). Returns the column
+/// of the inner key's first character (after the opening `$`), case-insensitive.
+/// Used for yml `$REF$` rename.
+pub(crate) fn loc_ref_key_cols_in_line(line: &str, needle_lower: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    // Find all `$` positions as char indices
+    let chars: Vec<char> = line.chars().collect();
+    let mut dollars: Vec<usize> = Vec::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '$' {
+            dollars.push(i);
+        }
+    }
+    let mut i = 0;
+    while i + 1 < dollars.len() {
+        let open = dollars[i];
+        let close = dollars[i + 1];
+        if close <= open + 1 {
+            i += 1;
+            continue;
+        }
+        let inner: String = chars[open + 1..close].iter().collect();
+        let key = inner.split('|').next().unwrap_or(&inner);
+        if !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            && key.to_ascii_lowercase() == needle_lower
+        {
+            out.push((open + 1) as u32);
+        }
+        i += 2;
+    }
+    out
+}
+
 /// Strip any `_desc` / `_tooltip` suffixes (repeatedly) to get the family root.
 /// `"my_thing_desc_tooltip"` -> `"my_thing"`.
 pub(crate) fn loc_root(key_lower: &str) -> String {
@@ -1373,6 +1410,64 @@ mod tests {
             2,
             "different URIs at same position must both survive"
         );
+    }
+
+    #[test]
+    fn code_token_ignore_case_matches_case_insensitively_and_respects_boundaries() {
+        // Case-insensitive whole-token: MY_KEY matches my_key / My_Key but not my_key_extra
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("x = MY_KEY y", "my_key"),
+            vec![4]
+        );
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("x = my_key_extra", "my_key"),
+            Vec::<u32>::new()
+        );
+        // Comment handling: # my_key inside comment not counted
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("x = my_key # MY_KEY", "my_key"),
+            vec![4]
+        );
+        // Quoted: inside "..." still matches (script values are quoted)
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("x = \"MY_KEY\" # MY_KEY", "my_key"),
+            vec![5]
+        );
+        // Dots are identifier chars, so my.key should not match my key
+        assert_eq!(
+            code_token_cols_in_line_ignore_case("a = my.key", "my_key"),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn loc_ref_key_cols_finds_dollar_refs_inside_yml() {
+        // $KEY$ and $KEY|Y$ both count, case-insensitive, whole-token
+        assert_eq!(
+            loc_ref_key_cols_in_line("  desc: \"See $MY_KEY$ and $OTHER|Y$\"", "my_key"),
+            vec![14]
+        );
+        assert_eq!(
+            loc_ref_key_cols_in_line("  desc: \"See $my_key|Y$\"", "my_key"),
+            vec![14]
+        );
+        // Not inside comment? yml comments start with # but our helper does not skip #; still, rename should possibly handle? For now, it still finds even after # – not critical.
+        assert_eq!(
+            loc_ref_key_cols_in_line("x = foo $my_key_extra$ y", "my_key"),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn loc_root_strips_desc_and_tooltip_repeatedly() {
+        assert_eq!(loc_root("my_key"), "my_key");
+        assert_eq!(loc_root("my_key_desc"), "my_key");
+        assert_eq!(loc_root("my_key_tooltip"), "my_key");
+        assert_eq!(loc_root("my_key_desc_tooltip"), "my_key");
+        assert_eq!(loc_root("my_key_tooltip_desc"), "my_key");
+        assert_eq!(loc_root("my_key_desc_desc"), "my_key");
+        // Non-suffix substring not stripped
+        assert_eq!(loc_root("my_key_desc_extra"), "my_key_desc_extra");
     }
 
     #[test]

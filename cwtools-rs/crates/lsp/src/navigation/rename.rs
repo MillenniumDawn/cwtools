@@ -10,7 +10,9 @@ use super::{
     at_var_at_cursor, code_token_cols_in_line, prepare_rename_range, rename_refused,
     source_range_in_text, word_at_position,
 };
-use crate::navigation::helpers::{code_token_cols_in_line_ignore_case, loc_root};
+use crate::navigation::helpers::{
+    code_token_cols_in_line_ignore_case, loc_ref_key_cols_in_line, loc_root,
+};
 
 impl Backend {
     pub(crate) async fn prepare_rename_impl(
@@ -168,8 +170,15 @@ impl Backend {
         let script_edits = self
             .collect_loc_rename_usages(&keys, &target_to_new, &fallback)
             .await;
+        let yml_ref_edits = self
+            .collect_loc_yml_refs(&keys, &target_to_new, &fallback)
+            .await;
         let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
-        for (file_uri, edits) in loc_edits.into_iter().chain(script_edits) {
+        for (file_uri, edits) in loc_edits
+            .into_iter()
+            .chain(script_edits)
+            .chain(yml_ref_edits)
+        {
             by_uri.entry(file_uri).or_default().extend(edits);
         }
         if by_uri.is_empty() {
@@ -311,6 +320,41 @@ impl Backend {
                 }
             }
             let _ = fallback;
+            let _ = keys;
+        }
+        by_uri.into_iter().collect()
+    }
+
+    async fn collect_loc_yml_refs(
+        &self,
+        keys: &HashSet<String>,
+        target_to_new: &HashMap<String, String>,
+        _fallback: &Url,
+    ) -> Vec<(String, Vec<TextEdit>)> {
+        let loc_uris = self.loc_file_uris().await;
+        if loc_uris.is_empty() {
+            return Vec::new();
+        }
+        let texts = self.file_text_snapshots_for(&loc_uris).await;
+        let encoding = self.state.config.read().position_encoding.clone();
+        let mut by_uri: HashMap<String, Vec<TextEdit>> = HashMap::new();
+        for uri in loc_uris {
+            let Some(snapshot) = texts.get(&uri) else {
+                continue;
+            };
+            let text = &snapshot.text;
+            for (line0, line) in text.lines().enumerate() {
+                for (key_lower, new_text) in target_to_new.iter() {
+                    for col in loc_ref_key_cols_in_line(line, key_lower) {
+                        let range =
+                            source_range_in_text(text, line0 as u32, col, key_lower, &encoding);
+                        by_uri.entry(uri.clone()).or_default().push(TextEdit {
+                            range,
+                            new_text: new_text.clone(),
+                        });
+                    }
+                }
+            }
             let _ = keys;
         }
         by_uri.into_iter().collect()
