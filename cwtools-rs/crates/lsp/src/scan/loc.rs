@@ -299,3 +299,86 @@ impl Backend {
         cwtools_profiling::log_rss("loc_rebuild_done");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cwtools_file_manager::file_manager::ScanBudget;
+    use cwtools_localization::{Lang, LocIndex, LocService};
+
+    #[test]
+    fn collect_loc_display_respects_primary_and_hover_all() {
+        // Two files: English and French, same key different text.
+        let tmp = tempfile::tempdir().unwrap();
+        let loc_dir = tmp.path().join("localisation");
+        std::fs::create_dir_all(&loc_dir).unwrap();
+        std::fs::write(
+            loc_dir.join("a_l_english.yml"),
+            "l_english:\n my_key:0 \"Hello\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            loc_dir.join("a_l_french.yml"),
+            "l_french:\n my_key:0 \"Bonjour\"\n",
+        )
+        .unwrap();
+        let svc = LocService::from_folder(tmp.path(), ScanBudget::default());
+        assert_eq!(svc.files().len(), 2);
+        let idx = LocIndex::build(&svc);
+        // Hover only primary (English) -> one translation.
+        let mut text = LocTextMap::default();
+        let mut locs = LocLocationMap::default();
+        collect_loc_display(&svc, &idx, Lang::English, false, &mut text, &mut locs);
+        let key: std::sync::Arc<str> = "my_key".into();
+        let entries = text.get(&key).expect("my_key hover");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, Lang::English);
+        assert_eq!(entries[0].1, "Hello");
+        // Hover all -> both languages.
+        let mut text_all = LocTextMap::default();
+        let mut locs_all = LocLocationMap::default();
+        collect_loc_display(
+            &svc,
+            &idx,
+            Lang::English,
+            true,
+            &mut text_all,
+            &mut locs_all,
+        );
+        let entries_all = text_all.get(&key).unwrap();
+        assert_eq!(entries_all.len(), 2);
+        // Locations: primary definition is preferred.
+        assert!(locs.contains_key(&key));
+        assert!(locs_all.contains_key(&key));
+    }
+
+    #[test]
+    fn collect_loc_display_prefers_primary_definition_over_first_scanned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc_dir = tmp.path().join("localisation");
+        std::fs::create_dir_all(&loc_dir).unwrap();
+        // Write French first (lexicographically earlier) but primary is English.
+        std::fs::write(
+            loc_dir.join("a_l_french.yml"),
+            "l_french:\n dup_key:0 \"Bonjour\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            loc_dir.join("b_l_english.yml"),
+            "l_english:\n dup_key:0 \"Hello\"\n",
+        )
+        .unwrap();
+        let svc = LocService::from_folder(tmp.path(), ScanBudget::default());
+        let idx = LocIndex::build(&svc);
+        let mut text = LocTextMap::default();
+        let mut locs = LocLocationMap::default();
+        collect_loc_display(&svc, &idx, Lang::English, false, &mut text, &mut locs);
+        let key: std::sync::Arc<str> = "dup_key".into();
+        let loc = locs.get(&key).unwrap();
+        assert!(
+            loc.0.to_string().contains("b_l_english"),
+            "primary English file should be the goto target, got {}",
+            loc.0
+        );
+    }
+}

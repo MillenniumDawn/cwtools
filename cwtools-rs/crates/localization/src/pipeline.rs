@@ -832,4 +832,85 @@ mod tests {
             "well-formed file must not emit CW001"
         );
     }
+
+    #[test]
+    fn parallel_command_validation_with_scripted_variables_is_sync() {
+        // Regression for the rayon Sync gate: `validate_loc_project_commands`
+        // fans out over `par_iter` while holding `&LocScopeData`, which carries
+        // `scripted_variables: Option<&dyn Fn(&str) -> bool>`. Without `Sync`
+        // on that trait object the closure passed to `flat_map_iter` fails to
+        // satisfy `Sync + Send` on every platform (Windows/macOS/Linux).
+        use crate::scope_validation::LocScopeData;
+        use cwtools_game::constants::Game;
+        use cwtools_game::scope_engine::ScopeId;
+        use cwtools_game::scope_engine::ScopeLink;
+        use cwtools_game::scope_registry::{ScopeDefOwned, ScopeRegistry};
+        use std::sync::Arc;
+
+        let mut reg = ScopeRegistry::default();
+        for (name, id) in [("country", 100u32), ("state", 101u32)] {
+            reg.by_name.insert(name.to_string(), ScopeId(id));
+            reg.by_id.insert(
+                ScopeId(id),
+                ScopeDefOwned {
+                    name: name.to_string(),
+                    aliases: vec![name.to_string()],
+                    subscope_of: vec![],
+                },
+            );
+        }
+        reg.links.insert(
+            "owner".to_string(),
+            ScopeLink {
+                valid_scopes: vec![ScopeId(101)],
+                target: Some(ScopeId(100)),
+                ignore_keys: vec![],
+            },
+        );
+        // Scripted variable registry must be `Sync` so the parallel pipeline
+        // can share it across threads.
+        fn is_known_var(name: &str) -> bool {
+            name.eq_ignore_ascii_case("war_support")
+        }
+        let data = LocScopeData {
+            game: Some(Game::Hoi4),
+            registry: Some(Arc::new(reg)),
+            terminal_commands: vec!["GetName".into()],
+            question_mark_variable: true,
+            parameter_variables: true,
+            scripted_variables: Some(&is_known_var),
+        };
+        // Build a service with many entries so rayon actually parallelizes.
+        let mut files = Vec::new();
+        for i in 0..50 {
+            files.push((
+                format!("a_{i}_l_english.yml"),
+                format!(
+                    "l_english:\n key{i}: \"[?Root.war_support] and [owner.GetName] and [totally_unknown]\"\n"
+                ),
+            ));
+        }
+        let svc = service_from(
+            &files
+                .iter()
+                .map(|(p, t)| (p.as_str(), t.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        // This is the exact call that previously failed to compile when
+        // `ScriptedVariables` lacked `Sync`.
+        let diags = validate_loc_project_commands(&svc, None, &data);
+        // `totally_unknown` is an unknown terminal command: with a registry
+        // and a non-empty terminal list it must be flagged (CW226 for a Jomini
+        // single-segment chain, CW266 for the legacy single-segment path).
+        // Either way it must surface, while `war_support` and `owner.GetName`
+        // are accepted. The count proves the rayon `Sync` gate held.
+        let flagged = diags
+            .iter()
+            .filter(|d| d.code == "CW226" || d.code == "CW266")
+            .count();
+        assert_eq!(flagged, 50, "each file has one unknown command: {diags:?}");
+        // Ensure `LocScopeData` itself is `Sync` (compile-time assertion).
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<LocScopeData>();
+    }
 }

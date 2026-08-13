@@ -1309,10 +1309,12 @@ pub fn load_rules(
 }
 
 #[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The header-only read must agree with a full parse on every header shape
     /// the loc parser accepts, or a scoped run would drop files it should keep.
     #[test]
     fn loc_header_language_matches_the_full_parse() {
@@ -1428,5 +1430,146 @@ mod tests {
             vanilla_gated_checks(Game::Stellaris, false),
             ["CW113", "CW222", "CW227", "CW229", "CW250", "CW500"]
         );
+    }
+
+    #[test]
+    fn default_cache_dir_is_absolute_and_honors_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Must be absolute on both Unix and Windows; a relative XDG/LAPPDATA
+        // would break the cache-key canonicalization.
+        let dir = default_cache_dir().expect("cache dir");
+        assert!(
+            dir.is_absolute(),
+            "{dir:?} must be absolute on {}",
+            std::env::consts::OS
+        );
+        // XDG_CACHE_HOME wins over HOME on every platform.
+        let tmp = tempfile::tempdir().unwrap();
+        let xdg = tmp.path().join("xdg");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&xdg).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+        let prev_la = std::env::var("LOCALAPPDATA").ok();
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: test-only; serialized by ENV_LOCK
+                unsafe {
+                    if let Some(v) = self.prev.take() {
+                        std::env::set_var(self.key, v);
+                    } else {
+                        std::env::remove_var(self.key);
+                    }
+                }
+            }
+        }
+        let _g1 = EnvGuard {
+            key: "XDG_CACHE_HOME",
+            prev: prev_xdg,
+        };
+        let _g2 = EnvGuard {
+            key: "HOME",
+            prev: prev_home,
+        };
+        let _g3 = EnvGuard {
+            key: "LOCALAPPDATA",
+            prev: prev_la,
+        };
+        // SAFETY: test-only; serialized by ENV_LOCK
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", &xdg);
+            std::env::set_var("HOME", &home);
+            std::env::set_var("LOCALAPPDATA", "");
+        }
+        let resolved = default_cache_dir().unwrap();
+        assert_eq!(resolved, xdg.join("cwtools"));
+    }
+
+    #[test]
+    fn default_cache_dir_falls_back_to_temp_when_no_home() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
+        let prev_home = std::env::var("HOME").ok();
+        let prev_la = std::env::var("LOCALAPPDATA").ok();
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: test-only; serialized by ENV_LOCK
+                unsafe {
+                    if let Some(v) = self.prev.take() {
+                        std::env::set_var(self.key, v);
+                    } else {
+                        std::env::remove_var(self.key);
+                    }
+                }
+            }
+        }
+        let _g1 = EnvGuard {
+            key: "XDG_CACHE_HOME",
+            prev: prev_xdg,
+        };
+        let _g2 = EnvGuard {
+            key: "HOME",
+            prev: prev_home,
+        };
+        let _g3 = EnvGuard {
+            key: "LOCALAPPDATA",
+            prev: prev_la,
+        };
+        // SAFETY: test-only; serialized by ENV_LOCK
+        unsafe {
+            std::env::remove_var("XDG_CACHE_HOME");
+            std::env::remove_var("HOME");
+            std::env::remove_var("LOCALAPPDATA");
+        }
+        let dir = default_cache_dir().expect("fallback");
+        assert!(dir.to_string_lossy().contains("cwtools"));
+        assert!(dir.is_absolute());
+    }
+
+    #[test]
+    fn load_loc_service_scopes_to_requested_languages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = tmp.path().join("localisation");
+        std::fs::create_dir_all(&loc).unwrap();
+        std::fs::write(loc.join("en_l_english.yml"), "l_english:\n k1:0 \"hi\"\n").unwrap();
+        std::fs::write(
+            loc.join("fr_l_french.yml"),
+            "l_french:\n k2:0 \"bonjour\"\n",
+        )
+        .unwrap();
+        let all = load_loc_service(&[tmp.path()], None, &[], &[]);
+        assert_eq!(all.files().len(), 2);
+        let scoped = load_loc_service(&[tmp.path()], Some(&[Lang::English]), &[], &[]);
+        assert_eq!(scoped.files().len(), 1);
+        assert_eq!(scoped.files()[0].lang, Some(Lang::English));
+        // CSV (no single header language) is never dropped by the language filter.
+        std::fs::write(loc.join("names.csv"), "key;english;french\nfoo;Foo;Bar\n").unwrap();
+        let scoped_with_csv = load_loc_service(&[tmp.path()], Some(&[Lang::English]), &[], &[]);
+        assert!(scoped_with_csv.files().iter().any(|f| f.is_csv));
+    }
+
+    #[test]
+    fn load_loc_service_respects_ignore_globs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = tmp.path().join("localisation");
+        std::fs::create_dir_all(&loc).unwrap();
+        std::fs::write(loc.join("keep_l_english.yml"), "l_english:\n k:0 \"hi\"\n").unwrap();
+        std::fs::write(
+            loc.join("skip_me_l_english.yml"),
+            "l_english:\n k2:0 \"hi\"\n",
+        )
+        .unwrap();
+        let filtered = load_loc_service(&[tmp.path()], None, &["skip_*".to_string()], &[]);
+        assert_eq!(filtered.files().len(), 1);
+        assert!(filtered.files()[0].path.contains("keep"));
     }
 }

@@ -204,6 +204,27 @@ fn write_settings_sig(dir: &Path, sig: u64) -> std::io::Result<()> {
 /// Validate (and update) the settings signature. Returns `true` if the cache is
 /// still valid; `false` if the directory was cleared and must be rebuilt.
 pub fn validate_or_clear(cache_dir: &Path, fingerprint: u64) -> std::io::Result<bool> {
+    // `cargo test` shares one SCRATCH_HOME across parallel test binaries; two
+    // `validate_or_clear` with different fingerprints can race: one prunes an
+    // empty fingerprint dir while the other is creating it. Treat a transient
+    // NotFound/AlreadyExists/Interrupted as a retry rather than a hard
+    // "parse cache unavailable" warning.
+    match try_validate_or_clear(cache_dir, fingerprint) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            try_validate_or_clear(cache_dir, fingerprint)
+        }
+        other => other,
+    }
+}
+
+fn try_validate_or_clear(cache_dir: &Path, fingerprint: u64) -> std::io::Result<bool> {
     let dir = workspace_cache_dir(cache_dir, fingerprint);
     // The path is built from a cache root the LSP client chose, and both arms
     // below write or delete through it. Anything already sitting there that is
@@ -1166,5 +1187,34 @@ mod tests {
         assert!(load(tmp.path(), 2, text, &table).is_none());
         // Initializing another workspace must not delete the original cache.
         assert!(load(tmp.path(), 1, text, &table).is_some());
+    }
+
+    #[test]
+    fn concurrent_validate_or_clear_shares_a_cache_root() {
+        // `cargo test --workspace` shares one SCRATCH_HOME across parallel
+        // test binaries; two `validate_or_clear` racing on the same root must
+        // not leave it unusable (#159 follow-up, Windows/macOS flake).
+        // Empty dirs are pruned, so we only assert no hard error and that a
+        // fresh fingerprint can still be created afterwards.
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = Arc::new(tmp.path().to_path_buf());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let root = Arc::clone(&cache_root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    validate_or_clear(&root, 0x1000 + i).is_ok()
+                })
+            })
+            .collect();
+        for h in handles {
+            assert!(h.join().unwrap(), "concurrent validate_or_clear failed");
+        }
+        // A fresh fingerprint must still be creatable after the race.
+        assert!(!validate_or_clear(cache_root.as_path(), 0x9fff).unwrap_or(true));
+        assert!(validate_or_clear(cache_root.as_path(), 0x9fff).unwrap());
     }
 }
