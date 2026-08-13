@@ -99,6 +99,8 @@ pub fn rules_at_pos(
     // The resolver discards the diagnostics it produces, but the shared context
     // still wants the run's shared path.
     let file_arc: crate::FilePath = std::sync::Arc::from(file_path);
+    let alias_branch_budget = std::cell::RefCell::new(AliasBranchBudget::default());
+    let inline_stack = std::cell::RefCell::new(Vec::new());
     let ctx = ValidationCtx {
         ast,
         ruleset,
@@ -109,10 +111,12 @@ pub fn rules_at_pos(
         modifier_keys: prepared.modifier_keys,
         loc_index: prepared.loc_index,
         extra_loc_keys: prepared.extra_loc_keys,
+        inline_scripts: prepared.inline_scripts,
         scope_checks: prepared.scope_checks,
         var_checks: prepared.var_checks,
         loop_vars: std::cell::RefCell::new(Vec::new()),
-        alias_branch_budget: std::cell::RefCell::new(AliasBranchBudget::default()),
+        alias_branch_budget: &alias_branch_budget,
+        inline_stack: &inline_stack,
         alias_memo: std::cell::RefCell::new(crate::ctx::AliasMemo::default()),
         // The resolver is a read-only navigation walk; it never contributes to
         // the project-wide unused check.

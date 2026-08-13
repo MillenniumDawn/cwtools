@@ -143,6 +143,10 @@ pub(crate) struct ValidationCtx<'a> {
     /// resolves immediately without waiting for a full rescan (#36). Lowercased,
     /// like the keys the existence checks compare against.
     pub(crate) extra_loc_keys: Option<&'a HashSet<String>>,
+    /// The `common/inline_scripts` bodies a call site may pull in. `None` on the
+    /// paths that never loaded them (single-file entry points, the LSP), where an
+    /// `inline_script` call is accepted unexpanded rather than guessed at.
+    pub(crate) inline_scripts: Option<&'a crate::inline_script::InlineScripts>,
     pub(crate) scope_checks: bool,
     pub(crate) var_checks: bool,
     /// Stack of implicit/explicit loop-variable names (normalized) in scope for
@@ -155,7 +159,13 @@ pub(crate) struct ValidationCtx<'a> {
     pub(crate) loop_vars: RefCell<Vec<String>>,
     /// Per-file cap on candidate branches from overloaded aliases. The first
     /// branch over the cap records the one diagnostic emitted after validation.
-    pub(crate) alias_branch_budget: RefCell<AliasBranchBudget>,
+    /// Borrowed rather than owned so an expanded `inline_script` body spends the
+    /// calling file's budget instead of being handed a fresh one.
+    pub(crate) alias_branch_budget: &'a RefCell<AliasBranchBudget>,
+    /// Lookup names of the `inline_script`s currently being expanded, outermost
+    /// first. Shared with every expanded body's context, which is what makes a
+    /// cycle or a runaway nesting reportable at the call site that started it.
+    pub(crate) inline_stack: &'a RefCell<Vec<String>>,
     /// Per-file memo of alias-usage results, so a subtree reached again in the
     /// same state is replayed instead of revalidated. Armed only once the file
     /// has spent [`ALIAS_MEMO_ARM_AFTER`] branches.
@@ -168,7 +178,40 @@ pub(crate) struct ValidationCtx<'a> {
     pub(crate) type_uses: Option<&'a RefCell<crate::references::UsedInstances>>,
 }
 
-impl ValidationCtx<'_> {
+impl<'a> ValidationCtx<'a> {
+    /// The context an expanded `inline_script` body is walked in: the same rules,
+    /// indexes, file and branch budget as the call site, over the rebuilt body's
+    /// own arena.
+    ///
+    /// The loop-variable stack is copied rather than shared — the body reads the
+    /// names in scope where it was called, and anything it pushes belongs to the
+    /// blocks inside it. The alias memo starts empty because its keys are source
+    /// spans, which only identify a usage within one arena.
+    pub(crate) fn for_inline_body<'b>(&'b self, ast: &'b ParsedFile) -> ValidationCtx<'b>
+    where
+        'a: 'b,
+    {
+        ValidationCtx {
+            ast,
+            ruleset: self.ruleset,
+            table: self.table,
+            file_path: self.file_path,
+            game: self.game,
+            type_index: self.type_index,
+            modifier_keys: self.modifier_keys,
+            loc_index: self.loc_index,
+            extra_loc_keys: self.extra_loc_keys,
+            inline_scripts: self.inline_scripts,
+            scope_checks: self.scope_checks,
+            var_checks: self.var_checks,
+            loop_vars: RefCell::new(self.loop_vars.borrow().clone()),
+            alias_branch_budget: self.alias_branch_budget,
+            inline_stack: self.inline_stack,
+            alias_memo: RefCell::new(AliasMemo::default()),
+            type_uses: self.type_uses,
+        }
+    }
+
     /// Whether uses of `type_name`'s instances are being recorded this run.
     /// Checked before the affix forms a complex `<type>` reference expands to,
     /// so a run that tracks nothing never builds them.

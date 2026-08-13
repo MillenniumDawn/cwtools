@@ -169,6 +169,7 @@ fn bench_rules_hot(c: &mut Criterion) {
         modifier_keys: None,
         loc_index: None,
         extra_loc_keys: None,
+        inline_scripts: None,
         registry: None,
         scope_checks: false,
         var_checks: false,

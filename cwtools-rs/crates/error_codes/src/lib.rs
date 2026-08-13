@@ -232,12 +232,13 @@ pub const CW272_FROM_RULES_CUSTOM_ERROR: ErrorCode = ErrorCode {
     message_template: "{}",
 };
 
-/// An `inline_script` usage that itself fails to validate.
-/// F# `InlineScriptResultsInError`.
+/// An `inline_script` call whose body the validator could not pull in: the
+/// script doesn't exist, the call names none, or the chain loops or runs too
+/// deep. F# `InlineScriptResultsInError`.
 pub const CW274_INLINE_SCRIPT_ERROR: ErrorCode = ErrorCode {
     id: "CW274",
     severity: ErrorSeverity::Error,
-    message_template: "This usage of inline_script results in an error, see related",
+    message_template: "{}",
 };
 
 /// Localisation string references another key that doesn't exist.

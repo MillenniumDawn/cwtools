@@ -48,8 +48,8 @@ use cwtools_rules::ruleset_loader::{RuleParseError, load_ruleset_from_dir};
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::references::{UsedInstances, check_unused_instances, needs_use_tracking};
 use cwtools_validation::{
-    ErrorSeverity, Prepared, ValidationError, build_modifier_keys, build_scope_registry_arc,
-    checks_from_env, validate_prepared, validate_prepared_tracking_uses,
+    ErrorSeverity, InlineScripts, Prepared, ValidationError, build_modifier_keys,
+    build_scope_registry_arc, checks_from_env, validate_prepared, validate_prepared_tracking_uses,
 };
 
 /// A discovered workspace/mod file, retained between indexing and validation.
@@ -277,6 +277,7 @@ pub struct Session {
     ruleset: RuleSet,
     type_index: TypeIndex,
     modifier_keys: HashSet<String>,
+    inline_scripts: InlineScripts,
     loc_service: LocService,
     loc_index: LocIndex,
     loc_languages: Option<Vec<Lang>>,
@@ -460,7 +461,7 @@ impl Session {
             }
             type_index.value_set_values.merge_file(file_uri, value_sets);
         }
-        let source_files = parsed
+        let source_files: Vec<SourceFile> = parsed
             .into_iter()
             .map(|src| SourceFile {
                 path: src.path,
@@ -468,6 +469,11 @@ impl Session {
                 fingerprint: src.fingerprint,
             })
             .collect();
+
+        // Bodies an `inline_script` call site splices in. Kept resident because a
+        // call site can only be checked against what it pulls in, and the same
+        // script is reached from every file that references it.
+        let inline_scripts = load_inline_scripts(&source_files, &rules_table);
 
         // Auto-managed cache: reuse a fresh one instead of walking the install,
         // and remember where to write one when there's nothing to reuse.
@@ -595,6 +601,7 @@ impl Session {
             ruleset,
             type_index,
             modifier_keys,
+            inline_scripts,
             loc_service,
             loc_index,
             loc_languages,
@@ -626,6 +633,7 @@ impl Session {
             loc_index: Some(&self.loc_index),
             // The CLI/driver loads loc from disk; no live-edit overlay.
             extra_loc_keys: None,
+            inline_scripts: Some(&self.inline_scripts),
             registry: self.registry.as_ref(),
             scope_checks,
             var_checks,
@@ -682,6 +690,11 @@ impl Session {
     /// The expanded modifier-key set.
     pub fn modifier_keys(&self) -> &HashSet<String> {
         &self.modifier_keys
+    }
+
+    /// The `common/inline_scripts` bodies call sites expand against.
+    pub fn inline_scripts(&self) -> &InlineScripts {
+        &self.inline_scripts
     }
 
     /// The loc-key index (workspace + vanilla).
@@ -863,6 +876,33 @@ impl SessionWithFiles {
     pub fn parsed_files(&self) -> &[SourceFile] {
         &self.files
     }
+}
+
+/// Parse the workspace's `common/inline_scripts` files into the expansion
+/// registry. Re-read rather than kept from the indexing pass: the ASTs there are
+/// consumed building the indexes, and a mod holds a handful of these against
+/// thousands of script files.
+fn load_inline_scripts(files: &[SourceFile], table: &StringTable) -> InlineScripts {
+    let mut scripts = InlineScripts::default();
+    for file in files
+        .iter()
+        .filter(|file| InlineScripts::is_script_path(&file.logical_path))
+    {
+        match read_text(&file.path) {
+            Ok(text) => {
+                scripts.insert(
+                    &file.logical_path,
+                    parse_string_without_comments(&text, table),
+                );
+            }
+            Err(error) => eprintln!(
+                "warn: skipping inline script {}: {}",
+                file.path.display(),
+                error
+            ),
+        }
+    }
+    scripts
 }
 
 /// Convert parse errors from a partially-parsed file into `ValidationError`s so
