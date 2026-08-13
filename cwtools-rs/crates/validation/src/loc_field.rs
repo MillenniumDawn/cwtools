@@ -199,18 +199,24 @@ fn check_loc_key(
         // config's built-in reads plus every variable the project sets. Withheld
         // while the variable index is empty (an unscanned workspace), which
         // leaves multi-segment chains lenient rather than flagging all of them.
-        let var_index = ctx
-            .type_index
-            .map(|i| &i.var_index)
-            .filter(|v| !v.is_empty());
+        let ruleset = ctx.ruleset;
+        let type_index = ctx.type_index;
+        let var_index = type_index.map(|i| &i.var_index).filter(|v| !v.is_empty());
         let names_variable = |name: &str| {
-            is_builtin_variable(ctx.ruleset, name) || var_index.is_some_and(|v| v.contains(name))
+            is_builtin_variable(ruleset, name) || var_index.is_some_and(|v| v.contains(name))
         };
         let lookup: cwtools_localization::ScriptedVariables<'_> = &names_variable;
+        let names_scripted_loc =
+            move |name: &str| type_index.is_some_and(|ti| ti.contains("scripted_loc", name));
+        let loc_lookup: cwtools_localization::ScriptedVariables<'_> = &names_scripted_loc;
+        let has_scripted_loc =
+            type_index.is_some_and(|ti| !ti.instances("scripted_loc").is_empty());
         let data = cwtools_localization::LocScopeData {
             game,
+            terminal_commands: ctx.ruleset.localisation_commands.iter().cloned().collect(),
             registry: scope_context.map(|c| c.registry.clone()),
             scripted_variables: var_index.is_some().then_some(lookup),
+            scripted_locs: has_scripted_loc.then_some(loc_lookup),
             ..Default::default()
         };
         for diag in cwtools_localization::validate_loc_commands(entry, initial, &data) {

@@ -879,6 +879,7 @@ mod tests {
             question_mark_variable: true,
             parameter_variables: true,
             scripted_variables: Some(&is_known_var),
+            ..Default::default()
         };
         // Build a service with many entries so rayon actually parallelizes.
         let mut files = Vec::new();

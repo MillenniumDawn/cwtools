@@ -159,6 +159,7 @@ pub fn merge_ruleset(dst: &mut RuleSet, src: RuleSet) {
     dst.scope_inputs.extend(src.scope_inputs);
     dst.link_inputs.extend(src.link_inputs);
     dst.folders.extend(src.folders);
+    dst.localisation_commands.extend(src.localisation_commands);
 }
 
 /// Parse a `folders.cwt`: one folder name per line, `#` comments and blank

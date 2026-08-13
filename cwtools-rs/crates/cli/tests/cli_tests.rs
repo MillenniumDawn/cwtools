@@ -1295,7 +1295,7 @@ fn test_loc_with_rules_reports_the_command_checks() {
         .stdout(predicate::str::contains(
             "controller used in wrong scope. In country but expected state",
         ))
-        .stderr(predicate::str::contains("Loaded 2 scopes and 2 links"));
+        .stderr(predicate::str::contains("Loaded 2 scopes, 2 links and"));
 }
 
 /// Half the pair checks nothing, and says so rather than looking like it did:

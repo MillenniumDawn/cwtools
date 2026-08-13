@@ -160,6 +160,32 @@ pub(crate) fn extract_scope_defs(
     }
 }
 
+/// Collect `localisation_commands = { GetName = ... }` terminal getters.
+pub(crate) fn extract_localisation_commands(
+    children: &[Child],
+    ast: &ParsedFile,
+    table: &StringTable,
+    ruleset: &mut RuleSet,
+) {
+    for child in children {
+        let Child::Leaf(lidx) = child else {
+            continue;
+        };
+        let name = table
+            .get_string(ast.arena.leaves[*lidx as usize].key.normal)
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        if name.is_empty() || name.starts_with('<') && name.ends_with('>') {
+            continue;
+        }
+        ruleset
+            .localisation_commands
+            .insert(name.to_ascii_lowercase());
+    }
+}
+
 /// Parse a top-level `links = { name = { output_scope=.. input_scopes=.. ... } }`
 /// block (links.cwt) into full `LinkInput`s, and record link/prefix names in
 /// `scope_links` (the valid-key set used by `scope_field` matching).

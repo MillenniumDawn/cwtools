@@ -81,6 +81,11 @@ pub struct LocScopeData<'a> {
     /// final segment. `None` keeps every multi-segment chain lenient, which is
     /// what a run with no variable index gets.
     pub scripted_variables: Option<ScriptedVariables<'a>>,
+    /// Scripted-localisation registry, consulted alongside terminal commands
+    /// before CW226 fires. Mirrors `scripted_variables` but for the final
+    /// tail of a command chain (`AST_GetNavyName` etc). `None` keeps the
+    /// check lenient when no type index is available.
+    pub scripted_locs: Option<ScriptedVariables<'a>>,
 }
 
 impl Default for LocScopeData<'_> {
@@ -92,6 +97,7 @@ impl Default for LocScopeData<'_> {
             parameter_variables: true,
             registry: None,
             scripted_variables: None,
+            scripted_locs: None,
         }
     }
 }
@@ -393,17 +399,18 @@ fn validate_jomini_chain(
     let mut ctx = build_loc_ctx(data, engine_game, initial_scope);
     // A `?` marks the bracket as a variable read (`[?ROOT.war_support|1]`), so the
     // final segment is a variable name the scripted-variable registry answers for.
-    // A chain without one ends in a command or a scripted-localisation name, and
-    // there is no registry for those — it stays exempt, as every multi-segment
-    // chain used to be. So does a chain reading through a variable
-    // (`[?GER_crisis_id.GERGetCrisisType]`), where the tail is a command again.
-    // Unknown intermediates (country-tag scopes like PAL) poison either kind,
-    // which is tracked below.
+    // A chain reading through a variable (`[?GER_crisis_id.GERGetCrisisType]`)
+    // has an opaque intermediate value and stays lenient. Other multi-segment
+    // chains (e.g. `ROOT.GetName`, `ROOT.AST_GetNavyName`) end in a terminal
+    // command or a scripted-localisation name and are validated against the
+    // rules/config registries. Unknown intermediates (country-tag scopes like
+    // PAL) poison either kind, which is tracked below.
     let marker = chain[0].key.strip_prefix('?');
-    let variable_read = data.question_mark_variable
-        && marker.is_some_and(|m| !reads_a_variable(m, data))
-        && data.scripted_variables.is_some();
-    let mut had_lenient_intermediate = !variable_read && chain.len() > 1;
+    let has_q_mark = data.question_mark_variable && marker.is_some();
+    let reads_through_variable = has_q_mark && marker.is_some_and(|m| reads_a_variable(m, data));
+    let lacks_variable_registry = has_q_mark && data.scripted_variables.is_none();
+    let mut had_lenient_intermediate =
+        (reads_through_variable || lacks_variable_registry) && chain.len() > 1;
 
     for (i, cmd) in chain.iter().enumerate() {
         let seg = &cmd.key;
@@ -453,10 +460,11 @@ fn validate_jomini_chain(
                     && !looks_terminal
                     && !had_lenient_intermediate
                     && !reads_a_variable(seg, data)
+                    && !is_scripted_loc(seg, data)
                 {
                     // Registry present, chain resolved cleanly up to this point,
-                    // final command is neither a command nor a defined variable:
-                    // CW226 (mirrors F# `LocNotFound`).
+                    // final segment is neither a known command, a defined variable,
+                    // nor a scripted-localisation: CW226 (mirrors F# `LocNotFound`).
                     diags.push(LocCommandDiagnostic::NotFound {
                         command: seg.to_string(),
                     });
@@ -479,6 +487,17 @@ fn validate_jomini_chain(
 /// engine resolves at runtime, and a `$ARG$`-concatenated name.
 fn reads_a_variable(segment: &str, data: &LocScopeData<'_>) -> bool {
     let Some(lookup) = data.scripted_variables else {
+        return false;
+    };
+    let name = segment.split('|').next().unwrap_or(segment).trim();
+    if name.is_empty() || name.contains(':') || name.contains('$') {
+        return true;
+    }
+    name.parse::<f64>().is_ok() || lookup(name)
+}
+
+fn is_scripted_loc(segment: &str, data: &LocScopeData<'_>) -> bool {
+    let Some(lookup) = data.scripted_locs else {
         return false;
     };
     let name = segment.split('|').next().unwrap_or(segment).trim();
@@ -576,6 +595,7 @@ mod tests {
             parameter_variables: true,
             registry: Some(Arc::new(reg)),
             scripted_variables: None,
+            ..Default::default()
         }
     }
 
@@ -797,6 +817,7 @@ mod tests {
             parameter_variables: true,
             registry: None, // no registry
             scripted_variables: None,
+            ..Default::default()
         };
         let diags = validate_loc_commands(&entry, ScopeId(0), &data);
         assert!(
@@ -861,15 +882,40 @@ mod tests {
     }
 
     #[test]
-    fn command_chain_stays_lenient() {
-        // No `?`: the final segment is a command or a scripted-localisation name,
-        // and there is no registry for those.
+    fn command_chain_typo_is_flagged() {
+        // No `?`: the final segment is checked against terminal commands and
+        // scripted-localisations; a typo must flag CW226.
         let entry = chain(&["Root", "war_suport"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert_eq!(
+            diags,
+            vec![LocCommandDiagnostic::NotFound {
+                command: "war_suport".into(),
+            }],
+        );
+    }
+
+    #[test]
+    fn command_chain_with_terminal_is_accepted() {
+        let entry = chain(&["Root", "GetName"]);
         let data = hoi4_data_with_variables();
         let diags = validate_loc_commands(&entry, ScopeId(100), &data);
         assert!(
             diags.is_empty(),
-            "a command chain should stay lenient: {diags:?}"
+            "a terminal command tail should be accepted: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn command_chain_with_scripted_loc_is_accepted() {
+        let entry = chain(&["Root", "AST_GetNavyName"]);
+        let mut data = hoi4_data_with_variables();
+        data.scripted_locs = Some(&|name: &str| name.eq_ignore_ascii_case("AST_GetNavyName"));
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "a scripted-localisation tail should be accepted: {diags:?}"
         );
     }
 
