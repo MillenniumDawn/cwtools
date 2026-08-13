@@ -1772,7 +1772,25 @@ fn test_validate_default_report_type_matches_explicit_cli() {
         .output()
         .unwrap();
     assert_eq!(default_out.stdout, explicit_out.stdout);
-    assert_eq!(default_out.stderr, explicit_out.stderr);
+    // Only the known transient cache warnings that race under parallel
+    // `cargo test` sharing SCRATCH_HOME are filtered; any other `warn:`
+    // must remain visible so a real persistent cache regression is not hidden.
+    fn without_cache_noise(buf: &[u8]) -> String {
+        String::from_utf8_lossy(buf)
+            .lines()
+            .filter(|l| {
+                !l.contains("warn: parse cache unavailable")
+                    && !l.contains("warn: could not read base-game cache")
+                    && !l.contains("  warn: could not write base-game cache")
+                    && !l.contains("  Base-game cache")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    assert_eq!(
+        without_cache_noise(&default_out.stderr),
+        without_cache_noise(&explicit_out.stderr)
+    );
     assert_eq!(default_out.status.code(), explicit_out.status.code());
 
     let stdout = String::from_utf8(default_out.stdout).unwrap();

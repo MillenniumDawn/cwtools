@@ -1738,4 +1738,93 @@ mod tests {
             "l_english:\n my_focus:0 \"TODO\"\n my_focus_desc:0 \"TODO\"\n"
         );
     }
+
+    #[test]
+    fn extract_localisation_languages_handles_absent_and_empty() {
+        assert_eq!(extract_localisation_languages(&json!({})), None);
+        // Non-array is a silent None (warns, doesn't scope).
+        assert_eq!(
+            extract_localisation_languages(&json!({ "localisationLanguages": "english" })),
+            None
+        );
+        // Empty array or all-unknown -> Some(None) meaning "validate all" (no scoping).
+        assert_eq!(
+            extract_localisation_languages(&json!({ "localisationLanguages": [] })),
+            Some(None)
+        );
+        assert_eq!(
+            extract_localisation_languages(&json!({ "localisationLanguages": ["klingon"] })),
+            Some(None)
+        );
+        // Mixed known/unknown keeps only known.
+        assert_eq!(
+            extract_localisation_languages(
+                &json!({ "localisationLanguages": ["english", "klingon", "french"] })
+            ),
+            Some(Some(vec![Lang::English, Lang::French]))
+        );
+    }
+
+    #[test]
+    fn extract_bool_setting_distinguishes_absent_from_wrong_type() {
+        assert_eq!(extract_bool_setting(&json!({}), "k"), None);
+        assert_eq!(extract_bool_setting(&json!({ "k": true }), "k"), Some(true));
+        assert_eq!(
+            extract_bool_setting(&json!({ "k": false }), "k"),
+            Some(false)
+        );
+        for v in [json!("true"), json!(1), json!(null)] {
+            assert_eq!(extract_bool_setting(&json!({ "k": v }), "k"), None);
+        }
+    }
+
+    #[test]
+    fn extract_hover_scope_display_accepts_only_two_strings() {
+        assert_eq!(extract_hover_scope_display(&json!({})), None);
+        assert_eq!(
+            extract_hover_scope_display(&json!({ "hoverScopeDisplay": "context" })),
+            Some(false)
+        );
+        assert_eq!(
+            extract_hover_scope_display(&json!({ "hoverScopeDisplay": "resolved" })),
+            Some(true)
+        );
+        for v in [
+            json!("Resolved"),
+            json!("CONTEXT"),
+            json!(true),
+            json!(null),
+        ] {
+            assert_eq!(
+                extract_hover_scope_display(&json!({ "hoverScopeDisplay": v })),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn folders_to_paths_drops_non_file_uris_and_empty() {
+        assert!(folders_to_paths(&[]).is_empty());
+        assert!(folders_to_paths(&["http://localhost/".to_string()]).is_empty());
+        assert!(folders_to_paths(&["not a uri".to_string()]).is_empty());
+        // A file URI with a drive letter parses on all platforms via `Url`.
+        let file_uri = if cfg!(windows) {
+            "file:///C:/repo"
+        } else {
+            "file:///repo"
+        };
+        let paths = folders_to_paths(&[file_uri.to_string()]);
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn extract_ignore_patterns_filters_non_string_and_empty() {
+        let opts = json!({
+            "ignoreFilePatterns": ["*.tmp", "", 42, null, "keep.txt"],
+            "ignoreDirectories": ["build", ""]
+        });
+        let (files, dirs) = extract_ignore_patterns(&opts);
+        assert_eq!(files, vec!["*.tmp".to_string(), "keep.txt".to_string()]);
+        assert_eq!(dirs, vec!["build".to_string()]);
+    }
 }

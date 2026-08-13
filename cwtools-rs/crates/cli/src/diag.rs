@@ -321,6 +321,17 @@ mod tests {
     use super::*;
     use cwtools_parser::ast::{SourcePos, SourceRange};
     use cwtools_parser::fix::SuggestedFix;
+    use std::path::PathBuf;
+
+    /// Absolute path spelled the host's way. On Windows a leading `/` is not
+    /// absolute (no drive), so tests must not hardcode it.
+    fn abs(tail: &str) -> String {
+        if cfg!(windows) {
+            format!("C:/{tail}")
+        } else {
+            format!("/{tail}")
+        }
+    }
 
     fn err_base() -> ValidationError {
         ValidationError {
@@ -343,16 +354,16 @@ mod tests {
     /// must all collapse to one digest.
     #[test]
     fn diag_hash_is_stable_across_path_spellings_of_the_same_file() {
-        let root = Path::new("/repo/mod");
+        let root = PathBuf::from(abs("repo/mod"));
         let spellings = [
-            "/repo/mod/common/x.txt",
-            "common/x.txt",
-            "/repo/mod/./common/x.txt",
-            r"\repo\mod\common\x.txt",
+            abs("repo/mod/common/x.txt"),
+            "common/x.txt".to_string(),
+            abs("repo/mod/./common/x.txt"),
+            r"\repo\mod\common\x.txt".to_string(),
         ];
         let hashes: Vec<String> = spellings
             .iter()
-            .map(|f| diag_hash(root, f, "CW282", "m", "cost = 150"))
+            .map(|f| diag_hash(&root, f, "CW282", "m", "cost = 150"))
             .collect();
         for (spelling, hash) in spellings.iter().zip(&hashes) {
             assert_eq!(
@@ -367,9 +378,21 @@ mod tests {
     /// alongside mod files) still produces a stable digest, not a panic.
     #[test]
     fn diag_hash_is_stable_for_a_file_outside_the_root() {
-        let root = Path::new("/repo/mod");
-        let a = diag_hash(root, "/vanilla/common/x.txt", "CW282", "m", "cost = 150");
-        let b = diag_hash(root, "/vanilla/common/x.txt", "CW282", "m", "cost = 150");
+        let root = PathBuf::from(abs("repo/mod"));
+        let a = diag_hash(
+            &root,
+            &abs("vanilla/common/x.txt"),
+            "CW282",
+            "m",
+            "cost = 150",
+        );
+        let b = diag_hash(
+            &root,
+            &abs("vanilla/common/x.txt"),
+            "CW282",
+            "m",
+            "cost = 150",
+        );
         assert_eq!(a, b);
     }
 
@@ -377,26 +400,27 @@ mod tests {
     /// and the root spelling disagree.
     #[test]
     fn relative_file_strips_the_root_regardless_of_spelling() {
-        let root = Path::new("/repo/mod");
+        let root = PathBuf::from(abs("repo/mod"));
         let want = "common/x.txt";
-        assert_eq!(relative_file("/repo/mod/common/x.txt", root), want);
+        assert_eq!(relative_file(&abs("repo/mod/common/x.txt"), &root), want);
         assert_eq!(
-            relative_file("common/x.txt", root),
+            relative_file("common/x.txt", &root),
             want,
             "already relative"
         );
         assert_eq!(
-            relative_file("/repo/mod/./common/x.txt", root),
+            relative_file(&abs("repo/mod/./common/x.txt"), &root),
             want,
             "a `./` component"
         );
+        let root_trailing = PathBuf::from(abs("repo/mod/"));
         assert_eq!(
-            relative_file("/repo/mod/common/x.txt", Path::new("/repo/mod/")),
+            relative_file(&abs("repo/mod/common/x.txt"), &root_trailing),
             want,
             "trailing separator on the root"
         );
         assert_eq!(
-            relative_file(r"\repo\mod\common\x.txt", root),
+            relative_file(r"\repo\mod\common\x.txt", &root),
             want,
             "backslash-separated spelling"
         );
@@ -407,10 +431,38 @@ mod tests {
     /// and does so the same way every time.
     #[test]
     fn relative_file_falls_back_and_does_not_panic_when_outside_the_root() {
-        let root = Path::new("/repo/mod");
-        let outside = "/vanilla/common/x.txt";
-        assert_eq!(relative_file(outside, root), outside);
-        assert_eq!(relative_file(outside, root), relative_file(outside, root));
+        let root = PathBuf::from(abs("repo/mod"));
+        let outside = abs("vanilla/common/x.txt");
+        assert_eq!(relative_file(&outside, &root), outside);
+        assert_eq!(
+            relative_file(&outside, &root),
+            relative_file(&outside, &root)
+        );
+    }
+
+    #[test]
+    fn relative_file_handles_windows_drive_and_backslash() {
+        // Windows drive-letter path and backslashes must still relativize.
+        let root = PathBuf::from(abs("repo/mod"));
+        let win = r"C:\repo\mod\common\x.txt";
+        // On Unix the drive prefix is just part of the string and won't match,
+        // so it falls back — that's correct for the host. On Windows it strips.
+        let got = relative_file(win, &root);
+        if cfg!(windows) {
+            assert_eq!(got, "common/x.txt");
+        } else {
+            assert_eq!(got, win.replace('\\', "/"));
+        }
+        // Backslash-separated spelling of the same file must still hash the same
+        // as the forward-slash absolute on the host's filesystem.
+        let root2 = PathBuf::from(abs("repo/mod"));
+        let fwd = abs("repo/mod/common/x.txt");
+        let bwd = r"\repo\mod\common\x.txt";
+        assert_eq!(
+            relative_file(&fwd, &root2),
+            relative_file(bwd, &root2),
+            "forward vs backslash must relativize identically"
+        );
     }
 
     /// Same diagnostic on the same source text, moved down two lines.

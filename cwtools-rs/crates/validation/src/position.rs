@@ -633,3 +633,103 @@ pub fn value_rules_for_key<'a>(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cwtools_parser::ast::{SourcePos, SourceRange};
+
+    fn range(sl: u32, sc: u16, el: u32, ec: u16) -> SourceRange {
+        SourceRange {
+            start: SourcePos { line: sl, col: sc },
+            end: SourcePos { line: el, col: ec },
+        }
+    }
+
+    #[test]
+    fn pos_in_range_is_inclusive_on_both_ends() {
+        let r = range(5, 3, 5, 10);
+        assert!(pos_in_range(5, 3, &r), "start is inclusive");
+        assert!(pos_in_range(5, 10, &r), "end is inclusive");
+        assert!(pos_in_range(5, 5, &r));
+        assert!(!pos_in_range(5, 2, &r), "one before start");
+        assert!(!pos_in_range(5, 11, &r), "one after end");
+    }
+
+    #[test]
+    fn pos_in_range_handles_multiline() {
+        let r = range(2, 0, 4, 5);
+        assert!(pos_in_range(2, 0, &r));
+        assert!(pos_in_range(3, 100, &r), "middle line any col");
+        assert!(pos_in_range(4, 5, &r));
+        assert!(!pos_in_range(4, 6, &r));
+        assert!(!pos_in_range(1, 0, &r), "before start line");
+        assert!(!pos_in_range(5, 0, &r), "after end line");
+    }
+
+    #[test]
+    fn pos_in_range_zero_width_point() {
+        let r = range(1, 5, 1, 5);
+        assert!(pos_in_range(1, 5, &r));
+        assert!(!pos_in_range(1, 4, &r));
+        assert!(!pos_in_range(1, 6, &r));
+    }
+
+    #[test]
+    fn rules_at_pos_distinguishes_on_key_from_in_value() {
+        // Exercises the `on_key` vs `in_value` branch without needing a full
+        // HOI4 corpus. Uses a minimal focus type so the instance block is
+        // recognised via `path = "common/national_focus"`.
+        use cwtools_file_manager::file_manager::ScanBudget;
+        use cwtools_parser::parser::parse_string;
+        use cwtools_rules::ruleset_loader::load_ruleset_from_dir;
+        use cwtools_string_table::string_table::StringTable;
+        let table = StringTable::new();
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/cwtools_position_test_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("focus.cwt"),
+            "types = { type[focus] = { path = \"common/national_focus\" } }\n\
+             focus = { id = scalar x = int }\n",
+        )
+        .unwrap();
+        let (ruleset, _) = load_ruleset_from_dir(&dir, &table, ScanBudget::default());
+        let _ = std::fs::remove_dir_all(&dir);
+        let prepared = crate::Prepared {
+            ruleset: &ruleset,
+            table: &table,
+            game: None,
+            type_index: None,
+            modifier_keys: None,
+            loc_index: None,
+            extra_loc_keys: None,
+            inline_scripts: None,
+            registry: None,
+            scope_checks: false,
+            var_checks: false,
+        };
+        let file_path = "common/national_focus/test.txt";
+        let text = "my_focus = {\n    id = my_id\n}\n";
+        let ast = parse_string(text, &table);
+        let on_key = rules_at_pos(&ast, file_path, &prepared, 2, 4, false);
+        let in_val = rules_at_pos(&ast, file_path, &prepared, 2, 9, false);
+        let a = on_key.expect("cursor on key must resolve");
+        let b = in_val.expect("cursor on value must resolve");
+        assert!(a.leaf.is_some() && b.leaf.is_some());
+        assert!(!a.leaf.as_ref().unwrap().in_value, "cursor on key");
+        assert!(b.leaf.as_ref().unwrap().in_value, "cursor on value");
+        assert_eq!(a.leaf.as_ref().unwrap().key, "id");
+        assert_eq!(b.leaf.as_ref().unwrap().key, "id");
+        // Cursor on the root instance key itself must be outside any entity.
+        let root_key = rules_at_pos(&ast, file_path, &prepared, 1, 0, false);
+        assert!(
+            root_key.is_none(),
+            "root key itself is not inside an entity"
+        );
+    }
+}
