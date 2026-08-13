@@ -317,9 +317,9 @@ pub(crate) struct DocumentState {
     /// a known type-instance id with its localised title. Read on each request.
     pub(crate) inlay_hints_loc_titles: std::sync::atomic::AtomicBool,
     /// Resolved-scope inlay hints (`cwtools.inlayHints.scopes` init option,
-    /// default OFF). Scaffolded but not yet produced: the resolved scope needs a
-    /// per-position resolver invocation per leaf, too costly over a viewport
-    /// range. See `inlay.rs`.
+    /// default OFF). When true, `textDocument/inlayHint` annotates visible
+    /// scope-changing blocks with their rule-aware resolved scope. See
+    /// `inlay.rs`.
     pub(crate) inlay_hints_scopes: std::sync::atomic::AtomicBool,
     /// Whether the client advertised `hierarchicalDocumentSymbolSupport` at
     /// initialize. When `true`, documentSymbol returns a nested `DocumentSymbol`

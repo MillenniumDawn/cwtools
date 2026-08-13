@@ -1,6 +1,7 @@
-//! `textDocument/inlayHint`: annotate id references with their localised title.
+//! `textDocument/inlayHint`: annotate id references with their localised title
+//! and scope-changing keys with the scope their block evaluates in.
 //!
-//! Two hint kinds were scoped for this feature (see the L9 review):
+//! Two hint kinds are scoped for this feature:
 //!
 //! - **Loc titles** (`cwtools.inlayHints.locTitles`, default ON): after a leaf
 //!   whose value is a known type-instance id that has a localised title, render
@@ -8,13 +9,14 @@
 //!   the type index and a `loc_text` lookup — so it stays cheap over a viewport
 //!   range without any new index.
 //! - **Resolved scopes** (`cwtools.inlayHints.scopes`, default OFF): after a
-//!   scope-changing key, render the scope it resolves to. NOT implemented: the
-//!   resolved scope needs the ambient scope context at the leaf, which only the
-//!   per-position resolver (`resolve_at_cursor` → `make_prepared` + `rules_at_pos`)
-//!   produces. Running that per leaf across a whole range is exactly the
-//!   too-costly path the review flagged, so the setting + capability are
-//!   scaffolded but the handler produces no scope hints. Wiring the flag now
-//!   keeps a later cheap-per-leaf implementation a drop-in.
+//!   `key = { ... }` block whose key changes the ambient scope, render the
+//!   target scope. A single validator-owned downward pass threads the full
+//!   ambient scope context through the requested file, including rule
+//!   `## push_scope`, `replace_scope`, alias overloads, and anonymous value
+//!   clauses. It emits only visible transitions and stays within the existing
+//!   [`MAX_HINTS`] response cap. Hints that resolve to the same scope as the
+//!   ambient scope, or to a `scope_N` / `any` / `invalid` placeholder, are
+//!   suppressed. This avoids the rejected per-leaf resolver path from issue #99.
 //!
 //! The capability is declared statically (loc titles default on); the handler
 //! gates each kind on its setting and returns nothing when both are off.
@@ -24,8 +26,10 @@ use tower_lsp::lsp_types::{
     InlayHint, InlayHintLabel, InlayHintParams, PositionEncodingKind, Range,
 };
 
+use cwtools_game::scope_engine::{SCOPE_ANY, SCOPE_INVALID, ScopeId};
+use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_info::TypeIndex;
-use cwtools_parser::ast::{Arena, Child, ParsedFile, Value};
+use cwtools_parser::ast::{Arena, Child, ParsedFile, SourceRange, Value};
 use cwtools_string_table::string_table::StringTable;
 
 use crate::navigation::{value_col_in_line, value_start_after_eq};
@@ -47,10 +51,6 @@ impl Backend {
     ) -> Result<Option<Vec<InlayHint>>> {
         use std::sync::atomic::Ordering::Relaxed;
         let loc_titles = self.state.inlay_hints_loc_titles.load(Relaxed);
-        // Scope hints are scaffolded (the setting + capability exist) but not yet
-        // produced — see the module docs. `scopes` is still read so a client that
-        // enables only scope hints keeps the capability alive; it just yields
-        // nothing until a cheap per-leaf resolver lands.
         let scopes = self.state.inlay_hints_scopes.load(Relaxed);
         if !loc_titles && !scopes {
             return Ok(None);
@@ -69,7 +69,9 @@ impl Backend {
             return Ok(None);
         };
         let encoding = self.state.config.read().position_encoding.clone();
-        let mut hints = Vec::new();
+        let ws_prefix = self.state.config.read().workspace_prefix.clone();
+        let logical_path = crate::paths::logical_path_from_uri(&uri, &ws_prefix);
+        let mut hints: Vec<InlayHint> = Vec::new();
         if loc_titles {
             // Lock order: info_service -> loc_text (documents already released).
             let info = self.state.info_service.read();
@@ -84,6 +86,54 @@ impl Backend {
                 &encoding,
             );
         }
+        if scopes {
+            let rem = MAX_HINTS.saturating_sub(hints.len());
+            if rem > 0 {
+                let rules_guard = self.state.rules.read();
+                let info_guard = self.state.info_service.read();
+                if let (Some(ruleset), Some(registry)) = (
+                    rules_guard.ruleset.as_ref(),
+                    rules_guard.scope_registry.as_ref(),
+                ) {
+                    let (game, scope_checks, var_checks) = {
+                        let cfg = self.state.config.read();
+                        (cfg.game(), cfg.scope_checks, cfg.var_checks)
+                    };
+                    let prepared = crate::validate::make_prepared(
+                        ruleset,
+                        &self.state.string_table,
+                        game,
+                        &info_guard.type_index,
+                        rules_guard.modifier_keys.as_ref(),
+                        None,
+                        None,
+                        Some(registry),
+                        scope_checks,
+                        var_checks,
+                    );
+                    let transitions = cwtools_validation::position::scope_transitions(
+                        &ast,
+                        &logical_path,
+                        &prepared,
+                        params.range.start.line + 1,
+                        params.range.end.line + 2,
+                    );
+                    let mut scope_hints = scope_hints_from_transitions(
+                        &transitions,
+                        &text,
+                        registry,
+                        &encoding,
+                        params.range,
+                    );
+                    if scope_hints.len() > rem {
+                        scope_hints.truncate(rem);
+                    }
+                    hints.extend(scope_hints);
+                }
+            }
+        }
+        hints.sort_by_key(|hint| (hint.position.line, hint.position.character));
+        hints.truncate(MAX_HINTS);
         if hints.is_empty() {
             Ok(None)
         } else {
@@ -205,6 +255,111 @@ fn collect_hints(children: &[Child], cx: &Ctx<'_>, out: &mut Vec<InlayHint>) {
     }
 }
 
+/// Convert validator scope transitions into rendered inlay hints.
+fn scope_hints_from_transitions(
+    transitions: &[cwtools_validation::position::ScopeTransition],
+    text: &str,
+    registry: &ScopeRegistry,
+    encoding: &PositionEncodingKind,
+    request_range: Range,
+) -> Vec<InlayHint> {
+    let lines: Vec<&str> = text.lines().collect();
+    transitions
+        .iter()
+        .filter_map(|transition| {
+            let hint = scope_hint_for_block(
+                registry,
+                transition.ambient,
+                transition.resolved,
+                transition.range,
+                &lines,
+                text,
+                encoding,
+            )?;
+            let p = hint.position;
+            let start = request_range.start;
+            let end = request_range.end;
+            let in_range = (p.line > start.line
+                || (p.line == start.line && p.character >= start.character))
+                && (p.line < end.line || (p.line == end.line && p.character < end.character));
+            in_range.then_some(hint)
+        })
+        .collect()
+}
+
+/// Build the scope inlay hint for a `key = { ... }` block whose `enter_block_scope`
+/// resolved to `resolved_scope`, given the ambient `ambient_scope` that was in
+/// effect before the block was entered. `lines` is the source split into lines.
+/// `None` when:
+/// - the block didn't actually change scope (`resolved == ambient`),
+/// - the resolved scope is a placeholder (`scope_N` for an id the registry
+///   doesn't know, `SCOPE_ANY`, `SCOPE_INVALID`),
+/// - the range's line has no parseable `key = …` header.
+///
+/// The hint is placed just past the `=` so a typical `key = ↦scope { ... }` reads
+/// as "this block evaluates in `scope`". `padding_left = true` inserts the
+/// leading space; `padding_right = None` keeps the `{` tight against the hint
+/// so it doesn't read as part of the scope name.
+///
+/// Pure (no LSP state, no IO) so the handler and its tests share the mapping.
+pub(crate) fn scope_hint_for_block(
+    registry: &ScopeRegistry,
+    ambient_scope: ScopeId,
+    resolved_scope: ScopeId,
+    range: SourceRange,
+    lines: &[&str],
+    text: &str,
+    encoding: &PositionEncodingKind,
+) -> Option<InlayHint> {
+    if resolved_scope == ambient_scope {
+        return None;
+    }
+    if !is_real_scope(registry, resolved_scope) {
+        return None;
+    }
+    let line0 = range.start.line.saturating_sub(1);
+    let key_col = range.start.col as u32;
+    let line = lines.get(line0 as usize).copied().unwrap_or("");
+    // Place the hint at the first non-whitespace column after the `=` — that's
+    // where `{` lives when the key was `key = { … }`. Falling back to the
+    // column right after `=` (e.g. an unparsable line) still anchors the hint
+    // visibly near the block.
+    let after_eq = value_start_after_eq(line, key_col).unwrap_or(key_col);
+    let col = skip_whitespace(line, after_eq).unwrap_or(after_eq);
+    let position = source_position_to_lsp(text, line0, col, encoding);
+    let label = format!("\u{2192} {}", registry.name_of(resolved_scope));
+    Some(InlayHint {
+        position,
+        label: InlayHintLabel::String(label),
+        kind: None,
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(true),
+        padding_right: None,
+        data: None,
+    })
+}
+
+/// Whether `scope` names a real scope in `registry` — anything except the
+/// sentinels and the `scope_N` placeholder for an id the registry doesn't
+/// know. Mirrors the hover-side filter that suppresses placeholder names from
+/// the scope table so the hint label never reads as `↦ scope_42`.
+fn is_real_scope(registry: &ScopeRegistry, scope: ScopeId) -> bool {
+    scope != SCOPE_ANY && scope != SCOPE_INVALID && registry.by_id.contains_key(&scope)
+}
+
+/// The first non-whitespace char column at or after `from` on `line`. Used to
+/// anchor the scope hint at the `{` of `key = { ... }` instead of the space that
+/// follows `=`.
+fn skip_whitespace(line: &str, from: u32) -> Option<u32> {
+    let from = from as usize;
+    line.chars()
+        .enumerate()
+        .skip(from)
+        .find(|(_, c)| !c.is_whitespace())
+        .map(|(i, _)| i as u32)
+}
+
 /// Where to begin scanning for the value token on the leaf's line. `Keyed` skips
 /// past the `=` (a `key = value` leaf); `Bare` starts at the value's own column
 /// (a keyless leaf-value). Both carry the relevant source column.
@@ -276,6 +431,7 @@ fn truncate_title(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cwtools_game::scope_registry::ScopeDefOwned;
     use cwtools_info::{SourceLocation, TypeInstance};
     use cwtools_localization::Lang;
     use std::collections::HashMap;
@@ -449,6 +605,105 @@ mod tests {
         let rendered = label(&hints[0]);
         assert!(rendered.ends_with('…'));
         assert_eq!(rendered.chars().count(), MAX_TITLE_CHARS + 1);
+    }
+
+    fn scope_registry_for_tests() -> (ScopeRegistry, ScopeId, ScopeId) {
+        let mut registry = ScopeRegistry::default();
+        let country = ScopeId(100);
+        let character = ScopeId(101);
+        registry.by_id.insert(
+            country,
+            ScopeDefOwned {
+                name: "Country".to_string(),
+                aliases: vec!["country".to_string()],
+                subscope_of: Vec::new(),
+            },
+        );
+        registry.by_id.insert(
+            character,
+            ScopeDefOwned {
+                name: "Character".to_string(),
+                aliases: vec!["character".to_string()],
+                subscope_of: vec![country],
+            },
+        );
+        (registry, country, character)
+    }
+
+    #[test]
+    fn scope_hint_uses_block_brace_position_and_resolved_name() {
+        let text = "owner = {\n}\n";
+        let table = StringTable::new();
+        let ast = cwtools_parser::parser::parse_string(text, &table);
+        let Child::Leaf(idx) = ast.root_children[0] else {
+            panic!("expected a keyed clause");
+        };
+        let (registry, country, character) = scope_registry_for_tests();
+        let hint = scope_hint_for_block(
+            &registry,
+            country,
+            character,
+            ast.arena.leaves[idx as usize].pos,
+            &["owner = {", "}"],
+            text,
+            &PositionEncodingKind::UTF16,
+        )
+        .expect("different real scopes produce a hint");
+        assert_eq!(label(&hint), "→ character");
+        assert_eq!(hint.position, Position::new(0, 8));
+        assert_eq!(hint.padding_left, Some(true));
+        assert_eq!(hint.padding_right, None);
+        assert!(hint.tooltip.is_none());
+        assert!(hint.text_edits.is_none());
+    }
+
+    #[test]
+    fn scope_hint_suppresses_ambient_and_placeholder_scopes() {
+        let text = "owner = { }\n";
+        let table = StringTable::new();
+        let ast = cwtools_parser::parser::parse_string(text, &table);
+        let Child::Leaf(idx) = ast.root_children[0] else {
+            panic!("expected a keyed clause");
+        };
+        let (registry, country, character) = scope_registry_for_tests();
+        let leaf = &ast.arena.leaves[idx as usize];
+        assert!(
+            scope_hint_for_block(
+                &registry,
+                country,
+                country,
+                leaf.pos,
+                &[],
+                text,
+                &PositionEncodingKind::UTF16,
+            )
+            .is_none()
+        );
+        assert!(
+            scope_hint_for_block(
+                &registry,
+                country,
+                SCOPE_ANY,
+                leaf.pos,
+                &[],
+                text,
+                &PositionEncodingKind::UTF16,
+            )
+            .is_none()
+        );
+        assert!(
+            scope_hint_for_block(
+                &registry,
+                country,
+                ScopeId(999),
+                leaf.pos,
+                &[],
+                text,
+                &PositionEncodingKind::UTF16,
+            )
+            .is_none()
+        );
+        assert!(is_real_scope(&registry, character));
     }
 
     #[test]
