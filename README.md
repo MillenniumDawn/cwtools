@@ -30,6 +30,7 @@ Both binaries drive the same pipeline.
 - `cache-vanilla` pre-indexes a base game install so later runs skip re-parsing it.
 - `parse`, `discover`, `rules`, `serialize` and `deserialize` inspect one file, a tree, or a `.cwb` cache.
 - Reports as text, CSV, JSON, GitHub Actions annotations or SARIF, with severity and code filters, hash baselines, and settings from a `cwtools.toml`.
+- `validate --file` and `--since <git-ref>` scope the report to the files you touched, for a pre-commit hook or a PR job.
 
 Both reuse the on-disk caches: parsed ASTs (`.cwb`) and the base game index,
 each kept until its inputs change.

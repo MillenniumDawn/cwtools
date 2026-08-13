@@ -684,6 +684,24 @@ impl SessionWithFiles {
     /// entry per file as `(path, diagnostics)`. The per-run shared state (scope
     /// registry) is built ONCE and reused across the batch.
     pub fn validate_all(&self) -> Vec<(PathBuf, Vec<ValidationError>)> {
+        self.validate_selected(None)
+    }
+
+    /// [`Self::validate_all`] restricted to `only`, for a run that reports on a
+    /// subset of the files (`validate --file` / `--since`). A skipped file
+    /// contributes no entry to the result.
+    ///
+    /// Skipping is sound exactly while the cross-file use pass is off: every
+    /// other check here reads one file plus the shared indexes, which are built
+    /// during load and don't depend on what this pass covers. With `track_uses`
+    /// on, CW239/CW231 judge each definition against the references collected
+    /// from *every* file, so a partial pass would report a definition as unused
+    /// that a skipped file uses — `only` is ignored there and the whole set is
+    /// validated, leaving the caller to filter the report.
+    pub fn validate_selected(
+        &self,
+        only: Option<&HashSet<PathBuf>>,
+    ) -> Vec<(PathBuf, Vec<ValidationError>)> {
         use rayon::prelude::*;
 
         let prepared = self.session.prepared();
@@ -694,9 +712,11 @@ impl SessionWithFiles {
         // an index there are no definitions to report against.
         let track_uses =
             prepared.type_index.is_some() && needs_use_tracking(prepared.ruleset, prepared.game);
+        let only = only.filter(|_| !track_uses);
         let mut results: Vec<(PathBuf, Vec<ValidationError>, UsedInstances)> = self
             .files
             .par_iter()
+            .filter(|src| only.is_none_or(|wanted| wanted.contains(&src.path)))
             .map(|src| {
                 let file_str: cwtools_validation::FilePath =
                     std::sync::Arc::from(src.path.to_str().unwrap_or(""));

@@ -12,10 +12,10 @@ use crate::diag::{
 };
 use crate::report::ReportType;
 use crate::run::{
-    announce_config, exit_code, exit_if_empty, load_config, missing_required, report_owns_stdout,
-    status,
+    EXIT_USAGE, announce_config, exit_code, exit_if_empty, load_config, missing_required,
+    report_owns_stdout, status,
 };
-use crate::{codes, config, report};
+use crate::{codes, config, report, scope};
 
 pub(super) fn run(args: ValidateArgs) {
     let ValidateArgs {
@@ -38,6 +38,8 @@ pub(super) fn run(args: ValidateArgs) {
         min_severity,
         ignore_codes,
         only_codes,
+        files,
+        since,
         allow_empty,
     } = args;
 
@@ -144,6 +146,24 @@ pub(super) fn run(args: ValidateArgs) {
     });
     let rules =
         rules.unwrap_or_else(|| missing_required("validate", "--rules <RULES>", "rules", fc));
+
+    // Resolved before the session loads: an unresolvable `--since` should fail
+    // in a moment, not after a full index.
+    let scope = scope::resolve(&files, since.as_deref(), &directory).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(EXIT_USAGE);
+    });
+    if let Some(s) = &scope {
+        for path in s.missing() {
+            eprintln!("warn: --file {} is not on disk", path.display());
+        }
+        if output_hashes.is_some() {
+            eprintln!(
+                "warn: --output-hashes with --file/--since writes only the scoped subset's \
+                 hashes; a baseline built this way drops everything outside it"
+            );
+        }
+    }
 
     let game_id = Game::from_str(&game).unwrap_or_else(|| {
         eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
@@ -260,6 +280,17 @@ pub(super) fn run(args: ValidateArgs) {
     );
     eprintln!("  Discovered {} files", session.parsed_files().len());
 
+    // The discovered files the scope covers. Everything is still indexed, so
+    // the cross-file checks are unaffected; the driver skips validating the
+    // rest where it can, and the report filter below is what makes the run
+    // correct either way.
+    let selected = scope
+        .as_ref()
+        .map(|s| s.select(session.parsed_files().iter().map(|f| f.path.as_path())));
+    if let Some(selected) = &selected {
+        eprintln!("  Reporting on {} of them", selected.len());
+    }
+
     // Nothing to validate is a failure, not a clean run. A failed walk
     // already exits 3 below, so don't relabel it as an empty input.
     if !session.discovery_failed {
@@ -331,7 +362,9 @@ pub(super) fn run(args: ValidateArgs) {
     // baseline survives the ruleset being checked out elsewhere, and filtered
     // by the same code and hash policy as everything else.
     for err in rule_errors {
-        if !codes::wanted(err.code, &only_codes, &ignore_codes) {
+        if !codes::wanted(err.code, &only_codes, &ignore_codes)
+            || !scope::wanted(scope.as_ref(), &err.file.to_string_lossy())
+        {
             continue;
         }
         let line_text = sources
@@ -344,8 +377,11 @@ pub(super) fn run(args: ValidateArgs) {
         diags.push(d);
     }
 
-    for (path, errors) in session.validate_all() {
+    for (path, errors) in session.validate_selected(selected.as_ref()) {
         let file_str = path.to_str().unwrap_or("");
+        if !scope::wanted(scope.as_ref(), file_str) {
+            continue;
+        }
         for err in errors {
             // Same placement as the hash baseline: a suppressed code
             // never reaches the counts, the report or --output-hashes.
@@ -375,7 +411,10 @@ pub(super) fn run(args: ValidateArgs) {
         }
     };
     for d in session.loc_project_diagnostics() {
-        if !d.file.starts_with(&dir_prefix) || !codes::wanted(d.code, &only_codes, &ignore_codes) {
+        if !d.file.starts_with(&dir_prefix)
+            || !codes::wanted(d.code, &only_codes, &ignore_codes)
+            || !scope::wanted(scope.as_ref(), &d.file)
+        {
             continue;
         }
         let line_text = sources.trimmed(&d.file, d.line as u32).to_string();

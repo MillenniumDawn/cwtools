@@ -80,6 +80,13 @@ files catch up on the next scan.
 everything from disk once into immutable-after-load state, then validate the whole
 set (`validate_all`). One `Session` per CLI run.
 
+`validate --file`/`--since` scope the report, not the load: the directory is still
+indexed whole, because the cross-file checks need it. `validate_selected` then
+skips validating the files outside the scope, but only while the CW239/CW231 use
+pass is off — that pass judges each definition against the references from every
+file, so a partial run there would invent unused-definition errors. The report
+filter in the CLI is what makes a scoped run correct either way.
+
 The LSP does NOT use `Session`. Its index is mutable and incremental (single files
 are re-indexed on each edit behind an `RwLock`, with no whole-workspace re-parse),
 which doesn't fit `Session`'s load-once ownership. Instead the LSP holds its own
