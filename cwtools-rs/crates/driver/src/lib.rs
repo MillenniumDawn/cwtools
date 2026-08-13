@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cwtools_cache::workspace::{self as workspace_cache, SourceCacheKey};
 use cwtools_file_manager::file_manager::{
     DirectoryType, DiscoveredFile, FileError, FileManager, FileManagerConfig, ScanBudget,
-    classify_directory,
+    classify_directory, glob_match,
 };
 use cwtools_file_manager::{FileEncoding, read_text, read_text_with_encoding};
 use cwtools_game::constants::Game;
@@ -48,8 +48,8 @@ use cwtools_rules::ruleset_loader::{RuleParseError, load_ruleset_from_dir};
 use cwtools_string_table::string_table::StringTable;
 use cwtools_validation::references::{UsedInstances, check_unused_instances, needs_use_tracking};
 use cwtools_validation::{
-    ErrorSeverity, Prepared, ValidationError, build_modifier_keys, build_scope_registry_arc,
-    checks_from_env, validate_prepared, validate_prepared_tracking_uses,
+    ErrorSeverity, InlineScripts, Prepared, ValidationError, build_modifier_keys,
+    build_scope_registry_arc, checks_from_env, validate_prepared, validate_prepared_tracking_uses,
 };
 
 /// A discovered workspace/mod file, retained between indexing and validation.
@@ -186,6 +186,38 @@ impl RulesInput {
     }
 }
 
+/// The checks a run cannot make without a base-game index, so a caller can say
+/// so instead of letting them read as clean.
+///
+/// Every one of these compares script against the union of mod and base-game
+/// definitions. Without `--vanilla` or `--vanilla-cache` that union is only the
+/// mod, so the engine cannot tell a genuinely missing definition from one the
+/// base game supplies and stays silent rather than flagging every vanilla
+/// reference. Returns an empty slice when `has_vanilla`, so a caller can render
+/// the notice unconditionally.
+///
+/// # Examples
+///
+/// ```
+/// use cwtools_driver::vanilla_gated_checks;
+/// use cwtools_game::constants::Game;
+///
+/// assert!(vanilla_gated_checks(Game::Hoi4, true).is_empty());
+/// assert!(vanilla_gated_checks(Game::Hoi4, false).contains(&"CW500"));
+/// ```
+pub fn vanilla_gated_checks(game: Game, has_vanilla: bool) -> &'static [&'static str] {
+    if has_vanilla {
+        return &[];
+    }
+    match game {
+        // CW227/CW229 (ship-design templates) and CW250 (planet-killer support
+        // script) sit behind the same index-completeness gate, but only the
+        // Stellaris validator emits them.
+        Game::Stellaris => &["CW113", "CW222", "CW227", "CW229", "CW250", "CW500"],
+        _ => &["CW113", "CW222", "CW500"],
+    }
+}
+
 /// Auto-managed on-disk cache of the base-game index, so a batch run doesn't
 /// re-parse the whole install every time. Only consulted when `vanilla` is a
 /// directory and no explicit `vanilla_cache` was supplied: a cache whose
@@ -245,6 +277,7 @@ pub struct Session {
     ruleset: RuleSet,
     type_index: TypeIndex,
     modifier_keys: HashSet<String>,
+    inline_scripts: InlineScripts,
     loc_service: LocService,
     loc_index: LocIndex,
     loc_languages: Option<Vec<Lang>>,
@@ -428,7 +461,7 @@ impl Session {
             }
             type_index.value_set_values.merge_file(file_uri, value_sets);
         }
-        let source_files = parsed
+        let source_files: Vec<SourceFile> = parsed
             .into_iter()
             .map(|src| SourceFile {
                 path: src.path,
@@ -436,6 +469,11 @@ impl Session {
                 fingerprint: src.fingerprint,
             })
             .collect();
+
+        // Bodies an `inline_script` call site splices in. Kept resident because a
+        // call site can only be checked against what it pulls in, and the same
+        // script is reached from every file that references it.
+        let inline_scripts = load_inline_scripts(&source_files, &rules_table);
 
         // Auto-managed cache: reuse a fresh one instead of walking the install,
         // and remember where to write one when there's nothing to reuse.
@@ -520,7 +558,9 @@ impl Session {
 
         // Mark the index as complete when vanilla data was loaded (either from a
         // directory or a pre-generated cache).  This lets CW500 type-reference
-        // checks fire without false positives on mod-only validation.
+        // checks fire without false positives on mod-only validation. Set
+        // together with the file index above, so `complete` answers for every
+        // family [`vanilla_gated_checks`] names.
         if has_vanilla_data {
             type_index.complete = true;
         }
@@ -539,7 +579,7 @@ impl Session {
         {
             loc_dirs.push(v.as_path());
         }
-        let loc_service = load_loc_service(&loc_dirs, loc_languages.as_deref());
+        let loc_service = load_loc_service(&loc_dirs, loc_languages.as_deref(), &[], &[]);
         let mut loc_index = LocIndex::build_scoped(&loc_service, loc_languages.as_deref());
         if let Some(keys) = cached_loc_keys {
             // Scoped the same way as the walked files above, so a cache hit and a
@@ -561,6 +601,7 @@ impl Session {
             ruleset,
             type_index,
             modifier_keys,
+            inline_scripts,
             loc_service,
             loc_index,
             loc_languages,
@@ -592,6 +633,7 @@ impl Session {
             loc_index: Some(&self.loc_index),
             // The CLI/driver loads loc from disk; no live-edit overlay.
             extra_loc_keys: None,
+            inline_scripts: Some(&self.inline_scripts),
             registry: self.registry.as_ref(),
             scope_checks,
             var_checks,
@@ -648,6 +690,11 @@ impl Session {
     /// The expanded modifier-key set.
     pub fn modifier_keys(&self) -> &HashSet<String> {
         &self.modifier_keys
+    }
+
+    /// The `common/inline_scripts` bodies call sites expand against.
+    pub fn inline_scripts(&self) -> &InlineScripts {
+        &self.inline_scripts
     }
 
     /// The loc-key index (workspace + vanilla).
@@ -831,6 +878,33 @@ impl SessionWithFiles {
     }
 }
 
+/// Parse the workspace's `common/inline_scripts` files into the expansion
+/// registry. Re-read rather than kept from the indexing pass: the ASTs there are
+/// consumed building the indexes, and a mod holds a handful of these against
+/// thousands of script files.
+fn load_inline_scripts(files: &[SourceFile], table: &StringTable) -> InlineScripts {
+    let mut scripts = InlineScripts::default();
+    for file in files
+        .iter()
+        .filter(|file| InlineScripts::is_script_path(&file.logical_path))
+    {
+        match read_text(&file.path) {
+            Ok(text) => {
+                scripts.insert(
+                    &file.logical_path,
+                    parse_string_without_comments(&text, table),
+                );
+            }
+            Err(error) => eprintln!(
+                "warn: skipping inline script {}: {}",
+                file.path.display(),
+                error
+            ),
+        }
+    }
+    scripts
+}
+
 /// Convert parse errors from a partially-parsed file into `ValidationError`s so
 /// they appear in the CLI report (and count toward the exit-1 threshold).
 fn parse_errors_to_validation(
@@ -853,21 +927,31 @@ fn parse_errors_to_validation(
         .collect()
 }
 
-/// Load the loc files under `dirs`, materializing only the languages a scoped
-/// run will use. Without `langs` every file is parsed (the default). With it, a
-/// file whose header declares a language outside the set is dropped before its
+/// Load the loc files under `dirs`, materializing only what a scoped run will
+/// use. Without `langs` every language is parsed (the default). With it, a file
+/// whose header declares a language outside the set is dropped before its
 /// entries are built — the base game ships eleven of them, and a scoped run
 /// neither validates nor looks up the rest. A file whose header language can't
 /// be read is always kept, matching how `validate_loc_project_with_union`
-/// scopes its own per-file pass.
-fn load_loc_service(dirs: &[&Path], langs: Option<&[Lang]>) -> LocService {
-    let Some(langs) = langs else {
+/// scopes its own per-file pass. `ignore_files` and `ignore_dirs` are the user's
+/// discovery globs, matched against the file name and against every directory
+/// name below the root the file was found under.
+///
+/// With none of the three the whole tree loads through the budgeted walk.
+pub fn load_loc_service(
+    dirs: &[&Path],
+    langs: Option<&[Lang]>,
+    ignore_files: &[String],
+    ignore_dirs: &[String],
+) -> LocService {
+    if langs.is_none() && ignore_files.is_empty() && ignore_dirs.is_empty() {
         return LocService::from_folders(dirs, ScanBudget::default());
-    };
+    }
     use rayon::prelude::*;
     let files: Vec<(String, String, Option<FileEncoding>)> =
         LocService::discover_files(dirs, ScanBudget::default())
             .into_par_iter()
+            .filter(|path| !loc_path_ignored(path, dirs, ignore_files, ignore_dirs))
             .filter_map(|path| {
                 // CSV loc (CK2/VIC2) carries every language in one file, keyed by
                 // column, so there is no single header language to filter on.
@@ -877,6 +961,7 @@ fn load_loc_service(dirs: &[&Path], langs: Option<&[Lang]>) -> LocService {
                 let path_str = path.to_string_lossy().into_owned();
                 let (text, encoding) = read_text_with_encoding(&path).ok()?;
                 if !is_csv
+                    && let Some(langs) = langs
                     && let Some(lang) = loc_header_language(&text, &path_str)
                     && !langs.contains(&lang)
                 {
@@ -886,6 +971,38 @@ fn load_loc_service(dirs: &[&Path], langs: Option<&[Lang]>) -> LocService {
             })
             .collect();
     LocService::from_files_with_encoding(files)
+}
+
+/// Whether a discovered loc path is excluded by the user's `--ignore-file` /
+/// `--ignore-dir` globs. Directory globs match a directory name at any depth, so
+/// the path is taken relative to the root it was discovered under first: an
+/// absolute root that happens to contain a `build` component is not the mod's.
+fn loc_path_ignored(
+    path: &Path,
+    roots: &[&Path],
+    file_globs: &[String],
+    dir_globs: &[String],
+) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if file_globs.iter().any(|pat| glob_match(pat, name)) {
+        return true;
+    }
+    if dir_globs.is_empty() {
+        return false;
+    }
+    let relative = roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path);
+    relative
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|c| c.as_os_str().to_str())
+        .any(|dir| dir_globs.iter().any(|pat| glob_match(pat, dir)))
 }
 
 /// The language a loc file declares, without parsing its entries. The header
@@ -1224,6 +1341,27 @@ mod tests {
         }
     }
 
+    /// A directory glob names a directory inside the mod, so it is matched
+    /// against the path below the root: a root that itself sits under `build`
+    /// must not exclude every file in it.
+    #[test]
+    fn loc_ignore_globs_apply_below_the_root() {
+        let root = Path::new("build/mod");
+        let kept = root.join("localisation/greeting_l_english.yml");
+        let staged = root.join("build/localisation/greeting_l_english.yml");
+        let dir_globs = ["build".to_string()];
+
+        assert!(!loc_path_ignored(&kept, &[root], &[], &dir_globs));
+        assert!(loc_path_ignored(&staged, &[root], &[], &dir_globs));
+        assert!(loc_path_ignored(
+            &kept,
+            &[root],
+            &["greeting*".to_string()],
+            &[]
+        ));
+        assert!(!loc_path_ignored(&kept, &[root], &[], &[]));
+    }
+
     #[test]
     fn loaded_parse_keeps_the_fingerprint_it_was_parsed_from() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1268,6 +1406,27 @@ mod tests {
             )),
             "error: {}",
             errors[0]
+        );
+    }
+
+    #[test]
+    fn vanilla_gated_checks_are_silent_once_the_index_is_loaded() {
+        for game in [Game::Hoi4, Game::Stellaris, Game::Ck3] {
+            assert!(vanilla_gated_checks(game, true).is_empty(), "{game}");
+        }
+    }
+
+    #[test]
+    fn vanilla_gated_checks_name_the_families_that_go_quiet() {
+        assert_eq!(
+            vanilla_gated_checks(Game::Hoi4, false),
+            ["CW113", "CW222", "CW500"]
+        );
+        // The ship-design and planet-killer checks share the gate but only
+        // Stellaris emits them.
+        assert_eq!(
+            vanilla_gated_checks(Game::Stellaris, false),
+            ["CW113", "CW222", "CW227", "CW229", "CW250", "CW500"]
         );
     }
 }

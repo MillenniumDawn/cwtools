@@ -16,9 +16,9 @@ pub use loc_string::{
     JominiCommand, JominiParam, JominiParseError, LocElement, parse_loc_elements,
 };
 pub use pipeline::{
-    LocDiagnostic, loc_error_code, loc_error_severity, validate_loc_file_text,
-    validate_loc_project, validate_loc_project_scoped, validate_loc_project_with_union,
-    validate_parsed_loc_files,
+    LocDiagnostic, loc_command_parts, loc_error_code, loc_error_severity, validate_loc_file_text,
+    validate_loc_project, validate_loc_project_commands, validate_loc_project_scoped,
+    validate_loc_project_with_union, validate_parsed_loc_files,
 };
 pub use scope_validation::{
     LocCommandDiagnostic, LocScopeData, ScriptedVariables, validate_loc_commands,

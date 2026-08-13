@@ -27,8 +27,10 @@
 //!
 //! `validate` reads every key. `fix` reads all but `report-type` and
 //! `min-severity` (it writes edits, not a report), and takes `only-codes` as
-//! the config spelling of its `--code`. `loc` reads `directory`,
-//! `report-type`, `min-severity`, the two code lists and `allow-empty`.
+//! the config spelling of its `--code`. `loc` reads the keys that shape a
+//! localisation scan: `game` and `rules` (which turn on the scope checks),
+//! `directory`, `report-type`, `min-severity`, `ignore-files`, `ignore-dirs`,
+//! `loc-languages`, the two code lists and `allow-empty`.
 //!
 //! The parser accepts the TOML this schema needs — comments, bare keys, basic
 //! and literal strings, booleans, and (multi-line) string arrays — and rejects
@@ -86,11 +88,17 @@ pub(crate) const FIX_KEYS: &[&str] = &[
     "allow-empty",
 ];
 
-/// `loc` takes a directory and lints it; rules and the base game don't enter into it.
+/// `loc` lints a directory of loc files. It reads the ruleset for its scopes and
+/// links, but never indexes the base game, so the vanilla keys don't apply.
 pub(crate) const LOC_KEYS: &[&str] = &[
+    "game",
     "directory",
+    "rules",
     "report-type",
     "min-severity",
+    "ignore-files",
+    "ignore-dirs",
+    "loc-languages",
     "ignore-codes",
     "only-codes",
     "allow-empty",

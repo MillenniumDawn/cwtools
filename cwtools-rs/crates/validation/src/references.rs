@@ -257,6 +257,7 @@ user = { uses = <thing> }
             modifier_keys: None,
             loc_index: None,
             extra_loc_keys: None,
+            inline_scripts: None,
             registry: registry.as_ref(),
             scope_checks: false,
             var_checks: false,

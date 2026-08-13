@@ -81,6 +81,33 @@ No `--vanilla`. It would need a Steam install of HOI4, which puts the guard out
 of reach of CI and of anyone else's machine, and the point here is a
 reproducible diff rather than vanilla coverage.
 
+### Vanilla tier
+
+The cost of that is a blind spot. CW113, CW222, CW227, CW229, CW250 and CW500
+compare script against the union of the mod's definitions and the base game's,
+so without a base game they report nothing at all and the corpus baseline never
+covers them. `cwtools validate` now says so on stderr, and in the `github` and
+`sarif` reports, but a silent check is still a check nothing guards.
+
+The second tier fills that in:
+
+```sh
+./scripts/vanilla-guard.sh
+```
+
+Same script underneath, same flags, same exit codes, against a synthetic base
+game, mod and ruleset committed under `scripts/vanilla-fixture/` and a baseline
+of its own (`scripts/vanilla-baseline.csv`, 5 diagnostics). No game install, so
+it runs anywhere. The fixture is deliberately small: one reference per family
+that resolves and one that doesn't, so a change that stops a check reporting and
+a change that makes it report everything both move the baseline. Re-bless it the
+same way, `./scripts/vanilla-guard.sh --bless`, and say why in the commit
+message.
+
+Adding a family to the fixture is the way to keep it honest as more checks go
+behind the base-game gate. Run it alongside the corpus guard for anything that
+touches those six codes.
+
 When a change is *meant* to move diagnostics, re-bless the baseline in the same
 commit and say in the message which codes moved and why:
 

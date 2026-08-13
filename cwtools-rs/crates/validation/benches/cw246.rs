@@ -88,6 +88,7 @@ fn bench_cw246(c: &mut Criterion) {
         modifier_keys: None,
         loc_index: None,
         extra_loc_keys: None,
+        inline_scripts: None,
         registry: registry.as_ref(),
         scope_checks: true,
         var_checks: true,

@@ -3,16 +3,20 @@
 //! Runs the scope-independent loc-entry checks (`validate_loc_file`) over every
 //! loaded loc file and normalizes the results to the F# numeric error codes
 //! (CW001/CW225/CW234/CW259/CW268/CW275/CW276), plus the per-file name/header checks
-//! (CW254/CW255/CW256/CW257). Scope-dependent command checks
-//! (CW226/CW260/CW266) run at the config reference site, not here, because they
-//! need the scope of the referencing field.
+//! (CW254/CW255/CW256/CW257). The scope-dependent command checks
+//! (CW226/CW260/CW266) run at the config reference site, where the scope of the
+//! referencing field is known; [`validate_loc_project_commands`] is the
+//! standalone counterpart for a caller that has a ruleset but no game files.
 
 use crate::commands::{Lang, LocFile};
 use crate::loc_index::LocKeySet;
+use crate::scope_validation::{LocCommandDiagnostic, LocScopeData, validate_loc_commands};
 use crate::service::LocService;
 use crate::validation::{LocErrorKind, hardcoded_loc_set, validate_loc_file_with_hardcoded};
 use crate::yaml_parser::{LangHeaderDiagnostic, check_loc_file_lang, parse_loc_text};
-use cwtools_error_codes::ErrorSeverity;
+use cwtools_error_codes::{ErrorCode, ErrorSeverity};
+use cwtools_game::scope_engine::{SCOPE_ANY, ScopeId};
+use cwtools_game::scope_registry::ScopeRegistry;
 use std::collections::HashSet;
 
 /// A normalized loc diagnostic ready to be surfaced as a `ValidationError` or an
@@ -312,11 +316,7 @@ pub fn validate_loc_project_with_union(
     service
         .files()
         .par_iter()
-        .filter(|file| match langs {
-            // None language can't be scoped out — keep validating it.
-            Some(set) => file.lang.map(|l| set.contains(&l)).unwrap_or(true),
-            None => true,
-        })
+        .filter(|file| lang_selected(file, langs))
         .flat_map_iter(|file| {
             // Directory-loading path: CW254 fires when the detected on-disk
             // encoding is missing/wrong BOM.
@@ -331,6 +331,100 @@ pub fn validate_loc_project_with_union(
             .into_iter()
         })
         .collect()
+}
+
+/// Run the scope-aware loc-command checks (CW226/CW260/CW266) over every loaded
+/// entry. For a caller that has a ruleset but no game files — the standalone
+/// `cwtools loc` lint.
+///
+/// `cwtools validate` runs the same checks at each reference site, seeded with
+/// the scope of the field using the key. There is no reference site here, so
+/// every chain starts at `any` and only what is wrong in every scope is
+/// reported. `data.registry` is what turns the checks on: without one the
+/// command validator stays fully lenient and this finds nothing.
+pub fn validate_loc_project_commands(
+    service: &LocService,
+    langs: Option<&[Lang]>,
+    data: &LocScopeData,
+) -> Vec<LocDiagnostic> {
+    use rayon::prelude::*;
+
+    let registry = data.registry.as_deref();
+    service
+        .files()
+        .par_iter()
+        .filter(|file| lang_selected(file, langs))
+        .flat_map_iter(|file| {
+            file.entries.iter().flat_map(move |entry| {
+                validate_loc_commands(entry, SCOPE_ANY, data)
+                    .into_iter()
+                    .map(move |diag| {
+                        let (code, message) = loc_command_parts(&diag, &entry.key, registry);
+                        LocDiagnostic {
+                            file: file.path.clone(),
+                            line: entry.position.line,
+                            col: entry.position.column,
+                            code: code.id,
+                            severity: code.severity,
+                            message,
+                            fix: None,
+                        }
+                    })
+            })
+        })
+        .collect()
+}
+
+/// The code and message a loc-command diagnostic is reported under. Shared by
+/// the reference-site check in `cwtools_validation` and by
+/// [`validate_loc_project_commands`], so the same finding reads the same way
+/// whichever pass found it.
+///
+/// `loc_key` is the key whose value carries the command. `registry` names the
+/// scopes in a CW260 message; without one their numeric ids are printed.
+pub fn loc_command_parts(
+    diag: &LocCommandDiagnostic,
+    loc_key: &str,
+    registry: Option<&ScopeRegistry>,
+) -> (&'static ErrorCode, String) {
+    let scope_name = |id: u32| match registry {
+        Some(reg) => reg.name_of(ScopeId(id)),
+        None => id.to_string(),
+    };
+    match diag {
+        LocCommandDiagnostic::WrongScope {
+            command,
+            current_scope,
+            expected_scopes,
+        } => {
+            let expected = expected_scopes
+                .iter()
+                .map(|s| scope_name(*s))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let code = &cwtools_error_codes::CW260_LOC_COMMAND_WRONG_SCOPE;
+            let message = code.format(&[command, &scope_name(*current_scope), &expected]);
+            (code, message)
+        }
+        LocCommandDiagnostic::ChainEndsInScope { command } => {
+            let code = &cwtools_error_codes::CW266_LOC_COMMAND_NOT_IN_DATA_TYPE;
+            (code, code.format(&[loc_key, command.as_str(), "scope"]))
+        }
+        LocCommandDiagnostic::NotFound { command } => {
+            let code = &cwtools_error_codes::CW226_INVALID_LOC_COMMAND;
+            (code, code.format(&[loc_key, command.as_str()]))
+        }
+    }
+}
+
+/// Whether a file's language is in the scoped set. A file with no detectable
+/// language can't be scoped out — it may be malformed, which is what the checks
+/// are for.
+fn lang_selected(file: &LocFile, langs: Option<&[Lang]>) -> bool {
+    match langs {
+        Some(set) => file.lang.is_none_or(|l| set.contains(&l)),
+        None => true,
+    }
 }
 
 /// Validate a single loc file's text against a precomputed key union. Used by
@@ -421,6 +515,35 @@ mod tests {
             let codes = |d: &[LocDiagnostic]| d.iter().map(|d| d.code).collect::<Vec<_>>();
             assert_eq!(codes(&from_text), codes(&from_parsed), "path: {path}");
         }
+    }
+
+    /// The registry is the gate: `cwtools loc` without `--rules` has none, and
+    /// an unknown command has to stay lenient there rather than be invented.
+    #[test]
+    fn the_project_command_pass_needs_a_registry() {
+        let svc = service_from(&[(
+            "a_l_english.yml",
+            "l_english:\n key1: \"Ruled by [totally_unknown()]\"\n",
+        )]);
+        assert!(
+            validate_loc_project_commands(&svc, None, &LocScopeData::default()).is_empty(),
+            "no registry means no command checks"
+        );
+
+        let data = LocScopeData {
+            game: Some(cwtools_game::constants::Game::Hoi4),
+            registry: Some(std::sync::Arc::new(ScopeRegistry::default())),
+            ..Default::default()
+        };
+        let diags = validate_loc_project_commands(&svc, None, &data);
+        assert_eq!(diags.len(), 1, "got: {diags:?}");
+        assert_eq!(diags[0].code, "CW226");
+        assert_eq!(diags[0].line, 2);
+        assert!(
+            diags[0].message.contains("totally_unknown"),
+            "message: {}",
+            diags[0].message
+        );
     }
 
     #[test]

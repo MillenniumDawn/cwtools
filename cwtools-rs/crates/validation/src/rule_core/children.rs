@@ -9,8 +9,12 @@ use std::sync::LazyLock;
 
 use crate::common::*;
 use crate::ctx::ValidationCtx;
+use crate::inline_script;
 use crate::scope::{enter_block_scope, scope_matches_required};
 use cwtools_error_codes as error_codes;
+
+/// The call-site key an inline script is pulled in with.
+const INLINE_SCRIPT: &str = "inline_script";
 
 use super::alias::validate_alias_usage;
 use super::leaf::{check_variable_get, field_matches_value, validate_leaf};
@@ -515,6 +519,23 @@ fn count_and_validate_children<'r>(
                     keybuf.extend_from_slice(unquote_key(s).as_bytes())
                 });
                 let key: &str = std::str::from_utf8(&keybuf).unwrap_or_default();
+                // An inline_script call is not a field of the block it sits in —
+                // it stands for the body it pulls in. Expand that body and count
+                // and check it as though it had been written here.
+                if key.eq_ignore_ascii_case(INLINE_SCRIPT) {
+                    expand_inline_script_call(
+                        ctx,
+                        leaf,
+                        key,
+                        rules,
+                        block,
+                        scope_context,
+                        &mut leafvalue_counts,
+                        &mut valueclause_counts,
+                        errors,
+                    );
+                    continue;
+                }
                 // Phase-1 tally: keyed children matched case-insensitively so a
                 // field written `texturefile` satisfies a rule keyed
                 // `textureFile`. Only keys a rule actually asks about are
@@ -776,6 +797,88 @@ fn count_and_validate_children<'r>(
     }
 
     (leafvalue_counts, valueclause_counts)
+}
+
+/// Check one `inline_script` call: rebuild the body it names with its arguments
+/// substituted, then count and validate that body against the caller's own rules,
+/// scope and cardinality tally — the only context the body has.
+///
+/// Its diagnostics are re-anchored onto the call site. The body's line numbers
+/// belong to the script file, which is not the file being validated, and the same
+/// body is right or wrong per call: the caller is what has to change. Each message
+/// picks up the script line it came from, so a nested call leaves a trail reading
+/// innermost first. CW274 stands in when the body cannot be pulled in at all.
+#[allow(clippy::too_many_arguments)]
+fn expand_inline_script_call<'r>(
+    ctx: &ValidationCtx,
+    leaf: &cwtools_parser::ast::Leaf,
+    key: &str,
+    rules: &'r [(RuleType, Options)],
+    block: &mut BlockRules<'r>,
+    scope_context: &mut Option<ScopeContext>,
+    leafvalue_counts: &mut [usize],
+    valueclause_counts: &mut [usize],
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(scripts) = ctx.inline_scripts else {
+        return;
+    };
+    let end = key_token_end(leaf, key, ctx.table);
+    let expanded = {
+        let stack = ctx.inline_stack.borrow();
+        inline_script::expand(leaf, &ctx.ast.arena, ctx.table, scripts, &stack)
+    };
+    let expanded = match expanded {
+        Ok(expanded) => expanded,
+        Err(failure) => {
+            errors.push(
+                ValidationError::from_code(
+                    &error_codes::CW274_INLINE_SCRIPT_ERROR,
+                    ctx.file_path,
+                    leaf.pos.start.line,
+                    leaf.pos.start.col,
+                    &[&failure.to_string()],
+                )
+                .with_end(end),
+            );
+            return;
+        }
+    };
+
+    ctx.inline_stack.borrow_mut().push(expanded.name);
+    let body = ctx.for_inline_body(&expanded.ast);
+    let mut body_errors = Vec::new();
+    let (body_leafvalues, body_valueclauses) = count_and_validate_children(
+        &body,
+        &expanded.ast.root_children,
+        rules,
+        block,
+        scope_context,
+        &mut body_errors,
+    );
+    ctx.inline_stack.borrow_mut().pop();
+
+    for (slot, count) in leafvalue_counts.iter_mut().zip(body_leafvalues) {
+        *slot += count;
+    }
+    for (slot, count) in valueclause_counts.iter_mut().zip(body_valueclauses) {
+        *slot += count;
+    }
+
+    errors.extend(body_errors.into_iter().map(|mut error| {
+        error.message = format!(
+            "{} (in {}:{})",
+            error.message, expanded.logical_path, error.line
+        );
+        error.line = leaf.pos.start.line;
+        error.col = leaf.pos.start.col;
+        error.end = Some((end.line, end.col));
+        // Both carry spans into the script file, which nothing downstream can
+        // resolve against the file this diagnostic is now reported in.
+        error.fix = None;
+        error.related.clear();
+        error
+    }));
 }
 
 /// Phase 3 of [`validate_children`]: enforce cardinality (min/max occurrence)

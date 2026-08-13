@@ -293,6 +293,7 @@ fn overlay_key_resolves_missing_loc() {
         modifier_keys: None,
         loc_index: Some(&idx),
         extra_loc_keys: None,
+        inline_scripts: None,
         registry: None,
         scope_checks: false,
         var_checks: false,

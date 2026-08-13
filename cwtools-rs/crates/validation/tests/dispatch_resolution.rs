@@ -54,6 +54,7 @@ fn navigate(rules: &str, script: &str, file_path: &str, marker: &str) -> Option<
         modifier_keys: None,
         loc_index: None,
         extra_loc_keys: None,
+        inline_scripts: None,
         registry: registry.as_ref(),
         scope_checks: true,
         var_checks: false,

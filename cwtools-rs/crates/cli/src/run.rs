@@ -2,6 +2,7 @@
 //! reporting, and the status lines that have to keep out of a redirected report.
 
 use clap::CommandFactory;
+use cwtools_game::constants::Game;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Cli;
@@ -80,6 +81,20 @@ pub(crate) fn announce_config(
             unread.join(", ")
         );
     }
+}
+
+/// The run-level notice for a validate that loaded no base-game index, or
+/// `None` when it did. A report is read as "nothing wrong here", so the checks
+/// that could not run have to be named rather than left to look clean.
+pub(crate) fn vanilla_notice(game: Game, has_vanilla: bool) -> Option<String> {
+    let codes = cwtools_driver::vanilla_gated_checks(game, has_vanilla);
+    if codes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "no base-game data loaded, so {} report nothing; pass --vanilla or --vanilla-cache to run them",
+        codes.join(", ")
+    ))
 }
 
 /// Bail on a setting that neither a flag nor the config file supplied, through
@@ -164,6 +179,22 @@ mod tests {
         // operational failures take precedence over validation errors
         assert_eq!(exit_code(5, false, true), 2);
         assert_eq!(exit_code(5, true, true), 3);
+    }
+
+    #[test]
+    fn vanilla_notice_is_silent_with_a_base_game_index() {
+        assert_eq!(vanilla_notice(Game::Hoi4, true), None);
+        assert_eq!(vanilla_notice(Game::Stellaris, true), None);
+    }
+
+    #[test]
+    fn vanilla_notice_names_the_disabled_checks_and_the_flags() {
+        let msg = vanilla_notice(Game::Hoi4, false).expect("notice without vanilla data");
+        assert!(msg.contains("CW113, CW222, CW500"), "got: {msg}");
+        assert!(msg.contains("--vanilla-cache"), "got: {msg}");
+        // Stellaris adds the ship-design and planet-killer families.
+        let stl = vanilla_notice(Game::Stellaris, false).expect("notice without vanilla data");
+        assert!(stl.contains("CW227, CW229"), "got: {stl}");
     }
 
     #[test]
