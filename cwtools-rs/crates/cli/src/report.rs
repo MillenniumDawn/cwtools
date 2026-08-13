@@ -139,10 +139,19 @@ pub(crate) fn github_row(d: &Diag, base: &Path) -> String {
     )
 }
 
+/// One `::notice::message` line for something that belongs to the run rather
+/// than to a file, so it lands in the job log instead of on a random source line.
+pub(crate) fn github_notice(message: &str) -> String {
+    format!("::notice::{}\n", escape_data(message))
+}
+
 // ── SARIF 2.1.0 ──────────────────────────────────────────────────────────────
 
 const SARIF_SCHEMA: &str = "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json";
 const INFORMATION_URI: &str = "https://github.com/MillenniumDawn/cwtools";
+
+/// Notification descriptor for the run-level "these checks did not run" message.
+const VANILLA_NOTIFICATION_ID: &str = "cwtools/vanilla-gated-checks";
 
 fn sarif_level(s: ErrorSeverity) -> &'static str {
     match s {
@@ -185,8 +194,11 @@ fn file_uri(path: &str) -> String {
 ///
 /// `tool.driver.rules` is generated from the shared emitted error-code
 /// catalog entries, and carries only the codes this run actually reported so
-/// every `ruleIndex` resolves.
-pub(crate) fn sarif_report(diags: &[&Diag], base: &Path) -> String {
+/// every `ruleIndex` resolves. `notice` is a run-level message with no location
+/// (the checks a missing base-game index disabled); it becomes a
+/// `toolConfigurationNotifications` entry rather than a result, and the whole
+/// `invocations` array is omitted when there is nothing to say.
+pub(crate) fn sarif_report(diags: &[&Diag], base: &Path, notice: Option<&str>) -> String {
     let mut rules: Vec<&'static (&'static str, ErrorCode)> = diags
         .iter()
         .filter_map(|d| codes::emitted_entry(d.code))
@@ -226,6 +238,21 @@ pub(crate) fn sarif_report(diags: &[&Diag], base: &Path) -> String {
                     rules: sarif_rules,
                 },
             },
+            invocations: notice
+                .map(|text| SarifInvocation {
+                    execution_successful: true,
+                    tool_configuration_notifications: vec![SarifNotification {
+                        descriptor: SarifDescriptorReference {
+                            id: VANILLA_NOTIFICATION_ID.to_string(),
+                        },
+                        level: "note".to_string(),
+                        message: SarifMessage {
+                            text: text.to_string(),
+                        },
+                    }],
+                })
+                .into_iter()
+                .collect(),
             original_uri_base_ids: {
                 let mut m = std::collections::BTreeMap::new();
                 m.insert("SRCROOT".to_string(), SarifUriBase { uri: root });
@@ -251,11 +278,33 @@ struct SarifDocument {
 #[derive(serde::Serialize)]
 struct SarifRun {
     tool: SarifTool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    invocations: Vec<SarifInvocation>,
     #[serde(rename = "originalUriBaseIds")]
     original_uri_base_ids: std::collections::BTreeMap<String, SarifUriBase>,
     #[serde(rename = "columnKind")]
     column_kind: String,
     results: Vec<SarifResult>,
+}
+
+#[derive(serde::Serialize)]
+struct SarifInvocation {
+    #[serde(rename = "executionSuccessful")]
+    execution_successful: bool,
+    #[serde(rename = "toolConfigurationNotifications")]
+    tool_configuration_notifications: Vec<SarifNotification>,
+}
+
+#[derive(serde::Serialize)]
+struct SarifNotification {
+    descriptor: SarifDescriptorReference,
+    level: String,
+    message: SarifMessage,
+}
+
+#[derive(serde::Serialize)]
+struct SarifDescriptorReference {
+    id: String,
 }
 
 #[derive(serde::Serialize)]
@@ -518,7 +567,7 @@ mod tests {
 
     #[test]
     fn sarif_has_the_2_1_0_envelope() {
-        let out = sarif_report(&[], Path::new("/repo"));
+        let out = sarif_report(&[], Path::new("/repo"), None);
         assert!(out.contains("\"version\": \"2.1.0\""));
         assert!(out.contains("sarif-schema-2.1.0.json"));
         assert!(out.contains("\"name\": \"cwtools\""));
@@ -537,7 +586,7 @@ mod tests {
     #[test]
     fn sarif_rules_come_from_the_error_code_catalog() {
         let d = diag("/repo/x.txt", 3, 2, "CW113", "missing file");
-        let out = sarif_report(&[&d], Path::new("/repo"));
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
         assert!(out.contains("\"id\": \"CW113\""), "got: {out}");
         assert!(out.contains("\"name\": \"MissingFile\""), "got: {out}");
         // shortDescription is the catalog's message template.
@@ -550,7 +599,7 @@ mod tests {
     #[test]
     fn sarif_describes_pass_through_templates_by_name() {
         let d = diag("/repo/x.txt", 1, 1, "CW240", "value is wrong");
-        let out = sarif_report(&[&d], Path::new("/repo"));
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
         assert!(out.contains("\"text\": \"Unexpected value\""), "got: {out}");
     }
 
@@ -561,7 +610,7 @@ mod tests {
             diag("/repo/b.txt", 2, 1, "CW113", "a"),
             diag("/repo/c.txt", 3, 1, "CW282", "c"),
         ];
-        let out = sarif_report(&ds.iter().collect::<Vec<_>>(), Path::new("/repo"));
+        let out = sarif_report(&ds.iter().collect::<Vec<_>>(), Path::new("/repo"), None);
         // CW113 sorts first, so it is rule 0 and CW282 is rule 1.
         assert_eq!(out.matches("\"ruleIndex\": 0").count(), 1);
         assert_eq!(out.matches("\"ruleIndex\": 1").count(), 2);
@@ -575,7 +624,7 @@ mod tests {
     #[test]
     fn sarif_rule_index_resolves_a_non_canonical_code_spelling() {
         let d = diag("/repo/x.txt", 3, 2, "cw113", "missing file");
-        let out = sarif_report(&[&d], Path::new("/repo"));
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
         assert!(out.contains("\"id\": \"CW113\""), "got: {out}");
         assert!(out.contains("\"ruleIndex\": 0"), "got: {out}");
     }
@@ -583,7 +632,7 @@ mod tests {
     #[test]
     fn sarif_locations_are_relative_to_the_source_root() {
         let d = diag(&abs("repo/common/x.txt"), 7, 3, "CW100", "m");
-        let out = sarif_report(&[&d], Path::new(&abs("repo")));
+        let out = sarif_report(&[&d], Path::new(&abs("repo")), None);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let loc = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"];
         assert_eq!(loc["artifactLocation"]["uri"], "common/x.txt");
@@ -600,7 +649,7 @@ mod tests {
     /// case where trimming them all leaves the scheme mangled as `file:/`.
     #[test]
     fn sarif_root_uri_survives_the_filesystem_root() {
-        let out = sarif_report(&[], Path::new("/"));
+        let out = sarif_report(&[], Path::new("/"), None);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v["runs"][0]["originalUriBaseIds"]["SRCROOT"]["uri"],
@@ -612,7 +661,7 @@ mod tests {
     #[test]
     fn sarif_description_replaces_template_placeholders() {
         let d = diag("/repo/x.txt", 1, 1, "CW100", "m");
-        let out = sarif_report(&[&d], Path::new("/repo"));
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
         assert!(
             out.contains("\"text\": \"Localisation key … is not defined for …\""),
             "got: {out}"
@@ -623,7 +672,7 @@ mod tests {
     #[test]
     fn sarif_encodes_spaces_in_uris() {
         let d = diag(&abs("games/Hearts of Iron IV/x.txt"), 1, 1, "CW100", "m");
-        let out = sarif_report(&[&d], Path::new(&abs("repo")));
+        let out = sarif_report(&[&d], Path::new(&abs("repo")), None);
         assert!(
             out.contains(&format!(
                 "\"uri\": \"{URI}games/Hearts%20of%20Iron%20IV/x.txt\""
@@ -636,7 +685,7 @@ mod tests {
     #[test]
     fn sarif_omits_the_rule_id_when_a_diagnostic_has_no_code() {
         let d = diag("/repo/x.yml", 0, 0, "", "could not parse");
-        let out = sarif_report(&[&d], Path::new("/repo"));
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["runs"][0]["results"][0].get("ruleId").is_none());
         assert_eq!(
@@ -652,7 +701,7 @@ mod tests {
     #[test]
     fn sarif_carries_the_diagnostic_hash_as_a_fingerprint() {
         let d = diag("/repo/x.txt", 1, 1, "CW100", "m");
-        let out = sarif_report(&[&d], Path::new("/repo"));
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
         assert!(
             out.contains("\"cwtoolsDiagHash/v1\": \"0123456789abcdef\""),
             "got: {out}"
@@ -660,9 +709,41 @@ mod tests {
     }
 
     #[test]
+    fn github_notice_is_a_run_level_annotation() {
+        assert_eq!(
+            github_notice("CW113, CW500 report nothing"),
+            "::notice::CW113, CW500 report nothing\n"
+        );
+        assert!(github_notice("a\nb").contains("a%0Ab"));
+    }
+
+    #[test]
+    fn sarif_carries_a_run_notice_outside_the_results() {
+        let out = sarif_report(&[], Path::new("/repo"), Some("CW113, CW500 report nothing"));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let notification = &v["runs"][0]["invocations"][0]["toolConfigurationNotifications"][0];
+        assert_eq!(notification["level"], "note");
+        assert_eq!(notification["descriptor"]["id"], VANILLA_NOTIFICATION_ID);
+        assert_eq!(
+            notification["message"]["text"],
+            "CW113, CW500 report nothing"
+        );
+        assert_eq!(v["runs"][0]["invocations"][0]["executionSuccessful"], true);
+        // A notice is not a finding: nothing joins the results.
+        assert_eq!(v["runs"][0]["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn sarif_omits_invocations_without_a_notice() {
+        let out = sarif_report(&[], Path::new("/repo"), None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["runs"][0].get("invocations").is_none(), "got: {out}");
+    }
+
+    #[test]
     fn sarif_escapes_json_in_messages() {
         let d = diag("/repo/x.txt", 1, 1, "CW100", "he said \"no\"\nthen left");
-        let out = sarif_report(&[&d], Path::new("/repo"));
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(
             v["runs"][0]["results"][0]["message"]["text"],

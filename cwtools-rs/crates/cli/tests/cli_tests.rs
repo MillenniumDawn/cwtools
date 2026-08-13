@@ -710,6 +710,56 @@ fn test_validate_vanilla_writes_and_reuses_the_cache() {
     );
 }
 
+// ── Vanilla-gated check families ─────────────────────────────────────────────
+//
+// Without a base-game index CW113/CW222/CW500 (and, on Stellaris, CW227/CW229/
+// CW250) report nothing, which reads as a clean file. The run has to say so.
+
+#[test]
+fn test_validate_notices_the_checks_a_missing_base_game_disables() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--no-vanilla-cache",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no base-game data loaded"))
+        .stderr(predicate::str::contains(
+            "CW113, CW222, CW227, CW229, CW250, CW500",
+        ));
+}
+
+#[test]
+fn test_validate_stays_quiet_about_the_gate_with_a_base_game() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--vanilla",
+            discover_dir.to_str().unwrap(),
+            "--no-vanilla-cache",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no base-game data loaded").not());
+}
+
 #[test]
 fn test_validate_no_vanilla_cache_writes_nothing() {
     let cache = tempfile::tempdir().unwrap();
@@ -1531,12 +1581,19 @@ fn test_validate_github_report() {
         .output()
         .unwrap();
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let mut lines = stdout.lines();
+    // No --vanilla, so the run leads with the notice naming the families it
+    // could not check. It carries no file, so it is a bare `::notice::`.
+    let notice = lines.next().unwrap_or_default();
+    assert!(notice.starts_with("::notice::"), "{stdout:?}");
+    assert!(notice.contains("CW500"), "{stdout:?}");
     // CW107 is Information-severity, which GitHub renders as a notice.
-    assert!(stdout.starts_with("::notice file="), "{stdout:?}");
-    assert!(stdout.contains(",line=3,col="), "{stdout:?}");
-    assert!(stdout.contains(",title=CW107::"), "{stdout:?}");
+    let row = lines.next().unwrap_or_default();
+    assert!(row.starts_with("::notice file="), "{stdout:?}");
+    assert!(row.contains(",line=3,col="), "{stdout:?}");
+    assert!(row.contains(",title=CW107::"), "{stdout:?}");
     // One workflow command per diagnostic, on one physical line each.
-    assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+    assert_eq!(stdout.lines().count(), 2, "{stdout:?}");
 }
 
 /// GitHub resolves annotation paths against the checkout root, which a step's

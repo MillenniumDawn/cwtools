@@ -9,9 +9,13 @@
 #   corpus  a real HOI4 mod (Kaiserreich-4-Development)
 #   rules   the .cwt ruleset (cwtools-hoi4-config/Config)
 #
-# No vanilla game install. --vanilla needs a Steam copy of HOI4, which no CI
-# runner and no second machine can be assumed to have. The guard wants a
-# reproducible diff, not vanilla coverage.
+# The default run has no vanilla game install. --vanilla needs a Steam copy of
+# HOI4, which no CI runner and no second machine can be assumed to have, and
+# the guard wants a reproducible diff. The cost is that CW113, CW222, CW227,
+# CW229, CW250 and CW500 never fire here: they can only answer against the
+# mod+base-game union, so without one they stay silent. scripts/vanilla-guard.sh
+# is the second tier that covers them, over a synthetic base game committed
+# alongside it, and it drives this script through --vanilla.
 #
 #   scripts/corpus-guard.sh              check against the baseline
 #   scripts/corpus-guard.sh --bless      rewrite the baseline (see CONTRIBUTING)
@@ -33,9 +37,14 @@ repo_root=$(dirname -- "$script_dir")
 projects=${CWTOOLS_PROJECTS:-$HOME/Documents/github-projects}
 corpus=${CWTOOLS_CORPUS:-$projects/Kaiserreich-4-Development}
 rules=${CWTOOLS_RULES:-$projects/cwtools-hoi4-config/Config}
+# Base game to index for reference resolution. Empty by default; see the header.
+vanilla=${CWTOOLS_VANILLA:-}
 baseline=${CWTOOLS_BASELINE:-$script_dir/corpus-baseline.csv}
 bin=${CWTOOLS_BIN:-$repo_root/cwtools-rs/target/release/cwtools}
 game=${CWTOOLS_GAME:-hoi4}
+# Script the baseline header tells the reader to re-bless with. A wrapper that
+# drives this one (vanilla-guard.sh) sets it to its own name.
+guard_name=${CWTOOLS_GUARD_NAME:-corpus-guard.sh}
 bless=0
 build=1
 
@@ -45,6 +54,7 @@ Usage: corpus-guard.sh [options]
 
   --corpus DIR     mod corpus to validate     (env CWTOOLS_CORPUS)
   --rules DIR      .cwt ruleset directory     (env CWTOOLS_RULES)
+  --vanilla DIR    base game to index         (env CWTOOLS_VANILLA)
   --baseline FILE  committed baseline report  (env CWTOOLS_BASELINE)
   --bin PATH       cwtools binary             (env CWTOOLS_BIN)
   --game NAME      game id, default hoi4      (env CWTOOLS_GAME)
@@ -61,6 +71,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --corpus) corpus=${2:?--corpus needs a directory}; shift 2 ;;
     --rules) rules=${2:?--rules needs a directory}; shift 2 ;;
+    --vanilla) vanilla=${2:?--vanilla needs a directory}; shift 2 ;;
     --baseline) baseline=${2:?--baseline needs a file}; shift 2 ;;
     --bin) bin=${2:?--bin needs a path}; shift 2 ;;
     --game) game=${2:?--game needs a name}; shift 2 ;;
@@ -75,6 +86,7 @@ die() { echo "corpus-guard: $*" >&2; exit 2; }
 
 [ -d "$corpus" ] || die "corpus not found: $corpus"
 [ -d "$rules" ] || die "rules not found: $rules"
+[ -z "$vanilla" ] || [ -d "$vanilla" ] || die "vanilla not found: $vanilla"
 
 if [ "$build" -eq 1 ]; then
   echo "corpus-guard: cargo build --release -p cwtools_cli"
@@ -87,6 +99,7 @@ fi
 # was handed, and that string is what gets stripped back out below.
 corpus=$(CDPATH='' cd -- "$corpus" && pwd -P)
 rules=$(CDPATH='' cd -- "$rules" && pwd -P)
+[ -z "$vanilla" ] || vanilla=$(CDPATH='' cd -- "$vanilla" && pwd -P)
 
 # Provenance of the inputs. A moved corpus or ruleset is the usual reason a
 # diff appears out of nowhere, so it goes in the baseline and in the failure
@@ -99,6 +112,7 @@ describe() {
 }
 corpus_rev=$(describe "$corpus")
 rules_rev=$(describe "$rules")
+[ -z "$vanilla" ] || vanilla_rev=$(describe "$vanilla")
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/corpus-guard.XXXXXX")
 keep=0
@@ -111,6 +125,14 @@ current=$work/current.csv
 echo "corpus-guard: $corpus [$corpus_rev]"
 echo "corpus-guard: $rules [$rules_rev]"
 
+# --no-vanilla-cache alongside --vanilla: the auto-managed cache under the OS
+# cache dir would make the report depend on what an earlier run left behind.
+vanilla_args=()
+if [ -n "$vanilla" ]; then
+  echo "corpus-guard: $vanilla [$vanilla_rev]"
+  vanilla_args=(--vanilla "$vanilla" --no-vanilla-cache)
+fi
+
 # Exit 1 means "found errors", which is the normal case here. Anything above
 # that (2 config, 3 discovery, 4 empty input, 101 panic) means no usable report.
 status=0
@@ -118,6 +140,7 @@ status=0
   --game "$game" \
   --directory "$corpus" \
   --rules "$rules" \
+  "${vanilla_args[@]+"${vanilla_args[@]}"}" \
   --report-type csv \
   --output-file "$raw" >"$work/validate.log" 2>&1 || status=$?
 if [ "$status" -gt 1 ]; then
@@ -141,9 +164,10 @@ fi
 # The message field is quoted when it contains a comma, and one Kaiserreich
 # path has commas in it too, so nothing here splits on commas.
 {
-  echo "# cwtools corpus guard baseline. Regenerate with scripts/corpus-guard.sh --bless"
+  echo "# cwtools guard baseline. Regenerate with scripts/$guard_name --bless"
   echo "# corpus: $(basename -- "$corpus") @ $corpus_rev"
   echo "# rules:  $(basename -- "$(dirname -- "$rules")")/$(basename -- "$rules") @ $rules_rev"
+  [ -z "$vanilla" ] || echo "# vanilla: $(basename -- "$vanilla") @ $vanilla_rev"
   echo "file,line,severity,code,message"
   tail -n +2 -- "$raw" \
     | awk -v root="$corpus/" '{ p = index($0, root); if (p) $0 = substr($0, 1, p - 1) substr($0, p + length(root)); print }' \
