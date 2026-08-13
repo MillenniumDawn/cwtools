@@ -1,5 +1,6 @@
 //! Type extraction: `types = { type[x] = { ... } }` blocks into `TypeDefinition`s,
-//! including their localisation/modifier sub-blocks and `## type_key_filter` comments.
+//! including their localisation/modifier sub-blocks and the `##` directives that
+//! precede the node.
 
 use super::*;
 
@@ -62,6 +63,7 @@ pub(crate) fn process_type_node(
     // Parse type_key_filter from comments before this type[] node
     def.type_key_filter = parse_type_key_filter_from_comments(comments);
     def.graph_related_types = parse_graph_related_types_from_comments(comments);
+    apply_option_directives(&mut def, comments);
 
     if let Value::Clause(children) = &leaf.value {
         // First pass: collect subtypes, localisation node, modifiers node
@@ -100,8 +102,8 @@ pub(crate) fn process_type_node(
                             let v = clean_path(&leaf_value_string(l, table));
                             def.path_options.paths.push(v);
                         }
-                        "path_strict" if leaf_value_string(l, table) == "yes" => {
-                            def.path_options.path_strict = true;
+                        "path_strict" => {
+                            def.path_options.path_strict = leaf_value_string(l, table) == "yes";
                         }
                         "path_file" => {
                             def.path_options.path_file = Some(leaf_value_string(l, table));
@@ -112,8 +114,8 @@ pub(crate) fn process_type_node(
                         "name_field" => {
                             def.name_field = Some(leaf_value_string(l, table));
                         }
-                        "type_per_file" if leaf_value_string(l, table) == "yes" => {
-                            def.type_per_file = true;
+                        "type_per_file" => {
+                            def.type_per_file = leaf_value_string(l, table) == "yes";
                         }
                         "starts_with" => {
                             def.starts_with = Some(leaf_value_string(l, table));
@@ -121,11 +123,11 @@ pub(crate) fn process_type_node(
                         "type_key_prefix" => {
                             def.key_prefix = Some(leaf_value_string(l, table));
                         }
-                        "severity" if leaf_value_string(l, table) == "warning" => {
-                            def.warning_only = true;
+                        "severity" => {
+                            def.warning_only = leaf_value_string(l, table) == "warning";
                         }
-                        "unique" if leaf_value_string(l, table) == "yes" => {
-                            def.unique = true;
+                        "unique" => {
+                            def.unique = leaf_value_string(l, table) == "yes";
                         }
                         // The `should_be_used` directive maps onto the
                         // `should_be_referenced` field (the field is named for
@@ -133,8 +135,8 @@ pub(crate) fn process_type_node(
                         // it feeds, but the directive that enables it is spelled
                         // `should_be_used`). Field is shared across crates, so
                         // it is not renamed here (#204).
-                        "should_be_used" if leaf_value_string(l, table) == "yes" => {
-                            def.should_be_referenced = true;
+                        "should_be_used" => {
+                            def.should_be_referenced = leaf_value_string(l, table) == "yes";
                         }
                         "skip_root_key" => {
                             if let Value::Clause(block_children) = &l.value {
@@ -184,6 +186,28 @@ pub(crate) fn process_type_node(
     }
 
     def
+}
+
+/// Seed the type options that may equally be written as a `## key = value`
+/// directive above the `type[x]` node instead of as a leaf in its body (#264).
+/// Seeding happens before the body loop, but the body leaf is authoritative
+/// for all six options: a body `unique = no` or `severity = error` overrides a
+/// directive that set the option on.
+///
+/// `path`, `path_file`, `path_extension`, `name_field`, `type_key_prefix` and
+/// `skip_root_key` stay body-only: nothing writes them as directives, and
+/// `skip_root_key` has block and leaf forms that don't map onto a comment line.
+fn apply_option_directives(def: &mut TypeDefinition, comments: &[String]) {
+    let yes = |key: &str| find_directive(comments, key).is_some_and(|v| strip_quotes(v) == "yes");
+    def.unique = yes("unique");
+    def.type_per_file = yes("type_per_file");
+    def.path_options.path_strict = yes("path_strict");
+    // The directive is spelled `should_be_used`; the field it feeds is named
+    // `should_be_referenced` (see the body-loop arm comment, #204).
+    def.should_be_referenced = yes("should_be_used");
+    def.warning_only =
+        find_directive(comments, "severity").is_some_and(|v| strip_quotes(v) == "warning");
+    def.starts_with = find_directive(comments, "starts_with").map(|v| strip_quotes(v).to_string());
 }
 
 /// Block form: `skip_root_key = { A B }`.
@@ -412,6 +436,178 @@ pub(crate) fn parse_modifiers_block(
         out.push(modifier);
     });
     out
+}
+
+#[cfg(test)]
+mod option_directive_tests {
+    use cwtools_parser::parser::parse_string;
+    use cwtools_string_table::string_table::StringTable;
+
+    use crate::{rules_converter::ast_to_ruleset, rules_types::TypeDefinition};
+
+    fn parse_typedef(cwt: &str) -> TypeDefinition {
+        let table = StringTable::new();
+        let ast = parse_string(cwt, &table);
+        ast_to_ruleset(&ast, &table)
+            .types
+            .into_iter()
+            .next()
+            .expect("no type parsed")
+    }
+
+    #[test]
+    fn comment_directives_set_every_shared_option() {
+        let def = parse_typedef(
+            r#"types = {
+                ## unique = yes
+                ## type_per_file = yes
+                ## path_strict = yes
+                ## should_be_used = yes
+                ## severity = warning
+                ## starts_with = my_
+                type[foo] = { path = "game/common/foo" }
+            }"#,
+        );
+        assert!(def.unique);
+        assert!(def.type_per_file);
+        assert!(def.path_options.path_strict);
+        assert!(def.should_be_referenced);
+        assert!(def.warning_only);
+        assert_eq!(def.starts_with, Some("my_".to_string()));
+    }
+
+    #[test]
+    fn body_leaves_still_set_every_shared_option() {
+        let def = parse_typedef(
+            r#"types = { type[foo] = {
+                path = "game/common/foo"
+                unique = yes
+                type_per_file = yes
+                path_strict = yes
+                should_be_used = yes
+                severity = warning
+                starts_with = "my_"
+            } }"#,
+        );
+        assert!(def.unique);
+        assert!(def.type_per_file);
+        assert!(def.path_options.path_strict);
+        assert!(def.should_be_referenced);
+        assert!(def.warning_only);
+        assert_eq!(def.starts_with, Some("my_".to_string()));
+    }
+
+    // `= yes` options need exactly `yes`, so an explicit `no` stays off.
+    #[test]
+    fn explicit_no_directive_leaves_the_option_off() {
+        let def = parse_typedef(
+            r#"types = {
+                ## unique = no
+                ## path_strict = no
+                type[foo] = { path = "game/common/foo" }
+            }"#,
+        );
+        assert!(!def.unique);
+        assert!(!def.path_options.path_strict);
+    }
+
+    // The body leaf is authoritative for the boolean/severity options, so an
+    // off-value spelling turns a directive-set option off. `starts_with` has
+    // no off spelling; its body override is covered below.
+    #[test]
+    fn body_off_value_overrides_directive_on_value() {
+        let def = parse_typedef(
+            r#"types = {
+                ## unique = yes
+                ## type_per_file = yes
+                ## path_strict = yes
+                ## should_be_used = yes
+                ## severity = warning
+                type[foo] = { path = "game/common/foo" unique = no type_per_file = no path_strict = no should_be_used = no severity = error }
+            }"#,
+        );
+        assert!(!def.unique);
+        assert!(!def.type_per_file);
+        assert!(!def.path_options.path_strict);
+        assert!(!def.should_be_referenced);
+        assert!(!def.warning_only);
+    }
+
+    // Quoted directive values unquote like the body form, so `## unique = "yes"`
+    // and `## severity = "warning"` read the same as their bare spellings.
+    #[test]
+    fn quoted_yes_and_warning_directives_set_the_option() {
+        let def = parse_typedef(
+            r#"types = {
+                ## unique = "yes"
+                ## severity = "warning"
+                type[foo] = { path = "game/common/foo" }
+            }"#,
+        );
+        assert!(def.unique);
+        assert!(def.warning_only);
+    }
+
+    #[test]
+    fn body_leaf_wins_over_the_directive() {
+        let def = parse_typedef(
+            r#"types = {
+                ## starts_with = from_comment_
+                type[foo] = { path = "game/common/foo" starts_with = "from_body_" }
+            }"#,
+        );
+        assert_eq!(def.starts_with, Some("from_body_".to_string()));
+    }
+
+    // The body form goes through `value_to_string`, which unquotes. A directive
+    // is raw comment text, so it has to unquote too or the two forms disagree.
+    #[test]
+    fn quoted_directive_value_is_unquoted() {
+        let def = parse_typedef(
+            r#"types = {
+                ## starts_with = "my_"
+                type[foo] = { path = "game/common/foo" }
+            }"#,
+        );
+        assert_eq!(def.starts_with, Some("my_".to_string()));
+    }
+
+    // A directive on a neighbouring type must not leak across.
+    #[test]
+    fn directives_do_not_leak_to_the_next_type() {
+        let table = StringTable::new();
+        let ast = parse_string(
+            r#"types = {
+                ## unique = yes
+                type[first] = { path = "game/common/first" }
+                type[second] = { path = "game/common/second" }
+            }"#,
+            &table,
+        );
+        let rs = ast_to_ruleset(&ast, &table);
+        let first = rs.types.iter().find(|t| t.name == "first").unwrap();
+        let second = rs.types.iter().find(|t| t.name == "second").unwrap();
+        assert!(first.unique);
+        assert!(!second.unique);
+    }
+
+    // `type_key_filter` between the directive and the node is the shape the HOI4
+    // config actually uses for its focus types.
+    #[test]
+    fn directive_survives_another_directive_below_it() {
+        let def = parse_typedef(
+            r#"types = {
+                ## unique = yes
+                ## type_key_filter = focus
+                type[focus] = { path = "game/common/national_focus" name_field = "id" }
+            }"#,
+        );
+        assert!(def.unique);
+        assert_eq!(
+            def.type_key_filter,
+            Some((vec!["focus".to_string()], false))
+        );
+    }
 }
 
 #[cfg(test)]
