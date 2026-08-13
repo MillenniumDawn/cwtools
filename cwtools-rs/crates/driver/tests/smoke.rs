@@ -610,6 +610,71 @@ fn validate_all_reports_nothing_without_should_be_used() {
     );
 }
 
+/// `validate_selected` skips the files outside the selection, so a caller
+/// reporting on a subset doesn't pay to validate the rest.
+#[test]
+fn validate_selected_skips_the_unselected_files() {
+    let tmp = unused_workspace(false);
+    let session = unused_session(tmp.path());
+    let only = HashSet::from([tmp
+        .path()
+        .join("mod")
+        .join("common")
+        .join("things")
+        .join("x.txt")]);
+
+    let paths: Vec<PathBuf> = session
+        .validate_selected(Some(&only))
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(paths.len(), 1, "only the selected file runs: {paths:?}");
+    assert!(paths[0].ends_with("common/things/x.txt"));
+    assert_eq!(
+        session.validate_all().len(),
+        2,
+        "and the unrestricted pass still covers both"
+    );
+}
+
+/// The selection is an optimization, never a change of answer. With the
+/// cross-file use pass armed, CW239 judges every definition against the
+/// references collected from every file — so honouring a selection that leaves
+/// out the only file holding a reference would report `used_thing` as unused.
+/// `validate_selected` validates the whole set instead, leaving the caller to
+/// filter its own report.
+#[test]
+fn validate_selected_is_ignored_while_use_tracking_is_on() {
+    let tmp = unused_workspace(true);
+    let session = unused_session(tmp.path());
+    // The definitions, without the file that references one of them.
+    let only = HashSet::from([tmp
+        .path()
+        .join("mod")
+        .join("common")
+        .join("things")
+        .join("x.txt")]);
+
+    let results = session.validate_selected(Some(&only));
+    let unused: Vec<&str> = results
+        .iter()
+        .flat_map(|(_, errors)| errors)
+        .filter(|e| e.code == Some("CW239"))
+        .map(|e| e.message.as_str())
+        .collect();
+    assert_eq!(
+        unused.len(),
+        1,
+        "only lone_thing is unreferenced; a partial pass would add used_thing: {unused:?}"
+    );
+    assert!(unused[0].contains("lone_thing"), "got {unused:?}");
+    assert_eq!(
+        results.len(),
+        2,
+        "the whole set is validated when the selection can't be honoured"
+    );
+}
+
 /// The pass is part of `validate_all`'s result, so it must be as repeatable as
 /// the rest of it. The per-file uses are merged out of a rayon collect, and a
 /// set iteration leaking into the output would show up here.

@@ -485,6 +485,177 @@ fn test_validate_output_file() {
     assert!(report.exists());
 }
 
+// ── Report scope (--file / --since) ──────────────────────────────────────────
+//
+// Both scope the report, not the run: the directory is still indexed whole, so
+// the cross-file checks behind CW100/CW113 see everything either way. Of the
+// mod_a fixture's two files only the event produces a diagnostic (CW107), so
+// whether it survives says which files the run reported on.
+
+/// `validate` over `dir` against the rules fixture, with `extra` appended.
+fn validate_dir(dir: &std::path::Path, extra: &[&str]) -> assert_cmd::assert::Assert {
+    let rules_dir = fixtures_dir().join("rules");
+    let mut cmd = cwtools();
+    cmd.args([
+        "validate",
+        "--game",
+        "stellaris",
+        "--directory",
+        dir.to_str().unwrap(),
+        "--rules",
+        rules_dir.to_str().unwrap(),
+    ]);
+    cmd.args(extra);
+    cmd.assert()
+}
+
+#[test]
+fn test_validate_file_scopes_the_report() {
+    let mod_dir = fixtures_dir().join("discover").join("mod_a");
+    let quiet = mod_dir.join("common").join("test.txt");
+    let noisy = mod_dir.join("events").join("test.txt");
+
+    validate_dir(&mod_dir, &["--file", quiet.to_str().unwrap()])
+        .success()
+        .stdout(predicate::str::contains("CW107").not());
+    validate_dir(&mod_dir, &["--file", noisy.to_str().unwrap()])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
+/// A relative `--file` and an absolute one name the same file: the diagnostic's
+/// own path spelling follows `--directory`, so the two sides have to be
+/// normalised before they are compared.
+#[test]
+fn test_validate_file_matches_across_path_spellings() {
+    let mod_dir = fixtures_dir().join("discover").join("mod_a");
+    let noisy = mod_dir.join("events").join(".").join("test.txt");
+    validate_dir(&mod_dir, &["--file", noisy.to_str().unwrap()])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
+/// A typo'd `--file` is named rather than silently scoping the run to nothing.
+/// It is a warning, not an error: a `--since` list legitimately covers files
+/// that no longer exist.
+#[test]
+fn test_validate_file_that_is_not_on_disk_warns_and_still_runs() {
+    let mod_dir = fixtures_dir().join("discover").join("mod_a");
+    let noisy = mod_dir.join("events").join("test.txt");
+    validate_dir(
+        &mod_dir,
+        &[
+            "--file",
+            noisy.to_str().unwrap(),
+            "--file",
+            mod_dir.join("nope.txt").to_str().unwrap(),
+        ],
+    )
+    .success()
+    .stderr(predicate::str::contains("nope.txt is not on disk"))
+    .stdout(predicate::str::contains("CW107"));
+}
+
+/// A baseline written from a scoped run would drop every hash outside the
+/// scope, which is a quiet way to lose one.
+#[test]
+fn test_validate_output_hashes_with_a_scope_warns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mod_dir = fixtures_dir().join("discover").join("mod_a");
+    let hashes = tmp.path().join("baseline.txt");
+    validate_dir(
+        &mod_dir,
+        &[
+            "--file",
+            mod_dir.join("events").join("test.txt").to_str().unwrap(),
+            "--output-hashes",
+            hashes.to_str().unwrap(),
+        ],
+    )
+    .success()
+    .stderr(predicate::str::contains("--output-hashes"));
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A git repo holding the mod_a fixture, committed, so `--since HEAD` has a
+/// clean tree to start from. Identity and signing are set on the repo so the
+/// commit doesn't depend on the developer's global git config.
+fn git_repo_mod() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = fixtures_dir().join("discover").join("mod_a");
+    for rel in ["common/test.txt", "events/test.txt"] {
+        let dst = tmp.path().join(rel);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(src.join(rel), &dst).unwrap();
+    }
+    git(tmp.path(), &["init"]);
+    git(tmp.path(), &["config", "user.email", "test@example.com"]);
+    git(tmp.path(), &["config", "user.name", "cwtools tests"]);
+    git(tmp.path(), &["config", "commit.gpgsign", "false"]);
+    git(tmp.path(), &["add", "."]);
+    git(tmp.path(), &["commit", "--no-verify", "-m", "fixture"]);
+    tmp
+}
+
+#[test]
+fn test_validate_since_scopes_to_the_changed_files() {
+    let repo = git_repo_mod();
+    let event = repo.path().join("events").join("test.txt");
+
+    // Nothing has changed since HEAD, so the event's CW107 is out of scope.
+    validate_dir(repo.path(), &["--since", "HEAD"])
+        .success()
+        .stdout(predicate::str::contains("CW107").not());
+
+    // Editing it brings it back. The trailing comment leaves the event itself
+    // (and so the diagnostic's line) alone.
+    let mut text = std::fs::read_to_string(&event).unwrap();
+    text.push_str("# touched\n");
+    std::fs::write(&event, text).unwrap();
+    validate_dir(repo.path(), &["--since", "HEAD"])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
+/// A file that was never committed is the case a scoped run most wants to
+/// catch, so untracked files count as changed.
+#[test]
+fn test_validate_since_covers_untracked_files() {
+    let repo = git_repo_mod();
+    std::fs::write(
+        repo.path().join("events").join("new.txt"),
+        "namespace = new_events\n\ncountry_event = {\n\tid = new.1\n}\n",
+    )
+    .unwrap();
+    validate_dir(repo.path(), &["--since", "HEAD"])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
+/// A ref git can't resolve fails the run. Carrying on would report either
+/// everything or nothing, and both read as a pass.
+#[test]
+fn test_validate_since_unknown_ref_is_a_usage_error() {
+    let repo = git_repo_mod();
+    validate_dir(repo.path(), &["--since", "no/such/ref"])
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("--since"));
+}
+
 // ── Automatic base-game cache ────────────────────────────────────────────────
 //
 // `--vanilla` keeps its index under the OS cache dir (XDG_CACHE_HOME here) so a

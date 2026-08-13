@@ -184,6 +184,20 @@ pub(crate) struct ValidateArgs {
     /// report every code. `--ignore-code` still applies on top.
     #[arg(long = "only-code", value_name = "CWxxx", value_parser = codes::parse_code)]
     pub(crate) only_codes: Vec<String>,
+    /// Report only diagnostics in this file (repeatable). The directory is
+    /// still indexed whole — the cross-file checks need it — so this scopes the
+    /// report, the counts and the exit code, not the run.
+    /// Example: --file common/ideas/mine.txt
+    #[arg(long = "file", value_name = "PATH")]
+    pub(crate) files: Vec<PathBuf>,
+    /// Report only diagnostics in files that changed since this git ref: the
+    /// `--file` set a pre-commit hook or a PR job would otherwise assemble
+    /// itself. Compares the working tree against the merge base of the ref and
+    /// HEAD, so a branch reports what it changed rather than what its base
+    /// branch did, and counts untracked files. Unions with --file.
+    /// Example: --since origin/main
+    #[arg(long, value_name = "GIT-REF")]
+    pub(crate) since: Option<String>,
     /// Accept a run with nothing to validate. Without this, a ruleset that
     /// loads no types or a directory that yields no files is an error
     /// (exit 4) instead of a silent "0 errors".

@@ -16,9 +16,10 @@ pub(crate) const EXIT_DISCOVERY_FAILED: i32 = 3;
 /// "nothing to check" from "the walk errored".
 pub(crate) const EXIT_EMPTY_INPUT: i32 = 4;
 
-/// A `cwtools.toml` that couldn't be read or understood. Shares clap's
-/// usage-error code: the run never started, so it is not a validation result.
-const EXIT_CONFIG_ERROR: i32 = 2;
+/// An input the run couldn't act on: a `cwtools.toml` that wouldn't read or
+/// parse, a `--since` ref git couldn't resolve. Shares clap's usage-error code,
+/// since the run never started and so has no validation result to report.
+pub(crate) const EXIT_USAGE: i32 = 2;
 
 /// Resolve the run's config file, failing loudly on a broken one. `anchor` is
 /// the directory the upward search starts from when `--config` wasn't given.
@@ -28,7 +29,7 @@ pub(crate) fn load_config(
 ) -> Option<config::FileConfig> {
     config::resolve(explicit, anchor).unwrap_or_else(|e| {
         eprintln!("error: {e}");
-        std::process::exit(EXIT_CONFIG_ERROR);
+        std::process::exit(EXIT_USAGE);
     })
 }
 

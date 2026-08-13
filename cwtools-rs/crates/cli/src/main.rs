@@ -7,6 +7,7 @@ mod config;
 mod diag;
 mod report;
 mod run;
+mod scope;
 
 fn main() {
     // Quiet by default; set RUST_LOG or CWTOOLS_PROFILE to turn on logging /
