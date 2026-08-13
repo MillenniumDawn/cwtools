@@ -48,6 +48,9 @@ pub struct RuleSet {
     /// config ships no folders.cwt (discovery then falls back to the engine's
     /// built-in folder list).
     pub folders: Vec<String>,
+    /// Lowercased localisation command names from `localisation_commands = { ... }`
+    /// (localisation.cwt). Terminal getters for loc validation (CW226/CW266).
+    pub localisation_commands: rustc_hash::FxHashSet<String>,
     /// Lookup index over `aliases`, built by `reindex()`. Two-level map:
     /// `category → key → indices of every matching overload`. Lookups require
     /// only two borrowed-str probes with zero allocation on the hot path.
@@ -276,6 +279,7 @@ impl RuleSet {
             scope_inputs: Vec::new(),
             link_inputs: Vec::new(),
             folders: Vec::new(),
+            localisation_commands: rustc_hash::FxHashSet::default(),
             alias_exact: rustc_hash::FxHashMap::default(),
             alias_categories: rustc_hash::FxHashMap::default(),
             type_by_name: rustc_hash::FxHashMap::default(),

@@ -123,6 +123,11 @@ fn fill_ruleset(ast: &ParsedFile, table: &StringTable) -> RuleSet {
                         extract_scope_defs(children, ast, table, &mut ruleset);
                     }
                 }
+                "localisation_commands" => {
+                    if let Value::Clause(children) = &leaf.value {
+                        extract_localisation_commands(children, ast, table, &mut ruleset);
+                    }
+                }
                 _ => {
                     process_root_leaf(key, leaf, ast, table, comments, &mut ruleset);
                 }

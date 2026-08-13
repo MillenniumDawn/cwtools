@@ -355,9 +355,10 @@ fn loc_scope_data(game: Option<&str>, rules: Option<&Path>) -> Option<LocScopeDa
                 std::process::exit(EXIT_DISCOVERY_FAILED);
             });
     eprintln!(
-        "Loaded {} scopes and {} links from {} for the {game} loc command checks",
+        "Loaded {} scopes, {} links and {} loc commands from {} for the {game} loc command checks",
         ruleset.scope_inputs.len(),
         ruleset.link_inputs.len(),
+        ruleset.localisation_commands.len(),
         rules.display()
     );
     if !problems.is_empty() {
@@ -369,6 +370,7 @@ fn loc_scope_data(game: Option<&str>, rules: Option<&Path>) -> Option<LocScopeDa
     }
     Some(LocScopeData {
         game: Some(game),
+        terminal_commands: ruleset.localisation_commands.iter().cloned().collect(),
         registry: build_scope_registry_arc(&ruleset, Some(game)),
         ..Default::default()
     })

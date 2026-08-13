@@ -10,7 +10,7 @@ use crate::loc_string::JominiCommand;
 use cwtools_game::constants::Game as EngineGame;
 use cwtools_game::scope_engine::{SCOPE_ANY, ScopeContext, ScopeId, ScopeResult};
 use cwtools_game::scope_registry::ScopeRegistry;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -54,6 +54,7 @@ pub enum LocCommandDiagnostic {
 /// caller's own normalization (`@` concatenation, `?`/`^` selectors, case)
 /// applies on top. `Sync` because both the per-file validation pass and the
 /// standalone loc lint fan out over rayon holding a `&LocScopeData`.
+// Both registries (variables and scripted_locs) share the same lookup shape.
 pub type ScriptedVariables<'a> = &'a (dyn Fn(&str) -> bool + Sync);
 
 /// Per-game static data needed for loc-command validation.
@@ -64,12 +65,12 @@ pub type ScriptedVariables<'a> = &'a (dyn Fn(&str) -> bool + Sync);
 pub struct LocScopeData<'a> {
     /// Game variant (controls which scope links are loaded).
     pub game: Option<EngineGame>,
-    /// Terminal getter commands accepted for this game.
+    /// Terminal getter commands accepted for this game. Lowercased.
     ///
     /// If this is empty every unknown command is accepted (fully lenient).
     /// If non-empty, any unknown final segment not in this list will produce
     /// a `ChainEndsInScope` diagnostic.
-    pub terminal_commands: Vec<String>,
+    pub terminal_commands: FxHashSet<String>,
     /// Whether `?variable` syntax is accepted (HOI4 / Stellaris).
     pub question_mark_variable: bool,
     /// Whether `parameter:xxx` references are accepted.
@@ -81,17 +82,23 @@ pub struct LocScopeData<'a> {
     /// final segment. `None` keeps every multi-segment chain lenient, which is
     /// what a run with no variable index gets.
     pub scripted_variables: Option<ScriptedVariables<'a>>,
+    /// Scripted-localisation registry, consulted alongside terminal commands
+    /// before CW226 fires. Mirrors `scripted_variables` but for the final
+    /// tail of a command chain (`AST_GetNavyName` etc). `None` keeps the
+    /// check lenient when no type index is available.
+    pub scripted_locs: Option<ScriptedVariables<'a>>,
 }
 
 impl Default for LocScopeData<'_> {
     fn default() -> Self {
         Self {
             game: None,
-            terminal_commands: Vec::new(),
+            terminal_commands: FxHashSet::default(),
             question_mark_variable: true,
             parameter_variables: true,
             registry: None,
             scripted_variables: None,
+            scripted_locs: None,
         }
     }
 }
@@ -140,14 +147,8 @@ pub fn validate_loc_commands(
     };
     let mut diags = Vec::new();
 
-    // Lowercased terminal-command set, built once per entry. The membership test
-    // (`is_terminal_command`) ran a linear case-insensitive scan per segment;
-    // a set turns that into an O(1) lookup. Identifiers are ASCII.
-    let terminal_set: HashSet<String> = data
-        .terminal_commands
-        .iter()
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    // `terminal_commands` is already lowercased (from RuleSet). Use directly.
+    let terminal_set = &data.terminal_commands;
 
     // Validate legacy [command] strings (single-segment, dot-split internally)
     for cmd in &entry.commands {
@@ -156,7 +157,7 @@ pub fn validate_loc_commands(
             initial_scope,
             engine_game,
             data,
-            &terminal_set,
+            terminal_set,
             &mut diags,
         );
     }
@@ -168,7 +169,7 @@ pub fn validate_loc_commands(
             initial_scope,
             engine_game,
             data,
-            &terminal_set,
+            terminal_set,
             &mut diags,
         );
     }
@@ -239,7 +240,7 @@ fn classify_segment(
     seg_lower: &str,
     is_last: bool,
     data: &LocScopeData<'_>,
-    terminal_set: &HashSet<String>,
+    terminal_set: &FxHashSet<String>,
 ) -> SegmentPre {
     if is_bypass_prefix(seg_lower, data) {
         return SegmentPre::Bypass;
@@ -302,7 +303,7 @@ fn validate_command_string(
     initial_scope: ScopeId,
     engine_game: EngineGame,
     data: &LocScopeData<'_>,
-    terminal_set: &HashSet<String>,
+    terminal_set: &FxHashSet<String>,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
     if is_bypass_prefix(&cmd.to_ascii_lowercase(), data) {
@@ -383,7 +384,7 @@ fn validate_jomini_chain(
     initial_scope: ScopeId,
     engine_game: EngineGame,
     data: &LocScopeData<'_>,
-    terminal_set: &HashSet<String>,
+    terminal_set: &FxHashSet<String>,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
     if chain.is_empty() {
@@ -393,17 +394,18 @@ fn validate_jomini_chain(
     let mut ctx = build_loc_ctx(data, engine_game, initial_scope);
     // A `?` marks the bracket as a variable read (`[?ROOT.war_support|1]`), so the
     // final segment is a variable name the scripted-variable registry answers for.
-    // A chain without one ends in a command or a scripted-localisation name, and
-    // there is no registry for those — it stays exempt, as every multi-segment
-    // chain used to be. So does a chain reading through a variable
-    // (`[?GER_crisis_id.GERGetCrisisType]`), where the tail is a command again.
-    // Unknown intermediates (country-tag scopes like PAL) poison either kind,
-    // which is tracked below.
+    // A chain reading through a variable (`[?GER_crisis_id.GERGetCrisisType]`)
+    // has an opaque intermediate value and stays lenient. Other multi-segment
+    // chains (e.g. `ROOT.GetName`, `ROOT.AST_GetNavyName`) end in a terminal
+    // command or a scripted-localisation name and are validated against the
+    // rules/config registries. Unknown intermediates (country-tag scopes like
+    // PAL) poison either kind, which is tracked below.
     let marker = chain[0].key.strip_prefix('?');
-    let variable_read = data.question_mark_variable
-        && marker.is_some_and(|m| !reads_a_variable(m, data))
-        && data.scripted_variables.is_some();
-    let mut had_lenient_intermediate = !variable_read && chain.len() > 1;
+    let has_q_mark = data.question_mark_variable && marker.is_some();
+    let reads_through_variable = has_q_mark && marker.is_some_and(|m| reads_a_variable(m, data));
+    let lacks_variable_registry = has_q_mark && data.scripted_variables.is_none();
+    let mut had_lenient_intermediate =
+        (reads_through_variable || lacks_variable_registry) && chain.len() > 1;
 
     for (i, cmd) in chain.iter().enumerate() {
         let seg = &cmd.key;
@@ -453,10 +455,11 @@ fn validate_jomini_chain(
                     && !looks_terminal
                     && !had_lenient_intermediate
                     && !reads_a_variable(seg, data)
+                    && !is_scripted_loc(seg, data)
                 {
                     // Registry present, chain resolved cleanly up to this point,
-                    // final command is neither a command nor a defined variable:
-                    // CW226 (mirrors F# `LocNotFound`).
+                    // final segment is neither a known command, a defined variable,
+                    // nor a scripted-localisation: CW226 (mirrors F# `LocNotFound`).
                     diags.push(LocCommandDiagnostic::NotFound {
                         command: seg.to_string(),
                     });
@@ -469,6 +472,17 @@ fn validate_jomini_chain(
     }
 }
 
+fn is_known_name(segment: &str, lookup: Option<ScriptedVariables<'_>>) -> bool {
+    let Some(lookup) = lookup else {
+        return false;
+    };
+    let name = segment.split('|').next().unwrap_or(segment).trim();
+    if name.is_empty() || name.contains(':') || name.contains('$') {
+        return true;
+    }
+    name.parse::<f64>().is_ok() || lookup(name)
+}
+
 /// Whether `segment` reads a variable the scripted-variable registry can vouch
 /// for, so a chain ending on it is legitimate rather than a typo.
 ///
@@ -478,14 +492,11 @@ fn validate_jomini_chain(
 /// the read formats (`[?0.3|-=%1]`), a `holder:name` read through a scope the
 /// engine resolves at runtime, and a `$ARG$`-concatenated name.
 fn reads_a_variable(segment: &str, data: &LocScopeData<'_>) -> bool {
-    let Some(lookup) = data.scripted_variables else {
-        return false;
-    };
-    let name = segment.split('|').next().unwrap_or(segment).trim();
-    if name.is_empty() || name.contains(':') || name.contains('$') {
-        return true;
-    }
-    name.parse::<f64>().is_ok() || lookup(name)
+    is_known_name(segment, data.scripted_variables)
+}
+
+fn is_scripted_loc(segment: &str, data: &LocScopeData<'_>) -> bool {
+    is_known_name(segment, data.scripted_locs)
 }
 
 /// Check if a command segment is (or looks like) a terminal getter.
@@ -496,8 +507,8 @@ fn reads_a_variable(segment: &str, data: &LocScopeData<'_>) -> bool {
 /// This covers the common Paradox naming convention (`GetName`, `GetDesc`,
 /// `GetRuler`…) plus the per-game list provided in `LocScopeData`.
 /// `lower` is the already-lowercased segment; `terminal_set` is the lowercased
-/// terminal-command set (built once per entry by `validate_loc_commands`).
-fn is_terminal_command(lower: &str, terminal_set: &HashSet<String>) -> bool {
+/// terminal-command set from `LocScopeData`.
+fn is_terminal_command(lower: &str, terminal_set: &FxHashSet<String>) -> bool {
     // Convention: terminal getters start with "Get" (case-insensitive)
     lower.starts_with("get") || terminal_set.contains(lower)
 }
@@ -566,16 +577,15 @@ mod tests {
         }
         LocScopeData {
             game: Some(EngineGame::Hoi4),
-            terminal_commands: vec![
-                "GetName".into(),
-                "GetNameDef".into(),
-                "GetAdjective".into(),
-                "GetLeader".into(),
-            ],
+            terminal_commands: ["GetName", "GetNameDef", "GetAdjective", "GetLeader"]
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect(),
             question_mark_variable: true,
             parameter_variables: true,
             registry: Some(Arc::new(reg)),
             scripted_variables: None,
+            ..Default::default()
         }
     }
 
@@ -792,11 +802,12 @@ mod tests {
         }]]);
         let data = LocScopeData {
             game: Some(EngineGame::Hoi4),
-            terminal_commands: Vec::new(),
+            terminal_commands: FxHashSet::default(),
             question_mark_variable: true,
             parameter_variables: true,
             registry: None, // no registry
             scripted_variables: None,
+            ..Default::default()
         };
         let diags = validate_loc_commands(&entry, ScopeId(0), &data);
         assert!(
@@ -861,15 +872,40 @@ mod tests {
     }
 
     #[test]
-    fn command_chain_stays_lenient() {
-        // No `?`: the final segment is a command or a scripted-localisation name,
-        // and there is no registry for those.
+    fn command_chain_typo_is_flagged() {
+        // No `?`: the final segment is checked against terminal commands and
+        // scripted-localisations; a typo must flag CW226.
         let entry = chain(&["Root", "war_suport"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert_eq!(
+            diags,
+            vec![LocCommandDiagnostic::NotFound {
+                command: "war_suport".into(),
+            }],
+        );
+    }
+
+    #[test]
+    fn command_chain_with_terminal_is_accepted() {
+        let entry = chain(&["Root", "GetName"]);
         let data = hoi4_data_with_variables();
         let diags = validate_loc_commands(&entry, ScopeId(100), &data);
         assert!(
             diags.is_empty(),
-            "a command chain should stay lenient: {diags:?}"
+            "a terminal command tail should be accepted: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn command_chain_with_scripted_loc_is_accepted() {
+        let entry = chain(&["Root", "AST_GetNavyName"]);
+        let mut data = hoi4_data_with_variables();
+        data.scripted_locs = Some(&|name: &str| name.eq_ignore_ascii_case("AST_GetNavyName"));
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "a scripted-localisation tail should be accepted: {diags:?}"
         );
     }
 
@@ -911,6 +947,77 @@ mod tests {
             diags.is_empty(),
             "Get-prefixed command should be accepted as terminal: {:?}",
             diags
+        );
+    }
+
+    #[test]
+    fn terminal_command_case_insensitive() {
+        let entry = chain(&["Root", "getname"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "terminal lookup must be case-insensitive: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn scripted_loc_with_format_suffix_is_accepted() {
+        let entry = chain(&["Root", "AST_GetNavyName|Y"]);
+        let mut data = hoi4_data_with_variables();
+        data.scripted_locs = Some(&|name: &str| name.eq_ignore_ascii_case("AST_GetNavyName"));
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "|format suffix must be stripped before lookup: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn scripted_loc_case_insensitive() {
+        let entry = chain(&["Root", "ast_getnavyname"]);
+        let mut data = hoi4_data_with_variables();
+        data.scripted_locs = Some(&|name: &str| name.eq_ignore_ascii_case("AST_GetNavyName"));
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "scripted_loc lookup must be case-insensitive"
+        );
+    }
+
+    #[test]
+    fn scripted_loc_special_segments_are_trusted() {
+        for seg in ["holder:foo", "$ARG$", "", "1.5"] {
+            let entry = chain(&["Root", seg]);
+            let mut data = hoi4_data_with_variables();
+            data.scripted_locs = Some(&|_: &str| false);
+            let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+            assert!(
+                diags.is_empty(),
+                "segment {seg:?} with :/$/numeric/empty must be trusted"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_with_format_and_mixed_case_is_accepted() {
+        let entry = chain(&["?Root", "WAR_SUPPORT|1"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "variable lookup must strip |format and ignore case"
+        );
+    }
+
+    #[test]
+    fn command_chain_unknown_intermediate_with_terminal_tail_stays_lenient() {
+        let entry = chain(&["Root", "PAL", "GetName"]);
+        let data = hoi4_data_with_variables();
+        let diags = validate_loc_commands(&entry, ScopeId(100), &data);
+        assert!(
+            diags.is_empty(),
+            "unknown intermediate poisons even terminal tails"
         );
     }
 }

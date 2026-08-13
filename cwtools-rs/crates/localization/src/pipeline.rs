@@ -875,10 +875,11 @@ mod tests {
         let data = LocScopeData {
             game: Some(Game::Hoi4),
             registry: Some(Arc::new(reg)),
-            terminal_commands: vec!["GetName".into()],
+            terminal_commands: ["getname"].into_iter().map(String::from).collect(),
             question_mark_variable: true,
             parameter_variables: true,
             scripted_variables: Some(&is_known_var),
+            ..Default::default()
         };
         // Build a service with many entries so rayon actually parallelizes.
         let mut files = Vec::new();
