@@ -6,7 +6,7 @@ use cwtools_driver::RulesInput;
 use cwtools_game::constants::Game;
 use cwtools_localization::{LocScopeData, validate_loc_project_commands};
 use cwtools_string_table::string_table::StringTable;
-use cwtools_validation::{ErrorSeverity, build_scope_registry_arc};
+use cwtools_validation::build_scope_registry_arc;
 
 use crate::cli::LocArgs;
 use crate::diag::{
@@ -16,7 +16,7 @@ use crate::diag::{
 use crate::report::ReportType;
 use crate::run::{
     EXIT_DISCOVERY_FAILED, announce_config, exit_code, exit_if_empty, load_config,
-    missing_required, report_owns_stdout, resolved_path, status,
+    missing_required, note, report_owns_stdout, resolved_path, status,
 };
 use crate::{codes, config, report};
 
@@ -34,6 +34,7 @@ pub(super) fn run(args: LocArgs) {
         ignore_dirs,
         loc_language,
         min_severity,
+        fail_on,
         ignore_codes,
         only_codes,
         allow_empty,
@@ -86,6 +87,8 @@ pub(super) fn run(args: LocArgs) {
         "min-severity",
         &mut applied,
     );
+    let fail_on = config::pick(fail_on, fc.and_then(|c| c.fail_on), "fail-on", &mut applied)
+        .unwrap_or_default();
     let ignore_codes = config::pick_list(
         ignore_codes,
         fc.map(|c| c.ignore_codes.clone()).unwrap_or_default(),
@@ -199,14 +202,6 @@ pub(super) fn run(args: LocArgs) {
         .collect();
 
     let total_issues = diags.len() + parse_errors.len();
-    // Severity-aware like `validate`: a parse failure is always an
-    // error; a lint diagnostic only counts if it's Error-severity, so
-    // e.g. Information-severity CW234 placeholders don't fail CI.
-    let total_errors = diags
-        .iter()
-        .filter(|d| d.severity == ErrorSeverity::Error)
-        .count()
-        + parse_errors.len();
 
     // Render the report in the requested format. The `cli` default
     // reproduces the original hand-rolled text report byte-for-byte;
@@ -268,11 +263,14 @@ pub(super) fn run(args: LocArgs) {
                 eprintln!("Error writing report {}: {}", p.display(), e);
                 true
             } else {
-                println!(
-                    "Wrote {} report ({} issues) to {}",
-                    report_type.as_str(),
-                    total_issues,
-                    p.display()
+                status(
+                    format!(
+                        "Wrote {} report ({} issues) to {}",
+                        report_type.as_str(),
+                        total_issues,
+                        p.display()
+                    ),
+                    false,
                 );
                 false
             }
@@ -306,7 +304,11 @@ pub(super) fn run(args: LocArgs) {
         }
     }
 
-    let code = exit_code(total_errors, false, write_failed);
+    // Severity-aware like `validate`: a parse failure is always an error, while
+    // a lint diagnostic only counts once it reaches the gate, so e.g. an
+    // Information-severity CW234 placeholder doesn't fail CI by default.
+    let failing = fail_on.failing(diags.iter().chain(&parse_errors).map(|d| d.severity));
+    let code = exit_code(failing, false, write_failed);
     if code != 0 {
         std::process::exit(code);
     }
@@ -354,13 +356,13 @@ fn loc_scope_data(game: Option<&str>, rules: Option<&Path>) -> Option<LocScopeDa
                 eprintln!("error: {e}");
                 std::process::exit(EXIT_DISCOVERY_FAILED);
             });
-    eprintln!(
+    note(format!(
         "Loaded {} scopes, {} links and {} loc commands from {} for the {game} loc command checks",
         ruleset.scope_inputs.len(),
         ruleset.link_inputs.len(),
         ruleset.localisation_commands.len(),
         rules.display()
-    );
+    ));
     if !problems.is_empty() {
         eprintln!(
             "warn: the ruleset has {} problems; run `cwtools rules {}` for them",

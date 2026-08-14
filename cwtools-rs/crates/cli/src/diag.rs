@@ -131,6 +131,22 @@ pub(crate) struct Diag {
     /// reads it, and computing one costs another relativize-and-digest per
     /// diagnostic.
     pub(crate) legacy_hash: String,
+    /// Exclusive end of the diagnostic's span, 1-based line and column, when
+    /// the emit site had a range to give. Only the `sarif` report reads it, so
+    /// it stays out of the hash and the cli/csv/json rows.
+    pub(crate) end: Option<(u32, u32)>,
+    /// Secondary spans the message refers to, always inside this row's own
+    /// file. Same contract as `end`: `sarif` only.
+    pub(crate) related: Vec<Related>,
+}
+
+/// A secondary span on a report row, normalised to the 1-based columns the CI
+/// formats use. `end` is exclusive, like [`Diag::end`].
+pub(crate) struct Related {
+    pub(crate) message: String,
+    pub(crate) line: u32,
+    pub(crate) col: u32,
+    pub(crate) end: (u32, u32),
 }
 
 /// Whether a `--ignore-hashes` baseline suppresses `d`. Both digests are
@@ -183,6 +199,19 @@ pub(crate) fn validation_to_diag(
         col: err.col as u32 + 1,
         hash,
         legacy_hash,
+        // The parser's exclusive 0-based end column lands on SARIF's exclusive
+        // 1-based `endColumn` by the same +1; the line is 1-based already.
+        end: err.end.map(|(line, col)| (line, col as u32 + 1)),
+        related: err
+            .related
+            .into_iter()
+            .map(|r| Related {
+                message: r.message,
+                line: r.line,
+                col: r.col as u32 + 1,
+                end: (r.end.0, r.end.1 as u32 + 1),
+            })
+            .collect(),
     }
 }
 
@@ -209,6 +238,9 @@ pub(crate) fn loc_diagnostic_to_diag(
         col: (d.col as u32).max(1),
         hash,
         legacy_hash,
+        // A loc diagnostic carries a point, not a range.
+        end: None,
+        related: Vec::new(),
     }
 }
 
@@ -235,6 +267,9 @@ pub(crate) fn rule_error_to_diag(
         col: err.col as u32 + 1,
         hash,
         legacy_hash,
+        // A rules-config problem carries a point, not a range.
+        end: None,
+        related: Vec::new(),
     }
 }
 
@@ -260,6 +295,8 @@ pub(crate) fn loc_parse_error_to_diag(
         col: 1,
         hash,
         legacy_hash,
+        end: None,
+        related: Vec::new(),
     }
 }
 
@@ -304,16 +341,34 @@ pub(crate) fn json_row(d: &Diag, last: bool) -> String {
     s
 }
 
+/// The ANSI color of a severity tag, matching the three levels a reader
+/// actually triages by: red stops the build, yellow probably should, and the
+/// two advisory levels recede.
+fn severity_color(s: ErrorSeverity) -> &'static str {
+    match s {
+        ErrorSeverity::Error => "\x1b[31m",
+        ErrorSeverity::Warning => "\x1b[33m",
+        ErrorSeverity::Information | ErrorSeverity::Hint => "\x1b[90m",
+    }
+}
+
 /// One grouped-CLI report row (the per-diagnostic line, not the file header).
-pub(crate) fn cli_row(d: &Diag) -> String {
+/// `color` paints the severity tag; it is off for everything but a report going
+/// to a terminal, so a redirected run is unchanged (see `run::color_enabled`).
+pub(crate) fn cli_row(d: &Diag, color: bool) -> String {
     let code_part = if d.code.is_empty() {
         String::new()
     } else {
         format!("[{}] ", d.code)
     };
+    let severity = if color {
+        format!("{}[{:?}]\x1b[0m", severity_color(d.severity), d.severity)
+    } else {
+        format!("[{:?}]", d.severity)
+    };
     format!(
-        "    [{:?}] {}{} (line {})\n",
-        d.severity, code_part, d.message, d.line
+        "    {} {}{} (line {})\n",
+        severity, code_part, d.message, d.line
     )
 }
 
@@ -664,30 +719,97 @@ mod tests {
         assert_eq!(v.as_array().unwrap().len(), 2);
     }
 
-    // Inertness guard (Task 8/18, step 2): a fix payload AND an end position must
-    // not change the report. The `Diag` mapping and every report row read neither —
-    // locked in here so populating the emit sites keeps validate output byte-identical.
+    // Inertness guard: a fix payload, an end position and a related span must not
+    // change the digest or any of the three text rows. `sarif` reads the end and
+    // the related spans on purpose (see `report`); nothing else may, or an
+    // existing `--ignore-hashes` baseline would stop matching the moment an emit
+    // site started recording a range.
     #[test]
     fn fix_payload_is_inert_in_report() {
         let base = err_base();
-        let mut with_fix = base.clone();
-        with_fix.fix = Some(SuggestedFix::delete(
+        let mut with_extras = base.clone();
+        with_extras.fix = Some(SuggestedFix::delete(
             "Remove redundant default",
             SourceRange {
                 start: SourcePos { line: 12, col: 4 },
                 end: SourcePos { line: 13, col: 0 },
             },
         ));
-        // Task 18: the end position is inert in the report too.
-        with_fix.end = Some((12, 30));
+        with_extras.end = Some((12, 30));
+        with_extras.related = vec![cwtools_validation::RelatedSpan {
+            message: "defined here".to_string(),
+            line: 4,
+            col: 2,
+            end: (4, 8),
+        }];
 
         let root = Path::new(".");
         let d0 = validation_to_diag(root, base, "cost = 150", true);
-        let d1 = validation_to_diag(root, with_fix, "cost = 150", true);
+        let d1 = validation_to_diag(root, with_extras, "cost = 150", true);
 
-        assert_eq!(d0.hash, d1.hash, "hash must ignore the fix");
-        assert_eq!(csv_row(&d0), csv_row(&d1), "csv row must ignore the fix");
+        assert_eq!(d0.hash, d1.hash, "hash must ignore the extras");
+        assert_eq!(d0.legacy_hash, d1.legacy_hash);
+        assert_eq!(csv_row(&d0), csv_row(&d1), "csv row must ignore the extras");
         assert_eq!(json_row(&d0, true), json_row(&d1, true));
-        assert_eq!(cli_row(&d0), cli_row(&d1), "cli row must ignore the fix");
+        assert_eq!(
+            cli_row(&d0, false),
+            cli_row(&d1, false),
+            "cli row must ignore the extras"
+        );
+        // The sarif report is the one that does read them.
+        assert_eq!(
+            d1.end,
+            Some((12, 31)),
+            "0-based exclusive col becomes 1-based"
+        );
+        assert_eq!(d1.related.len(), 1);
+        assert_eq!(d1.related[0].col, 3);
+        assert_eq!(d1.related[0].end, (4, 9));
+    }
+
+    fn row_diag(severity: ErrorSeverity) -> Diag {
+        Diag {
+            file: "x.txt".into(),
+            severity,
+            code: "CW100",
+            message: "m".to_string(),
+            line: 3,
+            col: 1,
+            hash: String::new(),
+            legacy_hash: String::new(),
+            end: None,
+            related: Vec::new(),
+        }
+    }
+
+    /// The uncolored row is the shape every existing baseline and CI log holds.
+    #[test]
+    fn cli_row_without_color_is_plain_text() {
+        assert_eq!(
+            cli_row(&row_diag(ErrorSeverity::Error), false),
+            "    [Error] [CW100] m (line 3)\n"
+        );
+    }
+
+    #[test]
+    fn cli_row_with_color_wraps_only_the_severity_tag() {
+        let row = cli_row(&row_diag(ErrorSeverity::Warning), true);
+        assert_eq!(row, "    \x1b[33m[Warning]\x1b[0m [CW100] m (line 3)\n");
+        // One escape pair: the message and the code stay unpainted.
+        assert_eq!(row.matches('\x1b').count(), 2);
+    }
+
+    #[test]
+    fn cli_row_colors_the_three_triage_levels_apart() {
+        let color_of = |s| {
+            cli_row(&row_diag(s), true)
+                .split_once('[')
+                .map(|(_, rest)| format!("[{}", rest.split('m').next().unwrap()))
+                .unwrap()
+        };
+        assert_eq!(color_of(ErrorSeverity::Error), "[31");
+        assert_eq!(color_of(ErrorSeverity::Warning), "[33");
+        assert_eq!(color_of(ErrorSeverity::Information), "[90");
+        assert_eq!(color_of(ErrorSeverity::Hint), "[90");
     }
 }

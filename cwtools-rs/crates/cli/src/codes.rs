@@ -5,6 +5,10 @@
 //! against it (a typo is an error, not a silent no-op). Not every mirrored code
 //! is currently emitted; pending codes are marked in `PENDING_CODES`. The SARIF
 //! report only turns emitted codes into `tool.driver.rules`.
+//!
+//! The long form of what a code means lives in `docs/ERROR_CODES.md` and is
+//! read from there rather than copied: [`doc_row`] parses the row `explain`
+//! prints, so the reference stays the one place the prose is written.
 
 use cwtools_error_codes::ErrorCode;
 
@@ -93,12 +97,16 @@ catalog![
     CW603_RULES_INVALID_DIRECTIVE,
 ];
 
-// Codes defined in `error_codes` but not yet wired.
+// Codes defined in `error_codes` but not yet wired. Kept in step with the
+// reference's Status column by `pending_codes_match_the_reference_status`: a
+// code listed here after its check lands loses its SARIF rule metadata.
 const PENDING_CODES: &[&str] = &[
-    "CW220", "CW221", "CW228", "CW230", "CW233", "CW269", "CW273", "CW274",
+    "CW220", "CW221", "CW228", "CW230", "CW233", "CW269", "CW273",
 ];
 
-fn is_pending_code(id: &str) -> bool {
+/// Whether the check behind `id` is still unwired. `list-codes` says so, since
+/// a code that never fires is otherwise indistinguishable from a clean run.
+pub(crate) fn is_pending_code(id: &str) -> bool {
     PENDING_CODES.iter().any(|p| p.eq_ignore_ascii_case(id))
 }
 
@@ -106,6 +114,11 @@ fn is_pending_code(id: &str) -> bool {
 /// validation entry exists for that code.
 pub(crate) fn entry(id: &str) -> Option<&'static (&'static str, ErrorCode)> {
     CATALOG.iter().find(|(_, c)| c.id.eq_ignore_ascii_case(id))
+}
+
+/// Every catalog entry, in declaration order (which is code order).
+pub(crate) fn all() -> impl Iterator<Item = &'static (&'static str, ErrorCode)> {
+    CATALOG.iter()
 }
 
 /// The entry for emitted codes only, for SARIF rule metadata.
@@ -150,6 +163,70 @@ pub(crate) fn rule_name(const_name: &str) -> String {
         }
         out
     })
+}
+
+/// One-line description of a code: its message template with the substitution
+/// points blanked out, or the prose form of its const name when the template is
+/// a bare pass-through and would render as nothing. Shared by `list-codes` and
+/// the SARIF `shortDescription` so the two can't drift.
+pub(crate) fn short_description(const_name: &str, code: &ErrorCode) -> String {
+    let description = code.message_template.replace("{}", "…");
+    if description.trim_matches(['…', ' ']).is_empty() {
+        rule_summary(const_name)
+    } else {
+        description
+    }
+}
+
+// ── The published reference ──────────────────────────────────────────────────
+
+/// `docs/ERROR_CODES.md`, embedded so `explain` answers from the binary alone.
+/// 30 KB of the reference the diagnostics already link to.
+const REFERENCE: &str = include_str!("../../../docs/ERROR_CODES.md");
+
+/// A code's row in the reference, as `explain` prints it. The severity and
+/// message columns are left to the catalog, which is where the emit sites read
+/// them from; `catalog_matches_the_reference` holds the two to each other.
+pub(crate) struct DocRow {
+    pub(crate) meaning: String,
+    pub(crate) status: String,
+}
+
+/// The reference row for `id`, or `None` when the doc carries no row for it.
+/// Rows are found by the per-code anchor rather than by position, so a heading
+/// or a table split above one doesn't move it.
+pub(crate) fn doc_row(id: &str) -> Option<DocRow> {
+    let cells = row_cells(doc_line(id)?);
+    // Leading and trailing `|` bracket the row, so the id lands at 1.
+    let cell = |i: usize| cells.get(i).filter(|c| !c.is_empty()).cloned();
+    Some(DocRow {
+        meaning: cell(4)?,
+        status: cell(5)?,
+    })
+}
+
+/// The raw table line carrying `id`'s anchor.
+fn doc_line(id: &str) -> Option<&'static str> {
+    let anchor = format!("<a id=\"{}\"></a>", id.to_ascii_lowercase());
+    REFERENCE.lines().find(|l| l.contains(&anchor))
+}
+
+/// Split a markdown table row into its cells. `\|` is an escaped pipe inside a
+/// cell rather than a separator — CW226's row reads `[?ROOT.war_support\|1]`,
+/// and splitting there would shift every column after it.
+fn row_cells(row: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = row.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => cell.push(chars.next().unwrap_or('\\')),
+            '|' => cells.push(std::mem::take(&mut cell).trim().to_string()),
+            c => cell.push(c),
+        }
+    }
+    cells.push(cell.trim().to_string());
+    cells
 }
 
 /// Prose form of a catalog const name, for the SARIF description of the codes
@@ -218,6 +295,93 @@ mod tests {
         assert!(
             missing.is_empty(),
             "docs/ERROR_CODES.md needs an <a id=\"cw###\"> anchor for: {missing:?}"
+        );
+    }
+
+    /// `explain` prints the reference's own prose, so a code whose row the
+    /// parser can't reach would print a heading with nothing under it.
+    #[test]
+    fn every_code_has_a_readable_reference_row() {
+        let missing: Vec<&str> = CATALOG
+            .iter()
+            .map(|(_, c)| c.id)
+            .filter(|id| doc_row(id).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/ERROR_CODES.md needs a `| <a id=…></a>CW### | Severity | Message | Meaning | \
+             Status |` row for: {missing:?}"
+        );
+    }
+
+    /// The reference restates the severity and the message template the emit
+    /// sites actually use. Two copies of a fact drift; this is the check that
+    /// says so at test time rather than in someone's CI log.
+    #[test]
+    fn catalog_matches_the_reference() {
+        for (_, code) in CATALOG {
+            let cells = row_cells(doc_line(code.id).expect("row exists"));
+            assert_eq!(
+                cells[2],
+                format!("{:?}", code.severity),
+                "{} severity disagrees with docs/ERROR_CODES.md",
+                code.id
+            );
+            assert_eq!(
+                cells[3], code.message_template,
+                "{} message disagrees with docs/ERROR_CODES.md",
+                code.id
+            );
+        }
+    }
+
+    /// `PENDING_CODES` decides whether a code reaches `tool.driver.rules`, so a
+    /// stale entry silently strips a real diagnostic's SARIF rule metadata —
+    /// which is exactly what it did to CW274 between its check landing and this
+    /// test. The reference's Status column is the same fact written down.
+    #[test]
+    fn pending_codes_match_the_reference_status() {
+        let mut documented: Vec<&str> = CATALOG
+            .iter()
+            .map(|(_, c)| c.id)
+            .filter(|id| {
+                !doc_row(id)
+                    .expect("row exists")
+                    .status
+                    .starts_with("Emitted")
+            })
+            .collect();
+        documented.sort_unstable();
+        let mut listed = PENDING_CODES.to_vec();
+        listed.sort_unstable();
+        assert_eq!(
+            documented, listed,
+            "PENDING_CODES disagrees with the Status column in docs/ERROR_CODES.md"
+        );
+    }
+
+    /// CW226's meaning cell contains `[?ROOT.war_support\|1]`; splitting on that
+    /// pipe would shift the status column into it.
+    #[test]
+    fn row_cells_keeps_an_escaped_pipe_inside_its_cell() {
+        let cells = row_cells(r"| a | b\|c | d |");
+        assert_eq!(cells, ["", "a", "b|c", "d", ""]);
+        let cw226 = doc_row("CW226").expect("CW226 is documented");
+        assert!(cw226.meaning.contains("war_support|1"), "{}", cw226.meaning);
+        assert!(cw226.status.starts_with("Emitted"), "{}", cw226.status);
+    }
+
+    #[test]
+    fn short_description_falls_back_to_the_const_name() {
+        let (_, cw240) = entry("CW240").unwrap();
+        assert_eq!(
+            short_description("CW240_UNEXPECTED_VALUE", cw240),
+            "Unexpected value"
+        );
+        let (_, cw110) = entry("CW110").unwrap();
+        assert_eq!(
+            short_description("CW110_TECH_CAT_MISSING", cw110),
+            cw110.message_template
         );
     }
 

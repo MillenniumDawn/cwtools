@@ -64,6 +64,98 @@ fn test_version_short_flag_prints_crate_version() {
         .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
+// ── Code catalog (explain / list-codes) ──────────────────────────────────────
+
+#[test]
+fn test_explain_prints_the_reference_row() {
+    cwtools()
+        .args(["explain", "CW113"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW113  Error  MissingFile"))
+        .stdout(predicate::str::contains(
+            "Message  File {} not found, this is case sensitive",
+        ))
+        .stdout(predicate::str::contains("Meaning  A file path referenced"))
+        .stdout(predicate::str::contains("Status   Emitted"))
+        .stdout(predicate::str::contains("ERROR_CODES.md#cw113"));
+}
+
+#[test]
+fn test_explain_accepts_a_lowercase_code() {
+    cwtools()
+        .args(["explain", "cw113"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW113  Error  MissingFile"));
+}
+
+#[test]
+fn test_explain_unknown_code_is_a_usage_error() {
+    cwtools()
+        .args(["explain", "CW999"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("CW999"))
+        .stderr(predicate::str::contains("list-codes"));
+}
+
+#[test]
+fn test_list_codes_covers_the_catalog_and_marks_the_pending_ones() {
+    cwtools()
+        .args(["list-codes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW001  Error"))
+        .stdout(predicate::str::contains("CW107  Information"))
+        // A pass-through template ("{}") renders as the code's prose name.
+        .stdout(predicate::str::contains(
+            "CW240  Error        Unexpected value",
+        ))
+        .stdout(
+            predicate::str::contains("CW220").and(predicate::str::contains("(emission pending)")),
+        )
+        // CW274's check shipped, so it must not read as pending.
+        .stdout(
+            predicate::str::contains("CW274  Error        InlineScriptError  (emission pending)")
+                .not(),
+        );
+}
+
+// ── Shell completions ────────────────────────────────────────────────────────
+
+#[test]
+fn test_completions_generate_for_every_supported_shell() {
+    for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+        cwtools()
+            .args(["completions", shell])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("cwtools"));
+    }
+}
+
+/// Generated from the live clap definition, so a flag that exists is offered.
+#[test]
+fn test_completions_cover_the_subcommands_and_flags() {
+    cwtools()
+        .args(["completions", "bash"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("validate"))
+        .stdout(predicate::str::contains("--fail-on"))
+        .stdout(predicate::str::contains("list-codes"));
+}
+
+#[test]
+fn test_completions_unknown_shell_fails() {
+    cwtools()
+        .args(["completions", "tcsh"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("tcsh"));
+}
+
 // ── Parse ────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -465,6 +557,174 @@ fn test_validate_min_severity_unknown_fails() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("invalid severity 'bogus'"));
+}
+
+// ── Output style (--quiet / --no-color) ──────────────────────────────────────
+
+#[test]
+fn test_quiet_drops_the_progress_chatter() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    validate_dir(&discover_dir, &["--quiet"])
+        .success()
+        .stderr(predicate::str::contains("Validating").not())
+        .stderr(predicate::str::contains("Discovered").not())
+        .stderr(predicate::str::contains("Loaded").not())
+        // The report itself is the output, not chatter.
+        .stdout(predicate::str::contains("CW107"))
+        .stdout(predicate::str::contains("Validation complete"));
+}
+
+#[test]
+fn test_quiet_short_flag_is_accepted() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    validate_dir(&discover_dir, &["-q"])
+        .success()
+        .stderr(predicate::str::contains("Validating").not());
+}
+
+/// A quiet run still has to say what it could not do, or a typo'd `--file`
+/// reads as a clean one.
+#[test]
+fn test_quiet_keeps_warnings() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    validate_dir(&discover_dir, &["--quiet", "--file", "nope/missing.txt"])
+        .success()
+        .stderr(predicate::str::contains("is not on disk"));
+}
+
+/// The scan banner is a status line, so `--quiet` reaches it in `loc` too.
+#[test]
+fn test_quiet_drops_the_loc_scan_banner() {
+    let loc_dir = fixtures_dir().join("loc");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--quiet"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scanning localisation").not())
+        .stdout(predicate::str::contains("Loc validation complete"));
+}
+
+/// Color is off for a piped report either way; `--no-color` must not change
+/// the bytes a redirected run produces.
+#[test]
+fn test_no_color_leaves_a_piped_report_byte_identical() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let plain = validate_dir(&discover_dir, &[]).get_output().stdout.clone();
+    let forced = validate_dir(&discover_dir, &["--no-color"])
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(plain, forced);
+    assert!(
+        !plain.contains(&0x1b),
+        "a piped report must carry no escapes"
+    );
+}
+
+#[test]
+fn test_no_color_is_accepted_on_every_reporting_subcommand() {
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .args(["rules", rules_dir.to_str().unwrap(), "--no-color"])
+        .assert()
+        .success();
+    let loc_dir = fixtures_dir().join("loc");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--no-color"])
+        .assert()
+        .success();
+}
+
+// ── Exit gate (--fail-on) ────────────────────────────────────────────────────
+//
+// mod_a's only diagnostic is an Information-severity CW107, so the fixture
+// exits 0 by default and the gate is the only thing that can change that.
+
+#[test]
+fn test_validate_fail_on_default_ignores_a_sub_error_diagnostic() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    validate_dir(&discover_dir, &[])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
+#[test]
+fn test_validate_fail_on_info_fails_on_an_information_diagnostic() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    validate_dir(&discover_dir, &["--fail-on", "info"])
+        .code(1)
+        .stdout(predicate::str::contains("CW107"));
+}
+
+#[test]
+fn test_validate_fail_on_warning_leaves_an_information_diagnostic_alone() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    validate_dir(&discover_dir, &["--fail-on", "warning"]).success();
+}
+
+/// The report-only case: publish the findings, never redden the build.
+#[test]
+fn test_validate_fail_on_none_never_fails() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    validate_dir(&discover_dir, &["--fail-on", "none"])
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
+/// `--min-severity` filters before the gate counts, so asking to fail on
+/// something it already dropped can never trip.
+#[test]
+fn test_validate_min_severity_filters_before_the_gate() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    validate_dir(
+        &discover_dir,
+        &["--min-severity", "error", "--fail-on", "info"],
+    )
+    .success()
+    .stdout(predicate::str::contains("CW107").not());
+}
+
+#[test]
+fn test_validate_fail_on_unknown_fails() {
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    validate_dir(&discover_dir, &["--fail-on", "bogus"])
+        .failure()
+        .stderr(predicate::str::contains("invalid severity 'bogus'"))
+        .stderr(predicate::str::contains("none"));
+}
+
+/// The ruleset's own warning (CW603) is below the default gate; asking for it
+/// is how CI fails on a `.cwt` that only degrades checks rather than breaking.
+#[test]
+fn test_rules_fail_on_none_reports_without_failing() {
+    let rules = broken_rules_dir();
+    cwtools()
+        .args(["rules", rules.path().to_str().unwrap(), "--fail-on", "none"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW601"));
+}
+
+/// `loc_error` carries an Error-severity CW225, so the default gate fails it.
+#[test]
+fn test_loc_fail_on_none_reports_an_error_without_failing() {
+    let loc_dir = fixtures_dir().join("loc_error");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--fail-on", "none"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW225"));
+}
+
+/// `loc_invalid`'s CW268 is a warning, below the default gate.
+#[test]
+fn test_loc_fail_on_warning_fails_on_a_warning() {
+    let loc_dir = fixtures_dir().join("loc_invalid");
+    cwtools()
+        .args(["loc", loc_dir.to_str().unwrap(), "--fail-on", "warning"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("CW268"));
 }
 
 #[test]
@@ -1992,6 +2252,34 @@ fn test_validate_sarif_report_is_well_formed() {
     assert!(stdout.contains("\"uriBaseId\": \"SRCROOT\""), "{stdout:?}");
     assert!(stdout.contains("\"partialFingerprints\""), "{stdout:?}");
     assert_balanced_json(&stdout);
+}
+
+/// The end position reaches the report from a real run, not just from a
+/// hand-built `Diag`: CW107 underlines the event key, so the region is a span.
+#[test]
+fn test_validate_sarif_regions_carry_the_end_position() {
+    let mod_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    let out = cwtools()
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            mod_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--report-type",
+            "sarif",
+        ])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let region = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+    assert_eq!(region["startLine"], 3);
+    assert_eq!(region["startColumn"], 1);
+    assert_eq!(region["endLine"], 3);
+    assert_eq!(region["endColumn"], 14, "the `country_event` key");
 }
 
 /// Cheap structural check that the hand-built JSON closes everything it opens

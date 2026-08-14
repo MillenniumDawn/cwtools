@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 
 use crate::diag::{Diag, SourceLines, cli_row, csv_row, json_row, rule_error_to_diag};
 use crate::report::{self, ReportType};
-use crate::run::{exit_code, status};
+use crate::run::{FailOn, color_enabled, exit_code, status};
 
-pub(super) fn run(file: PathBuf, report_type: Option<ReportType>) {
+pub(super) fn run(file: PathBuf, report_type: Option<ReportType>, fail_on: Option<FailOn>) {
     let report_type = report_type.unwrap_or(ReportType::Cli);
+    let fail_on = fail_on.unwrap_or_default();
     let table = StringTable::new();
     let (ruleset, errors) = load_rules_reporting(&file, &table);
 
@@ -50,10 +51,20 @@ pub(super) fn run(file: PathBuf, report_type: Option<ReportType>) {
 
     print!(
         "{}",
-        render(report_type, &diags, total_errors, total_warnings)
+        render(
+            report_type,
+            &diags,
+            total_errors,
+            total_warnings,
+            color_enabled(true)
+        )
     );
 
-    let code = exit_code(total_errors, false, false);
+    let code = exit_code(
+        fail_on.failing(diags.iter().map(|d| d.severity)),
+        false,
+        false,
+    );
     if code != 0 {
         std::process::exit(code);
     }
@@ -66,6 +77,7 @@ fn render(
     diags: &[Diag],
     total_errors: usize,
     total_warnings: usize,
+    color: bool,
 ) -> String {
     let mut out = String::new();
     match report_type {
@@ -99,7 +111,7 @@ fn render(
                     out.push_str(&format!("\n  {}:\n", d.file));
                     current = &d.file;
                 }
-                out.push_str(&cli_row(d));
+                out.push_str(&cli_row(d, color));
             }
             out.push_str(&format!(
                 "\nRules check complete: {} errors, {} warnings\n",

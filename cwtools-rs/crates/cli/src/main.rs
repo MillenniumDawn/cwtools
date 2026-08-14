@@ -13,5 +13,7 @@ fn main() {
     // Quiet by default; set RUST_LOG or CWTOOLS_PROFILE to turn on logging /
     // profiling. See PROFILING.md and `cwtools_profiling`.
     cwtools_profiling::init_tracing();
-    commands::dispatch(cli::Cli::parse().command);
+    let cli = cli::Cli::parse();
+    run::set_output_style(cli.quiet, cli.no_color);
+    commands::dispatch(cli.command);
 }
