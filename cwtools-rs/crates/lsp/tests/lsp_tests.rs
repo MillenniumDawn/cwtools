@@ -8353,10 +8353,15 @@ types = {
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     assert_eq!(resp["id"], 2, "got: {resp_str}");
     let all = resp["result"].as_array().expect("array result");
-    // An unfiltered request also carries the `source.fixAll` action; this test
-    // is about the per-diagnostic quickfix.
+    // An unfiltered request also carries the `source.fixAll` and
+    // ignore-in-workspace actions; this test is about the per-diagnostic
+    // quickfix.
     let actions: Vec<&serde_json::Value> = all.iter().filter(|a| a["kind"] == "quickfix").collect();
-    assert_eq!(actions.len(), 1, "one quickfix expected: {resp_str}");
+    assert_eq!(
+        actions.len(),
+        2,
+        "the fix plus the ignore action: {resp_str}"
+    );
     let action = actions[0];
     assert_eq!(action["kind"], "quickfix");
     assert_eq!(action["title"], "Remove empty limit");
@@ -8386,6 +8391,342 @@ types = {
         fixed, "x = { }\n",
         "applied edit must delete the empty limit"
     );
+}
+
+/// Whether a publish notification's diagnostics include `code`.
+fn publish_has_code(v: &serde_json::Value, code: &str) -> bool {
+    v["params"]["diagnostics"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|d| d["code"] == code))
+}
+
+/// Drain server frames until the next `publishDiagnostics` whose URI ends with
+/// `rel_path`, returning the notification. A server exit (EOF) fails the test
+/// rather than blocking: `read_frame` returns an empty frame at end of stream,
+/// which would otherwise loop forever.
+fn wait_for_publish_to(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    rel_path: &str,
+) -> serde_json::Value {
+    for _ in 0..400 {
+        let raw = match read_frame(reader) {
+            Ok(r) => r,
+            Err(_) => panic!("server exited while waiting for a publish of {rel_path}"),
+        };
+        if raw.is_empty() {
+            panic!("server exited while waiting for a publish of {rel_path}");
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
+            && v["method"] == "textDocument/publishDiagnostics"
+            && v["params"]["uri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(rel_path))
+        {
+            return v;
+        }
+    }
+    panic!("no publishDiagnostics for {rel_path} in 400 frames")
+}
+
+#[test]
+fn test_inline_ignore_directive_suppresses_a_keystroke_diagnostic() {
+    // The same file opened twice, once with `# cwtools-ignore CW281` trailing
+    // the offending line. The plain copy proves the setup fires CW281; the
+    // directive'd copy must publish it never.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let clean_rel = "common/decisions/clean.txt";
+    let clean_text = "x = { limit = { } }\n";
+    let clean_path = ws.path().join(clean_rel);
+    std::fs::create_dir_all(clean_path.parent().unwrap()).unwrap();
+    std::fs::write(&clean_path, clean_text).unwrap();
+
+    let ignored_rel = "common/decisions/ignored.txt";
+    let ignored_text = "x = { limit = { } } # cwtools-ignore CW281\n";
+    let ignored_path = ws.path().join(ignored_rel);
+    std::fs::write(&ignored_path, ignored_text).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let clean_uri = path_uri(&clean_path);
+    let ignored_uri = path_uri(&ignored_path);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let init_resp_str = read_response(&mut reader).expect("no init response");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&init_resp_str).unwrap()["result"]["capabilities"]
+            ["codeActionProvider"]
+            .is_object()
+    );
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    // The plain copy proves the setup fires CW281.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({ "textDocument": { "uri": clean_uri, "languageId": "hoi4", "version": 1, "text": clean_text } }),
+        ),
+    )
+    .unwrap();
+    let diag = wait_for_diag_object(&mut reader, clean_rel, "CW281")
+        .expect("CW281 diagnostic published for the clean file");
+    assert!(diag.get("data").is_some());
+
+    // The directive'd copy must not publish it. The first publish for the
+    // file after did_open is the keystroke validation result; a later one
+    // (e.g. from a dependent sweep) would be filtered the same way, but the
+    // first is enough to prove the directive is honored.
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({ "textDocument": { "uri": ignored_uri, "languageId": "hoi4", "version": 1, "text": ignored_text } }),
+        ),
+    )
+    .unwrap();
+    let publish = wait_for_publish_to(&mut reader, ignored_rel);
+    assert!(
+        !publish_has_code(&publish, "CW281"),
+        "directive must suppress CW281: {publish}"
+    );
+    child.kill().ok();
+}
+
+#[test]
+fn test_inline_ignore_directive_suppresses_a_scan_diagnostic() {
+    // Closed files: the workspace scan validates them from disk, and the
+    // directive must filter its publish the same way the keystroke path does.
+    // The plain copy proves the scan publishes CW281 at all.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let clean_rel = "common/decisions/clean.txt";
+    let clean_path = ws.path().join(clean_rel);
+    std::fs::create_dir_all(clean_path.parent().unwrap()).unwrap();
+    std::fs::write(&clean_path, "x = { limit = { } }\n").unwrap();
+
+    let ignored_rel = "common/decisions/ignored.txt";
+    let ignored_path = ws.path().join(ignored_rel);
+    std::fs::write(
+        &ignored_path,
+        "x = { limit = { } } # cwtools-ignore CW281\n",
+    )
+    .unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let init_resp_str = read_response(&mut reader).expect("no init response");
+    assert!(!init_resp_str.is_empty());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+
+    // Capture every publish the startup scan sends, up to its bar-off.
+    let rx = spawn_frame_collector(reader);
+    let mut clean_published = false;
+    let mut ignored_bad: Vec<serde_json::Value> = Vec::new();
+    recv_frame_until(
+        &rx,
+        std::time::Duration::from_secs(60),
+        "the startup scan to finish",
+        |v| {
+            if v["method"] != "textDocument/publishDiagnostics" {
+                return;
+            }
+            let Some(uri) = v["params"]["uri"].as_str() else {
+                return;
+            };
+            if uri.ends_with(clean_rel) && publish_has_code(v, "CW281") {
+                clean_published = true;
+            }
+            if uri.ends_with(ignored_rel) && publish_has_code(v, "CW281") {
+                ignored_bad.push(v.clone());
+            }
+        },
+        |v| v["method"] == "loadingBar" && v["params"]["enable"] == serde_json::Value::Bool(false),
+    );
+    child.kill().ok();
+
+    assert!(
+        clean_published,
+        "the scan must publish CW281 for the plain file, or the test proves nothing"
+    );
+    assert!(
+        ignored_bad.is_empty(),
+        "directive must suppress CW281 in the scan publish: {ignored_bad:?}"
+    );
+}
+
+#[test]
+fn test_ignore_code_action_edits_the_workspace_settings() {
+    // Round-trip: a CW281 diagnostic's codeAction response carries an
+    // "Ignore CW281 in this workspace" action whose edit adds the code to
+    // `cwtools.errors.ignore` in the workspace's .vscode/settings.json.
+    const RULES: &str = r#"
+types = {
+    type[decision] = { path = "game/common/decisions" }
+}
+"#;
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap(); // empty dir → index marked complete
+    std::fs::write(rules_dir.path().join("r.cwt"), RULES).unwrap();
+
+    let rel_path = "common/decisions/test.txt";
+    let text = "x = { limit = { } }\n";
+    let file_path = ws.path().join(rel_path);
+    std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    std::fs::write(&file_path, text).unwrap();
+
+    let ws_uri = path_uri(ws.path());
+    let doc_uri = path_uri(&file_path);
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        serde_json::json!({
+            "processId": std::process::id(),
+            "rootUri": ws_uri,
+            "capabilities": {},
+            "initializationOptions": {
+                "language": "hoi4",
+                "rulesCache": rules_dir.path().to_string_lossy(),
+                "vanilla": vanilla.path().to_string_lossy(),
+            }
+        }),
+    );
+    write_frame(&mut child, &init).unwrap();
+    let init_resp_str = read_response(&mut reader).expect("no init response");
+    assert!(!init_resp_str.is_empty());
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({ "textDocument": { "uri": doc_uri, "languageId": "hoi4", "version": 1, "text": text } }),
+        ),
+    )
+    .unwrap();
+
+    let diag =
+        wait_for_diag_object(&mut reader, rel_path, "CW281").expect("CW281 diagnostic published");
+
+    let ca_req = jsonrpc_request(
+        2,
+        "textDocument/codeAction",
+        serde_json::json!({
+            "textDocument": { "uri": doc_uri },
+            "range": diag["range"],
+            "context": { "diagnostics": [diag] },
+        }),
+    );
+    write_frame(&mut child, &ca_req).unwrap();
+    let resp_str = read_response(&mut reader).expect("no codeAction response");
+    child.kill().ok();
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
+    assert_eq!(resp["id"], 2, "got: {resp_str}");
+    let all = resp["result"].as_array().expect("array result");
+    let action = all
+        .iter()
+        .find(|a| a["title"] == "Ignore CW281 in this workspace")
+        .unwrap_or_else(|| panic!("no ignore action in the response: {resp_str}"));
+    assert_eq!(action["kind"], "quickfix");
+    assert_eq!(action["diagnostics"].as_array().unwrap().len(), 1);
+
+    let changes = action["edit"]["changes"]
+        .as_object()
+        .expect("edit carries a changes map");
+    assert_eq!(changes.len(), 1, "only the settings file is edited");
+    let (uri, edits) = changes.iter().next().expect("one file edited");
+    assert!(
+        uri.ends_with(".vscode/settings.json"),
+        "the edit must target the workspace settings file: {uri}"
+    );
+    let new_text = edits[0]["newText"].as_str().expect("whole-file replace");
+    let parsed: serde_json::Value =
+        serde_json::from_str(new_text).expect("settings stay valid json");
+    assert_eq!(parsed["cwtools"]["errors"]["ignore"][0], "CW281");
 }
 
 #[test]
@@ -8480,7 +8821,11 @@ decision = {
 
     let response: serde_json::Value = serde_json::from_str(&response).unwrap();
     let actions = response["result"].as_array().expect("array result");
-    assert_eq!(actions.len(), 1, "one quickfix expected: {response}");
+    assert_eq!(
+        actions.len(),
+        2,
+        "the fix plus the ignore action: {response}"
+    );
     assert_eq!(actions[0]["title"], "Did you mean 'historic'?");
     let edits = actions[0]["edit"]["changes"]
         .get(&doc_uri)
@@ -8604,7 +8949,11 @@ thing = {
 
     let response: serde_json::Value = serde_json::from_str(&response).unwrap();
     let actions = response["result"].as_array().expect("array result");
-    assert_eq!(actions.len(), 1, "one quickfix expected: {response}");
+    assert_eq!(
+        actions.len(),
+        2,
+        "the fix plus the ignore action: {response}"
+    );
     assert_eq!(actions[0]["title"], "Remove unnecessary quotes");
     let edits = actions[0]["edit"]["changes"]
         .get(&doc_uri)
@@ -10324,7 +10673,11 @@ thing = { x = scalar }
 
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     let actions = resp["result"].as_array().expect("array result");
-    assert_eq!(actions.len(), 1, "one create-loc-key action: {resp_str}");
+    assert_eq!(
+        actions.len(),
+        2,
+        "the create-loc-key action plus the ignore action: {resp_str}"
+    );
     let action = &actions[0];
     assert_eq!(action["title"], "Create localisation key my_thing_desc");
     assert_eq!(action["kind"], "quickfix");
@@ -10482,7 +10835,11 @@ thing = { x = scalar }
 
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     let actions = resp["result"].as_array().expect("array result");
-    assert_eq!(actions.len(), 1, "one create-loc-key action: {resp_str}");
+    assert_eq!(
+        actions.len(),
+        2,
+        "the create-loc-key action plus the ignore action: {resp_str}"
+    );
     let action = &actions[0];
     assert_eq!(action["title"], "Create localisation key my_thing_desc");
     assert_eq!(action["kind"], "quickfix");
@@ -10652,9 +11009,9 @@ thing = { x = scalar }
     let actions = resp["result"].as_array().expect("array result");
     assert_eq!(
         actions.len(),
-        1,
+        2,
         "the second key must be absorbed into the first's action, not offered \
-         as a second independent NewFile action: {resp_str}"
+         as a second independent NewFile action — only the ignore action joins: {resp_str}"
     );
 
     let ops = actions[0]["edit"]["documentChanges"]
@@ -10792,7 +11149,7 @@ thing = { x = scalar }
     let first_resp_str = read_response(&mut reader).expect("no codeAction response");
     let first_resp: serde_json::Value = serde_json::from_str(&first_resp_str).unwrap();
     let first_actions = first_resp["result"].as_array().expect("array result");
-    assert_eq!(first_actions.len(), 1);
+    assert_eq!(first_actions.len(), 2);
     let first_ops = first_actions[0]["edit"]["documentChanges"]
         .as_array()
         .expect("documentChanges");
@@ -10846,7 +11203,7 @@ thing = { x = scalar }
 
     let second_resp: serde_json::Value = serde_json::from_str(&second_resp_str).unwrap();
     let second_actions = second_resp["result"].as_array().expect("array result");
-    assert_eq!(second_actions.len(), 1);
+    assert_eq!(second_actions.len(), 2);
     let second_ops = second_actions[0]["edit"]["documentChanges"]
         .as_array()
         .expect("documentChanges");
@@ -11556,7 +11913,11 @@ thing = { x = scalar }
 
     let resp: serde_json::Value = serde_json::from_str(&resp_str).unwrap();
     let actions = resp["result"].as_array().expect("array result");
-    assert_eq!(actions.len(), 1, "one create-loc-key action: {resp_str}");
+    assert_eq!(
+        actions.len(),
+        2,
+        "the create-loc-key action plus the ignore action: {resp_str}"
+    );
     let ops = actions[0]["edit"]["documentChanges"]
         .as_array()
         .expect("documentChanges carries the cross-file edit");

@@ -498,6 +498,29 @@ pub(crate) fn code_is_suppressed(code: Option<&NumberOrString>, ignored: &[Strin
     }
 }
 
+/// Drop diagnostics whose code an inline `# cwtools-ignore` directive
+/// suppresses on the diagnostic's line or the lines beside it. A no-op when
+/// the file carries no directive, which is the common case and keeps this off
+/// the keystroke hot path's cost.
+pub(crate) fn drop_inline_suppressed(
+    diagnostics: &mut Vec<Diagnostic>,
+    map: &cwtools_validation::inline_ignore::InlineIgnoreMap,
+) {
+    if map.is_empty() {
+        return;
+    }
+    diagnostics.retain(|d| {
+        let Some(NumberOrString::String(code)) = d.code.as_ref() else {
+            return true;
+        };
+        !cwtools_validation::inline_ignore::inline_suppressed(
+            map,
+            d.range.start.line.saturating_add(1),
+            code,
+        )
+    });
+}
+
 pub(crate) fn validation_error_to_diagnostic(
     err: &ValidationError,
     lines: &DocLines,
@@ -1507,6 +1530,9 @@ impl Backend {
         // Per-line text + negotiated encoding, so every squiggle spans the whole
         // statement line and lands on the columns the client reads.
         let lines = DocLines::new(text, self.state.config.read().position_encoding.clone());
+        // Inline `# cwtools-ignore` directives, line → lowercased codes. Empty
+        // for files without one; the filter below is then a no-op.
+        let inline_ignored = cwtools_validation::inline_ignore::extract_inline_ignored_codes(text);
 
         // Localisation files are parsed and validated as loc, not config.
         if crate::paths::is_loc_file(uri) {
@@ -1587,6 +1613,8 @@ impl Backend {
                 self.revalidate_open_dependents(uri, generation, Some(&scope))
                     .await;
             }
+            let mut diagnostics = diagnostics;
+            drop_inline_suppressed(&mut diagnostics, &inline_ignored);
             return (diagnostics, None);
         }
 
@@ -1623,6 +1651,7 @@ impl Backend {
                     diagnostics.push(rule_parse_error_to_diagnostic(&err, &lines));
                 }
             }
+            drop_inline_suppressed(&mut diagnostics, &inline_ignored);
             return (diagnostics, None);
         }
 
@@ -1719,6 +1748,7 @@ impl Backend {
             for err in &errors {
                 diagnostics.push(validation_error_to_diagnostic(err, &lines));
             }
+            drop_inline_suppressed(&mut diagnostics, &inline_ignored);
             (diagnostics, Some(parsed))
         })
     }

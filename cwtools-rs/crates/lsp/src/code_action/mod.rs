@@ -30,6 +30,7 @@
 
 mod create_loc_key;
 mod fix_all;
+mod ignore_code;
 mod payload;
 
 pub(crate) use payload::{fix_to_data, fixable_span_edits};
@@ -67,6 +68,30 @@ impl Backend {
                 self.create_loc_key_actions(&uri, &params.context.diagnostics, &encoding)
                     .await,
             );
+            // The ignore action edits the workspace's settings file, not this
+            // document; the document text above is irrelevant to it.
+            let (ignored, root) = {
+                let cfg = self.state.config.read();
+                (
+                    cfg.ignored_error_codes.clone(),
+                    cfg.workspace_roots.first().cloned(),
+                )
+            };
+            let settings_content = if let Some(root) = root.as_ref() {
+                let path = root.join(".vscode").join("settings.json");
+                tokio::task::spawn_blocking(move || std::fs::read_to_string(path).ok())
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            actions.extend(ignore_code::ignore_code_actions(
+                &params.context.diagnostics,
+                &ignored,
+                root.as_deref(),
+                settings_content.as_deref(),
+            ));
         }
         if wants(only, &CodeActionKind::SOURCE_FIX_ALL)
             && let Some(action) =
