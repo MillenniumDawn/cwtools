@@ -357,6 +357,11 @@ struct SarifResult {
     level: String,
     message: SarifMessage,
     locations: Vec<SarifLocation>,
+    /// The secondary spans the message points at (the `if` a stray `else` is
+    /// missing, the case a path is indexed under). Omitted when there are none,
+    /// rather than serialized as an empty array.
+    #[serde(rename = "relatedLocations", skip_serializing_if = "Vec::is_empty")]
+    related_locations: Vec<SarifLocation>,
     #[serde(rename = "partialFingerprints")]
     partial_fingerprints: std::collections::BTreeMap<String, String>,
 }
@@ -365,6 +370,8 @@ struct SarifResult {
 struct SarifLocation {
     #[serde(rename = "physicalLocation")]
     physical_location: SarifPhysicalLocation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<SarifMessage>,
 }
 
 #[derive(serde::Serialize)]
@@ -387,19 +394,22 @@ struct SarifRegion {
     start_line: u32,
     #[serde(rename = "startColumn")]
     start_column: u32,
+    /// Both are exclusive ends in SARIF's convention, and both are omitted for
+    /// a diagnostic the emit site gave no range for: a region with only a start
+    /// is a valid point, while a wrong end draws a squiggle over the wrong text.
+    #[serde(rename = "endLine", skip_serializing_if = "Option::is_none")]
+    end_line: Option<u32>,
+    #[serde(rename = "endColumn", skip_serializing_if = "Option::is_none")]
+    end_column: Option<u32>,
 }
 
 fn sarif_rule_from((const_name, code): &&'static (&'static str, ErrorCode)) -> SarifRule {
-    let description = code.message_template.replace("{}", "…");
-    let description = if description.trim_matches(['…', ' ']).is_empty() {
-        codes::rule_summary(const_name)
-    } else {
-        description
-    };
     SarifRule {
         id: code.id.to_string(),
         name: codes::rule_name(const_name),
-        short_description: SarifMessage { text: description },
+        short_description: SarifMessage {
+            text: codes::short_description(const_name, code),
+        },
         default_configuration: SarifLevel {
             level: sarif_level(code.severity).to_string(),
         },
@@ -423,6 +433,21 @@ fn sarif_result_from(
     } else {
         rule_index.get(&d.code.to_ascii_lowercase()).copied()
     };
+    // Whole-file diagnostics report line 0 and get clamped to 1; carrying an
+    // end that predates the clamped start would invert the region.
+    let start_line = d.line.max(1);
+    let start_column = d.col.max(1);
+    let end = d
+        .end
+        .filter(|(line, col)| (*line, *col) >= (start_line, start_column));
+    let location =
+        |uri: String, uri_base_id: Option<String>, region: SarifRegion, message| SarifLocation {
+            physical_location: SarifPhysicalLocation {
+                artifact_location: SarifArtifactLocation { uri, uri_base_id },
+                region,
+            },
+            message,
+        };
     SarifResult {
         rule_id: d.code.to_string(),
         rule_index: rule_idx,
@@ -430,15 +455,38 @@ fn sarif_result_from(
         message: SarifMessage {
             text: d.message.clone(),
         },
-        locations: vec![SarifLocation {
-            physical_location: SarifPhysicalLocation {
-                artifact_location: SarifArtifactLocation { uri, uri_base_id },
-                region: SarifRegion {
-                    start_line: d.line.max(1),
-                    start_column: d.col.max(1),
-                },
+        locations: vec![location(
+            uri.clone(),
+            uri_base_id.clone(),
+            SarifRegion {
+                start_line,
+                start_column,
+                end_line: end.map(|(line, _)| line),
+                end_column: end.map(|(_, col)| col),
             },
-        }],
+            None,
+        )],
+        // Every secondary span is inside the diagnostic's own file, so they all
+        // share its artifact location.
+        related_locations: d
+            .related
+            .iter()
+            .map(|r| {
+                location(
+                    uri.clone(),
+                    uri_base_id.clone(),
+                    SarifRegion {
+                        start_line: r.line.max(1),
+                        start_column: r.col.max(1),
+                        end_line: Some(r.end.0),
+                        end_column: Some(r.end.1),
+                    },
+                    Some(SarifMessage {
+                        text: r.message.clone(),
+                    }),
+                )
+            })
+            .collect(),
         partial_fingerprints: {
             let mut m = std::collections::BTreeMap::new();
             m.insert("cwtoolsDiagHash/v1".to_string(), d.hash.clone());
@@ -461,6 +509,8 @@ mod tests {
             col,
             hash: "0123456789abcdef".to_string(),
             legacy_hash: "fedcba9876543210".to_string(),
+            end: None,
+            related: Vec::new(),
         }
     }
 
@@ -695,6 +745,87 @@ mod tests {
         assert_eq!(
             v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["startColumn"],
             1
+        );
+    }
+
+    /// An end position turns a point into a span, which is what a code-scanning
+    /// UI underlines. Both ends are SARIF-exclusive, matching the parser's own
+    /// exclusive end.
+    #[test]
+    fn sarif_regions_carry_the_end_position_when_there_is_one() {
+        let mut d = diag("/repo/x.txt", 7, 3, "CW282", "redundant default");
+        d.end = Some((7, 19));
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let region = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+        assert_eq!(region["startLine"], 7);
+        assert_eq!(region["startColumn"], 3);
+        assert_eq!(region["endLine"], 7);
+        assert_eq!(region["endColumn"], 19);
+    }
+
+    /// A point diagnostic must stay a point: an invented end would underline
+    /// text the check never looked at.
+    #[test]
+    fn sarif_omits_the_end_when_the_emit_site_gave_no_range() {
+        let d = diag("/repo/x.txt", 7, 3, "CW282", "m");
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let region = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+        assert!(region.get("endLine").is_none(), "got: {out}");
+        assert!(region.get("endColumn").is_none(), "got: {out}");
+    }
+
+    /// A whole-file diagnostic's start is clamped to 1:1, so an end recorded
+    /// before that would invert the region.
+    #[test]
+    fn sarif_drops_an_end_that_precedes_the_clamped_start() {
+        let mut d = diag("/repo/x.yml", 0, 0, "", "bad file");
+        d.end = Some((0, 4));
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let region = &v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"];
+        assert_eq!(region["startLine"], 1);
+        assert!(region.get("endLine").is_none(), "got: {out}");
+    }
+
+    #[test]
+    fn sarif_publishes_related_spans_against_the_same_file() {
+        let mut d = diag(&abs("repo/common/x.txt"), 12, 5, "CW238", "stray else");
+        d.related = vec![crate::diag::Related {
+            message: "the if this else belongs to".to_string(),
+            line: 4,
+            col: 3,
+            end: (4, 9),
+        }];
+        let out = sarif_report(&[&d], Path::new(&abs("repo")), None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let related = &v["runs"][0]["results"][0]["relatedLocations"][0];
+        assert_eq!(related["message"]["text"], "the if this else belongs to");
+        let loc = &related["physicalLocation"];
+        // Same artifact as the diagnostic itself: secondary spans are in-file.
+        assert_eq!(loc["artifactLocation"]["uri"], "common/x.txt");
+        assert_eq!(loc["artifactLocation"]["uriBaseId"], "SRCROOT");
+        assert_eq!(loc["region"]["startLine"], 4);
+        assert_eq!(loc["region"]["startColumn"], 3);
+        assert_eq!(loc["region"]["endColumn"], 9);
+        // The primary location stays unlabelled; the message is the result's.
+        assert!(
+            v["runs"][0]["results"][0]["locations"][0]
+                .get("message")
+                .is_none(),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn sarif_omits_related_locations_when_there_are_none() {
+        let d = diag("/repo/x.txt", 1, 1, "CW100", "m");
+        let out = sarif_report(&[&d], Path::new("/repo"), None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["runs"][0]["results"][0].get("relatedLocations").is_none(),
+            "got: {out}"
         );
     }
 

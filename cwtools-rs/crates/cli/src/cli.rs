@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use crate::codes;
 use crate::report::{self, ReportType};
+use crate::run::{self, FailOn};
 
 #[derive(Parser)]
 #[command(name = "cwtools")]
@@ -15,6 +16,17 @@ use crate::report::{self, ReportType};
 // From CARGO_PKG_VERSION, the same source `cwtools-server --version` prints.
 #[command(version)]
 pub(crate) struct Cli {
+    /// Suppress progress and summary chatter on stderr. Warnings, errors and
+    /// the report itself are unaffected, so a quiet run still says what it
+    /// could not do. Accepted on any subcommand.
+    #[arg(long, short, global = true)]
+    pub(crate) quiet: bool,
+    /// Never colorize the `cli` report. Color is off already unless stdout is
+    /// a terminal, so a redirected report, `--output-file` and every CI log are
+    /// plain text either way; `NO_COLOR` in the environment does the same.
+    /// Accepted on any subcommand.
+    #[arg(long, global = true)]
+    pub(crate) no_color: bool,
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -54,6 +66,11 @@ pub(crate) enum Commands {
         /// report has stdout to itself.
         #[arg(long, value_name = "FORMAT", value_parser = report::parse_report_type)]
         report_type: Option<ReportType>,
+        /// Exit 1 when a reported problem reaches this severity. Valid values:
+        /// error (default), warning, info, hint, none. `none` reports without
+        /// ever failing the run.
+        #[arg(long, value_name = "LEVEL", value_parser = run::parse_fail_on)]
+        fail_on: Option<FailOn>,
     },
     /// Validate a directory of game files against .cwt rules
     Validate(ValidateArgs),
@@ -79,6 +96,22 @@ pub(crate) enum Commands {
     /// Apply machine-applicable fixes for the curated fixable diagnostics.
     /// Dry-run by default (prints a unified-diff preview); pass `--apply` to write.
     Fix(FixArgs),
+    /// Print what one CWxxx code means: its severity, its message template, the
+    /// long form from the error-code reference, and whether the check is wired.
+    Explain {
+        /// The code to explain, e.g. CW113 (case-insensitive)
+        #[arg(value_name = "CODE")]
+        code: String,
+    },
+    /// List every diagnostic code, with its severity and a one-line summary.
+    ListCodes,
+    /// Print a shell completion script on stdout. Source it, or drop it where
+    /// the shell looks: `cwtools completions bash > /etc/bash_completion.d/cwtools`.
+    Completions {
+        /// Shell to generate for: bash, elvish, fish, powershell or zsh
+        #[arg(value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
 }
 
 // Deliberately not a doc comment: the `Validate` variant carries the
@@ -175,6 +208,13 @@ pub(crate) struct ValidateArgs {
     /// behavior).
     #[arg(long, value_name = "LEVEL", value_parser = parse_min_severity)]
     pub(crate) min_severity: Option<ErrorSeverity>,
+    /// Exit 1 when a reported diagnostic reaches this severity. Valid values:
+    /// error (default), warning, info, hint, none. `none` reports without ever
+    /// failing the run, for a job that publishes findings and gates on nothing.
+    /// Counts what the report holds, so `--min-severity` filters first: asking
+    /// to fail on something it dropped can never trip.
+    #[arg(long, value_name = "LEVEL", value_parser = run::parse_fail_on)]
+    pub(crate) fail_on: Option<FailOn>,
     /// Drop every diagnostic with this CW code (repeatable). The same
     /// suppression the editor applies via `cwtools.errors.ignore`, so one
     /// policy can cover both. Example: --ignore-code CW100
@@ -260,6 +300,11 @@ pub(crate) struct LocArgs {
     /// error, warning, info, hint. Omit to report everything.
     #[arg(long, value_name = "LEVEL", value_parser = parse_min_severity)]
     pub(crate) min_severity: Option<ErrorSeverity>,
+    /// Exit 1 when a reported diagnostic reaches this severity. Valid values:
+    /// error (default), warning, info, hint, none. Counts what the report
+    /// holds, so `--min-severity` filters first.
+    #[arg(long, value_name = "LEVEL", value_parser = run::parse_fail_on)]
+    pub(crate) fail_on: Option<FailOn>,
     /// Drop every diagnostic with this CW code (repeatable).
     #[arg(long = "ignore-code", value_name = "CWxxx", value_parser = codes::parse_code)]
     pub(crate) ignore_codes: Vec<String>,

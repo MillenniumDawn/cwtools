@@ -17,6 +17,7 @@
 //! directory = "."
 //! report-type = "github"
 //! min-severity = "warning"
+//! fail-on = "error"
 //! ignore-files = ["*.notes"]
 //! ignore-dirs = ["build", "temp*"]
 //! loc-languages = ["english"]
@@ -25,18 +26,20 @@
 //! allow-empty = false
 //! ```
 //!
-//! `validate` reads every key. `fix` reads all but `report-type` and
-//! `min-severity` (it writes edits, not a report), and takes `only-codes` as
-//! the config spelling of its `--code`. `loc` reads the keys that shape a
-//! localisation scan: `game` and `rules` (which turn on the scope checks),
-//! `directory`, `report-type`, `min-severity`, `ignore-files`, `ignore-dirs`,
-//! `loc-languages`, the two code lists and `allow-empty`.
+//! `validate` reads every key. `fix` reads all but `report-type`,
+//! `min-severity` and `fail-on` (it writes edits, not a report), and takes
+//! `only-codes` as the config spelling of its `--code`. `loc` reads the keys
+//! that shape a localisation scan: `game` and `rules` (which turn on the scope
+//! checks), `directory`, `report-type`, `min-severity`, `fail-on`,
+//! `ignore-files`, `ignore-dirs`, `loc-languages`, the two code lists and
+//! `allow-empty`.
 //!
 //! The parser accepts the TOML this schema needs — comments, bare keys, basic
 //! and literal strings, booleans, and (multi-line) string arrays — and rejects
 //! everything else by name and line rather than guessing.
 
 use crate::report::ReportType;
+use crate::run::FailOn;
 use cwtools_localization::Lang;
 use cwtools_validation::ErrorSeverity;
 use std::collections::HashSet;
@@ -56,6 +59,7 @@ const KEYS: &[&str] = &[
     "refresh-vanilla-cache",
     "report-type",
     "min-severity",
+    "fail-on",
     "ignore-files",
     "ignore-dirs",
     "loc-languages",
@@ -70,7 +74,7 @@ const KEYS: &[&str] = &[
 /// like it did nothing.
 pub(crate) const VALIDATE_KEYS: &[&str] = KEYS;
 
-/// `fix` writes edits, not a report, so the two report-shaping keys don't apply.
+/// `fix` writes edits, not a report, so the report-shaping keys don't apply.
 pub(crate) const FIX_KEYS: &[&str] = &[
     "game",
     "directory",
@@ -96,6 +100,7 @@ pub(crate) const LOC_KEYS: &[&str] = &[
     "rules",
     "report-type",
     "min-severity",
+    "fail-on",
     "ignore-files",
     "ignore-dirs",
     "loc-languages",
@@ -147,6 +152,7 @@ pub(crate) struct FileConfig {
     pub(crate) refresh_vanilla_cache: bool,
     pub(crate) report_type: Option<ReportType>,
     pub(crate) min_severity: Option<ErrorSeverity>,
+    pub(crate) fail_on: Option<FailOn>,
     pub(crate) ignore_files: Vec<String>,
     pub(crate) ignore_dirs: Vec<String>,
     pub(crate) loc_languages: Vec<Lang>,
@@ -335,6 +341,13 @@ fn from_entries(path: PathBuf, dir: &Path, entries: Vec<Entry>) -> Result<FileCo
                 let v = string(&cfg.path, e)?;
                 cfg.min_severity = Some(
                     crate::cli::parse_min_severity(&v)
+                        .map_err(|m| ConfigError::at(&cfg.path, e.line, m))?,
+                );
+            }
+            "fail-on" => {
+                let v = string(&cfg.path, e)?;
+                cfg.fail_on = Some(
+                    crate::run::parse_fail_on(&v)
                         .map_err(|m| ConfigError::at(&cfg.path, e.line, m))?,
                 );
             }
@@ -742,6 +755,7 @@ no-vanilla-cache = true
 refresh-vanilla-cache = false
 report-type = "github"
 min-severity = "warning"
+fail-on = "none"
 ignore-files = ["*.notes"]
 ignore-dirs = [
     "build",   # trailing comma and comments are fine
@@ -763,6 +777,7 @@ allow-empty = true
         assert!(cfg.allow_empty);
         assert_eq!(cfg.report_type, Some(ReportType::Github));
         assert_eq!(cfg.min_severity, Some(ErrorSeverity::Warning));
+        assert_eq!(cfg.fail_on, Some(FailOn::Never));
         assert_eq!(cfg.ignore_files, ["*.notes"]);
         assert_eq!(cfg.ignore_dirs, ["build", "temp*"]);
         assert_eq!(cfg.loc_languages, [Lang::English]);
@@ -880,6 +895,13 @@ allow-empty = true
     fn unknown_severity_is_an_error() {
         let e = err_for("min-severity = \"critical\"\n");
         assert!(e.contains("invalid severity 'critical'"), "got: {e}");
+    }
+
+    #[test]
+    fn unknown_fail_on_is_an_error() {
+        let e = err_for("fail-on = \"critical\"\n");
+        assert!(e.contains("invalid severity 'critical'"), "got: {e}");
+        assert!(e.contains("none"), "got: {e}");
     }
 
     #[test]

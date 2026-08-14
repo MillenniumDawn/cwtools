@@ -3,10 +3,12 @@
 
 use clap::CommandFactory;
 use cwtools_game::constants::Game;
+use cwtools_validation::ErrorSeverity;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Cli;
 use crate::config;
+use crate::diag::severity_rank;
 use crate::report::ReportType;
 
 /// The file walk itself failed (the path doesn't resolve, a dir is unreadable).
@@ -34,6 +36,43 @@ pub(crate) fn load_config(
     })
 }
 
+// ── Output style (--quiet / --no-color) ──────────────────────────────────────
+//
+// Both are global flags read once at startup rather than threaded through every
+// command: they shape lines emitted from a dozen places across four subcommands,
+// and no call site wants a decision about them.
+
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NO_COLOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record the run's `--quiet` / `--no-color`. Called once, before dispatch.
+pub(crate) fn set_output_style(quiet: bool, no_color: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    QUIET.store(quiet, Relaxed);
+    NO_COLOR.store(no_color, Relaxed);
+}
+
+/// A progress or summary line, dropped under `--quiet`. Warnings and errors go
+/// straight to `eprintln!` instead: a quiet run still has to say what it could
+/// not do, or a typo'd path reads as a clean one.
+pub(crate) fn note(line: impl AsRef<str>) {
+    if !QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{}", line.as_ref());
+    }
+}
+
+/// Whether the `cli` report should carry ANSI color. Off unless it is going to
+/// a terminal, so a redirected report, an `--output-file` and every CI log stay
+/// byte-for-byte what they were before color existed. `--no-color` and a
+/// non-empty `NO_COLOR` each force it off.
+pub(crate) fn color_enabled(to_stdout: bool) -> bool {
+    use std::io::IsTerminal;
+    to_stdout
+        && !NO_COLOR.load(std::sync::atomic::Ordering::Relaxed)
+        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+        && std::io::stdout().is_terminal()
+}
+
 /// Whether stdout is carrying one of the CI report formats, in which case status
 /// lines have to go to stderr instead: `cwtools loc . --report-type sarif >
 /// out.sarif` must not have a progress banner in the middle of the JSON. Only
@@ -43,7 +82,11 @@ pub(crate) fn report_owns_stdout(report_type: ReportType, output_file: Option<&P
 }
 
 /// A progress/status line, diverted to stderr when the report owns stdout.
+/// Chatter like [`note`], so `--quiet` drops it wherever it was headed.
 pub(crate) fn status(line: String, to_stderr: bool) {
+    if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     if to_stderr {
         eprintln!("{line}");
     } else {
@@ -67,7 +110,7 @@ pub(crate) fn announce_config(
     } else {
         format!("applied: {}", applied.join(", "))
     };
-    eprintln!("Using config {} ({})", cfg.path.display(), what);
+    note(format!("Using config {} ({})", cfg.path.display(), what));
     let unread: Vec<&str> = cfg
         .present
         .iter()
@@ -122,16 +165,58 @@ pub(crate) fn missing_required(
     root.error(kind, message).exit()
 }
 
+/// How severe a surviving diagnostic has to be for the run to fail. `Never` is
+/// the report-only case: publish the findings and leave the build green.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FailOn {
+    Never,
+    AtLeast(ErrorSeverity),
+}
+
+impl Default for FailOn {
+    /// Errors fail the run, which is what every release before `--fail-on` did.
+    fn default() -> Self {
+        FailOn::AtLeast(ErrorSeverity::Error)
+    }
+}
+
+impl FailOn {
+    /// How many of `severities` trip the gate.
+    pub(crate) fn failing(self, severities: impl Iterator<Item = ErrorSeverity>) -> usize {
+        match self {
+            FailOn::Never => 0,
+            FailOn::AtLeast(min) => severities
+                .filter(|s| severity_rank(*s) >= severity_rank(min))
+                .count(),
+        }
+    }
+}
+
+/// Parse a `--fail-on` value, for clap's `value_parser`. `none` is spelled out
+/// rather than left to `--fail-on` with no value: a flag that silently disarms
+/// the exit code is worth reading in a CI log.
+pub(crate) fn parse_fail_on(s: &str) -> Result<FailOn, String> {
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(FailOn::Never);
+    }
+    crate::cli::parse_min_severity(s)
+        .map(FailOn::AtLeast)
+        .map_err(|_| {
+            format!("invalid severity '{s}': valid values are error, warning, info, hint, none")
+        })
+}
+
 /// Map a run's outcome to a process exit code. Operational failures (couldn't
 /// discover the files, couldn't write the report) are distinct from validation
 /// finding errors, so CI can tell "the tool couldn't run" apart from "validation
-/// found problems". 0 = clean run, no errors.
-pub(crate) fn exit_code(total_errors: usize, discovery_failed: bool, write_failed: bool) -> i32 {
+/// found problems". `failing` is the count `--fail-on` selected, which defaults
+/// to the errors. 0 = clean run, nothing reached the gate.
+pub(crate) fn exit_code(failing: usize, discovery_failed: bool, write_failed: bool) -> i32 {
     if discovery_failed {
         EXIT_DISCOVERY_FAILED
     } else if write_failed {
         2
-    } else if total_errors > 0 {
+    } else if failing > 0 {
         1
     } else {
         0
@@ -179,6 +264,58 @@ mod tests {
         // operational failures take precedence over validation errors
         assert_eq!(exit_code(5, false, true), 2);
         assert_eq!(exit_code(5, true, true), 3);
+    }
+
+    /// Every severity, so a gate test reads as the whole range rather than a
+    /// pair that happens to straddle it.
+    const ALL: [ErrorSeverity; 4] = [
+        ErrorSeverity::Error,
+        ErrorSeverity::Warning,
+        ErrorSeverity::Information,
+        ErrorSeverity::Hint,
+    ];
+
+    /// A report bound for a file is never colored, whatever the terminal is
+    /// doing — the escapes would land in the artifact. The terminal path is
+    /// only reachable interactively, so this is the half a test can hold.
+    #[test]
+    fn a_report_written_to_a_file_is_never_colored() {
+        assert!(!color_enabled(false));
+    }
+
+    #[test]
+    fn fail_on_defaults_to_counting_errors() {
+        assert_eq!(FailOn::default(), FailOn::AtLeast(ErrorSeverity::Error));
+        assert_eq!(FailOn::default().failing(ALL.into_iter()), 1);
+    }
+
+    #[test]
+    fn fail_on_counts_everything_at_or_above_the_level() {
+        let count = |f: FailOn| f.failing(ALL.into_iter());
+        assert_eq!(count(FailOn::AtLeast(ErrorSeverity::Warning)), 2);
+        assert_eq!(count(FailOn::AtLeast(ErrorSeverity::Information)), 3);
+        assert_eq!(count(FailOn::AtLeast(ErrorSeverity::Hint)), 4);
+    }
+
+    #[test]
+    fn fail_on_none_never_trips() {
+        assert_eq!(FailOn::Never.failing(ALL.into_iter()), 0);
+        assert_eq!(
+            exit_code(FailOn::Never.failing(ALL.into_iter()), false, false),
+            0
+        );
+    }
+
+    #[test]
+    fn parse_fail_on_takes_the_severities_and_none() {
+        assert_eq!(parse_fail_on("none").unwrap(), FailOn::Never);
+        assert_eq!(parse_fail_on("NONE").unwrap(), FailOn::Never);
+        assert_eq!(
+            parse_fail_on("warning").unwrap(),
+            FailOn::AtLeast(ErrorSeverity::Warning)
+        );
+        let e = parse_fail_on("critical").unwrap_err();
+        assert!(e.contains("critical") && e.contains("none"), "got: {e}");
     }
 
     #[test]

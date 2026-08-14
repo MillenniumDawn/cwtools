@@ -12,8 +12,8 @@ use crate::diag::{
 };
 use crate::report::ReportType;
 use crate::run::{
-    EXIT_USAGE, announce_config, exit_code, exit_if_empty, load_config, missing_required,
-    report_owns_stdout, status, vanilla_notice,
+    EXIT_USAGE, announce_config, color_enabled, exit_code, exit_if_empty, load_config,
+    missing_required, note, report_owns_stdout, status, vanilla_notice,
 };
 use crate::{codes, config, report, scope};
 
@@ -36,6 +36,7 @@ pub(super) fn run(args: ValidateArgs) {
         loc_language,
         case_sensitive_files,
         min_severity,
+        fail_on,
         ignore_codes,
         only_codes,
         files,
@@ -102,6 +103,8 @@ pub(super) fn run(args: ValidateArgs) {
         "min-severity",
         &mut applied,
     );
+    let fail_on = config::pick(fail_on, fc.and_then(|c| c.fail_on), "fail-on", &mut applied)
+        .unwrap_or_default();
     let ignore_files = config::pick_list(
         ignore_files,
         fc.map(|c| c.ignore_files.clone()).unwrap_or_default(),
@@ -175,12 +178,12 @@ pub(super) fn run(args: ValidateArgs) {
     } else {
         format!("file {}", rules.display())
     };
-    eprintln!(
+    note(format!(
         "Validating {} files in {} against rules {}",
         game_id,
         directory.display(),
         rules_label
-    );
+    ));
 
     // Per-phase timings on stderr when CWTOOLS_TIMINGS is set.
     let _timings = std::env::var_os("CWTOOLS_TIMINGS").is_some();
@@ -208,14 +211,14 @@ pub(super) fn run(args: ValidateArgs) {
                     );
                 }
                 let total: usize = data.per_type.values().map(|v| v.len()).sum();
-                eprintln!(
+                note(format!(
                     "  Loaded {} base-game instances, {} loc languages, {} files from cache {} (fp: {})",
                     total,
                     data.loc_keys.len(),
                     data.file_paths.len(),
                     cache_path.display(),
                     cached_fp,
-                );
+                ));
                 Some((cached_fp, data))
             }
             Err(e) => {
@@ -272,13 +275,16 @@ pub(super) fn run(args: ValidateArgs) {
         cwtools_driver::default_cache_dir(),
     );
     let ruleset = session.ruleset();
-    eprintln!(
+    note(format!(
         "  Loaded {} types, {} enums, {} aliases",
         ruleset.types.len(),
         ruleset.enums.len(),
         ruleset.aliases.len()
-    );
-    eprintln!("  Discovered {} files", session.parsed_files().len());
+    ));
+    note(format!(
+        "  Discovered {} files",
+        session.parsed_files().len()
+    ));
 
     // Whole-run notice, not a diagnostic: nothing in the mod is wrong, the run
     // just could not answer for these families. `complete` is the gate the
@@ -287,7 +293,7 @@ pub(super) fn run(args: ValidateArgs) {
     // have a run-level slot for it.
     let vanilla_notice = vanilla_notice(game_id, session.type_index().complete);
     if let Some(notice) = &vanilla_notice {
-        eprintln!("  note: {notice}");
+        note(format!("  note: {notice}"));
     }
 
     // The discovered files the scope covers. Everything is still indexed, so
@@ -298,7 +304,7 @@ pub(super) fn run(args: ValidateArgs) {
         .as_ref()
         .map(|s| s.select(session.parsed_files().iter().map(|f| f.path.as_path())));
     if let Some(selected) = &selected {
-        eprintln!("  Reporting on {} of them", selected.len());
+        note(format!("  Reporting on {} of them", selected.len()));
     }
 
     // Nothing to validate is a failure, not a clean run. A failed walk
@@ -337,7 +343,7 @@ pub(super) fn run(args: ValidateArgs) {
             let index = index_game_dir(vanilla_dir, ruleset, rules_table, &var_effects);
             let aux = cwtools_driver::build_vanilla_cache_aux(vanilla_dir, &index);
             match vanilla_cache::save(&index, &game, &fp_live, cache_path, aux) {
-                Ok(n) => eprintln!("  Rebuilt vanilla cache with {} instances", n),
+                Ok(n) => note(format!("  Rebuilt vanilla cache with {} instances", n)),
                 Err(e) => eprintln!(
                     "  warn: could not write rebuilt cache {}: {}",
                     cache_path.display(),
@@ -524,13 +530,14 @@ pub(super) fn run(args: ValidateArgs) {
         }
         ReportType::Cli => {
             // cli: grouped by file
+            let color = color_enabled(output_file.is_none());
             let mut current = "";
             for d in &diags {
                 if &*d.file != current {
                     out.push_str(&format!("\n  {}:\n", d.file));
                     current = &d.file;
                 }
-                out.push_str(&cli_row(d));
+                out.push_str(&cli_row(d, color));
             }
             out.push_str(&format!(
                 "\nValidation complete: {} errors, {} warnings\n",
@@ -545,12 +552,15 @@ pub(super) fn run(args: ValidateArgs) {
                 eprintln!("Error writing report {}: {}", p.display(), e);
                 true
             } else {
-                println!(
-                    "Wrote {} report ({} errors, {} warnings) to {}",
-                    report_type.as_str(),
-                    total_errors,
-                    total_warnings,
-                    p.display()
+                status(
+                    format!(
+                        "Wrote {} report ({} errors, {} warnings) to {}",
+                        report_type.as_str(),
+                        total_errors,
+                        total_warnings,
+                        p.display()
+                    ),
+                    false,
                 );
                 false
             }
@@ -580,7 +590,8 @@ pub(super) fn run(args: ValidateArgs) {
         }
     }
 
-    let code = exit_code(total_errors, session.discovery_failed, write_failed);
+    let failing = fail_on.failing(diags.iter().map(|d| d.severity));
+    let code = exit_code(failing, session.discovery_failed, write_failed);
     if code != 0 {
         std::process::exit(code);
     }
