@@ -159,10 +159,14 @@ fn temp_path(path: &Path) -> PathBuf {
     PathBuf::from(temp)
 }
 
-fn write_atomically(
+/// Write `path` through a temp file and a rename, so a crash, a kill or a failed
+/// write leaves the previous file intact instead of a half-written one, and two
+/// writers racing on the same path cannot interleave. Shared with the `.cwv`
+/// vanilla cache, which needs the same guarantee.
+pub fn write_atomically(
     path: &Path,
     write: impl FnOnce(&mut File) -> std::io::Result<()>,
-) -> Result<(), CacheError> {
+) -> std::io::Result<()> {
     let temp = temp_path(path);
     let write_result = (|| -> std::io::Result<()> {
         let mut file = File::create(&temp)?;
@@ -170,20 +174,26 @@ fn write_atomically(
     })();
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&temp);
-        return Err(CacheError::Io(error));
+        return Err(error);
     }
 
     if let Err(error) = std::fs::rename(&temp, path) {
         #[cfg(windows)]
         if path.exists() {
-            // Windows rename does not replace an existing destination. Removing
-            // it is safe because readers already treat a miss as a re-parse.
-            std::fs::remove_file(path)?;
-            std::fs::rename(&temp, path)?;
+            // Windows rename can refuse an existing destination (a reader holding
+            // it open, a directory in the way). Removing it is safe because
+            // readers already treat a miss as a re-parse. When that fails too the
+            // temp still has to go: bailing out with `?` left one behind per
+            // failed write, and `is_cache_file` matches those.
+            let replaced = std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp, path));
+            if let Err(error) = replaced {
+                let _ = std::fs::remove_file(&temp);
+                return Err(error);
+            }
             return Ok(());
         }
         let _ = std::fs::remove_file(&temp);
-        return Err(CacheError::Io(error));
+        return Err(error);
     }
     Ok(())
 }
@@ -215,6 +225,7 @@ pub fn serialize_to_file(cached: &CachedFile, path: &Path) -> Result<(), CacheEr
         file.write_all(&[FORMAT_VERSION])?;
         file.write_all(&compressed)
     })
+    .map_err(CacheError::Io)
 }
 
 /// Read a `.cwb` file, validate its header, and return the decompressed rkyv
@@ -269,6 +280,7 @@ pub fn serialize_errors_to_file(cached: &CachedErrors, path: &Path) -> Result<()
         file.write_all(&[ERRORS_FORMAT_VERSION])?;
         file.write_all(&bytes)
     })
+    .map_err(CacheError::Io)
 }
 
 /// Read and validate a recovered-parse-error sidecar.

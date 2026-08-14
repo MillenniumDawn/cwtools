@@ -14,8 +14,9 @@
 //! NOT cached: the only consumer is the scope-aware command check on vanilla's
 //! own content, which we never validate.
 
-// zstd level and the bounded read/decode used by the `.cwb` parse cache too.
-use cwtools_cache::io::{ZSTD_LEVEL, decode_capped, read_capped};
+// zstd level, the atomic write and the bounded read/decode used by the `.cwb`
+// parse cache too.
+use cwtools_cache::io::{ZSTD_LEVEL, decode_capped, read_capped, write_atomically};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -337,14 +338,31 @@ fn write_cache(
         value_set_values: aux.value_set_values,
     };
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache).map_err(std::io::Error::other)?;
-    let compressed = zstd::encode_all(&bytes[..], ZSTD_LEVEL)?;
+
+    // Frame checksum on, as `.cwb` does. rkyv validates structure, not content,
+    // so a flipped byte can decompress into a different-but-valid archive and be
+    // served as a cache hit. The checksum turns that into a decode error, which
+    // every consumer already degrades to a re-index. Readers need no change: a
+    // frame without one still decodes, so old `.cwv` files stay loadable and
+    // CACHE_VERSION doesn't move.
+    let compressed = {
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), ZSTD_LEVEL)?;
+        encoder.include_checksum(true)?;
+        encoder.write_all(&bytes)?;
+        encoder.finish()?
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(MAGIC)?;
-    file.write_all(&[CACHE_VERSION])?;
-    file.write_all(&compressed)?;
+    // Temp-and-rename, as `.cwb` does. Writing onto the destination meant a
+    // crash, a full disk or a second writer on the same path (the LSP and the
+    // CLI share a cache dir and key the file by game + fingerprint) destroyed
+    // the cache that was already there, costing a full re-index.
+    write_atomically(path, |file| {
+        file.write_all(MAGIC)?;
+        file.write_all(&[CACHE_VERSION])?;
+        file.write_all(&compressed)
+    })?;
     Ok(count)
 }
 
@@ -510,6 +528,36 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         assert!(!is_cache_file(&link));
+    }
+
+    #[test]
+    fn a_save_that_cannot_land_leaves_no_temp_behind() {
+        // `save` writes through a temp file and renames (so a killed writer
+        // cannot destroy the cache that was there). The temp has to be cleaned
+        // up when the rename cannot happen, or a cache dir accumulates one
+        // `.cwv.tmp…` per failed run — which `is_cache_file` matches and
+        // `clearAllCaches` would then be responsible for.
+        let tmp = tempfile::tempdir().unwrap();
+        let occupied = tmp.path().join(cache_file_name("hoi4", "v1.16.4"));
+        std::fs::create_dir(&occupied).unwrap();
+
+        let empty = HashMap::new();
+        save_per_type(
+            &empty,
+            "hoi4",
+            "v1.16.4",
+            &occupied,
+            VanillaCacheAux::default(),
+        )
+        .expect_err("a save onto a directory cannot succeed");
+
+        let strays: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path() != occupied)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(strays.is_empty(), "temp file left behind: {strays:?}");
     }
 
     #[test]
@@ -812,6 +860,38 @@ mod tests {
         load(&path)
     }
 
+    /// Load and reduce the restored cache to a comparable string, so a
+    /// corruption that decodes into *different* data is distinguishable from one
+    /// that reproduces the original. `per_type` is a `HashMap`, so it is sorted
+    /// here rather than trusted to iterate in a fixed order.
+    fn fingerprint_bytes(bytes: &[u8]) -> Option<String> {
+        use std::fmt::Write;
+        let (game, fp, data) = load_bytes(bytes).ok()?;
+        let mut out = format!("{game}|{fp}");
+        let mut types: Vec<_> = data.per_type.iter().collect();
+        types.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, insts) in types {
+            let _ = write!(out, "|T {name}");
+            for (uri, inst) in insts {
+                let _ = write!(
+                    out,
+                    "|I {uri} {} {:?} {:?}",
+                    inst.name, inst.location, inst.primary_loc_key
+                );
+            }
+        }
+        let _ = write!(
+            out,
+            "|A {:?} {:?} {:?} {:?} {:?}",
+            data.loc_keys,
+            data.file_paths,
+            data.var_names,
+            data.complex_enum_values,
+            data.value_set_values
+        );
+        Some(out)
+    }
+
     /// Sanity anchor: the unmodified bytes every test below mutates do load.
     #[test]
     fn sample_cache_bytes_load_clean() {
@@ -905,6 +985,76 @@ mod tests {
                 bytes.len()
             );
         }
+    }
+
+    /// Bit rot in the compressed body. Every single-bit flip must either fail to
+    /// load or restore the cache exactly. Silently decoding into *different* data
+    /// is the bad case: rkyv validates structure, not content, so a flipped
+    /// instance name or line number sails through and the editor resolves
+    /// base-game references against an index that never existed.
+    ///
+    /// The zstd frame checksum is what closes that. With it off, 191 of 846 flips
+    /// here restored an altered cache and were served as hits (#245).
+    #[test]
+    fn a_bit_flipped_body_never_yields_altered_data() {
+        let bytes = sample_cache_bytes();
+        let body_start = MAGIC.len() + 1;
+        let clean = fingerprint_bytes(&bytes).expect("sample must load");
+        let mut same = 0usize;
+        let mut altered = 0usize;
+
+        for i in body_start..bytes.len() {
+            for bit in [0u8, 3, 7] {
+                let mut corrupt = bytes.clone();
+                corrupt[i] ^= 1 << bit;
+                // Reaching the next line at all is the test: a panic inside the
+                // load path fails here instead of degrading to a cache miss.
+                if let Some(got) = fingerprint_bytes(&corrupt) {
+                    if got == clean {
+                        same += 1;
+                    } else {
+                        altered += 1;
+                    }
+                }
+            }
+        }
+
+        let attempts = (bytes.len() - body_start) * 3;
+        assert_eq!(
+            altered, 0,
+            "{altered} of {attempts} bit flips restored different cache data and \
+             were accepted as a cache hit"
+        );
+        // A handful land in frame bits the decoder ignores and reproduce the
+        // original exactly. Harmless, but if it were most of them the checksum
+        // would not be doing anything.
+        assert!(
+            same * 4 < attempts,
+            "{same} of {attempts} bit flips round-tripped unchanged"
+        );
+    }
+
+    /// The frame checksum is a write-side setting only. A `.cwv` written before
+    /// it was turned on carries no checksum and must still load, which is why
+    /// enabling it needed no `CACHE_VERSION` bump and no cache wipe.
+    #[test]
+    fn a_checksumless_frame_still_loads() {
+        let bytes = sample_cache_bytes();
+        let body_start = MAGIC.len() + 1;
+        let mut raw = Vec::new();
+        decode_capped(&bytes[body_start..], MAX_CACHE_DECODED_BYTES, &mut raw).unwrap();
+
+        // `zstd::encode_all` is what the writer used before, and it writes no
+        // frame checksum.
+        let mut old_style = MAGIC.to_vec();
+        old_style.push(CACHE_VERSION);
+        old_style.extend_from_slice(&zstd::encode_all(&raw[..], ZSTD_LEVEL).unwrap());
+
+        assert_eq!(
+            fingerprint_bytes(&old_style).expect("a checksumless frame must still load"),
+            fingerprint_bytes(&bytes).unwrap(),
+            "old and new frames must restore the same cache"
+        );
     }
 
     /// A body that is not zstd at all: something else ended up in the cache dir

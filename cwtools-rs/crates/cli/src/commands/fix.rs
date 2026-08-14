@@ -147,7 +147,17 @@ pub(super) fn run(args: FixArgs) {
 
     let vanilla_cache_index = vanilla_cache
         .as_ref()
-        .and_then(|p| vanilla_cache::load(p).ok())
+        .and_then(|p| match vanilla_cache::load(p) {
+            Ok(loaded) => Some(loaded),
+            Err(e) => {
+                eprintln!(
+                    "  warn: could not load vanilla cache {}: {}",
+                    p.display(),
+                    e
+                );
+                None
+            }
+        })
         .map(|(_, fp, data)| (fp, data));
     let (_fp, vanilla_cache_index) = vanilla_cache_index.unzip();
 
