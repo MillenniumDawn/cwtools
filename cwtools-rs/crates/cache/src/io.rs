@@ -180,10 +180,16 @@ pub fn write_atomically(
     if let Err(error) = std::fs::rename(&temp, path) {
         #[cfg(windows)]
         if path.exists() {
-            // Windows rename does not replace an existing destination. Removing
-            // it is safe because readers already treat a miss as a re-parse.
-            std::fs::remove_file(path)?;
-            std::fs::rename(&temp, path)?;
+            // Windows rename can refuse an existing destination (a reader holding
+            // it open, a directory in the way). Removing it is safe because
+            // readers already treat a miss as a re-parse. When that fails too the
+            // temp still has to go: bailing out with `?` left one behind per
+            // failed write, and `is_cache_file` matches those.
+            let replaced = std::fs::remove_file(path).and_then(|()| std::fs::rename(&temp, path));
+            if let Err(error) = replaced {
+                let _ = std::fs::remove_file(&temp);
+                return Err(error);
+            }
             return Ok(());
         }
         let _ = std::fs::remove_file(&temp);

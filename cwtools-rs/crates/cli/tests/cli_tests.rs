@@ -874,11 +874,22 @@ fn test_validate_recovers_from_a_corrupt_vanilla_cache() {
         .find(|p| p.extension().is_some_and(|x| x == "cwv"))
         .expect("the first run wrote a cache");
 
-    // Bit rot in the middle of the compressed body, which the frame checksum
-    // turns into a decode error rather than a different-but-valid cache.
+    // Damage a run in the middle of the compressed body. One flipped bit would
+    // do in principle, but roughly one in two hundred lands in frame bits the
+    // decoder ignores and reproduces the cache exactly (the sweep in
+    // `vanilla_cache.rs` measures 4 of 858), and the byte layout depends on the
+    // order the install walked, so a single fixed bit is not a stable choice
+    // across platforms. A damaged run cannot decode on any of them.
     let mut bytes = std::fs::read(&cwv).unwrap();
+    assert!(
+        bytes.len() > 64,
+        "cache too small to damage: {}",
+        bytes.len()
+    );
     let middle = bytes.len() / 2;
-    bytes[middle] ^= 0x01;
+    for byte in &mut bytes[middle..middle + 16] {
+        *byte ^= 0xff;
+    }
     std::fs::write(&cwv, &bytes).unwrap();
 
     let discover_dir = fixtures_dir().join("discover").join("mod_a");
