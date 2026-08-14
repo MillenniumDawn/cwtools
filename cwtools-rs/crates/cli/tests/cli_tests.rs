@@ -857,6 +857,61 @@ fn test_validate_stays_quiet_about_the_gate_with_a_base_game() {
         .stderr(predicate::str::contains("no base-game data loaded").not());
 }
 
+/// The contract the whole `.cwv` corruption suite exists to protect: a cache
+/// that fails to load has to degrade to a re-index, not to a failed run and not
+/// to silently missing base-game data. The unit tests prove `load` returns an
+/// error; this proves the run recovers from it.
+#[test]
+fn test_validate_recovers_from_a_corrupt_vanilla_cache() {
+    let cache = tempfile::tempdir().unwrap();
+    assert_eq!(validate_with_cache_home(cache.path(), &[]), 1);
+
+    let dir = cache.path().join("cwtools");
+    let cwv = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "cwv"))
+        .expect("the first run wrote a cache");
+
+    // Bit rot in the middle of the compressed body, which the frame checksum
+    // turns into a decode error rather than a different-but-valid cache.
+    let mut bytes = std::fs::read(&cwv).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    std::fs::write(&cwv, &bytes).unwrap();
+
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .env("XDG_CACHE_HOME", cache.path())
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--vanilla",
+            discover_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("could not read base-game cache"))
+        // The gate notice fires only when no base-game data loaded at all, so
+        // its absence is what proves the install was re-indexed rather than the
+        // run carrying on blind.
+        .stderr(predicate::str::contains("no base-game data loaded").not());
+
+    // And the damaged cache was replaced, so the next run is a hit again.
+    assert_eq!(
+        validate_with_cache_home(cache.path(), &[]),
+        1,
+        "the recovery run should have rewritten the cache"
+    );
+}
+
 #[test]
 fn test_validate_no_vanilla_cache_writes_nothing() {
     let cache = tempfile::tempdir().unwrap();

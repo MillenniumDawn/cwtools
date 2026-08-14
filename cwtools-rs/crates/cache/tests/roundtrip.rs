@@ -385,3 +385,35 @@ fn out_of_bounds_child_index_is_rejected() {
         "out-of-bounds child index must be rejected at load, got Ok"
     );
 }
+
+/// The guarantee every cache writer leans on: a write that fails partway leaves
+/// the file that was already there untouched, rather than a truncated one the
+/// next run has to throw away. Both `.cwb` and `.cwv` route through this.
+#[test]
+fn a_failed_write_leaves_the_previous_file_intact() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.bin");
+    io::write_atomically(&path, |file| file.write_all(b"original")).unwrap();
+
+    let err = io::write_atomically(&path, |file| {
+        file.write_all(b"half a cache")?;
+        Err(std::io::Error::other("disk full"))
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "disk full");
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"original",
+        "the previous file must survive a failed write"
+    );
+    let strays: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|name| name != "cache.bin")
+        .collect();
+    assert!(strays.is_empty(), "temp file left behind: {strays:?}");
+}

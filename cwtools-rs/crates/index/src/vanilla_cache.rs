@@ -14,8 +14,9 @@
 //! NOT cached: the only consumer is the scope-aware command check on vanilla's
 //! own content, which we never validate.
 
-// zstd level and the bounded read/decode used by the `.cwb` parse cache too.
-use cwtools_cache::io::{ZSTD_LEVEL, decode_capped, read_capped};
+// zstd level, the atomic write and the bounded read/decode used by the `.cwb`
+// parse cache too.
+use cwtools_cache::io::{ZSTD_LEVEL, decode_capped, read_capped, write_atomically};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -353,10 +354,15 @@ fn write_cache(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(MAGIC)?;
-    file.write_all(&[CACHE_VERSION])?;
-    file.write_all(&compressed)?;
+    // Temp-and-rename, as `.cwb` does. Writing onto the destination meant a
+    // crash, a full disk or a second writer on the same path (the LSP and the
+    // CLI share a cache dir and key the file by game + fingerprint) destroyed
+    // the cache that was already there, costing a full re-index.
+    write_atomically(path, |file| {
+        file.write_all(MAGIC)?;
+        file.write_all(&[CACHE_VERSION])?;
+        file.write_all(&compressed)
+    })?;
     Ok(count)
 }
 
@@ -522,6 +528,36 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         assert!(!is_cache_file(&link));
+    }
+
+    #[test]
+    fn a_save_that_cannot_land_leaves_no_temp_behind() {
+        // `save` writes through a temp file and renames (so a killed writer
+        // cannot destroy the cache that was there). The temp has to be cleaned
+        // up when the rename cannot happen, or a cache dir accumulates one
+        // `.cwv.tmp…` per failed run — which `is_cache_file` matches and
+        // `clearAllCaches` would then be responsible for.
+        let tmp = tempfile::tempdir().unwrap();
+        let occupied = tmp.path().join(cache_file_name("hoi4", "v1.16.4"));
+        std::fs::create_dir(&occupied).unwrap();
+
+        let empty = HashMap::new();
+        save_per_type(
+            &empty,
+            "hoi4",
+            "v1.16.4",
+            &occupied,
+            VanillaCacheAux::default(),
+        )
+        .expect_err("a save onto a directory cannot succeed");
+
+        let strays: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path() != occupied)
+            .map(|e| e.file_name())
+            .collect();
+        assert!(strays.is_empty(), "temp file left behind: {strays:?}");
     }
 
     #[test]
