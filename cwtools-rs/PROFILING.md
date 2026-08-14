@@ -101,7 +101,16 @@ The LSP workspace walk consults three lists, layered in this order:
    The VS Code extension has no setting feeding it today; another client can send it.
 
 Both user lists default to empty and extend (not replace) the engine
-baseline. Patterns use `*` and `?` only (no `**`).
+baseline.
+
+A pattern with no separator names a file or directory, and matches it at any
+depth: `*.md`, `Changelog.txt`, `temp*`. A pattern with one addresses a place in
+the tree, and is matched against the path relative to the mod or workspace root:
+`common/**/*.txt`, `**/skip.txt`, `gfx/interface/`. There, `*` and `?` stay
+inside a single name while `**` spans any run of directories (including none), a
+leading `/` is the root the path is already relative to, and a trailing one
+covers everything below. Windows separators are accepted in a pattern and read
+the same way.
 
 The CLI exposes the same two lists as repeatable flags:
 `--ignore-file GLOB` and `--ignore-dir GLOB` on `validate`.

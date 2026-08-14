@@ -233,7 +233,10 @@ pub fn is_excluded_root_dir(name: &str) -> bool {
 /// extension, matching an include pattern, not on the exclude list, and within
 /// the size guard. Shared by single-root discovery ([`FileManager::collect_paths`])
 /// and the multi-mod path so both apply identical file-level rules.
-fn accept_script_file(cfg: &FileManagerConfig, path: &Path) -> bool {
+///
+/// `relative` is the file's root-relative path, for the exclude patterns that
+/// address a location rather than a name (see [`ignore_glob_match`]).
+fn accept_script_file(cfg: &FileManagerConfig, path: &Path, relative: &str) -> bool {
     if classify_extension(path) != FileKind::Script {
         return false;
     }
@@ -248,7 +251,7 @@ fn accept_script_file(cfg: &FileManagerConfig, path: &Path) -> bool {
     if cfg
         .exclude_patterns
         .iter()
-        .any(|pat| glob_match(pat, file_name))
+        .any(|pat| ignore_glob_match(pat, file_name, relative))
     {
         return false;
     }
@@ -320,13 +323,15 @@ pub struct FileManagerConfig {
     pub include_dirs: Vec<String>,
     /// Glob patterns for files (e.g., "*.txt").
     pub file_patterns: Vec<String>,
-    /// Filename patterns to exclude. Matched with the same `glob_match`
-    /// semantics as `file_patterns` (supports `*` and `?`).
+    /// Patterns to exclude, matched by [`ignore_glob_match`]: a bare name glob
+    /// (`*.md`) matches the file name at any depth, one with a separator
+    /// (`gfx/**/*.txt`) matches the root-relative path.
     pub exclude_patterns: Vec<String>,
     /// Directory names to skip entirely (exact, case-insensitive).
     pub exclude_dirs: Vec<String>,
     /// Directory glob patterns to skip entirely. Like `exclude_dirs` but each
-    /// entry is a glob (`*`, `?`) matched against the directory's basename.
+    /// entry is a glob, matched by [`ignore_glob_match`] against the directory's
+    /// basename or, when it carries a separator, its root-relative path.
     /// Layers on top of `exclude_dirs` — both lists are checked.
     pub exclude_dir_patterns: Vec<String>,
     /// Directory names skipped ONLY at the workspace root (exact, case-insensitive).
@@ -534,12 +539,17 @@ impl FileManager {
         let is_root_level = dir == self.config.root.as_path();
         let cfg = &self.config;
         // Accept only script files that pass the shared file-level filter; each
-        // yields (path, logical_path).
+        // yields (path, logical_path). The extension test comes first here: it
+        // rejects most of a mod's tree (art, sound) before the logical path an
+        // exclude pattern may match against is built.
         let mut accept = |path: &Path| -> Option<(PathBuf, String)> {
-            if !accept_script_file(cfg, path) {
+            if classify_extension(path) != FileKind::Script {
                 return None;
             }
             let logical_path = compute_logical_path_with_root(path, &root_prefix);
+            if !accept_script_file(cfg, path, &logical_path) {
+                return None;
+            }
             Some((path.to_path_buf(), logical_path))
         };
         let mut on_err = |path: &Path, e: std::io::Error| {
@@ -551,7 +561,10 @@ impl FileManager {
         };
         walk_dir_generic(
             dir,
-            is_root_level,
+            WalkRoot {
+                prefix: &root_prefix,
+                is_root_level,
+            },
             cfg,
             &[],
             &mut accept,
@@ -582,7 +595,7 @@ impl FileManager {
             self.config.scan_budget,
         )
         .into_iter()
-        .filter(|(path, _)| accept_script_file(&self.config, path))
+        .filter(|(path, logical_path)| accept_script_file(&self.config, path, logical_path))
         .map(|(path, logical_path)| DiscoveredFile { path, logical_path })
         .collect()
     }
@@ -676,6 +689,13 @@ fn compute_logical_path_with_root(path: &Path, root_prefix: &str) -> String {
             .unwrap_or("")
             .to_string()
     }
+}
+
+/// The forward-slash spelling of `path`, the form a path glob is written in.
+/// Windows hands back `\` separators, so a match target passes through here
+/// before [`ignore_glob_match`] sees it.
+pub fn to_slash_path(path: &Path) -> String {
+    normalize_slashes(path.to_string_lossy()).into_owned()
 }
 
 /// Convert backslashes to forward slashes, avoiding a full scan/allocation when
@@ -953,6 +973,11 @@ pub fn walk_workspace_files(
     budget: ScanBudget,
 ) -> Vec<PathBuf> {
     let cfg = FileManagerConfig::default();
+    let root_prefix = normalize_root_prefix(root);
+    // Only a pattern that addresses a location reads the relative path, so a
+    // workspace configured with plain name globs never builds one.
+    let needs_relative =
+        has_path_pattern(&cfg.exclude_patterns) || has_path_pattern(extra_file_globs);
     // Accept any file whose extension is requested and which isn't a free-form
     // excluded filename. No per-file size guard (unlike the CLI walker); the
     // read cap and byte budget are enforced when the LSP reads each file.
@@ -962,13 +987,18 @@ pub fn walk_workspace_files(
             return None;
         }
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let relative = if needs_relative {
+            compute_logical_path_with_root(path, &root_prefix)
+        } else {
+            String::new()
+        };
         if cfg
             .exclude_patterns
             .iter()
-            .any(|pat| glob_match(pat, file_name))
+            .any(|pat| ignore_glob_match(pat, file_name, &relative))
             || extra_file_globs
                 .iter()
-                .any(|pat| glob_match(pat, file_name))
+                .any(|pat| ignore_glob_match(pat, file_name, &relative))
         {
             return None;
         }
@@ -982,7 +1012,10 @@ pub fn walk_workspace_files(
     };
     let _ = walk_dir_generic(
         root,
-        true,
+        WalkRoot {
+            prefix: &root_prefix,
+            is_root_level: true,
+        },
         &cfg,
         extra_dir_globs,
         &mut accept,
@@ -1001,10 +1034,7 @@ pub fn walk_workspace_files(
 /// and a special file can report length 0 and be read to EOF. Regular entries
 /// reuse the `file_type` from `read_dir` to avoid a second stat. Read errors on
 /// child directories go to `on_dir_err`; the top-level read error is returned.
-/// `is_root_level` is true only when `dir` itself is the walk root, so its
-/// direct children are the ones `exclude_root_dirs` applies to; every
-/// recursive call passes `false`. The walk stops once `state.remaining_files`
-/// reaches 0.
+/// The walk stops once `state.remaining_files` reaches 0.
 ///
 /// Mutable state threaded through [`walk_dir_generic`]: the collected output
 /// and the remaining per-scan file budget.
@@ -1013,15 +1043,29 @@ struct WalkState<T> {
     remaining_files: usize,
 }
 
+/// Where the walk started, threaded down the recursion: the normalized root
+/// prefix a directory's path glob is matched relative to, and whether `dir` is
+/// the root itself, since only its direct children get `exclude_root_dirs`.
+/// Every recursive call clears `is_root_level`.
+#[derive(Clone, Copy)]
+struct WalkRoot<'a> {
+    prefix: &'a str,
+    is_root_level: bool,
+}
+
 fn walk_dir_generic<T>(
     dir: &Path,
-    is_root_level: bool,
+    root: WalkRoot<'_>,
     cfg: &FileManagerConfig,
     extra_dir_globs: &[String],
     accept: &mut dyn FnMut(&Path) -> Option<T>,
     on_dir_err: &mut dyn FnMut(&Path, std::io::Error),
     state: &mut WalkState<T>,
 ) -> std::io::Result<()> {
+    // Only a directory pattern that addresses a location needs the relative
+    // path built per entry; the usual all-names lists skip it entirely.
+    let dir_paths_needed =
+        has_path_pattern(&cfg.exclude_dir_patterns) || has_path_pattern(extra_dir_globs);
     // Collect (sort-key, path, file_type) once so sorting doesn't re-allocate an
     // OsString per comparison and directory tests reuse the readdir file type.
     let mut entries: Vec<(std::ffi::OsString, PathBuf, std::fs::FileType)> = Vec::new();
@@ -1043,6 +1087,11 @@ fn walk_dir_generic<T>(
         }
         if ft.is_dir() {
             let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let dir_relative = if dir_paths_needed {
+                compute_logical_path_with_root(&path, root.prefix)
+            } else {
+                String::new()
+            };
             // Root-anchored excludes apply only to direct children of the root.
             let skip = cfg
                 .exclude_dirs
@@ -1051,9 +1100,11 @@ fn walk_dir_generic<T>(
                 || cfg
                     .exclude_dir_patterns
                     .iter()
-                    .any(|pat| glob_match(pat, dir_name))
-                || extra_dir_globs.iter().any(|pat| glob_match(pat, dir_name))
-                || (is_root_level
+                    .any(|pat| ignore_glob_match(pat, dir_name, &dir_relative))
+                || extra_dir_globs
+                    .iter()
+                    .any(|pat| ignore_glob_match(pat, dir_name, &dir_relative))
+                || (root.is_root_level
                     && cfg
                         .exclude_root_dirs
                         .iter()
@@ -1061,7 +1112,10 @@ fn walk_dir_generic<T>(
             if !skip
                 && let Err(e) = walk_dir_generic(
                     &path,
-                    false,
+                    WalkRoot {
+                        is_root_level: false,
+                        ..root
+                    },
                     cfg,
                     extra_dir_globs,
                     accept,
@@ -1184,6 +1238,89 @@ fn glob_match_general(pattern: &str, text: &str) -> bool {
     glob_greedy(&p, &t)
 }
 
+/// True if `pattern` addresses a location in the tree rather than a bare name.
+/// Windows users write `\`, so both separators count.
+fn is_path_pattern(pattern: &str) -> bool {
+    pattern.contains(['/', '\\'])
+}
+
+/// True if any of `patterns` addresses a location, so a walk that finds none
+/// can skip building a root-relative path per entry.
+fn has_path_pattern(patterns: &[String]) -> bool {
+    patterns.iter().any(|p| is_path_pattern(p))
+}
+
+/// Match one user ignore glob against a discovered entry. A pattern with no
+/// separator is a name glob matched against `name` at any depth, which is what
+/// every pattern meant before this existed. One with a separator addresses a
+/// location and is matched against `relative`, the entry's path relative to the
+/// mod or workspace root, forward-slashed. So `**/skip.txt`, the spelling the
+/// VS Code client generates for every `errors.ignorefiles` entry, matches the
+/// file it names instead of nothing at all (#244).
+///
+/// `relative` is read only for path patterns, so a caller whose lists hold none
+/// can pass `""`.
+pub fn ignore_glob_match(pattern: &str, name: &str, relative: &str) -> bool {
+    if is_path_pattern(pattern) {
+        path_glob_match(pattern, relative)
+    } else {
+        glob_match(pattern, name)
+    }
+}
+
+/// Path-aware glob: `**` spans any run of directories (including none), while
+/// `*` and `?` stay inside one segment. That segment boundary is the whole
+/// reason this can't be [`glob_match`] over the joined path, where `*` would
+/// happily cross a `/`.
+///
+/// A leading separator anchors at the root, which `path` already is, so it only
+/// says where matching starts. A trailing one means everything below, and is
+/// read as a trailing `**`.
+fn path_glob_match(pattern: &str, path: &str) -> bool {
+    let mut segments: Vec<&str> = pattern.split(['/', '\\']).collect();
+    if segments.first() == Some(&"") {
+        segments.remove(0);
+    }
+    if segments.last() == Some(&"") {
+        segments.pop();
+        segments.push("**");
+    }
+    let text: Vec<&str> = path.split('/').collect();
+    segments_greedy(&segments, &text)
+}
+
+/// [`glob_greedy`] one level up: the same backtracking walk with `**` as the
+/// star and a whole segment as the unit, each pair compared by [`glob_match`]
+/// so `*` and `?` keep their meaning inside a single name.
+fn segments_greedy(p: &[&str], t: &[&str]) -> bool {
+    let (m, n) = (p.len(), t.len());
+    let mut i = 0; // position in t
+    let mut j = 0; // position in p
+    let mut star: Option<usize> = None; // most recent '**'
+    let mut mark = 0; // t position the star run restarts from
+    while i < n {
+        if j < m && p[j] == "**" {
+            star = Some(j);
+            j += 1;
+            mark = i;
+        } else if j < m && glob_match(p[j], t[i]) {
+            i += 1;
+            j += 1;
+        } else if let Some(s) = star {
+            // The star swallows one more directory and the run re-tries.
+            j = s + 1;
+            mark += 1;
+            i = mark;
+        } else {
+            return false;
+        }
+    }
+    while j < m && p[j] == "**" {
+        j += 1;
+    }
+    j == m
+}
+
 fn glob_greedy(p: &[char], t: &[char]) -> bool {
     let (m, n) = (p.len(), t.len());
     let mut i = 0; // position in t
@@ -1279,6 +1416,86 @@ mod tests {
         // prefix* fast path must not trigger when the prefix itself contains ?.
         assert!(glob_match("fo?*", "foobar"));
         assert!(!glob_match("fo?*", "fo")); // needs at least one char after "fo"
+    }
+
+    #[test]
+    fn path_globs_match_a_location_not_just_a_name() {
+        // #244: the VS Code client rewrites every `errors.ignorefiles` entry to
+        // `**/<name>`, which matched nothing at all while every ignore pattern
+        // was a name glob.
+        assert!(ignore_glob_match("**/skip.txt", "skip.txt", "skip.txt"));
+        assert!(ignore_glob_match(
+            "**/skip.txt",
+            "skip.txt",
+            "common/units/skip.txt"
+        ));
+        assert!(!ignore_glob_match(
+            "**/skip.txt",
+            "keep.txt",
+            "common/keep.txt"
+        ));
+        // The shipped `cwtools.ignore_patterns` default, dead for the same reason.
+        assert!(ignore_glob_match(
+            "**/99_README**.txt",
+            "99_README_units.txt",
+            "common/99_README_units.txt"
+        ));
+        // A name glob keeps its old meaning: the name, at any depth, and it
+        // never consults the relative path.
+        assert!(ignore_glob_match("*.md", "notes.md", "docs/notes.md"));
+        assert!(ignore_glob_match("*.md", "notes.md", ""));
+        assert!(!ignore_glob_match("*.md", "notes.txt", "docs/notes.txt"));
+    }
+
+    #[test]
+    fn path_globs_anchor_at_the_root_and_respect_segments() {
+        // A separator anchors the pattern, unlike a bare name.
+        assert!(ignore_glob_match(
+            "common/foo.txt",
+            "foo.txt",
+            "common/foo.txt"
+        ));
+        assert!(!ignore_glob_match(
+            "common/foo.txt",
+            "foo.txt",
+            "gfx/common/foo.txt"
+        ));
+        // A leading separator says the same thing; the target is already relative.
+        assert!(ignore_glob_match(
+            "/common/foo.txt",
+            "foo.txt",
+            "common/foo.txt"
+        ));
+        // `*` stays inside one segment; `**` spans any run of them, including none.
+        assert!(!ignore_glob_match(
+            "common/*.txt",
+            "foo.txt",
+            "common/units/foo.txt"
+        ));
+        assert!(ignore_glob_match(
+            "common/**/*.txt",
+            "foo.txt",
+            "common/units/foo.txt"
+        ));
+        assert!(ignore_glob_match(
+            "gfx/**/*.dds",
+            "f.dds",
+            "gfx/interface/goals/f.dds"
+        ));
+        assert!(ignore_glob_match(
+            "common/**/foo.txt",
+            "foo.txt",
+            "common/foo.txt"
+        ));
+        // A trailing separator covers the tree below it.
+        assert!(ignore_glob_match("build/", "foo.txt", "build/a/foo.txt"));
+        assert!(!ignore_glob_match("build/", "foo.txt", "src/foo.txt"));
+        // The Windows spelling of a path pattern means the same thing.
+        assert!(ignore_glob_match(
+            "common\\foo.txt",
+            "foo.txt",
+            "common/foo.txt"
+        ));
     }
 
     /// The pre-#169 DP matcher, kept as the reference for the greedy
@@ -1840,6 +2057,69 @@ mod tests {
         let pos = |n: &str| names.iter().position(|x| x == n).expect("file present");
         assert!(pos("alpha.txt") < pos("middle.txt"), "got: {:?}", names);
         assert!(pos("middle.txt") < pos("zebra.txt"), "got: {:?}", names);
+    }
+
+    /// #244: the globs the LSP forwards reach the walk, and a `**/`-prefixed one
+    /// (every `errors.ignorefiles` entry, once the client has rewritten it) drops
+    /// the file it names wherever it sits.
+    #[test]
+    fn walk_workspace_files_honours_path_globs() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("common/units")).unwrap();
+        std::fs::write(root.join("skip.txt"), "").unwrap();
+        std::fs::write(root.join("common/units/skip.txt"), "").unwrap();
+        std::fs::write(root.join("common/units/keep.txt"), "").unwrap();
+
+        let names = |globs: &[String], dirs: &[String]| -> Vec<String> {
+            walk_workspace_files(root, &["txt"], globs, dirs, ScanBudget::default())
+                .iter()
+                .map(|p| compute_logical_path(p, root))
+                .collect()
+        };
+
+        let all = names(&[], &[]);
+        assert_eq!(all.len(), 3, "nothing ignored yet: {all:?}");
+
+        let filtered = names(&["**/skip.txt".to_string()], &[]);
+        assert_eq!(filtered, ["common/units/keep.txt"], "got: {filtered:?}");
+
+        // Anchored to one location, the sibling at the root survives.
+        let anchored = names(&["common/**/skip.txt".to_string()], &[]);
+        assert!(
+            anchored.contains(&"skip.txt".to_string()),
+            "got: {anchored:?}"
+        );
+        assert!(
+            !anchored.contains(&"common/units/skip.txt".to_string()),
+            "got: {anchored:?}"
+        );
+
+        // A directory glob addressing a path prunes that subtree and no other.
+        let pruned = names(&[], &["common/units".to_string()]);
+        assert_eq!(pruned, ["skip.txt"], "got: {pruned:?}");
+    }
+
+    /// The CLI walker reads the same globs the same way (`exclude_patterns` is
+    /// where the driver puts `--ignore-file`), so the two discovery paths can't
+    /// disagree about what a pattern means.
+    #[test]
+    fn collect_paths_honours_path_globs() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("common/units")).unwrap();
+        std::fs::write(root.join("common/units/skip.txt"), "").unwrap();
+        std::fs::write(root.join("common/units/keep.txt"), "").unwrap();
+
+        let fm = FileManager::new(FileManagerConfig {
+            root: root.to_path_buf(),
+            exclude_patterns: vec!["**/skip.txt".to_string()],
+            ..Default::default()
+        });
+        let mut paths = Vec::new();
+        fm.collect_paths(root, &mut paths).unwrap();
+        let logical: Vec<&str> = paths.iter().map(|(_, lp)| lp.as_str()).collect();
+        assert_eq!(logical, ["common/units/keep.txt"], "got: {logical:?}");
     }
 
     /// A root that isn't there is an error, not an empty result: a typo'd
