@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cwtools_cache::workspace::{self as workspace_cache, SourceCacheKey};
 use cwtools_file_manager::file_manager::{
     DirectoryType, DiscoveredFile, FileError, FileManager, FileManagerConfig, ScanBudget,
-    classify_directory, glob_match,
+    classify_directory, ignore_glob_match, to_slash_path,
 };
 use cwtools_file_manager::{FileEncoding, read_text, read_text_with_encoding};
 use cwtools_game::constants::Game;
@@ -934,8 +934,9 @@ fn parse_errors_to_validation(
 /// neither validates nor looks up the rest. A file whose header language can't
 /// be read is always kept, matching how `validate_loc_project_with_union`
 /// scopes its own per-file pass. `ignore_files` and `ignore_dirs` are the user's
-/// discovery globs, matched against the file name and against every directory
-/// name below the root the file was found under.
+/// discovery globs, matched against the file name and every directory name
+/// below the root the file was found under, or against the root-relative path
+/// when the glob carries a separator (see `loc_path_ignored`).
 ///
 /// With none of the three the whole tree loads through the budgeted walk.
 pub fn load_loc_service(
@@ -974,8 +975,9 @@ pub fn load_loc_service(
 }
 
 /// Whether a discovered loc path is excluded by the user's `--ignore-file` /
-/// `--ignore-dir` globs. Directory globs match a directory name at any depth, so
-/// the path is taken relative to the root it was discovered under first: an
+/// `--ignore-dir` globs. A name glob matches a file or directory name at any
+/// depth; one carrying a separator matches a root-relative path. Either way the
+/// path is taken relative to the root it was discovered under first: an
 /// absolute root that happens to contain a `build` component is not the mod's.
 fn loc_path_ignored(
     path: &Path,
@@ -987,22 +989,40 @@ fn loc_path_ignored(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    if file_globs.iter().any(|pat| glob_match(pat, name)) {
+    let relative = roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path);
+    let relative = to_slash_path(relative);
+    if file_globs
+        .iter()
+        .any(|pat| ignore_glob_match(pat, name, &relative))
+    {
         return true;
     }
     if dir_globs.is_empty() {
         return false;
     }
-    let relative = roots
-        .iter()
-        .find_map(|root| path.strip_prefix(root).ok())
-        .unwrap_or(path);
-    relative
-        .parent()
-        .into_iter()
-        .flat_map(Path::components)
-        .filter_map(|c| c.as_os_str().to_str())
-        .any(|dir| dir_globs.iter().any(|pat| glob_match(pat, dir)))
+    // Every directory on the way down, offered by name and by the path it sits
+    // at, so a name glob still matches at any depth while a path glob anchors.
+    let mut ancestor = String::new();
+    let mut segments = relative.split('/').peekable();
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            break;
+        }
+        if !ancestor.is_empty() {
+            ancestor.push('/');
+        }
+        ancestor.push_str(segment);
+        if dir_globs
+            .iter()
+            .any(|pat| ignore_glob_match(pat, segment, &ancestor))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// The language a loc file declares, without parsing its entries. The header
@@ -1362,6 +1382,48 @@ mod tests {
             &[]
         ));
         assert!(!loc_path_ignored(&kept, &[root], &[], &[]));
+    }
+
+    /// #244: loc discovery reads a path glob the same way the script walk does,
+    /// so `**/<name>` (what the client sends for every `errors.ignorefiles`
+    /// entry) drops the file, and an anchored glob drops only its own subtree.
+    #[test]
+    fn loc_ignore_globs_match_a_path() {
+        let root = Path::new("build/mod");
+        let kept = root.join("localisation/greeting_l_english.yml");
+        let staged = root.join("wip/localisation/greeting_l_english.yml");
+
+        assert!(loc_path_ignored(
+            &kept,
+            &[root],
+            &["**/greeting_l_english.yml".to_string()],
+            &[]
+        ));
+        assert!(!loc_path_ignored(
+            &kept,
+            &[root],
+            &["wip/**/*.yml".to_string()],
+            &[]
+        ));
+        assert!(loc_path_ignored(
+            &staged,
+            &[root],
+            &["wip/**/*.yml".to_string()],
+            &[]
+        ));
+        // A directory glob can address a location too.
+        assert!(loc_path_ignored(
+            &staged,
+            &[root],
+            &[],
+            &["wip/localisation".to_string()]
+        ));
+        assert!(!loc_path_ignored(
+            &kept,
+            &[root],
+            &[],
+            &["wip/localisation".to_string()]
+        ));
     }
 
     #[test]
