@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use cwtools_error_codes as error_codes;
 
+pub mod inline_ignore;
 pub mod inline_script;
 pub mod missing_loc;
 pub mod per_game;

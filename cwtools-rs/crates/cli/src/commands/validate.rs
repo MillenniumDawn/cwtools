@@ -380,6 +380,7 @@ pub(super) fn run(args: ValidateArgs) {
     for err in rule_errors {
         if !codes::wanted(err.code, &only_codes, &ignore_codes)
             || !scope::wanted(scope.as_ref(), &err.file.to_string_lossy())
+            || sources.inline_suppressed(&err.file.to_string_lossy(), err.line, err.code)
         {
             continue;
         }
@@ -401,7 +402,11 @@ pub(super) fn run(args: ValidateArgs) {
         for err in errors {
             // Same placement as the hash baseline: a suppressed code
             // never reaches the counts, the report or --output-hashes.
-            if !codes::wanted(err.code.unwrap_or_default(), &only_codes, &ignore_codes) {
+            // The inline `# cwtools-ignore` directive suppresses the same
+            // way, scoped to the diagnostic's own line and its neighbours.
+            if !codes::wanted(err.code.unwrap_or_default(), &only_codes, &ignore_codes)
+                || sources.inline_suppressed(file_str, err.line, err.code.unwrap_or_default())
+            {
                 continue;
             }
             let line_text = sources.trimmed(file_str, err.line);
@@ -430,6 +435,7 @@ pub(super) fn run(args: ValidateArgs) {
         if !d.file.starts_with(&dir_prefix)
             || !codes::wanted(d.code, &only_codes, &ignore_codes)
             || !scope::wanted(scope.as_ref(), &d.file)
+            || sources.inline_suppressed(&d.file, d.line as u32, d.code)
         {
             continue;
         }

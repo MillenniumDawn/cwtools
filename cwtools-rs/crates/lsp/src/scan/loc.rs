@@ -286,12 +286,32 @@ impl Backend {
         // buffers after the index is installed, so disk diagnostics must not
         // overwrite them here.
         let open_uris: HashSet<String> = self.state.documents.lock().keys().cloned().collect();
-        for (file, diags) in by_file.drain() {
+        for (file, mut diags) in by_file.drain() {
             let uri = path_to_uri(std::path::Path::new(&file));
             if open_uris.contains(&uri) {
                 continue;
             }
             if let Ok(uri_obj) = Url::parse(&uri) {
+                // Inline `# cwtools-ignore` directives: the index build drops
+                // each loc file's text, so read it back just for the files that
+                // reported something (the rare ones), not the whole tree. On a
+                // blocking thread, like every other capped disk read here.
+                let file_path = std::path::PathBuf::from(&file);
+                let inline_ignored = tokio::task::spawn_blocking(move || {
+                    cwtools_file_manager::file_manager::read_text_capped(
+                        &file_path,
+                        crate::access::MAX_URI_READ_BYTES,
+                    )
+                    .ok()
+                    .map(|(text, _)| {
+                        cwtools_validation::inline_ignore::extract_inline_ignored_codes(&text)
+                    })
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+                crate::validate::drop_inline_suppressed(&mut diags, &inline_ignored);
                 self.publish_filtered(uri_obj, diags, None, source_hashes.get(&file).copied())
                     .await;
             }

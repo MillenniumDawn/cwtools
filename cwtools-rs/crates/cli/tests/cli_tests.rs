@@ -2481,6 +2481,50 @@ fn test_validate_ignore_code_drops_the_code() {
         ));
 }
 
+/// Write `content` over the mod fixture `config_mod` copies in, and validate
+/// it with the same config. Shared by the inline-directive tests below.
+fn validate_inline_mod(content: &str) -> assert_cmd::assert::Assert {
+    let tmp = config_mod(&config_body());
+    let test_txt = tmp.path().join("mod").join("events").join("test.txt");
+    std::fs::write(&test_txt, content).unwrap();
+    cwtools()
+        .args(["validate", "--config"])
+        .arg(tmp.path().join("cwtools.toml"))
+        .assert()
+}
+
+/// The fixture's only diagnostic is the CW107 on the `country_event` line
+/// (line 3): a directive there must drop it from the report, like
+/// `--ignore-code` but scoped to the file.
+#[test]
+fn test_validate_inline_ignore_same_line_suppresses_the_code() {
+    let content = "namespace = test_events\n\ncountry_event = { # cwtools-ignore CW107\n\tid = test.1\n\ttitle = \"Test Event\"\n\tdesc = \"A test event\"\n}\n";
+    validate_inline_mod(content)
+        .success()
+        .stdout(predicate::str::contains("CW107").not())
+        .stdout(predicate::str::contains(
+            "Validation complete: 0 errors, 0 warnings",
+        ));
+}
+
+/// The standalone form, on the line right after the offending one.
+#[test]
+fn test_validate_inline_ignore_next_line_suppresses_the_code() {
+    let content = "namespace = test_events\n\ncountry_event = {\n# cwtools-ignore CW107\n\tid = test.1\n\ttitle = \"Test Event\"\n\tdesc = \"A test event\"\n}\n";
+    validate_inline_mod(content)
+        .success()
+        .stdout(predicate::str::contains("CW107").not());
+}
+
+/// A directive naming a different code leaves the diagnostic alone.
+#[test]
+fn test_validate_inline_ignore_other_code_leaves_the_diagnostic() {
+    let content = "namespace = test_events\n\ncountry_event = { # cwtools-ignore CW100\n\tid = test.1\n\ttitle = \"Test Event\"\n\tdesc = \"A test event\"\n}\n";
+    validate_inline_mod(content)
+        .success()
+        .stdout(predicate::str::contains("CW107"));
+}
+
 #[test]
 fn test_validate_only_code_keeps_just_that_code() {
     let mod_dir = fixtures_dir().join("discover").join("mod_a");

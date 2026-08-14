@@ -83,6 +83,7 @@ fn legacy_diag_hash(root: &Path, file: &str, code: &str, message: &str, line: u3
 pub(crate) struct SourceLines {
     file: String,
     lines: Vec<String>,
+    inline_ignored: cwtools_validation::inline_ignore::InlineIgnoreMap,
 }
 
 impl SourceLines {
@@ -94,10 +95,29 @@ impl SourceLines {
                 .map(|text| text.lines().map(|l| l.trim().to_string()).collect())
                 .unwrap_or_default();
             self.file = file.to_string();
+            // Built from the same trimmed lines the hash path reads, so a
+            // directive costs nothing extra; trimming cannot hide one (it
+            // only strips leading/trailing whitespace around the line).
+            self.inline_ignored.clear();
+            for (i, line) in self.lines.iter().enumerate() {
+                if let Some(codes) = cwtools_validation::inline_ignore::inline_directive_codes(line)
+                {
+                    self.inline_ignored
+                        .insert(i as u32 + 1, codes.into_iter().collect());
+                }
+            }
         }
         line.checked_sub(1)
             .and_then(|i| self.lines.get(i as usize))
             .map_or("", String::as_str)
+    }
+
+    /// Whether a `# cwtools-ignore` directive in `file` suppresses a
+    /// diagnostic with 1-based `line` and `code`. Reuses the same memo the
+    /// trimmed-line lookup maintains, so per file it is one read at most.
+    pub(crate) fn inline_suppressed(&mut self, file: &str, line: u32, code: &str) -> bool {
+        self.trimmed(file, line);
+        cwtools_validation::inline_ignore::inline_suppressed(&self.inline_ignored, line, code)
     }
 }
 

@@ -7,6 +7,7 @@ use tower_lsp::lsp_types::*;
 use cwtools_cache::workspace as workspace_cache;
 use cwtools_parser::parser::parse_string_without_comments;
 use cwtools_rules::rules_types::RuleSet;
+use cwtools_validation::inline_ignore::{InlineIgnoreMap, extract_inline_ignored_codes};
 use cwtools_validation::references::{UsedInstances, check_unused_instances, needs_use_tracking};
 use cwtools_validation::validate_prepared_tracking_uses;
 
@@ -339,9 +340,14 @@ impl Backend {
         // `par_iter().collect()` preserves file order, so `outcomes[i]`
         // corresponds to `scan_files[i]`.
         use rayon::prelude::*;
-        // (cache_hit, parsed, source_hash) per file; None = open doc, parse
-        // failure, or read error.
-        type ParseOutcome = (bool, cwtools_parser::ast::ParsedFile, Option<u64>);
+        // (cache_hit, parsed, source_hash, inline_ignored) per file; None = open
+        // doc, parse failure, or read error.
+        type ParseOutcome = (
+            bool,
+            cwtools_parser::ast::ParsedFile,
+            Option<u64>,
+            InlineIgnoreMap,
+        );
         // block_in_place tells tokio this thread is about to do synchronous
         // blocking I/O; the runtime shifts its remaining tasks to other workers
         // so the LSP request loop is not starved while rayon parses.
@@ -374,17 +380,22 @@ impl Backend {
                             &self.state.string_table,
                         )
                     {
-                        let source_hash = cwtools_file_manager::file_manager::read_text_capped(
-                            &file.path,
-                            crate::access::MAX_URI_READ_BYTES,
-                        )
-                        .ok()
-                        .and_then(|(text, _)| {
-                            (workspace_cache::source_cache_key(&file.path).as_ref()
-                                == Some(&source_key))
-                                .then(|| cwtools_cache::workspace::content_hash(&text))
-                        });
-                        return Some((true, parsed, source_hash));
+                        // The text is read to re-check the metadata key; the
+                        // inline-ignore directives come from that same read.
+                        let (source_hash, inline_ignored) =
+                            match cwtools_file_manager::file_manager::read_text_capped(
+                                &file.path,
+                                crate::access::MAX_URI_READ_BYTES,
+                            ) {
+                                Ok((text, _)) => (
+                                    (workspace_cache::source_cache_key(&file.path).as_ref()
+                                        == Some(&source_key))
+                                    .then(|| cwtools_cache::workspace::content_hash(&text)),
+                                    extract_inline_ignored_codes(&text),
+                                ),
+                                Err(_) => (None, InlineIgnoreMap::new()),
+                            };
+                        return Some((true, parsed, source_hash, inline_ignored));
                     }
                     let source_key = (workspace_cache::PATH_METADATA_CACHE_SUPPORTED)
                         .then(|| workspace_cache::source_cache_key(&file.path))
@@ -429,6 +440,7 @@ impl Backend {
                             true,
                             parsed,
                             Some(cwtools_cache::workspace::content_hash(&text)),
+                            extract_inline_ignored_codes(&text),
                         ));
                     }
                     let parsed = parse_string_without_comments(&text, &self.state.string_table);
@@ -456,6 +468,7 @@ impl Backend {
                         false,
                         parsed,
                         Some(cwtools_cache::workspace::content_hash(&text)),
+                        extract_inline_ignored_codes(&text),
                     ))
                 })
                 .collect()
@@ -469,7 +482,7 @@ impl Backend {
         }
         let wrote_cache = outcomes
             .iter()
-            .any(|outcome| outcome.as_ref().is_some_and(|(hit, _, _)| !hit));
+            .any(|outcome| outcome.as_ref().is_some_and(|(hit, _, _, _)| !hit));
         if wrote_cache && let Some((cache_dir, fingerprint)) = cache_info.as_ref() {
             workspace_cache::prune(cache_dir, *fingerprint);
         }
@@ -478,9 +491,10 @@ impl Backend {
         let mut parsed_files: Vec<Option<cwtools_parser::ast::ParsedFile>> =
             Vec::with_capacity(scan_files.len());
         let mut source_hashes: Vec<Option<u64>> = Vec::with_capacity(scan_files.len());
+        let mut inline_ignores: Vec<InlineIgnoreMap> = Vec::with_capacity(scan_files.len());
         for (i, (file, outcome)) in scan_files.iter().zip(outcomes).enumerate() {
             let parsed = match outcome {
-                Some((cache_hit, parsed, source_hash)) => {
+                Some((cache_hit, parsed, source_hash, inline_ignored)) => {
                     self.index_parsed_file(&file.uri, &parsed, None);
                     if cache_hit {
                         cache_hits += 1;
@@ -488,10 +502,12 @@ impl Backend {
                         cache_misses += 1;
                     }
                     source_hashes.push(source_hash);
+                    inline_ignores.push(inline_ignored);
                     Some(parsed)
                 }
                 None => {
                     source_hashes.push(None);
+                    inline_ignores.push(InlineIgnoreMap::new());
                     None
                 }
             };
@@ -745,13 +761,19 @@ impl Backend {
         } else {
             Vec::new()
         };
-        type ValidationOutcome = (String, Vec<Diagnostic>, Option<UsedInstances>, Option<u64>);
+        type ValidationOutcome = (
+            String,
+            Vec<Diagnostic>,
+            Option<UsedInstances>,
+            Option<u64>,
+            InlineIgnoreMap,
+        );
         // Same sampler/latch pair as pass 1. Pass 2 additionally holds the
         // index and loc read guards for its whole parallel section — it must
         // see one consistent snapshot — which is the other reason progress
         // can't be reported from inside it directly.
         let validate_ticker = start_phase(progress, Phase::Validate, scan_files.len());
-        let results: Vec<(String, Vec<Diagnostic>, Option<u64>)> = {
+        let results: Vec<(String, Vec<Diagnostic>, Option<u64>, InlineIgnoreMap)> = {
             let info_guard = self.state.info_service.read();
             let loc_guard = self.state.loc_index.read();
             let type_index = &info_guard.type_index;
@@ -780,7 +802,8 @@ impl Backend {
                 .par_iter()
                 .zip(parsed_files.par_iter())
                 .zip(source_hashes.par_iter())
-                .filter_map(|((file, parsed_opt), source_hash)| {
+                .zip(inline_ignores.par_iter())
+                .filter_map(|(((file, parsed_opt), source_hash), inline_ignored)| {
                     if cancel.is_cancelled() {
                         return None;
                     }
@@ -809,7 +832,13 @@ impl Backend {
                             None,
                         ),
                     };
-                    Some((file.uri.clone(), diagnostics, used, *source_hash))
+                    Some((
+                        file.uri.clone(),
+                        diagnostics,
+                        used,
+                        *source_hash,
+                        inline_ignored.clone(),
+                    ))
                 })
                 .collect();
 
@@ -850,7 +879,7 @@ impl Backend {
                 let merged = {
                     let mut store = self.state.type_uses.write();
                     store.retain(|uri, _| open_uris.contains(uri));
-                    for (uri, _, used, _) in &mut results {
+                    for (uri, _, used, _, _) in &mut results {
                         store.insert(uri.clone(), used.take().unwrap_or_default());
                     }
                     for (uri, used) in open_uses {
@@ -871,7 +900,7 @@ impl Backend {
                 // Open docs get the same check from the post-scan
                 // `revalidate_all_open_docs`, which reads the store just built.
                 let no_lines = DocLines::none();
-                for (uri, diagnostics, _, _) in &mut results {
+                for (uri, diagnostics, _, _, _) in &mut results {
                     let file: cwtools_validation::FilePath = uri.as_str().into();
                     for err in check_unused_instances(
                         prepared.ruleset,
@@ -887,7 +916,9 @@ impl Backend {
 
             results
                 .into_iter()
-                .map(|(uri, diagnostics, _, source_hash)| (uri, diagnostics, source_hash))
+                .map(|(uri, diagnostics, _, source_hash, inline_ignored)| {
+                    (uri, diagnostics, source_hash, inline_ignored)
+                })
                 .collect()
             // info_guard / loc_guard dropped here, before any await.
         };
@@ -897,7 +928,13 @@ impl Backend {
             return false;
         }
         let publish_total = results.len();
-        for (i, (uri, diagnostics, source_hash)) in results.into_iter().enumerate() {
+        for (i, (uri, mut diagnostics, source_hash, inline_ignored)) in
+            results.into_iter().enumerate()
+        {
+            // Inline `# cwtools-ignore` directives, before the error count and
+            // the publish so both see the same set the editor's Problems panel
+            // gets.
+            crate::validate::drop_inline_suppressed(&mut diagnostics, &inline_ignored);
             total_errors += diagnostics
                 .iter()
                 .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
