@@ -64,20 +64,23 @@ pub(crate) fn has_directive(comments: &[String], key: &str) -> bool {
 /// - After stripping `##` and whitespace, the line must begin with `key`.
 /// - Newest match wins (scan from end).
 ///
-/// Returns the RHS string (trimmed) when found, `None` otherwise.
+/// Returns the RHS string (trimmed, with one balanced pair of surrounding
+/// quotes removed) when found, `None` otherwise, so `## scope = "country"`
+/// reads the same as `## scope = country` (#273).
 pub(crate) fn find_directive<'a>(comments: &'a [String], key: &str) -> Option<&'a str> {
     directive_bodies(comments).find_map(|rest| {
         let after_key = rest.strip_prefix(key)?.trim_start();
         let rhs = after_key.strip_prefix('=')?;
-        Some(rhs.trim())
+        Some(strip_quotes(rhs.trim()))
     })
 }
 
 /// Collect every `## key = value` directive into a map in a single pass.
 ///
-/// `key` is the token before the first `=` (trimmed); `value` is the trimmed RHS.
-/// Forward iteration with overwrite yields newest-match-wins, so for any `key`
-/// `map.get(key)` returns exactly what `find_directive(comments, key)` would.
+/// `key` is the token before the first `=` (trimmed); `value` is the trimmed
+/// RHS, unquoted the same way `find_directive` unquotes it. Forward iteration
+/// with overwrite yields newest-match-wins, so for any `key` `map.get(key)`
+/// returns exactly what `find_directive(comments, key)` would.
 /// `###` documentation lines and plain `#` comments are skipped.
 fn collect_directives(comments: &[String]) -> std::collections::HashMap<&str, &str> {
     let mut map = std::collections::HashMap::new();
@@ -92,7 +95,7 @@ fn collect_directives(comments: &[String]) -> std::collections::HashMap<&str, &s
         let Some((key, rhs)) = rest.split_once('=') else {
             continue;
         };
-        map.insert(key.trim_end(), rhs.trim());
+        map.insert(key.trim_end(), strip_quotes(rhs.trim()));
     }
     map
 }
@@ -233,6 +236,7 @@ pub(crate) fn parse_replace_scopes_from_comments(comments: &[String]) -> Option<
         let Some(value) = tokens.next() else {
             break;
         };
+        let value = strip_quotes(value);
         // Keys are case-insensitive: HOI4 config writes them uppercase
         // (`THIS = state ROOT = state`, operations.cwt) while other rules use
         // lowercase (`this = state`, state-history).
@@ -312,7 +316,7 @@ pub(crate) fn parse_required_scopes(comments: &[String]) -> Vec<String> {
         if rhs.starts_with('{') && rhs.ends_with('}') {
             return rhs[1..rhs.len() - 1]
                 .split_whitespace()
-                .map(|s| s.to_string())
+                .map(|s| strip_quotes(s).to_string())
                 .collect();
         } else if !rhs.is_empty() {
             return vec![rhs.to_string()];
@@ -362,7 +366,7 @@ pub(crate) fn validate_comment_directives(ast: &ParsedFile, path: &Path) -> Vec<
             continue;
         };
         let key = key.trim_end();
-        let rhs = rhs.trim();
+        let rhs = strip_quotes(rhs.trim());
         let message = match key {
             "cardinality" if cardinality_spec_is_malformed(rhs) => {
                 Some(format!("malformed `cardinality` bound `{rhs}`"))
@@ -521,6 +525,85 @@ mod tests {
         assert_eq!(opts.default_bool, None);
     }
 
+    // ── quoted directive values (#273) ────────────────────────────────────────
+
+    #[test]
+    fn find_directive_strips_surrounding_quotes() {
+        assert_eq!(
+            find_directive(&s(&[r#"## cardinality = "0..1""#]), "cardinality"),
+            Some("0..1")
+        );
+    }
+
+    #[test]
+    fn quoted_cardinality_parses_like_unquoted() {
+        let opts = options_from_comments(&s(&[r#"## cardinality = "~0..inf""#]), false);
+        assert_eq!((opts.min, opts.max, opts.strict_min), (0, i32::MAX, false));
+    }
+
+    #[test]
+    fn quoted_severity_parses_like_unquoted() {
+        let opts = options_from_comments(&s(&[r#"## severity = "warning""#]), false);
+        assert_eq!(opts.severity, Some(Severity::Warning));
+    }
+
+    #[test]
+    fn quoted_push_scope_parses_like_unquoted() {
+        let opts = options_from_comments(&s(&[r#"## push_scope = "country""#]), false);
+        assert_eq!(opts.push_scope.as_deref(), Some("country"));
+    }
+
+    #[test]
+    fn quoted_scope_parses_like_unquoted() {
+        assert_eq!(
+            parse_required_scopes(&s(&[r#"## scope = "country""#])),
+            vec!["country"]
+        );
+    }
+
+    #[test]
+    fn quoted_scope_list_is_unquoted_whole_or_per_member() {
+        assert_eq!(
+            parse_required_scopes(&s(&[r#"## scope = "{ country state }""#])),
+            vec!["country", "state"]
+        );
+        assert_eq!(
+            parse_required_scopes(&s(&[r#"## scope = { "country" "state" }"#])),
+            vec!["country", "state"]
+        );
+    }
+
+    #[test]
+    fn quoted_replace_scope_values_are_unquoted() {
+        let comments = s(&[r#"## replace_scope = { THIS = "state" ROOT = "country" }"#]);
+        let rs = parse_replace_scopes_from_comments(&comments).expect("should parse");
+        assert_eq!(rs.this.as_deref(), Some("state"));
+        assert_eq!(rs.root.as_deref(), Some("country"));
+    }
+
+    #[test]
+    fn quoted_replace_scopes_block_is_unquoted() {
+        let comments = s(&[r#"## replace_scopes = "{ THIS = state }""#]);
+        let rs = parse_replace_scopes_from_comments(&comments).expect("should parse");
+        assert_eq!(rs.this.as_deref(), Some("state"));
+    }
+
+    #[test]
+    fn quoted_remaining_options_parse_like_unquoted() {
+        let comments = s(&[
+            r#"## default_bool = "yes""#,
+            r#"## error_if_only_match = "scripted_effect""#,
+            r#"## outgoingReferenceLabel = "triggers""#,
+        ]);
+        let opts = options_from_comments(&comments, false);
+        assert_eq!(opts.default_bool, Some(true));
+        assert_eq!(opts.error_if_only_match.as_deref(), Some("scripted_effect"));
+        assert_eq!(
+            opts.reference_details.as_deref(),
+            Some(&ReferenceDetail::Outgoing("triggers".to_string()))
+        );
+    }
+
     // ── validate_comment_directives (R8) ──────────────────────────────────────
 
     fn parse(src: &str) -> ParsedFile {
@@ -557,6 +640,22 @@ mod tests {
         );
         let errors = validate_comment_directives(&ast, std::path::Path::new("t.cwt"));
         assert!(errors.is_empty(), "got: {:?}", errors);
+    }
+
+    #[test]
+    fn quoted_well_formed_directives_are_not_flagged() {
+        // The readers unquote these (#273), so CW603 must not fire on them.
+        let ast = parse("## cardinality = \"0..inf\"\n## severity = \"warning\"\nfoo = bar\n");
+        let errors = validate_comment_directives(&ast, std::path::Path::new("t.cwt"));
+        assert!(errors.is_empty(), "got: {:?}", errors);
+    }
+
+    #[test]
+    fn quoted_malformed_cardinality_is_still_flagged() {
+        let ast = parse("## cardinality = \"0..n\"\nfoo = bar\n");
+        let errors = validate_comment_directives(&ast, std::path::Path::new("t.cwt"));
+        assert_eq!(errors.len(), 1, "got: {:?}", errors);
+        assert!(errors[0].message.contains("0..n"));
     }
 
     #[test]
