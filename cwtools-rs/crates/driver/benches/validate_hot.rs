@@ -102,6 +102,13 @@ fn bench_validate_hot(c: &mut Criterion) {
         !ast.arena.leaves.is_empty(),
         "validate_hot: {CORPUS_FILE} parsed to no leaves"
     );
+    assert!(
+        ruleset
+            .types
+            .iter()
+            .any(|t| cwtools_index::check_path_dir(&t.path_options, &file_path)),
+        "validate_hot: {CORPUS_FILE} matches no type; the inner loop would not run"
+    );
 
     let type_index = TypeIndex::default();
     let scope_registry = build_scope_registry_arc(&ruleset, Some(Game::Hoi4));
