@@ -323,8 +323,7 @@ impl Session {
             }
         }
         let parse_cache = parse_cache_dir.and_then(|dir| {
-            let fingerprint =
-                workspace_cache::settings_fingerprint(&game.to_string(), &ruleset, &directory);
+            let fingerprint = workspace_cache::settings_fingerprint(&game.to_string(), &directory);
             match workspace_cache::validate_or_clear(&dir, fingerprint) {
                 Ok(_) => Some(ParseCache {
                     dir,

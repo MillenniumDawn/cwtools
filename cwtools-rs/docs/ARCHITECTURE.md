@@ -23,7 +23,7 @@ Then, roughly bottom-up:
 - `parser`: Paradox script text to an arena AST (on `string_table`).
 - `file_manager`: file discovery + parse orchestration (which dirs/files to walk,
   the exclude globs; on `parser`, `string_table`).
-- `cache`: rkyv+zstd on-disk AST cache (`.cwb`) (on `parser`, `string_table`, `rules`).
+- `cache`: rkyv+zstd on-disk AST cache (`.cwb`) (on `parser`, `string_table`).
 - `rules`: `.cwt` rule loading, giving a `RuleSet` of types/aliases/enums and
   scope/link inputs (on `game`, `parser`, `string_table`, `error_codes`, `file_manager`).
 - `localization`: `.yml` loc parsing, `LocService`/`LocIndex`, loc reference and

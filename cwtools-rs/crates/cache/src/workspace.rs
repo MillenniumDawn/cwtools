@@ -2,7 +2,7 @@
 //!
 //! Entries can be keyed by source path, mtime, and size so a hit skips reading
 //! the source file. Content-keyed access remains available for in-memory text.
-//! A `settings.sig` records the game, ruleset shape, and workspace root.
+//! A `settings.sig` records the game, workspace root, and cache format version.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,6 @@ use crate::io::{
     read_errors_from_file, serialize_errors_to_file, serialize_to_file, with_archived_file,
 };
 use cwtools_parser::ast::ParsedFile;
-use cwtools_rules::rules_types::RuleSet;
 use cwtools_string_table::string_table::StringTable;
 
 /// Cache format version. Bump when the `CachedFile` layout changes (or the
@@ -30,7 +29,9 @@ use cwtools_string_table::string_table::StringTable;
 /// semantic-token parsing needs them.
 /// v5: recovered parse errors are persisted with the AST.
 /// v6: Leaf records the exact value range.
-const CACHE_VERSION: u32 = 6;
+/// v7: dropped ruleset shape from the fingerprint. A `.cwt` edit cannot change
+/// how a script file parses, so it must not clear the directory.
+const CACHE_VERSION: u32 = 7;
 
 /// Whether platform metadata provides a reliable no-read change stamp.
 pub const PATH_METADATA_CACHE_SUPPORTED: bool = cfg!(unix);
@@ -99,10 +100,11 @@ pub fn source_cache_key(path: &Path) -> Option<SourceCacheKey> {
     Some(SourceCacheKey { hash })
 }
 
-/// Settings fingerprint: encodes everything that changes the parse or validation
-/// output for a workspace. If the fingerprint differs from `settings.sig`, the
-/// cached workspace directory is stale and must be cleared.
-pub fn settings_fingerprint(language: &str, ruleset: &RuleSet, workspace_root: &Path) -> u64 {
+/// Settings fingerprint: encodes everything that changes how a file parses.
+/// If the fingerprint differs from `settings.sig`, the cached workspace
+/// directory is stale and must be cleared. The ruleset is not part of this:
+/// a `.cwb` entry is a parsed AST, which does not depend on `.cwt` rules.
+pub fn settings_fingerprint(language: &str, workspace_root: &Path) -> u64 {
     // A record separator between fields so concatenation is unambiguous
     // (`a` + `bc` can't collide with `ab` + `c`).
     let mut h = FNV_OFFSET;
@@ -110,43 +112,12 @@ pub fn settings_fingerprint(language: &str, ruleset: &RuleSet, workspace_root: &
     // Game/language — changes scope definitions, keywords, etc.
     h = fnv1a(language.as_bytes(), h);
     h = sep(h);
-    // Workspace root — distinguishes two mods opened in different windows that
-    // happen to share the same ruleset.
+    // Workspace root — distinguishes two mods opened in different windows.
     let workspace_root = fs::canonicalize(workspace_root).unwrap_or_else(|_| {
         std::path::absolute(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf())
     });
     h = fnv1a(workspace_root.to_string_lossy().as_bytes(), h);
     h = sep(h);
-    // Ruleset shape — we can't hash the full RuleSet cheaply (no Hash impl),
-    // so hash the counts and names of its top-level components. This is a
-    // fast approximation; if two rulesets have identical shape they almost
-    // certainly produce identical parse/validation output.
-    h = fnv1a(&ruleset.types.len().to_le_bytes(), h);
-    for t in &ruleset.types {
-        h = fnv1a(t.name.as_bytes(), h);
-        h = sep(h);
-    }
-    h = fnv1a(&ruleset.aliases.len().to_le_bytes(), h);
-    for (name, _) in &ruleset.aliases {
-        h = fnv1a(name.as_bytes(), h);
-        h = sep(h);
-    }
-    h = fnv1a(&ruleset.single_aliases.len().to_le_bytes(), h);
-    for (name, _) in &ruleset.single_aliases {
-        h = fnv1a(name.as_bytes(), h);
-        h = sep(h);
-    }
-    h = fnv1a(&ruleset.enums.len().to_le_bytes(), h);
-    for e in &ruleset.enums {
-        h = fnv1a(e.key.as_bytes(), h);
-        h = sep(h);
-    }
-    h = fnv1a(&ruleset.complex_enums.len().to_le_bytes(), h);
-    h = fnv1a(&ruleset.root_rules.len().to_le_bytes(), h);
-    h = fnv1a(&ruleset.modifiers.len().to_le_bytes(), h);
-    h = fnv1a(&ruleset.modifier_categories.len().to_le_bytes(), h);
-    h = fnv1a(&ruleset.link_inputs.len().to_le_bytes(), h);
-    h = fnv1a(&ruleset.scope_inputs.len().to_le_bytes(), h);
     // Bump version together so a format change also invalidates.
     fnv1a(&CACHE_VERSION.to_le_bytes(), h)
 }
@@ -672,22 +643,18 @@ mod tests {
 
     #[test]
     fn settings_fingerprint_stable_and_sensitive() {
-        let rs = RuleSet::new();
         let root = Path::new("/tmp/ws");
-        let base = settings_fingerprint("hoi4", &rs, root);
+        let base = settings_fingerprint("hoi4", root);
         // Identical inputs -> identical fingerprint.
-        assert_eq!(base, settings_fingerprint("hoi4", &rs, root));
+        assert_eq!(base, settings_fingerprint("hoi4", root));
         // A language/game change must invalidate.
-        assert_ne!(base, settings_fingerprint("stellaris", &rs, root));
+        assert_ne!(base, settings_fingerprint("stellaris", root));
         // A workspace-root change must invalidate.
-        assert_ne!(
-            base,
-            settings_fingerprint("hoi4", &rs, Path::new("/tmp/other"))
-        );
+        assert_ne!(base, settings_fingerprint("hoi4", Path::new("/tmp/other")));
         let absolute = fs::canonicalize(".").unwrap();
         assert_eq!(
-            settings_fingerprint("hoi4", &rs, Path::new(".")),
-            settings_fingerprint("hoi4", &rs, &absolute)
+            settings_fingerprint("hoi4", Path::new(".")),
+            settings_fingerprint("hoi4", &absolute)
         );
     }
 
