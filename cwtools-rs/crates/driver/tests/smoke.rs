@@ -348,11 +348,10 @@ fn vanilla_cache_workspace() -> (
     // is the lowercased `icon.dds`.
     let cache = cwtools_index::vanilla_cache::VanillaCacheData {
         per_type: std::collections::HashMap::new(),
-        loc_keys: Vec::new(),
-        file_paths: vec!["gfx/vanilla/Icon.DDS".to_string()],
-        var_names: Vec::new(),
-        complex_enum_values: Vec::new(),
-        value_set_values: Vec::new(),
+        aux: cwtools_index::vanilla_cache::VanillaCacheAux {
+            file_paths: vec!["gfx/vanilla/Icon.DDS".to_string()],
+            ..Default::default()
+        },
     };
     (tmp, cache)
 }

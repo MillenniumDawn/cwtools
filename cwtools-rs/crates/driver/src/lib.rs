@@ -36,7 +36,7 @@ use cwtools_game::constants::Game;
 use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_index::vanilla_cache::{self, VanillaCacheData};
 use cwtools_index::{
-    TypeIndex, collect_set_variable_names, collect_type_instances_with_subtypes,
+    FileIndex, TypeIndex, collect_set_variable_names, collect_type_instances_with_subtypes,
     index_discovered_files, variable_defining_effects,
 };
 use cwtools_localization::{Lang, LocDiagnostic, LocIndex, LocService};
@@ -542,9 +542,6 @@ impl Session {
             .collect();
 
         let mut type_index = TypeIndex::new();
-        type_index
-            .file_index
-            .set_case_sensitive(case_sensitive_files);
         for (src, (instances, subtype_instances, var_names, value_sets)) in
             parsed.iter().zip(per_file)
         {
@@ -602,24 +599,28 @@ impl Session {
             // sentinel) so cross-file reference resolution keeps the base-game
             // provenance the cache stored.
             type_index.merge_base_game_with_uris(cache.per_type);
-            for n in &cache.var_names {
+            let aux = cache.aux;
+            for n in &aux.var_names {
                 type_index.var_index.add_name(n);
             }
             // File index (mod + cached vanilla paths) for `filepath` checks
             // (CW113), same coverage as a live vanilla walk.
-            type_index.file_index.add_root(&directory);
-            type_index.file_index.add_paths(cache.file_paths);
+            type_index.file_index = build_file_index(
+                &directory,
+                VanillaFiles::Cached(aux.file_paths),
+                case_sensitive_files,
+            );
             // Dynamic values (complex-enum / value_set members) collected from the
             // vanilla walk; without this a cache hit silently drops them.
             type_index.complex_enum_values.merge_file(
                 "<vanilla-cache>",
-                cache.complex_enum_values.into_iter().collect(),
+                aux.complex_enum_values.into_iter().collect(),
             );
             type_index.value_set_values.merge_file(
                 "<vanilla-cache>",
-                cache.value_set_values.into_iter().collect(),
+                aux.value_set_values.into_iter().collect(),
             );
-            cached_loc_keys = Some(cache.loc_keys);
+            cached_loc_keys = Some(aux.loc_keys);
         } else if let Some(vanilla_dir) = &vanilla {
             let vanilla_index = if let Some(parse_cache_dir) = &vanilla_parse_cache_dir
                 && !force_vanilla_rebuild
@@ -663,8 +664,11 @@ impl Session {
             }
             // File index (mod + vanilla) for `filepath` checks (CW113). Only when
             // vanilla is present: mod files commonly reference base-game assets.
-            type_index.file_index.add_root(&directory);
-            type_index.file_index.add_root(vanilla_dir);
+            type_index.file_index = build_file_index(
+                &directory,
+                VanillaFiles::Install(vanilla_dir),
+                case_sensitive_files,
+            );
         }
 
         // Mark the index as complete when vanilla data was loaded (either from a
@@ -1170,6 +1174,39 @@ pub fn default_cache_dir() -> Option<PathBuf> {
         }
     }
     Some(std::env::temp_dir().join("cwtools"))
+}
+
+/// Where the base game's half of the file index comes from: a cache that stored
+/// the paths, or an install to walk.
+pub enum VanillaFiles<'a> {
+    /// Paths restored from a vanilla cache, in their on-disk case.
+    Cached(Vec<String>),
+    /// A base-game install directory.
+    Install(&'a Path),
+}
+
+/// Build the index a `filepath` reference (CW113) resolves against: every file
+/// under the workspace root plus the base game's. Both front ends build it here,
+/// so the editor and the CLI answer the same reference the same way (#283).
+///
+/// Only call this when base-game data is loaded. The check is gated on a
+/// non-empty index, and half an index (a mod without its base game) would flag
+/// every reference into vanilla content.
+pub fn build_file_index(
+    workspace_root: &Path,
+    vanilla: VanillaFiles<'_>,
+    case_sensitive: bool,
+) -> FileIndex {
+    let mut index = FileIndex::new();
+    // Before any path is added: the flag decides whether on-disk case is
+    // recorded as the index is built.
+    index.set_case_sensitive(case_sensitive);
+    index.add_root(workspace_root);
+    match vanilla {
+        VanillaFiles::Cached(paths) => index.add_paths(paths),
+        VanillaFiles::Install(dir) => index.add_root(dir),
+    }
+    index
 }
 
 /// Walk a vanilla install for the cache's aux payload: per-language loc keys

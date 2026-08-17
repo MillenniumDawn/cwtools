@@ -94,6 +94,18 @@ which doesn't fit `Session`'s load-once ownership. Instead the LSP holds its own
 workspace state and builds a `Prepared` from the same shared primitives per
 validation. Same sequence, different ownership.
 
+Both front ends read the same base-game cache, and both have to consume all of
+it. `vanilla_cache::load` returns the type instances plus a `VanillaCacheAux`,
+the very type the writer packs, and the LSP routes that payload in one place
+(`Backend::stage_vanilla_payload`) which destructures it exhaustively. A field
+added to the cache is then a compile error on the side that ignores it, rather
+than a check that quietly answers differently in the editor: CW113 was dead in
+the LSP for as long as it was because the load dropped `file_paths` (#283), and
+`var_names` is still deliberately unrouted there (#306). The file index CW113
+resolves against is built on both sides by `driver::build_file_index`, over the
+workspace root and the base game together, and only when base-game data is
+present. Half an index would flag every reference into vanilla content.
+
 One capability is CLI-only today: `Session` loads the mod's
 `common/inline_scripts` bodies so an `inline_script` call site can be validated
 against what it pulls in (CW274 and the body's own diagnostics). The LSP keeps no

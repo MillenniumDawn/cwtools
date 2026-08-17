@@ -347,15 +347,7 @@ impl Backend {
             if let Some(vc) = opts.get("vanillaCache").and_then(|v| v.as_str()) {
                 match cwtools_info::vanilla_cache::load(std::path::Path::new(vc)) {
                     Ok((game, _fingerprint, data)) => {
-                        let total: usize = data.per_type.values().map(|v| v.len()).sum();
-                        *self.state.vanilla_index.lock() = Some(data.per_type);
-                        if !data.loc_keys.is_empty() {
-                            *self.state.vanilla_loc_keys.lock() = Some(data.loc_keys);
-                        }
-                        self.merge_vanilla_dynamic_values(
-                            data.complex_enum_values,
-                            data.value_set_values,
-                        );
+                        let total = self.stage_vanilla_payload(data);
                         self.client
                             .log_message(
                                 MessageType::INFO,
@@ -1289,6 +1281,7 @@ impl Backend {
         self.state.vanilla_merged.store(false, Ordering::SeqCst);
         *self.state.vanilla_index.lock() = None;
         *self.state.vanilla_loc_keys.lock() = None;
+        *self.state.vanilla_file_paths.lock() = None;
         *self.state.vanilla_loc.lock() = None;
         // ensure_vanilla_index turns the loading bar on but, unlike a full
         // workspace scan, this command never reaches the code that turns
@@ -1297,7 +1290,7 @@ impl Backend {
         let guard = crate::scan::ScanGuard::for_command(self);
         self.ensure_vanilla_index(Some(&progress), true, false)
             .await;
-        self.merge_pending_vanilla_index();
+        tokio::task::block_in_place(|| self.merge_pending_vanilla_index());
         self.rebuild_modifier_keys();
         guard.finish().await;
         // The base-game index is one opaque engine call with no per-file seam,
@@ -1341,6 +1334,7 @@ impl Backend {
         self.state.vanilla_merged.store(false, Ordering::SeqCst);
         *self.state.vanilla_index.lock() = None;
         *self.state.vanilla_loc_keys.lock() = None;
+        *self.state.vanilla_file_paths.lock() = None;
         *self.state.vanilla_loc.lock() = None;
         // A `Busy` scan (e.g. the periodic background pass) started before this
         // purge and may already be past its vanilla-index phase, so it can't be

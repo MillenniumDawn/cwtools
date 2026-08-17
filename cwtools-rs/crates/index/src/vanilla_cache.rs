@@ -123,7 +123,11 @@ struct VanillaCacheFile {
 /// The non-instance half of the cache payload. Built by whoever walks the
 /// install (CLI `cache-vanilla`, the stale-rebuild paths) and stored alongside
 /// the type instances.
-#[derive(Default)]
+///
+/// The same type comes back out of [`load`] (as [`VanillaCacheData::aux`]), so
+/// a field one side packs is a field the other side has to route somewhere: the
+/// editor cannot quietly restore a subset of what the CLI wrote (#283).
+#[derive(Clone, Debug, Default)]
 pub struct VanillaCacheAux {
     /// language name -> lowercased loc keys
     pub loc_keys: Vec<(String, Vec<String>)>,
@@ -144,16 +148,8 @@ pub struct VanillaCacheData {
     /// the driver / `TypeIndex.map` form). Consumers that navigate convert the
     /// path to a `file://` URI when merging into the live index.
     pub per_type: HashMap<String, Vec<(Arc<str>, TypeInstance)>>,
-    /// language name -> lowercased loc keys
-    pub loc_keys: Vec<(String, Vec<String>)>,
-    /// relative paths in original on-disk case (forward slashes)
-    pub file_paths: Vec<String>,
-    /// script-variable names
-    pub var_names: Vec<String>,
-    /// complex-enum members (enum name -> values)
-    pub complex_enum_values: Vec<(String, Vec<String>)>,
-    /// `value_set[...]` members (namespace -> values)
-    pub value_set_values: Vec<(String, Vec<String>)>,
+    /// Everything else the writer packed, in the type it packed it as.
+    pub aux: VanillaCacheAux,
 }
 
 /// A stable fingerprint of a base-game install, used to invalidate the cache
@@ -474,11 +470,13 @@ pub fn load(path: &Path) -> std::io::Result<(String, String, VanillaCacheData)> 
         cache.fingerprint,
         VanillaCacheData {
             per_type,
-            loc_keys: cache.loc_keys,
-            file_paths: cache.file_paths,
-            var_names: cache.var_names,
-            complex_enum_values: cache.complex_enum_values,
-            value_set_values: cache.value_set_values,
+            aux: VanillaCacheAux {
+                loc_keys: cache.loc_keys,
+                file_paths: cache.file_paths,
+                var_names: cache.var_names,
+                complex_enum_values: cache.complex_enum_values,
+                value_set_values: cache.value_set_values,
+            },
         },
     ))
 }
@@ -656,12 +654,12 @@ mod tests {
         };
         assert_eq!(primary_loc_key("GFX_a"), Some("GFX_A_TITLE".to_string()));
         assert_eq!(primary_loc_key("GFX_b"), None);
-        assert_eq!(loaded.loc_keys.len(), 1);
-        assert_eq!(loaded.loc_keys[0].0, "english");
-        assert_eq!(loaded.file_paths, vec!["gfx/interface/icon.dds"]);
-        assert_eq!(loaded.var_names, vec!["my_var"]);
-        assert_eq!(loaded.complex_enum_values[0].0, "equipment_stat");
-        assert_eq!(loaded.value_set_values[0].0, "country_flag");
+        assert_eq!(loaded.aux.loc_keys.len(), 1);
+        assert_eq!(loaded.aux.loc_keys[0].0, "english");
+        assert_eq!(loaded.aux.file_paths, vec!["gfx/interface/icon.dds"]);
+        assert_eq!(loaded.aux.var_names, vec!["my_var"]);
+        assert_eq!(loaded.aux.complex_enum_values[0].0, "equipment_stat");
+        assert_eq!(loaded.aux.value_set_values[0].0, "country_flag");
 
         let mut idx2 = TypeIndex::new();
         idx2.merge_base_game_with_uris(loaded.per_type);
@@ -883,11 +881,11 @@ mod tests {
         let _ = write!(
             out,
             "|A {:?} {:?} {:?} {:?} {:?}",
-            data.loc_keys,
-            data.file_paths,
-            data.var_names,
-            data.complex_enum_values,
-            data.value_set_values
+            data.aux.loc_keys,
+            data.aux.file_paths,
+            data.aux.var_names,
+            data.aux.complex_enum_values,
+            data.aux.value_set_values
         );
         Some(out)
     }
