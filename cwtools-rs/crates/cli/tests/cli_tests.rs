@@ -1603,6 +1603,34 @@ fn test_loc_without_rules_runs_no_command_checks() {
 }
 
 #[test]
+fn test_loc_parenthesised_expression_does_not_report_an_empty_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let loc = tmp.path().join("localisation");
+    std::fs::create_dir_all(&loc).unwrap();
+    std::fs::copy(
+        fixtures_dir().join("loc_parenthesised/cmds_l_english.txt"),
+        loc.join("cmds_l_english.yml"),
+    )
+    .unwrap();
+
+    cwtools()
+        .args([
+            "loc",
+            tmp.path().to_str().unwrap(),
+            "--game",
+            "hoi4",
+            "--rules",
+            loc_rules_dir().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Loc validation complete: 1 entries, 0 issues",
+        ))
+        .stdout(predicate::str::contains("CW226").not());
+}
+
+#[test]
 fn test_loc_with_rules_reports_the_command_checks() {
     cwtools()
         .args([

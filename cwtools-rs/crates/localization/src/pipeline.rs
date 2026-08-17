@@ -547,6 +547,21 @@ mod tests {
     }
 
     #[test]
+    fn parenthesised_jomini_expression_does_not_emit_an_empty_command() {
+        let svc = service_from(&[(
+            "a_l_english.yml",
+            "l_english:\n key1: \"Keep [(Character?.GetName:'CAP_SCIENTIST')]\"\n",
+        )]);
+        let data = LocScopeData {
+            game: Some(cwtools_game::constants::Game::Hoi4),
+            registry: Some(std::sync::Arc::new(ScopeRegistry::default())),
+            ..Default::default()
+        };
+
+        assert!(validate_loc_project_commands(&svc, None, &data).is_empty());
+    }
+
+    #[test]
     fn undefined_ref_maps_to_cw225() {
         let svc = service_from(&[(
             "a_l_english.yml",

@@ -387,7 +387,7 @@ fn validate_jomini_chain(
     terminal_set: &FxHashSet<String>,
     diags: &mut Vec<LocCommandDiagnostic>,
 ) {
-    if chain.is_empty() {
+    if chain.is_empty() || chain.iter().any(|cmd| cmd.key.is_empty()) {
         return;
     }
     let last_idx = chain.len() - 1;
