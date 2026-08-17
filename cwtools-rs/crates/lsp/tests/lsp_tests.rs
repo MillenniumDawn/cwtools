@@ -7355,8 +7355,11 @@ fn test_config_partial_payload_keeps_ignore_lists() {
 
     let quiet = std::time::Duration::from_millis(700);
     let budget = std::time::Duration::from_secs(5);
+    let baseline_log = fetch_profiling_log(&mut child, &rx, 1300);
+    let baseline_scans = baseline_log.matches("workspace_scan_start").count();
 
-    // Establish non-empty ignore lists → one configChange pass.
+    // Establish non-empty ignore lists. Discovery changed, so this needs a full
+    // scan to rebuild both the script and localisation indexes.
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -7371,9 +7374,9 @@ fn test_config_partial_payload_keeps_ignore_lists() {
     drain_after_first(&rx, quiet, budget);
     let log1 = fetch_profiling_log(&mut child, &rx, 1301);
     assert_eq!(
-        count_validate_log(&log1, "configChange"),
-        1,
-        "setting the ignore lists should revalidate once"
+        log1.matches("workspace_scan_start").count(),
+        baseline_scans + 1,
+        "setting the ignore lists should run one full scan"
     );
 
     // Idle-only partial payload → revalidates (idle changed) but must keep
@@ -7390,8 +7393,13 @@ fn test_config_partial_payload_keeps_ignore_lists() {
     let log2 = fetch_profiling_log(&mut child, &rx, 1302);
     assert_eq!(
         count_validate_log(&log2, "configChange"),
-        2,
-        "an idle-only change should still revalidate once (cumulative 2)"
+        1,
+        "an idle-only change should revalidate the open document once"
+    );
+    assert_eq!(
+        log2.matches("workspace_scan_start").count(),
+        baseline_scans + 1,
+        "an idle-only change must not run another full scan"
     );
 
     // Re-send the full payload (plus the now-current idle value). If the
@@ -7414,8 +7422,13 @@ fn test_config_partial_payload_keeps_ignore_lists() {
     child.kill().ok();
     assert_eq!(
         count_validate_log(&log3, "configChange"),
-        2,
-        "the partial payload must not have wiped the ignore lists (no new pass; cumulative stays 2)"
+        1,
+        "the partial payload must not have wiped the ignore lists"
+    );
+    assert_eq!(
+        log3.matches("workspace_scan_start").count(),
+        baseline_scans + 1,
+        "the identical full payload must not run another full scan"
     );
 }
 

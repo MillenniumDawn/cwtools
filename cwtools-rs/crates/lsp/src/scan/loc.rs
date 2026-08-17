@@ -68,17 +68,26 @@ impl Backend {
     /// `rebuild_and_publish_loc` re-reads on every scan. Lets a quiet background
     /// pass detect "nothing loc-related changed" and skip the full rebuild
     /// without reading or parsing a single file. Discovers files via
-    /// `LocService::discover_files` — the exact walk `rebuild_and_publish_loc`
-    /// uses via `LocService::from_folder` — so this can't drift from what it
-    /// actually reads. The base-game install is deliberately absent: it can't
-    /// change while the editor is running and its contribution is memoized by
+    /// `LocService::discover_files_filtered` — the exact filtered walk
+    /// `rebuild_and_publish_loc` uses — so this can't drift from what it reads.
+    /// The base-game install is deliberately absent: it can't change while the
+    /// editor is running and its contribution is memoized by
     /// [`Backend::vanilla_loc`], so stat'ing its ~2000 loc files every pass
     /// would only cost time. Blocking (stats every discovered file); call from
     /// within `block_in_place`.
     pub(crate) fn compute_loc_signature(&self, root_path: &std::path::Path) -> u64 {
-        let files = cwtools_localization::LocService::discover_files(
+        let (ignore_files, ignore_dirs) = {
+            let config = self.state.config.read();
+            (
+                config.ignore_file_patterns.clone(),
+                config.ignore_dir_patterns.clone(),
+            )
+        };
+        let files = cwtools_localization::LocService::discover_files_filtered(
             &[root_path],
             cwtools_file_manager::file_manager::ScanBudget::default(),
+            &ignore_files,
+            &ignore_dirs,
         );
         stat_signature_for(&files)
     }
@@ -91,29 +100,41 @@ impl Backend {
     /// re-parse all of it just to rebuild the same hover text, the same
     /// definition sites and the same keys (#89).
     ///
-    /// Keyed by the inputs that shape the maps — the install dir, the primary
-    /// language and the hover-all-languages toggle — so a session that somehow
-    /// changes one of them rebuilds rather than serving the wrong map.
+    /// Keyed by the inputs that shape the maps: the install dir, selected
+    /// languages, primary language and hover-all-languages toggle.
     ///
     /// `None` when no base-game dir is configured, and also when the configured
     /// one yielded no loc at all (an install on a drive that isn't mounted):
     /// nothing is memoized then, so the next scan tries again, and the caller
     /// keeps falling back to the vanilla cache's keys meanwhile. Blocking; call
     /// from within `block_in_place`.
-    fn vanilla_loc(&self, primary_lang: Lang, hover_all: bool) -> Option<Arc<VanillaLoc>> {
+    fn vanilla_loc(
+        &self,
+        loc_languages: Option<&[Lang]>,
+        primary_lang: Lang,
+        hover_all: bool,
+    ) -> Option<Arc<VanillaLoc>> {
         let Some(dir) = self.state.config.read().vanilla_dir.clone() else {
             *self.state.vanilla_loc.lock() = None;
             return None;
         };
-        let key = (dir, primary_lang, hover_all);
+        let key = (
+            dir,
+            loc_languages.map(<[_]>::to_vec),
+            primary_lang,
+            hover_all,
+        );
         if let Some((cached_key, loc)) = self.state.vanilla_loc.lock().as_ref()
             && *cached_key == key
         {
             return Some(Arc::clone(loc));
         }
-        let service = cwtools_localization::LocService::from_folder(
-            &key.0,
+        let service = cwtools_localization::LocService::from_folders_filtered(
+            &[&key.0],
             cwtools_file_manager::file_manager::ScanBudget::default(),
+            key.1.as_deref(),
+            &[],
+            &[],
         );
         if service.files().is_empty() {
             tracing::warn!(dir = %key.0.display(), "base-game dir holds no localisation files");
@@ -139,7 +160,14 @@ impl Backend {
         // so hover shows translations for keys that exist only there (#51). The
         // vanilla cache's key lists stand in when it isn't. Either way it costs
         // one read per session, not one per scan (#89).
-        let loc_languages = self.state.config.read().loc_languages.clone();
+        let (loc_languages, ignore_files, ignore_dirs) = {
+            let config = self.state.config.read();
+            (
+                config.loc_languages.clone(),
+                config.ignore_file_patterns.clone(),
+                config.ignore_dir_patterns.clone(),
+            )
+        };
 
         // Hover language scope: unless the user opted into all translations, keep
         // only the primary language (first configured loc language, else English)
@@ -152,6 +180,11 @@ impl Backend {
             .as_deref()
             .and_then(|l| l.first().copied())
             .unwrap_or(cwtools_localization::Lang::English);
+        let parsed_languages = if hover_all {
+            None
+        } else {
+            loc_languages.as_deref()
+        };
 
         // Build the index and collect per-file diagnostics in one block, then
         // drop the LocService before the index is published. The service holds
@@ -176,7 +209,7 @@ impl Backend {
             tokio::task::block_in_place(|| {
                 // The base game is read once per session and reused; only the
                 // workspace is walked again (#89).
-                let vanilla = self.vanilla_loc(primary_lang, hover_all);
+                let vanilla = self.vanilla_loc(parsed_languages, primary_lang, hover_all);
                 // The install dir is the source of truth for its own loc: the
                 // memo walked exactly the tree the vanilla cache's key lists
                 // were extracted from, so keeping those around is a second copy
@@ -187,9 +220,12 @@ impl Backend {
                 } else {
                     self.state.vanilla_loc_keys.lock().clone()
                 };
-                let service = cwtools_localization::LocService::from_folder(
-                    root_path,
+                let service = cwtools_localization::LocService::from_folders_filtered(
+                    &[root_path],
                     cwtools_file_manager::file_manager::ScanBudget::default(),
+                    parsed_languages,
+                    &ignore_files,
+                    &ignore_dirs,
                 );
                 let mut idx = cwtools_localization::LocIndex::build_scoped(
                     &service,

@@ -29,9 +29,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cwtools_cache::workspace::{self as workspace_cache, SourceCacheKey};
 use cwtools_file_manager::file_manager::{
     DirectoryType, DiscoveredFile, FileError, FileManager, FileManagerConfig, ScanBudget,
-    classify_directory, ignore_glob_match, to_slash_path,
+    classify_directory,
 };
-use cwtools_file_manager::{FileEncoding, read_text, read_text_with_encoding};
+use cwtools_file_manager::read_text;
 use cwtools_game::constants::Game;
 use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_index::vanilla_cache::{self, VanillaCacheData};
@@ -573,14 +573,27 @@ impl Session {
         // base-game loc keys doesn't false-positive). Only mod-path loc files are
         // reported by the caller. With a vanilla cache, the cached key sets stand
         // in for walking the install's loc files.
-        let mut loc_dirs: Vec<&Path> = vec![directory.as_path()];
+        let mut loc_service = load_loc_service(
+            &[directory.as_path()],
+            loc_languages.as_deref(),
+            ignore_files,
+            ignore_dirs,
+        );
+        let mut loc_index = LocIndex::build_scoped(&loc_service, loc_languages.as_deref());
         if cached_loc_keys.is_none()
             && let Some(v) = &vanilla
         {
-            loc_dirs.push(v.as_path());
+            let vanilla_loc = LocService::from_folders_filtered(
+                &[v],
+                ScanBudget::default(),
+                loc_languages.as_deref(),
+                &[],
+                &[],
+            );
+            let vanilla_index = LocIndex::build_scoped(&vanilla_loc, None);
+            loc_index.merge_from(&vanilla_index, loc_languages.as_deref());
+            loc_service.merge_from(vanilla_loc);
         }
-        let loc_service = load_loc_service(&loc_dirs, loc_languages.as_deref(), &[], &[]);
-        let mut loc_index = LocIndex::build_scoped(&loc_service, loc_languages.as_deref());
         if let Some(keys) = cached_loc_keys {
             // Scoped the same way as the walked files above, so a cache hit and a
             // live walk answer `--loc-language` identically.
@@ -927,119 +940,20 @@ fn parse_errors_to_validation(
         .collect()
 }
 
-/// Load the loc files under `dirs`, materializing only what a scoped run will
-/// use. Without `langs` every language is parsed (the default). With it, a file
-/// whose header declares a language outside the set is dropped before its
-/// entries are built — the base game ships eleven of them, and a scoped run
-/// neither validates nor looks up the rest. A file whose header language can't
-/// be read is always kept, matching how `validate_loc_project_with_union`
-/// scopes its own per-file pass. `ignore_files` and `ignore_dirs` are the user's
-/// discovery globs, matched against the file name and every directory name
-/// below the root the file was found under, or against the root-relative path
-/// when the glob carries a separator (see `loc_path_ignored`).
-///
-/// With none of the three the whole tree loads through the budgeted walk.
+/// Load the loc files under `dirs` with workspace discovery filters applied.
 pub fn load_loc_service(
     dirs: &[&Path],
     langs: Option<&[Lang]>,
     ignore_files: &[String],
     ignore_dirs: &[String],
 ) -> LocService {
-    if langs.is_none() && ignore_files.is_empty() && ignore_dirs.is_empty() {
-        return LocService::from_folders(dirs, ScanBudget::default());
-    }
-    use rayon::prelude::*;
-    let files: Vec<(String, String, Option<FileEncoding>)> =
-        LocService::discover_files(dirs, ScanBudget::default())
-            .into_par_iter()
-            .filter(|path| !loc_path_ignored(path, dirs, ignore_files, ignore_dirs))
-            .filter_map(|path| {
-                // CSV loc (CK2/VIC2) carries every language in one file, keyed by
-                // column, so there is no single header language to filter on.
-                let is_csv = path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("csv"));
-                let path_str = path.to_string_lossy().into_owned();
-                let (text, encoding) = read_text_with_encoding(&path).ok()?;
-                if !is_csv
-                    && let Some(langs) = langs
-                    && let Some(lang) = loc_header_language(&text, &path_str)
-                    && !langs.contains(&lang)
-                {
-                    return None;
-                }
-                Some((path_str, text, Some(encoding)))
-            })
-            .collect();
-    LocService::from_files_with_encoding(files)
-}
-
-/// Whether a discovered loc path is excluded by the user's `--ignore-file` /
-/// `--ignore-dir` globs. A name glob matches a file or directory name at any
-/// depth; one carrying a separator matches a root-relative path. Either way the
-/// path is taken relative to the root it was discovered under first: an
-/// absolute root that happens to contain a `build` component is not the mod's.
-fn loc_path_ignored(
-    path: &Path,
-    roots: &[&Path],
-    file_globs: &[String],
-    dir_globs: &[String],
-) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    let relative = roots
-        .iter()
-        .find_map(|root| path.strip_prefix(root).ok())
-        .unwrap_or(path);
-    let relative = to_slash_path(relative);
-    if file_globs
-        .iter()
-        .any(|pat| ignore_glob_match(pat, name, &relative))
-    {
-        return true;
-    }
-    if dir_globs.is_empty() {
-        return false;
-    }
-    // Every directory on the way down, offered by name and by the path it sits
-    // at, so a name glob still matches at any depth while a path glob anchors.
-    let mut ancestor = String::new();
-    let mut segments = relative.split('/').peekable();
-    while let Some(segment) = segments.next() {
-        if segments.peek().is_none() {
-            break;
-        }
-        if !ancestor.is_empty() {
-            ancestor.push('/');
-        }
-        ancestor.push_str(segment);
-        if dir_globs
-            .iter()
-            .any(|pat| ignore_glob_match(pat, segment, &ancestor))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// The language a loc file declares, without parsing its entries. The header
-/// line is handed to `parse_loc_text` on its own so the header semantics (BOM
-/// stripping, comment skipping, `l_*` lookup) stay defined in exactly one place.
-fn loc_header_language(text: &str, path: &str) -> Option<Lang> {
-    let mut end = 0;
-    for line in text.split_inclusive('\n') {
-        end += line.len();
-        let trimmed = line.trim_start_matches('\u{feff}').trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            break;
-        }
-    }
-    cwtools_localization::parse_loc_text(&text[..end], path)
-        .ok()
-        .and_then(|f| f.lang)
+    LocService::from_folders_filtered(
+        dirs,
+        ScanBudget::default(),
+        langs,
+        ignore_files,
+        ignore_dirs,
+    )
 }
 
 /// Cache file for `game` at `fingerprint` under `dir`. The name comes from the
@@ -1334,97 +1248,6 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// the loc parser accepts, or a scoped run would drop files it should keep.
-    #[test]
-    fn loc_header_language_matches_the_full_parse() {
-        let cases = [
-            "l_english:\n key:0 \"v\"\n",
-            "\u{feff}l_french:\n key:0 \"v\"\n",
-            "\u{feff}\u{feff}l_german:\n key:0 \"v\"\n",
-            " l_spanish:\n key:0 \"v\"\n",
-            "# a comment\n\nl_russian:\n key:0 \"v\"\n",
-            "\u{feff}# a comment\nl_polish:\n key:0 \"v\"\n",
-            "l_english:\n",
-            "l_klingon:\n key:0 \"v\"\n",
-            "no colon on this line\n key:0 \"v\"\n",
-            "# nothing but comments\n",
-            "",
-        ];
-        for text in cases {
-            let full = cwtools_localization::parse_loc_text(text, "f.yml")
-                .ok()
-                .and_then(|f| f.lang);
-            assert_eq!(
-                loc_header_language(text, "f.yml"),
-                full,
-                "header-only read diverged from the full parse on {text:?}"
-            );
-        }
-    }
-
-    /// A directory glob names a directory inside the mod, so it is matched
-    /// against the path below the root: a root that itself sits under `build`
-    /// must not exclude every file in it.
-    #[test]
-    fn loc_ignore_globs_apply_below_the_root() {
-        let root = Path::new("build/mod");
-        let kept = root.join("localisation/greeting_l_english.yml");
-        let staged = root.join("build/localisation/greeting_l_english.yml");
-        let dir_globs = ["build".to_string()];
-
-        assert!(!loc_path_ignored(&kept, &[root], &[], &dir_globs));
-        assert!(loc_path_ignored(&staged, &[root], &[], &dir_globs));
-        assert!(loc_path_ignored(
-            &kept,
-            &[root],
-            &["greeting*".to_string()],
-            &[]
-        ));
-        assert!(!loc_path_ignored(&kept, &[root], &[], &[]));
-    }
-
-    /// #244: loc discovery reads a path glob the same way the script walk does,
-    /// so `**/<name>` (what the client sends for every `errors.ignorefiles`
-    /// entry) drops the file, and an anchored glob drops only its own subtree.
-    #[test]
-    fn loc_ignore_globs_match_a_path() {
-        let root = Path::new("build/mod");
-        let kept = root.join("localisation/greeting_l_english.yml");
-        let staged = root.join("wip/localisation/greeting_l_english.yml");
-
-        assert!(loc_path_ignored(
-            &kept,
-            &[root],
-            &["**/greeting_l_english.yml".to_string()],
-            &[]
-        ));
-        assert!(!loc_path_ignored(
-            &kept,
-            &[root],
-            &["wip/**/*.yml".to_string()],
-            &[]
-        ));
-        assert!(loc_path_ignored(
-            &staged,
-            &[root],
-            &["wip/**/*.yml".to_string()],
-            &[]
-        ));
-        // A directory glob can address a location too.
-        assert!(loc_path_ignored(
-            &staged,
-            &[root],
-            &[],
-            &["wip/localisation".to_string()]
-        ));
-        assert!(!loc_path_ignored(
-            &kept,
-            &[root],
-            &[],
-            &["wip/localisation".to_string()]
-        ));
-    }
 
     #[test]
     fn loaded_parse_keeps_the_fingerprint_it_was_parsed_from() {

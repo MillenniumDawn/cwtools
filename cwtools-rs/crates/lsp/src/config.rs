@@ -1120,6 +1120,8 @@ impl Backend {
             return;
         }
 
+        let ignore_changed = files.as_ref().is_some_and(|files| files != &current_files)
+            || dirs.as_ref().is_some_and(|dirs| dirs != &current_dirs);
         let localisation_changed = localisation_languages
             .as_ref()
             .is_some_and(|languages| languages != &current_loc_languages);
@@ -1160,6 +1162,9 @@ impl Backend {
                 .hover_resolved_scope
                 .store(resolved, Ordering::Relaxed);
         }
+        if ignore_changed {
+            *self.state.loc_discovery_cache.lock() = None;
+        }
         // Bump the quiet-pass fingerprint generation: ignore globs or suppressed
         // codes may have changed, so the next background pass must re-run.
         self.state
@@ -1178,7 +1183,7 @@ impl Backend {
         // text, so they need the same serialized full scan as startup. A scan
         // already in progress may have passed its loc phase; queue one behind
         // it instead of racing a second rebuild.
-        if localisation_changed || hover_all_changed {
+        if ignore_changed || localisation_changed || hover_all_changed {
             if !self.validate_entire_workspace(false).await {
                 self.spawn_deferred_revalidation("didChangeConfiguration");
             }
