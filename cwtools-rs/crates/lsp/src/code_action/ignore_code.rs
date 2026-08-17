@@ -123,6 +123,15 @@ mod tests {
         }
     }
 
+    // `/ws` is not absolute on Windows; Url::from_file_path rejects it.
+    fn abs(tail: &str) -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(format!("C:/{tail}"))
+        } else {
+            std::path::PathBuf::from(format!("/{tail}"))
+        }
+    }
+
     #[test]
     fn new_settings_file_gets_the_section() {
         let updated = updated_settings_json("CW100", None).expect("new file builds");
@@ -188,13 +197,13 @@ mod tests {
 
     #[test]
     fn actions_are_built_per_unique_code() {
-        let root = std::path::Path::new("/ws");
+        let root = abs("ws");
         let diags = vec![
             diagnostic("CW100"),
             diagnostic("CW100"),
             diagnostic("CW246"),
         ];
-        let actions = ignore_code_actions(&diags, &[], Some(root), None);
+        let actions = ignore_code_actions(&diags, &[], Some(&root), None);
         assert_eq!(actions.len(), 2, "one action per distinct code");
         let CodeActionOrCommand::CodeAction(first) = &actions[0] else {
             panic!("expected a CodeAction");
@@ -218,13 +227,14 @@ mod tests {
             code: Some(NumberOrString::Number(100)),
             ..Default::default()
         };
-        let actions = ignore_code_actions(&[numeric], &[], Some(std::path::Path::new("/ws")), None);
+        let root = abs("ws");
+        let actions = ignore_code_actions(&[numeric], &[], Some(&root), None);
         assert!(actions.is_empty(), "numeric codes have no name to ignore");
 
         let already = ignore_code_actions(
             &[diagnostic("CW100")],
             &["cw100".to_string()],
-            Some(std::path::Path::new("/ws")),
+            Some(&root),
             None,
         );
         assert!(already.is_empty(), "already-ignored codes are skipped");

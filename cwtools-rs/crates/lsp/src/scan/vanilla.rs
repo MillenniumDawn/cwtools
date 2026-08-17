@@ -54,11 +54,9 @@ pub(crate) struct VanillaLoc {
     pub(crate) locations: LocLocationMap,
 }
 
-/// What a [`VanillaLoc`] was built for: the install dir, the primary language
-/// and the hover-all-languages toggle. All three come from the initialize
-/// options and never change afterwards, but keying on them keeps the memo
-/// honest if that ever stops being true.
-pub(crate) type VanillaLocKey = (std::path::PathBuf, Lang, bool);
+/// What a [`VanillaLoc`] was built for: the install dir, selected languages,
+/// primary language and hover-all-languages toggle.
+pub(crate) type VanillaLocKey = (std::path::PathBuf, Option<Vec<Lang>>, Lang, bool);
 
 impl VanillaLoc {
     pub(crate) fn build(

@@ -1013,6 +1013,49 @@ fn scoped_loc_load_skips_other_languages() {
 }
 
 #[test]
+fn session_loc_load_filters_the_mod_but_not_vanilla() {
+    let ws = loc_language_workspace();
+    let mod_loc = ws.path().join("mod/localisation");
+    std::fs::write(
+        mod_loc.join("skip_mod_l_english.yml"),
+        "l_english:\n ignored_mod_key:0 \"m\"\n",
+    )
+    .unwrap();
+    let vanilla = ws.path().join("vanilla");
+    let vanilla_loc = vanilla.join("localisation");
+    std::fs::create_dir_all(&vanilla_loc).unwrap();
+    std::fs::write(
+        vanilla_loc.join("skip_vanilla_l_english.yml"),
+        "l_english:\n vanilla_key:0 \"v\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vanilla_loc.join("names.csv"),
+        "key;english;french\nvanilla_csv_key;;Nom\n",
+    )
+    .unwrap();
+    let ignore_files = ["skip_*".to_string()];
+
+    let session = Session::load(SessionConfig {
+        game: Game::Hoi4,
+        rules: RulesInput::Dir(ws.path().join("rules")),
+        directory: ws.path().join("mod"),
+        vanilla: Some(vanilla),
+        vanilla_cache: None,
+        vanilla_cache_auto: None,
+        ignore_files: &ignore_files,
+        ignore_dirs: &[],
+        loc_languages: Some(vec![Lang::English]),
+        case_sensitive_files: false,
+        on_rules_diagnostic: None,
+    });
+
+    assert!(!session.loc_index().exists_any("ignored_mod_key"));
+    assert!(session.loc_index().exists_any("vanilla_key"));
+    assert!(session.loc_index().exists_any("vanilla_csv_key"));
+}
+
+#[test]
 fn scoped_loc_load_still_validates_unrecognised_headers() {
     // A file whose header language can't be read isn't scoped out by the loc
     // validator, so the parse-time filter must not drop it either (CW256).

@@ -384,6 +384,9 @@ pub(crate) struct DocumentState {
     /// files that still have errors, so a repaired one needs an explicit clear or
     /// its squiggle outlives the problem.
     pub(crate) published_rule_uris: parking_lot::Mutex<HashSet<String>>,
+    /// URIs the last localisation rebuild published diagnostics for. A file
+    /// excluded or removed by the next rebuild needs an explicit empty publish.
+    pub(crate) published_loc_uris: parking_lot::Mutex<HashSet<String>>,
     /// Monotonic edit counter, bumped on every `did_change`. A debounced
     /// validation captures the value at spawn time; the cross-file dependent
     /// sweep bails the moment a newer edit lands, so concurrent sweeps collapse
@@ -895,6 +898,7 @@ impl DocumentState {
             deferred_rules_messages: parking_lot::Mutex::new(Vec::new()),
             last_rules_toast: parking_lot::Mutex::new(None),
             published_rule_uris: parking_lot::Mutex::new(HashSet::new()),
+            published_loc_uris: parking_lot::Mutex::new(HashSet::new()),
             edit_generation: AtomicU64::new(0),
             doc_tokens: parking_lot::RwLock::new(HashMap::new()),
             pending_changed_names: Mutex::new(HashSet::new()),

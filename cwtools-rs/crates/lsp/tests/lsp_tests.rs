@@ -7527,8 +7527,11 @@ fn test_config_partial_payload_keeps_ignore_lists() {
 
     let quiet = std::time::Duration::from_millis(700);
     let budget = std::time::Duration::from_secs(5);
+    let baseline_log = fetch_profiling_log(&mut child, &rx, 1300);
+    let baseline_scans = baseline_log.matches("workspace_scan_start").count();
 
-    // Establish non-empty ignore lists → one configChange pass.
+    // Establish non-empty ignore lists. Discovery changed, so this needs a full
+    // scan to rebuild both the script and localisation indexes.
     write_frame(
         &mut child,
         &jsonrpc_notification(
@@ -7543,9 +7546,9 @@ fn test_config_partial_payload_keeps_ignore_lists() {
     drain_after_first(&rx, quiet, budget);
     let log1 = fetch_profiling_log(&mut child, &rx, 1301);
     assert_eq!(
-        count_validate_log(&log1, "configChange"),
-        1,
-        "setting the ignore lists should revalidate once"
+        log1.matches("workspace_scan_start").count(),
+        baseline_scans + 1,
+        "setting the ignore lists should run one full scan"
     );
 
     // Idle-only partial payload → revalidates (idle changed) but must keep
@@ -7562,8 +7565,13 @@ fn test_config_partial_payload_keeps_ignore_lists() {
     let log2 = fetch_profiling_log(&mut child, &rx, 1302);
     assert_eq!(
         count_validate_log(&log2, "configChange"),
-        2,
-        "an idle-only change should still revalidate once (cumulative 2)"
+        1,
+        "an idle-only change should revalidate the open document once"
+    );
+    assert_eq!(
+        log2.matches("workspace_scan_start").count(),
+        baseline_scans + 1,
+        "an idle-only change must not run another full scan"
     );
 
     // Re-send the full payload (plus the now-current idle value). If the
@@ -7586,9 +7594,68 @@ fn test_config_partial_payload_keeps_ignore_lists() {
     child.kill().ok();
     assert_eq!(
         count_validate_log(&log3, "configChange"),
-        2,
-        "the partial payload must not have wiped the ignore lists (no new pass; cumulative stays 2)"
+        1,
+        "the partial payload must not have wiped the ignore lists"
     );
+    assert_eq!(
+        log3.matches("workspace_scan_start").count(),
+        baseline_scans + 1,
+        "the identical full payload must not run another full scan"
+    );
+}
+
+#[test]
+fn test_live_ignore_clears_closed_localisation_diagnostics() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    write_disk_file(ws.path(), "common/decisions/scan.txt", STORM_FILE);
+    let ignored_uri = write_loc_file(
+        ws.path(),
+        "localisation/ignored_l_english.yml",
+        " broken:0 \"unterminated\n",
+    );
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let rx = spawn_frame_collector(reader);
+    reindex_until_scan_starts(&mut child, &rx);
+    recv_frame_until(
+        &rx,
+        std::time::Duration::from_secs(10),
+        "the localisation diagnostic before it is ignored",
+        |_| {},
+        |v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"] == ignored_uri
+                && publish_has_code(v, "CW268")
+        },
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": {
+                "ignoreFilePatterns": ["**/ignored_l_english.yml"],
+            }}),
+        ),
+    )
+    .unwrap();
+    recv_frame_until(
+        &rx,
+        std::time::Duration::from_secs(10),
+        "an empty publish clearing the ignored localisation diagnostic",
+        |_| {},
+        |v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"] == ignored_uri
+                && v["params"]["diagnostics"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+        },
+    );
+    child.kill().ok();
 }
 
 #[test]

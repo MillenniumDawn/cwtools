@@ -95,9 +95,13 @@ impl Backend {
             }
         }
         // Discovered loc files under workspace roots
-        let roots: Vec<std::path::PathBuf> = {
+        let (roots, ignore_files, ignore_dirs): (
+            Vec<std::path::PathBuf>,
+            Vec<String>,
+            Vec<String>,
+        ) = {
             let cfg = self.state.config.read();
-            if !cfg.workspace_roots.is_empty() {
+            let roots = if !cfg.workspace_roots.is_empty() {
                 cfg.workspace_roots.clone()
             } else if let Some(ws) = &cfg.workspace_uri {
                 if let Ok(url) = Url::parse(ws)
@@ -109,14 +113,21 @@ impl Backend {
                 }
             } else {
                 Vec::new()
-            }
+            };
+            (
+                roots,
+                cfg.ignore_file_patterns.clone(),
+                cfg.ignore_dir_patterns.clone(),
+            )
         };
         if !roots.is_empty() {
             let discovered = tokio::task::block_in_place(|| {
                 let refs: Vec<&std::path::Path> = roots.iter().map(|p| p.as_path()).collect();
-                cwtools_localization::LocService::discover_files(
+                cwtools_localization::LocService::discover_files_filtered(
                     &refs,
                     cwtools_file_manager::file_manager::ScanBudget::default(),
+                    &ignore_files,
+                    &ignore_dirs,
                 )
             });
             for path in discovered {

@@ -1897,6 +1897,31 @@ fn config_body() -> String {
 }
 
 #[test]
+fn test_validate_ignore_file_excludes_localisation_diagnostics() {
+    let tmp = config_mod(&config_body());
+    let loc = tmp.path().join("mod/localisation");
+    std::fs::create_dir_all(&loc).unwrap();
+    std::fs::write(
+        loc.join("ignored_l_english.yml"),
+        "\u{feff}l_english:\n broken:0 \"unterminated\n",
+    )
+    .unwrap();
+
+    cwtools()
+        .arg("validate")
+        .current_dir(tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW268"));
+    cwtools()
+        .args(["validate", "--ignore-file", "ignored*"])
+        .current_dir(tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("CW268").not());
+}
+
+#[test]
 fn test_config_supplies_game_directory_and_rules() {
     let tmp = config_mod(&config_body());
     cwtools()

@@ -430,7 +430,7 @@ impl Backend {
         }
         // The roots are read here, per request, so a folder added or removed
         // since the last one is already reflected.
-        let (workspace_root, edit_roots) = {
+        let (workspace_root, edit_roots, ignore_files, ignore_dirs) = {
             let cfg = self.state.config.read();
             let Some(ws_uri) = cfg.workspace_uri.clone() else {
                 return Vec::new();
@@ -441,7 +441,12 @@ impl Backend {
             let Some(root) = crate::access::file_uri_to_path(&ws_uri) else {
                 return Vec::new();
             };
-            (root, cfg.editable_roots.clone())
+            (
+                root,
+                cfg.editable_roots.clone(),
+                cfg.ignore_file_patterns.clone(),
+                cfg.ignore_dir_patterns.clone(),
+            )
         };
         let langs: Vec<Lang> = {
             let cfg = self.state.config.read();
@@ -473,9 +478,11 @@ impl Backend {
                     let discovered_root = workspace_root.clone();
                     let files = tokio::task::spawn_blocking(move || {
                         let roots = [discovered_root.as_path()];
-                        LocService::discover_files(
+                        LocService::discover_files_filtered(
                             &roots,
                             cwtools_file_manager::file_manager::ScanBudget::default(),
+                            &ignore_files,
+                            &ignore_dirs,
                         )
                     })
                     .await
