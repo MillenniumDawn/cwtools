@@ -516,6 +516,7 @@ pub(super) fn validate_math_clause(
 /// ([`enforce_cardinality`]) consumes:
 /// - `leafvalue_counts`: per-rule count of matching `LeafValueRule`s,
 /// - `valueclause_counts`: per-rule count of anonymous `{ ... }` clauses.
+#[tracing::instrument(level = "trace", skip_all)]
 fn count_and_validate_children<'r>(
     ctx: &ValidationCtx,
     children: &[Child],

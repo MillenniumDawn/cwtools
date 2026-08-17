@@ -103,6 +103,7 @@ fn texture_sibling_exists(candidate: &str, file_index: &cwtools_index::FileIndex
     file_index.contains(&sibling)
 }
 
+#[tracing::instrument(level = "trace", skip_all)]
 pub(super) fn validate_leaf(
     ctx: &ValidationCtx,
     leaf: &cwtools_parser::ast::Leaf,
