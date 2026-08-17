@@ -268,7 +268,8 @@ impl FileIndex {
 /// definition collected across the mod + base game), used to check that a
 /// `variable_field` reference resolves (CW246). Names are normalised to a
 /// canonical key so a definition like `morale@ROOT` and a read like
-/// `morale@GER` both resolve to `morale`. Empty unless the CLI populated it.
+/// `morale@GER` both resolve to `morale`. The CLI fills it during the batch
+/// index; the LSP fills it incrementally as files are indexed.
 #[derive(Debug, Default)]
 pub struct VarIndex {
     /// Normalized variable name → how many definitions carry it. A refcount so the
@@ -429,7 +430,8 @@ pub struct TypeIndex {
     /// reference checks (CW113). Empty unless the CLI populated it.
     pub file_index: FileIndex,
     /// Project-wide set of defined variable names, for `variable_field`
-    /// reference checks (CW246). Empty unless the CLI populated it.
+    /// reference checks (CW246). The CLI fills it during the batch index;
+    /// the LSP fills it incrementally via `InfoService`.
     pub var_index: VarIndex,
     /// Whether this index includes vanilla (base-game) definitions. When
     /// `false`, CW500 type-reference checks are skipped to avoid false

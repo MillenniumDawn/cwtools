@@ -13,7 +13,8 @@ Layer 0 (leaves, no cwtools dependencies):
 - `profiling`: tracing subscriber + RSS sampling for the CLI/LSP binaries (see `PROFILING.md`).
 - `error_codes`: the shared `CW###` catalog. Deliberately dependency-free so
   `validation` and `localization` share the same codes without a dependency edge.
-- `string_table`: the process-wide string interner. AST keys are `u32` ids into it.
+- `string_table`: the string interner. `StringTable::new()` builds a fresh sharded
+  table; `Clone` shares that instance only. AST keys are `u32` ids into it.
 - `game`: the `Game` enum plus scope/link data (the `ScopeDef` tables, the scope engine
   with `ScopeId`/`ScopeContext`/transitions, and the config-driven `ScopeRegistry`).
 
@@ -28,7 +29,7 @@ Then, roughly bottom-up:
 - `localization`: `.yml` loc parsing, `LocService`/`LocIndex`, loc reference and
   scope validation (on `error_codes`, `game`, `file_manager`, `parser`).
 - `index`: `TypeIndex`/`VarIndex`/`FileIndex` + value-set/complex-enum collection
-  + the vanilla cache payload (on `parser`, `file_manager`, `string_table`, `rules`, `cache`).
+  plus the vanilla cache payload (on `parser`, `file_manager`, `string_table`, `rules`, `cache`).
 - `validation`: the rule engine and per-game validators; emits `ValidationError`s
   (on `error_codes`, `parser`, `rules`, `string_table`, `game`, `index`, `localization`).
 - `info`: the incremental per-file index (`InfoService`) backing LSP hover, goto,
@@ -232,9 +233,9 @@ text (shown in hover tooltips) and validates that referenced keys actually exist
        |         - exists_any(key): does this key exist in any language?
        |         - missing_synced_languages(key): which languages lack it?
        |
-       |--> loc_text map (HashMap<key, Vec<(Lang, text)>>)
+       |--> loc_text map (FxHashMap<Arc<str>, Vec<(Lang, text)>>)
                  - used by hover to show translations
-                 - rebuilt during workspace scan
+                 - rebuilt on the workspace scan, then patched per loc edit
 ```
 
 ### Current implementation
@@ -247,12 +248,18 @@ All loc data lives in memory:
 - **`LocIndex`**: lowercased key sets per language + a union set. Built from
   `LocService`, then the service is dropped. Answers existence queries for
   config validation.
-- **`loc_text`**: `HashMap<String, Vec<(Lang, String)>>` for hover display.
-  Built from `LocService` before it's dropped. Only rebuilt during the full
-  workspace scan.
+- **`loc_text`**: `FxHashMap<Arc<str>, Vec<(Lang, String)>>` for hover display.
+  Built from `LocService` before it's dropped. Rebuilt on the full workspace
+  scan, then patched on every loc edit. The per-edit merge is lossy when two
+  files share a key: it overwrites that key and the next scan puts the full
+  picture back.
 - **`loc_live_overlay`**: per-open-file key sets for incremental `$ref$`
   checks. Updated on every loc file edit so newly-added keys resolve
   immediately without a full rescan.
+- **`loc_watched_overlay`**: the same key sets for loc files changed on disk
+  that are not open. Unioned with `loc_live_overlay` at the `$ref$` sites.
+  Survives a scan on purpose (the scan's disk reads can predate the watched
+  change).
 
 A SQLite-backed hover-text store was considered (to skip re-parsing unchanged files
 and stream results) but is not planned. The in-memory maps are cheap enough to rebuild.

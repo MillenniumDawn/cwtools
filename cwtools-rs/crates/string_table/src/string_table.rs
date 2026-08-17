@@ -122,8 +122,8 @@ impl Clone for StringTable {
     /// NOTE: this is an *aliasing* clone, not a deep copy. The clone shares the
     /// same underlying shards as the original, so a string interned through one
     /// handle is visible through the other. This is intentional (see the
-    /// `shared_table` test) — cloning a `StringTable` just hands out another
-    /// handle to the one process-wide table.
+    /// `shared_table` test). Cloning a `StringTable` hands out another handle
+    /// to the same instance, not a process-wide singleton.
     fn clone(&self) -> Self {
         Self {
             shards: Arc::clone(&self.shards),
