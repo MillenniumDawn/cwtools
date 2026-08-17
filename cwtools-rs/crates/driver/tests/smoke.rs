@@ -706,6 +706,28 @@ fn load_loc_session(
     )
 }
 
+fn parse_cache_entries(cache_dir: &std::path::Path) -> Vec<(String, std::time::SystemTime)> {
+    let mut entries = Vec::new();
+    let root = cache_dir.join("parse-cache");
+    for workspace in std::fs::read_dir(&root).unwrap().flatten() {
+        let dir_name = workspace.file_name().to_string_lossy().into_owned();
+        for entry in std::fs::read_dir(workspace.path()).unwrap().flatten() {
+            let path = entry.path();
+            let Some(ext) = path.extension() else {
+                continue;
+            };
+            if ext != "cwb" && ext != "cwe" {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let mtime = entry.metadata().unwrap().modified().unwrap();
+            entries.push((format!("{dir_name}/{name}"), mtime));
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
 #[test]
 fn parse_cache_preserves_cold_and_warm_validation_output() {
     let tmp = loc_gate_workspace(None);
@@ -733,6 +755,29 @@ fn parse_cache_preserves_cold_and_warm_validation_output() {
     assert!(cache_entries > 0);
     assert!(uncached.iter().any(|(_, errors)| !errors.is_empty()));
     assert_eq!(uncached, cold);
+    assert_eq!(cold, warm);
+}
+
+#[test]
+fn parse_cache_survives_a_ruleset_only_edit() {
+    let tmp = loc_gate_workspace(None);
+    let cache_dir = tmp.path().join("cache");
+    let cold = load_loc_session(tmp.path(), Some(cache_dir.clone())).validate_all();
+    let before = parse_cache_entries(&cache_dir);
+    assert!(!before.is_empty());
+
+    std::fs::write(
+        tmp.path().join("rules/alias.cwt"),
+        "alias[effect:foo] = scalar\n",
+    )
+    .unwrap();
+
+    let warm = load_loc_session(tmp.path(), Some(cache_dir.clone())).validate_all();
+    let after = parse_cache_entries(&cache_dir);
+    assert_eq!(
+        before, after,
+        "a rules-only edit must reuse the existing parse-cache entries"
+    );
     assert_eq!(cold, warm);
 }
 

@@ -258,8 +258,9 @@ impl Backend {
             .await;
 
         // Resolve the parse-cache directory and settings fingerprint. The
-        // fingerprint encodes the game, ruleset shape, and workspace root so
+        // fingerprint encodes the game, workspace root, and cache format so
         // stale caches are cleared automatically when any of those change.
+        // A rules edit is not one of those: a `.cwb` is a parsed AST.
         let (cache_info, cache_status) = {
             let (cache_dir, language) = {
                 let cfg = self.state.config.read();
@@ -267,17 +268,7 @@ impl Backend {
             };
             match cache_dir {
                 Some(cd) => {
-                    let ruleset_snap = self.state.rules.read().ruleset.clone();
-                    let fp = match ruleset_snap {
-                        Some(ref rs) => {
-                            workspace_cache::settings_fingerprint(&language, rs, &root_path)
-                        }
-                        None => workspace_cache::settings_fingerprint(
-                            &language,
-                            &RuleSet::new(),
-                            &root_path,
-                        ),
-                    };
+                    let fp = workspace_cache::settings_fingerprint(&language, &root_path);
                     match workspace_cache::validate_or_clear(&cd, fp) {
                         Ok(true) => (Some((cd, fp)), "Parse cache: hit (settings match)"),
                         Ok(false) => (Some((cd, fp)), "Parse cache: settings changed, cleared"),
