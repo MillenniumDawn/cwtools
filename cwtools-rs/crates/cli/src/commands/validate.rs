@@ -1,6 +1,9 @@
 //! `validate`: run the whole engine over a mod directory and render a report.
 
-use cwtools_driver::{RulesInput, Session, SessionConfig, VanillaCacheAuto, index_game_dir};
+use cwtools_driver::{
+    RulesInput, Session, SessionConfig, VanillaCacheAuto, index_game_dir,
+    index_game_dir_with_parse_cache,
+};
 use cwtools_game::constants::Game;
 use cwtools_info::vanilla_cache;
 use cwtools_rules::ruleset_loader::RuleParseError;
@@ -172,6 +175,7 @@ pub(super) fn run(args: ValidateArgs) {
         eprintln!("Unknown game: {}. Supported: hoi4, stellaris, eu4, ck2, ck3, vic2, vic3, ir, eu5, custom", game);
         std::process::exit(1);
     });
+    let parse_cache_game = game_id.to_string();
 
     let rules_label = if rules.is_dir() {
         format!("directory {}", rules.display())
@@ -340,7 +344,20 @@ pub(super) fn run(args: ValidateArgs) {
             );
             let rules_table = session.string_table();
             let var_effects = cwtools_info::variable_defining_effects(ruleset);
-            let index = index_game_dir(vanilla_dir, ruleset, rules_table, &var_effects);
+            let index = if no_vanilla_cache {
+                index_game_dir(vanilla_dir, ruleset, rules_table, &var_effects)
+            } else if let Some(cache_dir) = cwtools_driver::default_cache_dir() {
+                index_game_dir_with_parse_cache(
+                    vanilla_dir,
+                    ruleset,
+                    rules_table,
+                    &var_effects,
+                    &cache_dir,
+                    &parse_cache_game,
+                )
+            } else {
+                index_game_dir(vanilla_dir, ruleset, rules_table, &var_effects)
+            };
             let aux = cwtools_driver::build_vanilla_cache_aux(vanilla_dir, &index);
             match vanilla_cache::save(&index, &game, &fp_live, cache_path, aux) {
                 Ok(n) => note(format!("  Rebuilt vanilla cache with {} instances", n)),
