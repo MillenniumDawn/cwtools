@@ -540,6 +540,7 @@ dependencies = [
  "cwtools_game",
  "cwtools_parser",
  "cwtools_string_table",
+ "rayon",
  "rustc-hash",
  "tempfile",
  "tracing",
