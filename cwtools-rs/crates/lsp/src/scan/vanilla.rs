@@ -30,12 +30,24 @@ pub(crate) fn index_vanilla_dir(
     dir: &std::path::Path,
     ruleset: &RuleSet,
     table: &cwtools_string_table::string_table::StringTable,
+    parse_cache_dir: Option<&std::path::Path>,
+    game: &str,
 ) -> (
     HashMap<String, Vec<(Arc<str>, cwtools_info::TypeInstance)>>,
     cwtools_info::vanilla_cache::VanillaCacheAux,
 ) {
     let var_effects = cwtools_info::variable_defining_effects(ruleset);
-    let index = cwtools_driver::index_game_dir(dir, ruleset, table, &var_effects);
+    let index = match parse_cache_dir {
+        Some(cache_dir) => cwtools_driver::index_game_dir_with_parse_cache(
+            dir,
+            ruleset,
+            table,
+            &var_effects,
+            cache_dir,
+            game,
+        ),
+        None => cwtools_driver::index_game_dir(dir, ruleset, table, &var_effects),
+    };
     let aux = cwtools_driver::build_vanilla_cache_aux(dir, &index);
     let per_type = index.map.into_iter().collect();
     (per_type, aux)
@@ -312,11 +324,27 @@ impl Backend {
             .await;
 
         // Indexing parses thousands of files; run it off the async executor.
+        let parse_cache_dir = if force_rebuild {
+            None
+        } else {
+            cache_path
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf)
+        };
         let table = self.state.string_table.clone();
         let index_dir = dir.clone();
-        let join_result =
-            tokio::task::spawn_blocking(move || index_vanilla_dir(&index_dir, &ruleset, &table))
-                .await;
+        let cache_game = game.clone();
+        let join_result = tokio::task::spawn_blocking(move || {
+            index_vanilla_dir(
+                &index_dir,
+                &ruleset,
+                &table,
+                parse_cache_dir.as_deref(),
+                &cache_game,
+            )
+        })
+        .await;
         let (per_type, aux) = match join_result {
             Ok(result) => result,
             Err(e) => {

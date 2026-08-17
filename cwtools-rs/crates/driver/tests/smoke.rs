@@ -861,23 +861,34 @@ fn cache_workspace() -> tempfile::TempDir {
     tmp
 }
 
+fn load_cached_with_parse_cache(
+    workspace: &std::path::Path,
+    refresh: bool,
+    parse_cache_dir: Option<PathBuf>,
+) -> cwtools_driver::SessionWithFiles {
+    Session::load_with_parse_cache(
+        SessionConfig {
+            game: Game::Hoi4,
+            rules: RulesInput::Dir(workspace.join("rules")),
+            directory: workspace.join("mod"),
+            vanilla: Some(workspace.join("vanilla")),
+            vanilla_cache: None,
+            vanilla_cache_auto: Some(VanillaCacheAuto {
+                dir: workspace.join("cache"),
+                refresh,
+            }),
+            ignore_files: &[],
+            ignore_dirs: &[],
+            loc_languages: None,
+            case_sensitive_files: false,
+            on_rules_diagnostic: None,
+        },
+        parse_cache_dir,
+    )
+}
+
 fn load_cached(workspace: &std::path::Path, refresh: bool) -> cwtools_driver::SessionWithFiles {
-    Session::load(SessionConfig {
-        game: Game::Hoi4,
-        rules: RulesInput::Dir(workspace.join("rules")),
-        directory: workspace.join("mod"),
-        vanilla: Some(workspace.join("vanilla")),
-        vanilla_cache: None,
-        vanilla_cache_auto: Some(VanillaCacheAuto {
-            dir: workspace.join("cache"),
-            refresh,
-        }),
-        ignore_files: &[],
-        ignore_dirs: &[],
-        loc_languages: None,
-        case_sensitive_files: false,
-        on_rules_diagnostic: None,
-    })
+    load_cached_with_parse_cache(workspace, refresh, None)
 }
 
 fn cache_files(dir: &std::path::Path) -> Vec<PathBuf> {
@@ -931,15 +942,20 @@ fn vanilla_cache_auto_writes_then_reuses() {
 #[test]
 fn vanilla_cache_auto_refresh_rebuilds_and_overwrites() {
     let ws = cache_workspace();
-    load_cached(ws.path(), false);
+    let parse_cache_dir = ws.path().join("ast-cache");
+    load_cached_with_parse_cache(ws.path(), false, Some(parse_cache_dir.clone()));
+    assert!(
+        !parse_cache_entries(&parse_cache_dir).is_empty(),
+        "the first run should seed the parse cache"
+    );
     blank_the_install(ws.path());
 
-    let refreshed = load_cached(ws.path(), true);
+    let refreshed = load_cached_with_parse_cache(ws.path(), true, Some(parse_cache_dir.clone()));
     assert!(
         !refreshed.type_index().contains("thing", "vanilla_thing"),
         "--refresh must re-index the install, not read the cache"
     );
-    let after = load_cached(ws.path(), false);
+    let after = load_cached_with_parse_cache(ws.path(), false, Some(parse_cache_dir));
     assert!(
         !after.type_index().contains("thing", "vanilla_thing"),
         "--refresh must also overwrite the stale cache it skipped"
@@ -963,6 +979,90 @@ fn vanilla_cache_auto_is_keyed_by_ruleset_shape() {
         cache_files(&ws.path().join("cache")).len(),
         2,
         "each ruleset shape gets its own cache file"
+    );
+}
+
+#[test]
+fn vanilla_cache_miss_reuses_parse_cache_after_rules_change() {
+    let ws = cache_workspace();
+    let parse_cache_dir = ws.path().join("ast-cache");
+    let first = load_cached_with_parse_cache(ws.path(), false, Some(parse_cache_dir.clone()));
+    assert!(first.type_index().contains("thing", "vanilla_thing"));
+
+    let before = parse_cache_entries(&parse_cache_dir);
+    assert_eq!(
+        before
+            .iter()
+            .filter(|(path, _)| path.ends_with(".cwb"))
+            .count(),
+        2,
+        "the mod and vanilla roots should each write one AST entry"
+    );
+
+    std::fs::write(ws.path().join("rules").join("things.cwt"), THING_RULES_V2).unwrap();
+    let rebuilt = load_cached_with_parse_cache(ws.path(), false, Some(parse_cache_dir.clone()));
+    assert!(
+        rebuilt.type_index().contains("thing", "vanilla_thing"),
+        "the rules-shape cache miss must rebuild the vanilla index"
+    );
+    assert_eq!(
+        before,
+        parse_cache_entries(&parse_cache_dir),
+        "the rules-only rebuild must reuse vanilla AST entries"
+    );
+    assert_eq!(
+        cache_files(&ws.path().join("cache")).len(),
+        2,
+        "the rules shape should still produce a new vanilla index cache"
+    );
+}
+
+#[test]
+fn vanilla_parse_cache_reparses_changed_source() {
+    let ws = cache_workspace();
+    let parse_cache_dir = ws.path().join("ast-cache");
+    std::fs::write(
+        ws.path()
+            .join("vanilla")
+            .join("common")
+            .join("things")
+            .join("y.txt"),
+        "other_thing = { }\n",
+    )
+    .unwrap();
+    let first = load_cached_with_parse_cache(ws.path(), false, Some(parse_cache_dir.clone()));
+    assert!(first.type_index().contains("thing", "vanilla_thing"));
+    assert!(first.type_index().contains("thing", "other_thing"));
+
+    std::fs::write(
+        ws.path()
+            .join("vanilla")
+            .join("common")
+            .join("things")
+            .join("x.txt"),
+        "updated_vanilla_thing = { }\n",
+    )
+    .unwrap();
+    std::fs::write(ws.path().join("rules").join("things.cwt"), THING_RULES_V2).unwrap();
+
+    let rebuilt = load_cached_with_parse_cache(ws.path(), false, Some(parse_cache_dir));
+    assert!(
+        !rebuilt.type_index().contains("thing", "vanilla_thing"),
+        "a changed vanilla file must not use its old AST"
+    );
+    assert!(
+        rebuilt
+            .type_index()
+            .contains("thing", "updated_vanilla_thing")
+    );
+    assert!(
+        rebuilt.type_index().contains("thing", "other_thing"),
+        "an unchanged vanilla file must remain indexed"
+    );
+    assert_eq!(
+        cache_files(&ws.path().join("cache")).len(),
+        2,
+        "the rules shape should force a vanilla index-cache rebuild"
     );
 }
 

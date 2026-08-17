@@ -1193,6 +1193,45 @@ fn test_validate_no_vanilla_cache_writes_nothing() {
     );
 }
 
+#[test]
+fn test_validate_no_vanilla_cache_does_not_write_vanilla_parse_entries() {
+    let cache = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    let scripts = vanilla.path().join("common").join("things");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join("x.txt"), "thing = { }\n").unwrap();
+
+    let discover_dir = fixtures_dir().join("discover").join("mod_a");
+    let rules_dir = fixtures_dir().join("rules");
+    cwtools()
+        .env("XDG_CACHE_HOME", cache.path())
+        .args([
+            "validate",
+            "--game",
+            "stellaris",
+            "--directory",
+            discover_dir.to_str().unwrap(),
+            "--rules",
+            rules_dir.to_str().unwrap(),
+            "--vanilla",
+            vanilla.path().to_str().unwrap(),
+            "--no-vanilla-cache",
+        ])
+        .assert()
+        .success();
+
+    let fingerprint = cwtools_cache::workspace::settings_fingerprint("stellaris", vanilla.path());
+    let vanilla_parse_cache = cache
+        .path()
+        .join("cwtools")
+        .join("parse-cache")
+        .join(format!("{fingerprint:016x}"));
+    assert!(
+        !vanilla_parse_cache.exists(),
+        "--no-vanilla-cache must reparse vanilla instead of writing .cwb entries"
+    );
+}
+
 // ── Empty inputs ─────────────────────────────────────────────────────────────
 //
 // A run that validated nothing must not look like a clean run: exit 4 names the

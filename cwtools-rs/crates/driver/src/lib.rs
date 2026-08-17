@@ -29,9 +29,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use cwtools_cache::workspace::{self as workspace_cache, SourceCacheKey};
 use cwtools_file_manager::file_manager::{
     DirectoryType, DiscoveredFile, FileError, FileManager, FileManagerConfig, ScanBudget,
-    classify_directory,
+    ScanBytes, classify_directory,
 };
-use cwtools_file_manager::read_text;
+use cwtools_file_manager::{read_text, read_text_capped};
 use cwtools_game::constants::Game;
 use cwtools_game::scope_registry::ScopeRegistry;
 use cwtools_index::vanilla_cache::{self, VanillaCacheData};
@@ -83,29 +83,91 @@ struct ParseCache {
     wrote: AtomicBool,
 }
 
+struct ParseReadBudget<'a> {
+    max_file_size: u64,
+    max_scan_bytes: u64,
+    bytes: &'a ScanBytes,
+}
+
+#[derive(Clone, Copy)]
+enum ParseCacheUse {
+    Full,
+    Index,
+}
+
+fn open_parse_cache(cache_dir: &Path, game: &str, root: &Path) -> Option<ParseCache> {
+    let fingerprint = workspace_cache::settings_fingerprint(game, root);
+    match workspace_cache::validate_or_clear(cache_dir, fingerprint) {
+        Ok(_) => Some(ParseCache {
+            dir: cache_dir.to_path_buf(),
+            fingerprint,
+            wrote: AtomicBool::new(false),
+        }),
+        Err(error) => {
+            eprintln!(
+                "warn: parse cache unavailable at {}: {}",
+                cache_dir.display(),
+                error
+            );
+            None
+        }
+    }
+}
+
 fn load_or_parse(
     path: &Path,
     table: &StringTable,
     cache: Option<&ParseCache>,
-) -> Result<LoadedParse, FileError> {
-    if let Some(cache) = cache
-        && let Some((parsed, metadata)) =
-            workspace_cache::load_path(&cache.dir, cache.fingerprint, path, table)
-    {
-        return Ok(LoadedParse {
-            parsed,
-            fingerprint: SourceFingerprint {
-                metadata: Some(metadata),
-                content_hash: None,
-            },
-        });
+    cache_use: ParseCacheUse,
+    read_budget: Option<&ParseReadBudget>,
+) -> Result<Option<LoadedParse>, FileError> {
+    if let Some(cache) = cache {
+        let cached = match cache_use {
+            ParseCacheUse::Full => {
+                workspace_cache::load_path(&cache.dir, cache.fingerprint, path, table)
+            }
+            ParseCacheUse::Index => {
+                workspace_cache::load_path_for_index(&cache.dir, cache.fingerprint, path, table)
+            }
+        };
+        if let Some((parsed, metadata)) = cached {
+            return Ok(Some(LoadedParse {
+                parsed,
+                fingerprint: SourceFingerprint {
+                    metadata: Some(metadata),
+                    content_hash: None,
+                },
+            }));
+        }
     }
 
     let metadata = workspace_cache::source_cache_key(path);
-    let text = read_text(path)?;
+    let text = if let Some(read_budget) = read_budget {
+        let (text, bytes) = read_text_capped(path, read_budget.max_file_size)?;
+        if !read_budget
+            .bytes
+            .try_reserve(bytes, read_budget.max_scan_bytes)
+        {
+            eprintln!(
+                "warn: skipping {}: scan byte budget exceeded",
+                path.display()
+            );
+            return Ok(None);
+        }
+        text
+    } else {
+        read_text(path)?
+    };
     let use_content_cache = !workspace_cache::PATH_METADATA_CACHE_SUPPORTED || metadata.is_none();
     let cached = if use_content_cache {
-        cache.and_then(|cache| workspace_cache::load(&cache.dir, cache.fingerprint, &text, table))
+        cache.and_then(|cache| match cache_use {
+            ParseCacheUse::Full => {
+                workspace_cache::load(&cache.dir, cache.fingerprint, &text, table)
+            }
+            ParseCacheUse::Index => {
+                workspace_cache::load_for_index(&cache.dir, cache.fingerprint, &text, table)
+            }
+        })
     } else {
         None
     };
@@ -136,13 +198,13 @@ fn load_or_parse(
             cache.wrote.store(true, Ordering::Relaxed);
         }
     }
-    Ok(LoadedParse {
+    Ok(Some(LoadedParse {
         parsed,
         fingerprint: SourceFingerprint {
             metadata,
             content_hash: use_content_cache.then(|| workspace_cache::content_hash(&text)),
         },
-    })
+    }))
 }
 
 fn parse_discovered_files(
@@ -154,16 +216,63 @@ fn parse_discovered_files(
 
     files
         .into_par_iter()
-        .filter_map(|file| match load_or_parse(&file.path, table, cache) {
-            Ok(loaded) => Some(ParsedFileSource {
-                path: file.path,
-                logical_path: file.logical_path,
-                parsed: loaded.parsed,
-                fingerprint: loaded.fingerprint,
-            }),
-            Err(error) => {
-                eprintln!("warn: skipping {}: {}", file.path.display(), error);
-                None
+        .filter_map(|file| {
+            match load_or_parse(&file.path, table, cache, ParseCacheUse::Full, None) {
+                Ok(Some(loaded)) => Some(ParsedFileSource {
+                    path: file.path,
+                    logical_path: file.logical_path,
+                    parsed: loaded.parsed,
+                    fingerprint: loaded.fingerprint,
+                }),
+                Ok(None) => None,
+                Err(error) => {
+                    eprintln!("warn: skipping {}: {}", file.path.display(), error);
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn parse_discovered_files_for_index(
+    files: Vec<DiscoveredFile>,
+    table: &StringTable,
+    cache: &ParseCache,
+    config: &FileManagerConfig,
+) -> Vec<cwtools_file_manager::file_manager::ParsedFile> {
+    use rayon::prelude::*;
+
+    let bytes = ScanBytes::new();
+    let read_budget = ParseReadBudget {
+        max_file_size: config.max_file_size,
+        max_scan_bytes: config.scan_budget.max_bytes,
+        bytes: &bytes,
+    };
+    files
+        .into_par_iter()
+        .filter_map(|file| {
+            match load_or_parse(
+                &file.path,
+                table,
+                Some(cache),
+                ParseCacheUse::Index,
+                Some(&read_budget),
+            ) {
+                Ok(Some(loaded)) => {
+                    let parsed = loaded.parsed;
+                    Some(cwtools_file_manager::file_manager::ParsedFile {
+                        path: file.path,
+                        logical_path: file.logical_path,
+                        arena: parsed.arena,
+                        root_children: parsed.root_children,
+                        errors: parsed.errors,
+                    })
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    eprintln!("warn: skipping {}: {}", file.path.display(), error);
+                    None
+                }
             }
         })
         .collect()
@@ -322,24 +431,13 @@ impl Session {
                 sink(error);
             }
         }
-        let parse_cache = parse_cache_dir.and_then(|dir| {
-            let fingerprint = workspace_cache::settings_fingerprint(&game.to_string(), &directory);
-            match workspace_cache::validate_or_clear(&dir, fingerprint) {
-                Ok(_) => Some(ParseCache {
-                    dir,
-                    fingerprint,
-                    wrote: AtomicBool::new(false),
-                }),
-                Err(error) => {
-                    eprintln!(
-                        "warn: parse cache unavailable at {}: {}",
-                        dir.display(),
-                        error
-                    );
-                    None
-                }
-            }
-        });
+        let game_id = game.to_string();
+        let parse_cache = parse_cache_dir
+            .as_deref()
+            .and_then(|dir| open_parse_cache(dir, &game_id, &directory));
+        let vanilla_parse_cache_dir = vanilla_cache_auto
+            .as_ref()
+            .and_then(|_| parse_cache.as_ref().map(|cache| cache.dir.clone()));
 
         // Discover + parse mod files using the SAME string table. Layer the
         // user-supplied ignore globs on top of the engine defaults.
@@ -476,8 +574,8 @@ impl Session {
 
         // Auto-managed cache: reuse a fresh one instead of walking the install,
         // and remember where to write one when there's nothing to reuse.
-        let game_id = game.to_string();
         let mut cache_write_target: Option<(PathBuf, String)> = None;
+        let mut force_vanilla_rebuild = false;
         if let (None, Some(auto), Some(vanilla_dir)) =
             (&vanilla_cache, &vanilla_cache_auto, &vanilla)
         {
@@ -488,6 +586,7 @@ impl Session {
             }
             if vanilla_cache.is_none() {
                 cache_write_target = Some((path, fingerprint));
+                force_vanilla_rebuild = auto.refresh;
             }
         }
 
@@ -522,7 +621,20 @@ impl Session {
             );
             cached_loc_keys = Some(cache.loc_keys);
         } else if let Some(vanilla_dir) = &vanilla {
-            let vanilla_index = index_game_dir(vanilla_dir, &ruleset, &rules_table, &var_effects);
+            let vanilla_index = if let Some(parse_cache_dir) = &vanilla_parse_cache_dir
+                && !force_vanilla_rebuild
+            {
+                index_game_dir_with_parse_cache(
+                    vanilla_dir,
+                    &ruleset,
+                    &rules_table,
+                    &var_effects,
+                    parse_cache_dir,
+                    &game_id,
+                )
+            } else {
+                index_game_dir(vanilla_dir, &ruleset, &rules_table, &var_effects)
+            };
             // Persist before the index is consumed below, so the next run can
             // skip this walk entirely.
             if let Some((path, fingerprint)) = &cache_write_target {
@@ -805,8 +917,10 @@ impl SessionWithFiles {
                     &src.path,
                     &self.session.rules_table,
                     self.session.parse_cache.as_ref(),
+                    ParseCacheUse::Full,
+                    None,
                 ) {
-                    Ok(loaded) if loaded.fingerprint == src.fingerprint => loaded.parsed,
+                    Ok(Some(loaded)) if loaded.fingerprint == src.fingerprint => loaded.parsed,
                     Ok(_) => return changed_error(),
                     Err(error) => {
                         return (
@@ -1095,13 +1209,49 @@ pub fn index_game_dir(
     table: &StringTable,
     var_effects: &HashSet<String>,
 ) -> TypeIndex {
+    index_game_dir_with_cache(dir, ruleset, table, var_effects, None)
+}
+
+/// Index a base-game directory through the persistent parsed-AST cache.
+/// Entries are keyed by `dir`, so one install is shared across mod workspaces.
+pub fn index_game_dir_with_parse_cache(
+    dir: &Path,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    var_effects: &HashSet<String>,
+    cache_dir: &Path,
+    game: &str,
+) -> TypeIndex {
+    let cache = open_parse_cache(cache_dir, game, dir);
+    index_game_dir_with_cache(dir, ruleset, table, var_effects, cache.as_ref())
+}
+
+fn index_game_dir_with_cache(
+    dir: &Path,
+    ruleset: &RuleSet,
+    table: &StringTable,
+    var_effects: &HashSet<String>,
+    cache: Option<&ParseCache>,
+) -> TypeIndex {
     let mut config = search_config_for(dir);
     apply_config_folders(&mut config, &ruleset.folders);
     let mut mgr = FileManager::with_string_table(config, table.clone());
-    let files = match mgr.discover_and_parse() {
-        Ok(f) => f,
-        Err(_) => return TypeIndex::new(),
+    let files = if let Some(cache) = cache {
+        match mgr.discover_files() {
+            Ok(files) => parse_discovered_files_for_index(files, table, cache, &mgr.config),
+            Err(_) => return TypeIndex::new(),
+        }
+    } else {
+        match mgr.discover_and_parse() {
+            Ok(files) => files,
+            Err(_) => return TypeIndex::new(),
+        }
     };
+    if let Some(cache) = cache
+        && cache.wrote.swap(false, Ordering::Relaxed)
+    {
+        workspace_cache::prune(&cache.dir, cache.fingerprint);
+    }
     index_discovered_files(
         files,
         ruleset,
@@ -1253,7 +1403,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("source.txt");
         std::fs::write(&path, "a = 1\n").unwrap();
-        let loaded = load_or_parse(&path, &StringTable::new(), None).unwrap();
+        let loaded = load_or_parse(&path, &StringTable::new(), None, ParseCacheUse::Full, None)
+            .unwrap()
+            .expect("uncapped load");
 
         std::fs::write(&path, "a = 200\n").unwrap();
         assert_ne!(

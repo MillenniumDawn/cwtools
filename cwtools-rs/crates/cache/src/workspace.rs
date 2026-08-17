@@ -541,6 +541,7 @@ fn load_hash(
     fingerprint: u64,
     hash: u64,
     table: &StringTable,
+    load_errors: bool,
 ) -> Option<ParsedFile> {
     let dir = workspace_cache_dir(cache_dir, fingerprint);
     let path = file_cache_path(&dir, hash);
@@ -548,7 +549,11 @@ fn load_hash(
         with_archived_file(&path, |archived| archived_to_arena(archived, table))
             .ok()
             .and_then(Result::ok)?;
-    let errors = cached_errors_to_parse(read_errors_from_file(&error_cache_path(&dir, hash)).ok()?);
+    let errors = if load_errors {
+        cached_errors_to_parse(read_errors_from_file(&error_cache_path(&dir, hash)).ok()?)
+    } else {
+        Vec::new()
+    };
     Some(ParsedFile {
         arena,
         root_children,
@@ -578,6 +583,21 @@ fn store_hash(
     }
 }
 
+fn load_path_inner(
+    cache_dir: &Path,
+    fingerprint: u64,
+    source_path: &Path,
+    table: &StringTable,
+    load_errors: bool,
+) -> Option<(ParsedFile, SourceCacheKey)> {
+    if !PATH_METADATA_CACHE_SUPPORTED {
+        return None;
+    }
+    let key = source_cache_key(source_path)?;
+    let parsed = load_hash(cache_dir, fingerprint, key.hash, table, load_errors)?;
+    (source_cache_key(source_path).as_ref() == Some(&key)).then_some((parsed, key))
+}
+
 /// Load a cache entry keyed by the source path, mtime, and size.
 pub fn load_path(
     cache_dir: &Path,
@@ -585,12 +605,17 @@ pub fn load_path(
     source_path: &Path,
     table: &StringTable,
 ) -> Option<(ParsedFile, SourceCacheKey)> {
-    if !PATH_METADATA_CACHE_SUPPORTED {
-        return None;
-    }
-    let key = source_cache_key(source_path)?;
-    let parsed = load_hash(cache_dir, fingerprint, key.hash, table)?;
-    (source_cache_key(source_path).as_ref() == Some(&key)).then_some((parsed, key))
+    load_path_inner(cache_dir, fingerprint, source_path, table, true)
+}
+
+/// Load an indexing-only cache entry without its parse-error sidecar.
+pub fn load_path_for_index(
+    cache_dir: &Path,
+    fingerprint: u64,
+    source_path: &Path,
+    table: &StringTable,
+) -> Option<(ParsedFile, SourceCacheKey)> {
+    load_path_inner(cache_dir, fingerprint, source_path, table, false)
 }
 
 /// Persist an entry only if the source metadata still matches the snapshot
@@ -608,6 +633,22 @@ pub fn store_path(
     }
 }
 
+fn load_inner(
+    cache_dir: &Path,
+    fingerprint: u64,
+    text: &str,
+    table: &StringTable,
+    load_errors: bool,
+) -> Option<ParsedFile> {
+    load_hash(
+        cache_dir,
+        fingerprint,
+        content_hash(text),
+        table,
+        load_errors,
+    )
+}
+
 /// Load a cache entry keyed by the source text.
 pub fn load(
     cache_dir: &Path,
@@ -615,7 +656,17 @@ pub fn load(
     text: &str,
     table: &StringTable,
 ) -> Option<ParsedFile> {
-    load_hash(cache_dir, fingerprint, content_hash(text), table)
+    load_inner(cache_dir, fingerprint, text, table, true)
+}
+
+/// Load an indexing-only cache entry without its parse-error sidecar.
+pub fn load_for_index(
+    cache_dir: &Path,
+    fingerprint: u64,
+    text: &str,
+    table: &StringTable,
+) -> Option<ParsedFile> {
+    load_inner(cache_dir, fingerprint, text, table, false)
 }
 
 /// Persist an entry keyed by the source text.
@@ -782,6 +833,25 @@ mod tests {
         assert!(load(tmp.path(), fp, text, &table).is_none());
     }
 
+    #[test]
+    fn index_load_skips_parse_error_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let table = StringTable::new();
+        let fp = 7;
+        validate_or_clear(tmp.path(), fp).unwrap();
+        let text = "x = 1\n";
+        let mut parsed = parse_string(text, &table);
+        parsed.errors.push(ParseError::Pos(3, 4, "boom".into()));
+        store(tmp.path(), fp, text, &parsed, &table);
+
+        let indexed = load_for_index(tmp.path(), fp, text, &table).expect("expected a cache hit");
+        assert!(indexed.errors.is_empty());
+
+        let dir = workspace_cache_dir(tmp.path(), fp);
+        fs::write(error_cache_path(&dir, content_hash(text)), b"broken").unwrap();
+        assert!(load_for_index(tmp.path(), fp, text, &table).is_some());
+    }
+
     #[cfg(unix)]
     #[test]
     fn path_key_hits_until_source_metadata_changes() {
@@ -857,7 +927,7 @@ mod tests {
 
         fs::write(&source, "a = 200\n").unwrap();
         store_path(tmp.path(), fp, &source, &source_key, &parsed, &table);
-        assert!(load_hash(tmp.path(), fp, source_key.hash, &table).is_none());
+        assert!(load_hash(tmp.path(), fp, source_key.hash, &table, true).is_none());
     }
 
     /// Cold (parse + store) vs warm (deserialize) over the real Millennium Dawn

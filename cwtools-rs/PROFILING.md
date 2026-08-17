@@ -129,11 +129,14 @@ the profile/RSS-summary block. Net effect: ~4-6s shaved off the scan,
 steady-state RSS unchanged.
 
 **3b (on-disk persisted) — shipped.** The LSP and CLI share the parse cache
-under `<cache_dir>/parse-cache/<workspace-fingerprint>/`. Each entry contains
-a self-contained `.cwb` AST and a recovered-parse-error sidecar. Loading interns
-its strings into the current process's `StringTable`.
+under `<cache_dir>/parse-cache/<root-fingerprint>/`, one namespace per
+mod/workspace or base-game install. Each entry contains a self-contained `.cwb`
+AST and a recovered-parse-error sidecar. Loading interns its strings into the
+current process's `StringTable`.
 
 On Unix, disk-file entries use the path, mtime, size, inode, and ctime, so a
 warm hit skips reading the source. Other platforms use a content hash after the
 read. The CLI caches both indexing and validation, but still drops the first
 AST set before localisation indexing to keep the large-workspace memory bound.
+A stale `.cwv` rebuild reuses the base-game install's entries, parsing only its
+new or changed source files.
