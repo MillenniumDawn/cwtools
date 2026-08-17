@@ -2,7 +2,7 @@ use crate::post_process::post_process;
 #[cfg(test)]
 use crate::rules_converter::ast_to_ruleset;
 use crate::rules_converter::{ast_to_ruleset_raw, validate_comment_directives};
-use crate::rules_types::{CwtDefKind, RuleSet};
+use crate::rules_types::{CwtDefKind, CwtDefPosition, RuleSet};
 use cwtools_error_codes::{
     CW600_RULES_FILE_UNREADABLE, CW602_RULES_UNEXPANDED_ALIAS, ErrorCode, ErrorSeverity,
 };
@@ -174,8 +174,82 @@ fn parse_folders_list(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// What one `.cwt` file contributes to the merged ruleset. Each is built
+/// independently so the read/parse/convert fan-out can run in parallel; the
+/// merge folds them back in walk order.
+struct FileRules {
+    ruleset: RuleSet,
+    ref_candidates: Vec<crate::config_validation::RefCandidate>,
+    def_positions: Vec<CwtDefPosition>,
+    errors: Vec<RuleParseError>,
+}
+
+/// Read, parse and convert one `.cwt` file. Touches no shared state but the
+/// string table and the scan's byte counter, both of which are built for it.
+fn load_cwt_file(
+    path: &Path,
+    table: &StringTable,
+    budget: ScanBudget,
+    bytes: &ScanBytes,
+) -> FileRules {
+    let mut out = FileRules {
+        ruleset: RuleSet::new(),
+        ref_candidates: Vec::new(),
+        def_positions: Vec::new(),
+        errors: Vec::new(),
+    };
+    let unreadable = |message: String| {
+        RuleParseError::new(
+            &CW600_RULES_FILE_UNREADABLE,
+            path.to_path_buf(),
+            1,
+            0,
+            message,
+        )
+    };
+    match read_text_capped(path, budget.max_file_size) {
+        Ok((content, n)) => {
+            if !bytes.try_reserve(n, budget.max_bytes) {
+                out.errors
+                    .push(unreadable("scan byte budget exceeded".to_string()));
+                return out;
+            }
+            if path
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("folders.cwt"))
+            {
+                out.ruleset.folders = parse_folders_list(&content);
+            } else {
+                let parsed = parse_string(&content, table);
+                out.errors
+                    .extend(validate_comment_directives(&parsed, path));
+                out.ruleset = ast_to_ruleset_raw(&parsed, table);
+                crate::config_validation::collect_reference_candidates(
+                    path,
+                    &parsed,
+                    table,
+                    &mut out.ref_candidates,
+                );
+                crate::config_validation::collect_definition_positions(
+                    path,
+                    &parsed,
+                    table,
+                    &mut out.def_positions,
+                );
+            }
+        }
+        Err(e) => out.errors.push(unreadable(format!("read error: {}", e))),
+    }
+    out
+}
+
 /// Walk `dir` for `*.cwt` files, parse each with `table`, convert via
 /// `ast_to_ruleset`, and merge all results into one `RuleSet`.
+///
+/// Files are read and converted in parallel and merged in walk order, so the
+/// result is what loading them one at a time produces. The one thing that does
+/// move is which files a spent `max_bytes` refuses, since the reservations no
+/// longer land in walk order.
 ///
 /// Returns `(ruleset, errors)`. Errors are non-fatal: a file that fails to read
 /// is skipped and its message collected.
@@ -184,66 +258,30 @@ pub fn load_ruleset_from_dir(
     table: &StringTable,
     budget: ScanBudget,
 ) -> (RuleSet, Vec<RuleParseError>) {
+    use rayon::prelude::*;
+
     let mut cwt_files = Vec::new();
     let mut errors = Vec::new();
     let mut remaining = budget.max_files;
     collect_cwt_files(dir, &mut cwt_files, &mut errors, &mut remaining);
 
+    let bytes = ScanBytes::new();
+    let per_file: Vec<FileRules> = cwt_files
+        .par_iter()
+        .map(|path| load_cwt_file(path, table, budget, &bytes))
+        .collect();
+
     let mut combined = RuleSet::new();
     // Lightweight reference candidates collected from each AST while it is alive.
     // The AST itself is dropped as soon as it is converted; only these positioned
     // (kind, name) records are retained for the post-merge resolution pass, so we
-    // no longer pin every parsed `.cwt` file simultaneously.
+    // never pin more parsed `.cwt` files than there are threads.
     let mut ref_candidates: Vec<crate::config_validation::RefCandidate> = Vec::new();
-    let bytes = ScanBytes::new();
-
-    for path in &cwt_files {
-        match read_text_capped(path, budget.max_file_size) {
-            Ok((content, n)) => {
-                if !bytes.try_reserve(n, budget.max_bytes) {
-                    errors.push(RuleParseError::new(
-                        &CW600_RULES_FILE_UNREADABLE,
-                        path.clone(),
-                        1,
-                        0,
-                        "scan byte budget exceeded".to_string(),
-                    ));
-                    continue;
-                }
-                if path
-                    .file_name()
-                    .is_some_and(|n| n.eq_ignore_ascii_case("folders.cwt"))
-                {
-                    combined.folders.extend(parse_folders_list(&content));
-                } else {
-                    let parsed = parse_string(&content, table);
-                    errors.extend(validate_comment_directives(&parsed, path));
-                    let ruleset = ast_to_ruleset_raw(&parsed, table);
-                    merge_ruleset(&mut combined, ruleset);
-                    crate::config_validation::collect_reference_candidates(
-                        path,
-                        &parsed,
-                        table,
-                        &mut ref_candidates,
-                    );
-                    crate::config_validation::collect_definition_positions(
-                        path,
-                        &parsed,
-                        table,
-                        &mut combined.def_positions,
-                    );
-                }
-            }
-            Err(e) => {
-                errors.push(RuleParseError::new(
-                    &CW600_RULES_FILE_UNREADABLE,
-                    path.clone(),
-                    1,
-                    0,
-                    format!("read error: {}", e),
-                ));
-            }
-        }
+    for file in per_file {
+        errors.extend(file.errors);
+        merge_ruleset(&mut combined, file.ruleset);
+        ref_candidates.extend(file.ref_candidates);
+        combined.def_positions.extend(file.def_positions);
     }
 
     // Run the post-processing pipeline once all files have been merged so that

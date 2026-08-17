@@ -1,4 +1,9 @@
-//! Editor hot paths over a real ruleset: the work a keystroke triggers.
+//! Editor hot paths over a real ruleset: the work a keystroke triggers, plus
+//! the one-off load that has to finish before any of them can run.
+//!
+//! `ruleset/load_from_dir` is that load: walk the `.cwt` directory, parse and
+//! convert every file, expand single_aliases, reindex. Every CLI run and every
+//! editor startup waits on it before anything else can begin.
 //!
 //! The rule-resolution cases use the full HOI4 `.cwt` set, where the rule trees
 //! are big enough for a deep clone to show up:
@@ -134,7 +139,7 @@ fn bench_rules_hot(c: &mut Criterion) {
         return;
     };
     let table = StringTable::new();
-    let (ruleset, rule_errors) = match load_rules(&RulesInput::Dir(dir), &table) {
+    let (ruleset, rule_errors) = match load_rules(&RulesInput::Dir(dir.clone()), &table) {
         Ok(loaded) => loaded,
         Err(e) => {
             eprintln!("rules_hot: could not load rules: {e}");
@@ -186,6 +191,18 @@ fn bench_rules_hot(c: &mut Criterion) {
         !ctx.child_rules.is_empty(),
         "cursor should land in a block with rules"
     );
+
+    // Each iteration re-reads the whole `.cwt` directory from the page cache and
+    // interns into a fresh table, so it measures the load a cold CLI run and an
+    // LSP startup both pay.
+    c.bench_function("ruleset/load_from_dir", |b| {
+        b.iter(|| {
+            black_box(load_rules(
+                &RulesInput::Dir(dir.clone()),
+                &StringTable::new(),
+            ))
+        })
+    });
 
     c.bench_function("rules_at_pos/completion", |b| {
         b.iter(|| {
