@@ -636,12 +636,24 @@ mod tests {
         assert_eq!(a.len(), 1);
 
         let b = StringTable::new();
-        assert_eq!(b.len(), 0);
+        assert!(b.is_empty());
         assert_eq!(b.get_string(token.normal), None);
 
         b.intern("only_in_b");
         assert_eq!(a.len(), 1);
         assert_eq!(b.len(), 1);
+        assert_eq!(a.get_string(token.normal).as_deref(), Some("only_in_a"));
+    }
+
+    #[test]
+    fn cloned_handle_does_not_leak_into_a_fresh_table() {
+        let a = StringTable::new();
+        let shared = a.clone();
+        shared.intern("via_clone");
+        assert_eq!(a.len(), 1);
+
+        let fresh = StringTable::new();
+        assert!(fresh.is_empty());
     }
 
     #[test]

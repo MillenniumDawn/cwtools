@@ -1214,12 +1214,11 @@ alias[effect:set_temp_variable] = {
 
     #[test]
     fn value_set_var_cleared_on_file_clear() {
-        // Manually inject a non-@-var into a file's defined_variables and confirm
-        // that clear_file removes it from variable_counts (the 2.7 inversion fix).
+        // Injected @-namespace entry: clear_file must drop variable_counts and
+        // must not touch var_index (the CW246 path skips `@`).
         let mut svc = InfoService::new();
         let uri = "file://test.txt";
 
-        // Simulate a file with a value_set variable "my_var" (no @ prefix).
         let mut file_info = FileInfo::default();
         file_info.defined_variables.insert(
             "my_var".to_string(),
@@ -1229,7 +1228,6 @@ alias[effect:set_temp_variable] = {
                 end: (1, 0),
             },
         );
-        // Populate defined_variables_ns so that clear_file's refcount path fires.
         file_info.defined_variables_ns.insert(
             "@".to_string(),
             vec![cwtools_index::DefinedVariable {
@@ -1244,25 +1242,25 @@ alias[effect:set_temp_variable] = {
             }],
         );
         svc.files.insert(uri.to_string(), file_info);
-        // Mirror the refcount that index_file_with_path would have set; the key's
-        // presence in variable_counts is the membership signal.
         svc.variable_counts.insert("my_var".to_string(), 1);
+        svc.type_index.var_index.add_name("unrelated");
 
-        // Before clear: variable must be present.
         assert!(svc.variable_counts.contains_key("my_var"));
+        assert!(svc.type_index.var_index.contains("unrelated"));
+        assert!(!svc.type_index.var_index.contains("my_var"));
 
-        // Clear the file: variable must be removed.
         svc.clear_file(uri);
         assert!(
             !svc.variable_counts.contains_key("my_var"),
             "my_var should be gone after clear_file"
         );
+        assert!(
+            svc.type_index.var_index.contains("unrelated"),
+            "@-namespace clear must not strip an unrelated var_index name"
+        );
     }
 
-    #[test]
-    fn var_index_tracks_set_variable_across_index_and_clear() {
-        use cwtools_rules::rules_converter::ast_to_ruleset;
-        const RULES: &str = r#"
+    const SET_VARIABLE_RULES: &str = r#"
 types = { type[foo] = { path = "game/common/foo" } }
 foo = { alias_name[effect] = alias_match_left[effect] }
 alias[effect:set_variable] = {
@@ -1270,22 +1268,36 @@ alias[effect:set_variable] = {
     value = int_variable_field
 }
 "#;
-        let table = StringTable::new();
-        let ruleset = ast_to_ruleset(&parse_string(RULES, &table), &table);
-        let effects = variable_defining_effects(&ruleset);
 
-        let mut svc = InfoService::new();
-        svc.update_ruleset_data(effects);
+    fn set_variable_ruleset(table: &StringTable) -> RuleSet {
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        ast_to_ruleset(&parse_string(SET_VARIABLE_RULES, table), table)
+    }
+
+    fn index_set_variable(
+        svc: &mut InfoService,
+        uri: &str,
+        var: &str,
+        table: &StringTable,
+        ruleset: &RuleSet,
+    ) {
+        let script = format!("foo = {{ set_variable = {{ var = {var} value = 3 }} }}");
         svc.index_file_with_path(
-            "f.txt",
-            &parse_string(
-                "foo = { set_variable = { var = my_explicit value = 3 } }",
-                &table,
-            ),
-            &table,
-            &ruleset,
+            uri,
+            &parse_string(&script, table),
+            table,
+            ruleset,
             "game/common/foo/f.txt",
         );
+    }
+
+    #[test]
+    fn var_index_tracks_set_variable_across_index_and_clear() {
+        let table = StringTable::new();
+        let ruleset = set_variable_ruleset(&table);
+        let mut svc = InfoService::new();
+        svc.update_ruleset_data(variable_defining_effects(&ruleset));
+        index_set_variable(&mut svc, "f.txt", "my_explicit", &table, &ruleset);
         assert!(
             svc.type_index.var_index.contains("my_explicit"),
             "LSP index path must populate var_index"
@@ -1295,6 +1307,80 @@ alias[effect:set_variable] = {
         assert!(
             !svc.type_index.var_index.contains("my_explicit"),
             "clear_file must drop the name from var_index"
+        );
+    }
+
+    #[test]
+    fn var_index_contains_is_case_insensitive() {
+        let table = StringTable::new();
+        let ruleset = set_variable_ruleset(&table);
+        let mut svc = InfoService::new();
+        svc.update_ruleset_data(variable_defining_effects(&ruleset));
+        index_set_variable(&mut svc, "f.txt", "My_Explicit", &table, &ruleset);
+        assert!(svc.type_index.var_index.contains("my_explicit"));
+        assert!(svc.type_index.var_index.contains("MY_EXPLICIT"));
+    }
+
+    #[test]
+    fn var_index_ignores_at_vars() {
+        let table = StringTable::new();
+        let ruleset = set_variable_ruleset(&table);
+        let mut svc = InfoService::new();
+        svc.update_ruleset_data(variable_defining_effects(&ruleset));
+        svc.index_file_with_path(
+            "f.txt",
+            &parse_string(
+                "@my_at = 5\nfoo = { set_variable = { var = real_var value = 1 } }",
+                &table,
+            ),
+            &table,
+            &ruleset,
+            "game/common/foo/f.txt",
+        );
+        assert!(svc.type_index.var_index.contains("real_var"));
+        assert!(!svc.type_index.var_index.contains("@my_at"));
+        assert!(!svc.type_index.var_index.contains("my_at"));
+    }
+
+    #[test]
+    fn var_index_refcount_keeps_a_name_defined_in_another_file() {
+        let table = StringTable::new();
+        let ruleset = set_variable_ruleset(&table);
+        let mut svc = InfoService::new();
+        svc.update_ruleset_data(variable_defining_effects(&ruleset));
+        index_set_variable(&mut svc, "a.txt", "shared_var", &table, &ruleset);
+        index_set_variable(&mut svc, "b.txt", "shared_var", &table, &ruleset);
+        svc.clear_file("a.txt");
+        assert!(
+            svc.type_index.var_index.contains("shared_var"),
+            "clearing one file must keep a name still defined in another"
+        );
+        svc.clear_file("b.txt");
+        assert!(!svc.type_index.var_index.contains("shared_var"));
+    }
+
+    #[test]
+    fn var_index_reindex_replaces_a_files_names() {
+        let table = StringTable::new();
+        let ruleset = set_variable_ruleset(&table);
+        let mut svc = InfoService::new();
+        svc.update_ruleset_data(variable_defining_effects(&ruleset));
+        index_set_variable(&mut svc, "f.txt", "old_var", &table, &ruleset);
+        svc.clear_file("f.txt");
+        index_set_variable(&mut svc, "f.txt", "new_var", &table, &ruleset);
+        assert!(!svc.type_index.var_index.contains("old_var"));
+        assert!(svc.type_index.var_index.contains("new_var"));
+    }
+
+    #[test]
+    fn var_index_stays_empty_until_var_effects_are_set() {
+        let table = StringTable::new();
+        let ruleset = set_variable_ruleset(&table);
+        let mut svc = InfoService::new();
+        index_set_variable(&mut svc, "f.txt", "my_explicit", &table, &ruleset);
+        assert!(
+            !svc.type_index.var_index.contains("my_explicit"),
+            "set_variable names are not collected before update_ruleset_data"
         );
     }
 
