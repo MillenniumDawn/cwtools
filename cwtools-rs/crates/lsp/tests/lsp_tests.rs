@@ -2353,6 +2353,178 @@ fn test_hover_shows_localisation() {
 }
 
 #[test]
+fn test_loc_edit_updates_hover_without_a_rescan() {
+    // #53 / #292: loc_text is patched on a loc didChange. A revert that only
+    // rebuilt it on the workspace scan would keep serving the old hover.
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("test_rules.cwt"), DYNAMIC_RULES).unwrap();
+    std::fs::write(
+        rules_dir.path().join("scopes.cwt"),
+        "scopes = { country = { } state = { } }\n",
+    )
+    .unwrap();
+
+    let loc_dir = ws.path().join("localisation");
+    std::fs::create_dir_all(&loc_dir).unwrap();
+    let loc_rel = "localisation/test_l_english.yml";
+    let loc_old = "l_english:\n my_idea:0 \"Old Name\"\n other_idea:0 \"Other Text\"\n";
+    let loc_new = "l_english:\n my_idea:0 \"New Name\"\n other_idea:0 \"Other Text\"\n";
+    let mut loc_bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    loc_bytes.extend_from_slice(loc_old.as_bytes());
+    std::fs::write(loc_dir.join("test_l_english.yml"), &loc_bytes).unwrap();
+
+    let script_rel = "common/countries/test.txt";
+    let script_text = "my_country = {\n    name = my_idea\n    title = other_idea\n}\n";
+    let script_path = ws.path().join(script_rel);
+    std::fs::create_dir_all(script_path.parent().unwrap()).unwrap();
+    std::fs::write(&script_path, script_text).unwrap();
+
+    let trigger = ws.path().join("common/_scan_trigger.txt");
+    std::fs::write(&trigger, "# scan trigger\n").unwrap();
+
+    let mut child = cwtools_server_cmd()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    write_frame(
+        &mut child,
+        &jsonrpc_request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": path_uri(ws.path()),
+                "capabilities": {},
+                "initializationOptions": {
+                    "language": "hoi4",
+                    "rulesCache": rules_dir.path().to_string_lossy(),
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = read_response(&mut reader).expect("no init response");
+    write_frame(
+        &mut child,
+        &jsonrpc_notification("initialized", serde_json::json!({})),
+    )
+    .unwrap();
+    wait_for_scan_done(&mut reader);
+
+    let script_uri = path_uri(&script_path);
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": script_uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": script_text,
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, script_rel);
+
+    let hover_at = |child: &mut std::process::Child,
+                    reader: &mut BufReader<std::process::ChildStdout>,
+                    line: u32,
+                    character: u32,
+                    expect: &str,
+                    id0: i64|
+     -> String {
+        let mut last = String::new();
+        for attempt in 0..120 {
+            write_frame(
+                child,
+                &jsonrpc_request(
+                    id0 + attempt,
+                    "textDocument/hover",
+                    serde_json::json!({
+                        "textDocument": { "uri": script_uri },
+                        "position": { "line": line, "character": character },
+                    }),
+                ),
+            )
+            .unwrap();
+            let resp: serde_json::Value =
+                serde_json::from_str(&read_response(reader).expect("no hover response")).unwrap();
+            last = resp["result"]["contents"]["value"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if last.contains(expect) {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        last
+    };
+
+    let before = hover_at(&mut child, &mut reader, 1, 14, "Old Name", 100);
+    assert!(
+        before.contains("Old Name"),
+        "scan-built loc_text must show the on-disk loc, got: {before}"
+    );
+
+    let loc_uri = path_uri(ws.path().join(loc_rel));
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": loc_uri,
+                    "languageId": "hoi4",
+                    "version": 1,
+                    "text": loc_old,
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    wait_for_diagnostics(&mut reader, loc_rel);
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": loc_uri, "version": 2 },
+                "contentChanges": [{ "text": loc_new }],
+            }),
+        ),
+    )
+    .unwrap();
+    let _ = diags_for(&mut reader, loc_rel, 1);
+
+    let after = hover_at(&mut child, &mut reader, 1, 14, "New Name", 300);
+    assert!(
+        after.contains("New Name"),
+        "a loc didChange must patch hover without a rescan, got: {after}"
+    );
+    assert!(
+        !after.contains("Old Name"),
+        "the pre-edit loc text must not linger after the patch, got: {after}"
+    );
+
+    let neighbour = hover_at(&mut child, &mut reader, 2, 16, "Other Text", 500);
+    child.kill().ok();
+    assert!(
+        neighbour.contains("Other Text"),
+        "editing one key must leave an untouched key's hover alone, got: {neighbour}"
+    );
+}
+
+#[test]
 fn test_hover_idea_definition_shows_name_and_desc() {
     // A definition key: the idea token IS the loc key, with `<key>_desc` for the
     // description. Hover the key itself (not a value reference).
