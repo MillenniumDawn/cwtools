@@ -630,6 +630,21 @@ mod tests {
     }
 
     #[test]
+    fn independent_tables_do_not_share_entries() {
+        let a = StringTable::new();
+        let token = a.intern("only_in_a");
+        assert_eq!(a.len(), 1);
+
+        let b = StringTable::new();
+        assert_eq!(b.len(), 0);
+        assert_eq!(b.get_string(token.normal), None);
+
+        b.intern("only_in_b");
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+    }
+
+    #[test]
     fn stats_cover_every_shard() {
         let table = StringTable::new();
         for i in 0..2000 {

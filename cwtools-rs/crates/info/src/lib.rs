@@ -1259,6 +1259,45 @@ alias[effect:set_temp_variable] = {
         );
     }
 
+    #[test]
+    fn var_index_tracks_set_variable_across_index_and_clear() {
+        use cwtools_rules::rules_converter::ast_to_ruleset;
+        const RULES: &str = r#"
+types = { type[foo] = { path = "game/common/foo" } }
+foo = { alias_name[effect] = alias_match_left[effect] }
+alias[effect:set_variable] = {
+    var = value_set[variable]
+    value = int_variable_field
+}
+"#;
+        let table = StringTable::new();
+        let ruleset = ast_to_ruleset(&parse_string(RULES, &table), &table);
+        let effects = variable_defining_effects(&ruleset);
+
+        let mut svc = InfoService::new();
+        svc.update_ruleset_data(effects);
+        svc.index_file_with_path(
+            "f.txt",
+            &parse_string(
+                "foo = { set_variable = { var = my_explicit value = 3 } }",
+                &table,
+            ),
+            &table,
+            &ruleset,
+            "game/common/foo/f.txt",
+        );
+        assert!(
+            svc.type_index.var_index.contains("my_explicit"),
+            "LSP index path must populate var_index"
+        );
+
+        svc.clear_file("f.txt");
+        assert!(
+            !svc.type_index.var_index.contains("my_explicit"),
+            "clear_file must drop the name from var_index"
+        );
+    }
+
     // ── ReferenceIndex narrowed removal (via clear_file) ─────────────────────
 
     /// `clear_file` must drop only the cleared file's reference sites, across

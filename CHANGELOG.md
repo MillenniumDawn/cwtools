@@ -140,7 +140,7 @@
 
 ## Developer
 
-- Docs and comments now match the interner, `loc_text`, and `var_index`. The table is per-instance (not process-wide), hover text is patched per loc edit (and that merge is lossy across files that share a key), and the LSP fills the variable index. (#292)
+- Docs and comments now match the interner, `loc_text`, and `var_index`. The table is per-instance (not process-wide), hover text is patched per loc edit (and that merge is lossy across files that share a key), and the LSP fills the variable index. Two tests pin the isolation and the LSP `var_index` path. (#292)
 - The corpus guard grew a second tier for the checks it cannot reach. `scripts/vanilla-guard.sh` validates a synthetic base game, mod and ruleset committed under `scripts/vanilla-fixture/` against `scripts/vanilla-baseline.csv`, so CW113, CW222, CW227, CW229 and CW500 have regression coverage without a game install. It drives `corpus-guard.sh`, which gained `--vanilla`/`CWTOOLS_VANILLA` and records the base game in the baseline header. The fixture holds one reference per family that resolves and one that doesn't, so both "the check stopped reporting" and "the check reports everything" move the baseline. `cwtools_driver::vanilla_gated_checks` is the one list of what the gate covers, and both the notice and the docs read from it. (#96)
 - Split the oversized LSP and info sources along existing seams. `scan/` became
   `workspace`, `reindex`, `loc`, `vanilla` and `watched`; `navigation/` became
