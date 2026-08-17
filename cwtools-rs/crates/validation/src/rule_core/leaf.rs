@@ -777,3 +777,155 @@ fn field_to_description(field: &NewField) -> String {
         _ => "unknown field type".to_string(),
     }
 }
+
+/// Decision-table tests for the fall-through arms #287 made explicit: the value
+/// shapes each field rejects. Non-string shapes only, so the `@`/`$$`/`[` bypass
+/// and the string arms above stay with the integration tests and corpus guard.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clause() -> Value {
+        Value::Clause(Vec::new())
+    }
+
+    #[test]
+    fn unlisted_value_shapes_are_rejected() {
+        let table = StringTable::new();
+        let ruleset = RuleSet::default();
+        let cases = [
+            (NewField::ValueField(ValueType::Bool), Value::Int(1)),
+            (NewField::ValueField(ValueType::Bool), clause()),
+            (
+                NewField::ValueField(ValueType::Int { min: 0, max: 10 }),
+                Value::Bool(true),
+            ),
+            (
+                NewField::ValueField(ValueType::Int { min: 0, max: 10 }),
+                Value::Float(1.5),
+            ),
+            (
+                NewField::ValueField(ValueType::Float { min: 0.0, max: 1.0 }),
+                clause(),
+            ),
+            (
+                NewField::ValueField(ValueType::Enum("e".to_string())),
+                Value::Bool(false),
+            ),
+            (NewField::ValueField(ValueType::Percent), clause()),
+            (NewField::ValueField(ValueType::Date), Value::Int(2000)),
+            (
+                NewField::ValueField(ValueType::DateTime),
+                Value::Float(2000.1),
+            ),
+            (NewField::ValueField(ValueType::Ck2Dna), Value::Int(0)),
+            (NewField::ValueField(ValueType::Ck2DnaProperty), clause()),
+            (
+                NewField::ValueField(ValueType::IrFamilyName),
+                Value::Bool(true),
+            ),
+            (
+                NewField::ValueField(ValueType::StlNameFormat("f".to_string())),
+                Value::Int(1),
+            ),
+            (
+                NewField::TypeField(TypeType::Simple("t".to_string())),
+                Value::Bool(true),
+            ),
+            (
+                NewField::TypeField(TypeType::Simple("t".to_string())),
+                clause(),
+            ),
+            (NewField::ScopeField(vec!["country".to_string()]), clause()),
+            (
+                NewField::VariableField {
+                    is_int: false,
+                    is_32bit: false,
+                    min: 0.0,
+                    max: 10.0,
+                },
+                clause(),
+            ),
+            (
+                NewField::LocalisationField {
+                    synced: false,
+                    is_inline: false,
+                },
+                Value::Int(1),
+            ),
+            (
+                NewField::FilepathField {
+                    prefix: None,
+                    extension: None,
+                },
+                Value::Bool(true),
+            ),
+            (NewField::IconField("gfx".to_string()), Value::Int(1)),
+            (
+                NewField::ValueScopeField {
+                    is_int: false,
+                    min: 0.0,
+                    max: 10.0,
+                },
+                clause(),
+            ),
+            (
+                NewField::ValueScopeMarkerField {
+                    is_int: false,
+                    min: 0.0,
+                    max: 10.0,
+                },
+                clause(),
+            ),
+            (
+                NewField::AliasValueKeysField("a".to_string()),
+                Value::Int(1),
+            ),
+            (NewField::AliasField("effect".to_string()), Value::Int(1)),
+            (
+                NewField::SingleAliasField("s".to_string()),
+                Value::Bool(true),
+            ),
+        ];
+        for (field, value) in &cases {
+            assert!(
+                !field_matches_value(field, value, &table, &ruleset),
+                "{field:?} must reject {value:?}"
+            );
+        }
+    }
+
+    /// Contrast guard for the table above: the same fixture accepts shapes the
+    /// arms explicitly allow, so the rejections cannot pass by the matcher
+    /// rejecting everything.
+    #[test]
+    fn listed_value_shapes_are_accepted() {
+        let table = StringTable::new();
+        let ruleset = RuleSet::default();
+        let cases = [
+            (NewField::ValueField(ValueType::Bool), Value::Bool(true)),
+            // Range max is inclusive.
+            (
+                NewField::ValueField(ValueType::Int { min: 0, max: 10 }),
+                Value::Int(10),
+            ),
+            (NewField::ScalarField, clause()),
+            // yes/no are acceptable in variable contexts.
+            (
+                NewField::VariableField {
+                    is_int: false,
+                    is_32bit: false,
+                    min: 0.0,
+                    max: 10.0,
+                },
+                Value::Bool(true),
+            ),
+        ];
+        for (field, value) in &cases {
+            assert!(
+                field_matches_value(field, value, &table, &ruleset),
+                "{field:?} must accept {value:?}"
+            );
+        }
+    }
+}

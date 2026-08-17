@@ -377,3 +377,47 @@ fn field_to_key(field: &NewField) -> Option<&str> {
         _ => None,
     }
 }
+
+/// Decision-table tests for the false arms #287 made explicit. The corpus guard
+/// only runs the HOI4 rules, so the CK2/IR/Stellaris value types below are never
+/// exercised there; this pins that they stay non-matching as keys.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_typed_and_marker_fields_never_match_a_key() {
+        let ruleset = RuleSet::default();
+        // Fixture guard: the same ruleset does match where an arm says yes, so
+        // the rejections below cannot pass by everything being false.
+        assert!(field_matches_key(
+            &NewField::SpecificField("focus".to_string()),
+            "Focus",
+            &ruleset,
+            None
+        ));
+        // Each key is shaped to satisfy the field's own value check, so a pass
+        // proves the arm is a hard false rather than a lucky key mismatch.
+        let cases = [
+            (NewField::ValueField(ValueType::Bool), "yes"),
+            (
+                NewField::ValueField(ValueType::Ck2Dna),
+                "0123456789abcdef0123456789abcdef",
+            ),
+            (NewField::ValueField(ValueType::Ck2DnaProperty), "01234567"),
+            (NewField::ValueField(ValueType::IrFamilyName), "some_family"),
+            (
+                NewField::ValueField(ValueType::StlNameFormat("format".to_string())),
+                "some_name",
+            ),
+            (NewField::ValueField(ValueType::MathExpr), "value"),
+            (NewField::MarkerField(Marker::ColourField), "color"),
+        ];
+        for (field, key) in &cases {
+            assert!(
+                !field_matches_key(field, key, &ruleset, None),
+                "{field:?} must not match key {key:?}"
+            );
+        }
+    }
+}
