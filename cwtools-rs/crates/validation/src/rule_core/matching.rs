@@ -351,7 +351,16 @@ pub(crate) fn field_matches_key(
         | NewField::FilepathField { .. }
         | NewField::IconField(_)
         | NewField::AliasValueKeysField(_) => true,
-        _ => false,
+        // These value types never appear on the left-hand side of a rule.
+        NewField::ValueField(
+            ValueType::Bool
+            | ValueType::Ck2Dna
+            | ValueType::Ck2DnaProperty
+            | ValueType::IrFamilyName
+            | ValueType::StlNameFormat(_)
+            | ValueType::MathExpr,
+        ) => false,
+        NewField::MarkerField(_) => false,
     }
 }
 

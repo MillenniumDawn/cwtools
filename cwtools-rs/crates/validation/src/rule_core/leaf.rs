@@ -721,7 +721,39 @@ pub(crate) fn field_matches_value(
         (NewField::IgnoreMarkerField, _) => true,
         (NewField::IgnoreField(_), _) => true,
 
-        _ => false,
+        // Value shapes the arms above did not accept. Wildcard on the value side
+        // only, so a new NewField or ValueType variant fails to compile here
+        // instead of silently never matching.
+        (
+            NewField::ValueField(
+                ValueType::Bool
+                | ValueType::Int { .. }
+                | ValueType::Float { .. }
+                | ValueType::Enum(_)
+                | ValueType::Percent
+                | ValueType::Date
+                | ValueType::DateTime
+                | ValueType::Ck2Dna
+                | ValueType::Ck2DnaProperty
+                | ValueType::IrFamilyName
+                | ValueType::StlNameFormat(_),
+            ),
+            _,
+        ) => false,
+        (
+            NewField::TypeField(_)
+            | NewField::ScopeField(_)
+            | NewField::VariableField { .. }
+            | NewField::LocalisationField { .. }
+            | NewField::FilepathField { .. }
+            | NewField::IconField(_)
+            | NewField::ValueScopeField { .. }
+            | NewField::ValueScopeMarkerField { .. }
+            | NewField::AliasValueKeysField(_)
+            | NewField::AliasField(_)
+            | NewField::SingleAliasField(_),
+            _,
+        ) => false,
     }
 }
 
