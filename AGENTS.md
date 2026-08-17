@@ -99,6 +99,11 @@ them in blocks.
 Benches live in `crates/*/benches` and run under criterion.
 `cargo bench -p cwtools_driver --bench rules_hot` covers the editor hot paths
 and needs a rules checkout (`CWTOOLS_RULES`, or `CWTOOLS_PROJECTS`).
+`cargo bench -p cwtools_driver --bench validate_hot` covers the batch
+validation inner loop. `validate_prepared/fixture` always runs against an
+in-repo script. `validate_prepared/scripted_effects` needs the same rules
+checkout as `rules_hot` plus a corpus checkout (`CWTOOLS_CORPUS`,
+`CWTOOLS_PROJECTS`, or a sibling of this repo).
 [PROFILING.md](cwtools-rs/PROFILING.md) covers the `CWTOOLS_PROFILE`
 instrumentation.
 

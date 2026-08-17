@@ -39,6 +39,7 @@ instrumented hot path, with its busy/idle time. The instrumented paths today:
 - `load` (index, `vanilla_cache`) — the vanilla cache read at startup
 - `post_process` (rules) — the single ruleset post-processing pass
 - `validate_ast_with_loc` / `validate_prepared` (validation) — one span per file validated
+- `count_and_validate_children` / `validate_leaf` / `validate_alias_usage` (validation, TRACE) — one span per block, leaf, or alias usage. Off under `RUST_LOG=info`. Set `RUST_LOG=cwtools_validation=trace` to attribute time to a phase inside the file.
 - `merged_rules_for_type` (validation) — one span per typed definition's subtype merge
 - `parse_and_validate` / `index_parsed_file` (lsp) — one span per file the server validates
 - `semantic_tokens_full_impl` / `semantic_tokens_range_impl` (lsp) — one span per semantic-tokens request
@@ -71,7 +72,9 @@ CWTOOLS_TIMINGS=1 cargo run --release -p cwtools_cli -- validate --game hoi4 ...
 Put `#[tracing::instrument(skip_all)]` on the function (use `skip_all` so large
 args aren't formatted), and make sure the crate has `tracing` in its
 `Cargo.toml` (`tracing = { workspace = true }`). It shows up under
-`RUST_LOG=<crate>=info` automatically.
+`RUST_LOG=<crate>=info` automatically. Per-call inner loops (one span per
+leaf or block) should be `level = "trace"` so an `info` profile stays a
+per-file picture.
 
 ## What to look for (runtime)
 

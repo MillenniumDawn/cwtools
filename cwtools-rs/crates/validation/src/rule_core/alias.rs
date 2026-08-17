@@ -231,6 +231,7 @@ fn collect_loop_vars(
 /// at the branch limit. A result produced after the budget ran out is truncated,
 /// so it is never stored.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "trace", skip_all)]
 pub(super) fn validate_alias_usage(
     ctx: &ValidationCtx,
     category: &str,

@@ -28,3 +28,7 @@ tempfile = { workspace = true }
 [[bench]]
 name = "rules_hot"
 harness = false
+
+[[bench]]
+name = "validate_hot"
+harness = false
