@@ -7433,6 +7433,60 @@ fn test_config_partial_payload_keeps_ignore_lists() {
 }
 
 #[test]
+fn test_live_ignore_clears_closed_localisation_diagnostics() {
+    let ws = tempfile::tempdir().unwrap();
+    let rules_dir = tempfile::tempdir().unwrap();
+    let vanilla = tempfile::tempdir().unwrap();
+    std::fs::write(rules_dir.path().join("r.cwt"), GOTO_RULES).unwrap();
+    write_disk_file(ws.path(), "common/decisions/scan.txt", STORM_FILE);
+    let ignored_uri = write_loc_file(
+        ws.path(),
+        "localisation/ignored_l_english.yml",
+        " broken:0 \"unterminated\n",
+    );
+
+    let (mut child, reader) = storm_server(ws.path(), rules_dir.path(), vanilla.path());
+    let rx = spawn_frame_collector(reader);
+    reindex_until_scan_starts(&mut child, &rx);
+    recv_frame_until(
+        &rx,
+        std::time::Duration::from_secs(10),
+        "the localisation diagnostic before it is ignored",
+        |_| {},
+        |v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"] == ignored_uri
+                && publish_has_code(v, "CW268")
+        },
+    );
+
+    write_frame(
+        &mut child,
+        &jsonrpc_notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": {
+                "ignoreFilePatterns": ["**/ignored_l_english.yml"],
+            }}),
+        ),
+    )
+    .unwrap();
+    recv_frame_until(
+        &rx,
+        std::time::Duration::from_secs(10),
+        "an empty publish clearing the ignored localisation diagnostic",
+        |_| {},
+        |v| {
+            v["method"] == "textDocument/publishDiagnostics"
+                && v["params"]["uri"] == ignored_uri
+                && v["params"]["diagnostics"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+        },
+    );
+    child.kill().ok();
+}
+
+#[test]
 fn test_init_ignore_pattern_caps_cut_hostile_payload() {
     // #169: initializationOptions carrying a 1 MB glob and over-count lists
     // must be cut at the boundary. The startup summary (window/logMessage)

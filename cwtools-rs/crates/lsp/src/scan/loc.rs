@@ -322,6 +322,25 @@ impl Backend {
         // buffers after the index is installed, so disk diagnostics must not
         // overwrite them here.
         let open_uris: HashSet<String> = self.state.documents.lock().keys().cloned().collect();
+        let current_uris: HashSet<String> = by_file
+            .keys()
+            .map(|file| path_to_uri(std::path::Path::new(file)))
+            .filter(|uri| !open_uris.contains(uri))
+            .collect();
+        let stale_uris = {
+            let mut previous = self.state.published_loc_uris.lock();
+            let stale = previous
+                .difference(&current_uris)
+                .cloned()
+                .collect::<Vec<_>>();
+            *previous = current_uris;
+            stale
+        };
+        for uri in stale_uris {
+            if let Ok(uri) = Url::parse(&uri) {
+                self.publish_filtered(uri, Vec::new(), None, None).await;
+            }
+        }
         for (file, mut diags) in by_file.drain() {
             let uri = path_to_uri(std::path::Path::new(&file));
             if open_uris.contains(&uri) {

@@ -36,7 +36,7 @@
 
 ## Bug Fixes
 
-- `validate` and the language server now apply file and directory ignore globs to localisation discovery, matching script discovery and `cwtools loc`. Ignored trees are pruned before they consume the scan budget, and the editor no longer parses unselected localisation languages before filtering them. (#285)
+- `validate` and the language server now apply file and directory ignore globs to localisation discovery, matching script discovery and `cwtools loc`. Ignored trees are pruned before they consume the scan budget, and the editor no longer parses unselected localisation languages before filtering them. Changing the editor's ignore patterns also clears diagnostics from files that become excluded. (#285)
 
 - CW274 was still listed as a pending, non-emitted code in the CLI's catalog after its check shipped, so every `inline_script` diagnostic in a SARIF report came through without a `tool.driver.rules` entry: no `ruleIndex`, no `shortDescription`, and no `helpUri` to open the documentation from. It is now listed as emitted, and the pending list is checked against the Status column in `docs/ERROR_CODES.md` at test time so the two cannot drift again. `--only-code CW274` and `--ignore-code CW274` were unaffected and stay accepted. (#109)
 

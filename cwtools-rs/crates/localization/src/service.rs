@@ -670,23 +670,37 @@ mod tests {
         let ignored = tmp.path().join("ignored/localisation");
         let kept = tmp.path().join("kept/localisation");
         std::fs::create_dir_all(&ignored).unwrap();
-        std::fs::create_dir_all(&kept).unwrap();
         for name in ["a.yml", "b.yml", "c.yml"] {
             std::fs::write(ignored.join(name), "l_english:\n key:0 \"ignored\"\n").unwrap();
         }
-        std::fs::write(kept.join("keep.yml"), "l_english:\n key:0 \"kept\"\n").unwrap();
 
-        let budget = ScanBudget {
-            max_files: 1,
-            ..ScanBudget::default()
-        };
-        let files = LocService::discover_files_filtered(
-            &[tmp.path()],
-            budget,
+        let mut remaining = 1;
+        let ignore_dirs = ["ignored".to_string()];
+        let ignored_files = walk_folder_inner(
+            tmp.path(),
+            tmp.path(),
+            false,
+            true,
+            &mut remaining,
             &[],
-            &["ignored".to_string()],
+            &ignore_dirs,
         );
-        assert_eq!(files, vec![kept.join("keep.yml")]);
+        assert!(ignored_files.is_empty());
+        assert_eq!(remaining, 1);
+
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("keep.yml"), "l_english:\n key:0 \"kept\"\n").unwrap();
+        let kept_files = walk_folder_inner(
+            tmp.path(),
+            &tmp.path().join("kept"),
+            false,
+            false,
+            &mut remaining,
+            &[],
+            &ignore_dirs,
+        );
+        assert_eq!(kept_files, vec![kept.join("keep.yml")]);
+        assert_eq!(remaining, 0);
     }
 
     #[test]
@@ -765,7 +779,11 @@ mod tests {
             &[],
         );
         assert_eq!(service.errors().len(), 1);
-        assert!(service.errors()[0].1.contains("IO error"));
+        assert!(
+            service.errors()[0]
+                .1
+                .contains("file exceeds the 50 byte read cap")
+        );
     }
 
     #[test]
