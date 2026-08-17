@@ -11,7 +11,10 @@ rather than repeating them; read the linked file when you need the detail.
 - `cwtools-rs/` is the Rust workspace and the whole active codebase. Everything
   builds from there.
 - `scripts/corpus-guard.sh` and `scripts/corpus-baseline.csv` are the
-  diagnostics regression gate.
+  diagnostics regression gate. `scripts/vanilla-guard.sh` and
+  `scripts/vanilla-baseline.csv` are its second tier, over a committed synthetic
+  base game, for the checks that need one (CW113, CW222, CW227, CW229, CW250,
+  CW500).
 - `CHANGELOG.md` at the repo root covers both the engine and the release notes.
 - The F# tree is gone. Old parity notes that mention it are history, not a plan.
 
@@ -134,5 +137,7 @@ instrumentation.
   `windows-latest`, so a Unix-only assumption here turns every PR red.
 - Don't change a type that gets serialized into a cache without bumping the
   format version next to it (`FORMAT_VERSION` in `crates/cache/src/io.rs` for
-  `.cwb`, `CACHE_VERSION` in `crates/index/src/vanilla_cache.rs`). The bump is
-  what turns an old cache into a clean miss instead of a load error.
+  `.cwb` and `ERRORS_FORMAT_VERSION` for its `.cwe` sidecar, `CACHE_VERSION` in
+  `crates/index/src/vanilla_cache.rs` for `.cwv`, `CACHE_VERSION` in
+  `crates/cache/src/workspace.rs` for the parse cache's fingerprint). The bump
+  is what turns an old cache into a clean miss instead of a load error.

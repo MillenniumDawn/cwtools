@@ -1,6 +1,6 @@
 # CWTools Error Codes
 
-Each diagnostic the validator emits carries a `CWxxx` code. The codes mirror the F# cwtools catalog with a few intentional renumberings (see [Reconciliations](#reconciliations) below). They are emitted from `crates/validation`, plus the CW600 block from `crates/rules`, and surfaced through the LSP server as editor diagnostics or printed to stdout by the CLI.
+Each diagnostic the validator emits carries a `CWxxx` code. The codes mirror the F# cwtools catalog with a few intentional renumberings (see [Reconciliations](#reconciliations) below). They are emitted from `crates/validation` and `crates/localization` (the loc-file and `[command]` checks), plus the CW600 block from `crates/rules`, and surfaced through the LSP server as editor diagnostics or printed to stdout by the CLI.
 
 ## Severity levels
 
@@ -35,6 +35,28 @@ The other 8 F# codes were superseded placeholders, dropped rather than kept
 as unwired consts: CW002, CW249, CW998, CW999 had no path to emission;
 CW101/102/103 are covered by the rules-engine structural codes CW262/263,
 and CW241 by CW262-265.
+
+## Suppressing a diagnostic
+
+Three ways, all case-insensitive about the code:
+
+- Inline, on the line it fires on: `# cwtools-ignore CW100`. The directive
+  covers its own line and the lines directly above and below it, so the
+  trailing form (`foo = bar # cwtools-ignore CW100`) and the standalone
+  comment on either side both work. It names as many codes as you like
+  (`# cwtools-ignore CW100 CW246`), and a second `#` ends the list, so a human
+  note after it is not read as a code. Read from the raw source rather than the
+  AST, so it works in loc files and in a file that failed to parse. A
+  whole-file diagnostic (one with no line, like CW254) cannot be suppressed
+  this way.
+- Per run: `--ignore-code CWxxx` on the CLI (repeatable), or `ignore-codes` in
+  `cwtools.toml`. `--only-code` is the inverse.
+- Per workspace: the editor's `cwtools.errors.ignore` setting, which the "Ignore
+  CWxxx in this workspace" code action writes for you.
+
+The two escape hatches that turn off a whole family, `CWTOOLS_NO_SCOPE_CHECKS`
+and `CWTOOLS_NO_VAR_CHECKS`, are described under
+[Wired, runs by default](#wired-runs-by-default-with-an-escape-hatch).
 
 ---
 
@@ -86,7 +108,7 @@ and CW241 by CW262-265.
 | ID | Severity | Message | Meaning | Status |
 |---|---|---|---|---|
 | <a id="cw225"></a>CW225 | Error | Localisation key "{}" references "{}" which doesn't exist in {} | A loc string's `$KEY$` reference points to a key that has no definition. | Emitted |
-| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). A `?`-marked variable read (`[?ROOT.war_support\|1]`) is checked against the project's variable registry: the config's built-in `value[variable]` reads plus every name the mod sets, so only a name neither knows is reported. A chain without the `?` ends in a command or a scripted-localisation name and stays lenient, as does one reading through a variable (`[?some_var.SomeLoc]`) or through a segment the scope engine can't resolve. Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted (see [where the loc command checks run](#where-the-loc-command-checks-run)) |
+| <a id="cw226"></a>CW226 | Error | Localisation key "{}" uses command "{}" which doesn't exist | A loc string's `[Command()]` single-segment Jomini call names a command not found in the scope registry (with a loaded registry). A `?`-marked variable read (`[?ROOT.war_support\|1]`) is checked against the project's variable registry: the config's built-in `value[variable]` reads plus every name the mod sets, so only a name neither knows is reported. A chain without the `?` ends in a command or a scripted-localisation name and stays lenient, as does one reading through a variable (`[?some_var.SomeLoc]`) or through a segment the scope engine can't resolve. A chain with an empty segment is skipped whole, which is what a parenthesised Jomini expression (`[(Character?.GetName:'CAP_SCIENTIST')]`) parses to. Mirrors F# `validateJominiLocalisationCommandsBase` `LocNotFound`. | Emitted (see [where the loc command checks run](#where-the-loc-command-checks-run)) |
 
 ### CW227-CW233 -- Section/component/mesh/entity (Stellaris-specific)
 
