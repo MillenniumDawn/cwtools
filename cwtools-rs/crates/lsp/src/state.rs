@@ -253,7 +253,9 @@ pub(crate) struct DocumentState {
     /// Display text per loc key (lowercased) → list of (language, display text).
     /// Built from the LocService during workspace scan so hover can show
     /// localisation without re-reading loc files. Outer quotes are stripped
-    /// from the desc for cleaner display.
+    /// from the desc for cleaner display. Patched on every loc edit; a key
+    /// shared across files can lose the other file's translations until the
+    /// next scan.
     #[allow(clippy::type_complexity)]
     pub(crate) loc_text: parking_lot::RwLock<LocTextMap>,
     /// Definition site per loc key (lowercased) → (file URI, 0-based line). Built

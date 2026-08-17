@@ -122,8 +122,8 @@ impl Clone for StringTable {
     /// NOTE: this is an *aliasing* clone, not a deep copy. The clone shares the
     /// same underlying shards as the original, so a string interned through one
     /// handle is visible through the other. This is intentional (see the
-    /// `shared_table` test) — cloning a `StringTable` just hands out another
-    /// handle to the one process-wide table.
+    /// `shared_table` test). Cloning a `StringTable` hands out another handle
+    /// to the same instance, not a process-wide singleton.
     fn clone(&self) -> Self {
         Self {
             shards: Arc::clone(&self.shards),
@@ -627,6 +627,33 @@ mod tests {
         let b = table2.intern("hello");
 
         assert_eq!(a, b); // shared table → same token
+    }
+
+    #[test]
+    fn independent_tables_do_not_share_entries() {
+        let a = StringTable::new();
+        let token = a.intern("only_in_a");
+        assert_eq!(a.len(), 1);
+
+        let b = StringTable::new();
+        assert!(b.is_empty());
+        assert_eq!(b.get_string(token.normal), None);
+
+        b.intern("only_in_b");
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a.get_string(token.normal).as_deref(), Some("only_in_a"));
+    }
+
+    #[test]
+    fn cloned_handle_does_not_leak_into_a_fresh_table() {
+        let a = StringTable::new();
+        let shared = a.clone();
+        shared.intern("via_clone");
+        assert_eq!(a.len(), 1);
+
+        let fresh = StringTable::new();
+        assert!(fresh.is_empty());
     }
 
     #[test]
