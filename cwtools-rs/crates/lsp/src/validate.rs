@@ -2983,3 +2983,333 @@ mod whole_line_range_tests {
         assert!(diag.related_information.is_none());
     }
 }
+
+#[cfg(test)]
+mod ignored_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::state::DocumentState;
+    use cwtools_parser::parser::parse_string;
+    use cwtools_string_table::string_table::StringTable;
+    use parking_lot::Mutex;
+    use tower_lsp::{LanguageServer, LspService};
+
+    fn backend_with_ignore(patterns: Vec<String>, workspace_uri: Option<&str>) -> Backend {
+        let state = Arc::new(DocumentState::new());
+        {
+            let mut cfg = state.config.write();
+            cfg.ignore_file_patterns = patterns;
+            if let Some(ws) = workspace_uri {
+                cfg.workspace_prefix = Some(crate::paths::workspace_prefix_of(ws));
+                if let Some(path) = crate::access::file_uri_to_path(ws) {
+                    if let Ok(canonical) = std::fs::canonicalize(&path) {
+                        cfg.workspace_roots = vec![canonical.clone()];
+                        cfg.refresh_roots();
+                    } else {
+                        cfg.workspace_roots = vec![path];
+                        cfg.refresh_roots();
+                    }
+                }
+            }
+        }
+        let captured = Arc::new(Mutex::new(None));
+        let slot = captured.clone();
+        let st = state.clone();
+        let (_svc, _sock) = LspService::new(move |client| {
+            *slot.lock() = Some(client.clone());
+            Backend {
+                client,
+                state: st.clone(),
+            }
+        });
+        let client = captured.lock().take().expect("client");
+        Backend { client, state }
+    }
+
+    #[test]
+    fn is_ignored_uri_respects_engine_baseline() {
+        let backend = backend_with_ignore(vec![], Some("file:///ws"));
+        assert!(backend.is_ignored_uri("file:///ws/README.txt"));
+        assert!(backend.is_ignored_uri("file:///ws/Changelog.txt"));
+        assert!(backend.is_ignored_uri("file:///ws/docs/readme.md"));
+        assert!(backend.is_ignored_uri("file:///ws/sub/notes.md"));
+        assert!(!backend.is_ignored_uri("file:///ws/common/ideas/foo.txt"));
+        assert!(!backend.is_ignored_uri("file:///ws/events/kept.txt"));
+    }
+
+    #[test]
+    fn is_ignored_uri_bare_name_matches_any_depth() {
+        let backend = backend_with_ignore(vec!["ignored.txt".into()], Some("file:///ws"));
+        assert!(backend.is_ignored_uri("file:///ws/ignored.txt"));
+        assert!(backend.is_ignored_uri("file:///ws/common/ignored.txt"));
+        assert!(backend.is_ignored_uri("file:///ws/a/b/c/ignored.txt"));
+        assert!(!backend.is_ignored_uri("file:///ws/kept.txt"));
+    }
+
+    #[test]
+    fn is_ignored_uri_path_glob_matches_location() {
+        let backend = backend_with_ignore(vec!["**/skip.txt".into()], Some("file:///ws"));
+        assert!(backend.is_ignored_uri("file:///ws/skip.txt"));
+        assert!(backend.is_ignored_uri("file:///ws/common/skip.txt"));
+        assert!(!backend.is_ignored_uri("file:///ws/common/keep.txt"));
+
+        let backend2 = backend_with_ignore(vec!["common/**/skip.txt".into()], Some("file:///ws"));
+        assert!(!backend2.is_ignored_uri("file:///ws/skip.txt"));
+        assert!(backend2.is_ignored_uri("file:///ws/common/units/skip.txt"));
+    }
+
+    #[test]
+    fn is_ignored_uri_handles_percent_encoding_and_no_workspace() {
+        // No workspace_prefix -> logical path is the raw decoded path; bare-name still matches.
+        let backend = backend_with_ignore(vec!["ignored.txt".into()], None);
+        assert!(backend.is_ignored_uri("file:///tmp/ignored.txt"));
+        // Percent-encoded workspace and file.
+        let backend2 = backend_with_ignore(vec![], Some("file:///tmp/My%20Mod"));
+        // README baseline under encoded workspace.
+        assert!(backend2.is_ignored_uri("file:///tmp/My%20Mod/README.txt"));
+        assert!(backend2.is_ignored_uri("file:///tmp/My%20Mod/sub/README.txt"));
+    }
+
+    #[test]
+    fn clear_ignored_file_state_removes_all_indexes() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let ws_uri = tower_lsp::lsp_types::Url::from_file_path(tmp.path())
+            .unwrap()
+            .to_string();
+        let backend = backend_with_ignore(vec![], Some(&ws_uri));
+        // Ensure the workspace root is the temp dir (canonicalized).
+        {
+            let mut cfg = backend.state.config.write();
+            let canon = std::fs::canonicalize(tmp.path()).unwrap();
+            cfg.workspace_roots = vec![canon.clone()];
+            cfg.refresh_roots();
+            cfg.workspace_prefix = Some(crate::paths::workspace_prefix_of(&ws_uri));
+        }
+        let file_path = tmp.path().join("common/foo.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "").unwrap();
+        let uri = tower_lsp::lsp_types::Url::from_file_path(&file_path)
+            .unwrap()
+            .to_string();
+        // Seed indexes: info, doc_tokens, type_uses, file_index, loc overlays.
+        let table = StringTable::new();
+        let parsed = parse_string("my_type = { }", &table);
+        // Manually populate file_index so removal can be asserted.
+        {
+            let mut info = backend.state.info_service.write();
+            info.type_index.file_index.insert("common/foo.txt");
+            assert!(info.type_index.file_index.contains("common/foo.txt"));
+        }
+        backend
+            .state
+            .doc_tokens
+            .write()
+            .insert(uri.clone(), crate::validate::collect_doc_tokens(&parsed));
+        backend.state.type_uses.write().insert(
+            uri.clone(),
+            cwtools_validation::references::UsedInstances::default(),
+        );
+        backend
+            .state
+            .loc_live_overlay
+            .write()
+            .insert(uri.clone(), ["loc_key".to_string()].into_iter().collect());
+        backend
+            .state
+            .watched_signatures
+            .lock()
+            .insert(uri.clone(), (123, 456));
+        // Index the file (even without a ruleset the doc_tokens/type_uses/file_index
+        // and overlay state are what this test cares about; fingerprint may stay 0).
+        backend.index_parsed_file(&uri, &parsed, None);
+
+        backend.clear_ignored_file_state(&uri);
+
+        assert_eq!(
+            backend.state.info_service.read().export_fingerprint(&uri),
+            0,
+            "type index must be cleared"
+        );
+        assert!(!backend.state.doc_tokens.read().contains_key(uri.as_str()));
+        assert!(!backend.state.type_uses.read().contains_key(uri.as_str()));
+        assert!(
+            !backend
+                .state
+                .loc_live_overlay
+                .read()
+                .contains_key(uri.as_str())
+        );
+        assert!(
+            !backend
+                .state
+                .watched_signatures
+                .lock()
+                .contains_key(uri.as_str())
+        );
+        assert!(
+            !backend
+                .state
+                .info_service
+                .read()
+                .type_index
+                .file_index
+                .contains("common/foo.txt"),
+            "file_index entry must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_and_validate_ignored_returns_empty_and_clears_index() {
+        let backend = backend_with_ignore(vec!["ignored.txt".into()], Some("file:///ws"));
+        let uri = "file:///ws/ignored.txt";
+        let text = "my_type = { broken }";
+        // Seed an index entry that must be cleared.
+        let table = StringTable::new();
+        let seed = parse_string("my_type = { }", &table);
+        backend.index_parsed_file("file:///ws/common/keep.txt", &seed, None);
+        // Put something for the ignored URI so we can see it disappear.
+        backend.index_parsed_file(uri, &seed, None);
+        // Now park an ignored parse: the defensive guard should have cleared it,
+        // but we ensure parse_and_validate also clears and returns empty.
+        // First make the ignored file look indexed again (guard would have cleared it,
+        // so re-seed via direct info write).
+        {
+            let mut info = backend.state.info_service.write();
+            info.clear_file(uri);
+            // Re-seed via direct index to simulate stale state before config change.
+            drop(info);
+            backend.index_parsed_file(uri, &seed, None);
+            // Force ignore by setting pattern after indexing: re-create backend with ignore
+            // (already is) and ensure clear happens on next validate.
+        }
+        // The uri is ignored, so parse_and_validate must return empty diagnostics.
+        let (diags, ast) = backend
+            .parse_and_validate(uri, text, crate::ValidateTrigger::DidOpen, None)
+            .await;
+        assert!(diags.is_empty(), "ignored file must produce no diagnostics");
+        assert!(ast.is_none(), "ignored file must not return an AST");
+        assert_eq!(
+            backend.state.info_service.read().export_fingerprint(uri),
+            0,
+            "ignored file must be cleared from the type index"
+        );
+        assert!(!backend.state.doc_tokens.read().contains_key(uri));
+    }
+
+    #[tokio::test]
+    async fn index_parsed_file_defensively_skips_ignored() {
+        let backend = backend_with_ignore(vec!["README.txt".into()], Some("file:///ws"));
+        let uri = "file:///ws/README.txt";
+        let parsed = parse_string("x = 1", &StringTable::new());
+        backend.index_parsed_file(uri, &parsed, None);
+        assert_eq!(
+            backend.state.info_service.read().export_fingerprint(uri),
+            0,
+            "engine-baseline ignored file must never enter the index"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_parsed_prebuilt_returns_empty_for_ignored() {
+        let backend = backend_with_ignore(vec!["ignored.txt".into()], Some("file:///ws"));
+        let uri = "file:///ws/ignored.txt";
+        let parsed = parse_string("x = 1", &StringTable::new());
+        let lines = DocLines::new("x = 1", tower_lsp::lsp_types::PositionEncodingKind::UTF16);
+        let diags = backend.validate_parsed_prebuilt(
+            uri,
+            &parsed,
+            &std::collections::HashSet::new(),
+            &cwtools_rules::rules_types::RuleSet::default(),
+            None,
+            None,
+            &lines,
+        );
+        assert!(
+            diags.is_empty(),
+            "prebuilt validation of ignored file must be empty"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn did_open_ignored_is_not_indexed() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let ws_uri = Url::from_file_path(tmp.path()).unwrap().to_string();
+        let backend = backend_with_ignore(vec!["ignored.txt".into()], Some(&ws_uri));
+        let file_path = tmp.path().join("ignored.txt");
+        std::fs::write(&file_path, "").unwrap();
+        let uri = Url::from_file_path(&file_path).unwrap();
+        backend
+            .did_open(tower_lsp::lsp_types::DidOpenTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "paradox".into(),
+                    version: 1,
+                    text: "my_type = { }\n".into(),
+                },
+            })
+            .await;
+        // Document is retained (so revalidate_all_open_docs can find it) but index is clear.
+        assert!(backend.state.documents.lock().contains_key(uri.as_str()));
+        assert_eq!(
+            backend
+                .state
+                .info_service
+                .read()
+                .export_fingerprint(uri.as_str()),
+            0
+        );
+        assert!(!backend.state.doc_tokens.read().contains_key(uri.as_str()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn did_change_ignored_clears_index_and_tokens() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let ws_uri = Url::from_file_path(tmp.path()).unwrap().to_string();
+        let backend = backend_with_ignore(vec!["ignored.txt".into()], Some(&ws_uri));
+        let file_path = tmp.path().join("kept.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "").unwrap();
+        let uri = Url::from_file_path(&file_path).unwrap();
+        // Open as kept first.
+        backend
+            .did_open(tower_lsp::lsp_types::DidOpenTextDocumentParams {
+                text_document: tower_lsp::lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "paradox".into(),
+                    version: 1,
+                    text: "kept = { }\n".into(),
+                },
+            })
+            .await;
+        // Reconfigure to ignore it (simulates adding glob while open).
+        {
+            let mut cfg = backend.state.config.write();
+            cfg.ignore_file_patterns = vec!["kept.txt".into()];
+        }
+        backend
+            .did_change(tower_lsp::lsp_types::DidChangeTextDocumentParams {
+                text_document: tower_lsp::lsp_types::VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![tower_lsp::lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "kept = { changed }\n".into(),
+                }],
+            })
+            .await;
+        // After an edit to an ignored open doc, the index must be cleared, not repopulated.
+        // Allow the async publish to settle.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            backend
+                .state
+                .info_service
+                .read()
+                .export_fingerprint(uri.as_str()),
+            0
+        );
+    }
+}

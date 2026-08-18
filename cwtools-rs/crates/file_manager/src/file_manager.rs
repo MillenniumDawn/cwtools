@@ -2343,4 +2343,141 @@ mod tests {
             "over-cap file must be skipped: {names:?}"
         );
     }
+
+    #[test]
+    fn is_ignored_logical_path_applies_engine_baseline() {
+        // Baseline must win even with no user globs.
+        assert!(is_ignored_logical_path("README.txt", &[]));
+        assert!(is_ignored_logical_path("Changelog.txt", &[]));
+        assert!(is_ignored_logical_path("LICENSE.txt", &[]));
+        assert!(is_ignored_logical_path("docs/readme.md", &[]));
+        assert!(is_ignored_logical_path("notes/README.md", &[]));
+        assert!(!is_ignored_logical_path("common/ideas/foo.txt", &[]));
+        assert!(!is_ignored_logical_path("events/kept.txt", &[]));
+    }
+
+    #[test]
+    fn is_ignored_logical_path_bare_name_matches_any_depth() {
+        let extra = vec!["ignored.txt".to_string()];
+        assert!(is_ignored_logical_path("ignored.txt", &extra));
+        assert!(is_ignored_logical_path("common/ignored.txt", &extra));
+        assert!(is_ignored_logical_path("a/b/c/ignored.txt", &extra));
+        assert!(!is_ignored_logical_path("kept.txt", &extra));
+        assert!(!is_ignored_logical_path("common/kept.txt", &extra));
+    }
+
+    #[test]
+    fn is_ignored_logical_path_path_globs_match_location() {
+        assert!(is_ignored_logical_path(
+            "common/units/skip.txt",
+            &["**/skip.txt".to_string()]
+        ));
+        assert!(is_ignored_logical_path(
+            "skip.txt",
+            &["**/skip.txt".to_string()]
+        ));
+        assert!(!is_ignored_logical_path(
+            "common/units/keep.txt",
+            &["**/skip.txt".to_string()]
+        ));
+        assert!(is_ignored_logical_path(
+            "common/units/skip.txt",
+            &["common/**/skip.txt".to_string()]
+        ));
+        assert!(!is_ignored_logical_path(
+            "skip.txt",
+            &["common/**/skip.txt".to_string()]
+        ));
+        // Trailing slash means everything below.
+        assert!(is_ignored_logical_path(
+            "common/units/foo.txt",
+            &["common/units/".to_string()]
+        ));
+        assert!(!is_ignored_logical_path(
+            "common/other/foo.txt",
+            &["common/units/".to_string()]
+        ));
+    }
+
+    #[test]
+    fn is_ignored_logical_path_empty_is_never_ignored() {
+        assert!(!is_ignored_logical_path("", &[]));
+        assert!(!is_ignored_logical_path("", &["ignored.txt".to_string()]));
+    }
+
+    #[test]
+    fn is_ignored_file_wrapper_derives_logical_path() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        // Inside root.
+        let inside = root.join("common/ignored.txt");
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, "").unwrap();
+        assert!(is_ignored_file(root, &inside, &["ignored.txt".to_string()]));
+        // Outside root falls back to filename (compute_logical_path) and still
+        // matches a bare glob.
+        let outside = tmp.path().join("../outside_ignored.txt");
+        assert!(is_ignored_file(
+            root,
+            &outside,
+            &["outside_ignored.txt".to_string()]
+        ));
+        assert!(!is_ignored_file(root, &inside, &[]));
+        // Engine baseline via wrapper.
+        let readme = root.join("README.txt");
+        std::fs::write(&readme, "").unwrap();
+        assert!(is_ignored_file(root, &readme, &[]));
+    }
+
+    #[test]
+    fn is_ignored_logical_path_agrees_with_walk_workspace_files() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let root = tmp.path();
+        for rel in [
+            "README.txt",
+            "Changelog.txt",
+            "docs/readme.md",
+            "common/keep.txt",
+            "common/ignored.txt",
+            "events/skip.txt",
+            "common/units/keep.txt",
+        ] {
+            if let Some(parent) = std::path::Path::new(rel).parent() {
+                std::fs::create_dir_all(root.join(parent)).unwrap();
+            }
+            std::fs::write(root.join(rel), "").unwrap();
+        }
+        let extra = vec!["ignored.txt".to_string(), "**/skip.txt".to_string()];
+        let walked = walk_workspace_files(root, &["txt", "md"], &extra, &[], ScanBudget::default());
+        let walked_set: std::collections::HashSet<String> = walked
+            .iter()
+            .map(|p| compute_logical_path(p, root))
+            .collect();
+        for rel in [
+            "README.txt",
+            "Changelog.txt",
+            "docs/readme.md",
+            "common/ignored.txt",
+            "events/skip.txt",
+        ] {
+            assert!(
+                !walked_set.contains(rel),
+                "walk should have excluded {rel}: {walked_set:?}"
+            );
+            assert!(
+                is_ignored_logical_path(rel, &extra),
+                "predicate must agree it is ignored: {rel}"
+            );
+        }
+        for rel in ["common/keep.txt", "common/units/keep.txt"] {
+            assert!(
+                walked_set.contains(rel),
+                "walk should have kept {rel}: {walked_set:?}"
+            );
+            assert!(
+                !is_ignored_logical_path(rel, &extra),
+                "predicate must agree it is kept: {rel}"
+            );
+        }
+    }
 }
