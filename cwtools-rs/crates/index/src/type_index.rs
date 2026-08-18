@@ -187,6 +187,27 @@ impl FileIndex {
         (orig.as_str() != norm).then_some(orig.as_str())
     }
 
+    /// Insert a single workspace-relative path (forward slashes). Normalizes
+    /// separators and case the same way as [`add_root`] and [`add_paths`].
+    pub fn insert(&mut self, path: &str) {
+        let norm = path.replace('\\', "/");
+        let ci = norm.to_ascii_lowercase();
+        self.files.insert(ci.clone());
+        if self.case_sensitive {
+            self.files_exact.insert(ci, norm);
+        }
+    }
+
+    /// Remove a single workspace-relative path. Normalizes the same way as
+    /// [`insert`] so a watched DELETE can drop the entry `insert` added.
+    pub fn remove(&mut self, path: &str) {
+        let norm = path.replace('\\', "/").to_ascii_lowercase();
+        self.files.remove(&norm);
+        if self.case_sensitive {
+            self.files_exact.remove(&norm);
+        }
+    }
+
     /// Add relative paths (the vanilla-cache restore path), each carrying its
     /// on-disk case. Lowercased into the case-insensitive set always; recorded
     /// into the exact-case map only while `case_sensitive` is set, so the

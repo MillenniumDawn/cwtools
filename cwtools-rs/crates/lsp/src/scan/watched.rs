@@ -206,6 +206,25 @@ impl Backend {
             if !deletes.is_empty() {
                 self.process_watched_deletes(&deletes).await;
             }
+            // Keep FileIndex current for CW113 / icon completions: newly
+            // created workspace files land in the index between full scans.
+            // CHANGED that is actually a fresh create is also covered; insert
+            // is idempotent for existing entries. Gated on a non-empty index
+            // (vanilla present) so a mod-only workspace stays silent by design.
+            {
+                let to_insert: Vec<String> = changes
+                    .iter()
+                    .filter_map(|uri| self.workspace_rel_for_file_index(uri))
+                    .collect();
+                if !to_insert.is_empty() {
+                    let mut info = self.state.info_service.write();
+                    if !info.type_index.file_index.is_empty() {
+                        for rel in to_insert {
+                            info.type_index.file_index.insert(&rel);
+                        }
+                    }
+                }
+            }
             // Loc keys added or removed across the batch's loc files, recorded
             // per file in the watched overlay and swept ONCE after the loop —
             // the per-file cross-file sweep is the open-doc edit path's job
@@ -321,6 +340,16 @@ impl Backend {
         }
     }
 
+    /// Workspace-relative path for FileIndex bookkeeping, if `uri` is under
+    /// the workspace root and inside the access boundary. `None` for vanilla
+    /// files or URIs outside the boundary.
+    fn workspace_rel_for_file_index(&self, uri: &str) -> Option<String> {
+        let root = self.state.config.read().workspace_roots.first().cloned()?;
+        let abs = self.authorized_path(uri)?;
+        let rel = abs.strip_prefix(&root).ok()?;
+        rel.to_str().map(|s| s.replace('\\', "/"))
+    }
+
     /// Apply a coalesced batch of DELETE events off the message future: forget
     /// each URI from the info service (one write scope), both loc overlays, and
     /// the watched-signature record, bump the info revision once for the whole
@@ -328,8 +357,20 @@ impl Backend {
     /// empty publish goes through `publish_filtered` so the deleted file's
     /// `fixAllWorkspace` entry is dropped with its diagnostics (#133).
     async fn process_watched_deletes(&self, deletes: &[String]) {
+        // Keep FileIndex current for CW113 / icon completions: remove deleted
+        // workspace files. Only when the index is already populated (vanilla
+        // present); a mod-only workspace has an empty index by design.
+        let to_remove: Vec<String> = deletes
+            .iter()
+            .filter_map(|uri| self.workspace_rel_for_file_index(uri))
+            .collect();
         {
             let mut info = self.state.info_service.write();
+            if !to_remove.is_empty() && !info.type_index.file_index.is_empty() {
+                for rel in &to_remove {
+                    info.type_index.file_index.remove(rel);
+                }
+            }
             for uri in deletes {
                 info.clear_file(uri);
             }
