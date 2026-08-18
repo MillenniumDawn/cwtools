@@ -122,11 +122,48 @@ impl Backend {
         self.bump_info_revision();
     }
 
+    /// Stage a base-game payload (a cache hit or a live walk of the install) for
+    /// the merge that follows: type instances, loc keys and file paths wait in
+    /// `state`, dynamic values go straight into the index. Returns the number of
+    /// instances staged.
+    ///
+    /// Every field the cache writer packs is routed here, and the payload is
+    /// destructured exhaustively, so a field added to the cache is a compile
+    /// error rather than one the editor silently drops (#283).
+    pub(crate) fn stage_vanilla_payload(
+        &self,
+        data: cwtools_info::vanilla_cache::VanillaCacheData,
+    ) -> usize {
+        let cwtools_info::vanilla_cache::VanillaCacheData { per_type, aux } = data;
+        let cwtools_info::vanilla_cache::VanillaCacheAux {
+            loc_keys,
+            file_paths,
+            // Base-game script variables. The LSP's var index is refcounted per
+            // file, so folding a rootless set into it needs its own bookkeeping
+            // (#306); the live path drops them too, so this changes nothing.
+            var_names: _,
+            complex_enum_values,
+            value_set_values,
+        } = aux;
+
+        let total: usize = per_type.values().map(|v| v.len()).sum();
+        *self.state.vanilla_index.lock() = Some(per_type);
+        if !loc_keys.is_empty() {
+            *self.state.vanilla_loc_keys.lock() = Some(loc_keys);
+        }
+        *self.state.vanilla_file_paths.lock() = Some(file_paths);
+        self.merge_vanilla_dynamic_values(complex_enum_values, value_set_values);
+        total
+    }
+
     /// Merge a pending `vanilla_index` (from the cache or a live index) into
     /// the workspace type index. After the merge the raw per-type data is
     /// dropped from `vanilla_index` to eliminate double residency (the
     /// type_index already owns the instances). `vanilla_merged` prevents
     /// `ensure_vanilla_index` re-running on subsequent workspace scans.
+    ///
+    /// Walks the workspace root for the file index, so call it off the async
+    /// executor (`block_in_place`).
     pub(crate) fn merge_pending_vanilla_index(&self) {
         let per_type = self.state.vanilla_index.lock().take();
         if let Some(per_type) = per_type {
@@ -160,11 +197,30 @@ impl Backend {
                 std::mem::replace(&mut *merged, uris)
             };
 
+            // CW113 resolves a `filepath` against the mod's files and the base
+            // game's as one set, so both halves are indexed here, in the same
+            // write that publishes the merge. Case-insensitive: the editor has
+            // no equivalent of the CLI's --case-sensitive-files. With no
+            // workspace folder there is no mod half and the check stays silent,
+            // as it does on a mod-only CLI run.
+            let workspace_root = self.state.config.read().workspace_roots.first().cloned();
+            let file_index = workspace_root.and_then(|root| {
+                let paths = self.state.vanilla_file_paths.lock().take()?;
+                Some(cwtools_driver::build_file_index(
+                    &root,
+                    cwtools_driver::VanillaFiles::Cached(paths),
+                    false,
+                ))
+            });
+
             let mut info_guard = self.state.info_service.write();
             // Drop the previous base-game contribution (a re-merge after
             // cacheVanilla / clearAllCaches) before merging the fresh one.
             info_guard.type_index.remove_files(&old);
             info_guard.type_index.merge_base_game_with_uris(converted);
+            if let Some(file_index) = file_index {
+                info_guard.type_index.file_index = file_index;
+            }
             // Vanilla data is loaded, so the index now holds every base-game
             // instance. Mark it complete so the CW500/CW222 type-reference
             // checks fire (they're gated on `complete` to avoid false
@@ -264,15 +320,7 @@ impl Backend {
                 Ok((cache_game, cache_fp, data))
                     if cache_game == game && cache_fp == fingerprint =>
                 {
-                    let total: usize = data.per_type.values().map(|v| v.len()).sum();
-                    *self.state.vanilla_index.lock() = Some(data.per_type);
-                    if !data.loc_keys.is_empty() {
-                        *self.state.vanilla_loc_keys.lock() = Some(data.loc_keys);
-                    }
-                    self.merge_vanilla_dynamic_values(
-                        data.complex_enum_values,
-                        data.value_set_values,
-                    );
+                    let total = self.stage_vanilla_payload(data);
                     self.client
                         .log_message(
                             MessageType::INFO,
@@ -367,26 +415,16 @@ impl Backend {
             }
         };
 
-        let total: usize = per_type.values().map(|v| v.len()).sum();
-
-        // The freshly-extracted loc keys and dynamic values feed this session
-        // directly too (not just the persisted cache).
-        if !aux.loc_keys.is_empty() {
-            *self.state.vanilla_loc_keys.lock() = Some(aux.loc_keys.clone());
-        }
-        self.merge_vanilla_dynamic_values(
-            aux.complex_enum_values.clone(),
-            aux.value_set_values.clone(),
-        );
-
         // Persist for next startup so the base game isn't re-parsed every time.
+        // The payload is cloned rather than moved because the walk feeds this
+        // session too, through the same staging a cache hit uses.
         if let Some(cp) = &cache_path {
             match cwtools_info::vanilla_cache::save_per_type(
                 &per_type,
                 &game,
                 &fingerprint,
                 cp,
-                aux,
+                aux.clone(),
             ) {
                 Ok(n) => {
                     self.client
@@ -412,7 +450,8 @@ impl Backend {
             }
         }
 
-        *self.state.vanilla_index.lock() = Some(per_type);
+        let total = self
+            .stage_vanilla_payload(cwtools_info::vanilla_cache::VanillaCacheData { per_type, aux });
         self.client
             .log_message(
                 MessageType::INFO,

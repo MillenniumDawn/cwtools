@@ -218,8 +218,8 @@ pub(super) fn run(args: ValidateArgs) {
                 note(format!(
                     "  Loaded {} base-game instances, {} loc languages, {} files from cache {} (fp: {})",
                     total,
-                    data.loc_keys.len(),
-                    data.file_paths.len(),
+                    data.aux.loc_keys.len(),
+                    data.aux.file_paths.len(),
                     cache_path.display(),
                     cached_fp,
                 ));

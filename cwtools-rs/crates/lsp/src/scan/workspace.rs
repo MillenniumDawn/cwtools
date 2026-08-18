@@ -628,8 +628,9 @@ impl Backend {
         }
 
         // Merge the pre-generated vanilla index (if loaded) so base-game
-        // references resolve.
-        self.merge_pending_vanilla_index();
+        // references resolve. Walks the workspace root for the file index, so
+        // it runs off the executor.
+        tokio::task::block_in_place(|| self.merge_pending_vanilla_index());
 
         // Rebuild the cached modifier-key set now that the type index is
         // complete (templated modifiers like production_speed_<building>_factor

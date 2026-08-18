@@ -1116,6 +1116,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_vanilla_merge_populates_the_file_index() {
+        // CW113 is gated on a non-empty file index, and the editor's stayed
+        // empty: the cache load dropped `file_paths` and nothing walked the
+        // workspace, so the check was silently dead in the LSP (#283). Both
+        // halves have to be there — vanilla alone would flag every reference to
+        // a file the mod ships itself.
+        let backend = test_backend();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("mod");
+        std::fs::create_dir_all(root.join("gfx")).unwrap();
+        std::fs::write(root.join("gfx").join("mod_icon.dds"), b"").unwrap();
+        backend.state.config.write().workspace_roots = vec![root];
+
+        backend.stage_vanilla_payload(cwtools_info::vanilla_cache::VanillaCacheData {
+            per_type: std::collections::HashMap::new(),
+            aux: cwtools_info::vanilla_cache::VanillaCacheAux {
+                file_paths: vec!["gfx/vanilla_icon.dds".to_string()],
+                ..Default::default()
+            },
+        });
+        backend.merge_pending_vanilla_index();
+
+        let info = backend.state.info_service.read();
+        assert!(
+            info.type_index.file_index.contains("gfx/vanilla_icon.dds"),
+            "cached base-game paths must reach the file index"
+        );
+        assert!(
+            info.type_index.file_index.contains("gfx/mod_icon.dds"),
+            "the workspace's own files must reach the file index"
+        );
+    }
+
     #[test]
     fn test_index_vanilla_dir_respects_path_strict() {
         // path_strict = yes must only match the exact declared path, not siblings.
