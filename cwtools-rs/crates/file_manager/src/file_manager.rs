@@ -1273,13 +1273,21 @@ pub fn ignore_glob_match(pattern: &str, name: &str, relative: &str) -> bool {
 /// LSP's open-document gate so they agree on what is ignored.
 pub fn is_ignored_logical_path(logical_path: &str, extra_file_globs: &[String]) -> bool {
     let cfg = FileManagerConfig::default();
-    let file_name = logical_path.rsplit('/').next().unwrap_or(logical_path);
+    // Normalize Windows separators so a raw `a\b\c.txt` is handled even if the
+    // caller didn't go through `compute_logical_path` (the LSP always forwards
+    // `logical_path_from_uri` which is already slash-normalized).
+    let normalized = if logical_path.contains('\\') {
+        logical_path.replace('\\', "/")
+    } else {
+        logical_path.to_string()
+    };
+    let file_name = normalized.rsplit(['/', '\\']).next().unwrap_or(&normalized);
     cfg.exclude_patterns
         .iter()
-        .any(|pat| ignore_glob_match(pat, file_name, logical_path))
+        .any(|pat| ignore_glob_match(pat, file_name, &normalized))
         || extra_file_globs
             .iter()
-            .any(|pat| ignore_glob_match(pat, file_name, logical_path))
+            .any(|pat| ignore_glob_match(pat, file_name, &normalized))
 }
 
 /// True if the file at `path` under `root` would be excluded by the engine
@@ -2479,5 +2487,26 @@ mod tests {
                 "predicate must agree it is kept: {rel}"
             );
         }
+    }
+
+    #[test]
+    fn is_ignored_logical_path_handles_windows_separators() {
+        // Pattern with \ must still match a forward-slashed logical path and vice versa.
+        assert!(is_ignored_logical_path(
+            "common\\ignored.txt",
+            &["ignored.txt".to_string()]
+        ));
+        assert!(is_ignored_logical_path(
+            "common/ignored.txt",
+            &["common\\ignored.txt".to_string()]
+        ));
+        assert!(is_ignored_logical_path(
+            "a\\b\\skip.txt",
+            &["**/skip.txt".to_string()]
+        ));
+        assert!(is_ignored_logical_path(
+            "a/b/skip.txt",
+            &["**\\skip.txt".to_string()]
+        ));
     }
 }

@@ -34,7 +34,7 @@ pub struct UsedInstances(FxHashMap<String, FxHashSet<String>>);
 impl UsedInstances {
     /// Record `instance` as a use of a `type_name` instance. Names are stored
     /// unquoted and lowercased, matching how the type index compares them.
-    pub(crate) fn mark(&mut self, type_name: &str, instance: &str) {
+    pub fn mark(&mut self, type_name: &str, instance: &str) {
         let instance = instance.trim().trim_matches('"').trim();
         if instance.is_empty() {
             return;

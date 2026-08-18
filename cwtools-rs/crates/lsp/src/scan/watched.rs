@@ -181,7 +181,11 @@ impl Backend {
     /// handling on that path. Below the cap, deletions apply first (one
     /// `info_service` write), then per-file validation. Re-arms if new events
     /// landed while it was running.
-    async fn process_watched_batch(&self, changes: HashSet<String>, deletes: Vec<String>) {
+    pub(crate) async fn process_watched_batch(
+        &self,
+        changes: HashSet<String>,
+        deletes: Vec<String>,
+    ) {
         let mut lost_scan_cas = false;
         if watched_batch_over_cap(changes.len(), deletes.len()) {
             tracing::info!(
