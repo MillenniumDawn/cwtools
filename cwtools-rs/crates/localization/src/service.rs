@@ -285,23 +285,27 @@ fn walk_folder_inner(
     ignore_dirs: &[String],
 ) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(folder) else {
+    let Ok(rd) = std::fs::read_dir(folder) else {
         return files;
     };
+    let mut entries: Vec<(std::ffi::OsString, PathBuf, std::fs::FileType)> = Vec::new();
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        entries.push((entry.file_name(), entry.path(), ft));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for entry in entries.flatten() {
+    for (name, path, ft) in entries {
         if *remaining_files == 0 {
             break;
         }
-        let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
         // Reject symlinks and non-regular files outright (see
         // `file_manager::walk_dir_generic`): a symlink can point outside the
         // root or into a cycle, and a special file can report length 0.
         if ft.is_symlink() || !(ft.is_dir() || ft.is_file()) {
             continue;
         }
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let name = name.to_str().unwrap_or("");
         let relative = path.strip_prefix(root).unwrap_or(&path);
         let relative = to_slash_path(relative);
         if ft.is_dir() {
@@ -874,5 +878,42 @@ mod tests {
                 .any(|f| f.path.ends_with("huge_l_english.yml")),
             "over-cap file must not load"
         );
+    }
+
+    #[test]
+    fn discover_files_returns_sorted_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = tmp.path().join("localisation");
+        std::fs::create_dir_all(loc.join("zebra")).unwrap();
+        std::fs::create_dir_all(loc.join("alpha")).unwrap();
+        std::fs::write(loc.join("middle.yml"), "l_english:\n k:0 \"v\"\n").unwrap();
+        std::fs::write(loc.join("zebra").join("z.yml"), "l_english:\n k:0 \"v\"\n").unwrap();
+        std::fs::write(loc.join("alpha").join("a.yml"), "l_english:\n k:0 \"v\"\n").unwrap();
+
+        let files = LocService::discover_files(&[tmp.path()], ScanBudget::default());
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.yml", "middle.yml", "z.yml"]);
+    }
+
+    #[test]
+    fn discover_files_budget_follows_sorted_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = tmp.path().join("localisation");
+        std::fs::create_dir_all(&loc).unwrap();
+        for name in ["zebra.yml", "alpha.yml", "middle.yml"] {
+            std::fs::write(loc.join(name), "l_english:\n k:0 \"v\"\n").unwrap();
+        }
+        let files = LocService::discover_files(
+            &[tmp.path()],
+            ScanBudget {
+                max_files: 1,
+                ..ScanBudget::default()
+            },
+        );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name().unwrap().to_string_lossy(), "alpha.yml");
     }
 }

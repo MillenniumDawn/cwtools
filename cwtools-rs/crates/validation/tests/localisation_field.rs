@@ -59,6 +59,47 @@ fn unsynced_existing_key_ok() {
 }
 
 #[test]
+fn desc_overload_ignores_non_english_commands() {
+    const RULES: &str = r#"
+types = {
+    type[event] = {
+        path = "game/events"
+    }
+}
+event = {
+    desc = localisation
+    desc = {
+        text = localisation
+    }
+}
+"#;
+    let table = StringTable::new();
+    let ruleset = ast_to_ruleset(&parse_string(RULES, &table), &table);
+    let idx = loc_index(&[
+        (
+            "b_l_braz_por.yml",
+            "l_braz_por:\n EUevent.5.d: \"[Grecia]\"\n",
+        ),
+        ("a_l_english.yml", "l_english:\n EUevent.5.d: \"plain\"\n"),
+    ]);
+    let parsed = parse_string("event = {\n desc = EUevent.5.d\n}\n", &table);
+    let errs = validate_ast_with_loc(
+        &parsed,
+        &ruleset,
+        &table,
+        "events/EU_events.txt",
+        None,
+        None,
+        None,
+        Some(&idx),
+    );
+    assert!(
+        errs.iter().all(|e| e.code != Some("CW267")),
+        "English without commands must win the desc leaf, got: {errs:?}"
+    );
+}
+
+#[test]
 fn unsynced_missing_key_warns_cw100() {
     let idx = loc_index(&[("a_l_english.yml", "l_english:\n other: \"hi\"\n")]);
     let errs = run("mytype = {\n name = absent_key\n}\n", &idx);

@@ -113,10 +113,8 @@ fn collect_cwt_files(
         }
     };
 
+    let mut kids: Vec<(std::ffi::OsString, std::path::PathBuf, std::fs::FileType)> = Vec::new();
     for entry in entries {
-        if *remaining_files == 0 {
-            break;
-        }
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -125,7 +123,14 @@ fn collect_cwt_files(
             }
         };
         let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
+        kids.push((entry.file_name(), entry.path(), ft));
+    }
+    kids.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (_name, path, ft) in kids {
+        if *remaining_files == 0 {
+            break;
+        }
         if ft.is_symlink() || !(ft.is_dir() || ft.is_file()) {
             continue;
         }
@@ -246,10 +251,10 @@ fn load_cwt_file(
 /// Walk `dir` for `*.cwt` files, parse each with `table`, convert via
 /// `ast_to_ruleset`, and merge all results into one `RuleSet`.
 ///
-/// Files are read and converted in parallel and merged in walk order, so the
-/// result is what loading them one at a time produces. The one thing that does
-/// move is which files a spent `max_bytes` refuses, since the reservations no
-/// longer land in walk order.
+/// Files are read and converted in parallel and merged in sorted walk order, so
+/// the result is what loading them one at a time produces. The one thing that
+/// does move is which files a spent `max_bytes` refuses, since the reservations
+/// no longer land in walk order.
 ///
 /// Returns `(ruleset, errors)`. Errors are non-fatal: a file that fails to read
 /// is skipped and its message collected.
